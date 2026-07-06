@@ -43,14 +43,16 @@ impl GraphQLAction {
 
     /// Parse the GraphQL URL into (host, port, tls) for upstream peer.
     pub fn parse_upstream(&self) -> anyhow::Result<(String, u16, bool)> {
-        let parsed = url::Url::parse(&self.url)?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("missing host in GraphQL URL"))?
-            .to_string();
-        let tls = parsed.scheme() == "https";
-        let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
-        Ok((host, port, tls))
+        super::memoized_upstream(&self.url, || {
+            let parsed = url::Url::parse(&self.url)?;
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("missing host in GraphQL URL"))?
+                .to_string();
+            let tls = parsed.scheme() == "https";
+            let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+            Ok((host, port, tls))
+        })
     }
 }
 

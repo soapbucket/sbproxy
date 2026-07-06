@@ -44,22 +44,24 @@ impl WebSocketAction {
     /// Converts ws:// to http:// and wss:// to https:// before parsing
     /// so that the standard URL parser can extract host and port.
     pub fn parse_upstream(&self) -> anyhow::Result<(String, u16, bool)> {
-        let normalized = if self.url.starts_with("wss://") {
-            self.url.replacen("wss://", "https://", 1)
-        } else if self.url.starts_with("ws://") {
-            self.url.replacen("ws://", "http://", 1)
-        } else {
-            self.url.clone()
-        };
+        super::memoized_upstream(&self.url, || {
+            let normalized = if self.url.starts_with("wss://") {
+                self.url.replacen("wss://", "https://", 1)
+            } else if self.url.starts_with("ws://") {
+                self.url.replacen("ws://", "http://", 1)
+            } else {
+                self.url.clone()
+            };
 
-        let parsed = url::Url::parse(&normalized)?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("missing host in websocket URL"))?
-            .to_string();
-        let tls = parsed.scheme() == "https";
-        let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
-        Ok((host, port, tls))
+            let parsed = url::Url::parse(&normalized)?;
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("missing host in websocket URL"))?
+                .to_string();
+            let tls = parsed.scheme() == "https";
+            let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+            Ok((host, port, tls))
+        })
     }
 }
 

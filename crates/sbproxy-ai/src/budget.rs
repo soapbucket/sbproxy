@@ -155,7 +155,15 @@ pub enum OnExceedAction {
 /// Tracks accumulated usage per scope key.
 pub struct BudgetTracker {
     usage: DashMap<String, UsageRecord>,
+    /// Amortized-sweep counter (WOR-1693): every `SWEEP_INTERVAL`
+    /// records, drop entries for windowed buckets that have already
+    /// rolled over, so a per-user rolling-window scope cannot leak one
+    /// dead entry per window for the life of the process.
+    records_since_sweep: std::sync::atomic::AtomicUsize,
 }
+
+/// Records between amortized stale-window sweeps of [`BudgetTracker`].
+const SWEEP_INTERVAL: usize = 256;
 
 /// Accumulated usage for a single scope key.
 #[derive(Debug, Clone, Default)]
@@ -172,6 +180,7 @@ impl Default for BudgetTracker {
     fn default() -> Self {
         Self {
             usage: DashMap::new(),
+            records_since_sweep: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -199,6 +208,29 @@ impl BudgetTracker {
                 cost_usd: cost,
                 request_count: 1,
             });
+        self.maybe_sweep_stale_windows();
+    }
+
+    /// Amortized eviction of rolled-over window buckets (WOR-1693).
+    ///
+    /// Runs a full sweep once every [`SWEEP_INTERVAL`] records. Only keys
+    /// carrying a `#w<secs>:<bucket>` suffix whose bucket is strictly in
+    /// the past are dropped; such buckets are never read again (a budget
+    /// check always uses the current bucket). Cumulative / lifetime keys
+    /// (no window suffix) and the current bucket are never touched, so an
+    /// enforced total can never be reset by a sweep.
+    fn maybe_sweep_stale_windows(&self) {
+        use std::sync::atomic::Ordering;
+        let n = self.records_since_sweep.fetch_add(1, Ordering::Relaxed) + 1;
+        if n < SWEEP_INTERVAL {
+            return;
+        }
+        self.records_since_sweep.store(0, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.usage.retain(|key, _| !is_rolled_over_window(key, now));
     }
 
     /// Get current usage for a scope.
@@ -1152,6 +1184,29 @@ pub fn windowed_key(base: &str, window: Option<std::time::Duration>, now_unix_se
     }
 }
 
+/// Whether `key` names a window bucket that has already rolled over at
+/// `now_unix_secs` (WOR-1693).
+///
+/// A [`windowed_key`] has the form `<base>#w<secs>:<bucket>`; it is stale
+/// once `bucket` is strictly less than the current bucket
+/// (`now_unix_secs / secs`), and a rolled-over bucket is never read again
+/// because a budget check always addresses the current bucket. Keys with
+/// no `#w` window suffix (cumulative / lifetime scopes) or an
+/// unparseable suffix are never stale, so a base that legitimately
+/// contains `#` or `#w` is never mistaken for a rolled-over window.
+fn is_rolled_over_window(key: &str, now_unix_secs: u64) -> bool {
+    let Some((_, suffix)) = key.rsplit_once("#w") else {
+        return false;
+    };
+    let Some((secs_s, bucket_s)) = suffix.split_once(':') else {
+        return false;
+    };
+    let (Ok(secs), Ok(bucket)) = (secs_s.parse::<u64>(), bucket_s.parse::<u64>()) else {
+        return false;
+    };
+    secs != 0 && bucket < now_unix_secs / secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1933,5 +1988,45 @@ mod tests {
         assert!(tracker
             .check_limit(&limit, &day1, &OnExceedAction::Block)
             .is_none());
+    }
+
+    #[test]
+    fn sweep_evicts_rolled_over_windows_but_keeps_cumulative_and_current() {
+        // WOR-1693: an amortized sweep drops rolled-over window buckets so
+        // a per-user rolling-window scope cannot leak forever, without
+        // ever touching cumulative scopes or the current bucket.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let hour = std::time::Duration::from_secs(3600);
+        let tracker = BudgetTracker::new();
+
+        let stale = windowed_key("scope", Some(hour), 0); // bucket 0, long rolled over
+        let current = windowed_key("scope", Some(hour), now); // current bucket
+        let cumulative = windowed_key("scope-total", None, now); // no window suffix
+
+        tracker.record_usage(&stale, 10, 0.1);
+        tracker.record_usage(&current, 10, 0.1);
+        tracker.record_usage(&cumulative, 10, 0.1);
+
+        // Drive a sweep without minting new stale keys.
+        for _ in 0..SWEEP_INTERVAL {
+            tracker.record_usage(&cumulative, 0, 0.0);
+        }
+
+        assert_eq!(
+            tracker.get_usage(&stale).request_count,
+            0,
+            "a rolled-over window bucket should be evicted"
+        );
+        assert!(
+            tracker.get_usage(&current).request_count > 0,
+            "the current window must survive the sweep"
+        );
+        assert!(
+            tracker.get_usage(&cumulative).request_count > 0,
+            "a cumulative scope must never be evicted"
+        );
     }
 }

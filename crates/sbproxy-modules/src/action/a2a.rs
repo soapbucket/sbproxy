@@ -32,14 +32,16 @@ impl A2aAction {
 
     /// Parse the URL into (host, port, tls) for Pingora upstream peer.
     pub fn parse_upstream(&self) -> anyhow::Result<(String, u16, bool)> {
-        let parsed = url::Url::parse(&self.url)?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("missing host in A2A URL"))?
-            .to_string();
-        let tls = parsed.scheme() == "https";
-        let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
-        Ok((host, port, tls))
+        super::memoized_upstream(&self.url, || {
+            let parsed = url::Url::parse(&self.url)?;
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("missing host in A2A URL"))?
+                .to_string();
+            let tls = parsed.scheme() == "https";
+            let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+            Ok((host, port, tls))
+        })
     }
 }
 

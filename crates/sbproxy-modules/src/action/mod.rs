@@ -40,6 +40,37 @@ use std::collections::HashMap;
 use sbproxy_plugin::ActionHandler;
 use serde::{Deserialize, Deserializer};
 
+/// Memoize an upstream `(host, port, tls)` parse (WOR-1698).
+///
+/// Every `parse_upstream` runs `url::Url::parse` on a fixed config URL,
+/// and `upstream_peer` calls it on every proxied request. The result is
+/// deterministic given the action's inputs, so cache it keyed by a string
+/// the caller builds to capture every input (the URL, plus the gRPC `tls`
+/// flag). Only successful parses are cached, so a URL that fails to parse
+/// still errors per request exactly as before; behavior is unchanged. The
+/// cache clears past a generous cap so config churn cannot grow it without
+/// bound.
+pub(crate) fn memoized_upstream(
+    key: &str,
+    compute: impl FnOnce() -> anyhow::Result<(String, u16, bool)>,
+) -> anyhow::Result<(String, u16, bool)> {
+    #[allow(clippy::type_complexity)]
+    static CACHE: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, (String, u16, bool)>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+    const CACHE_CAP: usize = 8192;
+
+    if let Some(hit) = CACHE.lock().get(key) {
+        return Ok(hit.clone());
+    }
+    let value = compute()?;
+    let mut cache = CACHE.lock();
+    if cache.len() >= CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key.to_string(), value.clone());
+    Ok(value)
+}
+
 /// Action handler - enum dispatch for built-in types.
 /// Each variant holds its compiled config inline (no Box indirection).
 /// New variants are added as modules are implemented.
@@ -370,14 +401,16 @@ impl ProxyAction {
 
     /// Parse the URL into (host, port, tls) for Pingora upstream peer.
     pub fn parse_upstream(&self) -> anyhow::Result<(String, u16, bool)> {
-        let parsed = url::Url::parse(&self.url)?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("missing host in proxy URL"))?
-            .to_string();
-        let tls = parsed.scheme() == "https";
-        let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
-        Ok((host, port, tls))
+        memoized_upstream(&self.url, || {
+            let parsed = url::Url::parse(&self.url)?;
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("missing host in proxy URL"))?
+                .to_string();
+            let tls = parsed.scheme() == "https";
+            let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+            Ok((host, port, tls))
+        })
     }
 }
 
