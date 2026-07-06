@@ -18,8 +18,12 @@ meta() {
 
 # 1. Build toolchain. The Deep Learning VM image already carries the
 #    NVIDIA driver + CUDA toolkit; add Rust, Node, and C build deps.
+#    clang/libclang-dev: bindgen for the rquickjs-sys (JS engine) build.
+#    protobuf-compiler: prost codegen. Both are hard build deps of the
+#    default feature set.
 apt-get update -y
-apt-get install -y build-essential cmake pkg-config libssl-dev git curl
+apt-get install -y build-essential cmake pkg-config libssl-dev git curl \
+  clang libclang-dev protobuf-compiler
 
 if ! command -v npm >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
@@ -42,6 +46,18 @@ cd sbproxy
 ( cd ui && npm ci && npm run build )
 cargo build --release -p sbproxy --features embed-admin-ui
 install -m 0755 target/release/sbproxy /usr/local/bin/sbproxy
+
+# 2b. Inference engine: build llama.cpp with CUDA and put llama-server on
+#     PATH. ggml-org publishes no Linux CUDA prebuilt (only CPU/Vulkan/
+#     ROCm/SYCL), so a source build is the reliable GPU path. sm_89 = L4;
+#     change CMAKE_CUDA_ARCHITECTURES for a different card. The model host
+#     resolves the engine from PATH; `sbproxy doctor` reports it.
+export PATH="/usr/local/cuda/bin:$PATH"
+[ -d /opt/llama.cpp ] || git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp
+cmake -S /opt/llama.cpp -B /opt/llama.cpp/build \
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build /opt/llama.cpp/build --config Release --target llama-server -j"$(nproc)"
+install -m 0755 /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 
 # 3. Config + state dirs.
 install -d /etc/sbproxy /var/lib/sbproxy/certs /var/lib/sbproxy/models
