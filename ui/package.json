@@ -3,21 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "SBproxy built-in admin dashboard scaffold. Built to ui/dist/ and embedded into the sbproxy binary behind the embed-admin-ui cargo feature.",
+  "description": "SBproxy built-in admin dashboard. Vue 3 + Vite single-page app built to ui/dist/ and embedded into the sbproxy binary behind the embed-admin-ui cargo feature.",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit",
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
   },
   "devDependencies": {
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.3",
+    "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "^5.6.3",
-    "vite": "^6.4.2"
+    "vite": "^6.4.2",
+    "vue-tsc": "^2.2.0"
   }
 }

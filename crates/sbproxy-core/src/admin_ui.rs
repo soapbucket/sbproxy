@@ -1,27 +1,23 @@
 //! Static-asset surface for the built-in admin UI.
 //!
 //! When the `embed-admin-ui` cargo feature is on, the binary embeds
-//! the contents of `ui/dist/` (the React + Vite build output) via
+//! the contents of `ui/dist/` (the Vue + Vite build output) via
 //! `include_dir!`. Requests under `/admin/ui` are served from that
 //! tree, with `index.html` returned for both `/admin/ui` and
 //! `/admin/ui/` (and for any SPA route that does not match a real
-//! file, so React Router style paths work without a server-side
+//! file, so Vue Router history-mode paths work without a server-side
 //! rewrite map).
 //!
 //! When the feature is off, the same paths return a one-line 404 so
 //! operators see exactly what to run to enable the embedded UI. The
-//! default cargo build does not require a prior `pnpm build`.
+//! default cargo build does not require a prior `npm build`.
 //!
-//! The route handler always returns `(status, content_type, body)`
-//! tuples to match the existing admin dispatcher in `admin.rs`.
-//! Binary assets (fonts, images) are not yet supported by the
-//! dispatcher's `String` response shape; the scaffold ships text
-//! assets (HTML, JS, CSS, JSON, SVG, source maps) which is enough
-//! for a Vite-built SPA. Binary asset support is a follow-up.
-//!
-//! Real views (providers, models, routing-strategy preview, metrics
-//! tiles, the chat playground) are deferred to follow-up tickets;
-//! this module only wires the mount.
+//! `dispatch_bytes` returns `(status, content_type, Vec<u8>)` so the
+//! admin server can serve a real Vite bundle: binary assets (woff2
+//! fonts, png/webp images, wasm) are returned byte-for-byte, not just
+//! the text assets (HTML, JS, CSS, JSON, SVG, source maps). The older
+//! `dispatch` returns a `String` body and is kept for the callers
+//! that only need text (and for the no-feature 404 path).
 
 /// Path prefix the admin server uses for the built-in UI. Mounted on
 /// the existing admin dispatcher in [`crate::admin::handle_admin_request`]
@@ -75,8 +71,39 @@ pub fn dispatch(method: &str, path: &str) -> Option<(u16, &'static str, String)>
 /// subpath under `/admin/ui/` belong to this module. We accept the
 /// no-slash form so a single href like `<a href="/admin/ui">` does
 /// not 404 before the SPA loads.
-fn path_is_ours(path: &str) -> bool {
+pub fn path_is_ours(path: &str) -> bool {
     path == UI_PREFIX || path.starts_with(&format!("{UI_PREFIX}/"))
+}
+
+/// Byte-body variant of [`dispatch`], used by the admin server to serve
+/// a real Vite bundle including binary assets (fonts, images, wasm)
+/// that a `String` body would corrupt. Returns `None` when the path is
+/// not ours; otherwise `Some((status, content_type, bytes))`. Auth is
+/// enforced by the caller before this is reached (same Basic-auth gate
+/// as every other `/admin/*` route).
+pub fn dispatch_bytes(method: &str, path: &str) -> Option<(u16, &'static str, Vec<u8>)> {
+    if !path_is_ours(path) {
+        return None;
+    }
+    if !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD") {
+        return Some((
+            405,
+            "application/json",
+            br#"{"error":"method not allowed"}"#.to_vec(),
+        ));
+    }
+    #[cfg(feature = "embed-admin-ui")]
+    {
+        Some(serve_embedded_bytes(path))
+    }
+    #[cfg(not(feature = "embed-admin-ui"))]
+    {
+        Some((
+            404,
+            "text/plain; charset=utf-8",
+            NOT_BUILT_MESSAGE.as_bytes().to_vec(),
+        ))
+    }
 }
 
 /// Serve an asset from the embedded `ui/dist/` tree. SPA semantics:
@@ -137,11 +164,44 @@ fn serve_embedded(path: &str) -> (u16, &'static str, String) {
     )
 }
 
-/// Map a file extension to a `Content-Type` header value. Only the
-/// extensions Vite emits for a default React + TS build are listed;
-/// unknown extensions fall back to `application/octet-stream` so a
-/// stray binary at least transfers correctly even if it cannot
-/// render.
+/// Serve an asset from the embedded `ui/dist/` tree as raw bytes (no
+/// lossy UTF-8 decode), so binary assets survive. Same SPA fallback as
+/// [`serve_embedded`]: a missing file serves `index.html` with a 200 so
+/// client-side routes work on refresh / direct link.
+#[cfg(feature = "embed-admin-ui")]
+fn serve_embedded_bytes(path: &str) -> (u16, &'static str, Vec<u8>) {
+    use include_dir::{include_dir, Dir};
+    static UI_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
+
+    let relative = path
+        .strip_prefix(UI_PREFIX)
+        .map(|p| p.trim_start_matches('/'))
+        .unwrap_or("");
+    let lookup = if relative.is_empty() {
+        "index.html"
+    } else {
+        relative
+    };
+
+    if let Some(file) = UI_DIR.get_file(lookup) {
+        return (200, content_type_for(lookup), file.contents().to_vec());
+    }
+    if let Some(file) = UI_DIR.get_file("index.html") {
+        return (200, "text/html; charset=utf-8", file.contents().to_vec());
+    }
+    (
+        404,
+        "text/plain; charset=utf-8",
+        NOT_BUILT_MESSAGE.as_bytes().to_vec(),
+    )
+}
+
+/// Map a file extension to a `Content-Type` header value. Covers the
+/// text and binary assets a Vite build of the Vue app emits (JS/CSS/
+/// HTML/JSON/SVG plus woff2/woff/ttf fonts, png/jpg/gif/ico/webp
+/// images, and wasm); unknown extensions fall back to
+/// `application/octet-stream` so a stray file at least transfers
+/// correctly even if the browser cannot render it.
 #[cfg(feature = "embed-admin-ui")]
 fn content_type_for(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("");
@@ -152,6 +212,17 @@ fn content_type_for(path: &str) -> &'static str {
         "json" | "map" => "application/json; charset=utf-8",
         "svg" => "image/svg+xml",
         "txt" => "text/plain; charset=utf-8",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
         _ => "application/octet-stream",
     }
 }
@@ -191,7 +262,24 @@ mod tests {
         assert_eq!(status, 404);
         assert_eq!(ct, "text/plain; charset=utf-8");
         assert!(body.contains("Admin UI not built"));
-        assert!(body.contains("pnpm build"));
+        assert!(body.contains("npm build"));
         assert!(body.contains("embed-admin-ui"));
+    }
+
+    #[test]
+    fn dispatch_bytes_matches_only_ui_paths() {
+        assert!(dispatch_bytes("GET", "/api/health").is_none());
+        assert!(dispatch_bytes("GET", "/admin/ui").is_some());
+        let (status, _, _) = dispatch_bytes("POST", "/admin/ui/assets/x.js").expect("matched");
+        assert_eq!(status, 405);
+    }
+
+    #[cfg(not(feature = "embed-admin-ui"))]
+    #[test]
+    fn dispatch_bytes_default_build_is_404() {
+        let (status, ct, body) = dispatch_bytes("GET", "/admin/ui").expect("matched");
+        assert_eq!(status, 404);
+        assert_eq!(ct, "text/plain; charset=utf-8");
+        assert!(String::from_utf8_lossy(&body).contains("Admin UI not built"));
     }
 }

@@ -1175,6 +1175,16 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 .as_ref()
                 .map(|a| a.max_log_entries)
                 .unwrap_or(1000),
+            // WOR-1717: carry the operator's admin TLS cert/key paths
+            // through so the admin server serves HTTPS when configured.
+            tls: server_config
+                .admin
+                .as_ref()
+                .and_then(|a| a.tls.as_ref())
+                .map(|t| crate::admin::AdminTls {
+                    cert: t.cert.clone(),
+                    key: t.key.clone(),
+                }),
         };
         // Pass the same on-disk config path the file watcher uses
         // so `POST /admin/reload` re-reads the same file. The two

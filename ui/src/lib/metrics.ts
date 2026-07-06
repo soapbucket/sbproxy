@@ -1,0 +1,116 @@
+/** Minimal Prometheus text-exposition parser. */
+
+export interface MetricSample {
+  name: string;
+  labels: Record<string, string>;
+  value: number;
+}
+
+export interface MetricFamily {
+  name: string;
+  help?: string;
+  type?: string;
+  samples: MetricSample[];
+}
+
+const LINE_RE = /^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{([^}]*)\})?\s+(.+)$/;
+
+function parseLabels(raw: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!raw) return out;
+  // labels look like: a="1",b="two, with comma"
+  const re = /([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    out[m[1]] = m[2].replace(/\\"/g, '"').replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+  }
+  return out;
+}
+
+export function parsePrometheus(text: string): MetricFamily[] {
+  const families = new Map<string, MetricFamily>();
+
+  const family = (name: string): MetricFamily => {
+    let f = families.get(name);
+    if (!f) {
+      f = { name, samples: [] };
+      families.set(name, f);
+    }
+    return f;
+  };
+
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("#")) {
+      const parts = line.split(/\s+/);
+      // # HELP name text...   or   # TYPE name kind
+      if (parts[1] === "HELP" && parts[2]) {
+        family(parts[2]).help = parts.slice(3).join(" ");
+      } else if (parts[1] === "TYPE" && parts[2]) {
+        family(parts[2]).type = parts[3];
+      }
+      continue;
+    }
+    const m = LINE_RE.exec(line);
+    if (!m) continue;
+    const name = m[1];
+    const labels = parseLabels(m[3]);
+    const value = Number(m[4].split(/\s+/)[0]);
+    if (Number.isNaN(value)) continue;
+    // Fold histogram/summary/counter suffixes back to the base family
+    // name so a family groups its own samples.
+    const base = name.replace(/_(bucket|sum|count|total)$/, (s) =>
+      s === "_total" ? "_total" : s,
+    );
+    const f = family(base === name ? name : base);
+    f.samples.push({ name, labels, value });
+  }
+
+  return [...families.values()];
+}
+
+/** Sum every sample of a family whose labels match the given filter. */
+export function sumSamples(
+  family: MetricFamily | undefined,
+  labelFilter: Record<string, string> = {},
+): number {
+  if (!family) return 0;
+  return family.samples
+    .filter((s) =>
+      Object.entries(labelFilter).every(([k, v]) => s.labels[k] === v),
+    )
+    .reduce((acc, s) => acc + s.value, 0);
+}
+
+/** Group a family's samples by the value of one label. */
+export function groupByLabel(
+  family: MetricFamily | undefined,
+  label: string,
+): { key: string; value: number }[] {
+  if (!family) return [];
+  const acc = new Map<string, number>();
+  for (const s of family.samples) {
+    const key = s.labels[label] ?? "(none)";
+    acc.set(key, (acc.get(key) ?? 0) + s.value);
+  }
+  return [...acc.entries()]
+    .map(([key, value]) => ({ key, value }))
+    .sort((a, b) => b.value - a.value);
+}
+
+export function findFamily(
+  families: MetricFamily[],
+  ...names: string[]
+): MetricFamily | undefined {
+  for (const n of names) {
+    const exact = families.find((f) => f.name === n);
+    if (exact) return exact;
+  }
+  // Loose contains match as a fallback.
+  for (const n of names) {
+    const loose = families.find((f) => f.name.includes(n));
+    if (loose) return loose;
+  }
+  return undefined;
+}

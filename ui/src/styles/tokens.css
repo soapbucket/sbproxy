@@ -1,0 +1,115 @@
+/*
+ * SBproxy admin design tokens.
+ *
+ * Matches the current sbproxy.dev brand: a light editorial surface with
+ * a two-tier accent. The values below are the real tokens read from the
+ * live sbproxy.dev stylesheet (assets/index-*.css): the paper and ink
+ * scales, --navy / --navy-deep / --navy-soft, --azure / --azure-hover /
+ * --azure-soft / --azure-tint, the mint and rose state hues, the
+ * hairline low-alpha borders, the "ss01"/"cv11" feature settings, and
+ * the Instrument Sans (body and headings) plus JetBrains Mono (code and
+ * identifiers) type families.
+ *
+ * Accent tiers:
+ *  - Navy (#0e2a4d) is the commit / brand tier: primary buttons and the
+ *    brand mark. White text sits on navy.
+ *  - Azure (#2563eb) is the interaction tier only: links, focus rings,
+ *    and selected or active states. It is never a primary CTA fill.
+ *  - Amber survives only as a warning color (--sb-warn), never a CTA or
+ *    a heading.
+ *
+ * App chrome (sidebar, cards, tables, modals, badges) reads light off
+ * these variables. White paper (#ffffff) is the surface, with a subtle
+ * #f7f8fa for banding and hovers. The dark code panel (--sb-code-*) is
+ * retained as a deliberate accent for raw JSON and code blocks only.
+ */
+
+:root {
+  /* Type families (extracted from sbproxy.dev). No web font is loaded
+     so an air-gapped deploy stays self contained; the named faces are
+     used when present, otherwise the system stack takes over. */
+  --sb-font-sans: "Instrument Sans", ui-sans-serif, system-ui,
+    -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --sb-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+    Consolas, "Liberation Mono", monospace;
+
+  /* Light paper surfaces (site --paper-0 / --paper-50 / --paper-100). */
+  --sb-bg: #f7f8fa;
+  --sb-bg-sunken: #eef1f5;
+  --sb-surface: #ffffff;
+  --sb-surface-2: #f7f8fa;
+  --sb-surface-hover: #eef1f5;
+
+  /* Ink text scale (site --ink-800 / --ink-500 / --ink-400). */
+  --sb-text: #0f1f36;
+  --sb-text-muted: #4a5b73;
+  --sb-text-faint: #6b7d95;
+
+  /* Navy, the commit / brand tier (site --navy / --navy-deep /
+     --navy-soft). Primary CTAs and the brand mark. */
+  --sb-navy: #0e2a4d;
+  --sb-navy-strong: #081a33;
+  --sb-navy-soft: #1f3a60;
+  --sb-on-navy: #ffffff;
+
+  /* Azure, the interaction tier only (site --azure / --azure-hover /
+     --azure-soft / --azure-tint). Links, focus rings, active states. */
+  --sb-accent: #2563eb;
+  --sb-accent-strong: #1d4ed8;
+  --sb-accent-tint: #eef4fe;
+  --sb-accent-tint-strong: #dbe7fe;
+  --sb-accent-ring: rgba(37, 99, 235, 0.28);
+
+  /* Hairline rules (site --hairline / --hairline-strong /
+     --hairline-azure). */
+  --sb-border: rgba(10, 22, 40, 0.08);
+  --sb-border-strong: rgba(10, 22, 40, 0.14);
+  --sb-border-accent: rgba(37, 99, 235, 0.22);
+
+  /* State colors. Backgrounds are the site soft tints (--mint-soft,
+     --amber-tint, --rose-soft, --azure-soft); the text hues are the
+     site mint / amber / rose / azure darkened enough to read on those
+     light tints. Amber appears here as a warning only. */
+  --sb-ok: #0a7a55;
+  --sb-ok-bg: #d1fae5;
+  --sb-warn: #b45309;
+  --sb-warn-bg: #fef3c7;
+  --sb-warn-fg: #92400e;
+  --sb-err: #b4223f;
+  --sb-err-bg: #fce7ec;
+  --sb-info: #1d4ed8;
+  --sb-info-bg: #dbe7fe;
+
+  /* Dark code and identifier panel (extracted syntax palette), kept as
+     an intentional accent on the light chrome. */
+  --sb-code-bg: #0e1a2c;
+  --sb-code-fg: #e2e8f0;
+  --sb-code-key: #93c5fd;
+  --sb-code-str: #fbcfe8;
+  --sb-code-val: #86efac;
+  --sb-code-num: #c4b5fd;
+  --sb-code-com: #94a3b8;
+  --sb-code-punct: #cbd5e1;
+
+  /* Radii, modest and editorial (site uses 6-8px, pills at 999px). */
+  --sb-radius-sm: 6px;
+  --sb-radius: 8px;
+  --sb-radius-lg: 12px;
+  --sb-radius-pill: 999px;
+
+  /* Spacing rhythm. */
+  --sb-space-1: 4px;
+  --sb-space-2: 8px;
+  --sb-space-3: 12px;
+  --sb-space-4: 16px;
+  --sb-space-5: 24px;
+  --sb-space-6: 32px;
+  --sb-space-7: 48px;
+
+  /* Layout. */
+  --sb-sidebar-w: 232px;
+  --sb-content-max: 1160px;
+
+  --sb-shadow: 0 1px 2px rgba(10, 22, 40, 0.06),
+    0 10px 30px rgba(10, 22, 40, 0.12);
+}

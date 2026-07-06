@@ -38,6 +38,19 @@ pub struct AdminConfig {
     pub password: String,
     /// Maximum number of recent request log entries to retain in memory.
     pub max_log_entries: usize,
+    /// Optional TLS (WOR-1717). When set, the admin server (and the
+    /// built-in UI) is served over HTTPS with this PEM cert + key instead
+    /// of plaintext HTTP.
+    pub tls: Option<AdminTls>,
+}
+
+/// PEM certificate + key file paths for admin-server TLS (WOR-1717).
+#[derive(Debug, Clone)]
+pub struct AdminTls {
+    /// Path to the PEM certificate chain.
+    pub cert: std::path::PathBuf,
+    /// Path to the PEM private key (PKCS#8 or RSA).
+    pub key: std::path::PathBuf,
 }
 
 impl Default for AdminConfig {
@@ -48,6 +61,7 @@ impl Default for AdminConfig {
             username: "admin".to_string(),
             password: "changeme".to_string(),
             max_log_entries: 1000,
+            tls: None,
         }
     }
 }
@@ -1534,6 +1548,18 @@ pub fn spawn_admin_server(
         return None;
     }
     let port = state.config.port;
+    // WOR-1717: build the TLS acceptor up front so a bad cert fails the
+    // admin server at startup rather than silently per-connection.
+    let acceptor = match &state.config.tls {
+        Some(tls) => match build_admin_acceptor(tls) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                tracing::error!(error = %e, "admin TLS init failed; admin server not started");
+                return None;
+            }
+        },
+        None => None,
+    };
     Some(tokio::spawn(async move {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -1547,7 +1573,7 @@ pub fn spawn_admin_server(
                 return;
             }
         };
-        tracing::info!(addr = %addr, "admin server listening");
+        tracing::info!(addr = %addr, tls = acceptor.is_some(), "admin server listening");
         let rate_limiter = std::sync::Arc::new(AdminRateLimiter::new(60));
         let ip_filter = std::sync::Arc::new(AdminIpFilter::localhost_only());
         loop {
@@ -1561,36 +1587,85 @@ pub fn spawn_admin_server(
             let state = state.clone();
             let rate_limiter = rate_limiter.clone();
             let ip_filter = ip_filter.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let peer_ip = peer.ip().to_string();
-                if !ip_filter.is_allowed(&peer_ip) {
-                    let _ = write_admin_response(
-                        sock,
-                        403,
-                        "application/json",
-                        r#"{"error":"Forbidden"}"#,
-                    )
-                    .await;
-                    return;
+                // Complete the TLS handshake first (when configured), so
+                // even the 403/429 rejections are sent over TLS to a
+                // TLS-expecting client rather than as a plaintext reply.
+                match acceptor {
+                    Some(acc) => match acc.accept(sock).await {
+                        Ok(tls) => {
+                            serve_admin_conn(tls, peer_ip, state, rate_limiter, ip_filter).await
+                        }
+                        Err(e) => tracing::debug!(error = %e, "admin TLS handshake failed"),
+                    },
+                    None => serve_admin_conn(sock, peer_ip, state, rate_limiter, ip_filter).await,
                 }
-                if !rate_limiter.check(&peer_ip) {
-                    let _ = write_admin_response(
-                        sock,
-                        429,
-                        "application/json",
-                        r#"{"error":"Too Many Requests"}"#,
-                    )
-                    .await;
-                    return;
-                }
-                handle_admin_connection(sock, state).await;
             });
         }
     }))
 }
 
-async fn handle_admin_connection(
-    mut sock: tokio::net::TcpStream,
+/// Per-connection admin handling shared by the plaintext and TLS paths
+/// (WOR-1717): enforce the IP allowlist and rate limit, then dispatch.
+/// Generic over the stream so it serves both `TcpStream` and a TLS
+/// `TlsStream`.
+async fn serve_admin_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    sock: S,
+    peer_ip: String,
+    state: std::sync::Arc<AdminState>,
+    rate_limiter: std::sync::Arc<AdminRateLimiter>,
+    ip_filter: std::sync::Arc<AdminIpFilter>,
+) {
+    if !ip_filter.is_allowed(&peer_ip) {
+        let _ =
+            write_admin_response(sock, 403, "application/json", r#"{"error":"Forbidden"}"#).await;
+        return;
+    }
+    if !rate_limiter.check(&peer_ip) {
+        let _ = write_admin_response(
+            sock,
+            429,
+            "application/json",
+            r#"{"error":"Too Many Requests"}"#,
+        )
+        .await;
+        return;
+    }
+    handle_admin_connection(sock, state).await;
+}
+
+/// Build a rustls `TlsAcceptor` for the admin server from PEM cert + key
+/// files (WOR-1717). Returns a descriptive error string on any read or
+/// parse failure so `spawn_admin_server` can log it and decline to start
+/// rather than serve plaintext on a port an operator asked to be TLS.
+fn build_admin_acceptor(tls: &AdminTls) -> Result<tokio_rustls::TlsAcceptor, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let cert_pem = std::fs::read(&tls.cert)
+        .map_err(|e| format!("read admin cert {}: {e}", tls.cert.display()))?;
+    let key_pem = std::fs::read(&tls.key)
+        .map_err(|e| format!("read admin key {}: {e}", tls.key.display()))?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("parse admin cert {}: {e}", tls.cert.display()))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "admin cert {} contained no certificates",
+            tls.cert.display()
+        ));
+    }
+    let key = PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| format!("parse admin key {}: {e}", tls.key.display()))?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("build admin TLS config: {e}"))?;
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut sock: S,
     state: std::sync::Arc<AdminState>,
 ) {
     use tokio::io::AsyncReadExt;
@@ -1668,6 +1743,29 @@ async fn handle_admin_connection(
             auth_header = Some(rest.trim().to_string());
         }
     }
+    // WOR-1715: the built-in admin UI serves a real Vite bundle,
+    // including binary assets (fonts, images, wasm) that the `String`
+    // dispatcher path would corrupt. Serve it on the byte path here,
+    // behind the same Basic-auth gate as every other `/admin/*` route
+    // (the IP filter + rate limiter already ran in the accept loop).
+    if crate::admin_ui::path_is_ours(path) {
+        let authed = auth_header
+            .as_deref()
+            .and_then(decode_basic_auth)
+            .map(|(user, pass)| state.check_auth(&user, &pass))
+            .unwrap_or(false);
+        if !authed {
+            let _ =
+                write_admin_response(sock, 401, "application/json", r#"{"error":"Unauthorized"}"#)
+                    .await;
+            return;
+        }
+        if let Some((status, content_type, bytes)) = crate::admin_ui::dispatch_bytes(method, path) {
+            let _ = write_admin_response_bytes(sock, status, content_type, &bytes).await;
+            return;
+        }
+    }
+
     // Slice the body off the back of the buffer. Only valid when the
     // headers actually terminated; a malformed pre-header read falls
     // back to no body (the route's parser then 400s on missing JSON).
@@ -1730,14 +1828,9 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-async fn write_admin_response(
-    mut sock: tokio::net::TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &str,
-) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let reason = match status {
+/// The HTTP reason phrase for the status codes the admin server emits.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -1749,22 +1842,44 @@ async fn write_admin_response(
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
-    };
-    let response = format!(
+    }
+}
+
+async fn write_admin_response<S: tokio::io::AsyncWrite + Unpin>(
+    sock: S,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    write_admin_response_bytes(sock, status, content_type, body.as_bytes()).await
+}
+
+/// Write an admin response with a raw byte body. `write_admin_response`
+/// is the `&str` convenience wrapper; the admin UI (WOR-1715) uses this
+/// directly so binary assets (fonts, images, wasm) are sent unmodified.
+/// Generic over the stream so it works over both plain TCP and TLS
+/// (WOR-1717).
+async fn write_admin_response_bytes<S: tokio::io::AsyncWrite + Unpin>(
+    mut sock: S,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let header = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
          WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n\
-         \r\n\
-         {body}",
+         \r\n",
         status = status,
-        reason = reason,
+        reason = reason_phrase(status),
         content_type = content_type,
         len = body.len(),
-        body = body,
     );
-    sock.write_all(response.as_bytes()).await?;
+    sock.write_all(header.as_bytes()).await?;
+    sock.write_all(body).await?;
     sock.shutdown().await
 }
 
@@ -1781,6 +1896,7 @@ mod tests {
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            tls: None,
         })
     }
 
@@ -2122,6 +2238,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            tls: None,
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2157,6 +2274,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            tls: None,
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2184,6 +2302,7 @@ origins:
                 username: "admin".to_string(),
                 password: "secret".to_string(),
                 max_log_entries: 5,
+                tls: None,
             })
             .with_config_path(f.path()),
         );
@@ -2281,6 +2400,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            tls: None,
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2307,6 +2427,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            tls: None,
         })
         .with_config_path(&bogus)
         .with_loaded_config_content_hash("deadbeefcafe");
@@ -2334,6 +2455,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            tls: None,
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2379,6 +2501,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            tls: None,
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2418,6 +2541,41 @@ origins:
         for _ in 0..5 {
             assert!(limiter.check("10.0.0.1"), "should allow within limit");
         }
+    }
+
+    #[test]
+    fn admin_acceptor_missing_files_errors_clearly() {
+        // WOR-1717: an unreadable cert must produce a descriptive error
+        // so spawn_admin_server can log it and decline to start rather
+        // than serve plaintext on a port asked to be TLS.
+        let tls = AdminTls {
+            cert: std::path::PathBuf::from("/nonexistent/admin-cert.pem"),
+            key: std::path::PathBuf::from("/nonexistent/admin-key.pem"),
+        };
+        // map Ok to () since TlsAcceptor is not Debug (expect_err needs it).
+        let err = build_admin_acceptor(&tls)
+            .map(|_| ())
+            .expect_err("missing cert must error");
+        assert!(err.contains("read admin cert"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn admin_acceptor_rejects_non_cert_content() {
+        // A file that exists but is not a PEM cert must be rejected (no
+        // certificates parsed), not silently accepted.
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, b"not a certificate").unwrap();
+        std::fs::write(&key, b"not a key").unwrap();
+        let tls = AdminTls { cert, key };
+        let err = build_admin_acceptor(&tls)
+            .map(|_| ())
+            .expect_err("garbage cert must error");
+        assert!(
+            err.contains("admin cert") || err.contains("parse"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2575,6 +2733,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            tls: None,
         })
         .with_health_registry(registry);
         let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
@@ -2596,6 +2755,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            tls: None,
         })
         .with_health_registry(registry);
         let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
