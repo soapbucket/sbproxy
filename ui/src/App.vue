@@ -1,9 +1,18 @@
 <script setup lang="ts">
+import { onMounted } from "vue";
 import AppSidebar from "./components/AppSidebar.vue";
+import LoginView from "./views/LoginView.vue";
+import { useAuth } from "./composables/useAuth";
+
+// WOR-1758: check the session on load, then gate the app on auth.
+const { authenticated, ready, refresh } = useAuth();
+onMounted(refresh);
 </script>
 
 <template>
-  <div class="shell">
+  <div v-if="!ready" class="boot">Loading...</div>
+  <LoginView v-else-if="!authenticated" />
+  <div v-else class="shell">
     <AppSidebar />
     <main class="content">
       <div class="content__inner">
@@ -14,6 +23,12 @@ import AppSidebar from "./components/AppSidebar.vue";
 </template>
 
 <style scoped>
+.boot {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  color: var(--sb-text-muted);
+}
 .shell {
   display: flex;
   min-height: 100vh;

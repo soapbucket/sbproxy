@@ -1,12 +1,26 @@
 /*
  * Shared client for the sbproxy admin API.
  *
- * Every call is same-origin (the SPA is served by the admin port,
- * already behind that port's HTTP Basic auth) and uses absolute paths
- * so the requests resolve regardless of the `/admin/ui/` mount prefix.
- * Response shapes are best effort: the server is not available at
- * build time, so callers should read fields defensively.
+ * Every call is same-origin (the SPA is served by the admin port) and
+ * uses absolute paths so the requests resolve regardless of the
+ * `/admin/ui/` mount prefix. Response shapes are best effort: the server
+ * is not available at build time, so callers should read fields
+ * defensively.
+ *
+ * Auth: the SPA authenticates with a browser session (POST /admin/login)
+ * and holds the returned CSRF token in memory (WOR-1758), sent as
+ * `X-CSRF-Token` on every mutating request. Basic auth (no token) still
+ * works for CI / scripting, where mutations are CSRF-exempt.
  */
+
+// In-memory CSRF token for the current session; null when unauthenticated
+// or authenticated via Basic. Set from the login / session responses.
+let csrfToken: string | null = null;
+export function setCsrfToken(token: string | null): void {
+  csrfToken = token;
+}
+
+const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 export class ApiError extends Error {
   status: number;
@@ -49,6 +63,11 @@ async function request(
     credentials: "same-origin",
     headers: { Accept: "application/json" },
   };
+  // Send the CSRF token on mutations under a browser session. Basic-auth
+  // callers hold no token and are CSRF-exempt server-side.
+  if (csrfToken && MUTATING.has(method.toUpperCase())) {
+    init.headers = { ...init.headers, "X-CSRF-Token": csrfToken };
+  }
   if (body !== undefined) {
     init.headers = { ...init.headers, "Content-Type": "application/json" };
     init.body = JSON.stringify(body);
@@ -293,7 +312,35 @@ export interface PlaygroundChatResult {
   error?: string;
 }
 
+export interface SessionInfo {
+  authenticated: boolean;
+  username?: string;
+  role?: string;
+  via_session?: boolean;
+  csrf_token?: string | null;
+}
+export interface LoginResult {
+  role: string;
+  username: string;
+  csrf_token: string;
+}
+
 export const api = {
+  // Auth (WOR-1758)
+  session: () => getJson<SessionInfo>("/admin/session"),
+  login: async (username: string, password: string): Promise<LoginResult> => {
+    const r = await sendJson<LoginResult>("POST", "/admin/login", { username, password });
+    setCsrfToken(r.csrf_token ?? null);
+    return r;
+  },
+  logout: async (): Promise<void> => {
+    try {
+      await sendJson("POST", "/admin/logout");
+    } finally {
+      setCsrfToken(null);
+    }
+  },
+
   // Overview
   health: () => getJson<HealthResponse>("/health"),
   stats: () => getJson<StatsResponse>("/api/stats"),
