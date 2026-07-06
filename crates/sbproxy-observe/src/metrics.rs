@@ -856,6 +856,36 @@ impl ProxyMetrics {
         // `# {trace_id="..."} ...` suffix.
         crate::exemplars::splice_into_text(&raw)
     }
+
+    /// Sum the current values of the named metric families across all
+    /// their label sets, for cluster-metric publication (WOR-1721). Each
+    /// requested name maps to the total of its counter / gauge samples
+    /// (histograms contribute their sample sum); a name not present in the
+    /// registry maps to `0.0`. The mesh producer ships this compact
+    /// per-node snapshot so one node can report fleet totals without an
+    /// external Prometheus.
+    pub fn snapshot_named(&self, names: &[&str]) -> std::collections::HashMap<String, f64> {
+        let mut out: std::collections::HashMap<String, f64> =
+            names.iter().map(|n| ((*n).to_string(), 0.0)).collect();
+        for fam in self.registry.gather() {
+            let fname = fam.name();
+            if !names.contains(&fname) {
+                continue;
+            }
+            let mut total = 0.0;
+            for m in &fam.metric {
+                if let Some(c) = m.counter.as_ref() {
+                    total += c.value();
+                } else if let Some(g) = m.gauge.as_ref() {
+                    total += g.value();
+                } else if let Some(h) = m.histogram.as_ref() {
+                    total += h.sample_sum();
+                }
+            }
+            out.insert(fname.to_string(), total);
+        }
+        out
+    }
 }
 
 // --- Trace-id helper for exemplars ---

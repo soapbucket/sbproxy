@@ -560,6 +560,17 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
         crate::mesh_counters::install_mesh_counters(Arc::new(
             crate::mesh_counters::MeshKeyCounters::new(node_id),
         ));
+
+        // WOR-1721: fleet metrics. Install the process-global aggregator
+        // and, when the mesh node bootstrapped, spawn the publish/collect
+        // loop so `GET /admin/cluster/metrics` reports fleet totals from
+        // one node without an external Prometheus.
+        crate::cluster_metrics::install_cluster_metrics(Arc::new(
+            sbproxy_mesh::cluster_metrics::ClusterMetrics::new(),
+        ));
+        if let Some(node) = current_mesh_node() {
+            key_runtime().spawn(crate::cluster_metrics::run_loop(node, 15));
+        }
     }
 
     // Cross-replica invalidation: subscribe to the Redis channel so a peer's

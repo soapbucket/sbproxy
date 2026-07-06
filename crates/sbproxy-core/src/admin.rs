@@ -1289,6 +1289,10 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_model_host::dispatch(method, path) {
         return response;
     }
+    // WOR-1721: fleet metrics aggregated over the mesh.
+    if let Some(response) = crate::admin_cluster::dispatch(method, path) {
+        return response;
+    }
 
     // --- Method-aware routes first ---
     if path == "/admin/reload" {

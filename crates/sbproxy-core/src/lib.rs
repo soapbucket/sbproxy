@@ -12,6 +12,8 @@
 #![warn(missing_docs)]
 
 pub mod admin;
+/// Fleet metrics admin API (`/admin/cluster/metrics`), WOR-1721.
+pub mod admin_cluster;
 /// WOR-1553/1554: key + credential lifecycle REST API mounted on the
 /// admin server (`/admin/keys`, `/admin/credentials`).
 pub mod admin_keys;
@@ -39,6 +41,8 @@ pub mod agent_class;
 /// `check_policies` enum-arm dispatch in `server.rs` is unchanged.
 /// See `docs/adr-policy-engine-unification.md`.
 pub mod builtin_enforcers;
+/// WOR-1721: fleet-wide metric aggregation over the mesh.
+pub mod cluster_metrics;
 pub mod context;
 pub mod dispatch;
 pub mod hook_registry;

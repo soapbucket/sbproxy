@@ -299,6 +299,12 @@ Hard rule: `agent_id`, `request_id`, `session_id`, and `user_id` are never label
 
 When a budget is exhausted the offending label demotes to `__other__` and `sbproxy_label_cardinality_overflow_total` increments. The metric update still happens; a demoted bucket is preferable to a missing one because gaps look like real traffic dips.
 
+### Fleet totals across a cluster
+
+Metrics are per-instance: each process exposes only its own counters at `/metrics`. The default way to see cluster-wide numbers is an external Prometheus that scrapes every instance and sums with PromQL; the bundled Grafana dashboards already do this, so a Prometheus deployment needs nothing extra here.
+
+For deployments running the mesh key tier without a Prometheus, one node can report fleet totals directly. Each node periodically publishes a small allow-list of `sbproxy_*` totals into the mesh, and `GET /admin/cluster/metrics` returns the summed values plus the node count. This is a convenience for a single-pane view without a metrics stack, not a replacement for Prometheus: the set is curated, the cadence is coarse, and it only reports while the mesh tier is on (otherwise the endpoint returns 404). Prefer Prometheus for anything beyond an at-a-glance total.
+
 ## Logs
 
 ### Structured-log schema
