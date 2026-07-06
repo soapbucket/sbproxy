@@ -374,6 +374,10 @@ fn main() {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
+    // Anchor the uptime clock at real process start, so `/health` reports
+    // true uptime rather than time-since-first-health-hit.
+    sbproxy_observe::mark_process_start();
+
     let cli = Cli::parse();
 
     // --- --version / -V / `version` short-circuit ---

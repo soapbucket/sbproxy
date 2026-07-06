@@ -23,6 +23,16 @@ use serde::Serialize;
 
 static PROCESS_STARTED_AT: OnceLock<Instant> = OnceLock::new();
 
+/// Anchor the uptime clock at process start.
+///
+/// Call once, early in `main`, before serving. `handle_health` otherwise
+/// initializes this lazily on the first `/health` hit, which anchors
+/// uptime to the first request (so it reads ~0 on that render) rather
+/// than to real process start. Idempotent: the first call wins.
+pub fn mark_process_start() {
+    PROCESS_STARTED_AT.get_or_init(Instant::now);
+}
+
 // --- Component status enum ---
 
 /// Health verdict for one dependency.
@@ -87,7 +97,7 @@ pub struct HealthMetadata {
     pub build_hash: String,
     /// Current server-side timestamp.
     pub timestamp: String,
-    /// Seconds since the process first served a health report.
+    /// Seconds since process start (see `mark_process_start`).
     pub uptime_seconds: u64,
 }
 
@@ -323,12 +333,11 @@ impl HealthRegistry {
 /// - `ledger`: backed by the supplied `Recency`.
 /// - `bot_auth_directory`: backed by the supplied `Recency`.
 /// - `agent_registry`: `NotConfigured` stub.
-/// - `stripe`: `NotConfigured` stub.
-/// - `facilitator_quorum`: `NotConfigured` stub.
+/// - `mesh_quorum`: `NotConfigured` stub.
 ///
-/// Operators wire the real `agent_registry`, `stripe`, and
-/// `facilitator_quorum` probes by calling `registry.register(...)`
-/// in their respective wave's startup hook.
+/// The `agent_registry` and `mesh_quorum` real probes are registered at
+/// startup (see `sbproxy-core`'s lifecycle) by calling
+/// `registry.register(...)`, which overrides the seeded stub by name.
 pub fn default_registry(ledger_recency: Recency, bot_auth_recency: Recency) -> HealthRegistry {
     default_registry_optional(Some(ledger_recency), Some(bot_auth_recency))
 }
@@ -351,8 +360,7 @@ pub fn default_registry_optional(
         None => registry.register(Arc::new(NotConfiguredProbe::new("bot_auth_directory"))),
     }
     registry.register(Arc::new(NotConfiguredProbe::new("agent_registry")));
-    registry.register(Arc::new(NotConfiguredProbe::new("stripe")));
-    registry.register(Arc::new(NotConfiguredProbe::new("facilitator_quorum")));
+    registry.register(Arc::new(NotConfiguredProbe::new("mesh_quorum")));
     // WOR-1102: a poisoned sink dispatcher silently stops all telemetry
     // export while the pod keeps serving. Gate readiness on it so the
     // load balancer drains a telemetry-blind instance. A healthy or
@@ -521,7 +529,7 @@ mod tests {
     #[test]
     fn not_configured_probe_passes_readyz() {
         let registry = HealthRegistry::new();
-        registry.register(Arc::new(NotConfiguredProbe::new("stripe")));
+        registry.register(Arc::new(NotConfiguredProbe::new("mesh_quorum")));
         let (status, _, body) = handle_readyz(&registry);
         assert_eq!(status, 200);
         assert!(body.contains("not_configured"));
@@ -561,12 +569,11 @@ mod tests {
         let registry = default_registry(l, b);
         let (status, _, body) = handle_readyz(&registry);
         assert_eq!(status, 200, "body: {}", body);
-        // All five Wave 1 components show up.
+        // The seeded components show up.
         assert!(body.contains("ledger"));
         assert!(body.contains("bot_auth_directory"));
         assert!(body.contains("agent_registry"));
-        assert!(body.contains("stripe"));
-        assert!(body.contains("facilitator_quorum"));
+        assert!(body.contains("mesh_quorum"));
     }
 
     #[test]
@@ -585,16 +592,16 @@ mod tests {
     #[test]
     fn registry_re_registration_replaces_previous_probe() {
         let registry = HealthRegistry::new();
-        registry.register(Arc::new(NotConfiguredProbe::new("stripe")));
+        registry.register(Arc::new(NotConfiguredProbe::new("mesh_quorum")));
         let recency = Recency::new(Duration::from_secs(60));
         recency.mark_success();
-        registry.register(Arc::new(RecencyProbe::new("stripe", recency)));
+        registry.register(Arc::new(RecencyProbe::new("mesh_quorum", recency)));
         let (status, _, body) = handle_readyz(&registry);
         assert_eq!(status, 200);
-        // The replacement probe is healthy, not_configured.
+        // The replacement probe is healthy, not not_configured.
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let comps = v["components"].as_array().unwrap();
-        let stripe = comps.iter().find(|c| c["name"] == "stripe").unwrap();
-        assert_eq!(stripe["status"], "healthy");
+        let probe = comps.iter().find(|c| c["name"] == "mesh_quorum").unwrap();
+        assert_eq!(probe["status"], "healthy");
     }
 }

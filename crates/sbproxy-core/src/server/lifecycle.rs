@@ -1276,6 +1276,111 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             }
             _ => None,
         };
+
+        // WOR-1740: replace the seeded NotConfigured health stubs with real
+        // probes for the subsystems that expose a health signal. Registering
+        // under the same name overrides the stub.
+        //
+        // agent_registry (WOR-1743): the agent-class resolver's load state.
+        #[cfg(feature = "agent-class")]
+        admin_state_inner
+            .health_registry
+            .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
+                "agent_registry",
+                || {
+                    if crate::reload::agent_class_resolver().is_some() {
+                        (sbproxy_observe::ComponentStatus::Healthy, None)
+                    } else {
+                        (
+                            sbproxy_observe::ComponentStatus::NotConfigured,
+                            Some("agent-class resolver not installed".to_string()),
+                        )
+                    }
+                },
+            )));
+
+        // bot_auth_directory (WOR-1742): freshness of the web-bot-auth key
+        // directory. The directory refreshes on a timer, so recency is a
+        // real signal; never-refreshed (bot_auth unused) maps to
+        // NotConfigured so /readyz stays 200.
+        {
+            let recency = sbproxy_observe::Recency::new(std::time::Duration::from_secs(24 * 3600));
+            sbproxy_modules::auth::bot_auth_directory::global().set_recency(Some(recency.clone()));
+            admin_state_inner
+                .health_registry
+                .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
+                    "bot_auth_directory",
+                    move || match recency.last_success() {
+                        None => (
+                            sbproxy_observe::ComponentStatus::NotConfigured,
+                            Some("no directory refresh yet".to_string()),
+                        ),
+                        Some(_) if recency.is_fresh() => {
+                            (sbproxy_observe::ComponentStatus::Healthy, None)
+                        }
+                        Some(t) => (
+                            sbproxy_observe::ComponentStatus::Degraded,
+                            Some(format!(
+                                "directory last refreshed {}s ago",
+                                t.elapsed().as_secs()
+                            )),
+                        ),
+                    },
+                )));
+        }
+
+        // ledger (WOR-1741): the verifiable usage ledger's last append
+        // outcome. Traffic-independent (an idle ledger reports
+        // NotConfigured rather than a false stale), so this tracks the
+        // append result, not recency.
+        admin_state_inner
+            .health_registry
+            .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
+                "ledger",
+                || match sbproxy_ai::usage_ledger::ledger_health() {
+                    sbproxy_ai::usage_ledger::LedgerHealth::NeverAppended => (
+                        sbproxy_observe::ComponentStatus::NotConfigured,
+                        Some("no ledger append yet".to_string()),
+                    ),
+                    sbproxy_ai::usage_ledger::LedgerHealth::Ok => {
+                        (sbproxy_observe::ComponentStatus::Healthy, None)
+                    }
+                    sbproxy_ai::usage_ledger::LedgerHealth::Failed => (
+                        sbproxy_observe::ComponentStatus::Unhealthy,
+                        Some("last ledger append failed".to_string()),
+                    ),
+                },
+            )));
+
+        // mesh_quorum (WOR-1744): cluster peer quorum from the mesh
+        // IsolationObserver. NotConfigured when the mesh is not enabled;
+        // Unhealthy when the node is isolated (below its minimum peer
+        // quorum), else Healthy with the live peer count.
+        admin_state_inner
+            .health_registry
+            .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
+                "mesh_quorum",
+                || match crate::key_plane::current_mesh_node().and_then(|n| n.isolation_observer())
+                {
+                    None => (
+                        sbproxy_observe::ComponentStatus::NotConfigured,
+                        Some("mesh not enabled".to_string()),
+                    ),
+                    Some(obs) if obs.is_isolated() => (
+                        sbproxy_observe::ComponentStatus::Unhealthy,
+                        Some(format!(
+                            "isolated: {} of {} min peers alive",
+                            obs.last_alive_count(),
+                            obs.min_peers()
+                        )),
+                    ),
+                    Some(obs) => (
+                        sbproxy_observe::ComponentStatus::Healthy,
+                        Some(format!("{} peers alive", obs.last_alive_count())),
+                    ),
+                },
+            )));
+
         let admin_state = std::sync::Arc::new(admin_state_inner);
         // WOR-1718: install the global handle so the pipeline's logging
         // hook can feed the request-log ring buffer + SSE tail.
