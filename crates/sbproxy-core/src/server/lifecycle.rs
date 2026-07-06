@@ -1185,6 +1185,37 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                     cert: t.cert.clone(),
                     key: t.key.clone(),
                 }),
+            // WOR-1717: remote bind, IP allowlist, CORS origins.
+            bind: server_config
+                .admin
+                .as_ref()
+                .and_then(|a| a.bind.clone())
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            allow_ips: server_config
+                .admin
+                .as_ref()
+                .map(|a| a.allow_ips.clone())
+                .unwrap_or_default(),
+            cors_origins: server_config
+                .admin
+                .as_ref()
+                .map(|a| a.cors_origins.clone())
+                .unwrap_or_default(),
+            // WOR-1716: RBAC operators.
+            operators: server_config
+                .admin
+                .as_ref()
+                .map(|a| {
+                    a.operators
+                        .iter()
+                        .map(|o| crate::admin::AdminOperator {
+                            username: o.username.clone(),
+                            password: o.password.clone(),
+                            role: o.role,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
         // Pass the same on-disk config path the file watcher uses
         // so `POST /admin/reload` re-reads the same file. The two

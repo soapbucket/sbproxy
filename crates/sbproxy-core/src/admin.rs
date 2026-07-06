@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sbproxy_config::types::AdminRole;
 use serde::Serialize;
 
 pub mod prompt_persistence;
@@ -42,6 +43,15 @@ pub struct AdminConfig {
     /// built-in UI) is served over HTTPS with this PEM cert + key instead
     /// of plaintext HTTP.
     pub tls: Option<AdminTls>,
+    /// WOR-1717: bind address. Defaults to `127.0.0.1` (loopback only).
+    pub bind: String,
+    /// WOR-1717: IP / CIDR allowlist. Empty means loopback-only.
+    pub allow_ips: Vec<String>,
+    /// WOR-1717: allowed CORS origins. Empty means no CORS headers.
+    pub cors_origins: Vec<String>,
+    /// WOR-1716: RBAC operators in addition to the top-level admin (which
+    /// is always the full-access `admin` role).
+    pub operators: Vec<AdminOperator>,
 }
 
 /// PEM certificate + key file paths for admin-server TLS (WOR-1717).
@@ -53,6 +63,17 @@ pub struct AdminTls {
     pub key: std::path::PathBuf,
 }
 
+/// An admin operator identity with a role, for RBAC (WOR-1716).
+#[derive(Debug, Clone)]
+pub struct AdminOperator {
+    /// Login username.
+    pub username: String,
+    /// Login password.
+    pub password: String,
+    /// Role governing which admin actions this operator may perform.
+    pub role: AdminRole,
+}
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
@@ -62,6 +83,10 @@ impl Default for AdminConfig {
             password: "changeme".to_string(),
             max_log_entries: 1000,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         }
     }
 }
@@ -195,11 +220,25 @@ impl AdminIpFilter {
         }
     }
 
-    /// Returns `true` if `ip` is permitted.
-    ///
-    /// An empty allowlist permits all IPs.
+    /// Returns `true` if `ip` is permitted. An empty allowlist permits all
+    /// IPs (callers pass a non-empty list, or use `localhost_only`, so the
+    /// safe default is never the permit-all path). Each entry matches
+    /// either as an exact address or, when it parses as a CIDR, as a
+    /// network containing `ip` (WOR-1717).
     pub fn is_allowed(&self, ip: &str) -> bool {
-        self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|a| a == ip)
+        if self.allowed_ips.is_empty() {
+            return true;
+        }
+        let parsed: Option<std::net::IpAddr> = ip.parse().ok();
+        self.allowed_ips.iter().any(|a| {
+            if a == ip {
+                return true;
+            }
+            if let (Some(addr), Ok(net)) = (parsed, a.parse::<ipnetwork::IpNetwork>()) {
+                return net.contains(addr);
+            }
+            false
+        })
     }
 }
 
@@ -1564,8 +1603,17 @@ pub fn spawn_admin_server(
         },
         None => None,
     };
+    // WOR-1717: bind address from config (default loopback), and an IP
+    // allowlist. An empty allowlist keeps the safe loopback-only default;
+    // a configured list (CIDRs) permits remote admin from known networks.
+    let bind_ip: std::net::IpAddr = state
+        .config
+        .bind
+        .parse()
+        .unwrap_or_else(|_| std::net::IpAddr::from([127, 0, 0, 1]));
+    let allow_ips = state.config.allow_ips.clone();
     Some(tokio::spawn(async move {
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let addr = std::net::SocketAddr::new(bind_ip, port);
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -1579,7 +1627,11 @@ pub fn spawn_admin_server(
         };
         tracing::info!(addr = %addr, tls = acceptor.is_some(), "admin server listening");
         let rate_limiter = std::sync::Arc::new(AdminRateLimiter::new(60));
-        let ip_filter = std::sync::Arc::new(AdminIpFilter::localhost_only());
+        let ip_filter = std::sync::Arc::new(if allow_ips.is_empty() {
+            AdminIpFilter::localhost_only()
+        } else {
+            AdminIpFilter::new(allow_ips)
+        });
         loop {
             let (sock, peer) = match listener.accept().await {
                 Ok(p) => p,
@@ -1737,15 +1789,29 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let method = parts.next().unwrap_or("GET");
     let path = parts.next().unwrap_or("/");
     let mut auth_header: Option<String> = None;
+    let mut origin: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
-        if let Some(rest) = line.strip_prefix("Authorization:") {
+        if let Some(rest) = line
+            .strip_prefix("Authorization:")
+            .or_else(|| line.strip_prefix("authorization:"))
+        {
             auth_header = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("authorization:") {
-            auth_header = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("Origin:")
+            .or_else(|| line.strip_prefix("origin:"))
+        {
+            origin = Some(rest.trim().to_string());
         }
+    }
+    // WOR-1717: CORS headers for an allowed cross-origin caller (echoed on
+    // every response below), and a direct 204 answer to preflight OPTIONS.
+    let cors = cors_response_headers(origin.as_deref(), &state.config.cors_origins);
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        let _ = write_admin_response_headed(sock, 204, "text/plain", b"", &cors).await;
+        return;
     }
     // WOR-1715: the built-in admin UI serves a real Vite bundle,
     // including binary assets (fonts, images, wasm) that the `String`
@@ -1759,13 +1825,18 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             .map(|(user, pass)| state.check_auth(&user, &pass))
             .unwrap_or(false);
         if !authed {
-            let _ =
-                write_admin_response(sock, 401, "application/json", r#"{"error":"Unauthorized"}"#)
-                    .await;
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"Unauthorized"}"#,
+                &cors,
+            )
+            .await;
             return;
         }
         if let Some((status, content_type, bytes)) = crate::admin_ui::dispatch_bytes(method, path) {
-            let _ = write_admin_response_bytes(sock, status, content_type, &bytes).await;
+            let _ = write_admin_response_headed(sock, status, content_type, &bytes, &cors).await;
             return;
         }
     }
@@ -1817,7 +1888,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             )
         }
     };
-    let _ = write_admin_response(sock, status, content_type, &body).await;
+    let _ = write_admin_response_headed(sock, status, content_type, body.as_bytes(), &cors).await;
 }
 
 /// Locate the byte offset of the `\r\n\r\n` (or LF-only `\n\n` for
@@ -1864,27 +1935,72 @@ async fn write_admin_response<S: tokio::io::AsyncWrite + Unpin>(
 /// Generic over the stream so it works over both plain TCP and TLS
 /// (WOR-1717).
 async fn write_admin_response_bytes<S: tokio::io::AsyncWrite + Unpin>(
-    mut sock: S,
+    sock: S,
     status: u16,
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
+    write_admin_response_headed(sock, status, content_type, body, &[]).await
+}
+
+/// Write an admin response with a byte body plus extra response headers
+/// (WOR-1717 CORS, WOR-1714 `Set-Cookie`). `write_admin_response_bytes`
+/// is the no-extra-headers wrapper.
+async fn write_admin_response_headed<S: tokio::io::AsyncWrite + Unpin>(
+    mut sock: S,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(String, String)],
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let header = format!(
+    let mut header = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
-         WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n\
-         \r\n",
+         WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n",
         status = status,
         reason = reason_phrase(status),
         content_type = content_type,
         len = body.len(),
     );
+    for (k, v) in extra_headers {
+        header.push_str(k);
+        header.push_str(": ");
+        header.push_str(v);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
     sock.write_all(header.as_bytes()).await?;
     sock.write_all(body).await?;
     sock.shutdown().await
+}
+
+/// Build the CORS response headers for an admin request, or an empty vec
+/// when the request's `Origin` is not in the configured allowlist (or no
+/// allowlist is set). `*` matches any origin (echoed back so credentials
+/// still work). WOR-1717.
+fn cors_response_headers(origin: Option<&str>, allowed: &[String]) -> Vec<(String, String)> {
+    match origin {
+        Some(o) if allowed.iter().any(|a| a == o || a == "*") => vec![
+            ("Access-Control-Allow-Origin".to_string(), o.to_string()),
+            (
+                "Access-Control-Allow-Credentials".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "Access-Control-Allow-Methods".to_string(),
+                "GET, POST, PUT, PATCH, DELETE, OPTIONS".to_string(),
+            ),
+            (
+                "Access-Control-Allow-Headers".to_string(),
+                "Authorization, Content-Type, X-CSRF-Token".to_string(),
+            ),
+            ("Vary".to_string(), "Origin".to_string()),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 // --- Tests ---
@@ -1901,6 +2017,10 @@ mod tests {
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
     }
 
@@ -2243,6 +2363,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2279,6 +2403,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2307,6 +2435,10 @@ origins:
                 password: "secret".to_string(),
                 max_log_entries: 5,
                 tls: None,
+                bind: "127.0.0.1".to_string(),
+                allow_ips: Vec::new(),
+                cors_origins: Vec::new(),
+                operators: Vec::new(),
             })
             .with_config_path(f.path()),
         );
@@ -2405,6 +2537,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2432,6 +2568,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(&bogus)
         .with_loaded_config_content_hash("deadbeefcafe");
@@ -2460,6 +2600,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2506,6 +2650,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2665,6 +2813,38 @@ origins:
         assert!(filter.is_allowed("::1"));
     }
 
+    #[test]
+    fn ip_filter_cidr_match() {
+        // WOR-1717: entries that parse as CIDRs match by network.
+        let filter = AdminIpFilter::new(vec!["10.1.0.0/16".to_string(), "192.168.1.5".to_string()]);
+        assert!(filter.is_allowed("10.1.2.3"), "in CIDR");
+        assert!(filter.is_allowed("10.1.255.255"), "in CIDR");
+        assert!(!filter.is_allowed("10.2.0.1"), "outside CIDR");
+        assert!(filter.is_allowed("192.168.1.5"), "exact");
+        assert!(!filter.is_allowed("192.168.1.6"), "exact miss");
+    }
+
+    #[test]
+    fn cors_headers_gate_on_allowed_origin() {
+        // WOR-1717: CORS headers only for a configured origin.
+        let allowed = vec!["https://admin.example.com".to_string()];
+        let h = cors_response_headers(Some("https://admin.example.com"), &allowed);
+        assert!(h
+            .iter()
+            .any(|(k, v)| k == "Access-Control-Allow-Origin" && v == "https://admin.example.com"));
+        assert!(h
+            .iter()
+            .any(|(k, _)| k == "Access-Control-Allow-Credentials"));
+        assert!(cors_response_headers(Some("https://evil.example.com"), &allowed).is_empty());
+        assert!(cors_response_headers(None, &allowed).is_empty());
+        // Wildcard echoes the caller's origin so credentials still work.
+        let star = vec!["*".to_string()];
+        let hs = cors_response_headers(Some("https://any.example.com"), &star);
+        assert!(hs
+            .iter()
+            .any(|(k, v)| k == "Access-Control-Allow-Origin" && v == "https://any.example.com"));
+    }
+
     // --- /healthz + /readyz ---
 
     #[test]
@@ -2738,6 +2918,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_health_registry(registry);
         let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
@@ -2760,6 +2944,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_health_registry(registry);
         let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
