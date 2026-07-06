@@ -9,11 +9,43 @@ import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 
 const req = useAsync(() => api.requests());
-onMounted(req.run);
+onMounted(() => {
+  req.run();
+  loadLogLevel();
+});
 
 const raw = computed<RequestLog[]>(() =>
   asList<RequestLog>(req.data.value, "requests", "items", "entries", "data"),
 );
+
+// ---- runtime log level (WOR-1759) ----
+const logLevel = ref("");
+const levelDraft = ref("");
+const levelBusy = ref(false);
+const levelMsg = ref("");
+async function loadLogLevel() {
+  try {
+    logLevel.value = (await api.logLevel()).level ?? "";
+    levelDraft.value = logLevel.value;
+  } catch {
+    // admin may be older; hide the control by leaving logLevel empty.
+  }
+}
+async function applyLogLevel(value: string) {
+  if (levelBusy.value || !value.trim()) return;
+  levelBusy.value = true;
+  levelMsg.value = "";
+  try {
+    logLevel.value = (await api.setLogLevel(value)).level ?? value;
+    levelDraft.value = logLevel.value;
+    levelMsg.value = `Log level set to ${logLevel.value}`;
+  } catch (e) {
+    levelMsg.value = e instanceof Error ? e.message : "Failed to set level";
+  } finally {
+    levelBusy.value = false;
+  }
+}
+const LEVEL_PRESETS = ["info", "debug", "trace", "sbproxy_ai=debug"];
 
 // ---- filters ----
 const fMethod = ref("");
@@ -92,6 +124,29 @@ function clearFilters() {
     </template>
   </PageHeader>
 
+  <div class="sb-card loglevel" v-if="logLevel">
+    <span class="lbl">Tracing level</span>
+    <input
+      v-model="levelDraft"
+      class="sb-input lvl-input"
+      @keydown.enter="applyLogLevel(levelDraft)"
+      aria-label="Tracing filter directive"
+    />
+    <button class="sb-btn sb-btn--sm" :disabled="levelBusy" @click="applyLogLevel(levelDraft)">
+      Set
+    </button>
+    <button
+      v-for="p in LEVEL_PRESETS"
+      :key="p"
+      class="sb-btn sb-btn--sm preset"
+      :disabled="levelBusy"
+      @click="applyLogLevel(p)"
+    >
+      {{ p }}
+    </button>
+    <span class="sb-faint msg" v-if="levelMsg">{{ levelMsg }}</span>
+  </div>
+
   <div class="filters">
     <select class="sb-select" v-model="fMethod" aria-label="Filter by method">
       <option value="">All methods</option>
@@ -133,6 +188,28 @@ function clearFilters() {
 </template>
 
 <style scoped>
+.loglevel {
+  display: flex;
+  align-items: center;
+  gap: var(--sb-space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--sb-space-4);
+}
+.loglevel .lbl {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--sb-text-muted);
+}
+.loglevel .lvl-input {
+  max-width: 200px;
+}
+.loglevel .preset {
+  font-family: var(--sb-font-mono);
+}
+.loglevel .msg {
+  margin-left: auto;
+}
 .filters {
   display: flex;
   gap: var(--sb-space-3);

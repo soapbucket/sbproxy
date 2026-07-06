@@ -1783,6 +1783,51 @@ pub fn handle_admin_request(
             r#"{"error":"method not allowed"}"#.to_string(),
         );
     }
+    // WOR-1759: runtime log-level control. GET reads the current tracing
+    // filter; PUT/POST sets a new one (e.g. "debug" or "sbproxy_ai=debug")
+    // without a restart. The mutation goes through the connection
+    // handler's RBAC gate, so read-only operators are already blocked.
+    if path_only == "/admin/log-level" {
+        if method.eq_ignore_ascii_case("GET") {
+            return (
+                200,
+                "application/json",
+                serde_json::json!({ "level": sbproxy_observe::current_log_filter() }).to_string(),
+            );
+        }
+        if method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("POST") {
+            let level = body
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("level").and_then(|l| l.as_str()).map(str::to_string));
+            let level = match level {
+                Some(l) if !l.trim().is_empty() => l,
+                _ => {
+                    return (
+                        400,
+                        "application/json",
+                        r#"{"error":"missing 'level' directive"}"#.to_string(),
+                    )
+                }
+            };
+            return match sbproxy_observe::set_log_filter(&level) {
+                Ok(()) => (
+                    200,
+                    "application/json",
+                    serde_json::json!({ "level": level }).to_string(),
+                ),
+                Err(e) => (
+                    400,
+                    "application/json",
+                    format!(r#"{{"error":"{}"}}"#, e.replace('"', "'")),
+                ),
+            };
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
 
     // --- Route ---
     match path {
