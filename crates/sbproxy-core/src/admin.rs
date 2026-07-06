@@ -1709,6 +1709,70 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // WOR-1764: per-workspace budget state + manual resume.
+    if path_only == "/api/rate_limits/budget" {
+        return match crate::rate_limit_budget::registry() {
+            Some(reg) => match serde_json::to_string(&reg.snapshot()) {
+                Ok(body) => (200, "application/json", body),
+                Err(e) => (
+                    500,
+                    "application/json",
+                    format!(r#"{{"error":"serialize: {e}"}}"#),
+                ),
+            },
+            None => (
+                404,
+                "application/json",
+                r#"{"error":"no rate_limits: block configured"}"#.to_string(),
+            ),
+        };
+    }
+    if path_only == "/api/rate_limits/resume" {
+        if !method.eq_ignore_ascii_case("POST") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let workspace = body
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|v| {
+                v.get("workspace")
+                    .and_then(|w| w.as_str())
+                    .map(str::to_string)
+            });
+        let workspace = match workspace {
+            Some(w) if !w.trim().is_empty() => w,
+            _ => {
+                return (
+                    400,
+                    "application/json",
+                    r#"{"error":"missing 'workspace'"}"#.to_string(),
+                )
+            }
+        };
+        return match crate::rate_limit_budget::registry() {
+            Some(reg) if reg.resume(&workspace) => (
+                200,
+                "application/json",
+                format!(
+                    r#"{{"workspace":"{}","tier":"normal"}}"#,
+                    workspace.replace('"', "'")
+                ),
+            ),
+            Some(_) => (
+                404,
+                "application/json",
+                r#"{"error":"workspace not tracked (no traffic seen yet)"}"#.to_string(),
+            ),
+            None => (
+                404,
+                "application/json",
+                r#"{"error":"no rate_limits: block configured"}"#.to_string(),
+            ),
+        };
+    }
     if path_only == "/api/audit/recent" {
         let limit: usize = rl_query_param(path, "limit")
             .and_then(|s| s.parse().ok())
