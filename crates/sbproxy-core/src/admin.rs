@@ -2920,22 +2920,10 @@ mod tests {
         assert!(body.contains("Unauthorized"));
     }
 
-    #[test]
-    fn playground_chat_is_feature_disabled_after_auth() {
-        let state = make_state();
-        let auth = basic_auth("admin", "secret");
-        let (status, ct, body) = handle_admin_request(
-            "POST",
-            crate::admin_playground::CHAT_PATH,
-            &state,
-            Some(&auth),
-            Some("{}"),
-        );
-        assert_eq!(status, 404);
-        assert_eq!(ct, "application/json");
-        assert!(body.contains("feature disabled"));
-        assert!(body.contains("admin_chat_playground"));
-    }
+    // The playground chat + endpoints routes moved to the async admin
+    // connection handler (they await the AI client), so they are no
+    // longer dispatched from `handle_admin_request`; the handlers
+    // themselves are covered by `admin_playground::tests`.
 
     #[test]
     fn api_requests_returns_200_json() {
