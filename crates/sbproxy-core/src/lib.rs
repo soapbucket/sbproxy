@@ -23,6 +23,8 @@ pub mod admin_model_host;
 /// a feature-disabled response until the route is wired through the
 /// production AI dispatch path.
 pub mod admin_playground;
+/// Admin browser sessions + operator identity (WOR-1714 / WOR-1716).
+pub mod admin_session;
 /// Static-asset surface for the built-in admin
 /// dashboard at `/admin/ui/*`. Embedded via `include_dir!` when the
 /// `embed-admin-ui` feature is on; serves a one-line operator hint

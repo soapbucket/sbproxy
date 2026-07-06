@@ -341,6 +341,12 @@ pub struct AdminState {
     /// (the default); the binary opts in via
     /// [`AdminState::with_prompt_persistence`].
     pub prompt_persistence: Option<Arc<PromptPersistence>>,
+    /// WOR-1714: ephemeral HMAC signer for browser session tokens. A
+    /// fresh key per process, so a restart invalidates every session.
+    pub session_signer: crate::admin_session::SessionSigner,
+    /// WOR-1714: revoked session nonces (populated by `POST /admin/logout`),
+    /// cleared on restart. Checked on every session verification.
+    pub revoked_sessions: Mutex<std::collections::HashSet<String>>,
 }
 
 impl AdminState {
@@ -359,7 +365,70 @@ impl AdminState {
             reload_in_progress: AtomicBool::new(false),
             health_registry: sbproxy_observe::default_registry_optional(None, None),
             prompt_persistence: None,
+            session_signer: crate::admin_session::SessionSigner::random(),
+            revoked_sessions: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Resolve the operator + role from a session cookie or Basic auth
+    /// (WOR-1714 / WOR-1716). Session takes precedence. Returns `None`
+    /// when neither authenticates. The `csrf` field is set only for the
+    /// session path (the nonce the caller must echo in `X-CSRF-Token`).
+    pub fn resolve_principal(
+        &self,
+        auth_header: Option<&str>,
+        cookie_header: Option<&str>,
+    ) -> Option<AdminPrincipal> {
+        // Session cookie first.
+        if let Some(ch) = cookie_header {
+            if let Some(tok) =
+                crate::admin_session::cookie_value(ch, crate::admin_session::SESSION_COOKIE)
+            {
+                let now = unix_now();
+                if let Some(sess) = self.session_signer.verify(&tok, now) {
+                    let revoked = self
+                        .revoked_sessions
+                        .lock()
+                        .map(|s| s.contains(&sess.nonce))
+                        .unwrap_or(false);
+                    if !revoked {
+                        return Some(AdminPrincipal {
+                            username: sess.username,
+                            role: sess.role,
+                            via_session: true,
+                            csrf: Some(sess.nonce),
+                        });
+                    }
+                }
+            }
+        }
+        // Basic auth: the top-level admin credential (full access).
+        if let Some((user, pass)) = auth_header.and_then(decode_basic_auth) {
+            if self.check_auth(&user, &pass) {
+                return Some(AdminPrincipal {
+                    username: user,
+                    role: AdminRole::Admin,
+                    via_session: false,
+                    csrf: None,
+                });
+            }
+        }
+        None
+    }
+
+    /// Verify login credentials against the top-level admin and the
+    /// configured operators (WOR-1716), returning the matched role.
+    pub fn check_operator_login(&self, user: &str, pass: &str) -> Option<AdminRole> {
+        if self.check_auth(user, pass) {
+            return Some(AdminRole::Admin);
+        }
+        self.config
+            .operators
+            .iter()
+            .find(|o| {
+                o.username == user && constant_time_eq(o.password.as_bytes(), pass.as_bytes())
+            })
+            .map(|o| o.role)
     }
 
     /// Builder-style setter for the on-disk config path.
@@ -440,6 +509,31 @@ impl AdminState {
 }
 
 // --- Auth Helpers ---
+
+/// The authenticated admin operator for a request (WOR-1714 / WOR-1716):
+/// who they are, their role, whether they came in via a browser session
+/// (which triggers CSRF enforcement), and the CSRF nonce to match.
+#[derive(Debug, Clone)]
+pub struct AdminPrincipal {
+    /// Operator username (for the audit trail).
+    pub username: String,
+    /// Role governing which actions are permitted.
+    pub role: AdminRole,
+    /// True when authenticated by session cookie (vs Basic).
+    pub via_session: bool,
+    /// The session nonce, which the client must echo in `X-CSRF-Token`
+    /// on state-changing requests. `None` for Basic auth.
+    pub csrf: Option<String>,
+}
+
+/// Current unix time in seconds; `0` on a clock error (which fails expiry
+/// checks closed).
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Constant-time byte slice comparison.  Returns true iff `a == b`.
 /// Avoids short-circuit on length mismatch by always visiting every byte.
@@ -1790,6 +1884,8 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let path = parts.next().unwrap_or("/");
     let mut auth_header: Option<String> = None;
     let mut origin: Option<String> = None;
+    let mut cookie: Option<String> = None;
+    let mut csrf_header: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -1804,6 +1900,16 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             .or_else(|| line.strip_prefix("origin:"))
         {
             origin = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("Cookie:")
+            .or_else(|| line.strip_prefix("cookie:"))
+        {
+            cookie = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("X-CSRF-Token:")
+            .or_else(|| line.strip_prefix("x-csrf-token:"))
+        {
+            csrf_header = Some(rest.trim().to_string());
         }
     }
     // WOR-1717: CORS headers for an allowed cross-origin caller (echoed on
@@ -1813,17 +1919,106 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         let _ = write_admin_response_headed(sock, 204, "text/plain", b"", &cors).await;
         return;
     }
+
+    // Slice the request body off the buffer (needed by login + dispatch).
+    let body_owned: Option<String> = match (header_end, content_length) {
+        (Some(end), Some(cl)) => {
+            let start = end + 4;
+            let stop = (start + cl).min(buf.len());
+            if start < buf.len() {
+                Some(String::from_utf8_lossy(&buf[start..stop]).into_owned())
+            } else {
+                Some(String::new())
+            }
+        }
+        _ => None,
+    };
+
+    // WOR-1714: browser session endpoints, handled before the auth gate.
+    if path == "/admin/login" && is_state_changing(method) {
+        handle_admin_login(
+            sock,
+            &state,
+            auth_header.as_deref(),
+            body_owned.as_deref(),
+            &cors,
+            state.config.tls.is_some(),
+        )
+        .await;
+        return;
+    }
+    if path == "/admin/logout" && is_state_changing(method) {
+        handle_admin_logout(sock, &state, cookie.as_deref(), &cors).await;
+        return;
+    }
+
+    // WOR-1714 / WOR-1716: resolve the operator (session or Basic), enforce
+    // CSRF on cookie-authed mutations and RBAC (read-only cannot mutate),
+    // and audit the action with the operator's identity.
+    let principal = state.resolve_principal(auth_header.as_deref(), cookie.as_deref());
+    let mutating = is_state_changing(method);
+    if let Some(p) = &principal {
+        if p.via_session && mutating {
+            let ok = match (csrf_header.as_deref(), p.csrf.as_deref()) {
+                (Some(h), Some(c)) => constant_time_eq(h.as_bytes(), c.as_bytes()),
+                _ => false,
+            };
+            if !ok {
+                let _ = write_admin_response_headed(
+                    sock,
+                    403,
+                    "application/json",
+                    br#"{"error":"CSRF token missing or invalid"}"#,
+                    &cors,
+                )
+                .await;
+                return;
+            }
+        }
+        if p.role == AdminRole::ReadOnly && mutating {
+            let _ = write_admin_response_headed(
+                sock,
+                403,
+                "application/json",
+                br#"{"error":"forbidden: read-only operator cannot perform this action"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        if mutating {
+            tracing::info!(
+                target: "sbproxy::admin::audit",
+                operator = %p.username,
+                role = %role_label(p.role),
+                method = %method,
+                path = %path,
+                "admin action"
+            );
+        }
+    }
+    // A session-authenticated request synthesizes a Basic header so
+    // `handle_admin_request`'s internal gate accepts it (the RBAC gate
+    // above already ran on the resolved principal).
+    let auth_for_dispatch: Option<String> = if principal.as_ref().is_some_and(|p| p.via_session) {
+        Some(synthesize_basic(
+            &state.config.username,
+            &state.config.password,
+        ))
+    } else {
+        auth_header.clone()
+    };
+
     // WOR-1715: the built-in admin UI serves a real Vite bundle,
     // including binary assets (fonts, images, wasm) that the `String`
     // dispatcher path would corrupt. Serve it on the byte path here,
     // behind the same Basic-auth gate as every other `/admin/*` route
     // (the IP filter + rate limiter already ran in the accept loop).
     if crate::admin_ui::path_is_ours(path) {
-        let authed = auth_header
-            .as_deref()
-            .and_then(decode_basic_auth)
-            .map(|(user, pass)| state.check_auth(&user, &pass))
-            .unwrap_or(false);
+        // Authenticated by session cookie or Basic (WOR-1714). The SPA
+        // shell loads once the browser is authenticated; its API calls
+        // then carry the session cookie.
+        let authed = principal.is_some();
         if !authed {
             let _ = write_admin_response_headed(
                 sock,
@@ -1841,30 +2036,16 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         }
     }
 
-    // Slice the body off the back of the buffer. Only valid when the
-    // headers actually terminated; a malformed pre-header read falls
-    // back to no body (the route's parser then 400s on missing JSON).
-    let body_owned: Option<String> = match (header_end, content_length) {
-        (Some(end), Some(cl)) => {
-            let start = end + 4;
-            let stop = (start + cl).min(buf.len());
-            if start < buf.len() {
-                Some(String::from_utf8_lossy(&buf[start..stop]).into_owned())
-            } else {
-                Some(String::new())
-            }
-        }
-        _ => None,
-    };
     // WOR-618: `handle_admin_request` does blocking std::fs reads for
     // `POST /admin/reload` (re-read the config file) and
     // `GET /admin/drift` (re-hash the on-disk config). Both routes can
     // block on slow disks or large config files; run the dispatcher on
     // the blocking pool so the admin listener task keeps accepting new
-    // connections.
+    // connections. `auth_for_dispatch` carries a synthesized Basic header
+    // for session-authenticated requests (WOR-1714).
     let method_owned = method.to_string();
     let path_owned = path.to_string();
-    let auth_owned = auth_header.clone();
+    let auth_owned = auth_for_dispatch;
     let body_for_task = body_owned.clone();
     let state_for_task = state.clone();
     let (status, content_type, body) = match tokio::task::spawn_blocking(move || {
@@ -2001,6 +2182,136 @@ fn cors_response_headers(origin: Option<&str>, allowed: &[String]) -> Vec<(Strin
         ],
         _ => Vec::new(),
     }
+}
+
+/// Synthesize a Basic `Authorization` header from the top-level admin
+/// creds. When a request is already session-authenticated (WOR-1714), the
+/// connection handler passes this to `handle_admin_request` so its
+/// internal Basic gate accepts the request without re-checking; the
+/// role-based gate (WOR-1716) already ran on the resolved principal.
+fn synthesize_basic(user: &str, pass: &str) -> String {
+    use base64::Engine;
+    // Standard alphabet, no padding: `base64_decode` uses the standard
+    // alphabet and does not require padding, so this round-trips.
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(format!("{user}:{pass}"))
+    )
+}
+
+/// Whether a method mutates state (drives CSRF + RBAC enforcement).
+fn is_state_changing(method: &str) -> bool {
+    matches!(
+        method.to_ascii_uppercase().as_str(),
+        "POST" | "PUT" | "PATCH" | "DELETE"
+    )
+}
+
+fn role_label(role: AdminRole) -> &'static str {
+    match role {
+        AdminRole::Admin => "admin",
+        AdminRole::ReadOnly => "read_only",
+    }
+}
+
+/// Handle `POST /admin/login` (WOR-1714): verify credentials (Basic header
+/// or a JSON `{username,password}` body) against the top-level admin and
+/// configured operators, mint a session cookie, and return the CSRF token.
+async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
+    sock: S,
+    state: &AdminState,
+    auth_header: Option<&str>,
+    body: Option<&str>,
+    cors: &[(String, String)],
+    secure: bool,
+) {
+    let creds = auth_header.and_then(decode_basic_auth).or_else(|| {
+        body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|v| {
+                Some((
+                    v.get("username")?.as_str()?.to_string(),
+                    v.get("password")?.as_str()?.to_string(),
+                ))
+            })
+    });
+    let (user, pass) = match creds {
+        Some(c) => c,
+        None => {
+            let _ = write_admin_response_headed(
+                sock,
+                400,
+                "application/json",
+                br#"{"error":"missing credentials"}"#,
+                cors,
+            )
+            .await;
+            return;
+        }
+    };
+    let role = match state.check_operator_login(&user, &pass) {
+        Some(r) => r,
+        None => {
+            tracing::warn!(target: "sbproxy::admin::audit", operator = %user, "admin login failed");
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"invalid credentials"}"#,
+                cors,
+            )
+            .await;
+            return;
+        }
+    };
+    let ttl_secs = 8 * 3600;
+    let (token, csrf) = state.session_signer.mint(&user, role, ttl_secs, unix_now());
+    tracing::info!(target: "sbproxy::admin::audit", operator = %user, role = %role_label(role), "admin login");
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}; Max-Age={ttl_secs}",
+        crate::admin_session::SESSION_COOKIE
+    );
+    let mut headers = cors.to_vec();
+    headers.push(("Set-Cookie".to_string(), cookie));
+    let out = serde_json::json!({"role": role_label(role), "csrf_token": csrf, "username": user})
+        .to_string();
+    let _ =
+        write_admin_response_headed(sock, 200, "application/json", out.as_bytes(), &headers).await;
+}
+
+/// Handle `POST /admin/logout` (WOR-1714): revoke the session and clear
+/// the cookie.
+async fn handle_admin_logout<S: tokio::io::AsyncWrite + Unpin>(
+    sock: S,
+    state: &AdminState,
+    cookie_header: Option<&str>,
+    cors: &[(String, String)],
+) {
+    if let Some(ch) = cookie_header {
+        if let Some(tok) =
+            crate::admin_session::cookie_value(ch, crate::admin_session::SESSION_COOKIE)
+        {
+            if let Some(sess) = state.session_signer.verify(&tok, unix_now()) {
+                if let Ok(mut set) = state.revoked_sessions.lock() {
+                    set.insert(sess.nonce);
+                }
+            }
+        }
+    }
+    let clear = format!(
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        crate::admin_session::SESSION_COOKIE
+    );
+    let mut headers = cors.to_vec();
+    headers.push(("Set-Cookie".to_string(), clear));
+    let _ = write_admin_response_headed(
+        sock,
+        200,
+        "application/json",
+        br#"{"status":"logged out"}"#,
+        &headers,
+    )
+    .await;
 }
 
 // --- Tests ---
@@ -2843,6 +3154,85 @@ origins:
         assert!(hs
             .iter()
             .any(|(k, v)| k == "Access-Control-Allow-Origin" && v == "https://any.example.com"));
+    }
+
+    #[test]
+    fn session_principal_and_csrf() {
+        // WOR-1714: a valid session cookie resolves the operator, and the
+        // CSRF token equals the session nonce.
+        let state = make_state();
+        let (token, nonce) = state
+            .session_signer
+            .mint("alice", AdminRole::Admin, 3600, unix_now());
+        let cookie = format!("sb_admin_session={token}");
+        let p = state
+            .resolve_principal(None, Some(&cookie))
+            .expect("session resolves");
+        assert!(p.via_session);
+        assert_eq!(p.username, "alice");
+        assert_eq!(p.role, AdminRole::Admin);
+        assert_eq!(p.csrf.as_deref(), Some(nonce.as_str()));
+    }
+
+    #[test]
+    fn revoked_session_rejected() {
+        // WOR-1714: logout revokes the nonce.
+        let state = make_state();
+        let (token, nonce) = state
+            .session_signer
+            .mint("bob", AdminRole::Admin, 3600, unix_now());
+        state.revoked_sessions.lock().unwrap().insert(nonce);
+        let cookie = format!("sb_admin_session={token}");
+        assert!(state.resolve_principal(None, Some(&cookie)).is_none());
+    }
+
+    #[test]
+    fn basic_principal_is_admin() {
+        // make_state uses admin/secret.
+        let state = make_state();
+        let p = state
+            .resolve_principal(Some(&basic_auth("admin", "secret")), None)
+            .expect("basic resolves");
+        assert!(!p.via_session);
+        assert_eq!(p.role, AdminRole::Admin);
+        assert!(state
+            .resolve_principal(Some(&basic_auth("admin", "wrong")), None)
+            .is_none());
+    }
+
+    #[test]
+    fn operator_login_roles() {
+        // WOR-1716: top-level admin is full-access; a configured operator
+        // gets its declared role; wrong password fails.
+        let cfg = AdminConfig {
+            operators: vec![AdminOperator {
+                username: "ro".to_string(),
+                password: "ropass".to_string(),
+                role: AdminRole::ReadOnly,
+            }],
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(cfg);
+        assert_eq!(
+            state.check_operator_login("admin", "changeme"),
+            Some(AdminRole::Admin)
+        );
+        assert_eq!(
+            state.check_operator_login("ro", "ropass"),
+            Some(AdminRole::ReadOnly)
+        );
+        assert_eq!(state.check_operator_login("ro", "bad"), None);
+        assert_eq!(state.check_operator_login("nobody", "x"), None);
+    }
+
+    #[test]
+    fn synthesized_basic_round_trips() {
+        // WOR-1714: the synthesized header decodes back to the creds so
+        // handle_admin_request's Basic gate accepts a session-authed call.
+        let h = synthesize_basic("admin", "s3cret:with:colon");
+        let (u, p) = decode_basic_auth(&h).expect("decodes");
+        assert_eq!(u, "admin");
+        assert_eq!(p, "s3cret:with:colon");
     }
 
     // --- /healthz + /readyz ---
