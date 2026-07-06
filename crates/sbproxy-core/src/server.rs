@@ -264,6 +264,41 @@ fn build_tls_settings(
     Ok(settings)
 }
 
+/// Build Pingora `TlsSettings` whose server cert is selected per handshake by
+/// the ACME `CertResolver` (WOR-1772), via the forked
+/// `TlsSettings::with_cert_resolver`. The resolver holds the live cert set, so
+/// an ACME-issued or renewed cert is served immediately without rebuilding the
+/// listener or restarting the process. h2 is advertised in ALPN.
+fn build_tls_settings_with_resolver(
+    resolver: std::sync::Arc<sbproxy_tls::cert_resolver::CertResolver>,
+) -> anyhow::Result<pingora_core::listeners::tls::TlsSettings> {
+    let mut settings = pingora_core::listeners::tls::TlsSettings::with_cert_resolver(resolver)
+        .map_err(|e| anyhow::anyhow!("TlsSettings::with_cert_resolver: {e}"))?;
+    settings.enable_h2();
+    Ok(settings)
+}
+
+/// Like [`build_tls_settings_with_resolver`] but also attaches the mTLS client
+/// certificate verifier, so an ACME listener that also requires client certs
+/// still serves its cert dynamically (WOR-1772).
+fn build_mtls_tls_settings_with_resolver(
+    resolver: std::sync::Arc<sbproxy_tls::cert_resolver::CertResolver>,
+    mtls: &sbproxy_config::MtlsListenerConfig,
+    cache: sbproxy_tls::mtls::MtlsCertCacheHandle,
+) -> anyhow::Result<pingora_core::listeners::tls::TlsSettings> {
+    let mut settings = pingora_core::listeners::tls::TlsSettings::with_cert_resolver(resolver)
+        .map_err(|e| anyhow::anyhow!("TlsSettings::with_cert_resolver: {e}"))?;
+    settings.enable_h2();
+    let verifier = sbproxy_tls::mtls::build_client_cert_verifier(
+        &mtls.client_ca_file,
+        mtls.require,
+        &mtls.allowed_cn_patterns,
+        cache,
+    )?;
+    settings.set_client_cert_verifier(verifier);
+    Ok(settings)
+}
+
 /// Format an IP address as a node identifier for the RFC 7239 `Forwarded`
 /// header. IPv4 addresses are bare; IPv6 addresses must be wrapped in
 /// `"[…]"` per RFC 7239 §6 (and for hostnames-with-colons, similarly).

@@ -362,6 +362,40 @@ impl TlsState {
         Ok((cert_str, key_str))
     }
 
+    /// Install a self-signed fallback cert on the resolver (WOR-1772).
+    ///
+    /// With the forked Pingora listener reading the dynamic `CertResolver`,
+    /// the ACME cert installed by the renewal task is served live via SNI. But
+    /// before the first issue (and for SNI misses), the resolver needs a
+    /// fallback so `:443` still completes a handshake. This installs a
+    /// self-signed cert for the primary hostname as that fallback. ACME-only
+    /// mode has no manual cert, so there is nothing to clobber; calling this on
+    /// every (re)start is idempotent.
+    pub fn install_self_signed_fallback(&self) -> Result<()> {
+        let hostname = self
+            .hostnames
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("localhost");
+        let key_pair = rcgen::KeyPair::generate().context("generating fallback key pair")?;
+        let params = rcgen::CertificateParams::new(vec![hostname.to_string()])
+            .context("creating fallback cert params")?;
+        let cert = params
+            .self_signed(&key_pair)
+            .context("self-signing fallback cert")?;
+        let ck = cert_resolver::load_certified_key(
+            cert.pem().as_bytes(),
+            key_pair.serialize_pem().as_bytes(),
+        )
+        .context("loading self-signed fallback cert")?;
+        self.resolver.set_fallback(ck);
+        info!(
+            hostname,
+            "installed self-signed fallback cert for the ACME bootstrap window"
+        );
+        Ok(())
+    }
+
     ///
     /// Returns `Some(handle)` when the listener was started, or `None` if HTTP/3
     /// is disabled or not configured.
