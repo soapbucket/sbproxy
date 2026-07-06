@@ -308,6 +308,13 @@ export interface ClusterMetrics {
   metrics?: Record<string, number>;
 }
 
+export interface WorkspaceStatus {
+  workspace?: string;
+  tier?: string;
+  suspended?: boolean;
+  cooldown_secs?: number | null;
+}
+
 export interface RequestLog {
   id?: string;
   time?: string;
@@ -526,6 +533,11 @@ export const api = {
   // Rate-limit budget audit trail (WOR-1761) + fleet metrics (WOR-1762).
   auditRecent: (limit = 100) => getJson<AuditRow[]>(`/api/audit/recent?limit=${limit}`),
   clusterMetrics: () => getJson<ClusterMetrics>("/admin/cluster/metrics"),
+
+  // Rate-limit budget state + manual resume (WOR-1764).
+  budgetSnapshot: () => getJson<WorkspaceStatus[]>("/api/rate_limits/budget"),
+  resumeWorkspace: (workspace: string) =>
+    sendJson<unknown>("POST", "/api/rate_limits/resume", { workspace }),
 
   cacheStatus: () => getJson<CacheStatus>("/admin/cache"),
   cachePurge: (body: { key?: string; prefix?: string }) =>

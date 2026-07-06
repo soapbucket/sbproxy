@@ -190,6 +190,19 @@ pub struct AuditRow {
     pub reason: String,
 }
 
+/// A per-workspace budget snapshot for the admin API (WOR-1764).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkspaceStatus {
+    /// The workspace identifier.
+    pub workspace: String,
+    /// Current escalation tier (`normal`, `soft`, `throttle`, `auto_suspend`).
+    pub tier: String,
+    /// True while the workspace is auto-suspended (ceiling dropped to 1 rps).
+    pub suspended: bool,
+    /// Seconds left on the suspend cool-down, when one is active.
+    pub cooldown_secs: Option<u64>,
+}
+
 /// The per-request decision returned to the policy enforcer.
 #[derive(Debug, Clone)]
 pub struct BudgetDecision {
@@ -401,6 +414,74 @@ impl RateLimitBudgetRegistry {
     pub fn recent_audit(&self, limit: usize) -> Vec<AuditRow> {
         let ring = self.audit.lock().unwrap();
         ring.iter().rev().take(limit).cloned().collect()
+    }
+
+    /// Snapshot every tracked workspace's budget state for the admin API
+    /// (WOR-1764). Settles any pending cool-down first so the reported
+    /// tier is current. Sorted by workspace id.
+    pub fn snapshot(&self) -> Vec<WorkspaceStatus> {
+        let now = self.clock.now();
+        let mut map = self.workspaces.lock().unwrap();
+        let mut out: Vec<WorkspaceStatus> = map
+            .iter_mut()
+            .map(|(name, st)| {
+                Self::settle_cooldown(st, now, self.sustained, self.burst);
+                let suspended = st.tier == Tier::AutoSuspend;
+                let cooldown_secs = st
+                    .suspend_until
+                    .and_then(|until| until.checked_sub(now))
+                    .map(|d| d.as_secs());
+                WorkspaceStatus {
+                    workspace: name.clone(),
+                    tier: st.tier.as_str().to_string(),
+                    suspended,
+                    cooldown_secs,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.workspace.cmp(&b.workspace));
+        out
+    }
+
+    /// Manually clear a workspace's escalation, returning it to `Normal`
+    /// and cancelling any auto-suspend cool-down (WOR-1764). Records an
+    /// audit row. Returns `false` if the workspace is not tracked.
+    pub fn resume(&self, workspace: &str) -> bool {
+        let existed = {
+            let mut map = self.workspaces.lock().unwrap();
+            match map.get_mut(workspace) {
+                Some(st) => {
+                    st.tier = Tier::Normal;
+                    st.suspend_until = None;
+                    st.consecutive_throttles = 0;
+                    true
+                }
+                None => false,
+            }
+        };
+        if existed {
+            let row = AuditRow {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                action: "rate_limit_resume".to_string(),
+                target_kind: "workspace".to_string(),
+                target_id: workspace.to_string(),
+                reason: "manual resume via admin".to_string(),
+            };
+            tracing::info!(
+                target: "security_audit",
+                action = %row.action,
+                target_kind = %row.target_kind,
+                target_id = %row.target_id,
+                reason = %row.reason,
+                "rate-limit manual resume"
+            );
+            let mut ring = self.audit.lock().unwrap();
+            if ring.len() == AUDIT_RING_CAP {
+                ring.pop_front();
+            }
+            ring.push_back(row);
+        }
+        existed
     }
 }
 

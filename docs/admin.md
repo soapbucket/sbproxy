@@ -216,6 +216,8 @@ the default embedded and memory backends are per-node. See
 | GET | `/api/requests/stream` | Server-Sent-Events tail: a `data:` event per new request. |
 | GET | `/api/usage/spend` | Token and USD spend totals from the AI cost metrics. |
 | GET | `/api/audit/recent?limit=` | Recent rate-limit budget audit rows. |
+| GET | `/api/rate_limits/budget` | Per-workspace budget state: tier and suspend cool-down. |
+| POST | `/api/rate_limits/resume` | Manually clear a workspace's escalation, `{"workspace":"<id>"}`. |
 
 Metrics are per-instance: each process exposes only its own counters.
 For a cluster, an external Prometheus scrapes every instance and
