@@ -122,6 +122,19 @@ ignore = [
   # transitive; revisit when tract-onnx and tokenizers update.
   "RUSTSEC-2024-0436",
 
+  # RUSTSEC-2025-0057: fxhash 0.2.1, unmaintained. Path: fxhash -> bm25 ->
+  # mistralrs-core -> mistralrs -> sbproxy-model-host, i.e. only the
+  # off-by-default `embedded` inference engine tree (WOR-1658); not in the
+  # default build. Unmaintained, no maintained replacement reachable without
+  # an upstream bump; transitive; revisit when bm25 / mistralrs update.
+  "RUSTSEC-2025-0057",
+
+  # RUSTSEC-2025-0119: number_prefix 0.4.0, unmaintained. Same off-by-default
+  # mistral.rs `embedded` tree (via indicatif's progress UI under mistralrs);
+  # not in the default build. Unmaintained; transitive; revisit on an upstream
+  # bump that drops it.
+  "RUSTSEC-2025-0119",
+
   # RUSTSEC-2026-0173: proc-macro-error2 (a maintained fork of the older
   # proc-macro-error) is now itself unmaintained. Pulled in transitively as a
   # build-time proc-macro by the tonic/prost gRPC stack; no runtime artifact
@@ -182,6 +195,10 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "MIT",
   "MIT-0",
+  # 0BSD (BSD Zero Clause): public-domain-equivalent, more permissive than
+  # MIT, no attribution required. Transitive via the mistral.rs `embedded`
+  # engine tree (doctest-file, recvmsg under interprocess).
+  "0BSD",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",

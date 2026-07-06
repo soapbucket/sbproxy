@@ -214,6 +214,69 @@ Crates: ciborium, ciborium-io, ciborium-ll.
 
 ===========================================================================
 
+The following crates are pulled in only by the embedded model-host
+engine (mistral.rs, behind the off-by-default `embedded` cargo feature)
+and are licensed under the Apache License, Version 2.0. Where a crate is
+dual-licensed with a permissive alternative, the Apache-2.0 attribution
+is preserved here.
+
+approx
+Copyright The approx authors
+Licensed under the Apache License, Version 2.0
+https://github.com/brendanzab/approx
+
+hf-hub
+Copyright The HuggingFace Inc. team
+Licensed under the Apache License, Version 2.0
+https://github.com/huggingface/hf-hub
+
+hound
+Copyright Ruud van Asseldonk
+Licensed under the Apache License, Version 2.0
+https://github.com/ruuda/hound
+
+interprocess
+Copyright The interprocess authors
+Licensed under 0BSD OR Apache License, Version 2.0
+https://github.com/kotauskas/interprocess
+
+minijinja-contrib
+Copyright Armin Ronacher
+Licensed under the Apache License, Version 2.0
+https://github.com/mitsuhiko/minijinja
+
+moxcms
+Copyright The moxcms authors
+Licensed under BSD-3-Clause OR Apache License, Version 2.0
+https://github.com/awxkee/moxcms
+
+nalgebra
+Copyright The nalgebra authors (dimforge)
+Licensed under the Apache License, Version 2.0
+https://github.com/dimforge/nalgebra
+
+openai-harmony
+Copyright OpenAI
+Licensed under the Apache License, Version 2.0
+https://github.com/openai/harmony
+
+pxfm
+Copyright The pxfm authors
+Licensed under BSD-3-Clause OR Apache License, Version 2.0
+https://github.com/awxkee/pxfm
+
+safetensors
+Copyright The HuggingFace Inc. team
+Licensed under the Apache License, Version 2.0
+https://github.com/huggingface/safetensors
+
+simba
+Copyright The simba authors (dimforge)
+Licensed under the Apache License, Version 2.0
+https://github.com/dimforge/simba
+
+===========================================================================
+
 Additional dependencies are dual-licensed under MIT OR Apache-2.0. Under
 the terms of dual licensing, this project uses them under the MIT license
 where available. A full list of dependencies and their licenses can be
