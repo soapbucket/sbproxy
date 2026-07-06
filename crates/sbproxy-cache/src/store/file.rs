@@ -182,6 +182,10 @@ impl CacheStore for FileCacheStore {
         }
         Ok(())
     }
+
+    fn backend_name(&self) -> &'static str {
+        "file"
+    }
 }
 
 #[cfg(test)]

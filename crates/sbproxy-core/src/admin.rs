@@ -1591,6 +1591,10 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_cluster::dispatch(method, path) {
         return response;
     }
+    // WOR-1754 / WOR-1755: response-cache + key-policy-cache management.
+    if let Some(response) = crate::admin_cache::dispatch(method, path, body) {
+        return response;
+    }
 
     // --- Method-aware routes first ---
     if path == "/admin/reload" {

@@ -49,6 +49,12 @@ const routes = [
     component: () => import("./views/PlaygroundView.vue"),
     meta: { title: "Playground" },
   },
+  {
+    path: "/cache",
+    name: "cache",
+    component: () => import("./views/CacheView.vue"),
+    meta: { title: "Cache" },
+  },
   { path: "/:pathMatch(.*)*", redirect: "/" },
 ];
 
