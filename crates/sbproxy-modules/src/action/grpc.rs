@@ -159,22 +159,28 @@ impl GrpcAction {
     /// Converts grpc:// to http:// and grpcs:// to https:// before parsing.
     /// The `tls` field in the config can override scheme-based TLS detection.
     pub fn parse_upstream(&self) -> anyhow::Result<(String, u16, bool)> {
-        let normalized = if self.url.starts_with("grpcs://") {
-            self.url.replacen("grpcs://", "https://", 1)
-        } else if self.url.starts_with("grpc://") {
-            self.url.replacen("grpc://", "http://", 1)
-        } else {
-            self.url.clone()
-        };
+        // The result also depends on `self.tls`, so include it in the memo
+        // key (two gRPC actions with the same URL but different `tls:` must
+        // not share a cache entry). WOR-1698.
+        let key = format!("{}\u{0}{}", self.url, self.tls);
+        super::memoized_upstream(&key, || {
+            let normalized = if self.url.starts_with("grpcs://") {
+                self.url.replacen("grpcs://", "https://", 1)
+            } else if self.url.starts_with("grpc://") {
+                self.url.replacen("grpc://", "http://", 1)
+            } else {
+                self.url.clone()
+            };
 
-        let parsed = url::Url::parse(&normalized)?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("missing host in gRPC URL"))?
-            .to_string();
-        let tls = self.tls || parsed.scheme() == "https";
-        let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
-        Ok((host, port, tls))
+            let parsed = url::Url::parse(&normalized)?;
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("missing host in gRPC URL"))?
+                .to_string();
+            let tls = self.tls || parsed.scheme() == "https";
+            let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+            Ok((host, port, tls))
+        })
     }
 }
 

@@ -603,9 +603,39 @@ pub struct TlsFingerprintConfig {
     /// sidecar reported it as trustworthy.
     #[serde(default)]
     pub untrusted_client_cidrs: Vec<String>,
+    /// Pre-parsed [`Self::trustworthy_client_cidrs`] (WOR-1698/WOR-1699),
+    /// compiled once at config load so the per-request fingerprint path
+    /// does a membership check without re-parsing CIDR strings. Populated
+    /// by [`Self::from_extensions`]; empty for the disabled default.
+    #[serde(skip)]
+    trustworthy_cidrs_compiled: Vec<ipnetwork::IpNetwork>,
+    /// Pre-parsed [`Self::untrusted_client_cidrs`] (WOR-1699).
+    #[serde(skip)]
+    untrusted_cidrs_compiled: Vec<ipnetwork::IpNetwork>,
 }
 
 impl TlsFingerprintConfig {
+    /// Parse the CIDR string lists into their compiled forms once, at
+    /// config load. Invalid entries are dropped with a warn (moved here
+    /// from the per-request path, WOR-1699).
+    fn compile_cidrs(&mut self) {
+        fn parse(list: &[String], label: &str) -> Vec<ipnetwork::IpNetwork> {
+            list.iter()
+                .filter_map(|s| match s.parse::<ipnetwork::IpNetwork>() {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        tracing::warn!(cidr = %s, error = %e, "ignoring invalid {label} entry");
+                        None
+                    }
+                })
+                .collect()
+        }
+        self.trustworthy_cidrs_compiled =
+            parse(&self.trustworthy_client_cidrs, "trustworthy_client_cidrs");
+        self.untrusted_cidrs_compiled =
+            parse(&self.untrusted_client_cidrs, "untrusted_client_cidrs");
+    }
+
     /// Build a [`TlsFingerprintConfig`] from the parsed
     /// `proxy.extensions.tls_fingerprint` YAML block. Returns
     /// `Default::default()` (disabled) when the block is absent or
@@ -618,7 +648,10 @@ impl TlsFingerprintConfig {
             return Self::default();
         };
         match serde_yaml::from_value::<TlsFingerprintConfig>(block.clone()) {
-            Ok(cfg) => cfg,
+            Ok(mut cfg) => {
+                cfg.compile_cidrs();
+                cfg
+            }
             Err(e) => {
                 // WOR-1161: a malformed block silently falls back to
                 // disabled, which is a fail-open if the operator meant to
@@ -648,43 +681,17 @@ impl TlsFingerprintConfig {
         }
     }
 
-    /// Pre-parsed view of [`Self::trustworthy_client_cidrs`]. Invalid
-    /// entries are dropped with a warn log. Empty when the field is
-    /// unset, equivalent to "no trust list".
-    pub fn trustworthy_cidrs(&self) -> Vec<ipnetwork::IpNetwork> {
-        self.trustworthy_client_cidrs
-            .iter()
-            .filter_map(|s| match s.parse::<ipnetwork::IpNetwork>() {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    tracing::warn!(
-                        cidr = %s,
-                        error = %e,
-                        "ignoring invalid trustworthy_client_cidrs entry",
-                    );
-                    None
-                }
-            })
-            .collect()
+    /// Pre-parsed [`Self::trustworthy_client_cidrs`], compiled once at
+    /// config load (WOR-1699). Empty when the field is unset, equivalent
+    /// to "no trust list".
+    pub fn trustworthy_cidrs(&self) -> &[ipnetwork::IpNetwork] {
+        &self.trustworthy_cidrs_compiled
     }
 
-    /// Pre-parsed view of [`Self::untrusted_client_cidrs`]. Invalid
-    /// entries are dropped with a warn log.
-    pub fn untrusted_cidrs(&self) -> Vec<ipnetwork::IpNetwork> {
-        self.untrusted_client_cidrs
-            .iter()
-            .filter_map(|s| match s.parse::<ipnetwork::IpNetwork>() {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    tracing::warn!(
-                        cidr = %s,
-                        error = %e,
-                        "ignoring invalid untrusted_client_cidrs entry",
-                    );
-                    None
-                }
-            })
-            .collect()
+    /// Pre-parsed [`Self::untrusted_client_cidrs`], compiled once at
+    /// config load (WOR-1699).
+    pub fn untrusted_cidrs(&self) -> &[ipnetwork::IpNetwork] {
+        &self.untrusted_cidrs_compiled
     }
 
     /// Whether the named header should be honoured as a trust-bounded
