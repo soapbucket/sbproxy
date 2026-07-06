@@ -15,8 +15,9 @@
 //!
 //! Collection is read-only: no engine spawns, no directory is created,
 //! nothing is written. The GPU list comes from the same probe the
-//! model-host runtime uses ([`crate::server::model_host::make_probe`]),
-//! so `doctor` and admission can never disagree about the hardware.
+//! model-host runtime uses (`make_probe` in the server's model-host
+//! wiring), so `doctor` and admission can never disagree about the
+//! hardware.
 
 use std::path::PathBuf;
 
