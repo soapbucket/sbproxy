@@ -1277,6 +1277,9 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             _ => None,
         };
         let admin_state = std::sync::Arc::new(admin_state_inner);
+        // WOR-1718: install the global handle so the pipeline's logging
+        // hook can feed the request-log ring buffer + SSE tail.
+        crate::admin::install_admin_log_sink(admin_state.clone());
         // Pingora's `Server::run_forever` builds its own multi-thread
         // tokio runtime; spawning before run_forever installs the
         // task on that runtime via the global handle once Pingora

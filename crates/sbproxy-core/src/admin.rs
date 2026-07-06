@@ -1890,6 +1890,22 @@ pub fn handle_admin_request(
 // in-process [`AdminRateLimiter`] caps both per-IP and global
 // admin RPS so a misconfigured allowlist cannot be DDoSed.
 
+/// Process-global handle to the running admin state, installed at boot so
+/// the request pipeline's logging hook can feed the request-log ring
+/// buffer + SSE tail (WOR-1718). `None` when the admin server is off.
+static ADMIN_LOG_SINK: std::sync::OnceLock<Arc<AdminState>> = std::sync::OnceLock::new();
+
+/// Install the process-global admin-state handle (first install wins).
+pub fn install_admin_log_sink(state: Arc<AdminState>) {
+    let _ = ADMIN_LOG_SINK.set(state);
+}
+
+/// The running admin state, if the admin server is enabled, for the
+/// pipeline's logging hook to record each completed request.
+pub fn admin_log_sink() -> Option<&'static Arc<AdminState>> {
+    ADMIN_LOG_SINK.get()
+}
+
 /// Spawn the admin server bound to `127.0.0.1:<config.port>`.
 ///
 /// No-ops when `config.enabled` is false. The returned join handle

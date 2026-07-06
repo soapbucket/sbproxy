@@ -3955,17 +3955,42 @@ impl ProxyHttp for SbProxy {
         // labels run through the cardinality limiter regardless, so
         // tightening them is a follow-up.
         let agent_labels = build_agent_labels(ctx);
+        let latency_secs = ctx
+            .request_start
+            .map(|s| s.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
         sbproxy_observe::metrics::record_request_with_labels(
             &hostname,
             &method,
             status_u16,
-            ctx.request_start
-                .map(|s| s.elapsed().as_secs_f64())
-                .unwrap_or(0.0),
+            latency_secs,
             ctx.request_body_bytes,
             ctx.response_body_bytes,
             agent_labels,
         );
+
+        // WOR-1718: mirror the completed request into the admin request-log
+        // ring buffer (and its SSE tail) when the admin server is running.
+        if let Some(admin) = crate::admin::admin_log_sink() {
+            let req = session.req_header();
+            let path = req
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| req.uri.path().to_string());
+            admin.log_request(crate::admin::RequestLogEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                origin: hostname.clone(),
+                method: method.clone(),
+                path,
+                status: status_u16,
+                latency_ms: latency_secs * 1000.0,
+                client_ip: session
+                    .client_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default(),
+            });
+        }
 
         // Record latency on the hostname-only histogram (legacy view).
         let duration = ctx
