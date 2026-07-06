@@ -195,6 +195,10 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "MIT",
   "MIT-0",
+  # 0BSD (BSD Zero Clause): public-domain-equivalent, more permissive than
+  # MIT, no attribution required. Transitive via the mistral.rs `embedded`
+  # engine tree (doctest-file, recvmsg under interprocess).
+  "0BSD",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
