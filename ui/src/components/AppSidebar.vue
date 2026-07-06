@@ -12,6 +12,7 @@ const nav = [
   { to: "/metrics", label: "Metrics" },
   { to: "/prompts", label: "Prompts" },
   { to: "/playground", label: "Playground" },
+  { to: "/cache", label: "Cache" },
 ];
 </script>
 

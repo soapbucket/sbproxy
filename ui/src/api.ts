@@ -311,6 +311,11 @@ export interface PlaygroundChatResult {
   latency_ms?: number;
   error?: string;
 }
+export interface CacheStatus {
+  enabled: boolean;
+  backend?: string;
+  prefix_purge_supported?: boolean;
+}
 
 export interface SessionInfo {
   authenticated: boolean;
@@ -409,4 +414,11 @@ export const api = {
     getJson<PlaygroundEndpoints>("/admin/api/playground/endpoints"),
   playgroundChat: (body: PlaygroundChatRequest) =>
     sendJson<PlaygroundChatResult>("POST", "/admin/api/playground/chat", body),
+
+  // Cache (WOR-1754 / WOR-1755)
+  cacheStatus: () => getJson<CacheStatus>("/admin/cache"),
+  cachePurge: (body: { key?: string; prefix?: string }) =>
+    sendJson<unknown>("POST", "/admin/cache/purge", body),
+  evictKeyPolicy: (id?: string) =>
+    sendJson<unknown>("POST", "/admin/cache/key-policy/evict", id ? { id } : {}),
 };
