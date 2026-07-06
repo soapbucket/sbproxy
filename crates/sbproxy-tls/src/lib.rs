@@ -211,9 +211,14 @@ impl TlsState {
         let hostnames = self.hostnames.clone();
 
         maintenance_handle().spawn(async move {
+            // 12h renewal cadence. tokio's interval fires its first tick
+            // immediately, and we deliberately DO NOT skip it: a
+            // freshly-deployed domain with no cached cert must be issued at
+            // startup, not after the first 12h period (otherwise the
+            // listener serves the self-signed bootstrap cert for 12h). The
+            // per-hostname pass only logs when a cert is actually missing or
+            // due for renewal, so the immediate first tick is not noisy.
             let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
-            // The first tick fires immediately; skip it so we don't flood logs at startup.
-            interval.tick().await;
 
             loop {
                 interval.tick().await;
