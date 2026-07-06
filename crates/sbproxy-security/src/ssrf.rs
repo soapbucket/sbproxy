@@ -295,6 +295,29 @@ fn resolve_with_timeout(addr_str: &str, timeout: Duration) -> Result<Vec<SocketA
     }
 }
 
+/// Async, non-caching resolve of `host:port` to its full address set,
+/// giving up after [`DNS_RESOLUTION_TIMEOUT`] (WOR-1689).
+///
+/// This is the hot-path counterpart to [`resolve_with_timeout`]: it runs
+/// `getaddrinfo` on tokio's shared blocking pool and `await`s it, so a
+/// slow or hostile resolver yields the worker instead of pinning it, and
+/// no per-request OS thread is spawned. It deliberately does NOT cache:
+/// the SSRF verdict must be recomputed on every request so a host that is
+/// re-pointed at a private address (DNS rebinding) cannot ride a stale
+/// "allowed" verdict. Callers treat any `Err` as fail-closed.
+pub async fn resolve_host_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    match tokio::time::timeout(
+        DNS_RESOLUTION_TIMEOUT,
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(iter)) => Ok(iter.collect()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("dns resolution timed out".to_string()),
+    }
+}
+
 // --- Use of std's ToSocketAddrs ---
 
 use std::net::ToSocketAddrs;

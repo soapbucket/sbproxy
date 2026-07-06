@@ -284,7 +284,7 @@ impl ProxyHttp for SbProxy {
                 // rebinding is not a factor; the override path is
                 // checked against `allow_private_cidrs` separately.
                 if proxy.resolve_override.is_none() {
-                    guard_upstream(&host, port, tls, allow_private)?;
+                    guard_upstream(&host, port, tls, allow_private).await?;
                 }
 
                 // Service discovery: resolve to a fresh IP per
@@ -367,7 +367,7 @@ impl ProxyHttp for SbProxy {
                         Error::because(ErrorType::ConnectError, "lb target selection failed", e)
                     })?;
 
-                guard_upstream(&host, port, tls, allow_private)?;
+                guard_upstream(&host, port, tls, allow_private).await?;
 
                 lb.record_connect(target_idx);
                 ctx.lb_target_idx = Some(target_idx);
@@ -391,7 +391,7 @@ impl ProxyHttp for SbProxy {
                     Error::because(ErrorType::ConnectError, "bad A2A upstream URL", e)
                 })?;
 
-                guard_upstream(&host, port, tls, allow_private)?;
+                guard_upstream(&host, port, tls, allow_private).await?;
 
                 debug!(
                     hostname = %ctx.hostname,
@@ -411,7 +411,7 @@ impl ProxyHttp for SbProxy {
                     Error::because(ErrorType::ConnectError, "bad websocket upstream URL", e)
                 })?;
 
-                guard_upstream(&host, port, tls, allow_private)?;
+                guard_upstream(&host, port, tls, allow_private).await?;
 
                 debug!(
                     hostname = %ctx.hostname,
@@ -440,7 +440,8 @@ impl ProxyHttp for SbProxy {
                     rd.upstream_port,
                     rd.upstream_tls,
                     allow_private,
-                )?;
+                )
+                .await?;
                 debug!(
                     hostname = %ctx.hostname,
                     upstream_host = %rd.upstream_host,
@@ -463,7 +464,7 @@ impl ProxyHttp for SbProxy {
                     Error::because(ErrorType::ConnectError, "bad gRPC upstream URL", e)
                 })?;
 
-                guard_upstream(&host, port, tls, allow_private)?;
+                guard_upstream(&host, port, tls, allow_private).await?;
 
                 debug!(
                     hostname = %ctx.hostname,
@@ -490,7 +491,7 @@ impl ProxyHttp for SbProxy {
                     Error::because(ErrorType::ConnectError, "bad GraphQL upstream URL", e)
                 })?;
 
-                guard_upstream(&host, port, tls, allow_private)?;
+                guard_upstream(&host, port, tls, allow_private).await?;
 
                 debug!(
                     hostname = %ctx.hostname,

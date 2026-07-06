@@ -2744,109 +2744,66 @@ fn is_request_https(listener_is_tls: bool, peer_trusted: bool, xfp: Option<&str>
 /// caller can pin the dial to it. On failure returns a Pingora
 /// `Error` shaped as a `ConnectError` so the response surfaces as a
 /// generic 502.
-fn guard_upstream(
+/// SSRF guard for an upstream `host:port` (WOR-1689).
+///
+/// Async and non-blocking: an IP-literal host is checked directly with
+/// no DNS, and a hostname is resolved once via
+/// [`ssrf::resolve_host_addrs`] (getaddrinfo on tokio's blocking pool,
+/// `await`ed with a 2s timeout) instead of the old per-request OS-thread
+/// spawn that blocked the async worker. The verdict is fail-closed: any
+/// resolve error, timeout, or empty result rejects, and any resolved
+/// private IP rejects unless it falls inside `allow_private_cidrs`.
+/// Nothing is cached, so a host later re-pointed at a private address
+/// cannot ride a stale "allowed" verdict.
+async fn guard_upstream(
     host: &str,
     port: u16,
     tls: bool,
     allow_private_cidrs: &[ipnetwork::IpNetwork],
 ) -> Result<()> {
     use sbproxy_security::ssrf;
-    let scheme = if tls { "https" } else { "http" };
-    // We rebuild a URL just for the validator. IPv6 hosts must be
-    // bracketed; everything else passes through.
-    let host_part = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
+    let _ = tls; // scheme is no longer reconstructed into a URL
+
+    // IP literal: check it directly, no DNS. Hostname: resolve the full
+    // address set (fail-closed on error/timeout/empty).
+    let ips: Vec<std::net::IpAddr> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        vec![ip]
     } else {
-        host.to_string()
-    };
-    let candidate = format!("{scheme}://{host_part}:{port}/");
-
-    // The allowlist is applied to the URL host only when the parsed
-    // host is an IP. For hostname URLs, we check whether any
-    // resolved IP falls in an allowed CIDR after `validate_url_resolved`
-    // returns.
-    let host_string = host.to_string();
-    let host_allowlist = vec![host_string.clone()];
-
-    // First pass: cheap reject for non-allowlisted private literals.
-    match ssrf::validate_url_resolved(&candidate, &[]) {
-        Ok(resolved) => {
-            // Re-check resolved addresses against `is_private_ip`,
-            // honouring the operator's allow_private_cidrs override.
-            for addr in &resolved.addrs {
-                let ip = addr.ip();
-                if ssrf::is_private_ip(&ip)
-                    && !allow_private_cidrs.iter().any(|net| net.contains(ip))
-                {
-                    warn!(
-                        upstream_host = %host,
-                        upstream_ip = %ip,
-                        "SSRF: blocked upstream resolving to private IP",
-                    );
-                    return Err(Error::because(
-                        ErrorType::ConnectError,
-                        "SSRF: upstream resolved to private network",
-                        anyhow::anyhow!("blocked private IP {ip}"),
-                    ));
-                }
-            }
-            Ok(())
+        let addrs = ssrf::resolve_host_addrs(host, port).await.map_err(|reason| {
+            warn!(upstream_host = %host, reason = %reason, "SSRF: blocked upstream URL");
+            Error::because(
+                ErrorType::ConnectError,
+                "SSRF: blocked upstream URL",
+                anyhow::anyhow!(reason),
+            )
+        })?;
+        if addrs.is_empty() {
+            warn!(upstream_host = %host, "SSRF: upstream resolved to no addresses");
+            return Err(Error::because(
+                ErrorType::ConnectError,
+                "SSRF: blocked upstream URL",
+                anyhow::anyhow!("hostname '{host}' resolved to no addresses"),
+            ));
         }
-        Err(reason) => {
-            // Validation failed. If the operator allow-listed the URL
-            // host (or one of its resolved IPs), retry with the
-            // allowlist; otherwise reject.
-            if allow_private_cidrs.is_empty() {
-                warn!(
-                    upstream_host = %host,
-                    reason = %reason,
-                    "SSRF: blocked upstream URL",
-                );
-                return Err(Error::because(
-                    ErrorType::ConnectError,
-                    "SSRF: blocked upstream URL",
-                    anyhow::anyhow!(reason),
-                ));
-            }
-            // Retry with hostname allowlist so the validator returns
-            // the resolved set without rejecting on private IPs; we
-            // then enforce allow_private_cidrs ourselves.
-            match ssrf::validate_url_resolved(&candidate, &host_allowlist) {
-                Ok(resolved) => {
-                    for addr in &resolved.addrs {
-                        let ip = addr.ip();
-                        if ssrf::is_private_ip(&ip)
-                            && !allow_private_cidrs.iter().any(|net| net.contains(ip))
-                        {
-                            warn!(
-                                upstream_host = %host,
-                                upstream_ip = %ip,
-                                "SSRF: blocked upstream resolving to private IP outside allow_private_cidrs",
-                            );
-                            return Err(Error::because(
-                                ErrorType::ConnectError,
-                                "SSRF: upstream resolved to private network",
-                                anyhow::anyhow!("blocked private IP {ip}"),
-                            ));
-                        }
-                    }
-                    Ok(())
-                }
-                Err(reason) => {
-                    warn!(
-                        upstream_host = %host,
-                        reason = %reason,
-                        "SSRF: blocked upstream URL (with allowlist retry)",
-                    );
-                    Err(Error::because(
-                        ErrorType::ConnectError,
-                        "SSRF: blocked upstream URL",
-                        anyhow::anyhow!(reason),
-                    ))
-                }
-            }
+        addrs.into_iter().map(|sa| sa.ip()).collect()
+    };
+
+    // Reject any private IP not covered by the operator's allowlist.
+    for ip in ips {
+        if ssrf::is_private_ip(&ip) && !allow_private_cidrs.iter().any(|net| net.contains(ip)) {
+            warn!(
+                upstream_host = %host,
+                upstream_ip = %ip,
+                "SSRF: blocked upstream resolving to private IP",
+            );
+            return Err(Error::because(
+                ErrorType::ConnectError,
+                "SSRF: upstream resolved to private network",
+                anyhow::anyhow!("blocked private IP {ip}"),
+            ));
         }
     }
+    Ok(())
 }
 
 /// Parse a `resolve_override` value into a `host:port` connect string.
