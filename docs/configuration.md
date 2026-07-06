@@ -292,13 +292,21 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `
 |-------|------|---------|-------------|
 | `enabled` | bool | false | Enable the admin server |
 | `port` | int | 9090 | Listen port |
-| `username` | string | "admin" | HTTP Basic Auth username |
-| `password` | string | "changeme" | HTTP Basic Auth password |
+| `username` | string | "admin" | Top-level admin HTTP Basic username |
+| `password` | string | "changeme" | Top-level admin HTTP Basic password |
 | `max_log_entries` | int | 1000 | Recent-request log buffer size |
+| `bind` | string | "127.0.0.1" | Bind address; set to `0.0.0.0` or an interface for remote admin |
+| `allow_ips` | list | empty | IP / CIDR allowlist; empty keeps the loopback-only default |
+| `cors_origins` | list | empty | Allowed CORS origins for a separately hosted UI |
+| `operators` | list | empty | Login identities with roles: `{username, password, role}` where `role` is `admin` or `read_only` |
+| `tls` | object | unset | `{cert, key}` PEM paths; serve HTTPS instead of plaintext |
+| `prompt_persistence_path` | string | unset | redb file persisting prompt-version edits across restarts |
 
-When enabled, the admin server binds on `127.0.0.1:<port>` only,
-gates every request behind HTTP Basic auth, and applies a 60-rps
-per-IP rate limit. Endpoints:
+When enabled, the admin server binds `bind:<port>` (loopback by
+default), authenticates every request (HTTP Basic or a browser session),
+enforces the operator's role on mutations, and applies a 60-rps per-IP
+rate limit. Full auth, RBAC, remote-access, and endpoint reference is in
+[admin.md](admin.md). Endpoints (abbreviated):
 
 | Path | Description |
 |------|-------------|

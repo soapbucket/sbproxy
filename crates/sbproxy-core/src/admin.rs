@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sbproxy_config::types::AdminRole;
 use serde::Serialize;
 
 pub mod prompt_persistence;
@@ -42,6 +43,15 @@ pub struct AdminConfig {
     /// built-in UI) is served over HTTPS with this PEM cert + key instead
     /// of plaintext HTTP.
     pub tls: Option<AdminTls>,
+    /// WOR-1717: bind address. Defaults to `127.0.0.1` (loopback only).
+    pub bind: String,
+    /// WOR-1717: IP / CIDR allowlist. Empty means loopback-only.
+    pub allow_ips: Vec<String>,
+    /// WOR-1717: allowed CORS origins. Empty means no CORS headers.
+    pub cors_origins: Vec<String>,
+    /// WOR-1716: RBAC operators in addition to the top-level admin (which
+    /// is always the full-access `admin` role).
+    pub operators: Vec<AdminOperator>,
 }
 
 /// PEM certificate + key file paths for admin-server TLS (WOR-1717).
@@ -53,6 +63,17 @@ pub struct AdminTls {
     pub key: std::path::PathBuf,
 }
 
+/// An admin operator identity with a role, for RBAC (WOR-1716).
+#[derive(Debug, Clone)]
+pub struct AdminOperator {
+    /// Login username.
+    pub username: String,
+    /// Login password.
+    pub password: String,
+    /// Role governing which admin actions this operator may perform.
+    pub role: AdminRole,
+}
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
@@ -62,6 +83,10 @@ impl Default for AdminConfig {
             password: "changeme".to_string(),
             max_log_entries: 1000,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         }
     }
 }
@@ -195,11 +220,25 @@ impl AdminIpFilter {
         }
     }
 
-    /// Returns `true` if `ip` is permitted.
-    ///
-    /// An empty allowlist permits all IPs.
+    /// Returns `true` if `ip` is permitted. An empty allowlist permits all
+    /// IPs (callers pass a non-empty list, or use `localhost_only`, so the
+    /// safe default is never the permit-all path). Each entry matches
+    /// either as an exact address or, when it parses as a CIDR, as a
+    /// network containing `ip` (WOR-1717).
     pub fn is_allowed(&self, ip: &str) -> bool {
-        self.allowed_ips.is_empty() || self.allowed_ips.iter().any(|a| a == ip)
+        if self.allowed_ips.is_empty() {
+            return true;
+        }
+        let parsed: Option<std::net::IpAddr> = ip.parse().ok();
+        self.allowed_ips.iter().any(|a| {
+            if a == ip {
+                return true;
+            }
+            if let (Some(addr), Ok(net)) = (parsed, a.parse::<ipnetwork::IpNetwork>()) {
+                return net.contains(addr);
+            }
+            false
+        })
     }
 }
 
@@ -302,6 +341,16 @@ pub struct AdminState {
     /// (the default); the binary opts in via
     /// [`AdminState::with_prompt_persistence`].
     pub prompt_persistence: Option<Arc<PromptPersistence>>,
+    /// WOR-1714: ephemeral HMAC signer for browser session tokens. A
+    /// fresh key per process, so a restart invalidates every session.
+    pub session_signer: crate::admin_session::SessionSigner,
+    /// WOR-1714: revoked session nonces (populated by `POST /admin/logout`),
+    /// cleared on restart. Checked on every session verification.
+    pub revoked_sessions: Mutex<std::collections::HashSet<String>>,
+    /// WOR-1718: broadcast of each logged request (as JSON) for the SSE
+    /// tail at `GET /api/requests/stream`. A subscriber that falls behind
+    /// the buffer is lagged (skipped), never blocking `log_request`.
+    pub log_events: tokio::sync::broadcast::Sender<String>,
 }
 
 impl AdminState {
@@ -320,7 +369,71 @@ impl AdminState {
             reload_in_progress: AtomicBool::new(false),
             health_registry: sbproxy_observe::default_registry_optional(None, None),
             prompt_persistence: None,
+            session_signer: crate::admin_session::SessionSigner::random(),
+            revoked_sessions: Mutex::new(std::collections::HashSet::new()),
+            log_events: tokio::sync::broadcast::channel(256).0,
         }
+    }
+
+    /// Resolve the operator + role from a session cookie or Basic auth
+    /// (WOR-1714 / WOR-1716). Session takes precedence. Returns `None`
+    /// when neither authenticates. The `csrf` field is set only for the
+    /// session path (the nonce the caller must echo in `X-CSRF-Token`).
+    pub fn resolve_principal(
+        &self,
+        auth_header: Option<&str>,
+        cookie_header: Option<&str>,
+    ) -> Option<AdminPrincipal> {
+        // Session cookie first.
+        if let Some(ch) = cookie_header {
+            if let Some(tok) =
+                crate::admin_session::cookie_value(ch, crate::admin_session::SESSION_COOKIE)
+            {
+                let now = unix_now();
+                if let Some(sess) = self.session_signer.verify(&tok, now) {
+                    let revoked = self
+                        .revoked_sessions
+                        .lock()
+                        .map(|s| s.contains(&sess.nonce))
+                        .unwrap_or(false);
+                    if !revoked {
+                        return Some(AdminPrincipal {
+                            username: sess.username,
+                            role: sess.role,
+                            via_session: true,
+                            csrf: Some(sess.nonce),
+                        });
+                    }
+                }
+            }
+        }
+        // Basic auth: the top-level admin credential (full access).
+        if let Some((user, pass)) = auth_header.and_then(decode_basic_auth) {
+            if self.check_auth(&user, &pass) {
+                return Some(AdminPrincipal {
+                    username: user,
+                    role: AdminRole::Admin,
+                    via_session: false,
+                    csrf: None,
+                });
+            }
+        }
+        None
+    }
+
+    /// Verify login credentials against the top-level admin and the
+    /// configured operators (WOR-1716), returning the matched role.
+    pub fn check_operator_login(&self, user: &str, pass: &str) -> Option<AdminRole> {
+        if self.check_auth(user, pass) {
+            return Some(AdminRole::Admin);
+        }
+        self.config
+            .operators
+            .iter()
+            .find(|o| {
+                o.username == user && constant_time_eq(o.password.as_bytes(), pass.as_bytes())
+            })
+            .map(|o| o.role)
     }
 
     /// Builder-style setter for the on-disk config path.
@@ -378,6 +491,13 @@ impl AdminState {
         if log.len() >= self.config.max_log_entries {
             log.pop_front();
         }
+        // WOR-1718: fan out to the SSE tail before dropping the lock (best
+        // effort; no subscribers or a full buffer is a no-op / lag).
+        if self.log_events.receiver_count() > 0 {
+            if let Ok(json) = serde_json::to_string(&entry) {
+                let _ = self.log_events.send(json);
+            }
+        }
         log.push_back(entry);
     }
 
@@ -388,6 +508,33 @@ impl AdminState {
             .lock()
             .expect("admin log mutex poisoned");
         log.iter().rev().take(limit).cloned().collect()
+    }
+
+    /// Query the recent-request log (newest first) with optional filters
+    /// and pagination (WOR-1718). `status` is an exact code, `method` is
+    /// case-insensitive, `path_sub` is a substring, `offset`/`limit`
+    /// paginate the filtered result.
+    pub fn query_requests(
+        &self,
+        status: Option<u16>,
+        method: Option<&str>,
+        path_sub: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<RequestLogEntry> {
+        let log = self
+            .recent_requests
+            .lock()
+            .expect("admin log mutex poisoned");
+        log.iter()
+            .rev()
+            .filter(|e| status.is_none_or(|s| e.status == s))
+            .filter(|e| method.is_none_or(|m| e.method.eq_ignore_ascii_case(m)))
+            .filter(|e| path_sub.is_none_or(|p| e.path.contains(p)))
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// Validate basic auth credentials using constant-time comparison.
@@ -401,6 +548,31 @@ impl AdminState {
 }
 
 // --- Auth Helpers ---
+
+/// The authenticated admin operator for a request (WOR-1714 / WOR-1716):
+/// who they are, their role, whether they came in via a browser session
+/// (which triggers CSRF enforcement), and the CSRF nonce to match.
+#[derive(Debug, Clone)]
+pub struct AdminPrincipal {
+    /// Operator username (for the audit trail).
+    pub username: String,
+    /// Role governing which actions are permitted.
+    pub role: AdminRole,
+    /// True when authenticated by session cookie (vs Basic).
+    pub via_session: bool,
+    /// The session nonce, which the client must echo in `X-CSRF-Token`
+    /// on state-changing requests. `None` for Basic auth.
+    pub csrf: Option<String>,
+}
+
+/// Current unix time in seconds; `0` on a clock error (which fails expiry
+/// checks closed).
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Constant-time byte slice comparison.  Returns true iff `a == b`.
 /// Avoids short-circuit on length mismatch by always visiting every byte.
@@ -802,6 +974,136 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
             loaded_at,
         ),
     )
+}
+
+// --- /admin/config (WOR-1720) ---
+
+/// `GET /admin/config`: return the current on-disk config YAML plus the
+/// loaded content-hash, which a client passes back as `if_match` on a
+/// write for optimistic concurrency.
+fn handle_config_read(state: &AdminState) -> (u16, &'static str, String) {
+    let path = match state.config_path.as_ref() {
+        Some(p) => p,
+        None => {
+            return (
+                503,
+                "application/json",
+                r#"{"error":"config path not wired"}"#.to_string(),
+            )
+        }
+    };
+    let yaml = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = sanitise_path_in_error(&e.to_string(), path);
+            return (
+                500,
+                "application/json",
+                format!(r#"{{"error":"read config: {}"}}"#, msg.replace('"', "'")),
+            );
+        }
+    };
+    let revision = state
+        .loaded_config_content_hash
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default();
+    (
+        200,
+        "application/json",
+        serde_json::json!({"revision": revision, "yaml": yaml}).to_string(),
+    )
+}
+
+/// `PUT /admin/config`: validate a proposed config, persist it, and
+/// hot-swap the pipeline (WOR-1720). The body is the full `sb.yml`. An
+/// optional `if_match` (the content-hash from `GET /admin/config`) gives
+/// optimistic concurrency: a mismatch is `409`. The config is compiled
+/// before it is written, so an invalid config never clobbers the file.
+/// The swap reuses `handle_reload` (single-flight guard, reload hooks).
+fn handle_config_write(
+    state: &AdminState,
+    body: Option<&str>,
+    if_match: Option<&str>,
+) -> (u16, &'static str, String) {
+    let path = match state.config_path.as_ref() {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                503,
+                "application/json",
+                r#"{"error":"config path not wired"}"#.to_string(),
+            )
+        }
+    };
+    let yaml = match body {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"empty config body"}"#.to_string(),
+            )
+        }
+    };
+    // Optimistic concurrency: reject if the caller's expected revision no
+    // longer matches what is loaded.
+    if let Some(expected) = if_match {
+        let loaded = state
+            .loaded_config_content_hash
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        if loaded.as_deref() != Some(expected) {
+            return (
+                409,
+                "application/json",
+                format!(
+                    r#"{{"error":"revision mismatch","loaded":"{}"}}"#,
+                    loaded.unwrap_or_default()
+                ),
+            );
+        }
+    }
+    // Validate BEFORE writing so a bad config never clobbers the file.
+    let compiled = match sbproxy_config::compile_config(yaml) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"invalid config: {}"}}"#,
+                    e.to_string().replace('"', "'")
+                ),
+            )
+        }
+    };
+    if let Err(e) = crate::pipeline::CompiledPipeline::from_config(compiled) {
+        return (
+            400,
+            "application/json",
+            format!(
+                r#"{{"error":"config does not compile: {}"}}"#,
+                e.to_string().replace('"', "'")
+            ),
+        );
+    }
+    // Persist atomically (temp file + rename in the same directory).
+    let tmp = path.with_extension("sbproxy-tmp");
+    if let Err(e) = std::fs::write(&tmp, yaml.as_bytes()).and_then(|_| std::fs::rename(&tmp, &path))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        let msg = sanitise_path_in_error(&e.to_string(), &path);
+        return (
+            500,
+            "application/json",
+            format!(r#"{{"error":"write config: {}"}}"#, msg.replace('"', "'")),
+        );
+    }
+    // Re-read the just-written file and swap via the shared reload path.
+    handle_reload(state)
 }
 
 // --- /admin/drift ---
@@ -1423,6 +1725,64 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // WOR-1718: recent request log with filters + pagination. Query params:
+    // `status` (exact), `method` (case-insensitive), `path` (substring),
+    // `offset`, `limit`. No params returns the newest entries, unchanged.
+    if path_only == "/api/requests" {
+        let status = rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok());
+        let method_f = rl_query_param(path, "method");
+        let path_f = rl_query_param(path, "path");
+        let offset = rl_query_param(path, "offset")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let limit = rl_query_param(path, "limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(state.config.max_log_entries)
+            .min(state.config.max_log_entries);
+        let entries = state.query_requests(status, method_f, path_f, offset, limit);
+        return match serde_json::to_string(&entries) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+    // WOR-1718: spend summary from the AI cost/token metrics.
+    if path_only == "/api/usage/spend" {
+        let snap = sbproxy_observe::metrics::metrics().snapshot_named(&[
+            "sbproxy_ai_tokens_total",
+            "sbproxy_ai_cost_usd_micros_total",
+        ]);
+        let tokens = snap.get("sbproxy_ai_tokens_total").copied().unwrap_or(0.0);
+        let micros = snap
+            .get("sbproxy_ai_cost_usd_micros_total")
+            .copied()
+            .unwrap_or(0.0);
+        let body = serde_json::json!({
+            "tokens": tokens,
+            "cost_usd": micros / 1_000_000.0,
+        })
+        .to_string();
+        return (200, "application/json", body);
+    }
+    // WOR-1720: config read + write (validate, persist, hot-swap). The
+    // write path is a mutation, so the connection handler's RBAC gate has
+    // already blocked read-only operators before we get here.
+    if path_only == "/admin/config" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_read(state);
+        }
+        if method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("POST") {
+            return handle_config_write(state, body, rl_query_param(path, "if_match"));
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
 
     // --- Route ---
     match path {
@@ -1436,18 +1796,8 @@ pub fn handle_admin_request(
             sbproxy_observe::metrics::metrics().render(),
         ),
 
-        // Recent request log.
-        "/api/requests" => {
-            let entries = state.get_recent_requests(state.config.max_log_entries);
-            match serde_json::to_string(&entries) {
-                Ok(body) => (200, "application/json", body),
-                Err(e) => (
-                    500,
-                    "application/json",
-                    format!(r#"{{"error":"serialization failed: {e}"}}"#),
-                ),
-            }
-        }
+        // Recent request log is handled by the filtered early-return block
+        // above (WOR-1718), which also covers the no-query case.
 
         // Aggregate proxy liveness summary.
         "/api/health" => {
@@ -1540,6 +1890,22 @@ pub fn handle_admin_request(
 // in-process [`AdminRateLimiter`] caps both per-IP and global
 // admin RPS so a misconfigured allowlist cannot be DDoSed.
 
+/// Process-global handle to the running admin state, installed at boot so
+/// the request pipeline's logging hook can feed the request-log ring
+/// buffer + SSE tail (WOR-1718). `None` when the admin server is off.
+static ADMIN_LOG_SINK: std::sync::OnceLock<Arc<AdminState>> = std::sync::OnceLock::new();
+
+/// Install the process-global admin-state handle (first install wins).
+pub fn install_admin_log_sink(state: Arc<AdminState>) {
+    let _ = ADMIN_LOG_SINK.set(state);
+}
+
+/// The running admin state, if the admin server is enabled, for the
+/// pipeline's logging hook to record each completed request.
+pub fn admin_log_sink() -> Option<&'static Arc<AdminState>> {
+    ADMIN_LOG_SINK.get()
+}
+
 /// Spawn the admin server bound to `127.0.0.1:<config.port>`.
 ///
 /// No-ops when `config.enabled` is false. The returned join handle
@@ -1564,8 +1930,17 @@ pub fn spawn_admin_server(
         },
         None => None,
     };
+    // WOR-1717: bind address from config (default loopback), and an IP
+    // allowlist. An empty allowlist keeps the safe loopback-only default;
+    // a configured list (CIDRs) permits remote admin from known networks.
+    let bind_ip: std::net::IpAddr = state
+        .config
+        .bind
+        .parse()
+        .unwrap_or_else(|_| std::net::IpAddr::from([127, 0, 0, 1]));
+    let allow_ips = state.config.allow_ips.clone();
     Some(tokio::spawn(async move {
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let addr = std::net::SocketAddr::new(bind_ip, port);
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -1579,7 +1954,11 @@ pub fn spawn_admin_server(
         };
         tracing::info!(addr = %addr, tls = acceptor.is_some(), "admin server listening");
         let rate_limiter = std::sync::Arc::new(AdminRateLimiter::new(60));
-        let ip_filter = std::sync::Arc::new(AdminIpFilter::localhost_only());
+        let ip_filter = std::sync::Arc::new(if allow_ips.is_empty() {
+            AdminIpFilter::localhost_only()
+        } else {
+            AdminIpFilter::new(allow_ips)
+        });
         loop {
             let (sock, peer) = match listener.accept().await {
                 Ok(p) => p,
@@ -1737,42 +2116,44 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let method = parts.next().unwrap_or("GET");
     let path = parts.next().unwrap_or("/");
     let mut auth_header: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut cookie: Option<String> = None;
+    let mut csrf_header: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
-        if let Some(rest) = line.strip_prefix("Authorization:") {
+        if let Some(rest) = line
+            .strip_prefix("Authorization:")
+            .or_else(|| line.strip_prefix("authorization:"))
+        {
             auth_header = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("authorization:") {
-            auth_header = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("Origin:")
+            .or_else(|| line.strip_prefix("origin:"))
+        {
+            origin = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("Cookie:")
+            .or_else(|| line.strip_prefix("cookie:"))
+        {
+            cookie = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("X-CSRF-Token:")
+            .or_else(|| line.strip_prefix("x-csrf-token:"))
+        {
+            csrf_header = Some(rest.trim().to_string());
         }
     }
-    // WOR-1715: the built-in admin UI serves a real Vite bundle,
-    // including binary assets (fonts, images, wasm) that the `String`
-    // dispatcher path would corrupt. Serve it on the byte path here,
-    // behind the same Basic-auth gate as every other `/admin/*` route
-    // (the IP filter + rate limiter already ran in the accept loop).
-    if crate::admin_ui::path_is_ours(path) {
-        let authed = auth_header
-            .as_deref()
-            .and_then(decode_basic_auth)
-            .map(|(user, pass)| state.check_auth(&user, &pass))
-            .unwrap_or(false);
-        if !authed {
-            let _ =
-                write_admin_response(sock, 401, "application/json", r#"{"error":"Unauthorized"}"#)
-                    .await;
-            return;
-        }
-        if let Some((status, content_type, bytes)) = crate::admin_ui::dispatch_bytes(method, path) {
-            let _ = write_admin_response_bytes(sock, status, content_type, &bytes).await;
-            return;
-        }
+    // WOR-1717: CORS headers for an allowed cross-origin caller (echoed on
+    // every response below), and a direct 204 answer to preflight OPTIONS.
+    let cors = cors_response_headers(origin.as_deref(), &state.config.cors_origins);
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        let _ = write_admin_response_headed(sock, 204, "text/plain", b"", &cors).await;
+        return;
     }
 
-    // Slice the body off the back of the buffer. Only valid when the
-    // headers actually terminated; a malformed pre-header read falls
-    // back to no body (the route's parser then 400s on missing JSON).
+    // Slice the request body off the buffer (needed by login + dispatch).
     let body_owned: Option<String> = match (header_end, content_length) {
         (Some(end), Some(cl)) => {
             let start = end + 4;
@@ -1785,15 +2166,170 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         }
         _ => None,
     };
+
+    // WOR-1714: browser session endpoints, handled before the auth gate.
+    if path == "/admin/login" && is_state_changing(method) {
+        handle_admin_login(
+            sock,
+            &state,
+            auth_header.as_deref(),
+            body_owned.as_deref(),
+            &cors,
+            state.config.tls.is_some(),
+        )
+        .await;
+        return;
+    }
+    if path == "/admin/logout" && is_state_changing(method) {
+        handle_admin_logout(sock, &state, cookie.as_deref(), &cors).await;
+        return;
+    }
+
+    // WOR-1714 / WOR-1716: resolve the operator (session or Basic), enforce
+    // CSRF on cookie-authed mutations and RBAC (read-only cannot mutate),
+    // and audit the action with the operator's identity.
+    let principal = state.resolve_principal(auth_header.as_deref(), cookie.as_deref());
+    let mutating = is_state_changing(method);
+    if let Some(p) = &principal {
+        if p.via_session && mutating {
+            let ok = match (csrf_header.as_deref(), p.csrf.as_deref()) {
+                (Some(h), Some(c)) => constant_time_eq(h.as_bytes(), c.as_bytes()),
+                _ => false,
+            };
+            if !ok {
+                let _ = write_admin_response_headed(
+                    sock,
+                    403,
+                    "application/json",
+                    br#"{"error":"CSRF token missing or invalid"}"#,
+                    &cors,
+                )
+                .await;
+                return;
+            }
+        }
+        if p.role == AdminRole::ReadOnly && mutating {
+            let _ = write_admin_response_headed(
+                sock,
+                403,
+                "application/json",
+                br#"{"error":"forbidden: read-only operator cannot perform this action"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        if mutating {
+            tracing::info!(
+                target: "sbproxy::admin::audit",
+                operator = %p.username,
+                role = %role_label(p.role),
+                method = %method,
+                path = %path,
+                "admin action"
+            );
+        }
+    }
+    // A session-authenticated request synthesizes a Basic header so
+    // `handle_admin_request`'s internal gate accepts it (the RBAC gate
+    // above already ran on the resolved principal).
+    let auth_for_dispatch: Option<String> = if principal.as_ref().is_some_and(|p| p.via_session) {
+        Some(synthesize_basic(
+            &state.config.username,
+            &state.config.password,
+        ))
+    } else {
+        auth_header.clone()
+    };
+
+    // WOR-1718: SSE tail of the request log. Handled here rather than in
+    // `handle_admin_request` because it must own the socket and stream
+    // `data:` events until the client disconnects.
+    if path.split('?').next() == Some("/api/requests/stream") && method.eq_ignore_ascii_case("GET")
+    {
+        if principal.is_none() {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"Unauthorized"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        use tokio::io::AsyncWriteExt;
+        let mut head = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n",
+        );
+        for (k, v) in &cors {
+            head.push_str(k);
+            head.push_str(": ");
+            head.push_str(v);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        if sock.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = sock.write_all(b": connected\n\n").await;
+        let mut rx = state.log_events.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(json) => {
+                    if sock
+                        .write_all(format!("data: {json}\n\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let _ = sock.flush().await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        return;
+    }
+
+    // WOR-1715: the built-in admin UI serves a real Vite bundle,
+    // including binary assets (fonts, images, wasm) that the `String`
+    // dispatcher path would corrupt. Serve it on the byte path here,
+    // behind the same Basic-auth gate as every other `/admin/*` route
+    // (the IP filter + rate limiter already ran in the accept loop).
+    if crate::admin_ui::path_is_ours(path) {
+        // Authenticated by session cookie or Basic (WOR-1714). The SPA
+        // shell loads once the browser is authenticated; its API calls
+        // then carry the session cookie.
+        let authed = principal.is_some();
+        if !authed {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"Unauthorized"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        if let Some((status, content_type, bytes)) = crate::admin_ui::dispatch_bytes(method, path) {
+            let _ = write_admin_response_headed(sock, status, content_type, &bytes, &cors).await;
+            return;
+        }
+    }
+
     // WOR-618: `handle_admin_request` does blocking std::fs reads for
     // `POST /admin/reload` (re-read the config file) and
     // `GET /admin/drift` (re-hash the on-disk config). Both routes can
     // block on slow disks or large config files; run the dispatcher on
     // the blocking pool so the admin listener task keeps accepting new
-    // connections.
+    // connections. `auth_for_dispatch` carries a synthesized Basic header
+    // for session-authenticated requests (WOR-1714).
     let method_owned = method.to_string();
     let path_owned = path.to_string();
-    let auth_owned = auth_header.clone();
+    let auth_owned = auth_for_dispatch;
     let body_for_task = body_owned.clone();
     let state_for_task = state.clone();
     let (status, content_type, body) = match tokio::task::spawn_blocking(move || {
@@ -1817,7 +2353,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             )
         }
     };
-    let _ = write_admin_response(sock, status, content_type, &body).await;
+    let _ = write_admin_response_headed(sock, status, content_type, body.as_bytes(), &cors).await;
 }
 
 /// Locate the byte offset of the `\r\n\r\n` (or LF-only `\n\n` for
@@ -1864,27 +2400,202 @@ async fn write_admin_response<S: tokio::io::AsyncWrite + Unpin>(
 /// Generic over the stream so it works over both plain TCP and TLS
 /// (WOR-1717).
 async fn write_admin_response_bytes<S: tokio::io::AsyncWrite + Unpin>(
-    mut sock: S,
+    sock: S,
     status: u16,
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
+    write_admin_response_headed(sock, status, content_type, body, &[]).await
+}
+
+/// Write an admin response with a byte body plus extra response headers
+/// (WOR-1717 CORS, WOR-1714 `Set-Cookie`). `write_admin_response_bytes`
+/// is the no-extra-headers wrapper.
+async fn write_admin_response_headed<S: tokio::io::AsyncWrite + Unpin>(
+    mut sock: S,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(String, String)],
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let header = format!(
+    let mut header = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
-         WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n\
-         \r\n",
+         WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n",
         status = status,
         reason = reason_phrase(status),
         content_type = content_type,
         len = body.len(),
     );
+    for (k, v) in extra_headers {
+        header.push_str(k);
+        header.push_str(": ");
+        header.push_str(v);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
     sock.write_all(header.as_bytes()).await?;
     sock.write_all(body).await?;
     sock.shutdown().await
+}
+
+/// Build the CORS response headers for an admin request, or an empty vec
+/// when the request's `Origin` is not in the configured allowlist (or no
+/// allowlist is set). `*` matches any origin (echoed back so credentials
+/// still work). WOR-1717.
+fn cors_response_headers(origin: Option<&str>, allowed: &[String]) -> Vec<(String, String)> {
+    match origin {
+        Some(o) if allowed.iter().any(|a| a == o || a == "*") => vec![
+            ("Access-Control-Allow-Origin".to_string(), o.to_string()),
+            (
+                "Access-Control-Allow-Credentials".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "Access-Control-Allow-Methods".to_string(),
+                "GET, POST, PUT, PATCH, DELETE, OPTIONS".to_string(),
+            ),
+            (
+                "Access-Control-Allow-Headers".to_string(),
+                "Authorization, Content-Type, X-CSRF-Token".to_string(),
+            ),
+            ("Vary".to_string(), "Origin".to_string()),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Synthesize a Basic `Authorization` header from the top-level admin
+/// creds. When a request is already session-authenticated (WOR-1714), the
+/// connection handler passes this to `handle_admin_request` so its
+/// internal Basic gate accepts the request without re-checking; the
+/// role-based gate (WOR-1716) already ran on the resolved principal.
+fn synthesize_basic(user: &str, pass: &str) -> String {
+    use base64::Engine;
+    // Standard alphabet, no padding: `base64_decode` uses the standard
+    // alphabet and does not require padding, so this round-trips.
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(format!("{user}:{pass}"))
+    )
+}
+
+/// Whether a method mutates state (drives CSRF + RBAC enforcement).
+fn is_state_changing(method: &str) -> bool {
+    matches!(
+        method.to_ascii_uppercase().as_str(),
+        "POST" | "PUT" | "PATCH" | "DELETE"
+    )
+}
+
+fn role_label(role: AdminRole) -> &'static str {
+    match role {
+        AdminRole::Admin => "admin",
+        AdminRole::ReadOnly => "read_only",
+    }
+}
+
+/// Handle `POST /admin/login` (WOR-1714): verify credentials (Basic header
+/// or a JSON `{username,password}` body) against the top-level admin and
+/// configured operators, mint a session cookie, and return the CSRF token.
+async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
+    sock: S,
+    state: &AdminState,
+    auth_header: Option<&str>,
+    body: Option<&str>,
+    cors: &[(String, String)],
+    secure: bool,
+) {
+    let creds = auth_header.and_then(decode_basic_auth).or_else(|| {
+        body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|v| {
+                Some((
+                    v.get("username")?.as_str()?.to_string(),
+                    v.get("password")?.as_str()?.to_string(),
+                ))
+            })
+    });
+    let (user, pass) = match creds {
+        Some(c) => c,
+        None => {
+            let _ = write_admin_response_headed(
+                sock,
+                400,
+                "application/json",
+                br#"{"error":"missing credentials"}"#,
+                cors,
+            )
+            .await;
+            return;
+        }
+    };
+    let role = match state.check_operator_login(&user, &pass) {
+        Some(r) => r,
+        None => {
+            tracing::warn!(target: "sbproxy::admin::audit", operator = %user, "admin login failed");
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"invalid credentials"}"#,
+                cors,
+            )
+            .await;
+            return;
+        }
+    };
+    let ttl_secs = 8 * 3600;
+    let (token, csrf) = state.session_signer.mint(&user, role, ttl_secs, unix_now());
+    tracing::info!(target: "sbproxy::admin::audit", operator = %user, role = %role_label(role), "admin login");
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}; Max-Age={ttl_secs}",
+        crate::admin_session::SESSION_COOKIE
+    );
+    let mut headers = cors.to_vec();
+    headers.push(("Set-Cookie".to_string(), cookie));
+    let out = serde_json::json!({"role": role_label(role), "csrf_token": csrf, "username": user})
+        .to_string();
+    let _ =
+        write_admin_response_headed(sock, 200, "application/json", out.as_bytes(), &headers).await;
+}
+
+/// Handle `POST /admin/logout` (WOR-1714): revoke the session and clear
+/// the cookie.
+async fn handle_admin_logout<S: tokio::io::AsyncWrite + Unpin>(
+    sock: S,
+    state: &AdminState,
+    cookie_header: Option<&str>,
+    cors: &[(String, String)],
+) {
+    if let Some(ch) = cookie_header {
+        if let Some(tok) =
+            crate::admin_session::cookie_value(ch, crate::admin_session::SESSION_COOKIE)
+        {
+            if let Some(sess) = state.session_signer.verify(&tok, unix_now()) {
+                if let Ok(mut set) = state.revoked_sessions.lock() {
+                    set.insert(sess.nonce);
+                }
+            }
+        }
+    }
+    let clear = format!(
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        crate::admin_session::SESSION_COOKIE
+    );
+    let mut headers = cors.to_vec();
+    headers.push(("Set-Cookie".to_string(), clear));
+    let _ = write_admin_response_headed(
+        sock,
+        200,
+        "application/json",
+        br#"{"status":"logged out"}"#,
+        &headers,
+    )
+    .await;
 }
 
 // --- Tests ---
@@ -1901,6 +2612,10 @@ mod tests {
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
     }
 
@@ -2030,6 +2745,87 @@ mod tests {
         // Newest first: /p7 .. /p3
         assert_eq!(entries[0].path, "/p7");
         assert_eq!(entries[4].path, "/p3");
+    }
+
+    #[test]
+    fn query_requests_filters_and_paginates() {
+        // WOR-1718: filter by status/method/path substring, then paginate.
+        let cfg = AdminConfig {
+            max_log_entries: 100,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(cfg);
+        for i in 0..10u16 {
+            state.log_request(RequestLogEntry {
+                timestamp: format!("t{i}"),
+                origin: "o".to_string(),
+                method: if i % 2 == 0 { "GET" } else { "POST" }.to_string(),
+                path: format!("/api/thing/{i}"),
+                status: if i < 5 { 200 } else { 500 },
+                latency_ms: 1.0,
+                client_ip: "127.0.0.1".to_string(),
+            });
+        }
+        // Status filter.
+        let errs = state.query_requests(Some(500), None, None, 0, 100);
+        assert_eq!(errs.len(), 5);
+        assert!(errs.iter().all(|e| e.status == 500));
+        // Method filter (case-insensitive).
+        let posts = state.query_requests(None, Some("post"), None, 0, 100);
+        assert_eq!(posts.len(), 5);
+        // Path substring.
+        assert_eq!(
+            state
+                .query_requests(None, None, Some("/thing/7"), 0, 100)
+                .len(),
+            1
+        );
+        // Pagination: newest-first, skip 2, take 3.
+        let page = state.query_requests(None, None, None, 2, 3);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].path, "/api/thing/7");
+    }
+
+    #[test]
+    fn config_write_guards() {
+        // WOR-1720: the pre-write guards (empty body, invalid config,
+        // revision mismatch) run before any file write or hot-swap.
+        let dir = tempfile::tempdir().unwrap();
+        let cfgpath = dir.path().join("sb.yml");
+        let original = "proxy:\n  http_bind_port: 8080\norigins: {}\n";
+        std::fs::write(&cfgpath, original).unwrap();
+        let state = AdminState::new(AdminConfig::default())
+            .with_config_path(cfgpath.clone())
+            .with_loaded_config_content_hash("known-revision");
+
+        // Empty body -> 400.
+        assert_eq!(handle_config_write(&state, None, None).0, 400);
+        // Invalid YAML -> 400, and the file is untouched.
+        assert_eq!(
+            handle_config_write(&state, Some("origins: [oops"), None).0,
+            400
+        );
+        // Revision mismatch -> 409 (checked before validation/write).
+        assert_eq!(
+            handle_config_write(&state, Some(original), Some("stale-revision")).0,
+            409
+        );
+        // The on-disk config was never clobbered by the rejected writes.
+        assert_eq!(std::fs::read_to_string(&cfgpath).unwrap(), original);
+    }
+
+    #[test]
+    fn config_read_returns_yaml_and_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgpath = dir.path().join("sb.yml");
+        std::fs::write(&cfgpath, "proxy:\n  http_bind_port: 8080\n").unwrap();
+        let state = AdminState::new(AdminConfig::default())
+            .with_config_path(cfgpath)
+            .with_loaded_config_content_hash("rev-xyz");
+        let (status, _, body) = handle_config_read(&state);
+        assert_eq!(status, 200);
+        assert!(body.contains("http_bind_port"));
+        assert!(body.contains("rev-xyz"));
     }
 
     #[test]
@@ -2243,6 +3039,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2279,6 +3079,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2307,6 +3111,10 @@ origins:
                 password: "secret".to_string(),
                 max_log_entries: 5,
                 tls: None,
+                bind: "127.0.0.1".to_string(),
+                allow_ips: Vec::new(),
+                cors_origins: Vec::new(),
+                operators: Vec::new(),
             })
             .with_config_path(f.path()),
         );
@@ -2405,6 +3213,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2432,6 +3244,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(&bogus)
         .with_loaded_config_content_hash("deadbeefcafe");
@@ -2460,6 +3276,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2506,6 +3326,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
@@ -2665,6 +3489,117 @@ origins:
         assert!(filter.is_allowed("::1"));
     }
 
+    #[test]
+    fn ip_filter_cidr_match() {
+        // WOR-1717: entries that parse as CIDRs match by network.
+        let filter = AdminIpFilter::new(vec!["10.1.0.0/16".to_string(), "192.168.1.5".to_string()]);
+        assert!(filter.is_allowed("10.1.2.3"), "in CIDR");
+        assert!(filter.is_allowed("10.1.255.255"), "in CIDR");
+        assert!(!filter.is_allowed("10.2.0.1"), "outside CIDR");
+        assert!(filter.is_allowed("192.168.1.5"), "exact");
+        assert!(!filter.is_allowed("192.168.1.6"), "exact miss");
+    }
+
+    #[test]
+    fn cors_headers_gate_on_allowed_origin() {
+        // WOR-1717: CORS headers only for a configured origin.
+        let allowed = vec!["https://admin.example.com".to_string()];
+        let h = cors_response_headers(Some("https://admin.example.com"), &allowed);
+        assert!(h
+            .iter()
+            .any(|(k, v)| k == "Access-Control-Allow-Origin" && v == "https://admin.example.com"));
+        assert!(h
+            .iter()
+            .any(|(k, _)| k == "Access-Control-Allow-Credentials"));
+        assert!(cors_response_headers(Some("https://evil.example.com"), &allowed).is_empty());
+        assert!(cors_response_headers(None, &allowed).is_empty());
+        // Wildcard echoes the caller's origin so credentials still work.
+        let star = vec!["*".to_string()];
+        let hs = cors_response_headers(Some("https://any.example.com"), &star);
+        assert!(hs
+            .iter()
+            .any(|(k, v)| k == "Access-Control-Allow-Origin" && v == "https://any.example.com"));
+    }
+
+    #[test]
+    fn session_principal_and_csrf() {
+        // WOR-1714: a valid session cookie resolves the operator, and the
+        // CSRF token equals the session nonce.
+        let state = make_state();
+        let (token, nonce) = state
+            .session_signer
+            .mint("alice", AdminRole::Admin, 3600, unix_now());
+        let cookie = format!("sb_admin_session={token}");
+        let p = state
+            .resolve_principal(None, Some(&cookie))
+            .expect("session resolves");
+        assert!(p.via_session);
+        assert_eq!(p.username, "alice");
+        assert_eq!(p.role, AdminRole::Admin);
+        assert_eq!(p.csrf.as_deref(), Some(nonce.as_str()));
+    }
+
+    #[test]
+    fn revoked_session_rejected() {
+        // WOR-1714: logout revokes the nonce.
+        let state = make_state();
+        let (token, nonce) = state
+            .session_signer
+            .mint("bob", AdminRole::Admin, 3600, unix_now());
+        state.revoked_sessions.lock().unwrap().insert(nonce);
+        let cookie = format!("sb_admin_session={token}");
+        assert!(state.resolve_principal(None, Some(&cookie)).is_none());
+    }
+
+    #[test]
+    fn basic_principal_is_admin() {
+        // make_state uses admin/secret.
+        let state = make_state();
+        let p = state
+            .resolve_principal(Some(&basic_auth("admin", "secret")), None)
+            .expect("basic resolves");
+        assert!(!p.via_session);
+        assert_eq!(p.role, AdminRole::Admin);
+        assert!(state
+            .resolve_principal(Some(&basic_auth("admin", "wrong")), None)
+            .is_none());
+    }
+
+    #[test]
+    fn operator_login_roles() {
+        // WOR-1716: top-level admin is full-access; a configured operator
+        // gets its declared role; wrong password fails.
+        let cfg = AdminConfig {
+            operators: vec![AdminOperator {
+                username: "ro".to_string(),
+                password: "ropass".to_string(),
+                role: AdminRole::ReadOnly,
+            }],
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(cfg);
+        assert_eq!(
+            state.check_operator_login("admin", "changeme"),
+            Some(AdminRole::Admin)
+        );
+        assert_eq!(
+            state.check_operator_login("ro", "ropass"),
+            Some(AdminRole::ReadOnly)
+        );
+        assert_eq!(state.check_operator_login("ro", "bad"), None);
+        assert_eq!(state.check_operator_login("nobody", "x"), None);
+    }
+
+    #[test]
+    fn synthesized_basic_round_trips() {
+        // WOR-1714: the synthesized header decodes back to the creds so
+        // handle_admin_request's Basic gate accepts a session-authed call.
+        let h = synthesize_basic("admin", "s3cret:with:colon");
+        let (u, p) = decode_basic_auth(&h).expect("decodes");
+        assert_eq!(u, "admin");
+        assert_eq!(p, "s3cret:with:colon");
+    }
+
     // --- /healthz + /readyz ---
 
     #[test]
@@ -2738,6 +3673,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_health_registry(registry);
         let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
@@ -2760,6 +3699,10 @@ origins:
             password: "secret".to_string(),
             max_log_entries: 5,
             tls: None,
+            bind: "127.0.0.1".to_string(),
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
         })
         .with_health_registry(registry);
         let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);

@@ -1945,6 +1945,27 @@ pub struct AdminConfig {
     /// HTTP. Leave unset to serve plaintext (loopback default).
     #[serde(default)]
     pub tls: Option<AdminTlsConfig>,
+    /// WOR-1717: address the admin server binds. Defaults to `127.0.0.1`
+    /// (loopback only). Set to `0.0.0.0` or a specific interface for
+    /// remote admin, and pair it with `allow_ips` and `tls`.
+    #[serde(default)]
+    pub bind: Option<String>,
+    /// WOR-1717: IP / CIDR allowlist for admin clients. Empty means
+    /// loopback-only (`127.0.0.1`, `::1`), the safe default. List CIDRs to
+    /// permit remote admin from known networks.
+    #[serde(default)]
+    pub allow_ips: Vec<String>,
+    /// WOR-1717: allowed CORS origins for the admin API, so a separately
+    /// hosted SPA or dev server can call it cross-origin with credentials.
+    /// Empty means no CORS headers are emitted (same-origin only).
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    /// WOR-1716: additional admin operators with roles, for RBAC and an
+    /// attributable audit trail. The top-level `username` / `password` is
+    /// the implicit full-access `admin` operator; each entry here adds a
+    /// read-only or admin identity that logs in with its own credentials.
+    #[serde(default)]
+    pub operators: Vec<AdminOperator>,
 }
 
 /// TLS material for the admin server (WOR-1717): filesystem paths to a
@@ -1957,6 +1978,32 @@ pub struct AdminTlsConfig {
     pub cert: std::path::PathBuf,
     /// Path to the PEM private key file (PKCS#8 or RSA).
     pub key: std::path::PathBuf,
+}
+
+/// An admin operator identity with a role, for RBAC (WOR-1716).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct AdminOperator {
+    /// Login username.
+    pub username: String,
+    /// Login password.
+    pub password: String,
+    /// Role governing which admin actions this operator may perform.
+    #[serde(default)]
+    pub role: AdminRole,
+}
+
+/// Admin RBAC role (WOR-1716). `read_only` may call read (GET) endpoints
+/// only; `admin` may call every admin route.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminRole {
+    /// Read-only: GET / read endpoints only; state-changing routes 403.
+    ReadOnly,
+    /// Full admin: every admin route.
+    #[default]
+    Admin,
 }
 
 fn default_admin_port() -> u16 {
