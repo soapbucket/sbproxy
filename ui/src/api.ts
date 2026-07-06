@@ -437,6 +437,11 @@ export const api = {
   health: () => getJson<HealthResponse>("/health"),
   stats: () => getJson<StatsResponse>("/api/stats"),
   modelHostStatus: () => getJson<ModelHostStatus>("/admin/model-host/status"),
+  // Load (spawn/ready) or evict (unload to free VRAM) a model (WOR-1765).
+  modelHostLoad: (model: string) =>
+    sendJson<unknown>("POST", "/admin/model-host/load", { model }),
+  modelHostEvict: (model: string) =>
+    sendJson<unknown>("POST", "/admin/model-host/evict", { model }),
 
   // Keys
   keys: () => getJson<unknown>("/admin/keys"),

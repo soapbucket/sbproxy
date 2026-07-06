@@ -175,6 +175,8 @@ mutations need the `admin` role.
 | PUT | `/admin/log-level` | Change the log level at runtime, e.g. `{"level":"debug"}` or `{"level":"sbproxy_ai=debug"}`, no restart. |
 | GET | `/api/health/targets` | Per-target health, outlier, and breaker state. |
 | GET | `/admin/model-host/status` | Locally served models, VRAM, keep-alive. |
+| POST | `/admin/model-host/load` | Load (spawn + ready) a model, `{"model":"<catalog id or hf: ref>"}`. |
+| POST | `/admin/model-host/evict` | Unload a model to free VRAM, `{"model":"<name>"}`. |
 | GET | `/admin/cluster/metrics` | Fleet-aggregated metrics (mesh tier; see [observability.md](observability.md)). |
 
 **API keys and upstream credentials.** Full lifecycle over HTTP: create
