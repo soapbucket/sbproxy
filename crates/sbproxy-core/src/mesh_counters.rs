@@ -12,10 +12,13 @@
 //! rather than per-replica.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
+// WOR-1691: parking_lot so the per-request spend/rate recording cannot
+// poison a lock into an `.expect()` panic cascade across workers.
+use parking_lot::Mutex;
 use sbproxy_mesh::state::counter::GCounter;
 use sbproxy_mesh::state::sliding_window::SlidingWindow;
 
@@ -59,7 +62,6 @@ impl MeshKeyCounters {
         if tokens > 0 {
             self.spend_tokens
                 .lock()
-                .expect("spend_tokens lock")
                 .entry(key_id.to_string())
                 .or_default()
                 .increment(&self.node_id, tokens);
@@ -67,7 +69,6 @@ impl MeshKeyCounters {
         if micros > 0 {
             self.spend_micros
                 .lock()
-                .expect("spend_micros lock")
                 .entry(key_id.to_string())
                 .or_default()
                 .increment(&self.node_id, micros);
@@ -78,7 +79,6 @@ impl MeshKeyCounters {
     pub fn spend_tokens(&self, key_id: &str) -> u64 {
         self.spend_tokens
             .lock()
-            .expect("spend_tokens lock")
             .get(key_id)
             .map(GCounter::value)
             .unwrap_or(0)
@@ -89,7 +89,6 @@ impl MeshKeyCounters {
         let micros = self
             .spend_micros
             .lock()
-            .expect("spend_micros lock")
             .get(key_id)
             .map(GCounter::value)
             .unwrap_or(0);
@@ -101,7 +100,6 @@ impl MeshKeyCounters {
         let now = unix_now();
         self.requests
             .lock()
-            .expect("requests lock")
             .entry(key_id.to_string())
             .or_insert_with(|| SlidingWindow::new(RATE_BUCKET_SECS, RATE_WINDOW_BUCKETS))
             .increment(&self.node_id, now);
@@ -112,7 +110,6 @@ impl MeshKeyCounters {
         let now = unix_now();
         self.requests
             .lock()
-            .expect("requests lock")
             .get(key_id)
             .map(|w| w.count(now))
             .unwrap_or(0)
@@ -123,8 +120,8 @@ impl MeshKeyCounters {
     pub fn merge_peer(&self, other: &MeshKeyCounters) {
         merge_gcounters(&self.spend_tokens, &other.spend_tokens);
         merge_gcounters(&self.spend_micros, &other.spend_micros);
-        let mut ours = self.requests.lock().expect("requests lock");
-        for (k, w) in other.requests.lock().expect("peer requests lock").iter() {
+        let mut ours = self.requests.lock();
+        for (k, w) in other.requests.lock().iter() {
             ours.entry(k.clone())
                 .or_insert_with(|| SlidingWindow::new(RATE_BUCKET_SECS, RATE_WINDOW_BUCKETS))
                 .merge(w);
@@ -136,8 +133,8 @@ fn merge_gcounters(
     ours: &Mutex<HashMap<String, GCounter>>,
     theirs: &Mutex<HashMap<String, GCounter>>,
 ) {
-    let mut ours = ours.lock().expect("gcounter lock");
-    for (k, g) in theirs.lock().expect("peer gcounter lock").iter() {
+    let mut ours = ours.lock();
+    for (k, g) in theirs.lock().iter() {
         ours.entry(k.clone()).or_default().merge(g);
     }
 }

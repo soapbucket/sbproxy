@@ -32,21 +32,37 @@ use crate::providers::ProviderFormat;
 /// `path` is the inbound path (e.g. `/v1/chat/completions`) and may
 /// be rewritten by the translator (Anthropic uses `/v1/messages`,
 /// Gemini uses `/v1beta/models/{model}:generateContent`, Bedrock
-/// Converse uses `/model/{modelId}/converse`). The returned
-/// `(body, path)` pair is what the AI client should send upstream.
+/// Converse uses `/model/{modelId}/converse`). The returned path is
+/// what the AI client should send upstream.
+///
+/// The body is borrowed (WOR-1701): a `Some(value)` result carries a
+/// translated body the caller must send, while `None` means the body
+/// passes through unchanged and the caller should send the original
+/// borrowed body. This keeps the common OpenAI / Custom formats
+/// clone-free on the per-attempt path; only the native translators,
+/// which need an owned tree, clone.
 pub fn translate_request(
     format: ProviderFormat,
     path: &str,
-    body: serde_json::Value,
-) -> (serde_json::Value, String) {
+    body: &serde_json::Value,
+) -> (Option<serde_json::Value>, String) {
     match format {
-        ProviderFormat::OpenAi => (body, path.to_string()),
-        ProviderFormat::Anthropic => anthropic::request_to_native(body, path),
-        ProviderFormat::Google => gemini::request_to_native(body, path),
-        ProviderFormat::Bedrock => bedrock::request_to_native(body, path),
+        ProviderFormat::OpenAi => (None, path.to_string()),
+        ProviderFormat::Anthropic => {
+            let (b, p) = anthropic::request_to_native(body.clone(), path);
+            (Some(b), p)
+        }
+        ProviderFormat::Google => {
+            let (b, p) = gemini::request_to_native(body.clone(), path);
+            (Some(b), p)
+        }
+        ProviderFormat::Bedrock => {
+            let (b, p) = bedrock::request_to_native(body.clone(), path);
+            (Some(b), p)
+        }
         // Custom: pass through. Custom-format operators bring their
         // own translator via a plugin; the relay path stays lossless.
-        ProviderFormat::Custom => (body, path.to_string()),
+        ProviderFormat::Custom => (None, path.to_string()),
     }
 }
 

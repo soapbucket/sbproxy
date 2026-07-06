@@ -124,6 +124,9 @@ inventory.workspace = true
 
 # Concurrency and data structures
 arc-swap.workspace = true
+# parking_lot: no-poison mutexes on the request-path budget/mesh
+# counters so a panic while held cannot cascade (WOR-1691).
+parking_lot.workspace = true
 compact_str.workspace = true
 smallvec.workspace = true
 bytes.workspace = true

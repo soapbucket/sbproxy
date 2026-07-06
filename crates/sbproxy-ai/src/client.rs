@@ -353,8 +353,10 @@ impl AiClient {
         body: &serde_json::Value,
     ) -> Result<reqwest::Response> {
         let format = provider_format(provider);
-        let (translated_body, translated_path) =
-            translators::translate_request(format, path, body.clone());
+        let (translated_body, translated_path) = translators::translate_request(format, path, body);
+        // Passthrough formats return `None`; send the original borrowed
+        // body without a clone (WOR-1701).
+        let send_body = translated_body.as_ref().unwrap_or(body);
 
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
@@ -382,7 +384,7 @@ impl AiClient {
             req = req.header("anthropic-version", "2023-06-01");
         }
 
-        let resp = req.json(&translated_body).send().await?;
+        let resp = req.json(send_body).send().await?;
 
         Ok(resp)
     }
@@ -439,14 +441,14 @@ impl AiClient {
         let format = provider_format(provider);
 
         // Translate body and path when the body is present and the
-        // provider format diverges from OpenAI.
+        // provider format diverges from OpenAI. Passthrough formats
+        // return `None`, so `send_body` falls back to the original
+        // borrowed body with no clone (WOR-1701).
         let (translated_body, translated_path) = match body {
-            Some(b) => {
-                let (tb, tp) = translators::translate_request(format, path, b.clone());
-                (Some(tb), tp)
-            }
+            Some(b) => translators::translate_request(format, path, b),
             None => (None, path.to_string()),
         };
+        let send_body: Option<&serde_json::Value> = translated_body.as_ref().or(body);
 
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
@@ -473,8 +475,8 @@ impl AiClient {
             req = req.header("anthropic-version", "2023-06-01");
         }
 
-        if let Some(tb) = translated_body {
-            req = req.header("content-type", "application/json").json(&tb);
+        if let Some(sb) = send_body {
+            req = req.header("content-type", "application/json").json(sb);
         }
 
         let resp = req.send().await?;
@@ -662,7 +664,8 @@ impl AiClient {
             tasks.push(async move {
                 let format = provider_format(&provider);
                 let (translated_body, translated_path) =
-                    translators::translate_request(format, &path_owned, body_owned);
+                    translators::translate_request(format, &path_owned, &body_owned);
+                let send_body = translated_body.as_ref().unwrap_or(&body_owned);
                 let base_url_owned = provider.effective_base_url();
                 let base_url = base_url_owned.trim_end_matches('/');
                 let url = build_url(base_url, &translated_path);
@@ -674,7 +677,7 @@ impl AiClient {
                 if matches!(format, ProviderFormat::Anthropic) {
                     req = req.header("anthropic-version", "2023-06-01");
                 }
-                let resp = req.json(&translated_body).send().await;
+                let resp = req.json(send_body).send().await;
                 (i, provider, resp)
             });
         }
@@ -1135,7 +1138,8 @@ async fn run_shadow_request(
     timeout: std::time::Duration,
 ) {
     let format = provider_format(&provider);
-    let (translated_body, translated_path) = translators::translate_request(format, &path, body);
+    let (translated_body, translated_path) = translators::translate_request(format, &path, &body);
+    let send_body = translated_body.as_ref().unwrap_or(&body);
     let base_url_owned = provider.effective_base_url();
     let base_url = base_url_owned.trim_end_matches('/');
     let url = build_url(base_url, &translated_path);
@@ -1146,7 +1150,7 @@ async fn run_shadow_request(
         .header("content-type", "application/json")
         .header(auth_header, &auth_value)
         .header("x-sbproxy-shadow", "1")
-        .json(&translated_body)
+        .json(send_body)
         .timeout(timeout);
     if matches!(format, ProviderFormat::Anthropic) {
         req = req.header("anthropic-version", "2023-06-01");

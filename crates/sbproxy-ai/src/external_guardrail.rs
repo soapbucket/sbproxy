@@ -152,6 +152,16 @@ pub fn parse_verdict(body: &serde_json::Value) -> GuardrailVerdict {
     GuardrailVerdict { allowed, reason }
 }
 
+/// Process-wide HTTP client shared by every external guardrail check
+/// (WOR-1692). Built once so connections to guardrail endpoints are
+/// pooled and reused across requests; the per-check timeout is applied
+/// on the request builder, not here.
+fn guardrail_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(reqwest::Client::new);
+    &CLIENT
+}
+
 /// Call an external guardrail endpoint with `content` and return its verdict.
 ///
 /// POSTs the provider-shaped request body (see [`provider_request_body`]),
@@ -184,15 +194,13 @@ pub async fn check_external_guardrail(
         }
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(cfg.timeout_ms))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return on_error("client build"),
-    };
-    let mut req = client
+    // WOR-1692: use a shared, process-wide client so a guarded request
+    // reuses the connection pool instead of paying a fresh DNS + TCP +
+    // TLS handshake to the guardrail endpoint on every input and output
+    // check. The per-check timeout moves onto the request builder.
+    let mut req = guardrail_client()
         .post(&cfg.url)
+        .timeout(std::time::Duration::from_millis(cfg.timeout_ms))
         .json(&provider_request_body(cfg.provider, content));
     if let Some(key) = &cfg.api_key {
         let header = cfg.auth_header.as_deref().unwrap_or("Authorization");

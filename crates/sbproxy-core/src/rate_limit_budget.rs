@@ -230,8 +230,11 @@ pub struct RateLimitBudgetRegistry {
     abuse_threshold: u32,
     cooldown: Duration,
     clock: Clock,
-    workspaces: Mutex<HashMap<String, WorkspaceState>>,
-    audit: Mutex<VecDeque<AuditRow>>,
+    // WOR-1691: parking_lot on the request-path locks so a panic while
+    // held cannot poison them into an `.expect()`/`.unwrap()` cascade
+    // that kills every later request.
+    workspaces: parking_lot::Mutex<HashMap<String, WorkspaceState>>,
+    audit: parking_lot::Mutex<VecDeque<AuditRow>>,
 }
 
 impl RateLimitBudgetRegistry {
@@ -243,8 +246,8 @@ impl RateLimitBudgetRegistry {
             abuse_threshold: cfg.escalation.abuse_threshold_throttle_to_suspend.max(1),
             cooldown: Duration::from_secs(cfg.escalation.auto_suspend_cooldown_secs as u64),
             clock: Clock::new(cfg.clock),
-            workspaces: Mutex::new(HashMap::new()),
-            audit: Mutex::new(VecDeque::with_capacity(AUDIT_RING_CAP)),
+            workspaces: parking_lot::Mutex::new(HashMap::new()),
+            audit: parking_lot::Mutex::new(VecDeque::with_capacity(AUDIT_RING_CAP)),
         }
     }
 
@@ -279,10 +282,14 @@ impl RateLimitBudgetRegistry {
     /// metrics + the suspend audit row as side effects.
     pub fn check(&self, workspace: &str) -> BudgetDecision {
         let now = self.clock.now();
-        let mut map = self.workspaces.lock().unwrap();
-        let st = map
-            .entry(workspace.to_string())
-            .or_insert_with(|| self.new_state(now));
+        let mut map = self.workspaces.lock();
+        // WOR-1691: OSS always passes the static "default" key, so avoid
+        // the per-request `workspace.to_string()` that `entry` forces;
+        // allocate the key only on the first-seen miss.
+        if !map.contains_key(workspace) {
+            map.insert(workspace.to_string(), self.new_state(now));
+        }
+        let st = map.get_mut(workspace).expect("inserted above if absent");
 
         Self::settle_cooldown(st, now, self.sustained, self.burst);
 
@@ -380,7 +387,7 @@ impl RateLimitBudgetRegistry {
             reason = %row.reason,
             "rate-limit auto-suspend"
         );
-        let mut ring = self.audit.lock().unwrap();
+        let mut ring = self.audit.lock();
         if ring.len() == AUDIT_RING_CAP {
             ring.pop_front();
         }
@@ -392,7 +399,7 @@ impl RateLimitBudgetRegistry {
     /// the post-cool-down tier.
     pub fn effective(&self, workspace: &str) -> (u64, Tier) {
         let now = self.clock.now();
-        let mut map = self.workspaces.lock().unwrap();
+        let mut map = self.workspaces.lock();
         let st = map
             .entry(workspace.to_string())
             .or_insert_with(|| self.new_state(now));
@@ -412,7 +419,7 @@ impl RateLimitBudgetRegistry {
 
     /// The most recent audit rows, newest first, capped at `limit`.
     pub fn recent_audit(&self, limit: usize) -> Vec<AuditRow> {
-        let ring = self.audit.lock().unwrap();
+        let ring = self.audit.lock();
         ring.iter().rev().take(limit).cloned().collect()
     }
 
@@ -421,7 +428,7 @@ impl RateLimitBudgetRegistry {
     /// tier is current. Sorted by workspace id.
     pub fn snapshot(&self) -> Vec<WorkspaceStatus> {
         let now = self.clock.now();
-        let mut map = self.workspaces.lock().unwrap();
+        let mut map = self.workspaces.lock();
         let mut out: Vec<WorkspaceStatus> = map
             .iter_mut()
             .map(|(name, st)| {
@@ -448,7 +455,7 @@ impl RateLimitBudgetRegistry {
     /// audit row. Returns `false` if the workspace is not tracked.
     pub fn resume(&self, workspace: &str) -> bool {
         let existed = {
-            let mut map = self.workspaces.lock().unwrap();
+            let mut map = self.workspaces.lock();
             match map.get_mut(workspace) {
                 Some(st) => {
                     st.tier = Tier::Normal;
@@ -475,7 +482,7 @@ impl RateLimitBudgetRegistry {
                 reason = %row.reason,
                 "rate-limit manual resume"
             );
-            let mut ring = self.audit.lock().unwrap();
+            let mut ring = self.audit.lock();
             if ring.len() == AUDIT_RING_CAP {
                 ring.pop_front();
             }
