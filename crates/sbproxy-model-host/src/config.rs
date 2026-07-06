@@ -424,7 +424,7 @@ impl ServeEntry {
     pub fn keep_alive_duration(&self) -> Option<std::time::Duration> {
         self.keep_alive
             .as_deref()
-            .and_then(crate::launch::parse_duration)
+            .and_then(|s| sbproxy_util::parse_duration(s).ok())
     }
 
     /// The model id this entry registers under (WOR-1683): the explicit
@@ -525,7 +525,7 @@ impl ModelHostConfig {
         // keep_alive durations parse.
         for e in &self.models {
             if let Some(ka) = &e.keep_alive {
-                if crate::launch::parse_duration(ka).is_none() {
+                if sbproxy_util::parse_duration(ka).is_err() {
                     return Err(format!(
                         "serve model '{}' has an invalid keep_alive '{ka}'",
                         e.model

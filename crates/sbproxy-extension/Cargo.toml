@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 sbproxy-plugin.workspace = true
+sbproxy-util.workspace = true
 sbproxy-config.workspace = true
 # WOR-152 PR β: MCP federation records
 # `sbproxy_mcp_policy_hook_invocations_total` on every pre-tool-call

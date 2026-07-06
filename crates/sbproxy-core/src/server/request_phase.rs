@@ -3891,13 +3891,10 @@ fn decode_ed25519_seed(s: &str) -> Result<[u8; 32], String> {
             trimmed.len()
         ));
     }
-    let mut out = [0u8; 32];
-    for (i, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Ok(out)
+    let decoded = hex::decode(trimmed).map_err(|e| e.to_string())?;
+    decoded
+        .try_into()
+        .map_err(|_| "ed25519 signing_key must decode to exactly 32 bytes".to_string())
 }
 
 fn hex_nibble(b: u8) -> Result<u8, String> {
@@ -4105,13 +4102,7 @@ fn decode_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
             trimmed.len()
         ));
     }
-    let mut out = Vec::with_capacity(trimmed.len() / 2);
-    for chunk in trimmed.as_bytes().chunks(2) {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
+    hex::decode(trimmed).map_err(|e| e.to_string())
 }
 
 // --- WOR-892 PR2: OIDC callback handler ---

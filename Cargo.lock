@@ -8279,6 +8279,7 @@ dependencies = [
  "sbproxy-platform",
  "sbproxy-plugin",
  "sbproxy-security",
+ "sbproxy-util",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -8460,6 +8461,7 @@ dependencies = [
  "sbproxy-security",
  "sbproxy-tls",
  "sbproxy-transport",
+ "sbproxy-util",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -8544,6 +8546,7 @@ dependencies = [
  "sbproxy-config",
  "sbproxy-observe",
  "sbproxy-plugin",
+ "sbproxy-util",
  "semver",
  "serde",
  "serde_json",
@@ -8687,6 +8690,7 @@ dependencies = [
  "mistralrs",
  "nvml-wrapper",
  "reqwest 0.12.28",
+ "sbproxy-util",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -8748,6 +8752,7 @@ dependencies = [
  "sbproxy-plugin",
  "sbproxy-security",
  "sbproxy-transport",
+ "sbproxy-util",
  "sbproxy-vault",
  "semver",
  "serde",
@@ -8792,6 +8797,7 @@ dependencies = [
  "reqwest 0.12.28",
  "sbproxy-plugin",
  "sbproxy-security",
+ "sbproxy-util",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -8962,6 +8968,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "sbproxy-util"
+version = "0.1.0"
 
 [[package]]
 name = "sbproxy-vault"

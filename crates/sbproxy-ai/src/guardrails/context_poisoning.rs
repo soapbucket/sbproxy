@@ -434,6 +434,10 @@ fn is_hex_byte(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
 
+// Intentionally NOT `hex::decode`: the odd-length tolerance here (a
+// trailing lone nibble is dropped rather than rejected) is load-bearing
+// for the obfuscation scanner, which probes arbitrary hex-ish runs that
+// may not be cleanly byte-aligned.
 fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -474,15 +478,8 @@ fn snippet_at(content: &str, pos: usize, len: usize) -> String {
     while e < content.len() && !content.is_char_boundary(e) {
         e += 1;
     }
-    let mut out = content[s..e].to_string();
-    if out.len() > max {
-        out.truncate(max);
-        // Walk back to a char boundary.
-        while !out.is_char_boundary(out.len()) {
-            out.pop();
-        }
-    }
-    out.replace('\n', " ")
+    let out = content[s..e].to_string();
+    sbproxy_util::truncate_utf8(&out, max).replace('\n', " ")
 }
 
 #[cfg(test)]

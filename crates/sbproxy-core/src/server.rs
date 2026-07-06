@@ -1281,16 +1281,7 @@ fn redact_field_value(raw: &str) -> String {
         raw.to_string()
     };
 
-    if cleaned.len() <= REDACTED_FIELD_CAP {
-        cleaned
-    } else {
-        // Truncate on a char boundary so utf-8 stays valid.
-        let mut end = REDACTED_FIELD_CAP;
-        while end > 0 && !cleaned.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &cleaned[..end])
-    }
+    sbproxy_util::truncate_utf8_with_marker(&cleaned, REDACTED_FIELD_CAP, "...").into_owned()
 }
 
 // --- WOR-87 fake-sink capture helper ---
@@ -2748,7 +2739,7 @@ fn is_request_https(listener_is_tls: bool, peer_trusted: bool, xfp: Option<&str>
 ///
 /// Async and non-blocking: an IP-literal host is checked directly with
 /// no DNS, and a hostname is resolved once via
-/// [`ssrf::resolve_host_addrs`] (getaddrinfo on tokio's blocking pool,
+/// `ssrf::resolve_host_addrs` (getaddrinfo on tokio's blocking pool,
 /// `await`ed with a 2s timeout) instead of the old per-request OS-thread
 /// spawn that blocked the async worker. The verdict is fail-closed: any
 /// resolve error, timeout, or empty result rejects, and any resolved
@@ -2769,14 +2760,16 @@ async fn guard_upstream(
     let ips: Vec<std::net::IpAddr> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         vec![ip]
     } else {
-        let addrs = ssrf::resolve_host_addrs(host, port).await.map_err(|reason| {
-            warn!(upstream_host = %host, reason = %reason, "SSRF: blocked upstream URL");
-            Error::because(
-                ErrorType::ConnectError,
-                "SSRF: blocked upstream URL",
-                anyhow::anyhow!(reason),
-            )
-        })?;
+        let addrs = ssrf::resolve_host_addrs(host, port)
+            .await
+            .map_err(|reason| {
+                warn!(upstream_host = %host, reason = %reason, "SSRF: blocked upstream URL");
+                Error::because(
+                    ErrorType::ConnectError,
+                    "SSRF: blocked upstream URL",
+                    anyhow::anyhow!(reason),
+                )
+            })?;
         if addrs.is_empty() {
             warn!(upstream_host = %host, "SSRF: upstream resolved to no addresses");
             return Err(Error::because(

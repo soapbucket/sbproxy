@@ -12,6 +12,7 @@ members = [
     "crates/sbproxy-platform",
     "crates/sbproxy-cache",
     "crates/sbproxy-transport",
+    "crates/sbproxy-util",
     "crates/sbproxy-vault",
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
@@ -47,6 +48,7 @@ default-members = [
     "crates/sbproxy-platform",
     "crates/sbproxy-cache",
     "crates/sbproxy-transport",
+    "crates/sbproxy-util",
     "crates/sbproxy-vault",
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
@@ -87,6 +89,7 @@ sbproxy-observe = { path = "crates/sbproxy-observe" }
 sbproxy-platform = { path = "crates/sbproxy-platform" }
 sbproxy-cache = { path = "crates/sbproxy-cache" }
 sbproxy-transport = { path = "crates/sbproxy-transport" }
+sbproxy-util = { path = "crates/sbproxy-util" }
 sbproxy-vault = { path = "crates/sbproxy-vault" }
 sbproxy-keystore = { path = "crates/sbproxy-keystore" }
 sbproxy-storage = { path = "crates/sbproxy-storage" }

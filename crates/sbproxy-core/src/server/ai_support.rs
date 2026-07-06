@@ -478,24 +478,8 @@ fn truncate_ai_trace_content(input: &str) -> String {
 }
 
 fn truncate_utf8_with_marker(input: &str, max_bytes: usize) -> String {
-    if input.len() <= max_bytes {
-        return input.to_string();
-    }
-    if max_bytes <= AI_TRACE_CONTENT_TRUNCATED_MARKER.len() {
-        let mut boundary = max_bytes;
-        while boundary > 0 && !AI_TRACE_CONTENT_TRUNCATED_MARKER.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        return AI_TRACE_CONTENT_TRUNCATED_MARKER[..boundary].to_string();
-    }
-    let mut boundary = max_bytes - AI_TRACE_CONTENT_TRUNCATED_MARKER.len();
-    while boundary > 0 && !input.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    let mut out = String::with_capacity(boundary + AI_TRACE_CONTENT_TRUNCATED_MARKER.len());
-    out.push_str(&input[..boundary]);
-    out.push_str(AI_TRACE_CONTENT_TRUNCATED_MARKER);
-    out
+    sbproxy_util::truncate_utf8_with_marker(input, max_bytes, AI_TRACE_CONTENT_TRUNCATED_MARKER)
+        .into_owned()
 }
 
 #[derive(Default)]

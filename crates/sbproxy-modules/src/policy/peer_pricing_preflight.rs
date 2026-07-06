@@ -119,29 +119,7 @@ impl<'de> Deserialize<'de> for DurationString {
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty duration".into());
-    }
-    let (num_part, unit_part): (String, String) =
-        s.chars().partition(|c| c.is_ascii_digit() || *c == '.');
-    if num_part.is_empty() {
-        return Err(format!("no digits in duration {s:?}"));
-    }
-    let n: f64 = num_part.parse().map_err(|e| format!("bad number: {e}"))?;
-    let unit = unit_part.trim();
-    let secs = match unit {
-        "" | "s" => n,
-        "ms" => n / 1000.0,
-        "m" => n * 60.0,
-        "h" => n * 3600.0,
-        "d" => n * 86400.0,
-        other => return Err(format!("unknown duration unit {other:?}")),
-    };
-    if secs < 0.0 {
-        return Err("negative duration".into());
-    }
-    Ok(Duration::from_secs_f64(secs))
+    sbproxy_util::parse_duration(s)
 }
 
 /// What the policy does when a peer has not published a parseable
@@ -514,7 +492,7 @@ fn pick_matching_route(
     let candidates: Vec<&PricedRoute> = manifest
         .routes
         .iter()
-        .filter(|r| route_matches(&r.route_pattern, path))
+        .filter(|r| sbproxy_util::prefix_glob_match(&r.route_pattern, path))
         .collect();
     if candidates.is_empty() {
         return None;
@@ -539,19 +517,6 @@ fn pick_matching_route(
     pool.iter()
         .min_by_key(|r| r.price_micros)
         .map(|r| (**r).clone())
-}
-
-/// Minimal route matcher matching the same prefix-wildcard contract
-/// that [`crate::policy::Tier`] uses. Supports literal paths and a
-/// trailing `*` suffix wildcard. Anything else falls back to literal
-/// equality. Kept private to keep the matcher inside the policy so
-/// the public surface stays the policy itself.
-fn route_matches(pattern: &str, path: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        path.starts_with(prefix)
-    } else {
-        pattern == path
-    }
 }
 
 /// Best-effort parse of the agent's `Accept` header into a set of
@@ -922,6 +887,7 @@ on_no_manifest: allow
 
     #[test]
     fn route_matches_supports_literal_and_wildcard() {
+        use sbproxy_util::prefix_glob_match as route_matches;
         assert!(route_matches("/a", "/a"));
         assert!(!route_matches("/a", "/a/"));
         assert!(route_matches("/a/*", "/a/"));

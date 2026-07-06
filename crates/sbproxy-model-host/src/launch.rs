@@ -30,46 +30,6 @@ use crate::config::{EngineKind, KvCacheQuant};
 use crate::fit::FitPlan;
 use crate::supervisor::{EngineLauncher, LaunchSpec};
 
-/// Parse a keep-alive / timeout duration in the compact form the
-/// config uses (`90s`, `10m`, `1h`, `1h30m`). Bare digits are
-/// seconds. Returns `None` on anything unparseable so config
-/// validation can reject it rather than silently defaulting.
-pub fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // Bare integer means seconds.
-    if let Ok(secs) = s.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    let mut total = 0u64;
-    let mut num = String::new();
-    let mut saw_unit = false;
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            num.push(ch);
-        } else {
-            let value: u64 = num.parse().ok()?;
-            num.clear();
-            let unit_secs = match ch {
-                's' => 1,
-                'm' => 60,
-                'h' => 3600,
-                'd' => 86400,
-                _ => return None,
-            };
-            total = total.checked_add(value.checked_mul(unit_secs)?)?;
-            saw_unit = true;
-        }
-    }
-    // A trailing number with no unit (e.g. "1h30") is malformed.
-    if !num.is_empty() || !saw_unit {
-        return None;
-    }
-    Some(Duration::from_secs(total))
-}
-
 /// Build the launch spec (program + argv + env) for an engine.
 ///
 /// The argument templates are owned here, not in config, which is
@@ -1066,23 +1026,6 @@ mod tests {
         assert_eq!(chunk_size_for_ttft(250, 10_000.0), 2500);
         // A tiny SLO clamps to the floor.
         assert_eq!(chunk_size_for_ttft(1, 10_000.0), MIN_PREFILL_CHUNK);
-    }
-
-    #[test]
-    fn duration_parsing() {
-        assert_eq!(parse_duration("90"), Some(Duration::from_secs(90)));
-        assert_eq!(parse_duration("90s"), Some(Duration::from_secs(90)));
-        assert_eq!(parse_duration("10m"), Some(Duration::from_secs(600)));
-        assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_duration("1h30m"), Some(Duration::from_secs(5400)));
-        assert_eq!(parse_duration("2d"), Some(Duration::from_secs(172800)));
-    }
-
-    #[test]
-    fn duration_rejects_garbage() {
-        for bad in ["", "  ", "abc", "1h30", "10x", "m", "1.5h"] {
-            assert_eq!(parse_duration(bad), None, "{bad:?} should not parse");
-        }
     }
 
     // --- ProcessEngineLauncher against a fake process ---

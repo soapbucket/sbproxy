@@ -194,14 +194,7 @@ fn sha256_hex(text: &str) -> (String, [u8; 32]) {
 }
 
 fn truncate(text: &str, max_len: usize) -> &str {
-    if text.len() <= max_len {
-        return text;
-    }
-    let mut idx = max_len;
-    while idx > 0 && !text.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    &text[..idx]
+    sbproxy_util::truncate_utf8(text, max_len)
 }
 
 /// Classify a single message using the policy's detector, caching the

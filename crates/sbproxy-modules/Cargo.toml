@@ -61,6 +61,7 @@ a2a = ["a2a-anthropic", "a2a-google"]
 
 [dependencies]
 sbproxy-plugin.workspace = true
+sbproxy-util.workspace = true
 sbproxy-config.workspace = true
 sbproxy-middleware.workspace = true
 sbproxy-extension.workspace = true

@@ -58,6 +58,7 @@ inprocess-embed = ["dep:sbproxy-classifiers"]
 
 [dependencies]
 sbproxy-plugin.workspace = true
+sbproxy-util.workspace = true
 sbproxy-config.workspace = true
 sbproxy-tls.workspace = true
 sbproxy-modules.workspace = true

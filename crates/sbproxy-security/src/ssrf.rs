@@ -296,9 +296,9 @@ fn resolve_with_timeout(addr_str: &str, timeout: Duration) -> Result<Vec<SocketA
 }
 
 /// Async, non-caching resolve of `host:port` to its full address set,
-/// giving up after [`DNS_RESOLUTION_TIMEOUT`] (WOR-1689).
+/// giving up after the `DNS_RESOLUTION_TIMEOUT` (WOR-1689).
 ///
-/// This is the hot-path counterpart to [`resolve_with_timeout`]: it runs
+/// This is the hot-path counterpart to `resolve_with_timeout`: it runs
 /// `getaddrinfo` on tokio's shared blocking pool and `await`s it, so a
 /// slow or hostile resolver yields the worker instead of pinning it, and
 /// no per-request OS thread is spawned. It deliberately does NOT cache:

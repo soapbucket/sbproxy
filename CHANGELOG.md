@@ -11,6 +11,20 @@ Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+### Changed
+
+- **Duration strings parse consistently everywhere.** The `ms`/`s`/`m`/`h`/`d`
+  units, compound forms like `1h30m`, decimals like `1.5h`, and a bare
+  number (seconds) are now accepted by every duration field, instead of
+  each config block supporting a different subset (so a value like `1h`
+  that parsed in one block and errored in another now works in both). This
+  only widens what is accepted; no previously valid value changes meaning.
+- **Unresolvable upstream hosts always fail closed.** The upstream SSRF
+  guard no longer blocks the request worker on a per-request DNS resolve
+  (it resolves asynchronously now), and as part of that an upstream host
+  that fails to resolve is uniformly rejected, closing an edge where an
+  origin with a private-CIDR allowlist could previously fail open.
+
 ### Removed
 
 - **Two rate-limit config options that parsed but never enforced anything
@@ -22,6 +36,11 @@ of the new YAML fields below until the version that ships them.
   these keys keep loading (the keys are ignored). The live limits are
   unaffected: the top-level workspace `rate_limits:` budget, and the AI
   gateway's `model_rate_limits` / per-surface limits, all still enforce.
+- **Two build-only feature flags that nothing enabled were removed**
+  (`sbproxy-platform/postgres-store` and an unused `sbproxy-modules`
+  rate-limit feature), along with roughly 4,300 lines of verified
+  zero-caller internal code. No shipped configuration or public API
+  changes; the redb/SQLite storage stack is unaffected.
 
 ### Added
 

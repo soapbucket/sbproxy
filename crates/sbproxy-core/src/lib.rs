@@ -46,6 +46,8 @@ pub mod agent_class;
 /// `check_policies` enum-arm dispatch in `server.rs` is unchanged.
 /// See `docs/adr-policy-engine-unification.md`.
 pub mod builtin_enforcers;
+/// P0 edge capture wired into the request pipeline.
+pub mod capture_envelope;
 /// WOR-1721: fleet-wide metric aggregation over the mesh.
 pub mod cluster_metrics;
 pub mod context;
@@ -92,8 +94,6 @@ pub mod server;
 /// fires an in-process request through the compiled handler chain
 /// and feeds the verdict into the `/readyz` synthetic probe cache.
 pub mod synthetic;
-/// P0 edge capture wired into the request pipeline.
-pub mod capture_envelope;
 
 // Re-export the main entry point for convenience.
 pub use server::{run, GraceConfig};
