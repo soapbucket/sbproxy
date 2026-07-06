@@ -100,6 +100,10 @@ impl CacheStore for MemoryCacheStore {
         self.data.clear();
         Ok(())
     }
+
+    fn backend_name(&self) -> &'static str {
+        "memory"
+    }
 }
 
 #[cfg(test)]

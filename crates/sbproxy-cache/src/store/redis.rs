@@ -76,11 +76,34 @@ impl CacheStore for RedisCacheStore {
         self.store.delete(&self.full_key(key))
     }
 
+    fn delete_prefix(&self, prefix: &str) -> Result<usize> {
+        // Scan our namespace for keys under `prefix` and delete each. The
+        // scan is scoped to `sbproxy:cache:<prefix>` so it never touches
+        // rate-limit counters or other key spaces sharing the Redis.
+        let full = self.full_key(prefix);
+        let entries = self.store.scan_prefix(&full)?;
+        let mut removed = 0usize;
+        for (k, _) in entries {
+            if self.store.delete(&k).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     fn clear(&self) -> Result<()> {
-        // A `SCAN MATCH prefix*` + DEL would work, but on a shared Redis this
-        // can be destructive and slow. Callers that need a clean slate in
-        // tests should use `MemoryCacheStore` instead. Treat `clear()` as a
-        // best-effort no-op for Redis.
+        // SCAN our cache namespace and DEL each entry. Scoped to
+        // `sbproxy:cache:` so it leaves other key spaces (rate-limit
+        // counters, sessions) on a shared Redis untouched. This is an
+        // operator-initiated purge (admin API), not a hot-path call.
+        let entries = self.store.scan_prefix(self.prefix.as_bytes())?;
+        for (k, _) in entries {
+            let _ = self.store.delete(&k);
+        }
         Ok(())
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "redis"
     }
 }

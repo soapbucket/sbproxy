@@ -75,4 +75,11 @@ pub trait CacheStore: Send + Sync + 'static {
 
     /// Remove all entries.
     fn clear(&self) -> Result<()>;
+
+    /// Short backend name (`"memory"`, `"file"`, `"redis"`, ...) for
+    /// operator surfaces like the admin cache manager, which uses it to
+    /// explain which purge operations the backend actually supports.
+    fn backend_name(&self) -> &'static str {
+        "unknown"
+    }
 }

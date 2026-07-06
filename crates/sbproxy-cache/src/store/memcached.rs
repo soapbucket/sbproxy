@@ -236,6 +236,10 @@ impl CacheStore for MemcachedStore {
 
         Ok(())
     }
+
+    fn backend_name(&self) -> &'static str {
+        "memcached"
+    }
 }
 
 #[cfg(test)]

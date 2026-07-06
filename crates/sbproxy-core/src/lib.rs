@@ -12,6 +12,9 @@
 #![warn(missing_docs)]
 
 pub mod admin;
+/// Cache manager admin API: response-cache stats + purge and key-policy
+/// cache eviction (`/admin/cache*`), WOR-1754 / WOR-1755.
+pub mod admin_cache;
 /// Fleet metrics admin API (`/admin/cluster/metrics`), WOR-1721.
 pub mod admin_cluster;
 /// WOR-1553/1554: key + credential lifecycle REST API mounted on the
