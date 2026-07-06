@@ -67,7 +67,7 @@ async fn maybe_retry_upstream_status(
     ctx: &mut RequestContext,
 ) -> Result<()> {
     let status = upstream_response.status.as_u16();
-    let pipeline = reload::current_pipeline();
+    let pipeline = ctx.pipeline.clone();
     let Some(action) = active_action(&pipeline, ctx) else {
         return Ok(());
     };
@@ -205,7 +205,7 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        let pipeline = reload::current_pipeline();
+        let pipeline = ctx.pipeline.clone();
         let origin_idx = ctx.origin_idx.ok_or_else(|| {
             warn!("upstream_peer called without origin_idx");
             Error::new(ErrorType::HTTPStatus(500))
@@ -516,7 +516,7 @@ impl ProxyHttp for SbProxy {
         let mut grpc_web_request = false;
 
         {
-            let pipeline = reload::current_pipeline();
+            let pipeline = ctx.pipeline.clone();
             if let Some(idx) = ctx.origin_idx {
                 let origin = &pipeline.config.origins[idx];
                 outbound_cred = pipeline.outbound_creds.get(idx).and_then(|o| o.clone());
@@ -926,7 +926,7 @@ impl ProxyHttp for SbProxy {
         // configured header name. The same value is echoed on the
         // downstream response in `response_filter`.
         {
-            let pipeline = reload::current_pipeline();
+            let pipeline = ctx.pipeline.clone();
             let cfg = &pipeline.config.server.correlation_id;
             if cfg.enabled && !ctx.request_id.is_empty() {
                 let _ = upstream_request.insert_header(cfg.header.clone(), ctx.request_id.as_str());
@@ -1320,7 +1320,7 @@ impl ProxyHttp for SbProxy {
         if ctx.flags.debug {
             let _ = upstream_response
                 .insert_header("x-sbproxy-debug-request-id", ctx.request_id.as_str());
-            let pipeline = reload::current_pipeline();
+            let pipeline = ctx.pipeline.clone();
             let _ = upstream_response.insert_header(
                 "x-sbproxy-debug-config-rev",
                 pipeline.config_revision.as_str(),
@@ -1339,7 +1339,7 @@ impl ProxyHttp for SbProxy {
         {
             let status_code = upstream_response.status.as_u16();
             if !(200..300).contains(&status_code) {
-                let pipeline = reload::current_pipeline();
+                let pipeline = ctx.pipeline.clone();
                 if let Some(idx) = ctx.origin_idx {
                     if let Some(origin) = pipeline.config.origins.get(idx) {
                         if let Some(cfg) = origin.proxy_status.as_ref() {
@@ -1480,7 +1480,7 @@ impl ProxyHttp for SbProxy {
         {
             let upstream_status = upstream_response.status.as_u16();
             if let Some(origin_idx) = ctx.origin_idx {
-                let pipeline = reload::current_pipeline();
+                let pipeline = ctx.pipeline.clone();
                 if let Some(fallback) = &pipeline.fallbacks[origin_idx] {
                     if !fallback.on_status.is_empty()
                         && fallback.on_status.contains(&upstream_status)
@@ -1531,7 +1531,7 @@ impl ProxyHttp for SbProxy {
         let mut to_append: Vec<(String, String)> = Vec::new();
 
         {
-            let pipeline = reload::current_pipeline();
+            let pipeline = ctx.pipeline.clone();
             let origin_idx = match ctx.origin_idx {
                 Some(idx) => idx,
                 None => return Ok(()),
@@ -1659,73 +1659,79 @@ impl ProxyHttp for SbProxy {
             }
 
             // 4. Response modifiers (static headers, status override, body replacement, Lua scripts)
-            // Build template context for response modifier interpolation.
-            let tmpl = build_request_template_context(session, ctx, origin);
-            let mut response_headers = response_headers_from_header_map(&upstream_response.headers);
-            for modifier in &origin.response_modifiers {
-                if let Some(hm) = &modifier.headers {
-                    for key in &hm.remove {
-                        to_remove.push(key.clone());
-                        response_headers.remove(key);
+            // WOR-1697: only build the template context and JSON header
+            // map when the origin actually configures response modifiers;
+            // the common no-modifier origin skips both allocations.
+            if !origin.response_modifiers.is_empty() {
+                // Build template context for response modifier interpolation.
+                let tmpl = build_request_template_context(session, ctx, origin);
+                let mut response_headers =
+                    response_headers_from_header_map(&upstream_response.headers);
+                for modifier in &origin.response_modifiers {
+                    if let Some(hm) = &modifier.headers {
+                        for key in &hm.remove {
+                            to_remove.push(key.clone());
+                            response_headers.remove(key);
+                        }
+                        for (key, value) in &hm.set {
+                            let resolved = tmpl.resolve(value);
+                            insert_json_header(&mut response_headers, key, &resolved);
+                            to_set.push((key.clone(), resolved));
+                        }
+                        for (key, value) in &hm.add {
+                            let resolved = tmpl.resolve(value);
+                            insert_json_header(&mut response_headers, key, &resolved);
+                            to_append.push((key.clone(), resolved));
+                        }
                     }
-                    for (key, value) in &hm.set {
-                        let resolved = tmpl.resolve(value);
-                        insert_json_header(&mut response_headers, key, &resolved);
-                        to_set.push((key.clone(), resolved));
+                    // Status code override.
+                    if let Some(status_override) = &modifier.status {
+                        ctx.response_status_override = Some(status_override.code);
                     }
-                    for (key, value) in &hm.add {
-                        let resolved = tmpl.resolve(value);
-                        insert_json_header(&mut response_headers, key, &resolved);
-                        to_append.push((key.clone(), resolved));
+                    // Body replacement (stored for response_body_filter).
+                    if let Some(body_mod) = &modifier.body {
+                        if let Some(json_val) = &body_mod.replace_json {
+                            ctx.response_body_replacement = Some(Bytes::from(json_val.to_string()));
+                        } else if let Some(text) = &body_mod.replace {
+                            ctx.response_body_replacement = Some(Bytes::from(text.clone()));
+                        }
                     }
-                }
-                // Status code override.
-                if let Some(status_override) = &modifier.status {
-                    ctx.response_status_override = Some(status_override.code);
-                }
-                // Body replacement (stored for response_body_filter).
-                if let Some(body_mod) = &modifier.body {
-                    if let Some(json_val) = &body_mod.replace_json {
-                        ctx.response_body_replacement = Some(Bytes::from(json_val.to_string()));
-                    } else if let Some(text) = &body_mod.replace {
-                        ctx.response_body_replacement = Some(Bytes::from(text.clone()));
-                    }
-                }
-                if let Some(script) = &modifier.lua_script {
-                    let status = upstream_response.status.as_u16();
-                    match lua_response_modifier(script, status, &response_headers, ctx) {
-                        Ok(headers) => {
-                            for (key, value) in headers {
-                                insert_json_header(&mut response_headers, &key, &value);
-                                to_set.push((key, value));
+                    if let Some(script) = &modifier.lua_script {
+                        let status = upstream_response.status.as_u16();
+                        match lua_response_modifier(script, status, &response_headers, ctx) {
+                            Ok(headers) => {
+                                for (key, value) in headers {
+                                    insert_json_header(&mut response_headers, &key, &value);
+                                    to_set.push((key, value));
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Lua response modifier script error");
                             }
                         }
-                        Err(e) => {
-                            warn!(error = %e, "Lua response modifier script error");
-                        }
                     }
-                }
-                if let Some(script) = &modifier.js_script {
-                    let status = upstream_response.status.as_u16();
-                    match js_response_modifier(script, status, &response_headers, ctx) {
-                        Ok(headers) => {
-                            for (key, value) in headers {
-                                insert_json_header(&mut response_headers, &key, &value);
-                                to_set.push((key, value));
+                    if let Some(script) = &modifier.js_script {
+                        let status = upstream_response.status.as_u16();
+                        match js_response_modifier(script, status, &response_headers, ctx) {
+                            Ok(headers) => {
+                                for (key, value) in headers {
+                                    insert_json_header(&mut response_headers, &key, &value);
+                                    to_set.push((key, value));
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "JavaScript response modifier script error");
                             }
                         }
-                        Err(e) => {
-                            warn!(error = %e, "JavaScript response modifier script error");
-                        }
                     }
                 }
-            }
+            } // WOR-1697: end response_modifiers guard
         } // pipeline guard dropped here
 
         // 5. Forward rule request modifier headers echoed on response
         // (Go proxy includes forward rule set headers in the response too)
         {
-            let pipeline = reload::current_pipeline();
+            let pipeline = ctx.pipeline.clone();
             if let (Some(idx), Some(fwd_idx)) = (ctx.origin_idx, ctx.forward_rule_idx) {
                 if let Some(fwd_rules) = pipeline.forward_rules.get(idx) {
                     if let Some(fwd_rule) = fwd_rules.get(fwd_idx) {
@@ -1804,7 +1810,7 @@ impl ProxyHttp for SbProxy {
         // for `response.body` resolve to "" - the body-rewriting
         // expression continues to run at body-buffer time as before.
         {
-            let pipeline = reload::current_pipeline();
+            let pipeline = ctx.pipeline.clone();
             if let Some(idx) = ctx.origin_idx {
                 if idx < pipeline.transforms.len() {
                     for compiled in &pipeline.transforms[idx] {
@@ -1876,56 +1882,62 @@ impl ProxyHttp for SbProxy {
         //    block or modify the response. Body size is not yet known
         //    at the header-phase, so we pass None for body_size.
         {
-            let pipeline_a = reload::current_pipeline();
+            let pipeline_a = ctx.pipeline.clone();
             if let Some(idx) = ctx.origin_idx {
                 if let Some(policies) = pipeline_a.policies.get(idx) {
-                    let req = session.req_header();
-                    let method = req.method.as_str().to_string();
-                    let path = req.uri.path().to_string();
-                    let req_headers = req.headers.clone();
-                    let query = req.uri.query().map(|q| q.to_string());
-                    let client_ip = ctx.client_ip.map(|ip| ip.to_string());
-                    let hostname = ctx.hostname.to_string();
-                    let resp_status = upstream_response.status.as_u16();
-                    let resp_headers = upstream_response.headers.clone();
-                    for policy in policies {
-                        if let Policy::Assertion(a) = policy {
-                            let passed = a.evaluate(
-                                &method,
-                                &path,
-                                &req_headers,
-                                query.as_deref(),
-                                client_ip.as_deref(),
-                                &hostname,
-                                resp_status,
-                                &resp_headers,
-                                None,
-                            );
-                            if passed {
-                                tracing::info!(
-                                    target: "sbproxy::assertion",
-                                    assertion = %a.name,
-                                    status = resp_status,
-                                    "assertion passed"
+                    // WOR-1697: the per-origin policy vec almost always
+                    // exists but is usually empty of assertions; skip the
+                    // two HeaderMap clones and the string snapshots unless
+                    // at least one assertion is configured.
+                    if policies.iter().any(|p| matches!(p, Policy::Assertion(_))) {
+                        let req = session.req_header();
+                        let method = req.method.as_str().to_string();
+                        let path = req.uri.path().to_string();
+                        let req_headers = req.headers.clone();
+                        let query = req.uri.query().map(|q| q.to_string());
+                        let client_ip = ctx.client_ip.map(|ip| ip.to_string());
+                        let hostname = ctx.hostname.to_string();
+                        let resp_status = upstream_response.status.as_u16();
+                        let resp_headers = upstream_response.headers.clone();
+                        for policy in policies {
+                            if let Policy::Assertion(a) = policy {
+                                let passed = a.evaluate(
+                                    &method,
+                                    &path,
+                                    &req_headers,
+                                    query.as_deref(),
+                                    client_ip.as_deref(),
+                                    &hostname,
+                                    resp_status,
+                                    &resp_headers,
+                                    None,
                                 );
-                            } else {
-                                tracing::warn!(
-                                    target: "sbproxy::assertion",
-                                    assertion = %a.name,
-                                    status = resp_status,
-                                    expression = %a.expression,
-                                    "assertion failed"
-                                );
+                                if passed {
+                                    tracing::info!(
+                                        target: "sbproxy::assertion",
+                                        assertion = %a.name,
+                                        status = resp_status,
+                                        "assertion passed"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        target: "sbproxy::assertion",
+                                        assertion = %a.name,
+                                        status = resp_status,
+                                        expression = %a.expression,
+                                        "assertion failed"
+                                    );
+                                }
                             }
                         }
-                    }
+                    } // WOR-1697: end has-assertions guard
                 }
             }
         }
 
         // 8. Session cookie: set sbproxy_sid if session_config is present and cookie is absent.
         {
-            let pipeline3 = reload::current_pipeline();
+            let pipeline3 = ctx.pipeline.clone();
             if let Some(origin_idx) = ctx.origin_idx {
                 let origin = &pipeline3.config.origins[origin_idx];
                 if let Some(ref session_cfg) = origin.session {
@@ -1958,7 +1970,7 @@ impl ProxyHttp for SbProxy {
         // 9. Fire on_response callbacks.
         {
             let on_response_callbacks = {
-                let pipeline4 = reload::current_pipeline();
+                let pipeline4 = ctx.pipeline.clone();
                 ctx.origin_idx.and_then(|idx| {
                     let origin = &pipeline4.config.origins[idx];
                     if origin.on_response.is_empty() {
@@ -2003,7 +2015,7 @@ impl ProxyHttp for SbProxy {
         // upstream error path; here we capture application-level
         // errors from the response itself.
         if let Some(target_idx) = ctx.lb_target_idx {
-            let pipeline_o = reload::current_pipeline();
+            let pipeline_o = ctx.pipeline.clone();
             if let Some(origin_idx) = ctx.origin_idx {
                 if let Some(Action::LoadBalancer(lb)) = pipeline_o.actions.get(origin_idx) {
                     let status = upstream_response.status.as_u16();
@@ -2033,7 +2045,7 @@ impl ProxyHttp for SbProxy {
         // hand it to support to find the matching upstream / proxy
         // logs.
         {
-            let pipeline_c = reload::current_pipeline();
+            let pipeline_c = ctx.pipeline.clone();
             let cfg = &pipeline_c.config.server.correlation_id;
             if cfg.enabled && cfg.echo_response && !ctx.request_id.is_empty() {
                 let _ =
@@ -2043,7 +2055,7 @@ impl ProxyHttp for SbProxy {
 
         // 10. Prepare for body transforms: remove Content-Length so Pingora
         //    sends chunked encoding once we buffer and modify the body.
-        let pipeline2 = reload::current_pipeline();
+        let pipeline2 = ctx.pipeline.clone();
         let has_transforms = ctx
             .origin_idx
             .map(|idx| idx < pipeline2.transforms.len() && !pipeline2.transforms[idx].is_empty())
@@ -2366,7 +2378,7 @@ impl ProxyHttp for SbProxy {
                     .map(|pq| pq.as_str().to_string())
                     .unwrap_or_else(|| session.req_header().uri.path().to_string());
                 let result = {
-                    let pipeline = reload::current_pipeline();
+                    let pipeline = ctx.pipeline.clone();
                     let action = ctx.origin_idx.and_then(|idx| {
                         if let Some(fwd_idx) = ctx.forward_rule_idx {
                             pipeline
@@ -2527,7 +2539,7 @@ impl ProxyHttp for SbProxy {
             }
             if end_of_stream {
                 let collected = ctx.request_body_buf.take().unwrap_or_default();
-                let pipeline = reload::current_pipeline();
+                let pipeline = ctx.pipeline.clone();
                 let content_type = session
                     .req_header()
                     .headers
@@ -2844,7 +2856,7 @@ impl ProxyHttp for SbProxy {
             // chunks continue flowing through to the upstream
             // untouched.
             let max_req_bytes = {
-                let pipeline = reload::current_pipeline();
+                let pipeline = ctx.pipeline.clone();
                 ctx.origin_idx
                     .and_then(|i| pipeline.idempotencies.get(i))
                     .and_then(|opt| opt.as_ref())
@@ -2871,7 +2883,7 @@ impl ProxyHttp for SbProxy {
                 let collected = ctx.request_body_buf.take().unwrap_or_default();
                 let body_hash = sbproxy_middleware::idempotency::hash_body(&collected);
                 let header_name = {
-                    let pipeline = reload::current_pipeline();
+                    let pipeline = ctx.pipeline.clone();
                     ctx.origin_idx
                         .and_then(|i| pipeline.idempotencies.get(i))
                         .and_then(|opt| opt.as_ref())
@@ -3166,14 +3178,14 @@ impl ProxyHttp for SbProxy {
                     (key, body_buf, status, headers)
                 {
                     let ttl = {
-                        let pipeline_guard = reload::current_pipeline();
+                        let pipeline_guard = ctx.pipeline.clone();
                         ctx.origin_idx
                             .and_then(|idx| pipeline_guard.config.origins.get(idx))
                             .and_then(|o| o.response_cache.as_ref())
                             .map(|c| c.ttl_secs)
                             .unwrap_or(300)
                     };
-                    let pipeline_for_write = reload::current_pipeline();
+                    let pipeline_for_write = ctx.pipeline.clone();
                     if let Some(cache_store) = pipeline_for_write.cache_store.clone() {
                         let entry = sbproxy_cache::CachedResponse {
                             status,
@@ -3237,7 +3249,7 @@ impl ProxyHttp for SbProxy {
             // marker on the response tells operators we couldn't
             // cache it.
             let max_resp_bytes = {
-                let pipeline = reload::current_pipeline();
+                let pipeline = ctx.pipeline.clone();
                 ctx.origin_idx
                     .and_then(|i| pipeline.idempotencies.get(i))
                     .and_then(|opt| opt.as_ref())
@@ -3272,7 +3284,7 @@ impl ProxyHttp for SbProxy {
                     let headers = ctx.idempotency_response_headers.take();
                     let workspace = ctx.idempotency_workspace.clone().unwrap_or_default();
                     if let (Some(buf), Some(status), Some(headers)) = (buf, status, headers) {
-                        let pipeline = reload::current_pipeline();
+                        let pipeline = ctx.pipeline.clone();
                         if let Some(idem) = ctx
                             .origin_idx
                             .and_then(|i| pipeline.idempotencies.get(i))
@@ -3308,7 +3320,7 @@ impl ProxyHttp for SbProxy {
             return Ok(None);
         }
 
-        let pipeline = reload::current_pipeline();
+        let pipeline = ctx.pipeline.clone();
         let has_transforms = ctx
             .origin_idx
             .map(|i| i < pipeline.transforms.len() && !pipeline.transforms[i].is_empty())
@@ -3666,7 +3678,7 @@ impl ProxyHttp for SbProxy {
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
-        let pipeline = reload::current_pipeline();
+        let pipeline = ctx.pipeline.clone();
         let Some(origin_idx) = ctx.origin_idx else {
             return e;
         };
@@ -3754,7 +3766,7 @@ impl ProxyHttp for SbProxy {
 
         // Check if we have a fallback with on_error configured.
         if let Some(origin_idx) = ctx.origin_idx {
-            let pipeline = reload::current_pipeline();
+            let pipeline = ctx.pipeline.clone();
             if let Some(fallback) = &pipeline.fallbacks[origin_idx] {
                 if fallback.on_error {
                     debug!(
@@ -3805,7 +3817,7 @@ impl ProxyHttp for SbProxy {
         // failure modes hit before request_filter completes the
         // origin lookup).
         let request_path = session.req_header().uri.path().to_string();
-        let pipeline = reload::current_pipeline();
+        let pipeline = ctx.pipeline.clone();
         let origin_cfg = ctx
             .origin_idx
             .and_then(|idx| pipeline.config.origins.get(idx));
@@ -4059,7 +4071,7 @@ impl ProxyHttp for SbProxy {
         // Decrement load balancer connection count if this request used one.
         if let Some(target_idx) = ctx.lb_target_idx.take() {
             if let Some(origin_idx) = ctx.origin_idx {
-                let pipeline = reload::current_pipeline();
+                let pipeline = ctx.pipeline.clone();
                 if let Action::LoadBalancer(lb) = &pipeline.actions[origin_idx] {
                     lb.record_disconnect(target_idx);
                 }
@@ -4178,7 +4190,7 @@ fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
     let grpc_method = ctx.transcode_grpc_method.clone().unwrap_or_default();
     let grpc_status = ctx.transcode_grpc_status.unwrap_or(0);
     let grpc_message = ctx.transcode_grpc_message.clone();
-    let pipeline = reload::current_pipeline();
+    let pipeline = ctx.pipeline.clone();
     let action = ctx.origin_idx.and_then(|idx| {
         if let Some(fwd_idx) = ctx.forward_rule_idx {
             pipeline

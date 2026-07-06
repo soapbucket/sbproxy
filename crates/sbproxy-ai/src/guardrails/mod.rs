@@ -187,6 +187,10 @@ impl Guardrail {
     }
 }
 
+/// Per-pipeline mesh verdict cache: a bounded LRU from a SHA-256 of the
+/// prompt to the flagged labels + reasons (WOR-1694).
+type MeshVerdictCache = lru::LruCache<[u8; 32], (Vec<String>, Vec<String>)>;
+
 /// The guardrail pipeline - runs input and output checks.
 #[derive(Debug, Default)]
 pub struct GuardrailPipeline {
@@ -194,6 +198,18 @@ pub struct GuardrailPipeline {
     pub input: SmallVec<[Guardrail; 4]>,
     /// Guardrails evaluated against model output content.
     pub output: SmallVec<[Guardrail; 4]>,
+    /// Mesh verdict cache, scoped to this compiled pipeline (WOR-1694).
+    ///
+    /// It lives here rather than on the per-request `GuardrailMesh` (which
+    /// is rebuilt each request) so verdicts persist across requests for
+    /// one compiled config while never bleeding across origins: two
+    /// origins with the same guardrail *types* but different configured
+    /// patterns hold separate pipelines, hence separate caches. Keyed by
+    /// a SHA-256 of the prompt text (256-bit, so a crafted collision that
+    /// makes a benign prompt inherit a blocked prompt's verdict is
+    /// infeasible). `None` until the mesh first stores under it; only
+    /// populated when `mesh.cache` is opted in.
+    pub(crate) verdict_cache: parking_lot::Mutex<Option<MeshVerdictCache>>,
 }
 
 impl GuardrailPipeline {

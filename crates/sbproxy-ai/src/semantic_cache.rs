@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 /// How many recent lookup decisions the embedding cache keeps for the
 /// admin debug inspector (WOR-1756).
@@ -291,7 +292,10 @@ pub struct CachedHttpResponse {
 struct EmbeddingEntry {
     /// L2-normalized embedding vector.
     embedding: Vec<f32>,
-    response: CachedHttpResponse,
+    /// Shared so a lookup hit clones an `Arc` pointer rather than the
+    /// whole response (body bytes + header strings) under the entries
+    /// mutex (WOR-1703).
+    response: Arc<CachedHttpResponse>,
     cached_at: u64,
     /// Per-caller scope (hashed tenant + credential). A lookup only
     /// matches an entry with the same scope so one caller's cached
@@ -334,8 +338,10 @@ pub struct EmbeddingCache {
 /// the cosine similarity score that matched it.
 #[derive(Debug, Clone)]
 pub struct EmbeddingHit {
-    /// The cached response to replay.
-    pub response: CachedHttpResponse,
+    /// The cached response to replay. Shared with the cache entry, so
+    /// obtaining it off a hit is a refcount bump, not a body copy
+    /// (WOR-1703).
+    pub response: Arc<CachedHttpResponse>,
     /// Cosine similarity of the query against the matched entry.
     pub score: f32,
 }
@@ -537,7 +543,7 @@ impl EmbeddingCache {
             key,
             EmbeddingEntry {
                 embedding: normalized,
-                response,
+                response: Arc::new(response),
                 cached_at: Self::now_secs(),
                 scope,
             },

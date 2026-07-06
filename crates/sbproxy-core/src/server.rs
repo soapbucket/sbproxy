@@ -1418,9 +1418,21 @@ async fn send_response(
     Ok(())
 }
 
+/// Build a `{"error": "<message>"}` JSON body with the message
+/// correctly escaped (WOR-1738).
+///
+/// The error message can carry client-controlled text (for example an
+/// AI request's `model` field echoed back in a 403), so it must be
+/// escaped rather than interpolated into a hand-built JSON string. A
+/// quote or backslash in the message would otherwise break the envelope
+/// or inject sibling fields.
+pub(super) fn error_json_body(message: &str) -> String {
+    serde_json::json!({ "error": message }).to_string()
+}
+
 /// Send a JSON error response.
 async fn send_error(session: &mut Session, status: u16, message: &str) -> Result<()> {
-    let body = format!("{{\"error\":\"{message}\"}}");
+    let body = error_json_body(message);
     send_response(session, status, "application/json", body.as_bytes()).await
 }
 
@@ -1442,7 +1454,7 @@ async fn send_error_with_extra_headers(
     message: &str,
     extra_headers: &[(String, String)],
 ) -> Result<()> {
-    let body = format!("{{\"error\":\"{message}\"}}");
+    let body = error_json_body(message);
     let mut header = pingora_http::ResponseHeader::build(status, Some(2 + extra_headers.len()))
         .map_err(|e| {
             Error::because(
@@ -2920,6 +2932,14 @@ async fn check_policies(
 ) -> Option<(u16, String, &'static str)> {
     use sbproxy_observe::events::VerdictTag;
 
+    // WOR-1697: an origin with no enforcers is the common case; return
+    // "allow" (None) before materialising the request snapshot. The
+    // caller records the `record_policy(.., "all", "allow")` metric on
+    // the None path, so the empty-chain metric still fires.
+    if enforcers.is_empty() {
+        return None;
+    }
+
     // Materialise the request snapshot once. Built-in wrappers and
     // plugin enforcers share this view; the session-specific data
     // they need (client_ip, hostname, rate_limit_info) lives on
@@ -2939,7 +2959,10 @@ async fn check_policies(
     let mut confirm_state = crate::policy_dispatch::ConfirmReducerState::default();
 
     for compiled in enforcers {
-        let policy_id = compiled.enforcer.policy_type().to_string();
+        // WOR-1697: `policy_type()` is a `&'static str`; keep the borrow
+        // instead of allocating a String per enforcer. `emit_policy_verdict`
+        // takes `&str` and owns its own copy only where it needs one.
+        let policy_id = compiled.enforcer.policy_type();
         let started = std::time::Instant::now();
         let surface = compiled.surface;
         let ctx_any: &mut dyn std::any::Any = ctx;
@@ -2952,7 +2975,7 @@ async fn check_policies(
                     policy = %policy_id,
                     "policy enforce() returned error; treating as deny"
                 );
-                emit_policy_verdict(verdict_ctx, &policy_id, surface, VerdictTag::Deny, started);
+                emit_policy_verdict(verdict_ctx, policy_id, surface, VerdictTag::Deny, started);
                 return Some((500, "policy error".to_string(), "plugin"));
             }
         };
@@ -2961,13 +2984,7 @@ async fn check_policies(
             &mut ctx.policy_response_headers,
             &mut confirm_state,
         );
-        emit_policy_verdict(
-            verdict_ctx,
-            &policy_id,
-            surface,
-            translated.verdict,
-            started,
-        );
+        emit_policy_verdict(verdict_ctx, policy_id, surface, translated.verdict, started);
         if let Some(deny) = translated.deny {
             return Some(deny);
         }

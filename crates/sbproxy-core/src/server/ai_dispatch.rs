@@ -1972,7 +1972,11 @@ pub(super) async fn handle_ai_proxy(
                                 let _ = header.insert_header(name.clone(), value.clone());
                             }
                             let _ = header.insert_header("x-semcache", "HIT");
-                            let body = bytes::Bytes::from(hit.response.body);
+                            // `hit.response` is a shared `Arc` (WOR-1703);
+                            // materialize the body for replay off the
+                            // cache lock rather than deep-cloning the
+                            // response inside the critical section.
+                            let body = bytes::Bytes::from(hit.response.body.clone());
                             // WOR-1094: a cache hit is a zero-cost
                             // ledger transaction, not an absent one.
                             // Record the served tokens under the

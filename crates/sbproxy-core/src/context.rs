@@ -109,6 +109,17 @@ pub struct RequestContext {
     /// Index into `CompiledConfig.origins`, set after host routing.
     pub origin_idx: Option<usize>,
 
+    // --- Pipeline snapshot ---
+    /// The compiled pipeline snapshot this request runs against, pinned
+    /// once at request start (WOR-1690). Every Pingora phase after
+    /// `request_filter` reads config, actions, origins, policies, and
+    /// fallbacks through this field instead of re-loading the global
+    /// pipeline, so `origin_idx` and the collections it indexes always
+    /// come from the same snapshot. A hot reload mid-request no longer
+    /// risks a panic or a cross-origin config read; the request simply
+    /// completes on the config it started with.
+    pub pipeline: std::sync::Arc<crate::pipeline::CompiledPipeline>,
+
     // --- Auth state ---
     /// Authentication result, populated by the auth phase.
     pub auth_result: Option<AuthDecision>,
@@ -981,6 +992,7 @@ impl RequestContext {
             hostname: CompactString::default(),
             tenant_id: CompactString::const_new("__default__"),
             origin_idx: None,
+            pipeline: crate::reload::current_pipeline_full(),
             lb_target_idx: None,
             retry_count: 0,
             retry_backoff_ms: None,

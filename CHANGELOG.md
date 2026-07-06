@@ -56,6 +56,26 @@ of the new YAML fields below until the version that ships them.
   fails closed unless `failure_mode_allow` is set. Tokens that carry no mapped
   claim are unaffected.
 
+- **Error responses now emit valid JSON when the message contains a quote or
+  backslash.** The shared `send_error` helper and the ledger, policy, and
+  storage error paths built the `{"error": "..."}` body by string
+  interpolation, so a message carrying a client-supplied value (for example a
+  rejected AI `model` name) could break the JSON envelope or inject a sibling
+  field. Every error body is now serialized, so the message is always escaped.
+
+- **JSON threat protection now scans the whole request body.** The depth, key,
+  and size checks read only the first body chunk, so a JSON payload whose
+  oversized structure began past the first chunk could slip past the scan while
+  the full body still reached the upstream. The scan now accumulates the
+  complete body, bounded by `max_total_size` (or a hard ceiling when unset),
+  before validating it.
+
+- **The in-memory idempotency cache and the native SSE reassembly buffer are
+  now bounded.** The single-instance idempotency store grew without limit under
+  unique keys and is now a capacity-bounded LRU. The native streaming framer
+  buffered upstream bytes until a frame boundary and now caps the reassembly
+  buffer, so an upstream that never closes a frame cannot grow it without limit.
+
 ## [1.4.0] - 2026-06-27
 
 Fourth minor release on the Rust v1.x line. Hardening and reach for the

@@ -24,7 +24,8 @@ pub(super) async fn request_filter(
     // correlation header, adopt that value so upstream callers can
     // tie their traces to ours. Otherwise generate a fresh UUID v4.
     if ctx.request_id.is_empty() {
-        let cfg = &reload::current_pipeline().config.server.correlation_id;
+        let pipeline = ctx.pipeline.clone();
+        let cfg = &pipeline.config.server.correlation_id;
         let inbound = if cfg.enabled {
             session
                 .req_header()
@@ -88,7 +89,7 @@ pub(super) async fn request_filter(
     // upstream_request_filter.
     let peer_trusted: bool;
     {
-        let pipeline = reload::current_pipeline();
+        let pipeline = ctx.pipeline.clone();
         peer_trusted = ctx
             .client_ip
             .map(|ip| {
@@ -435,7 +436,7 @@ pub(super) async fn request_filter(
         // operator's `sidecar_header_allowlist`. The canonical
         // `x-sbproxy-tls-*` family is always honoured for backward
         // compat with the day-5 wire shape.
-        let pipeline = reload::current_pipeline();
+        let pipeline = ctx.pipeline.clone();
         let tls_cfg = &pipeline.tls_fingerprint_config;
         let capture_disabled =
             tls_cfg.enabled && tls_cfg.mode == crate::pipeline::TlsFingerprintMode::Disabled;
@@ -636,7 +637,7 @@ pub(super) async fn request_filter(
     // allocation-light. Default off, so deployments that do not enable
     // agent detection skip this block entirely.
     {
-        let pipeline = reload::current_pipeline();
+        let pipeline = ctx.pipeline.clone();
         if pipeline.agent_detect_config.enabled {
             if let Some(scorer) = reload::agent_detect_scorer() {
                 let tls = ctx
@@ -988,7 +989,7 @@ pub(super) async fn request_filter(
         // the pipeline lazily here because the main `pipeline`
         // binding for this request_filter scope is loaded later
         // (after the intake short-circuits on the report path).
-        let raw_log_enabled = reload::current_pipeline().page_shield_raw_report_log;
+        let raw_log_enabled = ctx.pipeline.page_shield_raw_report_log;
         if raw_log_enabled {
             let raw = String::from_utf8_lossy(&buf).into_owned();
             tracing::debug!(
@@ -1031,7 +1032,7 @@ pub(super) async fn request_filter(
     let hostname = hostname_owned.split(':').next().unwrap_or("");
     ctx.hostname = compact_str::CompactString::new(hostname);
 
-    let pipeline = reload::current_pipeline();
+    let pipeline = ctx.pipeline.clone();
     let origin_idx = match pipeline.resolve_origin(hostname) {
         Some(idx) => idx,
         None => {
@@ -1051,7 +1052,7 @@ pub(super) async fn request_filter(
     // single-tenant configs see the same default they had before
     // this PR.
     {
-        let pipeline_guard = reload::current_pipeline();
+        let pipeline_guard = ctx.pipeline.clone();
         ctx.tenant_id = pipeline_guard.config.origins[origin_idx].tenant_id.clone();
     }
 
@@ -1066,7 +1067,7 @@ pub(super) async fn request_filter(
     // an empty body, so signatures over body components fail
     // with a missing-component reason from the verifier.
     {
-        let pipeline_guard = reload::current_pipeline();
+        let pipeline_guard = ctx.pipeline.clone();
         let origin_for_sig = &pipeline_guard.config.origins[origin_idx];
         if let Some(ms_cfg) = origin_for_sig.message_signatures.as_ref() {
             if ms_cfg.verify {
@@ -1604,34 +1605,18 @@ pub(super) async fn request_filter(
     // the authorization endpoint. Intercept BEFORE the normal auth
     // check so the request does not loop on `oidc_check` returning
     // yet another IdP redirect.
-    {
-        let req_path = session.req_header().uri.path();
-        let auth_cfg_value = pipeline.config.origins[origin_idx]
-            .auth_config
-            .as_ref()
-            .cloned();
-        let is_oidc_callback = auth_cfg_value
-            .as_ref()
-            .and_then(|c| c.as_object())
-            .filter(|c| c.get("type").and_then(|v| v.as_str()) == Some("oidc"))
-            .map(|c| {
-                c.get("redirect_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("/oidc/callback")
-            })
-            .map(|p| p == req_path)
-            .unwrap_or(false);
-        if is_oidc_callback {
-            let cfg_json = auth_cfg_value.expect("oidc callback gated on auth_config Some");
-            let oidc_cfg = match sbproxy_modules::auth::oidc::OidcAuth::from_config(cfg_json) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "oidc callback: bad config");
-                    send_error(session, 500, "oidc misconfigured").await?;
-                    return Ok(true);
-                }
-            };
-            handle_oidc_callback(session, &oidc_cfg).await?;
+    //
+    // WOR-1700: read the compiled `OidcAuth` off the pinned pipeline
+    // snapshot instead of deep-cloning the origin's `auth_config` JSON
+    // per request and re-parsing it via `from_config` on every
+    // callback/logout hit. The compiled form carries `redirect_path` /
+    // `logout_path` with the same serde defaults, and config that
+    // compiles to `Auth::Oidc` is already validated at load, so the
+    // old per-request "oidc misconfigured" 500 branch is unreachable
+    // and drops out.
+    if let Some(sbproxy_modules::auth::Auth::Oidc(oidc)) = &pipeline.auths[origin_idx] {
+        if oidc.redirect_path == session.req_header().uri.path() {
+            handle_oidc_callback(session, oidc).await?;
             return Ok(true);
         }
 
@@ -1643,28 +1628,8 @@ pub(super) async fn request_filter(
         // Logout 1.0 §2. Recognised BEFORE the normal auth check so
         // it works for already-expired sessions too. Pure helpers
         // live in `sbproxy_modules::auth::oidc::logout`.
-        let is_oidc_logout = auth_cfg_value
-            .as_ref()
-            .and_then(|c| c.as_object())
-            .filter(|c| c.get("type").and_then(|v| v.as_str()) == Some("oidc"))
-            .map(|c| {
-                c.get("logout_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("/oidc/logout")
-            })
-            .map(|p| p == req_path)
-            .unwrap_or(false);
-        if is_oidc_logout {
-            let cfg_json = auth_cfg_value.expect("oidc logout gated on auth_config Some");
-            let oidc_cfg = match sbproxy_modules::auth::oidc::OidcAuth::from_config(cfg_json) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "oidc logout: bad config");
-                    send_error(session, 500, "oidc misconfigured").await?;
-                    return Ok(true);
-                }
-            };
-            handle_oidc_logout(session, &oidc_cfg).await?;
+        if oidc.logout_path == session.req_header().uri.path() {
+            handle_oidc_logout(session, oidc).await?;
             return Ok(true);
         }
     }
@@ -2111,21 +2076,57 @@ pub(super) async fn request_filter(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let declared_json = content_type.contains("application/json");
-            let body_bytes = session.read_request_body().await?;
-            if let Some(ref body) = body_bytes {
-                // WOR-1150: scan when the Content-Type declares JSON OR the
-                // body is actually JSON-shaped, so a client cannot bypass
-                // the JSON-bomb / depth limits by mislabeling the
-                // Content-Type (e.g. sending a deep JSON body as
-                // text/plain). `check_json_body` enforces the size limit,
-                // so an oversized body trips immediately.
-                let looks_json = body
+            // WOR-1150: scan when the Content-Type declares JSON OR the
+            // body is actually JSON-shaped, so a client cannot bypass the
+            // JSON-bomb / depth limits by mislabeling the Content-Type
+            // (e.g. sending a deep JSON body as text/plain). A JSON body's
+            // first non-whitespace byte is `{`/`[` and lands in the first
+            // transport chunk, so the shape check reads only that chunk.
+            if let Some(first_chunk) = session.read_request_body().await? {
+                let looks_json = first_chunk
                     .iter()
                     .find(|b| !b.is_ascii_whitespace())
                     .map(|b| *b == b'{' || *b == b'[')
                     .unwrap_or(false);
                 if declared_json || looks_json {
-                    if let Err(msg) = threat.check_json_body(body) {
+                    // WOR-1739: accumulate the FULL body, not just the
+                    // first chunk. Pingora delivers the body chunk by
+                    // chunk and mirrors every consumed chunk into its
+                    // retry buffer for upstream replay, so scanning a
+                    // single read left a JSON bomb whose depth / key
+                    // explosion straddled a later chunk unscanned while
+                    // the whole body still reached the origin. Bound the
+                    // buffer by the configured `max_total_size` (or a
+                    // hard ceiling when unset) so a threat-protected
+                    // origin cannot be driven to buffer without limit;
+                    // an over-cap body is rejected exactly as
+                    // `check_json_body` rejects an oversized one.
+                    const THREAT_SCAN_HARD_CAP: usize = 8 * 1024 * 1024;
+                    let size_cap = threat
+                        .json
+                        .as_ref()
+                        .and_then(|j| j.max_total_size)
+                        .unwrap_or(THREAT_SCAN_HARD_CAP);
+                    let mut body_buf: Vec<u8> = first_chunk.to_vec();
+                    let mut over_cap = body_buf.len() > size_cap;
+                    while !over_cap {
+                        match session.read_request_body().await? {
+                            Some(chunk) => {
+                                if body_buf.len().saturating_add(chunk.len()) > size_cap {
+                                    over_cap = true;
+                                } else {
+                                    body_buf.extend_from_slice(&chunk);
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    if over_cap {
+                        debug!("threat protection blocked request: body exceeds size cap");
+                        send_error(session, 413, "request entity too large").await?;
+                        return Ok(true);
+                    }
+                    if let Err(msg) = threat.check_json_body(&body_buf) {
                         debug!(detail = %msg, "threat protection blocked request");
                         send_error(session, 413, "request entity too large").await?;
                         return Ok(true);
@@ -2369,12 +2370,11 @@ pub(super) async fn request_filter(
     // `Default` applies (capture on, no echo, anonymous
     // auto-generate).
     {
-        let headers_owned: http::HeaderMap = session
-            .req_header()
-            .headers
-            .iter()
-            .map(|(n, v)| (n.clone(), v.clone()))
-            .collect();
+        // WOR-1700: `capture_dimensions` takes `&HeaderMap` and
+        // `&mut RequestContext` as separate arguments, and `session` /
+        // `ctx` are disjoint bindings, so borrow the live request
+        // headers directly instead of rebuilding the whole map
+        // entry-by-entry per request.
         let origin_cfg = &pipeline.config.origins[origin_idx];
         let properties_cfg = origin_cfg.properties.clone().unwrap_or_default();
         let sessions_cfg = origin_cfg.sessions.clone().unwrap_or_default();
@@ -2400,7 +2400,7 @@ pub(super) async fn request_filter(
         };
         crate::wave8::capture_dimensions(
             ctx,
-            &headers_owned,
+            &session.req_header().headers,
             &properties_cfg,
             &sessions_cfg,
             &user_cfg,
@@ -2695,7 +2695,7 @@ pub(super) async fn request_filter(
                 // (e.g. a2a_chain_depth_exceeded) fall through to their
                 // own dedicated branches below so their spec-pinned
                 // bodies and headers survive intact.
-                let body = format!("{{\"error\":\"{msg}\"}}");
+                let body = error_json_body(&msg);
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(7)).map_err(|e| {
                         Error::because(
@@ -2753,7 +2753,7 @@ pub(super) async fn request_filter(
                         (
                             "crawler-payment".to_string(),
                             "Crawler-Payment realm=\"ai-crawl\"".to_string(),
-                            format!("{{\"error\":\"{msg}\"}}"),
+                            error_json_body(&msg),
                         )
                     });
                 let mut header =
@@ -2797,7 +2797,7 @@ pub(super) async fn request_filter(
                     .crawl_challenge
                     .take()
                     .map(|(_, _, body)| body)
-                    .unwrap_or_else(|| format!("{{\"error\":\"{msg}\"}}"));
+                    .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
                         Error::because(
@@ -2823,7 +2823,7 @@ pub(super) async fn request_filter(
                     .crawl_challenge
                     .take()
                     .map(|(_, _, body)| body)
-                    .unwrap_or_else(|| format!("{{\"error\":\"{msg}\"}}"));
+                    .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
                         Error::because(
@@ -2848,7 +2848,7 @@ pub(super) async fn request_filter(
                     .crawl_challenge
                     .take()
                     .map(|(_, _, body)| body)
-                    .unwrap_or_else(|| format!("{{\"error\":\"{msg}\"}}"));
+                    .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(3)).map_err(|e| {
                         Error::because(
@@ -2881,7 +2881,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .a2a_denial_body
                     .take()
-                    .unwrap_or_else(|| format!("{{\"error\":\"{msg}\"}}"));
+                    .unwrap_or_else(|| error_json_body(&msg));
                 let header_count = if policy_type == "a2a_chain_depth_exceeded" {
                     3
                 } else {
@@ -3314,10 +3314,12 @@ pub(super) async fn request_filter(
     }
 
     // --- Forward rules: path/header/query routing to inline origins ---
-    let request_path = session.req_header().uri.path().to_string();
-    let request_query = session.req_header().uri.query().map(|q| q.to_string());
     let fwd_rules = &pipeline.forward_rules[origin_idx];
     if !fwd_rules.is_empty() {
+        // WOR-1697: only snapshot the path/query strings when there are
+        // forward rules to match against.
+        let request_path = session.req_header().uri.path().to_string();
+        let request_query = session.req_header().uri.query().map(|q| q.to_string());
         for (rule_idx, fwd_rule) in fwd_rules.iter().enumerate() {
             // Each `MatcherEntry` ANDs path/header/query; entries in the
             // list are ORed. `match_request` returns the captured path
