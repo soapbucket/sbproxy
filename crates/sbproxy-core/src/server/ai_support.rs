@@ -835,6 +835,7 @@ pub(super) fn budget_preflight(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
     providers: &[sbproxy_ai::ProviderConfig],
+    shared: &std::collections::HashMap<String, sbproxy_ai::UsageRecord>,
 ) -> BudgetGate {
     for (limit_idx, key) in keys {
         let limit = &cfg.limits[*limit_idx];
@@ -842,7 +843,18 @@ pub(super) fn budget_preflight(
         // keys are bucketed per-limit period, so checking one period's key
         // against another period's cap (as the all-limits path would) is
         // wrong.
-        let result = match BUDGET_TRACKER.check_limit(limit, key, &cfg.on_exceed) {
+        //
+        // WOR-1722: enforce against the cluster-shared total for this key
+        // when one is available (shared budgets on), so a fleet enforces
+        // one budget instead of N times the per-instance cap. The shared
+        // total is >= the local one, so this only ever blocks earlier, not
+        // later. Falls back to the local tracker when no shared view
+        // exists (`shared` empty, or a Redis read failed upstream).
+        let usage = shared
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| BUDGET_TRACKER.get_usage(key));
+        let result = match BUDGET_TRACKER.check_against(limit, &usage, &cfg.on_exceed) {
             Some(r) => r,
             None => continue,
         };

@@ -3219,6 +3219,9 @@ use ai_support::*;
 mod ai_dispatch;
 use ai_dispatch::*;
 
+// WOR-1722: cluster-shared AI budget counters (optional Redis backend).
+pub(crate) mod budget_share;
+
 // WOR-1680: process-global local model host for serve: providers.
 pub(crate) mod model_host;
 
