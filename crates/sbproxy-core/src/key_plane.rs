@@ -574,6 +574,18 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
             .or_else(|| cfg.store.url.clone()),
         _ => None,
     };
+    // WOR-1722: when a Redis key store is configured (clustered mode),
+    // reuse the same Redis for cluster-shared AI budget counters so a
+    // fleet enforces one budget instead of N times the per-instance cap.
+    // Absent a Redis key store, budgets stay per-instance (the floor).
+    if let Some(url) = subscribe_url.clone() {
+        let store = sbproxy_platform::storage::AsyncRedisKVStore::new(
+            sbproxy_platform::storage::AsyncRedisConfig::new(&url),
+        );
+        crate::server::budget_share::install_shared_budget(store);
+        tracing::info!("cluster-shared AI budgets enabled (Redis key store)");
+    }
+
     if let Some(url) = subscribe_url {
         key_runtime().spawn(async move {
             loop {

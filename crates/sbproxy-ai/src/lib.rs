@@ -61,7 +61,10 @@ pub mod usage_parser;
 pub mod usage_sink;
 
 pub use batch::{BatchJob, BatchStatus, BatchStore, MemoryBatchStore};
-pub use budget::{cheapest_model, estimate_cost, BudgetConfig, BudgetTracker, OnExceedAction};
+pub use budget::{
+    cheapest_model, estimate_cost, BudgetConfig, BudgetLimit, BudgetTracker, OnExceedAction,
+    UsageRecord,
+};
 pub use client::AiClient;
 pub use concurrency::ConcurrencyLimiter;
 pub use context_compress::{estimate_message_tokens, trim_to_budget};

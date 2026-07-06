@@ -132,6 +132,21 @@ impl AsyncKVStore for AsyncRedisKVStore {
         Ok(n)
     }
 
+    async fn incr_by_with_ttl(&self, key: &[u8], amount: i64, ttl_secs: u64) -> Result<i64> {
+        let mut c = self.conn().await?;
+        // Redis INCRBY (via `incr` with a non-1 amount) then EXPIRE. Same
+        // non-atomicity note as incr_with_ttl: the next call re-asserts
+        // the TTL. Accumulates arbitrary spend into a shared counter.
+        let n: i64 = c.incr(key, amount).await.context("redis INCRBY failed")?;
+        if ttl_secs > 0 {
+            let _: bool = c
+                .expire(key, ttl_secs as i64)
+                .await
+                .context("redis EXPIRE failed")?;
+        }
+        Ok(n)
+    }
+
     async fn delete(&self, key: &[u8]) -> Result<()> {
         let mut c = self.conn().await?;
         let _: i64 = c.del(key).await.context("redis DEL failed")?;

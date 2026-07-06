@@ -499,6 +499,8 @@ origins:
 
 Set token or dollar caps that apply across a workspace, a single virtual key, an end user, a model, an origin, or a metadata tag. The `budget` block sits under `action` and is parsed by `BudgetConfig` in `crates/sbproxy-ai/src/budget.rs`.
 
+By default the counters are per-instance (an in-process tracker), so a cluster of N replicas enforces roughly N times a given cap. When the key store runs on Redis (a `key_management` Redis backend, which is the clustered deployment shape), the same Redis also accumulates the spend and enforcement reads the shared total, so the fleet enforces one budget. Nothing extra is configured: cluster-shared budgets turn on whenever a Redis key store is present. If Redis is briefly unreachable the shared read fails open to the local tracker, so the per-instance count stays the floor.
+
 ```yaml
 action:
   type: ai_proxy

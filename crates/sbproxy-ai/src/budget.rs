@@ -242,7 +242,20 @@ impl BudgetTracker {
         scope_key: &str,
         on_exceed: &OnExceedAction,
     ) -> Option<BudgetCheckResult> {
-        let usage = self.get_usage(scope_key);
+        self.check_against(limit, &self.get_usage(scope_key), on_exceed)
+    }
+
+    /// Compare an explicit usage total against a single limit, without
+    /// reading the local tracker. This lets a caller enforce against a
+    /// total sourced elsewhere, in particular a shared cluster counter
+    /// (WOR-1722), so a fleet enforces one budget instead of N times the
+    /// per-instance cap. [`Self::check_limit`] is the local-usage wrapper.
+    pub fn check_against(
+        &self,
+        limit: &BudgetLimit,
+        usage: &UsageRecord,
+        on_exceed: &OnExceedAction,
+    ) -> Option<BudgetCheckResult> {
         if let Some(max_tokens) = limit.max_tokens {
             if usage.tokens >= max_tokens {
                 return Some(BudgetCheckResult {

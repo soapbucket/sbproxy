@@ -1184,7 +1184,11 @@ pub(super) async fn handle_ai_proxy(
             Some(hostname),
             tag_header.as_deref(),
         );
-        match budget_preflight(budget_cfg, &keys, &config.providers) {
+        // WOR-1722: pre-fetch the cluster-shared spend for these keys so
+        // the preflight enforces against the fleet total (empty map, hence
+        // local-only, when shared budgets are off).
+        let shared_spend = super::budget_share::read_shared_for_keys(&keys).await;
+        match budget_preflight(budget_cfg, &keys, &config.providers, &shared_spend) {
             BudgetGate::Allow => {
                 // WOR-1544: predictive soft-landing. Below the hard cap,
                 // warn and then downgrade as a scope approaches its
@@ -3705,6 +3709,17 @@ pub(super) async fn relay_ai_response_with_cache(
                 budget_prompt_tokens,
                 budget_completion_tokens,
             );
+            // WOR-1722: also accumulate into the cluster-shared counters
+            // (no-op without a shared store) so other replicas enforce
+            // against this spend.
+            super::budget_share::record_shared_budget_usage(
+                args.config,
+                args.keys,
+                args.model,
+                budget_prompt_tokens,
+                budget_completion_tokens,
+            )
+            .await;
             // Emit a surface-tagged AiBillingEvent alongside the
             // existing budget recording. Token-bearing responses
             // emit a Tokens variant. Image generation responses use
@@ -4793,6 +4808,15 @@ pub(super) async fn relay_ai_stream(
                     tokens.prompt_tokens as u64,
                     tokens.completion_tokens as u64,
                 );
+                // WOR-1722: mirror into the cluster-shared counters.
+                super::budget_share::record_shared_budget_usage(
+                    args.config,
+                    args.keys,
+                    args.model,
+                    tokens.prompt_tokens as u64,
+                    tokens.completion_tokens as u64,
+                )
+                .await;
                 let prompt = tokens.prompt_tokens as u64;
                 let completion = tokens.completion_tokens as u64;
                 // WOR-798: feed the router's per-provider token
