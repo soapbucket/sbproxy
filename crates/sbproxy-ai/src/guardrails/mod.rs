@@ -113,6 +113,19 @@ impl Guardrail {
     /// Role-aware check for the context-poisoning guardrail. Other
     /// guardrails fall back to text-only [`Guardrail::check`].
     pub fn check_messages(&self, messages: &[Message]) -> Option<GuardrailBlock> {
+        self.check_with_text(&extract_text_from_messages(messages), messages)
+    }
+
+    /// Like [`Guardrail::check_messages`] but with the prompt text
+    /// already extracted by the caller (WOR-1692).
+    ///
+    /// The role-aware guards (context poisoning, agent alignment) still
+    /// consume `messages`; every text guard reuses the single `content`
+    /// extraction instead of re-joining the whole prompt once per guard,
+    /// so a pipeline of G text guards makes one full-text copy rather
+    /// than G. `content` must be `extract_text_from_messages(messages)`
+    /// so the text each guard sees is byte-identical to today.
+    pub fn check_with_text(&self, content: &str, messages: &[Message]) -> Option<GuardrailBlock> {
         match self {
             Self::ContextPoisoning(g) => g.check_messages(messages),
             // Alignment needs the raw body to see `tool_calls`;
@@ -120,7 +133,7 @@ impl Guardrail {
             // text-fallback path so alignment does not flag on
             // every benign user message.
             Self::AgentAlignment(_) => None,
-            _ => self.check(&extract_text_from_messages(messages)),
+            _ => self.check(content),
         }
     }
 
@@ -232,8 +245,11 @@ impl GuardrailPipeline {
     /// `cp_conflicting_directive` rule; every other guardrail uses
     /// the flat text view of the concatenated message bodies.
     pub fn check_input(&self, messages: &[Message]) -> Option<GuardrailBlock> {
+        // WOR-1692: extract the prompt text once and hand it to every
+        // text guard, instead of each guard re-joining the whole prompt.
+        let content = extract_text_from_messages(messages);
         for guard in &self.input {
-            if let Some(block) = guard.check_messages(messages) {
+            if let Some(block) = guard.check_with_text(&content, messages) {
                 return Some(block);
             }
         }

@@ -33,13 +33,6 @@ agent-class = [
     "sbproxy-modules/agent-class",
     "sbproxy-security/agent-class",
 ]
-# `agent-classifier` adds the optional ML agent classifier verdict
-# field on `RequestContext`. The actual ONNX inference and feature
-# builder live in the enterprise
-# crate `sbproxy-classifier`; this flag only widens the per-request
-# context to hold the verdict the enterprise classifier produces. The
-# OSS proxy does not run the classifier itself.
-agent-classifier = ["agent-class"]
 # Forwards through to `sbproxy-tls/tls-fingerprint`,
 # enabling JA3 / JA4 / JA4H capture in the request pipeline. The
 # `tls_fingerprint` and `headless_signal` fields on `RequestContext`

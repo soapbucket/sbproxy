@@ -11,6 +11,18 @@ Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+### Removed
+
+- **Two rate-limit config options that parsed but never enforced anything
+  are gone.** A virtual key's `max_tokens_per_minute` (and the credential
+  policy's `tpm`) and an origin's per-origin `rate_limits:` block both
+  compiled and round-tripped but were never read at request time, so an
+  operator who set them believed they were capped when they were not.
+  They are removed rather than wired. Existing configs that still set
+  these keys keep loading (the keys are ignored). The live limits are
+  unaffected: the top-level workspace `rate_limits:` budget, and the AI
+  gateway's `model_rate_limits` / per-surface limits, all still enforce.
+
 ### Added
 
 - **The released binary is GPU-aware out of the box.** The `gpu-nvidia`

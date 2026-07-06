@@ -1992,16 +1992,6 @@
           "format": "uint64",
           "minimum": 0.0
         },
-        "max_tokens_per_minute": {
-          "description": "Max tokens per minute.",
-          "default": null,
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        },
         "max_budget_tokens": {
           "description": "Max total tokens for this key's budget window.",
           "default": null,
@@ -2965,16 +2955,6 @@
               ],
               "format": "uint64",
               "minimum": 0.0
-            },
-            "tpm": {
-              "description": "Tokens per minute cap.",
-              "default": null,
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint64",
-              "minimum": 0.0
             }
           }
         },
@@ -3447,18 +3427,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "rate_limits": {
-          "description": "Per-origin rate-limit budget. When present, the rate-limit middleware is mounted ahead of policies in the handler chain. When absent, the middleware stays off (backwards compatible with sb.yml configs that use the per-policy `type: rate_limiting` block).",
-          "default": null,
-          "anyOf": [
-            {
-              "$ref": "#/definitions/OriginRateLimitsConfig"
-            },
-            {
-              "type": "null"
-            }
-          ]
         },
         "default_content_shape": {
           "description": "Per-origin default content shape used when the agent's `Accept` header is `*/*` or absent. Threaded into the synthesised `auto_content_negotiate` config by [`crate::compile_origin`]. Recognised values: `markdown`, `json`, `html`, `pdf`, `other`. Unset falls back to `html`.",
@@ -5075,53 +5043,6 @@
           "description": "Maximum total lifetime of a connection, in seconds.\n\nConnections older than this will be closed and replaced even if they are still healthy.  Default: 300 s.",
           "default": 300,
           "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        }
-      }
-    },
-    "OriginRateLimitsConfig": {
-      "description": "Per-origin rate-limit budget configuration.\n\nPer-tenant and per-route token buckets, with an optional `route_overrides:` map that lets an operator pin a specific route to a tighter ceiling than the origin default.",
-      "type": "object",
-      "properties": {
-        "tenant_burst": {
-          "description": "Tenant-level burst. Effective ceiling that a single tenant may briefly exceed when arriving in bursts.",
-          "default": 2000,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "tenant_sustained": {
-          "description": "Tenant-level sustained ceiling (rps). Long-running traffic is flattened to this rate.",
-          "default": 1000,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "route_default": {
-          "description": "Per-route default ceiling (rps). Used when the request path has no entry in `route_overrides`.",
-          "default": 100,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "route_overrides": {
-          "description": "Per-route ceiling overrides keyed by literal path or `/prefix/*` pattern. The first matching entry wins, in iteration order.",
-          "default": {},
-          "type": "object",
-          "additionalProperties": {
-            "type": "integer",
-            "format": "uint32",
-            "minimum": 0.0
-          }
-        },
-        "soft_threshold_rps": {
-          "description": "Optional soft-tier ceiling. When `Some`, requests above this rate but below `tenant_sustained` are tagged but not throttled (useful for telemetry-driven escalation). `None` disables the soft tier.",
-          "default": null,
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint32",
           "minimum": 0.0
         }

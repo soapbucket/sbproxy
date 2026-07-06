@@ -7,8 +7,7 @@
 //! [`sbproxy_modules::ExpressionViews`] bundle from the live
 //! [`RequestContext`] (aipref signal, TLS fingerprint, agent-class
 //! resolver output, optional KYA verifier verdict under the
-//! `agent-class` feature, optional ML classifier verdict under the
-//! `agent-classifier` feature, and the `x-sb-flags` parsed feature
+//! `agent-class` feature, and the `x-sb-flags` parsed feature
 //! flags) and dispatches into
 //! [`sbproxy_modules::policy::ExpressionPolicy::evaluate_with_views`].
 //!
@@ -111,16 +110,6 @@ impl PolicyEnforcer for ExpressionEnforcer {
         #[cfg(not(feature = "agent-class"))]
         let agent_class_view: Option<sbproxy_extension::cel::context::AgentClassView<'_>> = None;
 
-        #[cfg(feature = "agent-classifier")]
-        let ml_view = ctx.ml_classification.as_ref().map(|m| {
-            sbproxy_extension::cel::context::MlClassificationView {
-                class: Some(m.class.as_str()),
-                confidence: Some(m.confidence),
-                model_version: Some(m.model_version),
-                feature_schema_version: Some(m.feature_schema_version),
-            }
-        });
-        #[cfg(not(feature = "agent-classifier"))]
         let ml_view: Option<sbproxy_extension::cel::context::MlClassificationView<'_>> = None;
 
         let features_view = sbproxy_extension::cel::context::FeatureFlagsView {

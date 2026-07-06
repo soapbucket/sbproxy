@@ -133,7 +133,6 @@ fn credential_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
 struct KeyMutation {
     name: Option<String>,
     max_requests_per_minute: Option<u64>,
-    max_tokens_per_minute: Option<u64>,
     max_budget_tokens: Option<u64>,
     max_budget_usd: Option<f64>,
     allowed_models: Option<Vec<String>>,
@@ -161,9 +160,6 @@ fn apply_key_mutation(rec: &mut KeyRecord, m: &KeyMutation) {
     }
     if m.max_requests_per_minute.is_some() {
         rec.max_requests_per_minute = m.max_requests_per_minute;
-    }
-    if m.max_tokens_per_minute.is_some() {
-        rec.max_tokens_per_minute = m.max_tokens_per_minute;
     }
     if m.max_budget_tokens.is_some() || m.max_budget_usd.is_some() {
         let mut b = rec.budget.clone().unwrap_or_default();
@@ -588,7 +584,6 @@ struct KeyView {
     name: Option<String>,
     status: RecordStatus,
     max_requests_per_minute: Option<u64>,
-    max_tokens_per_minute: Option<u64>,
     budget: Option<RecordBudget>,
     allowed_models: Vec<String>,
     blocked_models: Vec<String>,
@@ -621,7 +616,6 @@ impl From<&KeyRecord> for KeyView {
             name: r.name.clone(),
             status: r.status,
             max_requests_per_minute: r.max_requests_per_minute,
-            max_tokens_per_minute: r.max_tokens_per_minute,
             budget: r.budget.clone(),
             allowed_models: r.allowed_models.clone(),
             blocked_models: r.blocked_models.clone(),

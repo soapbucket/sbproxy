@@ -174,7 +174,7 @@ impl GuardrailMesh {
         let (labels, reasons) = match self.cache_lookup(pipeline, &key) {
             Some(hit) => hit,
             None => {
-                let collected = self.collect_cascade(pipeline, messages);
+                let collected = self.collect_cascade(pipeline, messages, content);
                 let labels: Vec<String> = collected.iter().map(|b| b.name.clone()).collect();
                 let reasons: Vec<String> = collected.iter().map(|b| b.reason.clone()).collect();
                 self.cache_store(pipeline, key, &(labels.clone(), reasons.clone()));
@@ -201,6 +201,7 @@ impl GuardrailMesh {
         &self,
         pipeline: &GuardrailPipeline,
         messages: &[Message],
+        content: &str,
     ) -> Vec<GuardrailBlock> {
         // Cheap detectors first so a tight latency budget still gets their
         // verdicts.
@@ -216,7 +217,11 @@ impl GuardrailMesh {
                     break;
                 }
             }
-            if let Some(block) = pipeline.input[idx].check_messages(messages) {
+            // WOR-1692: reuse the text already extracted for the cache
+            // key instead of re-extracting per guard. This also makes the
+            // detector-visible text provably identical to the cache-key
+            // text.
+            if let Some(block) = pipeline.input[idx].check_with_text(content, messages) {
                 out.push(block);
             }
         }

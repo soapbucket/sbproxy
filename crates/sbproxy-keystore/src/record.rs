@@ -79,9 +79,6 @@ pub struct KeyRecord {
     /// Max requests per minute (None = unlimited).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_requests_per_minute: Option<u64>,
-    /// Max tokens per minute (None = unlimited).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens_per_minute: Option<u64>,
     /// Per-key budget caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<RecordBudget>,
@@ -163,7 +160,6 @@ impl KeyRecord {
             name: None,
             status: RecordStatus::Active,
             max_requests_per_minute: None,
-            max_tokens_per_minute: None,
             budget: None,
             allowed_models: Vec::new(),
             blocked_models: Vec::new(),

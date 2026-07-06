@@ -276,8 +276,8 @@ fn now_unix() -> u64 {
 /// keys are unique per logical request and, before this bound, were only
 /// evicted when the same key was re-read, so the memory backend grew
 /// without limit under normal traffic (each entry holds a full response
-/// body). The bound mirrors [`crate::rate_limit::DEFAULT_MAX_KEYS`];
-/// overflow evicts the least-recently-used entry, whose only effect is
+/// body). The bound is a 100,000-entry cap; overflow evicts the
+/// least-recently-used entry, whose only effect is
 /// that a replay of that key past the cap re-executes instead of
 /// serving from cache, the same as after a restart.
 pub const DEFAULT_MAX_ENTRIES: usize = 100_000;

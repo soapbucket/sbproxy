@@ -407,7 +407,6 @@ fn lower_seed_key(
     rec.source = RecordSource::Config;
     rec.name = seed.name.clone();
     rec.max_requests_per_minute = seed.max_requests_per_minute;
-    rec.max_tokens_per_minute = seed.max_tokens_per_minute;
     if seed.max_budget_tokens.is_some() || seed.max_budget_usd.is_some() {
         rec.budget = Some(RecordBudget {
             max_tokens: seed.max_budget_tokens,
@@ -699,7 +698,6 @@ mod tests {
                 secret_hash: None,
                 name: Some("seeded".into()),
                 max_requests_per_minute: Some(10),
-                max_tokens_per_minute: None,
                 max_budget_tokens: Some(1000),
                 max_budget_usd: None,
                 allowed_models: vec![],
@@ -794,7 +792,6 @@ mod tests {
                 secret_hash: None,
                 name: Some("sm-seeded".into()),
                 max_requests_per_minute: None,
-                max_tokens_per_minute: None,
                 max_budget_tokens: None,
                 max_budget_usd: None,
                 allowed_models: vec![],

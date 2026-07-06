@@ -460,22 +460,6 @@ fn collect_endpoints(origin: &sbproxy_config::CompiledOrigin) -> Vec<(String, St
 fn collect_access(origin: &sbproxy_config::CompiledOrigin) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
 
-    if let Some(limits) = &origin.rate_limits {
-        lines.push(format!(
-            "Tenant rate limit: {} rps sustained, {} rps burst.",
-            limits.tenant_sustained, limits.tenant_burst,
-        ));
-        if !limits.route_overrides.is_empty() {
-            lines.push(format!(
-                "Per-route ceilings: {} entries (default {} rps).",
-                limits.route_overrides.len(),
-                limits.route_default,
-            ));
-        }
-    } else {
-        lines.push("No tenant rate limit configured.".to_string());
-    }
-
     match &origin.auth_config {
         Some(auth) => {
             let kind = auth
@@ -501,7 +485,6 @@ mod tests {
     use std::collections::HashMap;
 
     use compact_str::CompactString;
-    use sbproxy_config::types::OriginRateLimitsConfig;
     use sbproxy_config::{CompiledConfig, CompiledOrigin, ProxyServerConfig};
     use serde_json::json;
     use smallvec::smallvec;
@@ -588,7 +571,6 @@ mod tests {
     fn make_origin(
         hostname: &str,
         action_config: serde_json::Value,
-        rate_limits: Option<OriginRateLimitsConfig>,
         auth_config: Option<serde_json::Value>,
         forward_rules: Vec<serde_json::Value>,
     ) -> CompiledOrigin {
@@ -631,7 +613,6 @@ mod tests {
             extensions: HashMap::new(),
             expose_openapi: false,
             stream_safety: Vec::new(),
-            rate_limits,
             auto_content_negotiate: None,
             content_signal: None,
             token_bytes_ratio: None,
@@ -677,11 +658,6 @@ mod tests {
                     {"name": "anthropic", "models": ["claude-3-5-sonnet"]},
                 ],
             }),
-            Some(OriginRateLimitsConfig {
-                tenant_sustained: 500,
-                tenant_burst: 1_000,
-                ..Default::default()
-            }),
             Some(json!({"type": "api_key"})),
             vec![json!({
                 "rules": [{"prefix": "/v1/chat"}],
@@ -693,7 +669,6 @@ mod tests {
         let api = make_origin(
             "api.example.com",
             json!({"type": "proxy", "url": "https://backend.example.com"}),
-            None,
             None,
             Vec::new(),
         );
@@ -726,8 +701,7 @@ mod tests {
         // The "Access" bullets do not carry a `[label](url)` shape;
         // they round-trip as plain bullet lines and the parser skips
         // them. Assert on the raw generated doc to confirm the
-        // rate-limit and auth context are present.
-        assert!(doc.contains("500 rps sustained"));
+        // auth context is present.
         assert!(doc.contains("api_key"));
     }
 
@@ -740,13 +714,11 @@ mod tests {
                 "providers": [{"name": "openai", "models": ["gpt-4o"]}],
             }),
             None,
-            None,
             Vec::new(),
         );
         let b = make_origin(
             "b.example.com",
             json!({"type": "proxy", "url": "https://backend.example.com"}),
-            Some(OriginRateLimitsConfig::default()),
             Some(json!({"type": "basic_auth"})),
             Vec::new(),
         );
@@ -783,7 +755,6 @@ mod tests {
             "h",
             json!({"type": "proxy", "url": "https://backend.example.com"}),
             None,
-            None,
             Vec::new(),
         );
         assert!(collect_models(&origin).is_empty());
@@ -794,7 +765,6 @@ mod tests {
         let origin = make_origin(
             "h",
             json!({"type": "proxy", "url": "https://up.example.com"}),
-            None,
             None,
             vec![json!({
                 "rules": [{"prefix": "/api/v1"}, {"path": "/health"}],

@@ -2311,53 +2311,6 @@ async fn identity_hook_registry_iterates_registered_hooks() {
     let _ = HashMap::<&str, &str>::new();
 }
 
-#[cfg(feature = "agent-classifier")]
-#[tokio::test]
-async fn ml_classifier_hook_registry_iterates_registered_hooks() {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
-    struct CountingHook {
-        calls: Arc<Mutex<u32>>,
-    }
-    impl sbproxy_plugin::MlClassifierHook for CountingHook {
-        fn classify<'a>(
-            &'a self,
-            _snap: &'a sbproxy_plugin::RequestSnapshotView<'a>,
-        ) -> Pin<Box<dyn Future<Output = Option<sbproxy_plugin::MlClassificationResult>> + Send + 'a>>
-        {
-            *self.calls.lock().unwrap() += 1;
-            Box::pin(async move { None })
-        }
-    }
-
-    let calls = Arc::new(Mutex::new(0_u32));
-    sbproxy_plugin::register_ml_classifier_hook(Arc::new(CountingHook {
-        calls: calls.clone(),
-    }));
-    let snap = sbproxy_plugin::RequestSnapshotView {
-        method: "GET",
-        path: "/",
-        query: "",
-        header_count: 0,
-        body_size_bytes: None,
-        accept_header: "",
-        user_agent: "",
-        cookie_present: false,
-        ja4_fingerprint: None,
-        ja4_trustworthy: false,
-        known_headless: false,
-        agent_id_source: None,
-        client_ip: None,
-    };
-    for hook in sbproxy_plugin::ml_classifier_hooks().iter() {
-        let _ = hook.classify(&snap).await;
-    }
-    assert!(*calls.lock().unwrap() >= 1);
-}
-
 #[tokio::test]
 async fn anomaly_hook_registry_iterates_registered_hooks() {
     use std::future::Future;

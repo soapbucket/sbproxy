@@ -41,7 +41,6 @@ fn key_record_to_virtual_key(
             .filter_map(|v| serde_json::from_value(v.clone()).ok())
             .collect(),
         require_pii_redaction: rec.require_pii_redaction.clone(),
-        max_tokens_per_minute: rec.max_tokens_per_minute,
         max_requests_per_minute: rec.max_requests_per_minute,
         budget: rec
             .budget
