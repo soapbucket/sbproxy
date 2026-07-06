@@ -347,6 +347,10 @@ pub struct AdminState {
     /// WOR-1714: revoked session nonces (populated by `POST /admin/logout`),
     /// cleared on restart. Checked on every session verification.
     pub revoked_sessions: Mutex<std::collections::HashSet<String>>,
+    /// WOR-1718: broadcast of each logged request (as JSON) for the SSE
+    /// tail at `GET /api/requests/stream`. A subscriber that falls behind
+    /// the buffer is lagged (skipped), never blocking `log_request`.
+    pub log_events: tokio::sync::broadcast::Sender<String>,
 }
 
 impl AdminState {
@@ -367,6 +371,7 @@ impl AdminState {
             prompt_persistence: None,
             session_signer: crate::admin_session::SessionSigner::random(),
             revoked_sessions: Mutex::new(std::collections::HashSet::new()),
+            log_events: tokio::sync::broadcast::channel(256).0,
         }
     }
 
@@ -486,6 +491,13 @@ impl AdminState {
         if log.len() >= self.config.max_log_entries {
             log.pop_front();
         }
+        // WOR-1718: fan out to the SSE tail before dropping the lock (best
+        // effort; no subscribers or a full buffer is a no-op / lag).
+        if self.log_events.receiver_count() > 0 {
+            if let Ok(json) = serde_json::to_string(&entry) {
+                let _ = self.log_events.send(json);
+            }
+        }
         log.push_back(entry);
     }
 
@@ -496,6 +508,33 @@ impl AdminState {
             .lock()
             .expect("admin log mutex poisoned");
         log.iter().rev().take(limit).cloned().collect()
+    }
+
+    /// Query the recent-request log (newest first) with optional filters
+    /// and pagination (WOR-1718). `status` is an exact code, `method` is
+    /// case-insensitive, `path_sub` is a substring, `offset`/`limit`
+    /// paginate the filtered result.
+    pub fn query_requests(
+        &self,
+        status: Option<u16>,
+        method: Option<&str>,
+        path_sub: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<RequestLogEntry> {
+        let log = self
+            .recent_requests
+            .lock()
+            .expect("admin log mutex poisoned");
+        log.iter()
+            .rev()
+            .filter(|e| status.is_none_or(|s| e.status == s))
+            .filter(|e| method.is_none_or(|m| e.method.eq_ignore_ascii_case(m)))
+            .filter(|e| path_sub.is_none_or(|p| e.path.contains(p)))
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// Validate basic auth credentials using constant-time comparison.
@@ -1556,6 +1595,48 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // WOR-1718: recent request log with filters + pagination. Query params:
+    // `status` (exact), `method` (case-insensitive), `path` (substring),
+    // `offset`, `limit`. No params returns the newest entries, unchanged.
+    if path_only == "/api/requests" {
+        let status = rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok());
+        let method_f = rl_query_param(path, "method");
+        let path_f = rl_query_param(path, "path");
+        let offset = rl_query_param(path, "offset")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let limit = rl_query_param(path, "limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(state.config.max_log_entries)
+            .min(state.config.max_log_entries);
+        let entries = state.query_requests(status, method_f, path_f, offset, limit);
+        return match serde_json::to_string(&entries) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+    // WOR-1718: spend summary from the AI cost/token metrics.
+    if path_only == "/api/usage/spend" {
+        let snap = sbproxy_observe::metrics::metrics().snapshot_named(&[
+            "sbproxy_ai_tokens_total",
+            "sbproxy_ai_cost_usd_micros_total",
+        ]);
+        let tokens = snap.get("sbproxy_ai_tokens_total").copied().unwrap_or(0.0);
+        let micros = snap
+            .get("sbproxy_ai_cost_usd_micros_total")
+            .copied()
+            .unwrap_or(0.0);
+        let body = serde_json::json!({
+            "tokens": tokens,
+            "cost_usd": micros / 1_000_000.0,
+        })
+        .to_string();
+        return (200, "application/json", body);
+    }
 
     // --- Route ---
     match path {
@@ -1569,18 +1650,8 @@ pub fn handle_admin_request(
             sbproxy_observe::metrics::metrics().render(),
         ),
 
-        // Recent request log.
-        "/api/requests" => {
-            let entries = state.get_recent_requests(state.config.max_log_entries);
-            match serde_json::to_string(&entries) {
-                Ok(body) => (200, "application/json", body),
-                Err(e) => (
-                    500,
-                    "application/json",
-                    format!(r#"{{"error":"serialization failed: {e}"}}"#),
-                ),
-            }
-        }
+        // Recent request log is handled by the filtered early-return block
+        // above (WOR-1718), which also covers the no-query case.
 
         // Aggregate proxy liveness summary.
         "/api/health" => {
@@ -2008,6 +2079,57 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     } else {
         auth_header.clone()
     };
+
+    // WOR-1718: SSE tail of the request log. Handled here rather than in
+    // `handle_admin_request` because it must own the socket and stream
+    // `data:` events until the client disconnects.
+    if path.split('?').next() == Some("/api/requests/stream") && method.eq_ignore_ascii_case("GET")
+    {
+        if principal.is_none() {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"Unauthorized"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        use tokio::io::AsyncWriteExt;
+        let mut head = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n",
+        );
+        for (k, v) in &cors {
+            head.push_str(k);
+            head.push_str(": ");
+            head.push_str(v);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        if sock.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = sock.write_all(b": connected\n\n").await;
+        let mut rx = state.log_events.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(json) => {
+                    if sock
+                        .write_all(format!("data: {json}\n\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let _ = sock.flush().await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        return;
+    }
 
     // WOR-1715: the built-in admin UI serves a real Vite bundle,
     // including binary assets (fonts, images, wasm) that the `String`
@@ -2461,6 +2583,45 @@ mod tests {
         // Newest first: /p7 .. /p3
         assert_eq!(entries[0].path, "/p7");
         assert_eq!(entries[4].path, "/p3");
+    }
+
+    #[test]
+    fn query_requests_filters_and_paginates() {
+        // WOR-1718: filter by status/method/path substring, then paginate.
+        let cfg = AdminConfig {
+            max_log_entries: 100,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(cfg);
+        for i in 0..10u16 {
+            state.log_request(RequestLogEntry {
+                timestamp: format!("t{i}"),
+                origin: "o".to_string(),
+                method: if i % 2 == 0 { "GET" } else { "POST" }.to_string(),
+                path: format!("/api/thing/{i}"),
+                status: if i < 5 { 200 } else { 500 },
+                latency_ms: 1.0,
+                client_ip: "127.0.0.1".to_string(),
+            });
+        }
+        // Status filter.
+        let errs = state.query_requests(Some(500), None, None, 0, 100);
+        assert_eq!(errs.len(), 5);
+        assert!(errs.iter().all(|e| e.status == 500));
+        // Method filter (case-insensitive).
+        let posts = state.query_requests(None, Some("post"), None, 0, 100);
+        assert_eq!(posts.len(), 5);
+        // Path substring.
+        assert_eq!(
+            state
+                .query_requests(None, None, Some("/thing/7"), 0, 100)
+                .len(),
+            1
+        );
+        // Pagination: newest-first, skip 2, take 3.
+        let page = state.query_requests(None, None, None, 2, 3);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].path, "/api/thing/7");
     }
 
     #[test]
