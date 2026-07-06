@@ -143,6 +143,35 @@ export function histogramQuantile(
   return prevLe;
 }
 
+/**
+ * Average of a histogram family per label value: `sum(_sum)/sum(_count)`.
+ * Used for per-model token throughput (avg tok/s). Returns descending by
+ * value.
+ */
+export function histogramAvgByLabel(
+  family: MetricFamily | undefined,
+  label: string,
+): { key: string; value: number }[] {
+  if (!family) return [];
+  const sums = new Map<string, number>();
+  const counts = new Map<string, number>();
+  for (const s of family.samples) {
+    const key = s.labels[label];
+    if (key === undefined) continue;
+    if (s.name.endsWith("_sum")) {
+      sums.set(key, (sums.get(key) ?? 0) + s.value);
+    } else if (s.name.endsWith("_count")) {
+      counts.set(key, (counts.get(key) ?? 0) + s.value);
+    }
+  }
+  const out: { key: string; value: number }[] = [];
+  for (const [key, sum] of sums) {
+    const c = counts.get(key) ?? 0;
+    if (c > 0) out.push({ key, value: sum / c });
+  }
+  return out.sort((a, b) => b.value - a.value);
+}
+
 export function findFamily(
   families: MetricFamily[],
   ...names: string[]

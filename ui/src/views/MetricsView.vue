@@ -8,6 +8,7 @@ import {
   groupByLabel,
   sumSamples,
   histogramQuantile,
+  histogramAvgByLabel,
   type MetricFamily,
 } from "../lib/metrics";
 import { formatNumber, formatMs, formatUsd } from "../lib/format";
@@ -138,6 +139,17 @@ const activeConnections = computed(() => {
   return f ? sumSamples(f) : undefined;
 });
 
+// Token throughput (avg tok/s) per model, the standard local-model
+// measure. Populated by streaming completions (WOR-895).
+const throughputByModel = computed(() =>
+  histogramAvgByLabel(
+    findFamily(families.value, "sbproxy_ai_output_throughput_tokens_per_second"),
+    "model",
+  )
+    .map((m) => ({ key: m.key, value: Math.round(m.value * 10) / 10 }))
+    .slice(0, 8),
+);
+
 // Model-host gauges (any sbproxy_model_host_* or sbproxy_*vram* gauge).
 const modelHostGauges = computed(() => {
   const out: { key: string; value: number }[] = [];
@@ -208,6 +220,10 @@ const rawText = computed(() => req.data.value ?? "");
       </div>
 
       <div class="panels">
+        <div class="sb-card" v-if="throughputByModel.length">
+          <h3>Token throughput (avg tok/s)</h3>
+          <MiniBars :items="throughputByModel" />
+        </div>
         <div class="sb-card" v-if="latencyPercentiles.length">
           <h3>Request latency</h3>
           <dl class="pctl">
@@ -245,7 +261,7 @@ const rawText = computed(() => req.data.value ?? "");
 
       <p
         class="sb-faint"
-        v-if="!requestsByStatus.length && !requestsByMethod.length && !requestsByHost.length && !latencyPercentiles.length && !tokensByKind.length && !tokensByProvider.length && !modelHostGauges.length"
+        v-if="!requestsByStatus.length && !requestsByMethod.length && !requestsByHost.length && !latencyPercentiles.length && !throughputByModel.length && !tokensByKind.length && !tokensByProvider.length && !modelHostGauges.length"
       >
         No labelled series matched the known request, latency, token, or model-host families. Use View raw to inspect the full scrape.
       </p>
