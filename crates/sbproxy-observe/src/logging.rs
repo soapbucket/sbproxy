@@ -19,7 +19,41 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use std::sync::Mutex;
+use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
+
+/// Reload handle for the root `EnvFilter`, installed at startup so the
+/// admin API can change the log level of a running proxy (WOR-1759). The
+/// filter layer wraps the base `Registry`, so the handle type is fixed
+/// regardless of the output format.
+static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+/// The current filter directive string, kept alongside the handle since a
+/// `reload::Handle` does not expose its value.
+static CURRENT_FILTER: Mutex<String> = Mutex::new(String::new());
+
+/// The active tracing filter directive (e.g. `info`, `sbproxy_ai=debug`).
+pub fn current_log_filter() -> String {
+    CURRENT_FILTER.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Change the tracing filter of the running process at runtime. Returns
+/// an error if the directive is invalid or the reload handle was never
+/// installed (logging not initialized). Admin-gated by the caller.
+pub fn set_log_filter(directive: &str) -> Result<(), String> {
+    let handle = LOG_RELOAD
+        .get()
+        .ok_or_else(|| "log reload handle not installed".to_string())?;
+    let new = directive
+        .parse::<EnvFilter>()
+        .map_err(|e| format!("invalid filter directive: {e}"))?;
+    handle
+        .reload(new)
+        .map_err(|e| format!("reload failed: {e}"))?;
+    if let Ok(mut g) = CURRENT_FILTER.lock() {
+        *g = directive.to_string();
+    }
+    Ok(())
+}
 
 // --- Logging subscriber config ---
 
@@ -115,6 +149,14 @@ impl LoggingConfig {
             EnvFilter::new(&self.level)
         };
 
+        // WOR-1759: make the root filter reloadable so the admin API can
+        // change the log level at runtime. The handle is stored globally.
+        let (filter_layer, reload_handle) = reload::Layer::new(filter);
+        let _ = LOG_RELOAD.set(reload_handle);
+        if let Ok(mut g) = CURRENT_FILTER.lock() {
+            *g = self.level.clone();
+        }
+
         let otlp = telemetry.and_then(|config| {
             match crate::telemetry::build_otlp_trace_pipeline(config) {
                 Ok(pipeline) => pipeline,
@@ -127,7 +169,7 @@ impl LoggingConfig {
         match self.format.as_str() {
             "json" => {
                 tracing_subscriber::registry()
-                    .with(filter)
+                    .with(filter_layer)
                     .with(fmt::layer().json())
                     .with(otlp.as_ref().map(|pipeline| {
                         tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
@@ -136,7 +178,7 @@ impl LoggingConfig {
             }
             "pretty" => {
                 tracing_subscriber::registry()
-                    .with(filter)
+                    .with(filter_layer)
                     .with(fmt::layer().pretty())
                     .with(otlp.as_ref().map(|pipeline| {
                         tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
@@ -145,7 +187,7 @@ impl LoggingConfig {
             }
             _ => {
                 tracing_subscriber::registry()
-                    .with(filter)
+                    .with(filter_layer)
                     .with(fmt::layer().compact())
                     .with(otlp.as_ref().map(|pipeline| {
                         tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())

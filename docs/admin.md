@@ -171,6 +171,8 @@ mutations need the `admin` role.
 | PUT | `/admin/config` | Validate, persist, and hot-swap a new config (`?if_match=<rev>` for optimistic concurrency). |
 | GET | `/admin/drift` | On-disk config hash vs the loaded one. |
 | POST | `/admin/reload` | Re-read the config file and hot-swap the pipeline. |
+| GET | `/admin/log-level` | Current tracing filter directive. |
+| PUT | `/admin/log-level` | Change the log level at runtime, e.g. `{"level":"debug"}` or `{"level":"sbproxy_ai=debug"}`, no restart. |
 | GET | `/api/health/targets` | Per-target health, outlier, and breaker state. |
 | GET | `/admin/model-host/status` | Locally served models, VRAM, keep-alive. |
 | GET | `/admin/cluster/metrics` | Fleet-aggregated metrics (mesh tier; see [observability.md](observability.md)). |

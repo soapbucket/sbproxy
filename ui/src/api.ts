@@ -298,6 +298,10 @@ export function asList<T>(value: unknown, ...keys: string[]): T[] {
   return [];
 }
 
+export interface LogLevelInfo {
+  level: string;
+}
+
 export interface PlaygroundProvider {
   name: string;
   type?: string | null;
@@ -440,6 +444,10 @@ export const api = {
     sendJson<PlaygroundChatResult>("POST", "/admin/api/playground/chat", body),
 
   // Cache (WOR-1754 / WOR-1755)
+  // Runtime log level (WOR-1759)
+  logLevel: () => getJson<LogLevelInfo>("/admin/log-level"),
+  setLogLevel: (level: string) => sendJson<LogLevelInfo>("PUT", "/admin/log-level", { level }),
+
   cacheStatus: () => getJson<CacheStatus>("/admin/cache"),
   cachePurge: (body: { key?: string; prefix?: string }) =>
     sendJson<unknown>("POST", "/admin/cache/purge", body),
