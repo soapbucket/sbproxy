@@ -136,24 +136,38 @@ export interface StatsResponse {
   [k: string]: unknown;
 }
 
+export interface DeviceVram {
+  index?: number;
+  name?: string;
+  total_bytes?: number;
+  free_bytes?: number;
+}
 export interface ModelHostStatus {
-  status?: string;
+  // Real shape: {serving, models, vram} or {serving:false, reason}.
+  serving?: boolean;
+  reason?: string;
   models?: ResidentModel[];
+  vram?: {
+    budget_bytes?: number;
+    used_bytes?: number;
+    free_bytes?: number;
+    devices?: DeviceVram[];
+  };
+  // Tolerated loose/legacy fields.
+  status?: string;
   resident?: ResidentModel[];
-  vram_total_bytes?: number;
-  vram_used_bytes?: number;
-  vram_total?: number;
-  vram_used?: number;
   [k: string]: unknown;
 }
 
 export interface ResidentModel {
   name?: string;
   id?: string;
-  state?: string;
+  // EngineState serializes as a string or a small tagged object.
+  state?: string | Record<string, unknown>;
   status?: string;
+  port?: number;
   vram_bytes?: number;
-  vram?: number;
+  keep_alive_secs?: number;
   engine?: string;
   [k: string]: unknown;
 }

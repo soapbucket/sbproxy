@@ -55,6 +55,12 @@ const routes = [
     component: () => import("./views/CacheView.vue"),
     meta: { title: "Cache" },
   },
+  {
+    path: "/model-host",
+    name: "model-host",
+    component: () => import("./views/ModelHostView.vue"),
+    meta: { title: "Model host" },
+  },
   { path: "/:pathMatch(.*)*", redirect: "/" },
 ];
 

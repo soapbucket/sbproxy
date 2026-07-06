@@ -13,6 +13,7 @@ const nav = [
   { to: "/prompts", label: "Prompts" },
   { to: "/playground", label: "Playground" },
   { to: "/cache", label: "Cache" },
+  { to: "/model-host", label: "Model host" },
 ];
 </script>
 
