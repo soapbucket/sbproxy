@@ -16,8 +16,66 @@ function refresh() {
   openapi.run();
   drift.run();
   targetsReq.run();
+  loadConfig();
 }
 onMounted(refresh);
+
+// ---- live config editor (WOR-1763) ----
+const editorText = ref("");
+const editorRev = ref("");
+const configLoading = ref(false);
+const configErr = ref<ApiError | null>(null);
+const saveBusy = ref(false);
+const saveBanner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
+
+async function loadConfig() {
+  configLoading.value = true;
+  configErr.value = null;
+  try {
+    const doc = await api.config();
+    editorText.value = doc.yaml ?? "";
+    editorRev.value = doc.revision ?? "";
+  } catch (e) {
+    configErr.value = e instanceof ApiError ? e : new ApiError(0, String(e));
+  } finally {
+    configLoading.value = false;
+  }
+}
+
+async function saveConfig() {
+  if (saveBusy.value || !editorText.value.trim()) return;
+  saveBusy.value = true;
+  saveBanner.value = null;
+  try {
+    await api.putConfig(editorText.value, editorRev.value || undefined);
+    saveBanner.value = { tone: "ok", text: "Config validated, saved, and hot-swapped." };
+    await loadConfig(); // pick up the new revision
+    drift.run();
+    targetsReq.run();
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 409) {
+      saveBanner.value = {
+        tone: "err",
+        text: "Revision mismatch: the on-disk config changed since you loaded it. Reload the editor and reapply your edits.",
+      };
+    } else if (e instanceof ApiError && e.status === 400) {
+      let detail = e.body;
+      try {
+        detail = JSON.parse(e.body).error ?? e.body;
+      } catch {
+        // non-JSON body; show it raw
+      }
+      saveBanner.value = { tone: "err", text: detail || "Invalid config." };
+    } else {
+      saveBanner.value = {
+        tone: "err",
+        text: e instanceof ApiError ? e.hint : String(e),
+      };
+    }
+  } finally {
+    saveBusy.value = false;
+  }
+}
 
 // ---- openapi summary ----
 const showRawSpec = ref(false);
@@ -146,6 +204,42 @@ async function reload() {
 
   <p class="ok-line" v-if="reloadMsg">{{ reloadMsg }}</p>
   <ErrorState v-if="reloadError" :error="reloadError" title="Reload failed" @retry="reload" />
+
+  <!-- Live config editor -->
+  <section class="section">
+    <div class="section__head">
+      <h2>Edit configuration</h2>
+      <span class="sb-faint sb-mono" v-if="editorRev">rev {{ editorRev.slice(0, 12) }}</span>
+      <button class="sb-btn sb-btn--sm" :disabled="configLoading" @click="loadConfig">
+        {{ configLoading ? "Loading..." : "Reload editor" }}
+      </button>
+    </div>
+    <ErrorState v-if="configErr" :error="configErr" @retry="loadConfig" />
+    <div v-else class="sb-card">
+      <p class="banner" v-if="saveBanner" :class="`banner--${saveBanner.tone}`">
+        {{ saveBanner.text }}
+      </p>
+      <textarea
+        v-model="editorText"
+        class="sb-input editor"
+        spellcheck="false"
+        aria-label="Configuration YAML"
+      ></textarea>
+      <div class="editor-actions">
+        <button
+          class="sb-btn sb-btn--primary"
+          :disabled="saveBusy || !editorText.trim()"
+          @click="saveConfig"
+        >
+          {{ saveBusy ? "Saving..." : "Validate + save" }}
+        </button>
+        <span class="sb-faint">
+          Validated server-side, then hot-swapped. Optimistic concurrency by revision;
+          a mismatch means the on-disk config changed under you.
+        </span>
+      </div>
+    </div>
+  </section>
 
   <!-- Drift -->
   <section class="section">
@@ -316,5 +410,37 @@ async function reload() {
   padding: 8px 12px;
   color: var(--sb-ok);
   font-size: 0.85rem;
+}
+.editor {
+  width: 100%;
+  min-height: 340px;
+  font-family: var(--sb-font-mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  resize: vertical;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+.editor-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sb-space-3);
+  margin-top: var(--sb-space-3);
+  flex-wrap: wrap;
+}
+.banner {
+  padding: var(--sb-space-3) var(--sb-space-4);
+  border-radius: var(--sb-radius-sm);
+  margin-bottom: var(--sb-space-3);
+  font-size: 0.9rem;
+}
+.banner--ok {
+  background: var(--sb-accent-tint);
+  color: var(--sb-accent);
+}
+.banner--err {
+  background: #fdecea;
+  color: #c0392b;
 }
 </style>

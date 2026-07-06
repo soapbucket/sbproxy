@@ -113,6 +113,45 @@ async function sendJson<T>(
   return (await res.text()) as unknown as T;
 }
 
+/**
+ * Send a raw (non-JSON) request body, e.g. a YAML config document. Keeps
+ * the CSRF token on mutations; sets the given content type instead of
+ * JSON-encoding the body. Throws ApiError on non-2xx (the caller reads
+ * the detail for 400 invalid / 409 revision-mismatch).
+ */
+async function sendRaw(
+  method: string,
+  path: string,
+  rawBody: string,
+  contentType = "application/yaml",
+): Promise<string> {
+  const init: RequestInit = {
+    method,
+    credentials: "same-origin",
+    headers: { Accept: "application/json", "Content-Type": contentType },
+  };
+  if (csrfToken && MUTATING.has(method.toUpperCase())) {
+    init.headers = { ...init.headers, "X-CSRF-Token": csrfToken };
+  }
+  init.body = rawBody;
+  let res: Response;
+  try {
+    res = await fetch(path, init);
+  } catch (e) {
+    throw new ApiError(0, `Network error contacting ${path}`, String(e));
+  }
+  if (!res.ok) {
+    let text = "";
+    try {
+      text = await res.text();
+    } catch {
+      // ignore
+    }
+    throw new ApiError(res.status, `${method} ${path} failed (${res.status})`, text);
+  }
+  return await res.text();
+}
+
 /* ---- Types (best effort, all fields optional) ---- */
 
 export interface HealthComponent {
@@ -249,6 +288,11 @@ export interface TargetHealth {
   breaker_state?: string;
   latency_ms?: number;
   [k: string]: unknown;
+}
+
+export interface ConfigDoc {
+  revision?: string;
+  yaml?: string;
 }
 
 export interface RequestLog {
@@ -447,6 +491,17 @@ export const api = {
   // Runtime log level (WOR-1759)
   logLevel: () => getJson<LogLevelInfo>("/admin/log-level"),
   setLogLevel: (level: string) => sendJson<LogLevelInfo>("PUT", "/admin/log-level", { level }),
+
+  // Live config read + write (WOR-1763). putConfig sends the raw YAML body
+  // with optimistic concurrency (if_match=<revision>); ApiError carries
+  // the 400 (invalid) / 409 (revision mismatch) detail.
+  config: () => getJson<ConfigDoc>("/admin/config"),
+  putConfig: (yaml: string, ifMatch?: string) =>
+    sendRaw(
+      "PUT",
+      ifMatch ? `/admin/config?if_match=${encodeURIComponent(ifMatch)}` : "/admin/config",
+      yaml,
+    ),
 
   cacheStatus: () => getJson<CacheStatus>("/admin/cache"),
   cachePurge: (body: { key?: string; prefix?: string }) =>
