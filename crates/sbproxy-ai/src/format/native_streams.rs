@@ -594,6 +594,16 @@ pub struct SseFramer {
     buf: String,
 }
 
+/// Hard cap on the reassembly buffer (WOR-1693). A well-behaved
+/// upstream terminates every SSE event with a blank line; one that
+/// never does would otherwise grow `buf` without bound. 1 MiB
+/// comfortably holds any real event, so once the buffer exceeds it
+/// without a frame boundary we surface the accumulated bytes as a
+/// single frame (which the downstream parser rejects as malformed)
+/// rather than buffer forever. This trades a corrupt-frame signal for
+/// a DoS ceiling, the safer of the two.
+const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
+
 impl SseFramer {
     /// Construct an empty framer.
     pub fn new() -> Self {
@@ -620,6 +630,11 @@ impl SseFramer {
             if !frame.is_empty() {
                 frames.push(frame);
             }
+        }
+        // Bound the buffer: a stream with no frame separator cannot be
+        // allowed to accumulate indefinitely.
+        if self.buf.len() > MAX_BUFFERED_BYTES {
+            frames.push(std::mem::take(&mut self.buf));
         }
         frames
     }
@@ -1203,6 +1218,25 @@ mod tests {
         let mut f = SseFramer::new();
         let frames = f.feed(b"event: x\r\ndata: {}\r\n\r\n");
         assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn sse_framer_bounds_a_stream_with_no_separator() {
+        // WOR-1693: an upstream that never emits a blank line must not
+        // grow the buffer without bound. Feed past the cap in chunks and
+        // assert the framer flushes and the buffer stays bounded.
+        let mut f = SseFramer::new();
+        let chunk = vec![b'a'; 64 * 1024];
+        let mut emitted = 0usize;
+        for _ in 0..32 {
+            emitted += f.feed(&chunk).len();
+        }
+        assert!(
+            emitted >= 1,
+            "oversized buffer should be surfaced as a frame"
+        );
+        // After the flush the retained buffer is back under the cap.
+        assert!(f.buf.len() <= MAX_BUFFERED_BYTES);
     }
 
     #[test]

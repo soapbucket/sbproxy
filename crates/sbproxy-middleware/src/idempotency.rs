@@ -272,12 +272,22 @@ fn now_unix() -> u64 {
 
 // --- In-memory cache ---
 
+/// Default cap on the in-memory idempotency map (WOR-1693). Idempotency
+/// keys are unique per logical request and, before this bound, were only
+/// evicted when the same key was re-read, so the memory backend grew
+/// without limit under normal traffic (each entry holds a full response
+/// body). The bound mirrors [`crate::rate_limit::DEFAULT_MAX_KEYS`];
+/// overflow evicts the least-recently-used entry, whose only effect is
+/// that a replay of that key past the cap re-executes instead of
+/// serving from cache, the same as after a restart.
+pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
 /// In-memory [`IdempotencyCache`] for tests and single-instance
-/// deployments. Backed by a `RwLock<HashMap>` keyed by
-/// `(workspace_id, key)`. Entries are evicted lazily on read after
-/// `expires_at_unix` has passed.
+/// deployments. Backed by a bounded LRU keyed by `(workspace_id, key)`.
+/// Entries are evicted lazily on read after `expires_at_unix` has
+/// passed, and the LRU cap bounds total memory regardless of expiry.
 pub struct InMemoryIdempotencyCache {
-    inner: std::sync::RwLock<std::collections::HashMap<(String, String), CachedResponse>>,
+    inner: parking_lot::Mutex<lru::LruCache<(String, String), CachedResponse>>,
 }
 
 impl Default for InMemoryIdempotencyCache {
@@ -287,10 +297,17 @@ impl Default for InMemoryIdempotencyCache {
 }
 
 impl InMemoryIdempotencyCache {
-    /// Build an empty cache.
+    /// Build an empty cache with the default entry cap.
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_ENTRIES)
+    }
+
+    /// Build an empty cache with an explicit entry cap (>= 1).
+    pub fn with_capacity(max_entries: usize) -> Self {
+        let cap =
+            std::num::NonZeroUsize::new(max_entries.max(1)).expect("max_entries.max(1) is nonzero");
         Self {
-            inner: std::sync::RwLock::new(std::collections::HashMap::new()),
+            inner: parking_lot::Mutex::new(lru::LruCache::new(cap)),
         }
     }
 }
@@ -298,34 +315,28 @@ impl InMemoryIdempotencyCache {
 impl IdempotencyCache for InMemoryIdempotencyCache {
     fn get(&self, workspace_id: &str, key: &str) -> Option<CachedResponse> {
         // Read-side eviction: drop expired rows on access so a slow
-        // sweeper does not let stale rows replay.
+        // sweeper does not let stale rows replay. `get` also marks the
+        // entry most-recently-used so the LRU cap evicts cold keys.
         let now = now_unix();
         let key_pair = (workspace_id.to_string(), key.to_string());
-        {
-            let g = self.inner.read().ok()?;
-            if let Some(v) = g.get(&key_pair) {
-                if v.expires_at_unix > now {
-                    return Some(v.clone());
-                }
-            } else {
-                return None;
+        let mut g = self.inner.lock();
+        match g.get(&key_pair) {
+            Some(v) if v.expires_at_unix > now => Some(v.clone()),
+            Some(_) => {
+                // Expired: evict and report a miss.
+                g.pop(&key_pair);
+                None
             }
+            None => None,
         }
-        // Expired: take a write lock and evict.
-        if let Ok(mut g) = self.inner.write() {
-            if let Some(v) = g.get(&key_pair) {
-                if v.expires_at_unix <= now {
-                    g.remove(&key_pair);
-                }
-            }
-        }
-        None
     }
 
     fn put(&self, workspace_id: &str, key: &str, response: CachedResponse) {
-        if let Ok(mut g) = self.inner.write() {
-            g.insert((workspace_id.to_string(), key.to_string()), response);
-        }
+        // `put` evicts the least-recently-used entry when at capacity,
+        // bounding memory even against a stream of unique keys.
+        self.inner
+            .lock()
+            .put((workspace_id.to_string(), key.to_string()), response);
     }
 }
 
@@ -610,5 +621,29 @@ mod tests {
         let json = serde_json::to_vec(&resp).unwrap();
         let back: CachedResponse = serde_json::from_slice(&json).unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn in_memory_cache_is_bounded_under_unique_keys() {
+        // WOR-1693: inserting far past the cap must not grow the cache
+        // without bound. Each key is unique (as real idempotency keys
+        // are), so before the LRU bound the map grew forever.
+        let cap = 8;
+        let cache = InMemoryIdempotencyCache::with_capacity(cap);
+        let future = now_unix() + 3600;
+        for i in 0..1000 {
+            let resp = CachedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+                request_body_hash: hash_body(format!("req-{i}").as_bytes()),
+                expires_at_unix: future,
+            };
+            cache.put("ws", &format!("key-{i}"), resp);
+        }
+        assert_eq!(cache.inner.lock().len(), cap);
+        // The most-recent key survived; an early evicted key is a miss.
+        assert!(cache.get("ws", "key-999").is_some());
+        assert!(cache.get("ws", "key-0").is_none());
     }
 }

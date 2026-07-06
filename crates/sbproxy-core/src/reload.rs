@@ -161,6 +161,19 @@ pub fn current_pipeline() -> arc_swap::Guard<Arc<CompiledPipeline>> {
     pipeline_store().load()
 }
 
+/// Load an owned `Arc` to the current pipeline snapshot.
+///
+/// Unlike [`current_pipeline`], this returns a full `Arc` (not a
+/// borrow-scoped guard), so it can be stashed on the per-request
+/// [`RequestContext`](crate::context::RequestContext) at request start
+/// and read by every later Pingora phase. Pinning one snapshot per
+/// request means a request finishes on the config it began with: a hot
+/// reload that swaps or removes origins mid-request can no longer make a
+/// later phase index a fresh pipeline with a stale `origin_idx`.
+pub fn current_pipeline_full() -> Arc<CompiledPipeline> {
+    pipeline_store().load_full()
+}
+
 /// Set the global ACME challenge store (called once during TLS init).
 pub fn set_challenge_store(store: Arc<Http01ChallengeStore>) {
     let _ = CHALLENGE_STORE.set(store);

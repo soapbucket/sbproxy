@@ -22,8 +22,6 @@
 use super::{Guardrail, GuardrailBlock, GuardrailPipeline};
 use crate::types::Message;
 use serde::Deserialize;
-use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
 use std::time::Instant;
 
 fn default_block_threshold() -> usize {
@@ -112,23 +110,24 @@ fn cost_rank(g: &Guardrail) -> u8 {
     }
 }
 
-/// A 64-bit content + guardrail-set key for the verdict cache. Combines the
-/// prompt text with the set of guardrail names so two origins with
-/// different guardrails never share a cache entry.
-fn cache_key(pipeline: &GuardrailPipeline, content: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut h);
-    for g in &pipeline.input {
-        g.name().hash(&mut h);
-    }
-    h.finish()
+/// A collision-resistant 256-bit key over the prompt text for the
+/// per-pipeline verdict cache (WOR-1694).
+///
+/// The cache lives on the compiled [`GuardrailPipeline`], so origins with
+/// different guardrail configurations already hold separate caches and
+/// cannot share entries; the key only has to distinguish prompts within
+/// one pipeline. A SHA-256 (not the previous fixed-key `DefaultHasher`
+/// 64-bit hash) makes a crafted collision, where a benign prompt inherits
+/// a blocked prompt's cached verdict, infeasible.
+fn cache_key(content: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(content.as_bytes());
+    h.finalize().into()
 }
 
-/// Process-wide verdict cache. Keyed by `cache_key`, so it is correct
-/// across origins with different guardrail sets. Holds the flagged labels +
-/// reasons for a given prompt.
+/// Flagged labels + reasons cached for a given prompt.
 type CacheEntry = (Vec<String>, Vec<String>);
-static VERDICT_CACHE: Mutex<Option<lru::LruCache<u64, CacheEntry>>> = Mutex::new(None);
 
 /// The guardrail mesh runtime.
 #[derive(Debug, Clone)]
@@ -142,24 +141,23 @@ impl GuardrailMesh {
         Self { config }
     }
 
-    fn cache_lookup(&self, key: u64) -> Option<CacheEntry> {
+    fn cache_lookup(&self, pipeline: &GuardrailPipeline, key: &[u8; 32]) -> Option<CacheEntry> {
         if !self.config.cache {
             return None;
         }
-        let mut guard = VERDICT_CACHE.lock().ok()?;
-        guard.as_mut().and_then(|c| c.get(&key).cloned())
+        let mut guard = pipeline.verdict_cache.lock();
+        guard.as_mut().and_then(|c| c.get(key).cloned())
     }
 
-    fn cache_store(&self, key: u64, entry: &CacheEntry) {
+    fn cache_store(&self, pipeline: &GuardrailPipeline, key: [u8; 32], entry: &CacheEntry) {
         if !self.config.cache {
             return;
         }
-        if let Ok(mut guard) = VERDICT_CACHE.lock() {
-            let cap = std::num::NonZeroUsize::new(self.config.cache_capacity.max(1))
-                .unwrap_or(std::num::NonZeroUsize::new(1).unwrap());
-            let cache = guard.get_or_insert_with(|| lru::LruCache::new(cap));
-            cache.put(key, entry.clone());
-        }
+        let mut guard = pipeline.verdict_cache.lock();
+        let cap = std::num::NonZeroUsize::new(self.config.cache_capacity.max(1))
+            .unwrap_or(std::num::NonZeroUsize::new(1).unwrap());
+        let cache = guard.get_or_insert_with(|| lru::LruCache::new(cap));
+        cache.put(key, entry.clone());
     }
 
     /// Run the input guardrails as a cascade over the message text and fuse
@@ -172,14 +170,14 @@ impl GuardrailMesh {
         messages: &[Message],
         content: &str,
     ) -> MeshDecision {
-        let key = cache_key(pipeline, content);
-        let (labels, reasons) = match self.cache_lookup(key) {
+        let key = cache_key(content);
+        let (labels, reasons) = match self.cache_lookup(pipeline, &key) {
             Some(hit) => hit,
             None => {
                 let collected = self.collect_cascade(pipeline, messages);
                 let labels: Vec<String> = collected.iter().map(|b| b.name.clone()).collect();
                 let reasons: Vec<String> = collected.iter().map(|b| b.reason.clone()).collect();
-                self.cache_store(key, &(labels.clone(), reasons.clone()));
+                self.cache_store(pipeline, key, &(labels.clone(), reasons.clone()));
                 (labels, reasons)
             }
         };
@@ -330,5 +328,42 @@ mod tests {
         let second = eval(&mesh, &p, content);
         assert_eq!(first.labels, second.labels);
         assert!(second.block);
+    }
+
+    #[test]
+    fn cache_does_not_bleed_across_pipelines_with_same_guard_types() {
+        // WOR-1694: two pipelines with the same guard *type* (regex) but
+        // different patterns must not share verdicts. The old global cache
+        // keyed on content + guard *names* let a "clean" verdict from one
+        // origin answer another origin's differently-configured check; the
+        // per-pipeline cache makes that impossible.
+        let mut c = cfg(1);
+        c.cache = true;
+        let mesh = GuardrailMesh::new(c);
+
+        let mut blocks_badword = GuardrailPipeline::default();
+        blocks_badword.input.push(Guardrail::Regex(RegexGuardrail {
+            patterns: vec![regex::Regex::new("badword").unwrap()],
+            action: RegexAction::Block,
+        }));
+
+        let mut allows_badword = GuardrailPipeline::default();
+        allows_badword.input.push(Guardrail::Regex(RegexGuardrail {
+            patterns: vec![regex::Regex::new("otherword").unwrap()],
+            action: RegexAction::Block,
+        }));
+
+        let content = "this has a badword in it";
+        // First pipeline blocks and caches the verdict.
+        let a = eval(&mesh, &blocks_badword, content);
+        assert!(a.block, "pipeline blocking 'badword' should block");
+        // Same guard type, different pattern: must reach its own clean
+        // verdict rather than inherit the first pipeline's cached block.
+        let b = eval(&mesh, &allows_badword, content);
+        assert!(
+            !b.block,
+            "differently-configured pipeline must not inherit the cached block"
+        );
+        assert!(b.labels.is_empty());
     }
 }

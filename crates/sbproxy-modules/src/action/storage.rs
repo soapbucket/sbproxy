@@ -533,7 +533,9 @@ fn guess_content_type(key: &str) -> &'static str {
 }
 
 fn error_response(status: u16, message: &str) -> StorageResponse {
-    let body = format!("{{\"error\":\"{}\"}}", message);
+    // Escape the message (WOR-1738): callers may pass storage-key or
+    // path text, so a quote or backslash must not break the envelope.
+    let body = serde_json::json!({ "error": message }).to_string();
     StorageResponse {
         status,
         headers: vec![

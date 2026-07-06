@@ -691,20 +691,22 @@ impl TlsFingerprintConfig {
     /// [`Self::sidecar_header_allowlist`] for everything else. Matches
     /// case-insensitively.
     pub fn header_allowed(&self, name: &str) -> bool {
-        let lower = name.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "x-sbproxy-tls-ja3"
-                | "x-sbproxy-tls-ja4"
-                | "x-sbproxy-tls-ja4h"
-                | "x-sbproxy-tls-ja4s"
-                | "x-sbproxy-tls-trustworthy"
-        ) {
+        // WOR-1699: compare case-insensitively against the byte-borrowed
+        // name instead of allocating a lowercased copy per call (this
+        // runs up to 8 times per request on the fingerprint path).
+        const CANONICAL: [&str; 5] = [
+            "x-sbproxy-tls-ja3",
+            "x-sbproxy-tls-ja4",
+            "x-sbproxy-tls-ja4h",
+            "x-sbproxy-tls-ja4s",
+            "x-sbproxy-tls-trustworthy",
+        ];
+        if CANONICAL.iter().any(|c| c.eq_ignore_ascii_case(name)) {
             return true;
         }
         self.sidecar_header_allowlist
             .iter()
-            .any(|h| h.eq_ignore_ascii_case(&lower))
+            .any(|h| h.eq_ignore_ascii_case(name))
     }
 }
 
