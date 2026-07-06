@@ -30,7 +30,7 @@ use cert_store::{CertMeta, CertStore};
 use challenges::Http01ChallengeStore;
 use ocsp::OcspStapler;
 use sbproxy_config::ProxyServerConfig;
-use sbproxy_platform::MemoryKVStore;
+use sbproxy_platform::{KVStore, MemoryKVStore};
 
 /// A tokio runtime handle for the TLS maintenance tasks (OCSP refresh, ACME
 /// renewal). These are started from the synchronous proxy-setup path, before
@@ -66,7 +66,7 @@ pub struct TlsState {
     /// ACME configuration (None means ACME is disabled).
     acme_config: Option<sbproxy_config::AcmeConfig>,
     /// Persistent certificate storage backend.
-    cert_store: Arc<CertStore<MemoryKVStore>>,
+    cert_store: Arc<CertStore>,
     /// Hostnames this proxy is responsible for.
     hostnames: Vec<String>,
     /// OCSP stapler for the manual fallback cert. `None` when no
@@ -83,6 +83,50 @@ pub struct TlsState {
     manual_cert_pem: Option<Vec<u8>>,
 }
 
+/// Open the KVStore backing the ACME cert store, chosen by
+/// `acme.storage_backend` at `acme.storage_path` (WOR-1773).
+///
+/// `redb` (the default) persists locally so a single node survives a
+/// restart without re-issuing. The pluggable backends for a fleet
+/// (shared `file`, `s3`/`gcs`, `redis`, `cluster`) land as their own
+/// backends; until then an unrecognized backend falls back to in-memory
+/// with a loud warning, so it is obvious certs are not being persisted.
+fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVStore> {
+    use sbproxy_platform::storage::RedbKVStore;
+    let Some(acme) = acme else {
+        return Arc::new(MemoryKVStore::new(0));
+    };
+    match acme.storage_backend.as_str() {
+        "memory" => Arc::new(MemoryKVStore::new(0)),
+        "redb" => {
+            let dir = acme.storage_path.trim_end_matches('/');
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(path = %dir, error = %e,
+                    "cert store: cannot create storage dir; certs will NOT persist (in-memory fallback)");
+                return Arc::new(MemoryKVStore::new(0));
+            }
+            let file = format!("{dir}/certstore.redb");
+            match RedbKVStore::new(&file) {
+                Ok(s) => {
+                    info!(path = %file, "cert store backend: redb (persistent)");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    warn!(path = %file, error = %e,
+                        "cert store: redb open failed; certs will NOT persist (in-memory fallback)");
+                    Arc::new(MemoryKVStore::new(0))
+                }
+            }
+        }
+        other => {
+            warn!(backend = %other,
+                "cert store: '{other}' backend not yet wired (shared file, s3/gcs, redis, cluster \
+                 land in WOR-1773); certs will NOT persist (in-memory fallback)");
+            Arc::new(MemoryKVStore::new(0))
+        }
+    }
+}
+
 impl TlsState {
     /// Initialize TLS state from a [`ProxyServerConfig`].
     ///
@@ -97,7 +141,7 @@ impl TlsState {
 
         let resolver = Arc::new(CertResolver::new());
         let challenge_store = Arc::new(Http01ChallengeStore::new());
-        let cert_store = Arc::new(CertStore::new(MemoryKVStore::new(0)));
+        let cert_store = Arc::new(CertStore::new(open_cert_backend(config.acme.as_ref())));
 
         // --- Manual cert files ---
         let mut ocsp_stapler: Option<Arc<OcspStapler>> = None;

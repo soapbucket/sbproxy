@@ -14,7 +14,6 @@ use tracing::{debug, info, warn};
 
 use crate::cert_store::CertStore;
 use crate::challenges::Http01ChallengeStore;
-use sbproxy_platform::KVStore;
 
 // --- ACME directory URLs ---
 
@@ -253,7 +252,7 @@ impl AcmeClient {
     /// Load the ACME account key from the store, or generate a fresh one and persist it.
     ///
     /// Returns an `EcdsaKeyPair` (P-256 / SHA-256).
-    pub fn load_or_create_account_key<S: KVStore>(store: &CertStore<S>) -> Result<EcdsaKeyPair> {
+    pub fn load_or_create_account_key(store: &CertStore) -> Result<EcdsaKeyPair> {
         if let Some(pem_bytes) = store.get_account_key().context("read account key")? {
             // Parse existing key
             let pkcs8 = pem_to_pkcs8(&pem_bytes).context("decode stored account key PEM")?;
@@ -1107,8 +1106,8 @@ mod tests {
     use crate::cert_store::CertStore;
     use sbproxy_platform::MemoryKVStore;
 
-    fn make_store() -> CertStore<MemoryKVStore> {
-        CertStore::new(MemoryKVStore::new(0))
+    fn make_store() -> CertStore {
+        CertStore::new(std::sync::Arc::new(MemoryKVStore::new(0)))
     }
 
     // --- WOR-597: directory-URL loopback detection ---

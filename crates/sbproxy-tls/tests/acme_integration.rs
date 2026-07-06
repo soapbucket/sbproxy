@@ -87,7 +87,7 @@ async fn test_fetch_nonce() {
 #[tokio::test]
 #[ignore = "requires Pebble: cd e2e/pebble && ./run-pebble.sh up"]
 async fn test_account_key_persists_across_clients() {
-    let store = CertStore::new(MemoryKVStore::new(0));
+    let store = CertStore::new(std::sync::Arc::new(MemoryKVStore::new(0)));
 
     // Generate key with first client.
     let key1 = AcmeClient::load_or_create_account_key(&store).unwrap();
@@ -106,7 +106,7 @@ async fn test_account_key_persists_across_clients() {
 #[tokio::test]
 #[ignore = "requires Pebble: cd e2e/pebble && ./run-pebble.sh up"]
 async fn test_cert_store_roundtrip_with_resolver() {
-    let store = CertStore::new(MemoryKVStore::new(0));
+    let store = CertStore::new(std::sync::Arc::new(MemoryKVStore::new(0)));
     let resolver = Arc::new(CertResolver::new());
 
     // Generate a self-signed cert to simulate an ACME-issued cert.
@@ -161,7 +161,7 @@ async fn test_challenge_store_with_pebble_flow() {
     let challenge_store = Http01ChallengeStore::new();
 
     // Simulate what the ACME flow does: register a pending challenge.
-    let store = CertStore::new(MemoryKVStore::new(0));
+    let store = CertStore::new(std::sync::Arc::new(MemoryKVStore::new(0)));
     let key_pair = AcmeClient::load_or_create_account_key(&store).unwrap();
     let token = "test-challenge-token-12345";
     let key_auth = AcmeClient::key_authorization(token, &key_pair);
@@ -187,7 +187,7 @@ async fn test_account_registration() {
         return;
     }
 
-    let store = CertStore::new(MemoryKVStore::new(0));
+    let store = CertStore::new(std::sync::Arc::new(MemoryKVStore::new(0)));
     let key_pair = AcmeClient::load_or_create_account_key(&store).unwrap();
 
     let mut client = AcmeClient::new(PEBBLE_DIRECTORY, "test@example.com", vec!["http-01".into()]);
@@ -223,7 +223,7 @@ async fn test_full_cert_issuance() {
         return;
     }
 
-    let store = CertStore::new(MemoryKVStore::new(0));
+    let store = CertStore::new(std::sync::Arc::new(MemoryKVStore::new(0)));
     let key_pair = AcmeClient::load_or_create_account_key(&store).unwrap();
     let challenge_store = Http01ChallengeStore::new();
 

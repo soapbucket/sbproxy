@@ -39,13 +39,17 @@ pub struct CertMeta {
 // --- CertStore ---
 
 /// KVStore adapter for ACME certificate persistence.
-pub struct CertStore<S: KVStore> {
-    store: S,
+pub struct CertStore {
+    store: std::sync::Arc<dyn KVStore>,
 }
 
-impl<S: KVStore> CertStore<S> {
-    /// Create a new CertStore wrapping the given KVStore backend.
-    pub fn new(store: S) -> Self {
+impl CertStore {
+    /// Create a new CertStore over any [`KVStore`] backend (WOR-1773).
+    ///
+    /// The backend is a trait object so an operator can persist certs to
+    /// redb (local, default), sqlite, or a shared store (redis) for a
+    /// fleet, chosen by `acme.storage_backend`, without changing this type.
+    pub fn new(store: std::sync::Arc<dyn KVStore>) -> Self {
         Self { store }
     }
 
@@ -181,8 +185,8 @@ mod tests {
     use super::*;
     use sbproxy_platform::MemoryKVStore;
 
-    fn store() -> CertStore<MemoryKVStore> {
-        CertStore::new(MemoryKVStore::new(0))
+    fn store() -> CertStore {
+        CertStore::new(std::sync::Arc::new(MemoryKVStore::new(0)))
     }
 
     fn sample_meta() -> CertMeta {
@@ -191,6 +195,38 @@ mod tests {
             expires_at: "2027-01-01T00:00:00Z".into(),
             serial: "01ABCDEF".into(),
         }
+    }
+
+    #[test]
+    fn redb_backend_persists_across_reopen() {
+        // WOR-1773: the whole point of a non-memory backend is that a
+        // restart does not lose the cert (and so does not re-issue). Write
+        // a bundle through a redb-backed store, drop it (a "restart"), then
+        // reopen the same file and confirm the cert is still there.
+        use sbproxy_platform::storage::RedbKVStore;
+        let path = std::env::temp_dir().join(format!(
+            "sbproxy-certstore-test-{}.redb",
+            std::process::id()
+        ));
+        let path_str = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let cs = CertStore::new(std::sync::Arc::new(RedbKVStore::new(path_str).unwrap()));
+            cs.put_cert_bundle("example.com", b"CERTPEM", b"KEYPEM", &sample_meta())
+                .unwrap();
+        } // store dropped: simulates a process restart
+
+        let reopened = CertStore::new(std::sync::Arc::new(RedbKVStore::new(path_str).unwrap()));
+        let (cert, key) = reopened
+            .get_cert_and_key("example.com")
+            .unwrap()
+            .expect("cert survives a reopen");
+        assert_eq!(cert, b"CERTPEM");
+        assert_eq!(key, b"KEYPEM");
+        assert!(reopened.get_meta("example.com").unwrap().is_some());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
