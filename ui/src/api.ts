@@ -316,6 +316,16 @@ export interface CacheStatus {
   backend?: string;
   prefix_purge_supported?: boolean;
 }
+export interface SemanticDecision {
+  reason: string;
+  score?: number | null;
+  threshold: number;
+  scope: string;
+  at_unix: number;
+}
+export interface SemanticCacheDebug {
+  caches: { origin: string; recent: SemanticDecision[] }[];
+}
 
 export interface SessionInfo {
   authenticated: boolean;
@@ -421,4 +431,5 @@ export const api = {
     sendJson<unknown>("POST", "/admin/cache/purge", body),
   evictKeyPolicy: (id?: string) =>
     sendJson<unknown>("POST", "/admin/cache/key-policy/evict", id ? { id } : {}),
+  semanticCache: () => getJson<SemanticCacheDebug>("/admin/cache/semantic"),
 };

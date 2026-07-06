@@ -10,12 +10,24 @@ import ErrorState from "../components/ErrorState.vue";
 
 const statusReq = useAsync(() => api.cacheStatus());
 const metricsReq = useAsync(() => api.metrics());
+const semanticReq = useAsync(() => api.semanticCache());
 
 function refresh() {
   statusReq.run();
   metricsReq.run();
+  semanticReq.run();
 }
 onMounted(refresh);
+
+// Semantic (embedding) cache decisions, flattened per origin. Only shown
+// when at least one AI origin has an embedding cache with recorded
+// lookups.
+const semanticCaches = computed(() =>
+  (semanticReq.data.value?.caches ?? []).filter((c) => c.recent.length > 0),
+);
+function decisionTone(reason: string): string {
+  return reason === "hit" ? "var(--sb-accent)" : "var(--sb-text-muted)";
+}
 
 const status = computed<CacheStatus | null>(() => statusReq.data.value);
 const enabled = computed(() => !!status.value?.enabled);
@@ -163,6 +175,36 @@ const evictAllPolicies = () =>
         </button>
       </div>
     </div>
+
+    <div class="sb-card panel" v-if="semanticCaches.length">
+      <h3>Semantic cache decisions</h3>
+      <p class="sb-faint">
+        Recent embedding-cache lookups and why each hit or missed
+        (no_entry / expired / below_threshold / cross_scope).
+      </p>
+      <div v-for="c in semanticCaches" :key="c.origin" class="semantic">
+        <div class="semantic__origin sb-mono">{{ c.origin }}</div>
+        <div class="table-wrap">
+          <table class="sb-table">
+            <thead>
+              <tr><th>Reason</th><th>Score</th><th>Threshold</th><th>Scope</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="(d, i) in c.recent" :key="i">
+                <td>
+                  <span :style="{ color: decisionTone(d.reason), fontWeight: 600 }">
+                    {{ d.reason }}
+                  </span>
+                </td>
+                <td>{{ d.score != null ? d.score.toFixed(3) : "-" }}</td>
+                <td>{{ d.threshold.toFixed(2) }}</td>
+                <td class="sb-mono sb-muted">{{ d.scope || "-" }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   </template>
 </template>
 
@@ -202,5 +244,16 @@ const evictAllPolicies = () =>
 .banner--err {
   background: #fdecea;
   color: #c0392b;
+}
+.semantic {
+  margin-top: var(--sb-space-4);
+}
+.semantic__origin {
+  font-size: 0.82rem;
+  color: var(--sb-text-muted);
+  margin-bottom: var(--sb-space-2);
+}
+.table-wrap {
+  overflow-x: auto;
 }
 </style>
