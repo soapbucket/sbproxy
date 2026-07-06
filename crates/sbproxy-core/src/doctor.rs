@@ -97,6 +97,10 @@ pub struct DoctorReport {
     pub nvidia_smi: Option<PathBuf>,
     /// The allowlisted inference engines and their `PATH` resolution.
     pub engines: Vec<EngineBinary>,
+    /// Resolved container runtime (docker or podman), `None` when
+    /// absent. vLLM can run from a pinned container image instead of a
+    /// `PATH` binary, so this counts toward serving readiness.
+    pub container_runtime: Option<PathBuf>,
     /// Default model-weight cache directory and whether it exists yet.
     /// A `serve:` block's `cache_dir` overrides this at runtime.
     pub model_cache_dir: PathBuf,
@@ -125,14 +129,17 @@ impl DoctorReport {
                 path: find_on_path("llama-server"),
             },
         ];
+        let container_runtime = find_on_path("docker").or_else(|| find_on_path("podman"));
         let model_cache_dir = sbproxy_model_host::resolve_cache_dir(None, None);
         let model_cache_exists = model_cache_dir.is_dir();
-        let local_serving = serving_verdict(&features, &gpus, &engines);
+        let local_serving =
+            serving_verdict(&features, &gpus, &engines, container_runtime.is_some());
         Self {
             features,
             gpus,
             nvidia_smi: find_on_path("nvidia-smi"),
             engines,
+            container_runtime,
             model_cache_dir,
             model_cache_exists,
             local_serving,
@@ -207,6 +214,15 @@ impl DoctorReport {
         }
 
         out.push_str(&format!(
+            "  {:<14}{}\n",
+            "container",
+            self.container_runtime
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not found (docker/podman)".to_string())
+        ));
+
+        out.push_str(&format!(
             "\nmodel cache\n  {}{}\n",
             self.model_cache_dir.display(),
             if self.model_cache_exists {
@@ -232,11 +248,13 @@ const GIB: f64 = (1024u64 * 1024 * 1024) as f64;
 
 /// Decide whether a `serve:` block would admit a model here, mirroring
 /// the runtime's requirements: the probe feature, at least one visible
-/// GPU, and at least one engine binary to exec.
+/// GPU, and at least one way to run an engine (a binary on `PATH`, or
+/// a container runtime for vLLM's pinned-image launch).
 fn serving_verdict(
     features: &BuildFeatures,
     gpus: &[GpuDescriptor],
     engines: &[EngineBinary],
+    container_runtime: bool,
 ) -> LocalServing {
     let mut blockers = Vec::new();
     if !features.gpu_nvidia {
@@ -252,9 +270,12 @@ fn serving_verdict(
                 .to_string(),
         );
     }
-    if engines.iter().all(|e| e.path.is_none()) {
+    if engines.iter().all(|e| e.path.is_none()) && !container_runtime {
         blockers.push(
-            "no inference engine on PATH; install vllm or llama-server (llama.cpp)".to_string(),
+            "no way to run an inference engine: neither vllm nor llama-server is \
+             on PATH and no container runtime (docker/podman) is available; run \
+             `sbproxy doctor --install vllm` or `sbproxy doctor --install llama-cpp`"
+                .to_string(),
         );
     }
     LocalServing {
@@ -263,12 +284,11 @@ fn serving_verdict(
     }
 }
 
-/// Resolve a program on `PATH`, like `which`, without shelling out.
+/// Resolve a program on `PATH`. Delegates to the model-host resolver
+/// so `doctor`, the plan-time engine doctor, and the serve-preflight
+/// warning all agree on what "installed" means.
 fn find_on_path(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+    sbproxy_model_host::resolve_on_path(program)
 }
 
 #[cfg(test)]
@@ -320,6 +340,7 @@ mod tests {
             &BuildFeatures::current(),
             &[gpu("NVIDIA L4")],
             &[engine(true)],
+            false,
         );
         if cfg!(feature = "gpu-nvidia") {
             assert!(v.ready, "blockers: {:?}", v.blockers);
@@ -330,11 +351,28 @@ mod tests {
 
     #[test]
     fn verdict_blocks_without_gpu_and_engine() {
-        let v = serving_verdict(&BuildFeatures::current(), &[], &[engine(false)]);
+        let v = serving_verdict(&BuildFeatures::current(), &[], &[engine(false)], false);
         assert!(!v.ready);
         // Missing GPU (or missing feature) and missing engine are both
         // reported, not just the first.
         assert_eq!(v.blockers.len(), 2, "blockers: {:?}", v.blockers);
+    }
+
+    #[test]
+    fn container_runtime_satisfies_the_engine_leg() {
+        // No engine binary, but docker present: vLLM can launch from a
+        // pinned image, so the engine blocker must not fire.
+        let v = serving_verdict(
+            &BuildFeatures::current(),
+            &[gpu("NVIDIA L4")],
+            &[engine(false)],
+            true,
+        );
+        assert!(
+            !v.blockers.iter().any(|b| b.contains("inference engine")),
+            "blockers: {:?}",
+            v.blockers
+        );
     }
 
     #[test]

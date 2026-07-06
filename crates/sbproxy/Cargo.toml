@@ -71,11 +71,14 @@ embed-admin-ui = ["sbproxy-core/embed-admin-ui"]
 # cleanly. Library consumers of sbproxy-core still opt in per crate.
 # `sbproxy doctor` reports what the running host supports.
 gpu-nvidia = ["sbproxy-core/gpu-nvidia"]
-model-weights = ["sbproxy-core/model-weights"]
+model-weights = ["sbproxy-core/model-weights", "sbproxy-model-host/weights"]
 
 [dependencies]
 sbproxy-core.workspace = true
 sbproxy-config.workspace = true
+# `doctor --install`: PATH probes, the pinned llama.cpp release
+# download, and the cache-dir resolver.
+sbproxy-model-host.workspace = true
 # WOR-1540: `ai ledger verify` reuses the verifiable-ledger crypto.
 sbproxy-ai.workspace = true
 sbproxy-modules.workspace = true

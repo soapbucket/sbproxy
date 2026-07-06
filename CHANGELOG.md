@@ -27,9 +27,23 @@ of the new YAML fields below until the version that ships them.
   do on the current host: compiled capability features, the GPUs the
   `serve:` admission path sees (same probe, so they cannot disagree),
   which inference engines (`vllm`, `llama-server`) resolve on `PATH`,
-  the model-weight cache directory, and a readiness verdict for local
-  model serving with every blocker listed. `--format json` emits a
-  stable machine-readable report; collection is read-only.
+  container runtime availability, the model-weight cache directory, and
+  a readiness verdict for local model serving with every blocker
+  listed. `--format json` emits a stable machine-readable report;
+  collection is read-only.
+- **`sbproxy doctor --install`.** Acquires a missing engine on the
+  spot: `vllm` through `uv` or `pipx`, `llama-cpp` through Homebrew or
+  a pinned sha256-verified ggml-org release (`--llama-tag` +
+  `--llama-sha256`, linked into `--bin-dir`). Every command is a fixed
+  argument list printed before it runs, nothing runs unconfirmed
+  (`--yes` for provisioning scripts), and GPU drivers are never
+  installed.
+- **Serve-preflight warnings at config load.** A config that declares
+  `serve:` on a host with no visible GPU, or with a serve entry whose
+  engine has no binary and no container runtime, now logs a warning at
+  startup and on every hot reload naming the model, the resolved
+  engine, and the blocker, instead of degrading silently until the
+  first request fails over.
 
 ### Fixed
 

@@ -14,6 +14,9 @@ use std::path::PathBuf;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+/// `doctor --install`: acquire missing serve: prerequisites.
+mod install;
+
 // mimalloc is Microsoft's high-performance allocator. Typically 5-10% faster
 // than glibc malloc on server workloads; negligible on allocation-light
 // paths. See sbproxy-bench/docs/RUST_OPTIMIZATIONS.md A2.
@@ -321,6 +324,27 @@ struct DoctorArgs {
     /// emits a single structured object for tooling.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Install a missing serve: prerequisite instead of reporting.
+    /// `vllm` uses uv or pipx; `llama-cpp` uses Homebrew or a pinned
+    /// release (`--llama-tag` + `--llama-sha256`). The command is
+    /// printed and confirmed before anything runs.
+    #[arg(long = "install", value_enum)]
+    install: Option<install::InstallTarget>,
+    /// Skip the confirmation prompt (for provisioning scripts).
+    #[arg(long = "yes", short = 'y', requires = "install")]
+    yes: bool,
+    /// Pinned llama.cpp release tag (e.g. `b4589`; `latest` is
+    /// rejected). Used by `--install llama-cpp` when Homebrew is
+    /// absent.
+    #[arg(long = "llama-tag", requires = "install")]
+    llama_tag: Option<String>,
+    /// sha256 of the pinned llama.cpp release zip for `--llama-tag`.
+    #[arg(long = "llama-sha256", requires = "llama_tag")]
+    llama_sha256: Option<String>,
+    /// Where `--install llama-cpp` links the `llama-server` binary so
+    /// the engine launcher finds it on PATH.
+    #[arg(long = "bin-dir", default_value = "/usr/local/bin")]
+    bin_dir: PathBuf,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -708,10 +732,21 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
 
 // --- `doctor` handler ---
 
-/// Print the host-capability diagnostics report. Exits 0 once the
-/// report is produced: "this host cannot serve local models" is a
-/// finding, not an error.
+/// Print the host-capability diagnostics report, or, with
+/// `--install`, acquire a missing prerequisite. The report path exits
+/// 0 once the report is produced ("this host cannot serve local
+/// models" is a finding, not an error); the install path exits 0 only
+/// when the prerequisite is in place afterwards.
 fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
+    if let Some(target) = args.install {
+        return install::run(
+            target,
+            args.yes,
+            args.llama_tag.as_deref(),
+            args.llama_sha256.as_deref(),
+            &args.bin_dir,
+        );
+    }
     let report = sbproxy_core::doctor::DoctorReport::collect();
     match args.format {
         OutputFormat::Text => print!("{}", report.render_text()),

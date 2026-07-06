@@ -99,6 +99,59 @@ pub(crate) fn make_probe() -> Arc<dyn GpuProbe> {
     }
 }
 
+/// Warn, at pipeline load time (startup and every hot reload), about
+/// every `serve:` prerequisite this host is missing: no visible GPU,
+/// or a serve entry whose resolved engine has no binary (and no
+/// container runtime) to run it with. The request path degrades
+/// gracefully either way (admission rejects / the attempt fails over
+/// to the next provider), but silently degrading at 3am is not
+/// bulletproof; the operator finds out when the config lands, with a
+/// pointer at `sbproxy doctor`.
+///
+/// Best-effort and read-only: probes never panic, and a pipeline with
+/// no `serve:` block logs nothing.
+pub(crate) fn preflight_serve_warnings(actions: &[sbproxy_modules::Action]) {
+    for action in actions {
+        if let sbproxy_modules::Action::AiProxy(ai) = action {
+            warn_missing_serve_prereqs(&ai.config);
+        }
+    }
+}
+
+/// The per-config half of [`preflight_serve_warnings`].
+fn warn_missing_serve_prereqs(config: &AiHandlerConfig) {
+    let Some(merged) = merged_serve_config(config) else {
+        return;
+    };
+    let gpus = make_probe().probe();
+    let env = sbproxy_model_host::EngineEnv::probe_host(!gpus.is_empty());
+    if gpus.is_empty() {
+        tracing::warn!(
+            "serve: is configured but no GPU is visible to this process; \
+             local model serving will reject admission and requests will \
+             fail over to the next provider (or 502 with no fallback). \
+             Run `sbproxy doctor` for the full host report"
+        );
+    }
+    for entry in &merged.models {
+        // GGUF-ness steers the `auto` engine choice toward llama.cpp;
+        // at this preflight the weights are not resolved yet, so the
+        // reference string is the best available signal.
+        let is_gguf = entry.model.to_ascii_lowercase().contains("gguf");
+        let doctor = sbproxy_model_host::EngineDoctor::for_entry(entry, is_gguf, &env);
+        if !doctor.runnable {
+            tracing::warn!(
+                model = %doctor.model,
+                engine = ?doctor.resolved,
+                "serve: model cannot start on this host: {}. Run \
+                 `sbproxy doctor` to inspect, or `sbproxy doctor --install <engine>` \
+                 to install the engine",
+                doctor.blocker.as_deref().unwrap_or("engine unavailable"),
+            );
+        }
+    }
+}
+
 /// Merge every provider's `serve:` block into one host config. A single
 /// node has one GPU and one residency budget, so all served models
 /// share one runtime; a provider's models are concatenated and the

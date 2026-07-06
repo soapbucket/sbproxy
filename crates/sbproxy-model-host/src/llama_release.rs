@@ -152,6 +152,23 @@ pub async fn ensure_llama_server(
     ))
 }
 
+/// Blocking wrapper around [`ensure_llama_server`] for synchronous CLI
+/// callers (`sbproxy doctor --install llama-cpp`). Spins a
+/// current-thread runtime for the one download; not for use inside the
+/// serving runtime, which is already async.
+#[cfg(feature = "weights")]
+pub fn ensure_llama_server_blocking(
+    cache_dir: &std::path::Path,
+    tag: &str,
+    expected_sha256: &str,
+) -> Result<PathBuf, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?
+        .block_on(ensure_llama_server(cache_dir, tag, expected_sha256))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

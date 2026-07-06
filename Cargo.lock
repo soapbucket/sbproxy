@@ -8291,6 +8291,7 @@ dependencies = [
  "sbproxy-ai",
  "sbproxy-config",
  "sbproxy-core",
+ "sbproxy-model-host",
  "sbproxy-modules",
  "sbproxy-observe",
  "sbproxy-plugin",

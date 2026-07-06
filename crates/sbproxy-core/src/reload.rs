@@ -141,6 +141,11 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
         config_version,
     );
     sbproxy_modules::projections::install_projections(docs);
+    // Serve-preflight: warn (never fail) when the config declares
+    // local model serving but this host is missing a prerequisite,
+    // so the gap surfaces at load time instead of on the first
+    // request that quietly fails over.
+    crate::server::model_host::preflight_serve_warnings(&new_pipeline.actions);
     pipeline_store().store(Arc::new(new_pipeline));
 }
 
