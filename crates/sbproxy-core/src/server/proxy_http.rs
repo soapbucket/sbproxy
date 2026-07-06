@@ -21,6 +21,55 @@ fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Op
     }
 }
 
+/// Scheme-agnostic host + path of an upstream URL (WOR-1698).
+struct ParsedUpstreamUrl {
+    /// `Url::host_str()` of the upstream, or `None` when the URL has no
+    /// host or does not parse.
+    host: Option<String>,
+    /// `Url::path()` of the upstream (empty string when the URL does not
+    /// parse), used to derive the base-path prefix for the Proxy action.
+    path: String,
+}
+
+/// Memoized parse of an upstream URL's host and path (WOR-1698).
+///
+/// `upstream_request_filter` re-derived the upstream host (for the
+/// rewritten `Host` header, every action arm) and the Proxy base path by
+/// calling `url::Url::parse` on the fixed config URL on every request.
+/// The result is deterministic per URL, so cache it. The cache is keyed
+/// by the raw URL string and reproduces exactly the
+/// `url::Url::parse(url).host_str()` / `.path()` the call sites used, so
+/// behavior is unchanged (a URL that fails to parse yields `host: None`
+/// and an empty path, the same as the old `.ok()` handling).
+fn parsed_upstream_url(url: &str) -> std::sync::Arc<ParsedUpstreamUrl> {
+    #[allow(clippy::type_complexity)]
+    static CACHE: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<ParsedUpstreamUrl>>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    // Upstream URLs come from config and are few; bound the memo so a
+    // long-lived process that reloads many distinct configs cannot grow
+    // it without limit (the WOR-1693 discipline).
+    const CACHE_CAP: usize = 8192;
+
+    let mut cache = CACHE.lock();
+    if let Some(hit) = cache.get(url) {
+        return hit.clone();
+    }
+    let parsed = url::Url::parse(url).ok();
+    let info = std::sync::Arc::new(ParsedUpstreamUrl {
+        host: parsed.as_ref().and_then(|u| u.host_str().map(String::from)),
+        path: parsed
+            .as_ref()
+            .map(|u| u.path().to_string())
+            .unwrap_or_default(),
+    });
+    if cache.len() >= CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(url.to_string(), info.clone());
+    info
+}
+
 fn retry_config_for_action(action: &Action) -> Option<&sbproxy_modules::action::RetryConfig> {
     match action {
         Action::Proxy(proxy) => proxy.retry.as_ref(),
@@ -633,54 +682,42 @@ impl ProxyHttp for SbProxy {
                 upstream_host_header = match effective_action {
                     Action::Proxy(p) => {
                         fc = p.forwarding;
-                        p.host_override.clone().or_else(|| {
-                            url::Url::parse(&p.url)
-                                .ok()
-                                .and_then(|u| u.host_str().map(String::from))
-                        })
+                        p.host_override
+                            .clone()
+                            .or_else(|| parsed_upstream_url(&p.url).host.clone())
                     }
                     Action::LoadBalancer(lb) => ctx
                         .lb_target_idx
                         .and_then(|i| lb.targets.get(i))
                         .and_then(|t| {
                             fc = t.forwarding;
-                            t.host_override.clone().or_else(|| {
-                                url::Url::parse(&t.url)
-                                    .ok()
-                                    .and_then(|u| u.host_str().map(String::from))
-                            })
+                            t.host_override
+                                .clone()
+                                .or_else(|| parsed_upstream_url(&t.url).host.clone())
                         }),
                     Action::WebSocket(ws) => {
                         fc = ws.forwarding;
-                        ws.host_override.clone().or_else(|| {
-                            url::Url::parse(&ws.url)
-                                .ok()
-                                .and_then(|u| u.host_str().map(String::from))
-                        })
+                        ws.host_override
+                            .clone()
+                            .or_else(|| parsed_upstream_url(&ws.url).host.clone())
                     }
                     Action::Grpc(g) => {
                         fc = g.forwarding;
-                        g.authority.clone().or_else(|| {
-                            url::Url::parse(&g.url)
-                                .ok()
-                                .and_then(|u| u.host_str().map(String::from))
-                        })
+                        g.authority
+                            .clone()
+                            .or_else(|| parsed_upstream_url(&g.url).host.clone())
                     }
                     Action::A2a(a) => {
                         fc = a.forwarding;
-                        a.host_override.clone().or_else(|| {
-                            url::Url::parse(&a.url)
-                                .ok()
-                                .and_then(|u| u.host_str().map(String::from))
-                        })
+                        a.host_override
+                            .clone()
+                            .or_else(|| parsed_upstream_url(&a.url).host.clone())
                     }
                     Action::GraphQL(gq) => {
                         fc = gq.forwarding;
-                        gq.host_override.clone().or_else(|| {
-                            url::Url::parse(&gq.url)
-                                .ok()
-                                .and_then(|u| u.host_str().map(String::from))
-                        })
+                        gq.host_override
+                            .clone()
+                            .or_else(|| parsed_upstream_url(&gq.url).host.clone())
                     }
                     _ => None,
                 };
@@ -688,11 +725,13 @@ impl ProxyHttp for SbProxy {
                 disable_forwarded_host = forwarding.disable_forwarded_host_header;
 
                 if let Action::Proxy(proxy) = effective_action {
-                    if let Ok(parsed) = url::Url::parse(&proxy.url) {
-                        let p = parsed.path();
-                        if p != "/" && !p.is_empty() {
-                            upstream_url_path = Some(p.to_string());
-                        }
+                    // WOR-1698: read the memoized path instead of
+                    // re-parsing the fixed upstream URL. A URL that does
+                    // not parse yields an empty path, so the guard below
+                    // skips it, matching the old `if let Ok(..)` behavior.
+                    let p = &parsed_upstream_url(&proxy.url).path;
+                    if p != "/" && !p.is_empty() {
+                        upstream_url_path = Some(p.clone());
                     }
                 }
 
@@ -4218,5 +4257,36 @@ fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
             None => b"{}".to_vec(),
         },
         _ => b"{}".to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parsed_upstream_url_extracts_host_and_path() {
+        let info = parsed_upstream_url("https://api.example.com:8443/v1/base");
+        assert_eq!(info.host.as_deref(), Some("api.example.com"));
+        assert_eq!(info.path, "/v1/base");
+    }
+
+    #[test]
+    fn parsed_upstream_url_handles_no_path_and_bad_url() {
+        // Root path stays "/" (the base-path guard treats it as "no prefix").
+        assert_eq!(parsed_upstream_url("http://host").path, "/");
+        // A URL that does not parse yields no host and an empty path, so
+        // the call sites behave exactly as the old `.ok()` handling did.
+        let bad = parsed_upstream_url("not a url");
+        assert!(bad.host.is_none());
+        assert!(bad.path.is_empty());
+    }
+
+    #[test]
+    fn parsed_upstream_url_memoizes_repeated_lookups() {
+        let a = parsed_upstream_url("https://memo.example.com/x");
+        let b = parsed_upstream_url("https://memo.example.com/x");
+        // A cache hit returns the same Arc, not a fresh parse.
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
     }
 }
