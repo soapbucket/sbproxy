@@ -19,9 +19,9 @@ pub mod admin_cluster;
 pub mod admin_keys;
 /// Model-host status admin API (`/admin/model-host/status`), WOR-1665.
 pub mod admin_model_host;
-/// Gated chat-playground route mounted on the admin server. Returns
-/// a feature-disabled response until the route is wired through the
-/// production AI dispatch path.
+/// Admin chat playground: list configured AI endpoints and run a chat
+/// completion against any of them through the production AI dispatch
+/// path. Handled in the async admin connection handler.
 pub mod admin_playground;
 /// Admin browser sessions + operator identity (WOR-1714 / WOR-1716).
 pub mod admin_session;

@@ -43,6 +43,12 @@ const routes = [
     component: () => import("./views/PromptsView.vue"),
     meta: { title: "Prompts" },
   },
+  {
+    path: "/playground",
+    name: "playground",
+    component: () => import("./views/PlaygroundView.vue"),
+    meta: { title: "Playground" },
+  },
   { path: "/:pathMatch(.*)*", redirect: "/" },
 ];
 
