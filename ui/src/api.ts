@@ -295,6 +295,19 @@ export interface ConfigDoc {
   yaml?: string;
 }
 
+export interface AuditRow {
+  timestamp?: string;
+  action?: string;
+  target_kind?: string;
+  target_id?: string;
+  reason?: string;
+}
+
+export interface ClusterMetrics {
+  nodes?: number;
+  metrics?: Record<string, number>;
+}
+
 export interface RequestLog {
   id?: string;
   time?: string;
@@ -502,6 +515,10 @@ export const api = {
       ifMatch ? `/admin/config?if_match=${encodeURIComponent(ifMatch)}` : "/admin/config",
       yaml,
     ),
+
+  // Rate-limit budget audit trail (WOR-1761) + fleet metrics (WOR-1762).
+  auditRecent: (limit = 100) => getJson<AuditRow[]>(`/api/audit/recent?limit=${limit}`),
+  clusterMetrics: () => getJson<ClusterMetrics>("/admin/cluster/metrics"),
 
   cacheStatus: () => getJson<CacheStatus>("/admin/cache"),
   cachePurge: (body: { key?: string; prefix?: string }) =>

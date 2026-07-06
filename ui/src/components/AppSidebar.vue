@@ -14,6 +14,8 @@ const nav = [
   { to: "/playground", label: "Playground" },
   { to: "/cache", label: "Cache" },
   { to: "/model-host", label: "Model host" },
+  { to: "/audit", label: "Audit" },
+  { to: "/cluster", label: "Cluster" },
 ];
 </script>
 
