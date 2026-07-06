@@ -1,0 +1,49 @@
+# Rendered by Terraform (deploy/terraform/l4-demo). Serves local models
+# behind a public, Let's-Encrypt-TLS, bearer-token-protected data plane.
+# The admin server stays on loopback; reach it over an SSH tunnel:
+#   gcloud compute ssh ${acme_domain} -- -L 9090:localhost:9090
+proxy:
+  # Port 80 carries the ACME http-01 challenge; 443 is the TLS data plane
+  # (tls-alpn-01 also works here). sbproxy manages the cert lifecycle.
+  http_bind_port: 80
+  https_bind_port: 443
+  acme:
+    enabled: true
+%{ if acme_email != "" ~}
+    email: ${acme_email}
+%{ endif ~}
+    storage_path: /var/lib/sbproxy/certs
+  admin:
+    enabled: true
+    bind: "127.0.0.1"
+    port: 9090
+    username: admin
+    password: ${admin_password}
+
+origins:
+  "${acme_domain}":
+    # Every request must present Authorization: Bearer <token>.
+    authentication:
+      type: bearer
+      tokens:
+        - ${bearer_token}
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          default_model: ${default_model}
+          models:
+%{ for m in serve_models ~}
+            - ${ coalesce(m.name, m.model) }
+%{ endfor ~}
+          serve:
+            eviction: lru
+            cache_budget_gib: ${cache_budget_gib}
+            models:
+%{ for m in serve_models ~}
+              - model: "${m.model}"
+%{ if m.name != null ~}
+                name: ${m.name}
+%{ endif ~}
+                keep_alive: ${coalesce(m.keep_alive, "30m")}
+%{ endfor ~}
