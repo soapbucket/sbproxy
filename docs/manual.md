@@ -274,34 +274,24 @@ gracefully (admission rejects, the attempt fails over to the next
 provider), but the gap surfaces when the config lands instead of on
 the first request.
 
-#### `doctor --install` - install a missing engine
+#### Installing a missing engine
 
-`--install` acquires a missing `serve:` prerequisite instead of just
-reporting it:
+sbproxy diagnoses; it does not install engines. When `doctor` reports a
+missing engine it prints the prerequisites and the manual steps. Install
+one, then re-run `sbproxy doctor` to confirm it is detected on `PATH`:
 
-```bash
-sbproxy doctor --install vllm                 # uv tool install / pipx install
-sbproxy doctor --install llama-cpp            # brew install llama.cpp
-sbproxy doctor --install llama-cpp \
-  --llama-tag b4589 --llama-sha256 <zip-sha>  # pinned upstream release
-sbproxy doctor --install vllm --yes           # no prompt (provisioning)
-```
+- **llama.cpp** (GGUF models): download a prebuilt release from
+  <https://github.com/ggml-org/llama.cpp/releases> and put `llama-server`
+  on `PATH`. On Linux x64 that is the `llama-<tag>-bin-ubuntu-x64.tar.gz`
+  asset (CPU); for NVIDIA GPU without a CUDA build use the
+  `ubuntu-vulkan-x64` asset; for maximum GPU throughput build from source
+  with `cmake -B build -DGGML_CUDA=ON` and install `build/bin/llama-server`.
+- **vLLM** (safetensors / FP8): `uv tool install vllm` or `pipx install
+  vllm`, or run the pinned vLLM container via the `serve:` block's
+  `engines.launch: container`.
 
-`vllm` installs through `uv` (preferred) or `pipx`; with neither
-present it prints where to get them, or how to run vLLM from a pinned
-container image instead. `llama-cpp` installs through Homebrew; with
-no Homebrew it downloads the named ggml-org release for this platform,
-verifies the archive against the sha256 you pass, extracts it into the
-model cache, and links `llama-server` into `--bin-dir` (default
-`/usr/local/bin`) so the engine launcher finds it on `PATH`.
-
-Every executed command is a fixed argument list (no shell), printed
-before it runs, and nothing runs without confirmation (`--yes` skips
-the prompt for scripts). The release path accepts only a pinned tag
-plus digest, never `latest`. GPU drivers are never installed; a
-missing driver is reported with guidance only. After a successful
-install the doctor report is printed again so you see the new
-verdict. Exits 0 only when the prerequisite is in place afterwards.
+GPU drivers are never installed by sbproxy; a missing driver is reported
+with guidance only.
 
 ### `completions` - shell tab-completion scripts
 

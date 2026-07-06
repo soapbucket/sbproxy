@@ -37,10 +37,12 @@ linked, so the same binary runs on a GPU-free host (the probe reports
 zero GPUs and `serve:` admission rejects cleanly) and discovers real
 devices on a GPU host with no rebuild. Run `sbproxy doctor` to see what
 the current host supports: compiled features, visible GPUs, engines on
-`PATH`, container runtime, and the `serve:` readiness verdict; add
-`--install vllm` or `--install llama-cpp` to acquire a missing engine
-(package manager first, or a pinned sha256-verified release for
-llama.cpp; see [manual.md](manual.md)). The same prerequisites are
+`PATH`, container runtime, and the `serve:` readiness verdict; for a
+missing engine it maps the prerequisites and the manual steps to
+install one (a prebuilt `llama-server` on PATH, the `ubuntu-vulkan-x64`
+asset for NVIDIA GPU without a CUDA build, or vLLM via uv/pipx/a
+container). sbproxy diagnoses; it does not install engines. The same
+prerequisites are
 checked when a config loads: a `serve:` block on a host with no
 visible GPU, or a serve entry whose engine has no binary and no
 container runtime, logs a warning at startup and on every hot reload
