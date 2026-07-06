@@ -54,6 +54,18 @@ pub trait AsyncKVStore: Send + Sync + 'static {
     /// a local counter or the sync trait.
     async fn incr_with_ttl(&self, key: &[u8], ttl_secs: u64) -> Result<i64>;
 
+    /// Atomically add `amount` to the integer counter at `key` (Redis
+    /// `INCRBY`) and ensure the key's TTL is at least `ttl_secs`. Returns
+    /// the post-increment value. Like [`incr_with_ttl`](Self::incr_with_ttl)
+    /// but by an arbitrary amount, so callers can accumulate spend
+    /// (tokens, micro-USD) into a shared counter across replicas.
+    ///
+    /// The default returns a `not supported` error; backends that can do
+    /// it atomically (Redis) override this. Callers should fail open.
+    async fn incr_by_with_ttl(&self, _key: &[u8], _amount: i64, _ttl_secs: u64) -> Result<i64> {
+        anyhow::bail!("incr_by_with_ttl not supported by this backend")
+    }
+
     /// Delete a key. No-op if absent.
     async fn delete(&self, key: &[u8]) -> Result<()>;
 }
