@@ -12,6 +12,10 @@ proxy:
 %{ if acme_email != "" ~}
     email: ${acme_email}
 %{ endif ~}
+    # http-01 only: the proxy drives the HTTP-01 challenge; tls-alpn-01
+    # is not wired, and it is first in the default preference list, so an
+    # unset challenge_types fails issuance (WOR-1771).
+    challenge_types: ["http-01"]
     storage_path: /var/lib/sbproxy/certs
   admin:
     enabled: true
