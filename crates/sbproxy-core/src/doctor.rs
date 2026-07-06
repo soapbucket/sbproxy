@@ -272,9 +272,17 @@ fn serving_verdict(
     }
     if engines.iter().all(|e| e.path.is_none()) && !container_runtime {
         blockers.push(
-            "no way to run an inference engine: neither vllm nor llama-server is \
-             on PATH and no container runtime (docker/podman) is available; run \
-             `sbproxy doctor --install vllm` or `sbproxy doctor --install llama-cpp`"
+            "no inference engine: neither vllm nor llama-server is on PATH and no \
+             container runtime (docker/podman) is present. Install one, then re-run \
+             `sbproxy doctor` to confirm:\n\
+             \x20     - llama.cpp (GGUF): download a prebuilt release and put \
+             `llama-server` on PATH (Linux x64: the `llama-<tag>-bin-ubuntu-x64.tar.gz` \
+             asset from https://github.com/ggml-org/llama.cpp/releases). For NVIDIA GPU \
+             without a CUDA build, use the `ubuntu-vulkan-x64` asset; for maximum GPU \
+             throughput, build from source with `-DGGML_CUDA=ON`.\n\
+             \x20     - vLLM (safetensors/FP8): `uv tool install vllm` (or `pipx install \
+             vllm`), or run the pinned vLLM container via the serve: block's \
+             `engines.launch: container`"
                 .to_string(),
         );
     }

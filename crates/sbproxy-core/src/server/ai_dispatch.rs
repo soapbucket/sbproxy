@@ -2546,7 +2546,9 @@ pub(super) async fn handle_ai_proxy(
                     warn!(
                         provider = %resolved_provider.name,
                         attempt = %attempt,
-                        "AI proxy: local engine unavailable, failing over: {e}"
+                        "AI proxy: local engine unavailable, failing over: {e}. \
+                         Run `sbproxy doctor` to check local-serving prerequisites \
+                         (GPU, inference engine, weights)"
                     );
                     continue;
                 }
