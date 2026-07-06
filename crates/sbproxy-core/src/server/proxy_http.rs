@@ -632,7 +632,7 @@ impl ProxyHttp for SbProxy {
                 let mut fc = ForwardingHeaderControls::default();
                 upstream_host_header = match effective_action {
                     Action::Proxy(p) => {
-                        fc = p.forwarding.clone();
+                        fc = p.forwarding;
                         p.host_override.clone().or_else(|| {
                             url::Url::parse(&p.url)
                                 .ok()
@@ -643,7 +643,7 @@ impl ProxyHttp for SbProxy {
                         .lb_target_idx
                         .and_then(|i| lb.targets.get(i))
                         .and_then(|t| {
-                            fc = t.forwarding.clone();
+                            fc = t.forwarding;
                             t.host_override.clone().or_else(|| {
                                 url::Url::parse(&t.url)
                                     .ok()
@@ -651,7 +651,7 @@ impl ProxyHttp for SbProxy {
                             })
                         }),
                     Action::WebSocket(ws) => {
-                        fc = ws.forwarding.clone();
+                        fc = ws.forwarding;
                         ws.host_override.clone().or_else(|| {
                             url::Url::parse(&ws.url)
                                 .ok()
@@ -659,7 +659,7 @@ impl ProxyHttp for SbProxy {
                         })
                     }
                     Action::Grpc(g) => {
-                        fc = g.forwarding.clone();
+                        fc = g.forwarding;
                         g.authority.clone().or_else(|| {
                             url::Url::parse(&g.url)
                                 .ok()
@@ -667,7 +667,7 @@ impl ProxyHttp for SbProxy {
                         })
                     }
                     Action::A2a(a) => {
-                        fc = a.forwarding.clone();
+                        fc = a.forwarding;
                         a.host_override.clone().or_else(|| {
                             url::Url::parse(&a.url)
                                 .ok()
@@ -675,7 +675,7 @@ impl ProxyHttp for SbProxy {
                         })
                     }
                     Action::GraphQL(gq) => {
-                        fc = gq.forwarding.clone();
+                        fc = gq.forwarding;
                         gq.host_override.clone().or_else(|| {
                             url::Url::parse(&gq.url)
                                 .ok()

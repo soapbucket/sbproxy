@@ -45,6 +45,15 @@ of the new YAML fields below until the version that ships them.
   engine, and the blocker, instead of degrading silently until the
   first request fails over.
 
+### Changed
+
+- **A forward rule whose header matcher names an invalid HTTP header now
+  fails at config load.** The `header:` matcher on a `forward_rules:`
+  entry precompiles its name at load time; a name that is not a valid
+  header (for example one containing spaces) previously loaded and then
+  silently never matched, and now reports a clear error at load and on
+  reload. Valid configurations are unaffected.
+
 ### Fixed
 
 - **Revoking a key now blocks OIDC/JWT identities mapped to it.** With

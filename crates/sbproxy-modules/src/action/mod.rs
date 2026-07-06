@@ -330,7 +330,10 @@ backoff_ms: 10
 /// All fields default to `false`, meaning the proxy will set the header.
 /// Setting a field to `true` suppresses that header on the upstream
 /// request for this action.
-#[derive(Debug, Deserialize, Clone, Default)]
+// WOR-1698: all fields are `bool`, so this is `Copy`; the per-request
+// forwarding-controls read on the proxy hot path is then a register
+// copy instead of a `.clone()`.
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
 pub struct ForwardingHeaderControls {
     /// When true, suppress the `X-Forwarded-Host` header that the proxy
     /// would otherwise set to the client's original `Host` whenever the

@@ -274,15 +274,17 @@ impl PathMatch {
 pub enum HeaderMatch {
     /// Header must exist and its value must equal `value` exactly.
     Equals {
-        /// Header name (case-insensitive lookup).
-        name: String,
+        /// Header name, precompiled at config-load time (WOR-1698) so
+        /// the request path does a constant-time lookup rather than
+        /// re-deriving the name from a `String` on every match.
+        name: http::HeaderName,
         /// Expected value.
         value: String,
     },
     /// Header must exist and its value must start with `prefix`.
     Prefix {
-        /// Header name (case-insensitive lookup).
-        name: String,
+        /// Header name, precompiled at config-load time (WOR-1698).
+        name: http::HeaderName,
         /// Required value prefix.
         prefix: String,
     },
@@ -293,12 +295,12 @@ impl HeaderMatch {
     pub fn matches(&self, headers: &http::HeaderMap) -> bool {
         match self {
             HeaderMatch::Equals { name, value } => headers
-                .get(name.as_str())
+                .get(name)
                 .and_then(|v| v.to_str().ok())
                 .map(|got| got == value)
                 .unwrap_or(false),
             HeaderMatch::Prefix { name, prefix } => headers
-                .get(name.as_str())
+                .get(name)
                 .and_then(|v| v.to_str().ok())
                 .map(|got| got.starts_with(prefix.as_str()))
                 .unwrap_or(false),
@@ -1616,11 +1618,16 @@ fn compile_header_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Opt
     let Some(obj) = val else {
         return Ok(None);
     };
-    let name = obj
+    let name_str = obj
         .get("name")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("forward-rule header matcher missing 'name'"))?
-        .to_string();
+        .ok_or_else(|| anyhow::anyhow!("forward-rule header matcher missing 'name'"))?;
+    // WOR-1698: validate + intern the header name at load time so the
+    // request path never re-parses it. An invalid name now fails config
+    // load with a clear error instead of silently never matching.
+    let name = http::HeaderName::from_bytes(name_str.as_bytes()).map_err(|e| {
+        anyhow::anyhow!("forward-rule header matcher has invalid name '{name_str}': {e}")
+    })?;
     if let Some(value) = obj.get("value").and_then(|v| v.as_str()) {
         return Ok(Some(HeaderMatch::Equals {
             name,
@@ -1635,7 +1642,7 @@ fn compile_header_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Opt
     }
     Err(anyhow::anyhow!(
         "forward-rule header matcher '{}' needs 'value' or 'prefix'",
-        name
+        name.as_str()
     ))
 }
 
