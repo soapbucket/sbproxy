@@ -144,8 +144,7 @@ fn warn_missing_serve_prereqs(config: &AiHandlerConfig) {
                 model = %doctor.model,
                 engine = ?doctor.resolved,
                 "serve: model cannot start on this host: {}. Run \
-                 `sbproxy doctor` to inspect, or `sbproxy doctor --install <engine>` \
-                 to install the engine",
+                 `sbproxy doctor` to see the prerequisites and how to install them",
                 doctor.blocker.as_deref().unwrap_or("engine unavailable"),
             );
         }

@@ -85,9 +85,10 @@ first request.
 
 `sbproxy doctor` gives the host-wide version of the same answer with
 no config at all: visible GPUs, engines on PATH, container runtime,
-and a readiness verdict with every blocker listed. Add
-`--install vllm` or `--install llama-cpp` to acquire a missing engine
-on the spot (see [manual.md](manual.md) for the full flag surface).
+and a readiness verdict with every blocker listed. For a missing
+engine it prints the prerequisites and the manual steps to install
+one (a prebuilt release on PATH, or a container runtime); sbproxy
+diagnoses, it does not install engines for you.
 The proxy also re-checks these prerequisites every time a config with
 `serve:` loads, and logs a warning per missing piece, so a
 freshly-imaged box that lost its engine or driver tells you at boot,
