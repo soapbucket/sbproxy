@@ -29,8 +29,47 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
         "/admin/cache/key-policy/evict" if method.eq_ignore_ascii_case("POST") => {
             Some(key_policy_evict(body))
         }
+        "/admin/cache/semantic" if method.eq_ignore_ascii_case("GET") => Some(semantic_debug(path)),
         _ => None,
     }
+}
+
+/// `GET /admin/cache/semantic`: recent semantic (embedding) cache lookup
+/// decisions per AI origin, so an operator can see why requests hit or
+/// missed (WOR-1756). Each decision carries the reason (`hit`,
+/// `no_entry`, `expired`, `below_threshold`, `cross_scope`), the score
+/// where relevant, and the threshold. `?limit=N` bounds the count.
+fn semantic_debug(path: &str) -> Resp {
+    use sbproxy_modules::Action;
+    let limit = path
+        .split_once("limit=")
+        .and_then(|(_, rest)| rest.split('&').next())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(100);
+    let pipeline = crate::reload::current_pipeline();
+    let mut caches = Vec::new();
+    for (idx, action) in pipeline.actions.iter().enumerate() {
+        if let Action::AiProxy(ai) = action {
+            if let Some(cache) = ai.config.embedding_cache() {
+                let origin = pipeline
+                    .config
+                    .origins
+                    .get(idx)
+                    .map(|o| o.hostname.to_string())
+                    .unwrap_or_default();
+                caches.push(json!({
+                    "origin": origin,
+                    "recent": cache.recent_decisions(limit),
+                }));
+            }
+        }
+    }
+    (
+        200,
+        "application/json",
+        json!({ "caches": caches }).to_string(),
+    )
 }
 
 /// `GET /admin/cache`: response-cache status. `enabled` is false when no

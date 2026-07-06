@@ -6,7 +6,30 @@
 
 use lru::LruCache;
 use parking_lot::Mutex;
+use serde::Serialize;
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
+
+/// How many recent lookup decisions the embedding cache keeps for the
+/// admin debug inspector (WOR-1756).
+const RECENT_DECISIONS_CAP: usize = 100;
+
+/// One semantic-cache lookup outcome, recorded for the admin debug
+/// inspector so an operator can see why a request did or did not hit.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheDecision {
+    /// `hit`, `no_entry`, `expired`, `below_threshold`, or `cross_scope`.
+    pub reason: &'static str,
+    /// The matched cosine score on a hit, or the closest same-scope
+    /// candidate's score on a `below_threshold` miss; `None` otherwise.
+    pub score: Option<f32>,
+    /// The similarity threshold the lookup was gated on.
+    pub threshold: f32,
+    /// The caller scope (tenant / credential) the lookup ran in.
+    pub scope: String,
+    /// Unix seconds when the lookup happened.
+    pub at_unix: u64,
+}
 
 /// Thread-safe exact-match cache for AI responses.
 ///
@@ -302,6 +325,9 @@ pub struct EmbeddingCache {
     /// Standalone OpenAI-compatible endpoint config (for `source: openai`).
     openai: Option<OpenAiEmbeddingConfig>,
     entries: Mutex<LruCache<String, EmbeddingEntry>>,
+    /// Recent lookup decisions for the admin debug inspector (WOR-1756),
+    /// bounded to the most recent `RECENT_DECISIONS_CAP`.
+    recent: Mutex<VecDeque<CacheDecision>>,
 }
 
 /// Outcome of a successful semantic lookup: the cached response plus
@@ -361,6 +387,7 @@ impl EmbeddingCache {
             inprocess,
             openai,
             entries: Mutex::new(LruCache::new(cap)),
+            recent: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -398,41 +425,98 @@ impl EmbeddingCache {
     /// cached response and the matching score. Expired entries
     /// encountered during the scan are removed.
     pub fn lookup(&self, query: &[f32], scope: &str) -> Option<EmbeddingHit> {
+        let now = Self::now_secs();
         let q = normalize(query);
         if q.is_empty() {
+            self.record_decision("no_entry", None, scope, now);
             return None;
         }
-        let now = Self::now_secs();
-        let mut cache = self.entries.lock();
-        // Collect expired keys to evict after the scan (can't mutate
-        // while iterating the LRU).
-        let mut expired: Vec<String> = Vec::new();
-        let mut best: Option<(String, f32)> = None;
-        for (key, entry) in cache.iter() {
-            if now.saturating_sub(entry.cached_at) > self.ttl_secs {
-                expired.push(key.clone());
-                continue;
+        let hit;
+        let reason;
+        let mut decision_score = None;
+        {
+            let mut cache = self.entries.lock();
+            // Collect expired keys to evict after the scan (can't mutate
+            // while iterating the LRU).
+            let mut expired: Vec<String> = Vec::new();
+            let mut best: Option<(String, f32)> = None;
+            // Best same-scope, non-expired score regardless of threshold, so
+            // a miss can report whether there was a near-match (WOR-1756).
+            let mut same_scope_best: Option<f32> = None;
+            let mut cross_scope = 0usize;
+            for (key, entry) in cache.iter() {
+                if now.saturating_sub(entry.cached_at) > self.ttl_secs {
+                    expired.push(key.clone());
+                    continue;
+                }
+                // WOR-1142: never match across callers. An entry stored by
+                // one tenant/credential is invisible to a different one.
+                if entry.scope != scope {
+                    cross_scope += 1;
+                    continue;
+                }
+                let score = dot(&q, &entry.embedding);
+                if same_scope_best.map(|s| score > s).unwrap_or(true) {
+                    same_scope_best = Some(score);
+                }
+                if score >= self.threshold && best.as_ref().map(|(_, s)| score > *s).unwrap_or(true)
+                {
+                    best = Some((key.clone(), score));
+                }
             }
-            // WOR-1142: never match across callers. An entry stored by
-            // one tenant/credential is invisible to a different one.
-            if entry.scope != scope {
-                continue;
+            for k in &expired {
+                cache.pop(k);
             }
-            let score = dot(&q, &entry.embedding);
-            if score >= self.threshold && best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
-                best = Some((key.clone(), score));
+            match best {
+                Some((key, score)) => {
+                    // `get` marks the entry most-recently-used.
+                    hit = cache.get(&key).map(|entry| EmbeddingHit {
+                        response: entry.response.clone(),
+                        score,
+                    });
+                    reason = "hit";
+                    decision_score = Some(score);
+                }
+                None => {
+                    hit = None;
+                    reason = if let Some(s) = same_scope_best {
+                        decision_score = Some(s);
+                        "below_threshold"
+                    } else if cross_scope > 0 {
+                        "cross_scope"
+                    } else if !expired.is_empty() {
+                        "expired"
+                    } else {
+                        "no_entry"
+                    };
+                }
             }
         }
-        for k in expired {
-            cache.pop(&k);
+        self.record_decision(reason, decision_score, scope, now);
+        hit
+    }
+
+    /// Record a lookup outcome in the bounded recent-decisions buffer for
+    /// the admin debug inspector (WOR-1756).
+    fn record_decision(&self, reason: &'static str, score: Option<f32>, scope: &str, at_unix: u64) {
+        let mut recent = self.recent.lock();
+        if recent.len() >= RECENT_DECISIONS_CAP {
+            recent.pop_front();
         }
-        let (key, score) = best?;
-        // `get` marks the entry most-recently-used.
-        let entry = cache.get(&key)?;
-        Some(EmbeddingHit {
-            response: entry.response.clone(),
+        recent.push_back(CacheDecision {
+            reason,
             score,
-        })
+            threshold: self.threshold,
+            scope: scope.to_string(),
+            at_unix,
+        });
+    }
+
+    /// The most recent lookup decisions, newest first, for the admin
+    /// debug inspector.
+    pub fn recent_decisions(&self, limit: usize) -> Vec<CacheDecision> {
+        let recent = self.recent.lock();
+        recent.iter().rev().take(limit).cloned().collect()
     }
 
     /// Store a response under `key` with its prompt `embedding`. The
