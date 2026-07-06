@@ -61,9 +61,6 @@ pub struct VirtualKeyConfig {
     /// bodies before this key can dispatch upstream.
     #[serde(default)]
     pub require_pii_redaction: Vec<String>,
-    /// Maximum tokens per minute for this key.
-    #[serde(default)]
-    pub max_tokens_per_minute: Option<u64>,
     /// Maximum requests per minute for this key.
     #[serde(default)]
     pub max_requests_per_minute: Option<u64>,
@@ -306,7 +303,6 @@ pub struct KeyRateLimiter {
 
 #[derive(Debug, Default)]
 struct KeyRateState {
-    tokens_this_minute: u64,
     requests_this_minute: u64,
     minute_start: Option<std::time::Instant>,
 }
@@ -360,14 +356,6 @@ impl KeyRateLimiter {
         entry.requests_this_minute += 1;
         true
     }
-
-    /// Record token usage for rate tracking.
-    pub fn record_tokens(&self, key: &str, tokens: u64) {
-        let mut state = self.state.lock();
-        if let Some(entry) = state.get_mut(key) {
-            entry.tokens_this_minute += tokens;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -383,7 +371,6 @@ mod tests {
             allowed_providers: vec![],
             principal_selectors: vec![],
             require_pii_redaction: vec![],
-            max_tokens_per_minute: None,
             max_requests_per_minute: None,
             budget: None,
             tags: vec![],
@@ -407,7 +394,6 @@ mod tests {
             allowed_providers: vec![],
             principal_selectors: vec![],
             require_pii_redaction: vec![],
-            max_tokens_per_minute: None,
             max_requests_per_minute: None,
             budget: None,
             tags: vec![],
@@ -625,15 +611,6 @@ mod tests {
         for _ in 0..100 {
             assert!(limiter.check_rate("sk-1", &config));
         }
-    }
-
-    #[test]
-    fn rate_limiter_record_tokens() {
-        let limiter = KeyRateLimiter::new();
-        let config = make_key("sk-1", true);
-        limiter.check_rate("sk-1", &config);
-        limiter.record_tokens("sk-1", 500);
-        // Just verify it doesn't panic; token tracking is internal state.
     }
 
     #[test]

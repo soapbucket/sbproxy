@@ -225,7 +225,6 @@ mod tests {
             extensions: HashMap::new(),
             expose_openapi: false,
             stream_safety: Vec::new(),
-            rate_limits: None,
             auto_content_negotiate: None,
             content_signal: None,
             token_bytes_ratio: None,

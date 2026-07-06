@@ -616,23 +616,6 @@ pub struct RequestContext {
     #[cfg(feature = "agent-class")]
     pub kya_kyab_balance: Option<u64>,
 
-    // --- ML agent classifier verdict (A5.2 / G5.5) ---
-    //
-    // Populated by the enterprise classifier sidecar's feature builder
-    // + ONNX inference path. In async mode (the default), the verdict
-    // lands here after the request phase and is read by response-phase
-    // policies. In sync mode, it lands before policy evaluation.
-    //
-    // `None` when:
-    //   - the `agent-classifier` feature is disabled,
-    //   - no enterprise classifier is configured for this hostname,
-    //   - or inference timed out and the timeout path filled `Some` with
-    //     `MlClass::Unknown`. (Timeout still produces `Some` so the
-    //     access log can distinguish "did not run" from "ran and gave up".)
-    /// Verdict from the ML agent classifier.
-    #[cfg(feature = "agent-classifier")]
-    pub ml_classification: Option<sbproxy_classifiers::MlClassification>,
-
     // --- aipref signal (Wave 4 / G4.9) ---
     //
     // Parsed from the request-side `aipref` header by a request
@@ -1098,8 +1081,6 @@ impl RequestContext {
             kya_version: None,
             #[cfg(feature = "agent-class")]
             kya_kyab_balance: None,
-            #[cfg(feature = "agent-classifier")]
-            ml_classification: None,
             aipref: None,
             canonical_url: None,
             metrics: RequestMetrics::default(),

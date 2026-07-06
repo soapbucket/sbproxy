@@ -1019,9 +1019,6 @@ pub struct SeedKeyConfig {
     /// Max requests per minute.
     #[serde(default)]
     pub max_requests_per_minute: Option<u64>,
-    /// Max tokens per minute.
-    #[serde(default)]
-    pub max_tokens_per_minute: Option<u64>,
     /// Max total tokens for this key's budget window.
     #[serde(default)]
     pub max_budget_tokens: Option<u64>,
@@ -3243,9 +3240,6 @@ pub enum CredentialPolicy {
         /// Requests per minute cap.
         #[serde(default)]
         rpm: Option<u64>,
-        /// Tokens per minute cap.
-        #[serde(default)]
-        tpm: Option<u64>,
     },
     /// Require PII redaction for the named rule set on every request
     /// served by this credential. The names match
@@ -3429,13 +3423,6 @@ pub struct RawOriginConfig {
     /// for the origin even when the hook is wired.
     #[serde(default)]
     pub stream_safety: Vec<String>,
-    /// Per-origin rate-limit budget. When present, the rate-limit
-    /// middleware is mounted ahead of policies in the handler chain.
-    /// When absent, the middleware stays off (backwards compatible
-    /// with sb.yml configs that use the per-policy
-    /// `type: rate_limiting` block).
-    #[serde(default)]
-    pub rate_limits: Option<OriginRateLimitsConfig>,
     /// Per-origin default content shape used when the agent's
     /// `Accept` header is `*/*` or absent. Threaded into the
     /// synthesised `auto_content_negotiate` config by
@@ -3697,63 +3684,6 @@ pub struct AgentSkillEntry {
 
 fn default_agent_skill_visibility() -> String {
     "public".to_string()
-}
-
-// --- Per-origin rate limits ---
-
-/// Per-origin rate-limit budget configuration.
-///
-/// Per-tenant and per-route token buckets, with an optional
-/// `route_overrides:` map that lets an operator pin a specific route
-/// to a tighter ceiling than the origin default.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct OriginRateLimitsConfig {
-    /// Tenant-level burst. Effective ceiling that a single tenant
-    /// may briefly exceed when arriving in bursts.
-    #[serde(default = "default_tenant_burst")]
-    pub tenant_burst: u32,
-    /// Tenant-level sustained ceiling (rps). Long-running traffic is
-    /// flattened to this rate.
-    #[serde(default = "default_tenant_sustained")]
-    pub tenant_sustained: u32,
-    /// Per-route default ceiling (rps). Used when the request path
-    /// has no entry in `route_overrides`.
-    #[serde(default = "default_route_default")]
-    pub route_default: u32,
-    /// Per-route ceiling overrides keyed by literal path or `/prefix/*`
-    /// pattern. The first matching entry wins, in iteration order.
-    #[serde(default)]
-    pub route_overrides: std::collections::BTreeMap<String, u32>,
-    /// Optional soft-tier ceiling. When `Some`, requests above this
-    /// rate but below `tenant_sustained` are tagged but not
-    /// throttled (useful for telemetry-driven escalation). `None`
-    /// disables the soft tier.
-    #[serde(default)]
-    pub soft_threshold_rps: Option<u32>,
-}
-
-impl Default for OriginRateLimitsConfig {
-    fn default() -> Self {
-        Self {
-            tenant_burst: default_tenant_burst(),
-            tenant_sustained: default_tenant_sustained(),
-            route_default: default_route_default(),
-            route_overrides: std::collections::BTreeMap::new(),
-            soft_threshold_rps: None,
-        }
-    }
-}
-
-fn default_tenant_burst() -> u32 {
-    2_000
-}
-
-fn default_tenant_sustained() -> u32 {
-    1_000
-}
-
-fn default_route_default() -> u32 {
-    100
 }
 
 // --- Middleware Configs ---

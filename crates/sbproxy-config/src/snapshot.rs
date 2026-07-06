@@ -15,9 +15,9 @@ use smallvec::SmallVec;
 use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, AgentsJsonConfig, CompressionConfig,
     CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
-    MirrorConfig, OlpConfig, OriginRateLimitsConfig, ProblemDetailsConfig, ProxyServerConfig,
-    ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
-    SessionConfig, WebBotAuthPublishConfig,
+    MirrorConfig, OlpConfig, ProblemDetailsConfig, ProxyServerConfig, ProxyStatusConfig,
+    RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
+    WebBotAuthPublishConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -149,12 +149,6 @@ pub struct CompiledOrigin {
     /// AI responses. Threaded through `StreamSafetyCtx.rules` to the
     /// stream-safety hook.
     pub stream_safety: Vec<String>,
-    /// Per-origin rate-limit budget. `None` means the operator did
-    /// not author a `rate_limits:` block and the rate-limit middleware
-    /// stays off for this origin. `Some(_)` carries the typed budget
-    /// so the request pipeline can mount the middleware ahead of
-    /// policies.
-    pub rate_limits: Option<OriginRateLimitsConfig>,
     /// Synthesised content-negotiate config emitted by
     /// [`crate::compile_origin`] when the origin has an
     /// `ai_crawl_control` policy or any content-shaping transform

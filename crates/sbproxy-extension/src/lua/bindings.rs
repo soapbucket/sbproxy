@@ -390,48 +390,6 @@ pub fn enrich_request_table_with_kya(
     }
 }
 
-/// Splice the ML agent classifier verdict into an
-/// existing request table built by [`build_request_table`]. Adds a
-/// nested `ml_classification` sub-table mirroring the CEL surface
-/// (`crate::cel::context::populate_ml_namespace`).
-///
-/// Fields default to the zero value when the classifier did not run.
-pub fn enrich_request_table_with_ml(
-    request: &mut serde_json::Value,
-    class: Option<&str>,
-    confidence: Option<f32>,
-    model_version: Option<&str>,
-    feature_schema_version: Option<u32>,
-) {
-    if let Some(map) = request.as_object_mut() {
-        let mut ml = serde_json::Map::new();
-        ml.insert(
-            "class".to_string(),
-            serde_json::Value::String(class.unwrap_or("").to_string()),
-        );
-        ml.insert(
-            "confidence".to_string(),
-            serde_json::Number::from_f64(confidence.unwrap_or(0.0) as f64)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-        );
-        ml.insert(
-            "model_version".to_string(),
-            serde_json::Value::String(model_version.unwrap_or("").to_string()),
-        );
-        ml.insert(
-            "feature_schema_version".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(
-                feature_schema_version.unwrap_or(0),
-            )),
-        );
-        map.insert(
-            "ml_classification".to_string(),
-            serde_json::Value::Object(ml),
-        );
-    }
-}
-
 // --- Response Table Builder ---
 
 /// Build a Lua-friendly response table from HTTP response data.
@@ -602,41 +560,6 @@ mod tests {
         assert_eq!(req["kya"]["verdict"], "missing");
         assert_eq!(req["kya"]["agent_id"], "");
         assert_eq!(req["kya"]["kyab_balance"]["amount"], 0);
-    }
-
-    // --- Wave 5 / A5.2 ML classifier tests ---
-
-    #[test]
-    fn enrich_request_table_adds_ml_classification_subtable_for_human_verdict() {
-        let headers = HashMap::new();
-        let mut req = build_request_table("GET", "/", &headers, None, None);
-        enrich_request_table_with_ml(
-            &mut req,
-            Some("human"),
-            Some(0.97),
-            Some("ml-agent-v1"),
-            Some(1),
-        );
-        assert_eq!(req["ml_classification"]["class"], "human");
-        // serde_json normalises 0.97 to a Number; we assert via the
-        // f64 round-trip rather than a direct equality on f32.
-        let conf = req["ml_classification"]["confidence"].as_f64().unwrap();
-        assert!((conf - 0.97).abs() < 0.001);
-        assert_eq!(req["ml_classification"]["model_version"], "ml-agent-v1");
-        assert_eq!(req["ml_classification"]["feature_schema_version"], 1);
-    }
-
-    #[test]
-    fn enrich_request_table_adds_ml_classification_subtable_with_defaults() {
-        let headers = HashMap::new();
-        let mut req = build_request_table("GET", "/", &headers, None, None);
-        enrich_request_table_with_ml(&mut req, None, None, None, None);
-        assert_eq!(req["ml_classification"]["class"], "");
-        assert_eq!(
-            req["ml_classification"]["confidence"].as_f64().unwrap(),
-            0.0
-        );
-        assert_eq!(req["ml_classification"]["feature_schema_version"], 0);
     }
 
     #[test]

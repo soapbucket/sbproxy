@@ -494,19 +494,16 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                     }
                 }
                 // Per-credential rate_limit lowers onto the legacy
-                // `max_requests_per_minute` + `max_tokens_per_minute`
-                // fields. `require_pii_redaction` lowers onto the
-                // runtime key so dispatch can reject the request before
-                // provider selection when request redaction is inactive.
+                // `max_requests_per_minute` field. `require_pii_redaction`
+                // lowers onto the runtime key so dispatch can reject the
+                // request before provider selection when request redaction
+                // is inactive.
                 let mut required_pii_redaction = Vec::new();
                 for policy in &cred.policies {
                     match policy {
-                        CredentialPolicy::RateLimit { rpm, tpm } => {
+                        CredentialPolicy::RateLimit { rpm } => {
                             if let Some(r) = rpm {
                                 vk["max_requests_per_minute"] = json!(r);
-                            }
-                            if let Some(t) = tpm {
-                                vk["max_tokens_per_minute"] = json!(t);
                             }
                         }
                         CredentialPolicy::RequirePiiRedaction { rules } => {
@@ -1341,10 +1338,6 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         extensions: config.extensions,
         expose_openapi: config.expose_openapi,
         stream_safety: config.stream_safety,
-        // R2.3 wire: ride the parsed `rate_limits:` block onto the
-        // compiled snapshot. The handler-chain mount lives in a
-        // follow-up; this commit just makes the YAML schema land.
-        rate_limits: config.rate_limits,
         // Wave 4 day-4 wire: synthesised `content_negotiate` config,
         // populated above when the origin has an `ai_crawl_control`
         // policy or one of the new content-shaping transforms.
@@ -2906,52 +2899,6 @@ origins:
             compiled.messenger.is_some(),
             "messenger must be built from messenger_settings block"
         );
-    }
-
-    #[test]
-    fn compile_config_parses_rate_limits_block_per_origin() {
-        // R2.3 wire: the `rate_limits:` block on an origin must
-        // round-trip onto `CompiledOrigin::rate_limits` so the
-        // handler-chain mount has a typed source.
-        let yaml = r#"
-origins:
-  "api.example.com":
-    action:
-      type: proxy
-      url: http://127.0.0.1:18888
-    rate_limits:
-      tenant_burst: 2000
-      tenant_sustained: 1000
-      route_default: 100
-      route_overrides:
-        /search: 50
-      soft_threshold_rps: 800
-"#;
-        let compiled = compile_config(yaml).expect("compile");
-        let origin = compiled.resolve_origin("api.example.com").expect("origin");
-        let rl = origin.rate_limits.as_ref().expect("rate_limits parsed");
-        assert_eq!(rl.tenant_burst, 2000);
-        assert_eq!(rl.tenant_sustained, 1000);
-        assert_eq!(rl.route_default, 100);
-        assert_eq!(rl.route_overrides.get("/search"), Some(&50));
-        assert_eq!(rl.soft_threshold_rps, Some(800));
-    }
-
-    #[test]
-    fn compile_config_no_rate_limits_when_block_absent() {
-        // Backwards compat: an origin without the `rate_limits:`
-        // block lands `rate_limits = None` so the middleware mount
-        // skips it entirely.
-        let yaml = r#"
-origins:
-  "api.example.com":
-    action:
-      type: proxy
-      url: http://127.0.0.1:18888
-"#;
-        let compiled = compile_config(yaml).expect("compile");
-        let origin = compiled.resolve_origin("api.example.com").expect("origin");
-        assert!(origin.rate_limits.is_none());
     }
 
     #[test]

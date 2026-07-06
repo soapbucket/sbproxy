@@ -28,10 +28,6 @@ pub mod macaroon;
 pub mod modifiers;
 pub mod problem_details;
 pub mod proxy_status;
-/// Per-origin rate-limit middleware. Consumes the
-/// `rate_limits:` block on `CompiledOrigin` and gates traffic ahead of
-/// the per-origin policy chain.
-pub mod rate_limit;
 pub mod signatures;
 /// RFC 9421 HTTP Message Signatures: outbound signing path (sign on
 /// egress). Companion to [`signatures`], which implements the inbound

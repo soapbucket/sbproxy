@@ -478,16 +478,6 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Reload,
         reason: "auth chain re-compiles on reload",
     },
-    BlastRadiusRule {
-        pattern: "origins.*.rate_limits.**",
-        radius: BlastRadius::Reload,
-        reason: "rate-limit budget re-read on reload",
-    },
-    BlastRadiusRule {
-        pattern: "origins.*.rate_limits",
-        radius: BlastRadius::Reload,
-        reason: "rate-limit budget re-read on reload",
-    },
     // --- Hitless origin tweaks: backend timeout, capture toggles
     //     etc. The proxy reads these fields per request from the
     //     arc-swapped pipeline so the swap is observed without
@@ -1323,18 +1313,6 @@ origins:
       url: https://upstream.example.com
 "#;
 
-    const ORIGIN_BASE_PLUS_RATELIMIT: &str = r#"
-origins:
-  api.example.com:
-    action:
-      type: proxy
-      url: https://upstream.example.com
-    rate_limits:
-      tenant_burst: 200
-      tenant_sustained: 100
-      route_default: 50
-"#;
-
     const ORIGIN_TWO: &str = r#"
 origins:
   api.example.com:
@@ -1413,23 +1391,6 @@ origins:
         assert!(entry.new.is_none());
         assert!(entry.old.is_some());
         assert_eq!(report.summary.removed, 1);
-    }
-
-    #[test]
-    fn plan_changed_origin_emits_field_preview_in_reason() {
-        let a = parse(ORIGIN_BASE);
-        let b = parse(ORIGIN_BASE_PLUS_RATELIMIT);
-        let report = plan(&a, &b);
-        assert_eq!(report.entries.len(), 1);
-        let entry = &report.entries[0];
-        assert_eq!(entry.kind, PlanKind::Changed);
-        assert_eq!(entry.path, "origins.api.example.com");
-        assert_eq!(entry.blast_radius, BlastRadius::Reload);
-        assert!(
-            entry.reason.contains("rate_limits"),
-            "expected rate_limits in reason, got {:?}",
-            entry.reason
-        );
     }
 
     #[test]
