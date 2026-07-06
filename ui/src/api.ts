@@ -265,6 +265,34 @@ export function asList<T>(value: unknown, ...keys: string[]): T[] {
   return [];
 }
 
+export interface PlaygroundProvider {
+  name: string;
+  type?: string | null;
+  models: string[];
+  default_model?: string | null;
+}
+export interface PlaygroundEndpoint {
+  origin: string;
+  providers: PlaygroundProvider[];
+}
+export interface PlaygroundEndpoints {
+  endpoints: PlaygroundEndpoint[];
+}
+export interface PlaygroundChatRequest {
+  origin: string;
+  request: Record<string, unknown>;
+}
+export interface PlaygroundChatResult {
+  origin?: string;
+  status?: number;
+  model?: string;
+  response?: Record<string, unknown>;
+  usage?: { input_tokens: number; output_tokens: number };
+  cost_usd?: number;
+  latency_ms?: number;
+  error?: string;
+}
+
 export const api = {
   // Overview
   health: () => getJson<HealthResponse>("/health"),
@@ -328,4 +356,10 @@ export const api = {
       `/admin/prompts/${encodeURIComponent(host)}/${encodeURIComponent(name)}/pin`,
       body,
     ),
+
+  // Playground
+  playgroundEndpoints: () =>
+    getJson<PlaygroundEndpoints>("/admin/api/playground/endpoints"),
+  playgroundChat: (body: PlaygroundChatRequest) =>
+    sendJson<PlaygroundChatResult>("POST", "/admin/api/playground/chat", body),
 };
