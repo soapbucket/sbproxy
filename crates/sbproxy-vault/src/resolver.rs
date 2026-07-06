@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::manager::VaultBackend;
+use crate::manager::{VaultBackend, VaultManager};
 use crate::vault_ref::{
     legacy_vault_env_name, legacy_vault_reference_replacement, warn_legacy_vault_reference_once,
+    VaultRef,
 };
 
 /// Behaviour when the vault backend is unavailable and a `secret:` reference
@@ -45,6 +46,11 @@ pub struct SecretResolver {
     /// physical vault path can change.
     map: HashMap<String, String>,
     fallback: ResolveFallback,
+    /// Provider-scheme backends (`vault://`, `awssm://`, `secretfile://`,
+    /// `secret://`, ...). When set, a recognized reference resolves
+    /// through here and a miss is a hard error, never passed through
+    /// verbatim (WOR-1767).
+    manager: Option<Arc<VaultManager>>,
 }
 
 impl SecretResolver {
@@ -58,12 +64,21 @@ impl SecretResolver {
             backend,
             map,
             fallback: ResolveFallback::Reject,
+            manager: None,
         }
     }
 
     /// Set the fallback strategy used when the vault backend is unavailable.
     pub fn with_fallback(mut self, fallback: ResolveFallback) -> Self {
         self.fallback = fallback;
+        self
+    }
+
+    /// Attach the provider-scheme backend manager used to resolve
+    /// `vault://`, `awssm://`, `secretfile://`, `secret://`, and the other
+    /// provider-URI references (WOR-1767).
+    pub fn with_manager(mut self, manager: Arc<VaultManager>) -> Self {
+        self.manager = Some(manager);
         self
     }
 
@@ -80,34 +95,58 @@ impl SecretResolver {
     /// (which dispatches the work to a blocking thread pool) so the
     /// caller does not stall a Tokio worker.
     pub fn resolve(&self, value: &str) -> Result<String> {
-        if let Some(name) = value.strip_prefix("secret:") {
-            self.resolve_secret(name)
-        } else if let Some(var) = legacy_vault_env_name(value) {
+        // Legacy `vault://env/NAME` alias -> env var (compat window). Checked
+        // before the provider-URI parse so the alias keeps its env semantics.
+        if let Some(var) = legacy_vault_env_name(value) {
             let replacement =
                 legacy_vault_reference_replacement(value).unwrap_or_else(|| format!("${{{var}}}"));
             warn_legacy_vault_reference_once(value, &replacement);
-            std::env::var(var).with_context(|| format!("env var {} not set", var))
-        } else if value.starts_with("${") && value.ends_with('}') {
-            let var = &value[2..value.len() - 1];
-            std::env::var(var).with_context(|| format!("env var {} not set", var))
-        } else if let Some(path) = value.strip_prefix("file:") {
-            std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read secret file: {}", path))
-                .map(|s| s.trim().to_string())
-        } else {
-            // WOR-1165: only a whole-value `${VAR}` wrapper is expanded.
-            // If the value embeds a reference inside a larger string (e.g.
-            // `Bearer ${TOKEN}`), it is passed through literally; warn so
-            // an operator who expected interpolation is not silently
-            // surprised by a literal `${...}` reaching the upstream.
-            if value.contains("${") {
-                tracing::warn!(
-                    "config value embeds an env-style `${{VAR}}` reference, but only a whole-value \
-                     `${{VAR}}` wrapper is expanded; this value is passed through literally"
-                );
-            }
-            Ok(value.to_string())
+            return std::env::var(var).with_context(|| format!("env var {} not set", var));
         }
+        // Whole-value `${VAR}` -> env var.
+        if value.starts_with("${") && value.ends_with('}') {
+            let var = &value[2..value.len() - 1];
+            return std::env::var(var).with_context(|| format!("env var {} not set", var));
+        }
+        // `file:/path` -> file contents.
+        if let Some(path) = value.strip_prefix("file:") {
+            return std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read secret file: {}", path))
+                .map(|s| s.trim().to_string());
+        }
+        // Provider-URI schemes: vault:// awssm:// gcpsm:// k8ssecret://
+        // secretfile:// secret://. Resolve through the backend manager.
+        // WOR-1767: a recognized reference that cannot be resolved is a HARD
+        // ERROR, never passed through verbatim (a literal `vault://...`
+        // reaching an upstream as a bearer token is the footgun this closes).
+        // Checked before the deprecated `secret:` colon form so `secret://`
+        // is routed to the manager, not mis-parsed as a `secret:` name.
+        if let Ok(reference) = VaultRef::parse(value) {
+            return match &self.manager {
+                Some(manager) => manager
+                    .get_from_ref(&reference)?
+                    .ok_or_else(|| anyhow::anyhow!("secret not found for reference: {value}")),
+                None => anyhow::bail!(
+                    "no secret backend configured to resolve {value}; declare it under \
+                     proxy.secrets.backends"
+                ),
+            };
+        }
+        // Deprecated `secret:<name>` (colon) form. Superseded by
+        // `secret://<backend>/<name>`; kept for the compat window.
+        if let Some(name) = value.strip_prefix("secret:") {
+            return self.resolve_secret(name);
+        }
+        // Plain value: passed through. WOR-1165: only a whole-value `${VAR}`
+        // wrapper is expanded; an embedded `${..}` inside a larger string is
+        // literal, so warn rather than silently surprise the operator.
+        if value.contains("${") {
+            tracing::warn!(
+                "config value embeds an env-style `${{VAR}}` reference, but only a whole-value \
+                 `${{VAR}}` wrapper is expanded; this value is passed through literally"
+            );
+        }
+        Ok(value.to_string())
     }
 
     /// Async wrapper around [`Self::resolve`] that dispatches the call to
@@ -310,6 +349,50 @@ mod tests {
     fn resolve_plain_string_passthrough() {
         let resolver = resolver_no_backend();
         assert_eq!(resolver.resolve("just_a_value").unwrap(), "just_a_value");
+        assert_eq!(
+            resolver.resolve("http://example.com").unwrap(),
+            "http://example.com"
+        );
+    }
+
+    // --- provider-URI schemes via the manager (WOR-1767) ---
+
+    fn manager_with_local(name: &str, key: &str, value: &str) -> Arc<VaultManager> {
+        let vault = LocalVault::new();
+        vault.set_secret(key, value).unwrap();
+        let mut mgr = VaultManager::new();
+        mgr.register(name, Box::new(vault));
+        Arc::new(mgr)
+    }
+
+    #[test]
+    fn resolve_secret_scheme_via_manager() {
+        let mgr = manager_with_local("local", "openai", "sk-resolved");
+        let resolver = SecretResolver::new(None, HashMap::new()).with_manager(mgr);
+        assert_eq!(
+            resolver.resolve("secret://local/openai").unwrap(),
+            "sk-resolved"
+        );
+    }
+
+    #[test]
+    fn unresolved_provider_uri_errors_not_verbatim() {
+        // The footgun this closes: a provider-URI reference must never be
+        // passed through verbatim (which would send the literal `vault://...`
+        // as a credential). With no backend configured it is a hard error.
+        let resolver = resolver_no_backend();
+        assert!(resolver
+            .resolve("vault://primary/secret/openai?key=api_key")
+            .is_err());
+        assert!(resolver.resolve("awssm://primary/openai").is_err());
+        assert!(resolver.resolve("secret://nope/key").is_err());
+    }
+
+    #[test]
+    fn plain_url_still_passes_through_not_treated_as_reference() {
+        // http:// is not a secret scheme; it must pass through unchanged.
+        let resolver = manager_with_local("local", "k", "v");
+        let resolver = SecretResolver::new(None, HashMap::new()).with_manager(resolver);
         assert_eq!(
             resolver.resolve("http://example.com").unwrap(),
             "http://example.com"
