@@ -57,6 +57,7 @@ const answer = computed<string>(() => {
 });
 
 const showRaw = ref(false);
+const debugMode = ref(false);
 
 async function send() {
   if (!selectedOrigin.value || !prompt.value.trim() || sending.value) return;
@@ -72,6 +73,7 @@ async function send() {
     result.value = await api.playgroundChat({
       origin: selectedOrigin.value,
       request,
+      debug: debugMode.value,
     });
   } catch (e) {
     chatError.value = e as ApiError;
@@ -136,6 +138,10 @@ async function send() {
         ></textarea>
       </label>
       <div class="actions">
+        <label class="debug-toggle">
+          <input type="checkbox" v-model="debugMode" />
+          <span>Debug</span>
+        </label>
         <span class="sb-faint hint">Ctrl/Cmd + Enter to send</span>
         <button
           class="sb-btn sb-btn--primary"
@@ -182,6 +188,21 @@ async function send() {
         <pre v-if="showRaw" class="sb-code">{{ JSON.stringify(result.response, null, 2) }}</pre>
         <pre v-else class="answer__text">{{ answer }}</pre>
       </div>
+
+      <div class="sb-card debug" v-if="result.debug">
+        <h3>Debug</h3>
+        <dl class="debug-grid">
+          <dt>Request id</dt>
+          <dd class="sb-mono">{{ result.debug.request_id ?? "-" }}</dd>
+          <dt>Config revision</dt>
+          <dd class="sb-mono">{{ result.debug.config_revision ?? "-" }}</dd>
+        </dl>
+        <p class="sb-faint">
+          Logged server-side under the admin::playground target; grep the
+          request id to correlate. The config revision is the pipeline that
+          served this request.
+        </p>
+      </div>
     </template>
   </template>
 </template>
@@ -218,6 +239,32 @@ label {
   align-items: center;
   justify-content: flex-end;
   gap: var(--sb-space-4);
+}
+.debug-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  color: var(--sb-text-muted);
+  margin-right: auto;
+  cursor: pointer;
+}
+.debug-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 16px;
+  margin-bottom: var(--sb-space-3);
+  font-size: 0.85rem;
+}
+.debug-grid dt {
+  color: var(--sb-text-muted);
+}
+.debug-grid dd {
+  margin: 0;
+  word-break: break-all;
+}
+.debug h3 {
+  margin-bottom: var(--sb-space-3);
 }
 .hint {
   font-size: 0.78rem;

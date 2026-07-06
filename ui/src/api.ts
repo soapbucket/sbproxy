@@ -375,6 +375,7 @@ export interface PlaygroundEndpoints {
 export interface PlaygroundChatRequest {
   origin: string;
   request: Record<string, unknown>;
+  debug?: boolean;
 }
 export interface PlaygroundChatResult {
   origin?: string;
@@ -384,6 +385,7 @@ export interface PlaygroundChatResult {
   usage?: { input_tokens: number; output_tokens: number };
   cost_usd?: number;
   latency_ms?: number;
+  debug?: { request_id?: string; config_revision?: string };
   error?: string;
 }
 export interface CacheStatus {
