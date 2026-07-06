@@ -2265,7 +2265,7 @@ pub(super) async fn request_filter(
         }
     }
 
-    // --- Wave 8 P0 edge capture ---
+    // --- P0 edge capture ---
     //
     // Stamp custom properties, session linkage, and end-user ID
     // onto the request context. Runs after auth so the
@@ -2303,7 +2303,7 @@ pub(super) async fn request_filter(
             }
             _ => (None, None),
         };
-        crate::wave8::capture_dimensions(
+        crate::capture_envelope::capture_dimensions(
             ctx,
             &session.req_header().headers,
             &properties_cfg,

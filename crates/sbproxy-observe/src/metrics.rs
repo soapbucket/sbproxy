@@ -1237,7 +1237,7 @@ pub fn record_capture_budget_drop(workspace_id: &str, dimension: &'static str) {
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_capture_budget_dropped_total",
-            "Wave 8 envelope dimensions dropped because the per-workspace budget was exhausted",
+            "Capture envelope dimensions dropped because the per-workspace budget was exhausted",
             &["workspace", "dimension"],
         )
         .expect("capture budget counter registers")
@@ -1329,7 +1329,7 @@ pub fn record_capture_drop(
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_capture_dropped_total",
-            "Wave 8 envelope dimensions dropped during capture, by reason",
+            "Capture envelope dimensions dropped during capture, by reason",
             &["workspace", "dimension", "reason"],
         )
         .expect("capture drop counter registers")

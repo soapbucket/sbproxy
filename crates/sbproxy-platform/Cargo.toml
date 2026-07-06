@@ -9,7 +9,6 @@ publish = false
 default = ["redb-store", "sqlite-store"]
 redb-store = ["dep:redb"]
 sqlite-store = ["dep:rusqlite"]
-postgres-store = ["dep:postgres"]
 
 [dependencies]
 sbproxy-plugin.workspace = true
@@ -37,7 +36,6 @@ tracing = { workspace = true }
 # Optional storage backends
 redb = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
-postgres = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

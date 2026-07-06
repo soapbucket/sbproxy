@@ -93,7 +93,7 @@ pub mod server;
 /// and feeds the verdict into the `/readyz` synthetic probe cache.
 pub mod synthetic;
 /// P0 edge capture wired into the request pipeline.
-pub mod wave8;
+pub mod capture_envelope;
 
 // Re-export the main entry point for convenience.
 pub use server::{run, GraceConfig};

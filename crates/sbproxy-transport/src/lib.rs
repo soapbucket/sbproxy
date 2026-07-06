@@ -1,28 +1,14 @@
 //! sbproxy-transport: Custom HTTP transport features.
 //!
-//! Provides retry, request coalescing, hedged requests, upstream
-//! rate limiting, self-tuning connection pools, and request deduplication
-//! for the proxy transport layer.
+//! Provides the gRPC surface for the proxy transport layer: gRPC-Web
+//! bridging and descriptor-driven REST <-> gRPC transcoding.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod auto_pool;
-pub mod coalescing;
-pub mod dedup;
 pub mod grpc;
-pub mod hedging;
-pub mod mirroring;
-pub mod ratelimit;
-pub mod retry;
 
-pub use coalescing::{CoalescedResponse, RequestCoalescer};
-pub use dedup::DedupCache;
 pub use grpc::{
     GrpcStatus, GrpcTrailers, GrpcWebBridge, HttpMethod, PathTemplate, RouteSpec,
     TranscodedRequest, TranscodedResponse, Transcoder,
 };
-pub use hedging::HedgingConfig;
-pub use mirroring::{mirror_request, MirrorConfig};
-pub use ratelimit::UpstreamRateLimiter;
-pub use retry::{RetryBudget, RetryConfig};

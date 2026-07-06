@@ -70,7 +70,6 @@ tokio-rustls = { workspace = true }
 # are called here.
 sbproxy-transport.workspace = true
 sbproxy-middleware.workspace = true
-sbproxy-httpkit.workspace = true
 sbproxy-observe.workspace = true
 sbproxy-extension.workspace = true
 sbproxy-ai.workspace = true

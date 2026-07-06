@@ -1804,7 +1804,7 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        // 8. Wave 8 P0 session ID echo.
+        // 8. P0 session ID echo.
         //    When a session was captured (caller-supplied valid ULID or
         //    auto-generated for anonymous traffic), echo it on the
         //    response so stateless SDK callers can learn their
@@ -4188,7 +4188,7 @@ impl ProxyHttp for SbProxy {
             ctx.metrics.stripped_bytes,
         );
 
-        // --- Wave 8 / T4.6 envelope dispatch ---
+        // --- T4.6 envelope dispatch ---
         //
         // Build the terminal RequestEvent and hand it to the
         // registered RequestEventSink. The OSS default is a no-op
@@ -4208,9 +4208,9 @@ impl ProxyHttp for SbProxy {
         } else {
             None
         };
-        crate::wave8::dispatch_terminal_event(
+        crate::capture_envelope::dispatch_terminal_event(
             ctx,
-            crate::wave8::DEFAULT_WORKSPACE_ID,
+            crate::capture_envelope::DEFAULT_WORKSPACE_ID,
             latency_ms_envelope,
             error_class,
         );

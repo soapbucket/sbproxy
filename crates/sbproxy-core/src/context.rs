@@ -519,9 +519,9 @@ pub struct RequestContext {
     /// struct.
     pub classifier_extensions: HashMap<String, serde_json::Value>,
 
-    // --- Wave 8 P0 envelope dimensions ---
+    // --- P0 envelope dimensions ---
     //
-    // Filled at request entry by `pipeline::capture_wave8_dimensions`.
+    // Filled at request entry by `capture_envelope::capture_dimensions`.
     /// Caller-supplied custom properties from `X-Sb-Property-*`
     /// headers. Cardinality-capped, allowlist-checked, redaction-applied.
     pub properties: BTreeMap<String, String>,

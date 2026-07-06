@@ -16,7 +16,6 @@ members = [
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
     "crates/sbproxy-mesh",
-    "crates/sbproxy-storage-mesh",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
@@ -52,7 +51,6 @@ default-members = [
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
     "crates/sbproxy-mesh",
-    "crates/sbproxy-storage-mesh",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
@@ -93,7 +91,6 @@ sbproxy-vault = { path = "crates/sbproxy-vault" }
 sbproxy-keystore = { path = "crates/sbproxy-keystore" }
 sbproxy-storage = { path = "crates/sbproxy-storage" }
 sbproxy-mesh = { path = "crates/sbproxy-mesh" }
-sbproxy-storage-mesh = { path = "crates/sbproxy-storage-mesh" }
 sbproxy-middleware = { path = "crates/sbproxy-middleware" }
 sbproxy-extension = { path = "crates/sbproxy-extension" }
 sbproxy-model-host = { path = "crates/sbproxy-model-host" }
@@ -282,7 +279,7 @@ include_dir = "0.7"
 # time-ordered); v4 stays available for legacy random-id sites.
 uuid = { version = "1", features = ["v4", "v7"] }
 
-# ULID (lexicographically sortable IDs). The Wave 8 envelope uses ULIDs
+# ULID (lexicographically sortable IDs). The capture envelope uses ULIDs
 # for request_id / session_id / parent_session_id. The `serde` feature
 # lets us (de)serialize directly without a String intermediate.
 ulid = { version = "1", features = ["serde"] }
@@ -306,7 +303,6 @@ object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
 # Embedded databases
 redb = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
-postgres = "0.19"
 
 # TLS / QUIC / HTTP3
 quinn = "0.11"

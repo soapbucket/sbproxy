@@ -195,7 +195,7 @@ pub struct AccessLogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stripped_bytes: Option<u64>,
 
-    // --- Wave 8 envelope linkage ---
+    // --- Capture envelope linkage ---
     /// Capture envelope ULID. Distinct from `request_id` (UUIDv4); the
     /// ULID feeds the typed envelope stream and the access log so portal
     /// queries can join the two sources.
