@@ -49,6 +49,13 @@ pub fn reload_ai_client() {
     AI_CLIENT.store(std::sync::Arc::new(AiClient::new()));
 }
 
+/// The current AI client, for surfaces outside the request pipeline
+/// (e.g. the admin chat playground) that need to dispatch a provider
+/// call. Returns an owned snapshot safe to hold across an await.
+pub(crate) fn ai_client() -> std::sync::Arc<AiClient> {
+    AI_CLIENT.load_full()
+}
+
 /// Process-wide AI budget tracker.
 ///
 /// Accumulates token and cost usage across every AI proxy request

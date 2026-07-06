@@ -1567,20 +1567,16 @@ pub fn handle_admin_request(
         );
     }
 
-    // --- Built-in admin UI + gated playground route. ---
+    // --- Built-in admin UI. ---
     //
-    // Both modules return `Some(...)` for paths they own and `None`
-    // otherwise, so we delegate first and only fall through to the
-    // existing dispatcher when neither matches. The UI mount sits
-    // behind the `embed-admin-ui` cargo feature; without the
-    // feature, requests under `/admin/ui` return a one-line 404
-    // explaining how to enable the embedded build. The playground
-    // chat path is reserved but explicitly disabled until the
-    // production AI dispatch wiring lands.
+    // Returns `Some(...)` for paths it owns and `None` otherwise, so we
+    // delegate first and only fall through to the existing dispatcher
+    // when it does not match. The UI mount sits behind the
+    // `embed-admin-ui` cargo feature; without the feature, requests
+    // under `/admin/ui` return a one-line 404 explaining how to enable
+    // the embedded build. The playground routes are handled in the async
+    // connection handler (they must await the AI client), not here.
     if let Some(response) = crate::admin_ui::dispatch(method, path) {
-        return response;
-    }
-    if let Some(response) = crate::admin_playground::dispatch(method, path) {
         return response;
     }
     // WOR-1553/1554: dynamic key + credential lifecycle API.
@@ -2241,6 +2237,44 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     } else {
         auth_header.clone()
     };
+
+    // WOR-1753: chat playground. Handled here (not in
+    // `handle_admin_request`) because the chat call awaits the AI client.
+    // Both routes require authentication; the chat POST is a mutation, so
+    // the RBAC gate above already restricted it to the admin role.
+    let pg_path = path.split('?').next().unwrap_or(path);
+    if pg_path == crate::admin_playground::ENDPOINTS_PATH && method.eq_ignore_ascii_case("GET") {
+        if principal.is_none() {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"Unauthorized"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        let (status, ct, resp) = crate::admin_playground::list_endpoints();
+        let _ = write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors).await;
+        return;
+    }
+    if pg_path == crate::admin_playground::CHAT_PATH && method.eq_ignore_ascii_case("POST") {
+        if principal.is_none() {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"Unauthorized"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        let (status, ct, resp) = crate::admin_playground::handle_chat(body_owned.as_deref()).await;
+        let _ = write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors).await;
+        return;
+    }
 
     // WOR-1718: SSE tail of the request log. Handled here rather than in
     // `handle_admin_request` because it must own the socket and stream
