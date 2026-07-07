@@ -2,7 +2,7 @@
 
 *Last modified: 2026-07-06*
 
-The gateway hosts glm-4-flash on the local GPU and serves it under the
+The gateway hosts Qwen3 14B on the local GPU and serves it under the
 alias `claude-sonnet-4-5`. Because SBproxy exposes an Anthropic-format
 `/v1/messages` bridge alongside the OpenAI wire, Claude Code reaches the
 local model with only a base-URL change, and OpenAI-wire clients like
@@ -37,7 +37,7 @@ claude-sonnet-4-5
 Hello! Running locally and ready to help.
 ```
 
-The response is Anthropic-shaped even though a local GLM produced it.
+The response is Anthropic-shaped even though a local Qwen produced it.
 The first request is slow: it pays for the weight download and the
 engine boot. After that, `keep_alive: 30m` keeps the model resident.
 

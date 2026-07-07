@@ -25,11 +25,17 @@ origins:
           serve:
             models:
               # A catalog id, resolved by the built-in model catalog.
-              # engine defaults to auto (safetensors picks vLLM, GGUF
-              # picks llama.cpp) and the fit planner picks the quant
-              # this card can run: FP8 on an L4 (Ada, compute 8.9),
-              # a Q4 GGUF on a T4 that has no FP8 kernels.
-              - model: qwen3-14b
-                # Unload after 30 idle minutes so the L4's 24 GB is
+              # Explicit weights source: repo, quant, file. This GGUF +
+              # llama-server path is the one certified on the L4 today;
+              # bare catalog ids (`model: qwen3-14b`) and the fit
+              # planner's automatic quant choice (FP8 on an Ada L4,
+              # Q4 GGUF on a T4) take over once catalog-driven serving
+              # lands. See docs/model-host.md for the phased status.
+              - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
+                gguf_file: Qwen3-14B-Q4_K_M.gguf
+                name: qwen3-14b
+                # llama-server applies the GGUF's embedded chat template.
+                extra_args: ["--jinja"]
+                # Unload after 30 idle minutes so the card's VRAM is
                 # free for whatever you load next.
                 keep_alive: 30m

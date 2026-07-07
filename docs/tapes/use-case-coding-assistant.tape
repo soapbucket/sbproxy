@@ -22,20 +22,20 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `# glm-4-flash is running on this box's GPU under the name claude-sonnet-4-5.`
+Type `# qwen3-14b is running on this box's GPU under the name claude-sonnet-4-5.`
 Sleep 1.4s
 Enter
 Sleep 500ms
 
-Type `curl -s localhost:8080/v1/messages -H 'Content-Type: application/json' -d '{"model":"claude-sonnet-4-5","max_tokens":100,"messages":[{"role":"user","content":"One sentence: where are you running?"}]}' | jq -r '.model, .content[0].text'`
+Type `curl -s localhost:8080/v1/messages -H 'Content-Type: application/json' -d '{"model":"claude-sonnet-4-5","max_tokens":400,"messages":[{"role":"user","content":"One sentence: where are you running?"}]}' | jq -r '(.model|split("/")|last), .content[0].text'`
 Enter
-Sleep 5s
+Sleep 16s
 
 Type `# Same gateway on the OpenAI wire, for Cline and Continue.`
 Enter
 Type `curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"One sentence: what are you really?"}]}' | jq -r '.choices[0].message.content'`
 Enter
-Sleep 5s
+Sleep 16s
 
 Type `# Claude Code needs only the base URL.`
 Enter

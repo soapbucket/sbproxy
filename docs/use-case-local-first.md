@@ -1,8 +1,8 @@
 # You bought a GPU. Prove it pays for itself.
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-07*
 
-![Provider failover: the primary provider fails and the fallback chain serves the request from the backup](assets/ai-fallback.gif)
+![A local Qwen3 answer from the GPU, a training-sensitive prompt pinned to the local lane, then the ledger split across both lanes and the dollars the GPU displaced](assets/use-case-local-first.gif)
 
 The recording above shows provider failover between two hosted providers, the closest recorded behavior to this story's local-to-cloud spill. The local-first recording lands with GPU certification.
 
@@ -66,11 +66,14 @@ Now the local lane:
             - qwen3-14b
           serve:
             models:
-              - model: qwen3-14b
+              - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
+                gguf_file: Qwen3-14B-Q4_K_M.gguf
+                name: qwen3-14b
+                extra_args: ["--jinja"]
                 keep_alive: 30m
 ```
 
-The `serve:` block is the part that makes this box a provider. There is no `base_url`: the gateway spawns the engine and resolves its loopback port itself. The engine defaults to `auto`, which reads the weights and the host (GGUF or no container runtime picks llama.cpp, safetensors picks vLLM), and the fit planner picks a quant the card can actually run, so an L4 takes FP8 and a T4 falls back to an int4 GGUF. `keep_alive: 30m` unloads an idle engine to free VRAM.
+The `serve:` block is the part that makes this box a provider. There is no `base_url`: the gateway spawns the engine and resolves its loopback port itself. The weights are named explicitly (repo, quant, file), llama-server serves them with the GGUF's embedded chat template (`--jinja`), and `name:` is the model id every plane sees. Bare catalog ids with the fit planner choosing a quant for your card (FP8 on an L4, an int4 GGUF on a T4) take over once catalog-driven serving lands; the explicit form is the one certified on hardware today. `keep_alive: 30m` unloads an idle engine to free VRAM.
 
 The `no_prompt_training: true` flag matters more than it looks. Tokens served here never leave the box, so the local lane is safe for prompts that opt out of training. The flag is also load-bearing: a request that opts out routes only to providers marked this way, so leaving it off would exclude the local lane from exactly the prompts it should keep.
 
@@ -119,12 +122,12 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
     -d '{"model":"qwen3-14b","messages":[{"role":"user","content":"In one sentence, what is a reverse proxy?"}]}' \
-  | jq -r '.model, .choices[0].message.content'
-qwen3-14b
-A reverse proxy is a server that sits in front of backends and forwards client requests to them.
+  | jq -r '(.model|split("/")|last), .choices[0].message.content'
+Qwen3-14B-Q4_K_M.gguf
+A reverse proxy is a server that acts as an intermediary between clients and backend servers, handling client requests on behalf of the servers to improve performance, security, or scalability.
 ```
 
-`qwen3-14b` in the `model` field means your GPU answered. Now flag a prompt as training-sensitive:
+That is a captured response. The `model` field currently names the served weights file rather than echoing `qwen3-14b`, which is blunt but useful: a filesystem path in the model field is proof your GPU answered, and the `jq` split trims it to the filename. Now flag a prompt as training-sensitive:
 
 ```console
 $ curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -132,13 +135,13 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -H 'x-sbproxy-disallow-prompt-training: true' \
     -d '{"model":"qwen3-14b","messages":[{"role":"user","content":"Summarize this internal memo in one line: Q3 margins improved."}]}' \
-  | jq -r '.model'
-qwen3-14b
+  | jq -r '.model|split("/")|last'
+Qwen3-14B-Q4_K_M.gguf
 ```
 
 Same answer path, but the routing set was different: only providers marked `no_prompt_training` were eligible. That has teeth when things go wrong. With the local engine down, this request fails with a 502 rather than spilling to the unmarked cloud lane, and if no configured provider is marked at all, the gateway rejects it up front with `HTTP 400` and `"type": "no_compliant_provider"` in the body. Either way the prompt never reaches a training-eligible upstream.
 
-You can watch the spill itself without contriving an outage. Run the same config on a box with no GPU: the log prints `AI proxy: local engine unavailable, failing over` on each attempt, the chain advances, and the response's `model` field reads `gpt-4o-mini`. On the GPU host, the same thing happens per request whenever the local lane is saturated or its engine is down.
+You can watch the spill itself without contriving an outage. Run the same config on a box with no GPU: the log prints `AI proxy: local engine unavailable, failing over` on each attempt, the chain advances, and the response's `model` field reads `gpt-4o-mini`. On the GPU host, the same advance happens whenever the local lane cannot bring its engine up for a request.
 
 Now the money question. Count the lanes, verify the record, and price what the GPU displaced:
 

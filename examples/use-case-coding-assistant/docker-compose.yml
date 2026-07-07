@@ -1,4 +1,4 @@
-# Point your coding assistant at your own GPU: SBproxy serving glm-4-flash
+# Point your coding assistant at your own GPU: SBproxy serving Qwen3 14B
 # under the alias claude-sonnet-4-5, with the Anthropic-format /v1/messages
 # bridge and the OpenAI wire both on port 8080.
 #

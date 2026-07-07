@@ -1,8 +1,8 @@
 # Point your coding assistant at your own GPU
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-07*
 
-![An OpenAI-shaped chat completion answered by a Claude model through SBproxy's Anthropic format bridge](assets/ai-claude.gif)
+![The Anthropic wire answered by local Qwen3 weights behind the claude-sonnet-4-5 alias, the OpenAI wire answering the same, then the one-line base-URL change](assets/use-case-coding-assistant.gif)
 
 *The recording shows the gateway's Anthropic format bridge against a hosted Claude upstream. A recording of this page's config, with the model running on a local GPU, lands with model-host GPU certification.*
 
@@ -12,7 +12,7 @@ One honest note up front. The model host is landing in phases. The released bina
 
 ## What you will build
 
-A gateway on port 8080 that hosts `glm-4-flash` on your GPU and answers to the name `claude-sonnet-4-5`. It speaks two wires at once: the Anthropic format on `POST /v1/messages`, which is what Claude Code sends, and the OpenAI format on `POST /v1/chat/completions`, which is what Cline and Continue send. Both resolve the same serve-entry alias, so one config serves every assistant on your team. A daily token budget watches the whole thing, because the governance planes treat a local model exactly like a hosted one.
+A gateway on port 8080 that hosts Qwen3 14B on your GPU and answers to the name `claude-sonnet-4-5`. It speaks two wires at once: the Anthropic format on `POST /v1/messages`, which is what Claude Code sends, and the OpenAI format on `POST /v1/chat/completions`, which is what Cline and Continue send. Both resolve the same serve-entry alias, so one config serves every assistant on your team. A daily token budget watches the whole thing, because the governance planes treat a local model exactly like a hosted one.
 
 ## Prerequisites
 
@@ -56,12 +56,14 @@ origins:
             - claude-sonnet-4-5
           serve:
             models:
-              - model: glm-4-flash
+              - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
+                gguf_file: Qwen3-14B-Q4_K_M.gguf
                 name: claude-sonnet-4-5
+                extra_args: ["--jinja"]
                 keep_alive: 30m
 ```
 
-The `serve:` block is the whole trick. `glm-4-flash` is a catalog id: the built-in catalog supplies the Hugging Face repo and quant variants, and the fit planner picks the quant your card can actually run. The gateway resolves the weights, spawns the engine as a supervised subprocess, and routes to it over loopback, which is why the provider carries no `base_url`. The `name:` field is the alias every plane sees. A request for `claude-sonnet-4-5` lands on the local GLM, and since that is the model id Claude Code asks for by default, the client side shrinks to a base-URL change. `keep_alive: 30m` unloads the engine after thirty idle minutes so the VRAM comes back.
+The `serve:` block is the whole trick. The model line names the weights explicitly: the Hugging Face repo, the quant, and the file. The gateway fetches them into its cache, spawns the engine as a supervised subprocess, and routes to it over loopback, which is why the provider carries no `base_url`. (Bare catalog ids like `qwen3-14b`, with the fit planner choosing the quant for your card, resolve here once catalog-driven serving lands; the explicit form is the one certified on hardware today.) The `name:` field is the alias every plane sees. A request for `claude-sonnet-4-5` lands on the local Qwen, and since that is the model id Claude Code asks for by default, the client side shrinks to a base-URL change. `extra_args: ["--jinja"]` has llama-server apply the chat template embedded in the GGUF, and `keep_alive: 30m` unloads the engine after thirty idle minutes so the VRAM comes back.
 
 The origin key matters more than it looks. Hostname matching strips the port, so `"localhost"` matches a client whose base URL is `http://localhost:8080`. Running the gateway on a shared GPU box, key the origin with the hostname your clients will use instead.
 
@@ -103,21 +105,21 @@ $ curl -s http://localhost:8080/v1/messages \
     -H 'Content-Type: application/json' \
     -d '{
       "model": "claude-sonnet-4-5",
-      "max_tokens": 128,
+      "max_tokens": 400,
       "messages": [{"role": "user", "content": "One sentence: where are you running?"}]
     }'
 {
-  "id": "msg_01...",
-  "type": "message",
+  "content": [{"text": "I don't run physically, but I'm always here to assist you!", "type": "text"}],
+  "id": "chatcmpl-...",
+  "model": "/var/lib/sbproxy/models/Qwen/Qwen3-14B-GGUF/main/Qwen3-14B-Q4_K_M.gguf",
   "role": "assistant",
-  "model": "claude-sonnet-4-5",
-  "content": [{"type": "text", "text": "I am running on local hardware behind your gateway."}],
   "stop_reason": "end_turn",
-  "usage": {"input_tokens": 19, "output_tokens": 12}
+  "type": "message",
+  "usage": {"input_tokens": 16, "output_tokens": 235}
 }
 ```
 
-The response is Anthropic-shaped and the model field carries the alias, but a GLM on your GPU wrote the text. No API key changed hands; this config defines no virtual keys, so the gateway accepts the request as-is. Add `virtual_keys` from [configuration.md](configuration.md#virtual-keys-virtual_keys) when you want per-client keys and quotas in front of the box.
+That is a captured response, not a mock, and two things in it are worth knowing about. The `model` field currently names the served weights file rather than echoing the alias, which is unambiguous proof the tokens came from your disk. And Qwen3 is a reasoning model: it spends tokens thinking before it answers (the bridge strips the thinking from `content`), so give `max_tokens` room; at 100 the whole budget can go to thought and the text comes back empty. The text itself was written by the Qwen on your GPU. No API key changed hands; this config defines no virtual keys, so the gateway accepts the request as-is. Add `virtual_keys` from [configuration.md](configuration.md#virtual-keys-virtual_keys) when you want per-client keys and quotas in front of the box.
 
 ### Claude Code
 
@@ -136,7 +138,7 @@ Both speak the OpenAI wire, and the gateway serves it from the same config. In C
 
 ```yaml
 models:
-  - name: local-glm
+  - name: local-qwen
     provider: openai
     model: claude-sonnet-4-5
     apiBase: http://localhost:8080/v1
@@ -154,7 +156,7 @@ Hi! Ready when you are.
 
 ## You are done when
 
-`curl -s http://localhost:8080/v1/messages` with the request above returns HTTP 200, the body carries `"model": "claude-sonnet-4-5"` in Anthropic shape, and `nvidia-smi` on the gateway host shows the engine process holding VRAM while it answers. On a box without a GPU you can only get partway: `sbproxy validate` passes and the gateway logs a startup warning naming the model and the missing prerequisite, which is the designed behavior, not a bug.
+`curl -s http://localhost:8080/v1/messages` with the request above returns HTTP 200 in Anthropic shape with the served weights file in the `model` field, and `nvidia-smi` on the gateway host shows the engine process holding VRAM while it answers. On a box without a GPU you can only get partway: `sbproxy validate` passes and the gateway logs a startup warning naming the model and the missing prerequisite, which is the designed behavior, not a bug.
 
 ## Next steps
 

@@ -1,6 +1,6 @@
 # Serve Qwen, GLM, or Gemma on one cloud L4
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-07*
 
 ![sbproxy validate, plan, and doctor running the serve preflight for this page's config on a machine with no GPU](assets/use-case-serve-on-l4.gif)
 
@@ -12,7 +12,7 @@ A status note before you spend money. The model host is the newest part of SBpro
 
 ## What you will build
 
-A `g2-standard-8` VM with one 24 GB L4, running an OpenAI-compatible gateway on port 8080. You name `qwen3-14b` in a `serve:` block. SBproxy resolves it through the built-in catalog to the `Qwen/Qwen3-14B` weights, fits a quant to the card (FP8, because an Ada-generation L4 has FP8 kernels), launches vLLM as a supervised subprocess on a loopback port, and routes chat completions to it. The same routing, guardrail, budget, and ledger planes that govern hosted providers apply to this local one, so the config you write here can grow a cloud spill lane later without rework.
+A `g2-standard-8` VM with one 24 GB L4, running an OpenAI-compatible gateway on port 8080. A `serve:` block names the official `Qwen/Qwen3-14B-GGUF` weights at `Q4_K_M`; SBproxy downloads them into its cache, launches llama-server as a supervised subprocess on a loopback port, and routes chat completions to it. That GGUF-plus-llama-server pairing is the path certified on this exact card; the catalog-id form, where the fit planner picks the quant for your card (FP8 on an Ada L4), takes over once catalog-driven serving lands. The same routing, guardrail, budget, and ledger planes that govern hosted providers apply to this local one, so the config you write here can grow a cloud spill lane later without rework.
 
 ## Prerequisites
 
@@ -48,11 +48,7 @@ gcloud compute ssh sbproxy-l4 --zone=us-central1-a
 
 The repo wraps these commands in `scripts/provision-l4.sh` (`up`, `ssh`, `down`) if you would rather not retype them, and [`deploy/terraform/l4-demo`](../deploy/terraform/l4-demo) is the Terraform version with a public IP, Let's Encrypt TLS, and a bearer token in front, for when this stops being an experiment.
 
-On the box, put an inference engine on `PATH`. vLLM is the right engine for safetensors and FP8:
-
-```bash
-uv tool install vllm   # or: pipx install vllm
-```
+On the box, put an inference engine on `PATH`. For the GGUF path this page walks, that is `llama-server`: grab the CUDA build for your platform from the [llama.cpp releases page](https://github.com/ggml-org/llama.cpp/releases) (the asset names are version-pinned, pick the `ubuntu` `cuda` zip), unzip it, and put `llama-server` somewhere on `PATH` such as `/usr/local/bin`. vLLM serves the safetensors path and installs with `uv tool install vllm`; it becomes the default for safetensors weights once that path is certified.
 
 Then install SBproxy itself:
 
@@ -88,7 +84,10 @@ origins:
             - qwen3-14b
           serve:
             models:
-              - model: qwen3-14b
+              - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
+                gguf_file: Qwen3-14B-Q4_K_M.gguf
+                name: qwen3-14b
+                extra_args: ["--jinja"]
                 keep_alive: 30m
 ```
 
@@ -96,9 +95,9 @@ The `proxy` block binds the data plane to 8080. The origin key `ai.local` is the
 
 The provider is the interesting part. It has no `base_url`, and that is deliberate: a served provider is hosted on this box, the gateway resolves the engine's loopback port itself, and writing `base_url` next to `serve:` is rejected as a config error. The `default_model` and `models` list name the serve entry, and that name is the model id every plane sees: routing, budgets, virtual keys, the usage ledger.
 
-Inside `serve:`, `qwen3-14b` is a catalog id. The built-in catalog maps it to `Qwen/Qwen3-14B` and its official quant list, most preferred first: `[FP8, Q4_K_M]`. The engine defaults to `auto` (safetensors picks vLLM, GGUF picks llama.cpp), and the fit planner walks the quant list and takes the first one that both runs on the card and fits its free VRAM at the planned context. On this L4 that is FP8. On a 16 GB T4 the same config still works, because the planner refuses FP8 with a capability message and lands on the Q4 GGUF instead. `keep_alive: 30m` unloads an idle engine after thirty minutes so the VRAM comes back.
+Inside `serve:`, the model line names the weights explicitly: the Hugging Face repo, the quant, and the exact file. GGUF weights pick llama.cpp as the engine, `extra_args: ["--jinja"]` has llama-server apply the chat template embedded in the GGUF (Qwen3's turns render wrong without it), and `name:` is the model id every plane sees. `keep_alive: 30m` unloads an idle engine after thirty minutes so the VRAM comes back. The shorter form you will eventually write here is a bare catalog id (`model: qwen3-14b`), with the fit planner walking the quant list `[FP8, Q4_K_M]` and taking the first one the card can run: FP8 on this L4, the Q4 GGUF on a 16 GB T4 that has no FP8 kernels. That resolution ships with catalog-driven serving; today a bare catalog id fails at request time with `no model metadata`, so use the explicit form.
 
-To serve GLM instead, change the model line (and the two name references above it) to `glm-4-flash`, another catalog id. Gemma is not in the built-in catalog and its repos are gated, so give it a model manifest entry instead: one reviewable file that names the source repo, a pinned revision, per-file sha256 digests, a pull policy, and, for a gated repo, your Hugging Face token as an `hf_token` secret reference rather than a literal in config. Point `serve.catalog_file` at the manifest and name its entry in `serve.models`. A curated manifest with digests doubles as a supply-chain allowlist. See [`examples/model-manifest`](../examples/model-manifest) and the manifest section of [model-host.md](model-host.md).
+To serve GLM instead, point the model line at a GLM GGUF repo and file the same way. Gemma is not in the built-in catalog and its repos are gated, so give it a model manifest entry instead: one reviewable file that names the source repo, a pinned revision, per-file sha256 digests, a pull policy, and, for a gated repo, your Hugging Face token as an `hf_token` secret reference rather than a literal in config. Point `serve.catalog_file` at the manifest and name its entry in `serve.models`. A curated manifest with digests doubles as a supply-chain allowlist. See [`examples/model-manifest`](../examples/model-manifest) and the manifest section of [model-host.md](model-host.md).
 
 One paragraph on why this config surface is shaped the way it is. Letting configuration start subprocesses inside a gateway that holds provider keys is a real attack surface, so it is constrained: `engine` is an allowlisted enum (`vllm`, `llama_cpp`), never a command string, the runtime owns the argument templates, engine binaries resolve from `PATH` or pinned releases only, and downloaded weights verify against manifest sha256 digests before an engine reads them. The full posture, including what is enforced today and what hardening remains, is in [security-model-host.md](security-model-host.md).
 
@@ -114,21 +113,21 @@ build capabilities
   ...
 
 gpus
-  [0] NVIDIA L4  24 GiB total, 22 GiB free, compute 8.9, fp8 yes
+  [0] NVIDIA L4  22 GiB total, 22 GiB free, compute 8.9, fp8 yes
   nvidia-smi: /usr/bin/nvidia-smi
 
 inference engines on PATH
-  vllm          /home/you/.local/bin/vllm
-  llama-server  not found
-  container     /usr/bin/docker
+  vllm          not found
+  llama-server  /usr/local/bin/llama-server
+  container     not found (docker/podman)
 
 model cache
-  /var/lib/sbproxy/models (not created yet)
+  /var/lib/sbproxy/models
 
 local model serving (serve:): ready
 ```
 
-That `fp8 yes` on the GPU line is the compute capability 8.9 the fit planner gates on. On a machine that does not qualify, the verdict flips to `not available` and lists every blocker with install steps, which is a better way to find out than a spawn failure at 2am.
+That is the verdict captured on the reference L4. The `fp8 yes` on the GPU line is the compute capability 8.9 the fit planner gates on. On a machine that does not qualify, the verdict flips to `not available` and lists every blocker with install steps, which is a better way to find out than a spawn failure at 2am.
 
 Check the config itself with the plan differ. With no `--against` baseline, everything surfaces as added:
 
@@ -147,7 +146,7 @@ Start the gateway:
 sbproxy sb.yml
 ```
 
-Send the first completion. Be patient with this one call: it pays the cold start, a managed download of the Qwen3-14B weights into `/var/lib/sbproxy/models` and a vLLM bring-up. Expect minutes. The gateway log shows the progress.
+Send the first completion. Be patient with this one call: it pays the cold start, a managed download of the 9 GB GGUF into `/var/lib/sbproxy/models` plus the llama-server bring-up. On the reference L4 that first call answered in about four and a half minutes, and a later cold start with the weights already cached took 226 seconds; the gateway log shows the progress.
 
 ```console
 $ curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -155,30 +154,34 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{"model":"qwen3-14b","messages":[{"role":"user","content":"Say hello from the L4."}]}'
 {
-  "id": "...",
+  "choices": [{"finish_reason": "stop", "index": 0, "message": {"role": "assistant",
+    "content": "A reverse proxy is a server that acts as an intermediary between clients and backend servers...",
+    "reasoning_content": "Okay, the user asked..."}}],
+  "id": "chatcmpl-...",
+  "model": "/var/lib/sbproxy/models/Qwen/Qwen3-14B-GGUF/main/Qwen3-14B-Q4_K_M.gguf",
   "object": "chat.completion",
-  "model": "qwen3-14b",
-  "choices": [{"message": {"role": "assistant", "content": "Hello from the L4!"}, "finish_reason": "stop"}],
-  "usage": {"prompt_tokens": 15, "completion_tokens": 7, "total_tokens": 22}
+  "usage": {"prompt_tokens": 16, "completion_tokens": 235, "total_tokens": 251}
 }
 ```
 
-Now look at what the fit planner actually decided. The engine argv is built by the runtime, and the quant flag on it is the planner's pick:
+Two captured details worth reading twice. The `model` field currently names the served weights file rather than echoing `qwen3-14b`; a filesystem path there is unambiguous proof this box answered. And Qwen3 is a reasoning model: on the OpenAI wire its thinking arrives separately as `reasoning_content`, and it spends real tokens there, so give `max_tokens` room when you cap it.
+
+Now look at what the runtime handed the engine:
 
 ```console
-$ pgrep -af 'vllm serve'
-41217 /home/you/.local/bin/vllm serve Qwen/Qwen3-14B --host 127.0.0.1 --port 8101 --quantization fp8 ...
+$ pgrep -af llama-server
+70420 llama-server --model /var/lib/sbproxy/models/Qwen/Qwen3-14B-GGUF/main/Qwen3-14B-Q4_K_M.gguf --host 127.0.0.1 --port 39867 --ctx-size 131072 --n-gpu-layers 999 --jinja
 ```
 
-`--quantization fp8` is the decision this page is about, made from the card's compute capability and free VRAM before the process ever spawned. Run the identical config on a T4 and the planner rejects that candidate with `FP8 needs FP8 kernels but Tesla T4 (compute 7.5) has none`, then falls through to `Q4_K_M`. The math behind the choice, weights plus KV cache at the planned context times a headroom factor, is in [gpu-fit-planning.md](gpu-fit-planning.md).
+The runtime owns that argv: the loopback bind, the cache path, full GPU offload. When catalog-driven serving lands, the quant on this line becomes the fit planner's decision, made from compute capability and free VRAM before the process ever spawns; on a T4 it refuses FP8 with `FP8 needs FP8 kernels but Tesla T4 (compute 7.5) has none` and falls through to `Q4_K_M`. The math behind that choice is in [gpu-fit-planning.md](gpu-fit-planning.md).
 
 Send the same request a second time. It answers in normal API time, because the model is resident and stays that way for the `keep_alive` window.
 
 ## You are done when
 
-- The completion returns `HTTP 200` with an OpenAI-shaped body where `model` reads `qwen3-14b` and `usage.total_tokens` is present.
-- `pgrep -af 'vllm serve'` on the box shows `--quantization fp8` in the engine argv: the fit planner's pick for the Ada card, visible in a process listing.
-- A second identical request completes in a small fraction of the first call's time.
+- The completion returns `HTTP 200` with an OpenAI-shaped body whose `model` field names the served GGUF file and whose `usage.total_tokens` is present.
+- `pgrep -af llama-server` on the box shows the Q4_K_M weights file and `--n-gpu-layers 999` in the engine argv.
+- A second identical request completes in a small fraction of the first call's time (4.2 seconds against a 226-second cold start, on the reference L4).
 
 Then stop the meter:
 
