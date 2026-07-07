@@ -1,6 +1,6 @@
 # Secret Backends
 
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-07*
 
 SBproxy resolves secret material through provider-specific reference schemes. The scheme names the provider type, the authority names the configured backend instance, and the path is interpreted by that provider:
 
@@ -43,16 +43,17 @@ The HashiCorp client speaks KV v1 or KV v2 against Vault OSS or Vault Enterprise
 
 ```yaml
 proxy:
-  vault:
-    - name: primary
-      type: hashicorp
-      addr: https://vault.shared.example/v1
-      mount: secret/tenants/acme-corp
-      engine: v2
-      cache_ttl: 5m
-      auth:
-        type: token
-        token: ${VAULT_TOKEN_ACME}
+  secrets:
+    backends:
+      - type: hashicorp
+        name: primary
+        addr: https://vault.shared.example/v1
+        mount: secret/tenants/acme-corp
+        engine: v2
+        cache_ttl_secs: 300
+        auth:
+          type: token
+          token: ${VAULT_TOKEN_ACME}
 ```
 
 | Field | Type | Description |
@@ -60,7 +61,7 @@ proxy:
 | `addr` | string | Vault server URL. Trailing slash is normalised. |
 | `mount` | string | KV mount path. Tenant-isolated deployments scope this to a per-tenant directory. |
 | `engine` | enum | `v1` or `v2`. KV v2 is the default for new Vault deployments. |
-| `cache_ttl` | duration | TTL on cached reads. Default is 5 minutes. |
+| `cache_ttl_secs` | integer | TTL in seconds on cached reads. Default is 300. |
 | `auth` | object | One of `token`, `approle`, or `kubernetes`. |
 | `namespace` | string | Optional `X-Vault-Namespace` header for Vault Enterprise. |
 
@@ -110,21 +111,22 @@ The AWS client speaks the official Secrets Manager API. The default credential c
 
 ```yaml
 proxy:
-  vault:
-    - name: primary
-      type: aws_secrets_manager
-      region: us-east-1
-      mount_prefix: prod/sbproxy/tenants/acme-corp
-      cache_ttl: 5m
-      auth:
-        type: default_chain
+  secrets:
+    backends:
+      - type: aws
+        name: primary
+        region: us-east-1
+        mount_prefix: prod/sbproxy/tenants/acme-corp
+        cache_ttl_secs: 300
+        auth:
+          type: default_chain
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `region` | string | AWS region. Required. |
 | `mount_prefix` | string | Path prefix every read must stay inside. Tenant deployments scope this to a per-tenant directory. |
-| `cache_ttl` | duration | TTL on cached reads. Default is 5 minutes. |
+| `cache_ttl_secs` | integer | TTL in seconds on cached reads. Default is 300. |
 | `auth` | object | One of `static_keys`, `default_chain`, or `assumed_role`. |
 
 ### Auth Methods
@@ -174,12 +176,13 @@ The GCP backend reads Secret Manager through the `AccessSecretVersion` API. It s
 
 ```yaml
 proxy:
-  vault:
-    - name: primary
-      type: gcp_secret_manager
-      project_id: acme-prod
-      cache_ttl_secs: 300
-      auth: application_default
+  secrets:
+    backends:
+      - type: gcp
+        name: primary
+        project_id: acme-prod
+        cache_ttl_secs: 300
+        auth: application_default
 ```
 
 | Field | Type | Description |
@@ -207,19 +210,20 @@ The Kubernetes backend reads Secret objects through the standard Kubernetes API.
 
 ```yaml
 proxy:
-  vault:
-    - name: primary
-      type: kubernetes
-      namespace: tenant-acme
-      cache_ttl: 5m
-      auth:
-        type: in_cluster
+  secrets:
+    backends:
+      - type: k8s
+        name: primary
+        namespace: tenant-acme
+        cache_ttl_secs: 300
+        auth:
+          type: in_cluster
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `namespace` | string | Namespace the backend reads from. Cross-namespace references are rejected. |
-| `cache_ttl` | duration | TTL on cached reads. Default is 5 minutes. |
+| `cache_ttl_secs` | integer | TTL in seconds on cached reads. Default is 300. |
 | `auth` | object | One of `in_cluster` or `kubeconfig`. |
 
 ### Auth Methods
@@ -261,42 +265,54 @@ Both `data` and `stringData` fields are honoured. `data` keys are base64-decoded
 
 Use `secretfile://` for a backend-configured YAML or JSON secret file. Use `secret://` for a backend-configured static secret map. Keep `file:/path/to/secret` and `secret:<name>` for legacy configs that already use those forms.
 
+Configure these backends under `proxy.secrets.backends`. Each has a `name` used in the reference. A `local` backend's `entries` values may be `${ENV}` so real secrets stay in the environment rather than the config file. A reference in an AI provider `api_key` resolves against these at startup, and an unresolved reference stops the proxy from starting rather than being sent verbatim as a bearer token.
+
 ```yaml
 proxy:
-  vault:
-    - name: local
-      type: file
-      path: /etc/sbproxy/secrets.yaml
-      format: yaml
+  secrets:
+    backends:
+      - type: file
+        name: local
+        path: /etc/sbproxy/secrets.yaml
+        format: yaml
+      - type: local
+        name: app
+        entries:
+          openai_key: "${OPENAI_KEY}"
 ```
 
 ```text
 secretfile://local/openai-prod?key=api_key
-secret://local/openai-prod
+secret://app/openai_key
 ```
 
-## Tenant Isolation
+## Scope
 
-Use a separate backend instance per tenant and give each instance the same logical name, such as `primary`. The reference stays stable while the request context chooses the physical store:
+Backends are declared at proxy scope under `proxy.secrets.backends`, and every origin resolves references against that one set. A reference names the backend it wants, so you can point different origins at different physical stores by giving each store its own backend name:
 
 ```yaml
 proxy:
-  vault:
-    - name: primary
-      type: hashicorp
-      addr: https://vault.shared.example/v1
-      mount: secret/tenants/shared
-
-tenants:
-  acme-corp:
-    vault:
-      - name: primary
-        type: hashicorp
+  secrets:
+    backends:
+      - type: hashicorp
+        name: shared
+        addr: https://vault.shared.example/v1
+        mount: secret/tenants/shared
+        auth:
+          type: token
+          token: ${VAULT_TOKEN}
+      - type: hashicorp
+        name: acme
         addr: https://vault.acme.example/v1
         mount: secret/tenants/acme-corp
+        auth:
+          type: token
+          token: ${VAULT_TOKEN_ACME}
 ```
 
-An origin in `acme-corp` that reads `vault://primary/secret/data/openai-prod?key=api_key` resolves through the tenant backend. An origin without a tenant-specific backend falls back to the proxy backend with the same name and provider type.
+An origin that reads `vault://acme/secret/data/openai-prod?key=api_key` resolves through the `acme` backend; one that reads `vault://shared/...` uses the shared store.
+
+Per-tenant and per-origin backend scopes (where the same reference name resolves to a different physical store depending on the request's tenant) are not wired yet. Give each store a distinct backend name at proxy scope for now.
 
 ## Cache Semantics
 

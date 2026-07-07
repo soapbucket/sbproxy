@@ -514,6 +514,11 @@ fn pick_run_path(cli: &Cli) -> Option<PathBuf> {
 fn run_proxy(config_path: Option<&std::path::Path>, grace: sbproxy_core::GraceConfig) {
     match config_path {
         Some(path) => {
+            // WOR-1767: build + install the process secret resolver from
+            // `proxy.secrets.backends` before the server compiles its config,
+            // so provider-URI references in api_key / client_secret resolve
+            // (or fail loud) instead of reaching the wire verbatim.
+            install_secret_resolver(path);
             let path_str = path.to_string_lossy();
             if let Err(e) = sbproxy_core::run(&path_str, grace) {
                 eprintln!("Fatal: {e:#}");
@@ -527,6 +532,280 @@ fn run_proxy(config_path: Option<&std::path::Path>, grace: sbproxy_core::GraceCo
             std::process::exit(1);
         }
     }
+}
+
+/// Whole-value `${VAR}` env substitution for a `local` backend entry, so
+/// real secret values can stay in the environment rather than the YAML.
+/// A non-`${VAR}` value is used as-is; an unset var leaves the ref (which
+/// then fails resolution, loudly, rather than silently blanking).
+fn env_interp(value: &str) -> String {
+    match value
+        .strip_prefix("${")
+        .and_then(|inner| inner.strip_suffix('}'))
+    {
+        Some(var) => std::env::var(var).unwrap_or_else(|_| value.to_string()),
+        None => value.to_string(),
+    }
+}
+
+/// Build the process secret resolver from `proxy.secrets` and install it
+/// (WOR-1767). Provider-URI references (`secret://`, `secretfile://`, ...)
+/// in config values then resolve at handler-build; an unresolved reference
+/// hard-fails at that point. A misconfigured backend here (e.g. a missing
+/// secrets file) fails loud rather than starting with unresolved secrets.
+///
+/// A read/parse error is left for `sbproxy_core::run` to report; when there
+/// is no `proxy.secrets` block, nothing is installed and references pass
+/// through (caught by plan-time validation).
+fn install_secret_resolver(path: &std::path::Path) {
+    let Ok(yaml) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(&yaml) else {
+        return;
+    };
+    let Some(secrets_val) = root.get("proxy").and_then(|p| p.get("secrets")) else {
+        return;
+    };
+    let secrets: sbproxy_config::SecretsConfig = match serde_yaml::from_value(secrets_val.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Fatal: invalid proxy.secrets config: {e:#}");
+            std::process::exit(1);
+        }
+    };
+    if secrets.backends.is_empty() && secrets.map.is_empty() {
+        return;
+    }
+
+    let mut manager = sbproxy_vault::VaultManager::new();
+    for backend in &secrets.backends {
+        match backend {
+            sbproxy_config::SecretBackendConfig::Local { name, entries } => {
+                let vault = sbproxy_vault::LocalVault::new();
+                for (k, v) in entries {
+                    if let Err(e) = vault.set_secret(k, &env_interp(v)) {
+                        eprintln!("Fatal: secret backend '{name}': {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+                manager.register_backend(
+                    sbproxy_vault::VaultProviderType::LocalSecret,
+                    name.clone(),
+                    Box::new(vault),
+                );
+            }
+            sbproxy_config::SecretBackendConfig::File { name, path, format } => {
+                let format = match format {
+                    sbproxy_config::SecretFileFormat::Yaml => sbproxy_vault::FileFormat::Yaml,
+                    sbproxy_config::SecretFileFormat::Json => sbproxy_vault::FileFormat::Json,
+                };
+                match sbproxy_vault::FileVaultBackend::new(sbproxy_vault::FileVaultConfig {
+                    path: path.clone(),
+                    format,
+                }) {
+                    Ok(b) => manager.register_backend(
+                        sbproxy_vault::VaultProviderType::SecretFile,
+                        name.clone(),
+                        Box::new(b),
+                    ),
+                    Err(e) => {
+                        eprintln!("Fatal: secret backend '{name}' ({}): {e:#}", path.display());
+                        std::process::exit(1);
+                    }
+                }
+            }
+            sbproxy_config::SecretBackendConfig::Hashicorp {
+                name,
+                addr,
+                mount,
+                engine,
+                cache_ttl_secs,
+                namespace,
+                auth,
+            } => {
+                let engine = match engine {
+                    sbproxy_config::SecretKvEngine::V1 => sbproxy_vault::KvEngine::V1,
+                    sbproxy_config::SecretKvEngine::V2 => sbproxy_vault::KvEngine::V2,
+                };
+                let auth = match auth {
+                    sbproxy_config::HashiCorpBackendAuth::Token { token } => {
+                        sbproxy_vault::HashiCorpAuth::Token {
+                            token: env_interp(token),
+                        }
+                    }
+                    sbproxy_config::HashiCorpBackendAuth::Approle {
+                        role_id,
+                        secret_id,
+                        mount,
+                    } => sbproxy_vault::HashiCorpAuth::AppRole {
+                        role_id: role_id.clone(),
+                        secret_id: env_interp(secret_id),
+                        mount: mount.clone(),
+                    },
+                    sbproxy_config::HashiCorpBackendAuth::Kubernetes {
+                        role,
+                        jwt_path,
+                        mount,
+                    } => sbproxy_vault::HashiCorpAuth::Kubernetes {
+                        role: role.clone(),
+                        jwt_path: jwt_path.clone(),
+                        mount: mount.clone(),
+                    },
+                };
+                let cfg = sbproxy_vault::HashiCorpConfig {
+                    addr: addr.clone(),
+                    auth,
+                    mount: mount.clone(),
+                    engine,
+                    cache_ttl: cache_ttl_secs.map(std::time::Duration::from_secs),
+                    namespace: namespace.clone(),
+                };
+                match sbproxy_vault::HashiCorpVaultBackend::new(cfg) {
+                    Ok(b) => manager.register_backend(
+                        sbproxy_vault::VaultProviderType::HashiCorp,
+                        name.clone(),
+                        Box::new(b),
+                    ),
+                    Err(e) => {
+                        eprintln!("Fatal: secret backend '{name}': {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            sbproxy_config::SecretBackendConfig::Aws {
+                name,
+                region,
+                mount_prefix,
+                cache_ttl_secs,
+                auth,
+            } => {
+                let auth = match auth {
+                    sbproxy_config::AwsBackendAuth::StaticKeys {
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                    } => sbproxy_vault::AwsAuth::StaticKeys {
+                        access_key_id: env_interp(access_key_id),
+                        secret_access_key: env_interp(secret_access_key),
+                        session_token: session_token.as_deref().map(env_interp),
+                    },
+                    sbproxy_config::AwsBackendAuth::DefaultChain => {
+                        sbproxy_vault::AwsAuth::DefaultChain
+                    }
+                    sbproxy_config::AwsBackendAuth::AssumedRole {
+                        role_arn,
+                        external_id,
+                        session_name,
+                    } => sbproxy_vault::AwsAuth::AssumedRole {
+                        role_arn: role_arn.clone(),
+                        external_id: external_id.clone(),
+                        session_name: session_name.clone(),
+                    },
+                };
+                let cfg = sbproxy_vault::AwsSecretsManagerConfig {
+                    region: region.clone(),
+                    auth,
+                    mount_prefix: mount_prefix.clone(),
+                    cache_ttl: cache_ttl_secs.map(std::time::Duration::from_secs),
+                };
+                match sbproxy_vault::AwsSecretsManagerBackend::new(cfg) {
+                    Ok(b) => manager.register_backend(
+                        sbproxy_vault::VaultProviderType::AwsSecretsManager,
+                        name.clone(),
+                        Box::new(b),
+                    ),
+                    Err(e) => {
+                        eprintln!("Fatal: secret backend '{name}': {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            sbproxy_config::SecretBackendConfig::Gcp {
+                name,
+                project_id,
+                endpoint,
+                cache_ttl_secs,
+                auth,
+            } => {
+                let auth = match auth {
+                    sbproxy_config::GcpBackendAuth::ApplicationDefault => {
+                        sbproxy_vault::GcpSecretManagerAuth::ApplicationDefault
+                    }
+                    sbproxy_config::GcpBackendAuth::ServiceAccountKeyFile { path } => {
+                        sbproxy_vault::GcpSecretManagerAuth::ServiceAccountKeyFile {
+                            path: path.clone(),
+                        }
+                    }
+                    sbproxy_config::GcpBackendAuth::ServiceAccountKeyJson { json } => {
+                        sbproxy_vault::GcpSecretManagerAuth::ServiceAccountKeyJson {
+                            json: env_interp(json),
+                        }
+                    }
+                    sbproxy_config::GcpBackendAuth::ExternalAccountFile { path } => {
+                        sbproxy_vault::GcpSecretManagerAuth::ExternalAccountFile {
+                            path: path.clone(),
+                        }
+                    }
+                };
+                let cfg = sbproxy_vault::GcpSecretManagerConfig {
+                    project_id: project_id.clone(),
+                    endpoint: endpoint.clone(),
+                    auth,
+                    cache_ttl_secs: *cache_ttl_secs,
+                };
+                match sbproxy_vault::GcpSecretManagerBackend::new(cfg) {
+                    Ok(b) => manager.register_backend(
+                        sbproxy_vault::VaultProviderType::GcpSecretManager,
+                        name.clone(),
+                        Box::new(b),
+                    ),
+                    Err(e) => {
+                        eprintln!("Fatal: secret backend '{name}': {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            sbproxy_config::SecretBackendConfig::K8s {
+                name,
+                namespace,
+                cache_ttl_secs,
+                auth,
+            } => {
+                let auth = match auth {
+                    sbproxy_config::K8sBackendAuth::InCluster => {
+                        sbproxy_vault::KubernetesAuth::InCluster
+                    }
+                    sbproxy_config::K8sBackendAuth::Kubeconfig { path, context } => {
+                        sbproxy_vault::KubernetesAuth::Kubeconfig {
+                            path: path.clone(),
+                            context: context.clone(),
+                        }
+                    }
+                };
+                let cfg = sbproxy_vault::KubernetesSecretsConfig {
+                    auth,
+                    namespace: namespace.clone(),
+                    cache_ttl: cache_ttl_secs.map(std::time::Duration::from_secs),
+                };
+                match sbproxy_vault::KubernetesSecretsBackend::new(cfg) {
+                    Ok(b) => manager.register_backend(
+                        sbproxy_vault::VaultProviderType::KubernetesSecret,
+                        name.clone(),
+                        Box::new(b),
+                    ),
+                    Err(e) => {
+                        eprintln!("Fatal: secret backend '{name}': {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+
+    let resolver = sbproxy_vault::SecretResolver::new(None, secrets.map)
+        .with_manager(std::sync::Arc::new(manager));
+    sbproxy_vault::install_process_resolver(std::sync::Arc::new(resolver));
 }
 
 /// Print the load-bearing version line.

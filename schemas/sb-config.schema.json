@@ -1404,6 +1404,14 @@
           "description": "Fallback strategy when the vault backend is unavailable.\n\nSupported values: `\"cache\"` (default), `\"reject\"`, `\"env\"`.",
           "default": "cache",
           "type": "string"
+        },
+        "backends": {
+          "description": "Named secret backends that provider-URI references resolve against (WOR-1767). A `secret://<name>/<key>` reference resolves against the `local` backend named `<name>`; `secretfile://<name>/<key>` against the `file` backend named `<name>`. An unresolved reference in an `api_key` or `client_secret` fails startup rather than reaching the wire verbatim.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SecretBackendConfig"
+          }
         }
       }
     },
@@ -1452,6 +1460,634 @@
           "minimum": 0.0
         }
       }
+    },
+    "SecretBackendConfig": {
+      "description": "One named secret backend for provider-URI resolution (WOR-1767).\n\nConfig-native (does not depend on the vault crate). The binary builds a vault manager from these at boot.",
+      "oneOf": [
+        {
+          "description": "In-config secrets, referenced as `secret://<name>/<key>`. Entry values may themselves be `${ENV}` so real secrets stay out of YAML.",
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "local"
+              ]
+            },
+            "name": {
+              "description": "Backend name used in the `secret://<name>/...` reference.",
+              "type": "string"
+            },
+            "entries": {
+              "description": "Key to value map.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "description": "A YAML/JSON secrets file, referenced as `secretfile://<name>/<key>`.",
+          "type": "object",
+          "required": [
+            "name",
+            "path",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "file"
+              ]
+            },
+            "name": {
+              "description": "Backend name used in the `secretfile://<name>/...` reference.",
+              "type": "string"
+            },
+            "path": {
+              "description": "Path to the secrets file.",
+              "type": "string"
+            },
+            "format": {
+              "description": "File format.",
+              "default": "yaml",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SecretFileFormat"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "HashiCorp Vault KV, referenced as `vault://<name>/<path>`.",
+          "type": "object",
+          "required": [
+            "addr",
+            "auth",
+            "name",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "hashicorp"
+              ]
+            },
+            "name": {
+              "description": "Backend name used in the `vault://<name>/...` reference.",
+              "type": "string"
+            },
+            "addr": {
+              "description": "Vault server URL, e.g. `https://vault.example/v1`.",
+              "type": "string"
+            },
+            "mount": {
+              "description": "KV mount path.",
+              "default": "secret",
+              "type": "string"
+            },
+            "engine": {
+              "description": "KV engine version.",
+              "default": "v2",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SecretKvEngine"
+                }
+              ]
+            },
+            "cache_ttl_secs": {
+              "description": "Cache TTL in seconds for resolved reads.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "namespace": {
+              "description": "Optional Vault Enterprise namespace.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "auth": {
+              "description": "Authentication method.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/HashiCorpBackendAuth"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "AWS Secrets Manager, referenced as `awssm://<name>/<secret-id>`.",
+          "type": "object",
+          "required": [
+            "auth",
+            "mount_prefix",
+            "name",
+            "region",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "aws"
+              ]
+            },
+            "name": {
+              "description": "Backend name used in the `awssm://<name>/...` reference.",
+              "type": "string"
+            },
+            "region": {
+              "description": "AWS region.",
+              "type": "string"
+            },
+            "mount_prefix": {
+              "description": "Path prefix every read must stay inside.",
+              "type": "string"
+            },
+            "cache_ttl_secs": {
+              "description": "Cache TTL in seconds for resolved reads.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "auth": {
+              "description": "Authentication method.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AwsBackendAuth"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "GCP Secret Manager, referenced as `gcpsm://<name>/<secret>`.",
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "gcp"
+              ]
+            },
+            "name": {
+              "description": "Backend name used in the `gcpsm://<name>/...` reference.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Default GCP project id for short references.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "endpoint": {
+              "description": "Secret Manager API endpoint override.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cache_ttl_secs": {
+              "description": "Cache TTL in seconds for resolved reads.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "auth": {
+              "description": "Authentication method (defaults to Application Default Credentials).",
+              "default": "application_default",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GcpBackendAuth"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Kubernetes Secrets, referenced as `k8ssecret://<name>/<secret>/<key>`.",
+          "type": "object",
+          "required": [
+            "auth",
+            "name",
+            "namespace",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "k8s"
+              ]
+            },
+            "name": {
+              "description": "Backend name used in the `k8ssecret://<name>/...` reference.",
+              "type": "string"
+            },
+            "namespace": {
+              "description": "Namespace the backend reads Secret objects from.",
+              "type": "string"
+            },
+            "cache_ttl_secs": {
+              "description": "Cache TTL in seconds for resolved reads.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "auth": {
+              "description": "Authentication method.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/K8sBackendAuth"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "SecretFileFormat": {
+      "description": "Format of a `file` secret backend's contents (WOR-1767).",
+      "oneOf": [
+        {
+          "description": "YAML (default).",
+          "type": "string",
+          "enum": [
+            "yaml"
+          ]
+        },
+        {
+          "description": "JSON.",
+          "type": "string",
+          "enum": [
+            "json"
+          ]
+        }
+      ]
+    },
+    "SecretKvEngine": {
+      "description": "HashiCorp KV engine version for a `hashicorp` secret backend (WOR-1767).",
+      "oneOf": [
+        {
+          "description": "KV version 1.",
+          "type": "string",
+          "enum": [
+            "v1"
+          ]
+        },
+        {
+          "description": "KV version 2 (default).",
+          "type": "string",
+          "enum": [
+            "v2"
+          ]
+        }
+      ]
+    },
+    "HashiCorpBackendAuth": {
+      "description": "Authentication for a `hashicorp` secret backend (WOR-1767).",
+      "oneOf": [
+        {
+          "description": "Static token.",
+          "type": "object",
+          "required": [
+            "token",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "token"
+              ]
+            },
+            "token": {
+              "description": "Vault token (may be `${ENV}`).",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "AppRole role_id + secret_id.",
+          "type": "object",
+          "required": [
+            "role_id",
+            "secret_id",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "approle"
+              ]
+            },
+            "role_id": {
+              "description": "AppRole role id.",
+              "type": "string"
+            },
+            "secret_id": {
+              "description": "AppRole secret id (may be `${ENV}`).",
+              "type": "string"
+            },
+            "mount": {
+              "description": "AppRole auth mount.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Kubernetes service-account JWT exchange.",
+          "type": "object",
+          "required": [
+            "role",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "kubernetes"
+              ]
+            },
+            "role": {
+              "description": "Vault role bound to the service account.",
+              "type": "string"
+            },
+            "jwt_path": {
+              "description": "Path to the service-account JWT.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mount": {
+              "description": "Kubernetes auth mount.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "AwsBackendAuth": {
+      "description": "Authentication for an `aws` secret backend (WOR-1767).",
+      "oneOf": [
+        {
+          "description": "Static access keys.",
+          "type": "object",
+          "required": [
+            "access_key_id",
+            "secret_access_key",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "static_keys"
+              ]
+            },
+            "access_key_id": {
+              "description": "Access key id (may be `${ENV}`).",
+              "type": "string"
+            },
+            "secret_access_key": {
+              "description": "Secret access key (may be `${ENV}`).",
+              "type": "string"
+            },
+            "session_token": {
+              "description": "Optional session token (may be `${ENV}`).",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The AWS default credential chain (env, instance profile, ...).",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "default_chain"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role for cross-account access.",
+          "type": "object",
+          "required": [
+            "role_arn",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "assumed_role"
+              ]
+            },
+            "role_arn": {
+              "description": "Role ARN to assume.",
+              "type": "string"
+            },
+            "external_id": {
+              "description": "Optional external id from the trust policy.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_name": {
+              "description": "Optional session name.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "GcpBackendAuth": {
+      "description": "Authentication for a `gcp` secret backend (WOR-1767). Externally tagged to match the bare-string `application_default` default.",
+      "oneOf": [
+        {
+          "description": "Application Default Credentials (default).",
+          "type": "string",
+          "enum": [
+            "application_default"
+          ]
+        },
+        {
+          "description": "A service-account key file on disk.",
+          "type": "object",
+          "required": [
+            "service_account_key_file"
+          ],
+          "properties": {
+            "service_account_key_file": {
+              "type": "object",
+              "required": [
+                "path"
+              ],
+              "properties": {
+                "path": {
+                  "description": "Path to the key file.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Inline service-account key JSON (may be `${ENV}`).",
+          "type": "object",
+          "required": [
+            "service_account_key_json"
+          ],
+          "properties": {
+            "service_account_key_json": {
+              "type": "object",
+              "required": [
+                "json"
+              ],
+              "properties": {
+                "json": {
+                  "description": "The key JSON.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "An external-account (Workload Identity Federation) file.",
+          "type": "object",
+          "required": [
+            "external_account_file"
+          ],
+          "properties": {
+            "external_account_file": {
+              "type": "object",
+              "required": [
+                "path"
+              ],
+              "properties": {
+                "path": {
+                  "description": "Path to the external-account file.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "K8sBackendAuth": {
+      "description": "Authentication for a `k8s` secret backend (WOR-1767).",
+      "oneOf": [
+        {
+          "description": "In-cluster service-account credentials.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "in_cluster"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A kubeconfig file.",
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "kubeconfig"
+              ]
+            },
+            "path": {
+              "description": "Path to the kubeconfig.",
+              "type": "string"
+            },
+            "context": {
+              "description": "Optional context name.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
     },
     "KeyManagementConfig": {
       "description": "Top-level `key_management:` block: the runtime key plane (mutable store, policy cache, at-rest crypto, OIDC claim map, declarative seed).",

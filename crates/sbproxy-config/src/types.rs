@@ -4129,6 +4129,234 @@ pub struct SecretsConfig {
     /// Supported values: `"cache"` (default), `"reject"`, `"env"`.
     #[serde(default = "default_fallback")]
     pub fallback: String,
+    /// Named secret backends that provider-URI references resolve against
+    /// (WOR-1767). A `secret://<name>/<key>` reference resolves against the
+    /// `local` backend named `<name>`; `secretfile://<name>/<key>` against
+    /// the `file` backend named `<name>`. An unresolved reference in an
+    /// `api_key` or `client_secret` fails startup rather than reaching the
+    /// wire verbatim.
+    #[serde(default)]
+    pub backends: Vec<SecretBackendConfig>,
+}
+
+/// One named secret backend for provider-URI resolution (WOR-1767).
+///
+/// Config-native (does not depend on the vault crate). The binary builds a
+/// vault manager from these at boot.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SecretBackendConfig {
+    /// In-config secrets, referenced as `secret://<name>/<key>`. Entry
+    /// values may themselves be `${ENV}` so real secrets stay out of YAML.
+    Local {
+        /// Backend name used in the `secret://<name>/...` reference.
+        name: String,
+        /// Key to value map.
+        #[serde(default)]
+        entries: HashMap<String, String>,
+    },
+    /// A YAML/JSON secrets file, referenced as `secretfile://<name>/<key>`.
+    File {
+        /// Backend name used in the `secretfile://<name>/...` reference.
+        name: String,
+        /// Path to the secrets file.
+        path: std::path::PathBuf,
+        /// File format.
+        #[serde(default)]
+        format: SecretFileFormat,
+    },
+    /// HashiCorp Vault KV, referenced as `vault://<name>/<path>`.
+    Hashicorp {
+        /// Backend name used in the `vault://<name>/...` reference.
+        name: String,
+        /// Vault server URL, e.g. `https://vault.example/v1`.
+        addr: String,
+        /// KV mount path.
+        #[serde(default = "default_secret_mount")]
+        mount: String,
+        /// KV engine version.
+        #[serde(default)]
+        engine: SecretKvEngine,
+        /// Cache TTL in seconds for resolved reads.
+        #[serde(default)]
+        cache_ttl_secs: Option<u64>,
+        /// Optional Vault Enterprise namespace.
+        #[serde(default)]
+        namespace: Option<String>,
+        /// Authentication method.
+        auth: HashiCorpBackendAuth,
+    },
+    /// AWS Secrets Manager, referenced as `awssm://<name>/<secret-id>`.
+    Aws {
+        /// Backend name used in the `awssm://<name>/...` reference.
+        name: String,
+        /// AWS region.
+        region: String,
+        /// Path prefix every read must stay inside.
+        mount_prefix: String,
+        /// Cache TTL in seconds for resolved reads.
+        #[serde(default)]
+        cache_ttl_secs: Option<u64>,
+        /// Authentication method.
+        auth: AwsBackendAuth,
+    },
+    /// GCP Secret Manager, referenced as `gcpsm://<name>/<secret>`.
+    Gcp {
+        /// Backend name used in the `gcpsm://<name>/...` reference.
+        name: String,
+        /// Default GCP project id for short references.
+        #[serde(default)]
+        project_id: Option<String>,
+        /// Secret Manager API endpoint override.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Cache TTL in seconds for resolved reads.
+        #[serde(default)]
+        cache_ttl_secs: Option<u64>,
+        /// Authentication method (defaults to Application Default Credentials).
+        #[serde(default)]
+        auth: GcpBackendAuth,
+    },
+    /// Kubernetes Secrets, referenced as `k8ssecret://<name>/<secret>/<key>`.
+    K8s {
+        /// Backend name used in the `k8ssecret://<name>/...` reference.
+        name: String,
+        /// Namespace the backend reads Secret objects from.
+        namespace: String,
+        /// Cache TTL in seconds for resolved reads.
+        #[serde(default)]
+        cache_ttl_secs: Option<u64>,
+        /// Authentication method.
+        auth: K8sBackendAuth,
+    },
+}
+
+/// Format of a `file` secret backend's contents (WOR-1767).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretFileFormat {
+    /// YAML (default).
+    #[default]
+    Yaml,
+    /// JSON.
+    Json,
+}
+
+/// HashiCorp KV engine version for a `hashicorp` secret backend (WOR-1767).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretKvEngine {
+    /// KV version 1.
+    V1,
+    /// KV version 2 (default).
+    #[default]
+    V2,
+}
+
+fn default_secret_mount() -> String {
+    "secret".to_string()
+}
+
+/// Authentication for a `hashicorp` secret backend (WOR-1767).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HashiCorpBackendAuth {
+    /// Static token.
+    Token {
+        /// Vault token (may be `${ENV}`).
+        token: String,
+    },
+    /// AppRole role_id + secret_id.
+    Approle {
+        /// AppRole role id.
+        role_id: String,
+        /// AppRole secret id (may be `${ENV}`).
+        secret_id: String,
+        /// AppRole auth mount.
+        #[serde(default)]
+        mount: Option<String>,
+    },
+    /// Kubernetes service-account JWT exchange.
+    Kubernetes {
+        /// Vault role bound to the service account.
+        role: String,
+        /// Path to the service-account JWT.
+        #[serde(default)]
+        jwt_path: Option<String>,
+        /// Kubernetes auth mount.
+        #[serde(default)]
+        mount: Option<String>,
+    },
+}
+
+/// Authentication for an `aws` secret backend (WOR-1767).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AwsBackendAuth {
+    /// Static access keys.
+    StaticKeys {
+        /// Access key id (may be `${ENV}`).
+        access_key_id: String,
+        /// Secret access key (may be `${ENV}`).
+        secret_access_key: String,
+        /// Optional session token (may be `${ENV}`).
+        #[serde(default)]
+        session_token: Option<String>,
+    },
+    /// The AWS default credential chain (env, instance profile, ...).
+    DefaultChain,
+    /// Assume an IAM role for cross-account access.
+    AssumedRole {
+        /// Role ARN to assume.
+        role_arn: String,
+        /// Optional external id from the trust policy.
+        #[serde(default)]
+        external_id: Option<String>,
+        /// Optional session name.
+        #[serde(default)]
+        session_name: Option<String>,
+    },
+}
+
+/// Authentication for a `gcp` secret backend (WOR-1767). Externally tagged
+/// to match the bare-string `application_default` default.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GcpBackendAuth {
+    /// Application Default Credentials (default).
+    #[default]
+    ApplicationDefault,
+    /// A service-account key file on disk.
+    ServiceAccountKeyFile {
+        /// Path to the key file.
+        path: String,
+    },
+    /// Inline service-account key JSON (may be `${ENV}`).
+    ServiceAccountKeyJson {
+        /// The key JSON.
+        json: String,
+    },
+    /// An external-account (Workload Identity Federation) file.
+    ExternalAccountFile {
+        /// Path to the external-account file.
+        path: String,
+    },
+}
+
+/// Authentication for a `k8s` secret backend (WOR-1767).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum K8sBackendAuth {
+    /// In-cluster service-account credentials.
+    InCluster,
+    /// A kubeconfig file.
+    Kubeconfig {
+        /// Path to the kubeconfig.
+        path: String,
+        /// Optional context name.
+        #[serde(default)]
+        context: Option<String>,
+    },
 }
 
 /// HashiCorp Vault connection settings.
@@ -5201,6 +5429,117 @@ map:
             cfg.map.get("db_password").map(|s| s.as_str()),
             Some("secret/data/prod/db_password")
         );
+    }
+
+    #[test]
+    fn secrets_config_backends_deserialization() {
+        // WOR-1767: the provider-URI backend surface.
+        let yaml = r#"
+backend: env
+backends:
+  - type: local
+    name: app
+    entries:
+      openai_key: "${OPENAI_KEY}"
+  - type: file
+    name: shared
+    path: /etc/sbproxy/secrets.yaml
+    format: json
+"#;
+        let cfg: SecretsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.backends.len(), 2);
+        match &cfg.backends[0] {
+            SecretBackendConfig::Local { name, entries } => {
+                assert_eq!(name, "app");
+                assert_eq!(
+                    entries.get("openai_key").map(|s| s.as_str()),
+                    Some("${OPENAI_KEY}")
+                );
+            }
+            other => panic!("expected local backend, got {other:?}"),
+        }
+        match &cfg.backends[1] {
+            SecretBackendConfig::File { name, path, format } => {
+                assert_eq!(name, "shared");
+                assert_eq!(path.to_str(), Some("/etc/sbproxy/secrets.yaml"));
+                assert!(matches!(format, SecretFileFormat::Json));
+            }
+            other => panic!("expected file backend, got {other:?}"),
+        }
+        // Default: no backends when omitted.
+        let bare: SecretsConfig = serde_yaml::from_str("backend: env\n").unwrap();
+        assert!(bare.backends.is_empty());
+    }
+
+    #[test]
+    fn secrets_config_cloud_backends_deserialization() {
+        // WOR-1785: the cloud backend variants + their auth sub-enums.
+        let yaml = r#"
+backend: env
+backends:
+  - type: hashicorp
+    name: primary
+    addr: https://vault.example/v1
+    engine: v2
+    auth:
+      type: approle
+      role_id: acme
+      secret_id: "${VAULT_SECRET_ID}"
+  - type: aws
+    name: aws1
+    region: us-east-1
+    mount_prefix: prod/sbproxy
+    auth:
+      type: default_chain
+  - type: gcp
+    name: gcp1
+    project_id: acme-prod
+    auth: application_default
+  - type: k8s
+    name: k8s1
+    namespace: apps
+    auth:
+      type: in_cluster
+"#;
+        let cfg: SecretsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.backends.len(), 4);
+        match &cfg.backends[0] {
+            SecretBackendConfig::Hashicorp {
+                name,
+                engine,
+                auth,
+                mount,
+                ..
+            } => {
+                assert_eq!(name, "primary");
+                // mount defaults to "secret" when omitted.
+                assert_eq!(mount, "secret");
+                assert!(matches!(engine, SecretKvEngine::V2));
+                assert!(matches!(auth, HashiCorpBackendAuth::Approle { .. }));
+            }
+            other => panic!("expected hashicorp backend, got {other:?}"),
+        }
+        assert!(matches!(
+            &cfg.backends[1],
+            SecretBackendConfig::Aws {
+                auth: AwsBackendAuth::DefaultChain,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &cfg.backends[2],
+            SecretBackendConfig::Gcp {
+                auth: GcpBackendAuth::ApplicationDefault,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &cfg.backends[3],
+            SecretBackendConfig::K8s {
+                auth: K8sBackendAuth::InCluster,
+                ..
+            }
+        ));
     }
 
     #[test]

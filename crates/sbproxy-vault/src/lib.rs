@@ -34,7 +34,7 @@ pub use k8s::{
 pub use local::LocalVault;
 pub use manager::{VaultBackend, VaultManager};
 pub use metadata::{SecretMeta, SecretMetadataTracker};
-pub use resolver::{ResolveFallback, SecretResolver};
+pub use resolver::{install_process_resolver, process_resolver, ResolveFallback, SecretResolver};
 pub use rotation::RotationManager;
 pub use scope::{auto_scope, parse_scope, validate_access, SecretScope};
 pub use secret_string::SecretString;

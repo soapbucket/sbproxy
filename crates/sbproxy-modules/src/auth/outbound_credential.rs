@@ -118,6 +118,42 @@ pub struct VaultSecretConfig {
     pub scheme: String,
 }
 
+impl OutboundCredentialConfig {
+    /// Resolve provider-URI secret references (WOR-1784) in this credential's
+    /// secret-bearing fields through the process secret resolver, so a
+    /// `vault://` / `secret://` reference becomes the real secret at config
+    /// load rather than being sent to the token endpoint verbatim. An
+    /// unresolved reference is a hard error. No-op when no resolver is
+    /// installed (the validate/plan subcommands, unit tests).
+    pub fn resolve_secret_refs(&mut self) -> anyhow::Result<()> {
+        let Some(resolver) = sbproxy_vault::process_resolver() else {
+            return Ok(());
+        };
+        match self {
+            OutboundCredentialConfig::TokenExchange(c) => {
+                if let Some(secret) = c.client_secret.take() {
+                    c.client_secret = Some(
+                        resolver
+                            .resolve(&secret)
+                            .map_err(|e| anyhow::anyhow!("token_exchange client_secret: {e}"))?,
+                    );
+                }
+            }
+            OutboundCredentialConfig::ClientCredentials(c) => {
+                c.client_secret = resolver
+                    .resolve(&c.client_secret)
+                    .map_err(|e| anyhow::anyhow!("client_credentials client_secret: {e}"))?;
+            }
+            OutboundCredentialConfig::VaultSecret(c) => {
+                c.secret = resolver
+                    .resolve(&c.secret)
+                    .map_err(|e| anyhow::anyhow!("vault_secret secret: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A resolved outbound credential, ready to stamp on the upstream
 /// request as a header.
 #[derive(Debug, Clone, PartialEq, Eq)]
