@@ -668,6 +668,13 @@ impl AiHandlerConfig {
             if provider.base_url.is_some() {
                 continue; // explicit endpoint: any name is fine
             }
+            if provider.serve.is_some() {
+                // WOR-1809: a served provider hosts its model on this
+                // box; its name is a free-form label and the gateway
+                // resolves the engine's loopback port itself, so the
+                // localhost-fallback warning below does not apply.
+                continue;
+            }
             // When `provider_type` is set it is the catalog key and `name`
             // is just a free-form label; otherwise `name` is the key.
             let (label, key) = match provider.provider_type.as_deref() {

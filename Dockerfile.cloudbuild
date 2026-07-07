@@ -53,6 +53,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # Reads the workspace and emits recipe.json. The recipe is a digest of
 # every Cargo.toml / Cargo.lock in the tree; first-party source bodies
 # do not affect it, which is the property that makes warm rebuilds fast.
+# --- Stage: admin-ui ---------------------------------------------------
+# WOR-1781: build the admin SPA so the binary can embed it. ui/dist is
+# gitignored, so the image build must produce it; the builder stage
+# copies it in before cargo compiles with `embed-admin-ui`.
+FROM node:22-slim AS admin-ui
+WORKDIR /ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
+COPY ui/ .
+RUN npm run build
+
 FROM chef-base AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
@@ -68,7 +79,7 @@ ARG CARGO_PROFILE=release-fast
 COPY --from=planner /src/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo chef cook --profile "${CARGO_PROFILE}" --bin sbproxy --recipe-path recipe.json
+    cargo chef cook --profile "${CARGO_PROFILE}" --bin sbproxy --features embed-admin-ui --recipe-path recipe.json
 
 # --- Stage 4: builder --------------------------------------------------
 # Copies the cooked dep artifacts from the cacher stage, then the
@@ -79,9 +90,10 @@ FROM chef-base AS builder
 ARG CARGO_PROFILE=release-fast
 COPY --from=cacher /src/target target
 COPY . .
+COPY --from=admin-ui /ui/dist ui/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --profile "${CARGO_PROFILE}" --bin sbproxy --locked \
+    cargo build --profile "${CARGO_PROFILE}" --bin sbproxy --features embed-admin-ui --locked \
  && cp "/src/target/${CARGO_PROFILE}/sbproxy" /usr/local/bin/sbproxy
 
 # --- Stage 5: cert-gen -------------------------------------------------

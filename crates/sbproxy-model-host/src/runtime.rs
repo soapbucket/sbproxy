@@ -238,8 +238,13 @@ pub enum RuntimeError {
         reason: String,
     },
     /// No metadata for the resolved model.
-    #[error("no model metadata for '{0}' (weights not fetched?)")]
-    NoMetadata(String),
+    #[error("no model metadata for '{name}' (weights source '{model}' not fetched? Bare catalog ids resolve once catalog-driven serving lands; name the weights explicitly, e.g. \"hf:<repo>:<quant>\" with gguf_file)")]
+    NoMetadata {
+        /// The serve-entry name the request asked for.
+        name: String,
+        /// The `model:` source the entry declares (catalog id or hf ref).
+        model: String,
+    },
     /// The fit planner rejected every candidate.
     #[error("fit: {0}")]
     Fit(String),
@@ -261,7 +266,7 @@ impl RuntimeError {
         match self {
             RuntimeError::UnknownModel(_) => "unknown_model",
             RuntimeError::Resolve { .. } => "resolve",
-            RuntimeError::NoMetadata(_) => "no_metadata",
+            RuntimeError::NoMetadata { .. } => "no_metadata",
             RuntimeError::Fit(_) => "fit",
             RuntimeError::Residency(_) => "residency",
             RuntimeError::Port(_) => "port",
@@ -734,7 +739,10 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                 .or_else(|| self.metadata.metadata(&model_ref)),
             None => self.metadata.metadata(&model_ref),
         }
-        .ok_or_else(|| RuntimeError::NoMetadata(name.to_string()))?;
+        .ok_or_else(|| RuntimeError::NoMetadata {
+            name: name.to_string(),
+            model: entry.model.clone(),
+        })?;
 
         let candidates = self.candidate_quants(&model_ref);
         let seq_len = entry.max_context.unwrap_or(meta.max_context);

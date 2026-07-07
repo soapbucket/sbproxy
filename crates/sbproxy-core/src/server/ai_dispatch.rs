@@ -2576,6 +2576,13 @@ pub(super) async fn handle_ai_proxy(
         if !resolved_model.is_empty() {
             ctx.ai_model = Some(resolved_model.clone());
         }
+        // WOR-1809: mark served-provider attempts so the response
+        // handler can rewrite the engine's `model` field (a local
+        // engine reports its weights file path there) back to the
+        // serve-entry name the client asked for. Reset per attempt so
+        // a failover to a hosted lane clears it.
+        ctx.ai_serve_model = (provider.serve.is_some() && !resolved_model.is_empty())
+            .then(|| resolved_model.clone());
         ai_span.record("gen_ai.system", provider.name.as_str());
         ai_span.record("llm.provider", provider.name.as_str());
         if !resolved_model.is_empty() {
@@ -3376,6 +3383,21 @@ pub(super) async fn relay_ai_response_with_cache(
         ))
     } else {
         raw_body
+    };
+
+    // WOR-1809: a served (local) engine reports its weights file path
+    // in the response's `model` field. Rewrite it to the serve-entry
+    // name the client asked for, before the rewrap and the cache
+    // writes, so local lanes echo a model id exactly like hosted
+    // lanes. Streaming responses keep the engine's string for now
+    // (the SSE relay does not materialize chunks).
+    let resp_body: bytes::Bytes = match ctx
+        .as_ref()
+        .and_then(|c| c.ai_serve_model.as_deref())
+        .filter(|_| (200..300).contains(&status))
+    {
+        Some(serve_name) => rewrite_response_model(resp_body, serve_name),
+        None => resp_body,
     };
 
     // Native-format inbound rewrap. When the client entered
@@ -5007,6 +5029,28 @@ fn prepend_system_message(body: &mut serde_json::Value, text: &str) {
 /// eligible. Returns `None` (leave the order unchanged) when the model is
 /// empty, when no provider declares it (so unenumerated models still pass
 /// straight through), or when the filter would not exclude any provider.
+/// Rewrite the top-level `model` field of an OpenAI-shaped JSON body to
+/// `model`. A served (local) engine reports its weights file path there
+/// (e.g. `/var/lib/sbproxy/models/.../Qwen3-14B-Q4_K_M.gguf`), which is
+/// not the id any plane routed on (WOR-1809); the serve-entry name is.
+/// Non-JSON bodies and bodies without a `model` field pass through
+/// unchanged, so error envelopes and exotic shapes are never mangled.
+fn rewrite_response_model(body: bytes::Bytes, model: &str) -> bytes::Bytes {
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    match v.get("model").and_then(|m| m.as_str()) {
+        Some(existing) if existing != model => {
+            v["model"] = serde_json::Value::String(model.to_string());
+            match serde_json::to_vec(&v) {
+                Ok(out) => bytes::Bytes::from(out),
+                Err(_) => body,
+            }
+        }
+        _ => body,
+    }
+}
+
 fn model_eligible_providers(
     order: &[usize],
     providers: &[sbproxy_ai::ProviderConfig],
@@ -5725,5 +5769,36 @@ mod dynamic_key_resolution_tests {
             !limiter.check_rate(&vk.key, &vk),
             "the third request in the window exceeds the 2 rpm limit"
         );
+    }
+}
+
+#[cfg(test)]
+mod served_model_rewrite_tests {
+    use super::rewrite_response_model;
+
+    #[test]
+    fn rewrites_weights_path_to_serve_name() {
+        let body = bytes::Bytes::from(
+            r#"{"model":"/var/lib/sbproxy/models/Qwen/Qwen3-14B-GGUF/main/Qwen3-14B-Q4_K_M.gguf","choices":[]}"#,
+        );
+        let out = rewrite_response_model(body, "qwen3-14b");
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(v["model"], "qwen3-14b");
+        assert!(v.get("choices").is_some());
+    }
+
+    #[test]
+    fn leaves_matching_model_untouched() {
+        let body = bytes::Bytes::from(r#"{"model":"qwen3-14b"}"#);
+        let out = rewrite_response_model(body.clone(), "qwen3-14b");
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn passes_through_non_json_and_missing_field() {
+        let sse = bytes::Bytes::from("data: {\"chunk\":1}\n\n");
+        assert_eq!(rewrite_response_model(sse.clone(), "m"), sse);
+        let err = bytes::Bytes::from(r#"{"error":{"message":"boom"}}"#);
+        assert_eq!(rewrite_response_model(err.clone(), "m"), err);
     }
 }

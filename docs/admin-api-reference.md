@@ -376,28 +376,21 @@ contracts live with the feature.
 
 ---
 
-## Chat playground (`POST /admin/api/playground/chat`)
+## Chat playground
 
-A reserved endpoint for the dashboard's interactive chat surface.
-The admin UI scaffold + cargo feature ship today, but the chat
-playground is gated off until it can route through the production AI
-dispatch path with the same origin/provider constraints as normal
-proxy traffic.
+Two routes back the dashboard's interactive chat surface. Both sit
+behind the admin auth and RBAC gate; the chat route is a mutation, so
+it requires the `admin` role.
 
-Today an authenticated `POST` returns `404 Not Found` with a JSON
-feature-disabled envelope:
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/admin/api/playground/endpoints` | List every AI origin the live pipeline serves, with each provider's declared models and default model. Read-only, sourced from the compiled pipeline, so a config reload updates it without a restart. |
+| POST | `/admin/api/playground/chat` | Run a chat completion against a chosen endpoint through the same AI client the data plane uses. Returns the upstream response plus token usage, cost, and latency. |
 
-```json
-{
-  "error": "feature disabled",
-  "feature": "admin_chat_playground",
-  "detail": "admin chat playground is not wired in this build; use configured AI proxy origins for live model traffic"
-}
-```
-
-Other verbs return `405 Method Not Allowed`. The route shares the
-admin port's basic-auth gate, so a curious operator pinging it
-without credentials still sees `401 Unauthorized` first.
+Because the chat call routes through the production dispatch path, it
+honors the same origin and provider constraints as normal proxy
+traffic. Unauthenticated requests see `401 Unauthorized`; other verbs
+return `405 Method Not Allowed`.
 
 The path is reserved on the admin server (next to `/admin/reload`)
 rather than the production proxy listener. It is not a live chat API

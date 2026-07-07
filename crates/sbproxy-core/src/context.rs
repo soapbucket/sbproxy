@@ -693,6 +693,12 @@ pub struct RequestContext {
     /// the access log records the resolved model even when the
     /// upstream errors before returning a body.
     pub ai_model: Option<String>,
+    /// Set when the dispatched provider hosts its model on this box
+    /// (a `serve:` provider): the serve-entry name the client asked
+    /// for. The response handler rewrites the upstream body's `model`
+    /// field to this name, because a local engine reports its weights
+    /// file path there, which is not the id any plane routed on.
+    pub ai_serve_model: Option<String>,
     /// Prompt / input tokens reported by the provider response.
     pub ai_tokens_in: Option<u64>,
     /// WOR-1499: estimated prompt tokens computed on the request path
@@ -1090,6 +1096,7 @@ impl RequestContext {
             principal: sbproxy_plugin::Principal::anonymous(),
             attribution_tags: sbproxy_ai::attribution::AttributionTags::default(),
             ai_model: None,
+            ai_serve_model: None,
             ai_tokens_in: None,
             ai_prompt_tokens_est: None,
             ai_prompt_fingerprint: None,

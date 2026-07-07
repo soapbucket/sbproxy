@@ -90,8 +90,22 @@ jobs:
               ;;
           esac
 
+      # WOR-1781: build the admin SPA and embed it, so shipped binaries
+      # serve the dashboard at /admin/ui instead of "Admin UI not built".
+      # ui/dist is gitignored (only a keepfile is tracked), so the release
+      # lane must produce it before cargo embeds it via include_dir.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: build admin ui
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
       - name: build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy --features embed-admin-ui
 
       - name: package tarball
         shell: bash

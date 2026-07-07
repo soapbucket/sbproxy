@@ -446,6 +446,31 @@ pub fn translate_openai_response_to_anthropic(body: &[u8]) -> Vec<u8> {
         Err(_) => return body.to_vec(),
     };
     let resp = openai_to_hub_response(&parsed);
+    // WOR-1809: a reasoning model can spend the entire max_tokens budget
+    // on thinking. The bridge keeps thinking out of `content`, so the
+    // client sees an empty message with `stop_reason: max_tokens` and no
+    // hint why. Name the cause so the operator raises max_tokens instead
+    // of debugging an "empty response".
+    let choice0 = parsed.get("choices").and_then(|c| c.get(0));
+    let msg = choice0.and_then(|c| c.get("message"));
+    let budget_ate_reasoning = choice0
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|f| f.as_str())
+        == Some("length")
+        && msg
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .is_none_or(str::is_empty)
+        && msg
+            .and_then(|m| m.get("reasoning_content"))
+            .and_then(|c| c.as_str())
+            .is_some_and(|s| !s.is_empty());
+    if budget_ate_reasoning {
+        tracing::warn!(
+            "anthropic bridge: empty content with stop_reason max_tokens; the model spent the \
+             whole token budget on reasoning. Raise the request's max_tokens."
+        );
+    }
     let value = hub_response_to_anthropic_value(&resp);
     serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
 }

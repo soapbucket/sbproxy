@@ -1464,7 +1464,10 @@ pub(super) fn emit_ai_billing_event(
             .with_cost(cost_usd)
             .with_scope_keys(scope_keys);
     sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
-    tracing::info!(
+    // WOR-1809: debug, not info. This fires per billing scope, so one
+    // completion can emit a burst of identical lines; the ledger sinks
+    // and metrics are the durable record, the log line is a trace.
+    tracing::debug!(
         ai.surface = event.surface.as_str(),
         ai.provider = event.provider.as_str(),
         ai.cost_usd = event.cost_usd,
