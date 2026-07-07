@@ -5465,6 +5465,77 @@ backends:
     }
 
     #[test]
+    fn secrets_config_cloud_backends_deserialization() {
+        // WOR-1785: the cloud backend variants + their auth sub-enums.
+        let yaml = r#"
+backend: env
+backends:
+  - type: hashicorp
+    name: primary
+    addr: https://vault.example/v1
+    engine: v2
+    auth:
+      type: approle
+      role_id: acme
+      secret_id: "${VAULT_SECRET_ID}"
+  - type: aws
+    name: aws1
+    region: us-east-1
+    mount_prefix: prod/sbproxy
+    auth:
+      type: default_chain
+  - type: gcp
+    name: gcp1
+    project_id: acme-prod
+    auth: application_default
+  - type: k8s
+    name: k8s1
+    namespace: apps
+    auth:
+      type: in_cluster
+"#;
+        let cfg: SecretsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.backends.len(), 4);
+        match &cfg.backends[0] {
+            SecretBackendConfig::Hashicorp {
+                name,
+                engine,
+                auth,
+                mount,
+                ..
+            } => {
+                assert_eq!(name, "primary");
+                // mount defaults to "secret" when omitted.
+                assert_eq!(mount, "secret");
+                assert!(matches!(engine, SecretKvEngine::V2));
+                assert!(matches!(auth, HashiCorpBackendAuth::Approle { .. }));
+            }
+            other => panic!("expected hashicorp backend, got {other:?}"),
+        }
+        assert!(matches!(
+            &cfg.backends[1],
+            SecretBackendConfig::Aws {
+                auth: AwsBackendAuth::DefaultChain,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &cfg.backends[2],
+            SecretBackendConfig::Gcp {
+                auth: GcpBackendAuth::ApplicationDefault,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &cfg.backends[3],
+            SecretBackendConfig::K8s {
+                auth: K8sBackendAuth::InCluster,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn secrets_config_rotation_block() {
         let yaml = r#"
 backend: env
