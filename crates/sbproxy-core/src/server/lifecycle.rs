@@ -1081,49 +1081,26 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                     );
                 }
             } else if server_config.acme.as_ref().is_some_and(|a| a.enabled) {
-                // ACME-only mode: generate a self-signed bootstrap cert so the
-                // HTTPS listener can start immediately. ACME will replace it with
-                // a real cert once issuance completes.
-                match tls.generate_self_signed_bootstrap_cert() {
-                    Ok((cert_path, key_path)) => {
-                        // Wire mTLS through the ACME path too. Without
-                        // this branch, an operator who configured mTLS
-                        // alongside ACME would silently get plain TLS
-                        // until they noticed clients reaching the
-                        // upstream without the expected cert headers.
-                        if let Some(mtls_cfg) = server_config.mtls.as_ref() {
-                            let cache = crate::identity::mtls_cert_cache();
-                            match build_mtls_tls_settings(&cert_path, &key_path, mtls_cfg, cache) {
-                                Ok(settings) => {
-                                    proxy_service.add_tls_with_settings(
-                                        &format!("0.0.0.0:{https_port}"),
-                                        None,
-                                        settings,
-                                    );
-                                    tracing::info!(
-                                        port = %https_port,
-                                        require = %mtls_cfg.require,
-                                        "HTTPS listener added (ACME bootstrap + mTLS; ACME will replace cert)"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "mTLS setup failed on ACME path; falling back to non-mTLS HTTPS"
-                                    );
-                                    proxy_service
-                                        .add_tls(
-                                            &format!("0.0.0.0:{https_port}"),
-                                            &cert_path,
-                                            &key_path,
-                                        )
-                                        .map_err(|e| {
-                                            anyhow::anyhow!("failed to add TLS listener: {}", e)
-                                        })?;
-                                }
-                            }
-                        } else {
-                            let settings = build_tls_settings(&cert_path, &key_path)?;
+                // ACME mode (WOR-1772): the forked Pingora listener reads the
+                // dynamic CertResolver, so a cert the ACME task issues is served
+                // live via SNI and renewals swap with no restart. Install a
+                // self-signed fallback first so :443 completes a handshake
+                // before the first issue and for SNI misses.
+                if let Err(e) = tls.install_self_signed_fallback() {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to install self-signed fallback; HTTPS listener not started"
+                    );
+                } else if let Some(mtls_cfg) = server_config.mtls.as_ref() {
+                    // Wire mTLS through the ACME path too, still serving the
+                    // cert dynamically from the resolver.
+                    let cache = crate::identity::mtls_cert_cache();
+                    match build_mtls_tls_settings_with_resolver(
+                        tls.resolver.clone(),
+                        mtls_cfg,
+                        cache,
+                    ) {
+                        Ok(settings) => {
                             proxy_service.add_tls_with_settings(
                                 &format!("0.0.0.0:{https_port}"),
                                 None,
@@ -1131,15 +1108,36 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                             );
                             tracing::info!(
                                 port = %https_port,
-                                "HTTPS listener added (self-signed bootstrap, HTTP/2 enabled, ACME will replace)"
+                                require = %mtls_cfg.require,
+                                "HTTPS listener added (ACME dynamic cert via resolver + mTLS)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "mTLS setup failed on ACME path; HTTPS listener not started"
                             );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "failed to generate bootstrap cert, HTTPS listener not started"
-                        );
+                } else {
+                    match build_tls_settings_with_resolver(tls.resolver.clone()) {
+                        Ok(settings) => {
+                            proxy_service.add_tls_with_settings(
+                                &format!("0.0.0.0:{https_port}"),
+                                None,
+                                settings,
+                            );
+                            tracing::info!(
+                                port = %https_port,
+                                "HTTPS listener added (ACME dynamic cert via resolver, HTTP/2 enabled)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to build resolver TLS settings; HTTPS listener not started"
+                            );
+                        }
                     }
                 }
             }

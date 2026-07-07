@@ -351,3 +351,22 @@ inherits = "release"
 # artifacts continue to use `[profile.release]`.
 lto = "off"
 codegen-units = 16
+
+# WOR-1772: fork of Cloudflare Pingora 0.8.0 adding
+# `TlsSettings::with_cert_resolver` so the rustls HTTPS listener selects the
+# server cert from the dynamic CertResolver (ACME certs served live, renewals
+# swap with no restart). All pingora-* crates are patched to the one fork so
+# the workspace resolves a single consistent copy. Re-sync on a pingora
+# upgrade: rebase soapbucket/pingora sbproxy-0.8.0 onto the new tag.
+[patch.crates-io]
+pingora-core = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-proxy = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-http = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-error = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-cache = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-rustls = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-lru = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-pool = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-runtime = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-timeout = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
+pingora-header-serde = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }

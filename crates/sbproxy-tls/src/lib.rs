@@ -30,7 +30,7 @@ use cert_store::{CertMeta, CertStore};
 use challenges::Http01ChallengeStore;
 use ocsp::OcspStapler;
 use sbproxy_config::ProxyServerConfig;
-use sbproxy_platform::MemoryKVStore;
+use sbproxy_platform::{KVStore, MemoryKVStore};
 
 /// A tokio runtime handle for the TLS maintenance tasks (OCSP refresh, ACME
 /// renewal). These are started from the synchronous proxy-setup path, before
@@ -66,7 +66,7 @@ pub struct TlsState {
     /// ACME configuration (None means ACME is disabled).
     acme_config: Option<sbproxy_config::AcmeConfig>,
     /// Persistent certificate storage backend.
-    cert_store: Arc<CertStore<MemoryKVStore>>,
+    cert_store: Arc<CertStore>,
     /// Hostnames this proxy is responsible for.
     hostnames: Vec<String>,
     /// OCSP stapler for the manual fallback cert. `None` when no
@@ -83,6 +83,50 @@ pub struct TlsState {
     manual_cert_pem: Option<Vec<u8>>,
 }
 
+/// Open the KVStore backing the ACME cert store, chosen by
+/// `acme.storage_backend` at `acme.storage_path` (WOR-1773).
+///
+/// `redb` (the default) persists locally so a single node survives a
+/// restart without re-issuing. The pluggable backends for a fleet
+/// (shared `file`, `s3`/`gcs`, `redis`, `cluster`) land as their own
+/// backends; until then an unrecognized backend falls back to in-memory
+/// with a loud warning, so it is obvious certs are not being persisted.
+fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVStore> {
+    use sbproxy_platform::storage::RedbKVStore;
+    let Some(acme) = acme else {
+        return Arc::new(MemoryKVStore::new(0));
+    };
+    match acme.storage_backend.as_str() {
+        "memory" => Arc::new(MemoryKVStore::new(0)),
+        "redb" => {
+            let dir = acme.storage_path.trim_end_matches('/');
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(path = %dir, error = %e,
+                    "cert store: cannot create storage dir; certs will NOT persist (in-memory fallback)");
+                return Arc::new(MemoryKVStore::new(0));
+            }
+            let file = format!("{dir}/certstore.redb");
+            match RedbKVStore::new(&file) {
+                Ok(s) => {
+                    info!(path = %file, "cert store backend: redb (persistent)");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    warn!(path = %file, error = %e,
+                        "cert store: redb open failed; certs will NOT persist (in-memory fallback)");
+                    Arc::new(MemoryKVStore::new(0))
+                }
+            }
+        }
+        other => {
+            warn!(backend = %other,
+                "cert store: '{other}' backend not yet wired (shared file, s3/gcs, redis, cluster \
+                 land in WOR-1773); certs will NOT persist (in-memory fallback)");
+            Arc::new(MemoryKVStore::new(0))
+        }
+    }
+}
+
 impl TlsState {
     /// Initialize TLS state from a [`ProxyServerConfig`].
     ///
@@ -97,7 +141,7 @@ impl TlsState {
 
         let resolver = Arc::new(CertResolver::new());
         let challenge_store = Arc::new(Http01ChallengeStore::new());
-        let cert_store = Arc::new(CertStore::new(MemoryKVStore::new(0)));
+        let cert_store = Arc::new(CertStore::new(open_cert_backend(config.acme.as_ref())));
 
         // --- Manual cert files ---
         let mut ocsp_stapler: Option<Arc<OcspStapler>> = None;
@@ -360,6 +404,40 @@ impl TlsState {
 
         info!(cert = %cert_str, "generated self-signed bootstrap cert for ACME-only mode");
         Ok((cert_str, key_str))
+    }
+
+    /// Install a self-signed fallback cert on the resolver (WOR-1772).
+    ///
+    /// With the forked Pingora listener reading the dynamic `CertResolver`,
+    /// the ACME cert installed by the renewal task is served live via SNI. But
+    /// before the first issue (and for SNI misses), the resolver needs a
+    /// fallback so `:443` still completes a handshake. This installs a
+    /// self-signed cert for the primary hostname as that fallback. ACME-only
+    /// mode has no manual cert, so there is nothing to clobber; calling this on
+    /// every (re)start is idempotent.
+    pub fn install_self_signed_fallback(&self) -> Result<()> {
+        let hostname = self
+            .hostnames
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("localhost");
+        let key_pair = rcgen::KeyPair::generate().context("generating fallback key pair")?;
+        let params = rcgen::CertificateParams::new(vec![hostname.to_string()])
+            .context("creating fallback cert params")?;
+        let cert = params
+            .self_signed(&key_pair)
+            .context("self-signing fallback cert")?;
+        let ck = cert_resolver::load_certified_key(
+            cert.pem().as_bytes(),
+            key_pair.serialize_pem().as_bytes(),
+        )
+        .context("loading self-signed fallback cert")?;
+        self.resolver.set_fallback(ck);
+        info!(
+            hostname,
+            "installed self-signed fallback cert for the ACME bootstrap window"
+        );
+        Ok(())
     }
 
     ///
