@@ -194,7 +194,19 @@ impl OidcAuth {
     /// the dispatcher in [`crate::compile::compile_auth`] stays
     /// uniform.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        let parsed: Self = serde_json::from_value(value)?;
+        let mut parsed: Self = serde_json::from_value(value)?;
+        // WOR-1784: resolve provider-URI secret references in client_secret
+        // and cookie_secret before validation, so a resolved secret is used
+        // (and length-checked) rather than the literal reference reaching the
+        // OIDC provider verbatim. An unresolved reference is a hard error.
+        if let Some(resolver) = sbproxy_vault::process_resolver() {
+            parsed.client_secret = resolver
+                .resolve(&parsed.client_secret)
+                .map_err(|e| anyhow::anyhow!("oidc auth: resolving client_secret: {e}"))?;
+            parsed.cookie_secret = resolver
+                .resolve(&parsed.cookie_secret)
+                .map_err(|e| anyhow::anyhow!("oidc auth: resolving cookie_secret: {e}"))?;
+        }
         if parsed.cookie_secret.len() < 32 {
             anyhow::bail!(
                 "oidc auth: cookie_secret must be at least 32 bytes (got {})",

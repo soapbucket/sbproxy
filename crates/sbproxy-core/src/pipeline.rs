@@ -1092,14 +1092,21 @@ impl CompiledPipeline {
             // WOR-802: parse the JSON into the typed closed enum so a bad
             // mode fails config load rather than silently at request time.
             let outbound_cred = match &origin.outbound_credential {
-                Some(cfg) => Some(
-                    serde_json::from_value::<
+                Some(cfg) => {
+                    let mut parsed = serde_json::from_value::<
                         sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig,
                     >(cfg.clone())
                     .map_err(|e| {
                         anyhow::anyhow!("origin {}: outbound_credential: {}", origin.origin_id, e)
-                    })?,
-                ),
+                    })?;
+                    // WOR-1784: resolve provider-URI secret references in the
+                    // credential's client_secret / secret at load, failing
+                    // loud, so they never reach the token endpoint verbatim.
+                    parsed.resolve_secret_refs().map_err(|e| {
+                        anyhow::anyhow!("origin {}: outbound_credential: {}", origin.origin_id, e)
+                    })?;
+                    Some(parsed)
+                }
                 None => None,
             };
             outbound_creds.push(outbound_cred);
