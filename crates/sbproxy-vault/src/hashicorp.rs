@@ -524,10 +524,10 @@ impl VaultBackend for HashiCorpVaultBackend {
                 }
                 Err(ureq::Error::Status(s, r)) => {
                     return Err(anyhow!(
-                        "HashiCorp vault: write {} {} on {}",
+                        "HashiCorp vault: write {} on {}: {}",
                         s,
-                        r.status_text(),
-                        url
+                        url,
+                        vault_error_detail(r)
                     ));
                 }
                 Err(e) => {
@@ -562,10 +562,10 @@ impl HashiCorpVaultBackend {
                 }
                 Err(ureq::Error::Status(s, r)) => {
                     return Err(anyhow!(
-                        "HashiCorp vault: {} {} on {}",
+                        "HashiCorp vault: {} on {}: {}",
                         s,
-                        r.status_text(),
-                        url
+                        url,
+                        vault_error_detail(r)
                     ));
                 }
                 Err(e) => {
@@ -662,6 +662,43 @@ fn login_kubernetes(
             )
         })?;
     Ok(token.to_string())
+}
+
+/// Extract a readable detail from a Vault error response for an error
+/// message. Vault returns its reason in a JSON `{"errors":[...]}` body, which
+/// is far more useful than the generic HTTP status text ("Forbidden"), so
+/// prefer the joined `errors`. Falls back to the status text, then a short
+/// body excerpt. Consumes the response to read its body.
+fn vault_error_detail(response: ureq::Response) -> String {
+    let status_text = response.status_text().to_string();
+    let body = response.into_string().unwrap_or_default();
+    format_vault_error(&body, &status_text)
+}
+
+/// Pure formatting for [`vault_error_detail`], split out so it is testable
+/// without constructing a `ureq::Response`.
+fn format_vault_error(body: &str, status_text: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(errors) = value.get("errors").and_then(|e| e.as_array()) {
+            let joined = errors
+                .iter()
+                .filter_map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            if !joined.is_empty() {
+                return joined;
+            }
+        }
+    }
+    if !status_text.is_empty() {
+        return status_text.to_string();
+    }
+    let trimmed = body.trim();
+    if trimmed.len() <= 256 {
+        trimmed.to_string()
+    } else {
+        format!("{}...", &trimmed[..256])
+    }
 }
 
 #[cfg(test)]
@@ -914,5 +951,33 @@ mod tests {
         assert!(b.cache_hit("stale").is_none());
         // And the entry was evicted in the process.
         assert_eq!(b.cache.lock().len(), 0);
+    }
+
+    #[test]
+    fn format_vault_error_prefers_errors_array() {
+        let body = r#"{"errors":["permission denied"]}"#;
+        assert_eq!(format_vault_error(body, "Forbidden"), "permission denied");
+    }
+
+    #[test]
+    fn format_vault_error_joins_multiple_errors() {
+        let body = r#"{"errors":["1 error occurred:","* missing client token"]}"#;
+        assert_eq!(
+            format_vault_error(body, "Bad Request"),
+            "1 error occurred:; * missing client token"
+        );
+    }
+
+    #[test]
+    fn format_vault_error_falls_back_to_status_text() {
+        // Empty errors array, or non-JSON body: use the status text.
+        assert_eq!(
+            format_vault_error(r#"{"errors":[]}"#, "Forbidden"),
+            "Forbidden"
+        );
+        assert_eq!(
+            format_vault_error("gateway timeout", "Bad Gateway"),
+            "Bad Gateway"
+        );
     }
 }

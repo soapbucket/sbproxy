@@ -254,7 +254,12 @@ impl VaultBackend for AwsSecretsManagerBackend {
                     .send()
                     .await
             })
-            .map_err(|e| anyhow!("AWS Secrets Manager: GetSecretValue {name}: {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "AWS Secrets Manager: GetSecretValue {name}: {}",
+                    error_chain_detail(&e)
+                )
+            })?;
 
         // Prefer `secret_string`. Binary secrets (`secret_binary`) are
         // returned as base64-encoded strings so the on-wire shape
@@ -287,7 +292,12 @@ impl VaultBackend for AwsSecretsManagerBackend {
                     .send()
                     .await
             })
-            .map_err(|e| anyhow!("AWS Secrets Manager: PutSecretValue {key}: {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "AWS Secrets Manager: PutSecretValue {key}: {}",
+                    error_chain_detail(&e)
+                )
+            })?;
         // Invalidate so the next get sees the new value.
         self.cache.lock().remove(key);
         Ok(())
@@ -353,6 +363,24 @@ async fn build_client(region: String, auth: AwsAuth) -> Result<smc::Client> {
     };
 
     Ok(smc::Client::new(&sdk_config))
+}
+
+/// Render an error and its `source()` chain as one string. The AWS SDK's
+/// top-level `SdkError` Display is often just "service error"; the useful
+/// detail (for example `ResourceNotFoundException: Secrets Manager can't find
+/// the specified secret`) lives further down the source chain, so walk it and
+/// join the distinct messages.
+fn error_chain_detail(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(s) = source {
+        let text = s.to_string();
+        if parts.last().map(String::as_str) != Some(text.as_str()) {
+            parts.push(text);
+        }
+        source = s.source();
+    }
+    parts.join(": ")
 }
 
 #[cfg(test)]
@@ -529,5 +557,36 @@ mod tests {
         }
         assert!(b.cache_hit("stale").is_none());
         assert_eq!(b.cache.lock().len(), 0);
+    }
+
+    #[test]
+    fn error_chain_detail_walks_source_chain() {
+        #[derive(Debug)]
+        struct Err2;
+        impl std::fmt::Display for Err2 {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "ResourceNotFoundException: can't find the specified secret"
+                )
+            }
+        }
+        impl std::error::Error for Err2 {}
+        #[derive(Debug)]
+        struct Err1;
+        impl std::fmt::Display for Err1 {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "service error")
+            }
+        }
+        impl std::error::Error for Err1 {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&Err2)
+            }
+        }
+        assert_eq!(
+            error_chain_detail(&Err1),
+            "service error: ResourceNotFoundException: can't find the specified secret"
+        );
     }
 }
