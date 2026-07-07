@@ -165,6 +165,10 @@ enum Cmd {
     /// per-GPU fit verdict and cache status; `models show <id>` prints
     /// the full entry.
     Models(ModelsCmd),
+    /// Freshness: is any of it out of date. `sbproxy update` checks the
+    /// engine release feed and the cached models; `--self` also checks
+    /// the sbproxy binary. Reports only (a dry run); nothing is mutated.
+    Update(UpdateArgs),
     /// Diagnose what this binary can do on the current host: compiled
     /// capability features, visible GPUs, inference engines on PATH,
     /// and whether a `serve:` provider could admit a model here.
@@ -414,6 +418,25 @@ struct ModelsShowArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct UpdateArgs {
+    /// Check the sbproxy binary against the release channel.
+    #[arg(long = "self")]
+    self_: bool,
+    /// Check the inference engines (default when no target flag is set).
+    #[arg(long = "engines")]
+    engines: bool,
+    /// Check the cached models (default when no target flag is set).
+    #[arg(long = "models")]
+    models: bool,
+    /// Weight cache directory to check for pulled models.
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
+    /// Output format. `text` (default) or `json`.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
 struct DoctorArgs {
     /// Optional config file. When given, doctor also reports how each
     /// `serve:` model resolves on this host (engine + fit preview) and
@@ -589,6 +612,9 @@ fn main() {
         }
         Some(Cmd::Models(cmd)) => {
             run_subcommand("models", 2, handle_models_subcommand(&cmd));
+        }
+        Some(Cmd::Update(args)) => {
+            run_subcommand("update", 2, handle_update_subcommand(&args));
         }
         Some(Cmd::Doctor(args)) => {
             run_subcommand("doctor", 2, handle_doctor_subcommand(&args));
@@ -1596,6 +1622,275 @@ fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+// --- `update` handler (WOR-1804) ---
+
+const SBPROXY_RELEASE_REPO: &str = "soapbucket/sbproxy";
+const LLAMA_RELEASE_REPO: &str = "ggml-org/llama.cpp";
+
+#[derive(serde::Serialize)]
+struct SelfFreshness {
+    current: String,
+    latest: Option<String>,
+    update_available: bool,
+}
+
+#[derive(serde::Serialize)]
+struct EngineFreshness {
+    engine: &'static str,
+    installed: Option<String>,
+    pinned_release: Option<String>,
+    latest_release: Option<String>,
+    update_available: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ModelFreshness {
+    id: String,
+    hf_repo: String,
+    revision: String,
+    /// `pinned` (a commit or tag) or `moving-ref` (a branch that drifts).
+    tracking: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct UpdateReport {
+    #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
+    self_: Option<SelfFreshness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engines: Option<Vec<EngineFreshness>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: Option<Vec<ModelFreshness>>,
+    note: String,
+}
+
+fn handle_update_subcommand(args: &UpdateArgs) -> anyhow::Result<i32> {
+    // `update` = engines + models. `--self` adds the binary check; only
+    // `--engines` / `--models` narrow (so `update --self` still reports
+    // engines + models).
+    let narrowed = args.engines || args.models;
+    let self_ = args.self_.then(check_self_freshness);
+    let engines = (args.engines || !narrowed).then(check_engines_freshness);
+    let models = if args.models || !narrowed {
+        Some(check_models_freshness(args.cache_dir.as_deref())?)
+    } else {
+        None
+    };
+
+    let report = UpdateReport {
+        self_,
+        engines,
+        models,
+        note: "dry run: `sbproxy update` reports only. Applying an update \
+               (engine swap, self-update, model re-pull) is not wired yet; \
+               a pinned artifact is never mutated without an explicit run."
+            .to_string(),
+    };
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Text => print_update_report(&report),
+    }
+    Ok(0)
+}
+
+fn check_self_freshness() -> SelfFreshness {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let latest = github_latest_release(SBPROXY_RELEASE_REPO);
+    let update_available = latest
+        .as_deref()
+        .map(|l| version_is_newer(&current, l))
+        .unwrap_or(false);
+    SelfFreshness {
+        current,
+        latest,
+        update_available,
+    }
+}
+
+fn check_engines_freshness() -> Vec<EngineFreshness> {
+    let pinned = sbproxy_model_host::DEFAULT_LLAMA_RELEASE_TAG.to_string();
+    let llama_latest = github_latest_release(LLAMA_RELEASE_REPO);
+    let llama_update = llama_latest
+        .as_deref()
+        .map(|l| l != pinned)
+        .unwrap_or(false);
+    vec![
+        EngineFreshness {
+            engine: "llama_cpp",
+            installed: engine_version("llama-server"),
+            pinned_release: Some(pinned),
+            latest_release: llama_latest,
+            update_available: llama_update,
+        },
+        EngineFreshness {
+            engine: "vllm",
+            installed: engine_version("vllm"),
+            // vLLM is not a pinned single-binary release on this path.
+            pinned_release: None,
+            latest_release: None,
+            update_available: false,
+        },
+    ]
+}
+
+fn check_models_freshness(
+    cache_dir: Option<&std::path::Path>,
+) -> anyhow::Result<Vec<ModelFreshness>> {
+    let catalog = load_models_catalog(None)?;
+    let root = model_cache_root(cache_dir);
+    let mut out = Vec::new();
+    for (id, entry) in &catalog.models {
+        if !model_is_cached(&root, entry) {
+            continue; // only report models that are actually pulled
+        }
+        let revision = entry.revision.clone().unwrap_or_else(|| "main".to_string());
+        out.push(ModelFreshness {
+            id: id.clone(),
+            hf_repo: entry.hf_repo.clone(),
+            tracking: if is_moving_ref(&revision) {
+                "moving-ref"
+            } else {
+                "pinned"
+            },
+            revision,
+        });
+    }
+    Ok(out)
+}
+
+/// The version string an installed engine reports, or `None` when it is
+/// not on `PATH`.
+fn engine_version(program: &str) -> Option<String> {
+    sbproxy_model_host::resolve_on_path(program)?;
+    let out = std::process::Command::new(program)
+        .arg("--version")
+        .output()
+        .ok()?;
+    for stream in [&out.stdout, &out.stderr] {
+        let text = String::from_utf8_lossy(stream);
+        if let Some(line) = text.lines().find(|l| !l.trim().is_empty()) {
+            return Some(line.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Whether a revision is a moving reference (a branch that can drift from
+/// what was pulled) rather than a pinned commit / tag.
+fn is_moving_ref(revision: &str) -> bool {
+    let is_commit = revision.len() == 40 && revision.chars().all(|c| c.is_ascii_hexdigit());
+    let is_tag = revision.starts_with('v')
+        && revision[1..]
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false);
+    !(is_commit || is_tag)
+}
+
+/// The latest release tag of a GitHub repo (best-effort, via `curl`).
+/// `None` when offline or the tool is absent.
+fn github_latest_release(repo: &str) -> Option<String> {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "6",
+            "-H",
+            "Accept: application/vnd.github+json",
+        ])
+        .arg(format!(
+            "https://api.github.com/repos/{repo}/releases/latest"
+        ))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.get("tag_name")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Whether `latest` is a newer semver than `current` (either may carry a
+/// leading `v`); unparsable parts compare as `0`.
+fn version_is_newer(current: &str, latest: &str) -> bool {
+    fn parts(s: &str) -> Vec<u64> {
+        s.trim_start_matches('v')
+            .split(['.', '-', '+'])
+            .filter_map(|p| p.parse::<u64>().ok())
+            .collect()
+    }
+    let (c, l) = (parts(current), parts(latest));
+    for i in 0..c.len().max(l.len()) {
+        let cv = c.get(i).copied().unwrap_or(0);
+        let lv = l.get(i).copied().unwrap_or(0);
+        if lv != cv {
+            return lv > cv;
+        }
+    }
+    false
+}
+
+fn print_update_report(r: &UpdateReport) {
+    if let Some(s) = &r.self_ {
+        println!("sbproxy");
+        println!("  current  {}", s.current);
+        println!(
+            "  latest   {}",
+            s.latest.as_deref().unwrap_or("unknown (offline?)")
+        );
+        println!(
+            "  {}",
+            if s.update_available {
+                "UPDATE AVAILABLE"
+            } else {
+                "up to date"
+            }
+        );
+    }
+    if let Some(engines) = &r.engines {
+        println!("\nengines");
+        for e in engines {
+            println!("  {}", e.engine);
+            println!(
+                "    installed  {}",
+                e.installed.as_deref().unwrap_or("not installed")
+            );
+            if let Some(p) = &e.pinned_release {
+                println!("    pinned     {p}");
+            }
+            println!(
+                "    latest     {}",
+                e.latest_release.as_deref().unwrap_or("unknown / n/a")
+            );
+            if e.update_available {
+                println!(
+                    "    a newer prebuilt exists (pinned by default; \
+                     set engines.<engine>.acquire.version to move)"
+                );
+            }
+        }
+    }
+    if let Some(models) = &r.models {
+        println!("\ncached models");
+        if models.is_empty() {
+            println!("  none pulled yet");
+        }
+        for m in models {
+            let note = if m.tracking == "moving-ref" {
+                " (tracks a moving ref; may be behind upstream)"
+            } else {
+                " (pinned)"
+            };
+            println!("  {:<20} {}@{}{}", m.id, m.hf_repo, m.revision, note);
+        }
+    }
+    println!("\n{}", r.note);
+}
+
 // --- `projections` handler ---
 
 /// Dispatch the `projections render` subcommand.
@@ -2250,6 +2545,28 @@ mod tests {
             prov.acquire.as_ref().unwrap().accel,
             sbproxy_model_host::EngineAccel::Metal
         );
+    }
+
+    #[test]
+    fn update_version_newer_compares_semver() {
+        assert!(version_is_newer("1.4.0", "v1.5.0"));
+        assert!(version_is_newer("1.4.0", "1.4.1"));
+        assert!(version_is_newer("1.4.0", "2.0.0"));
+        assert!(!version_is_newer("1.5.0", "v1.4.9"));
+        assert!(!version_is_newer("1.4.0", "1.4.0"));
+        assert!(!version_is_newer("1.4.0", "v1.4.0"));
+    }
+
+    #[test]
+    fn update_moving_ref_vs_pinned() {
+        assert!(is_moving_ref("main"));
+        assert!(is_moving_ref("master"));
+        assert!(is_moving_ref("my-feature-branch"));
+        // A pinned tag or a 40-hex commit sha is not moving.
+        assert!(!is_moving_ref("v1.2.0"));
+        assert!(!is_moving_ref(&"a".repeat(40)));
+        // A 39-char near-sha is treated as a branch (moving).
+        assert!(is_moving_ref(&"a".repeat(39)));
     }
 
     #[test]
