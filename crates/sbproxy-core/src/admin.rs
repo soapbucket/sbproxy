@@ -565,6 +565,35 @@ pub struct AdminPrincipal {
     pub csrf: Option<String>,
 }
 
+/// WOR-1777: the `Set-Cookie` + `X-CSRF-Token` headers that upgrade a
+/// Basic-authenticated principal to a session token, so a client can carry
+/// a short-lived token instead of resending the password on every request.
+/// Returns empty for a `via_session` principal (it already holds a cookie),
+/// so requests that already present the cookie are not re-minted.
+fn basic_session_upgrade_headers(
+    signer: &crate::admin_session::SessionSigner,
+    principal: &AdminPrincipal,
+    secure: bool,
+    now: u64,
+) -> Vec<(String, String)> {
+    if principal.via_session {
+        return Vec::new();
+    }
+    let ttl_secs = 8 * 3600;
+    let (token, csrf) = signer.mint(&principal.username, principal.role, ttl_secs, now);
+    let secure_attr = if secure { "; Secure" } else { "" };
+    vec![
+        (
+            "Set-Cookie".to_string(),
+            format!(
+                "{}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}; Max-Age={ttl_secs}",
+                crate::admin_session::SESSION_COOKIE
+            ),
+        ),
+        ("X-CSRF-Token".to_string(), csrf),
+    ]
+}
+
 /// Current unix time in seconds; `0` on a clock error (which fails expiry
 /// checks closed).
 fn unix_now() -> u64 {
@@ -2256,7 +2285,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     }
     // WOR-1717: CORS headers for an allowed cross-origin caller (echoed on
     // every response below), and a direct 204 answer to preflight OPTIONS.
-    let cors = cors_response_headers(origin.as_deref(), &state.config.cors_origins);
+    let mut cors = cors_response_headers(origin.as_deref(), &state.config.cors_origins);
     if method.eq_ignore_ascii_case("OPTIONS") {
         let _ = write_admin_response_headed(sock, 204, "text/plain", b"", &cors).await;
         return;
@@ -2299,6 +2328,21 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     // and audit the action with the operator's identity.
     let principal = state.resolve_principal(auth_header.as_deref(), cookie.as_deref());
     let mutating = is_state_changing(method);
+    // WOR-1777: upgrade a Basic-authenticated client to a session token.
+    // When auth came via Basic (no session cookie), mint a session token and
+    // Set-Cookie it, plus return the CSRF nonce in a header, so a browser
+    // stops re-prompting for Basic and a client can carry the short-lived
+    // token instead of resending the password on every request. A client
+    // that ignores both keeps working via per-request Basic. Requests that
+    // already present the cookie are `via_session` and are not re-minted.
+    if let Some(p) = &principal {
+        cors.extend(basic_session_upgrade_headers(
+            &state.session_signer,
+            p,
+            state.config.tls.is_some(),
+            unix_now(),
+        ));
+    }
     if let Some(p) = &principal {
         if p.via_session && mutating {
             let ok = match (csrf_header.as_deref(), p.csrf.as_deref()) {
@@ -2767,6 +2811,62 @@ async fn handle_admin_logout<S: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basic_auth_upgrade_mints_verifiable_session() {
+        // WOR-1777: a Basic-authed principal is upgraded to a session token.
+        use crate::admin_session::{SessionSigner, SESSION_COOKIE};
+        let signer = SessionSigner::random();
+        let now = 1000u64;
+        let basic = AdminPrincipal {
+            username: "admin".into(),
+            role: AdminRole::Admin,
+            via_session: false,
+            csrf: None,
+        };
+        let headers = basic_session_upgrade_headers(&signer, &basic, false, now);
+
+        let cookie = headers
+            .iter()
+            .find(|(k, _)| k == "Set-Cookie")
+            .map(|(_, v)| v.as_str())
+            .expect("Set-Cookie present");
+        assert!(cookie.contains(&format!("{SESSION_COOKIE}=")));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+
+        let csrf = headers
+            .iter()
+            .find(|(k, _)| k == "X-CSRF-Token")
+            .map(|(_, v)| v.clone())
+            .expect("X-CSRF-Token present");
+
+        // The minted token verifies to the same operator, and the returned
+        // CSRF equals the session nonce a mutation must echo.
+        let token = cookie
+            .strip_prefix(&format!("{SESSION_COOKIE}="))
+            .and_then(|s| s.split(';').next())
+            .expect("token in cookie");
+        let sess = signer.verify(token, now).expect("minted token verifies");
+        assert_eq!(sess.username, "admin");
+        assert_eq!(sess.role, AdminRole::Admin);
+        assert_eq!(sess.nonce, csrf);
+
+        // A session-authenticated principal already holds a cookie: no re-mint.
+        let via_session = AdminPrincipal {
+            username: "x".into(),
+            role: AdminRole::Admin,
+            via_session: true,
+            csrf: Some("n".into()),
+        };
+        assert!(basic_session_upgrade_headers(&signer, &via_session, false, now).is_empty());
+
+        // The Secure attribute is set only when the admin listener is TLS.
+        let secure = basic_session_upgrade_headers(&signer, &basic, true, now);
+        assert!(secure
+            .iter()
+            .any(|(k, v)| k == "Set-Cookie" && v.contains("; Secure")));
+    }
 
     fn make_state() -> AdminState {
         AdminState::new(AdminConfig {
