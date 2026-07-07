@@ -1,6 +1,6 @@
 # Self-hosting SBproxy
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-07*
 
 One binary to self-host your AI gateway, and the same binary runs the
 models. OpenRouter proved that teams want unified routing, fallbacks,
@@ -155,6 +155,43 @@ to the local model the same way they apply to a hosted one. The usage
 ledger prices each local completion at what the equivalent hosted API
 would have charged and reports dollars saved per model per month, which
 is the number that justifies the GPU.
+
+## A public endpoint with Let's Encrypt
+
+Nothing on this page requires staying on a private network. Give the
+origin a real hostname, open ports 80 and 443, and enable ACME: the
+gateway answers the http-01 challenge itself, obtains a certificate
+from Let's Encrypt (or any ACME-compatible CA), and renews it before
+expiry. Issued certificates persist in a local store, so a restart
+reuses the certificate instead of asking the CA for a fresh one.
+
+```yaml
+proxy:
+  http_bind_port: 80
+  https_bind_port: 443
+  acme:
+    enabled: true
+    email: ops@example.com
+
+origins:
+  "ai.example.com":
+    force_ssl: true
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          serve:
+            models:
+              - model: qwen3-14b
+```
+
+That is a governed, OpenAI-compatible endpoint on your own GPU with
+real TLS, reachable by your team, your customers, or any agent you
+hand a key to. Put virtual keys and budgets in front before you expose
+it; a public `/v1/chat/completions` with no auth is an open GPU. The
+field reference, other ACME directories, and the shared certificate
+stores a fleet needs are in
+[configuration.md](configuration.md#acme--auto-tls).
 
 ## OpenRouter parity map
 
