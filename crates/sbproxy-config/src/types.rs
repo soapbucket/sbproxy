@@ -4122,6 +4122,53 @@ pub struct SecretsConfig {
     /// Supported values: `"cache"` (default), `"reject"`, `"env"`.
     #[serde(default = "default_fallback")]
     pub fallback: String,
+    /// Named secret backends that provider-URI references resolve against
+    /// (WOR-1767). A `secret://<name>/<key>` reference resolves against the
+    /// `local` backend named `<name>`; `secretfile://<name>/<key>` against
+    /// the `file` backend named `<name>`. An unresolved reference in an
+    /// `api_key` or `client_secret` fails startup rather than reaching the
+    /// wire verbatim.
+    #[serde(default)]
+    pub backends: Vec<SecretBackendConfig>,
+}
+
+/// One named secret backend for provider-URI resolution (WOR-1767).
+///
+/// Config-native (does not depend on the vault crate). The binary builds a
+/// vault manager from these at boot.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SecretBackendConfig {
+    /// In-config secrets, referenced as `secret://<name>/<key>`. Entry
+    /// values may themselves be `${ENV}` so real secrets stay out of YAML.
+    Local {
+        /// Backend name used in the `secret://<name>/...` reference.
+        name: String,
+        /// Key to value map.
+        #[serde(default)]
+        entries: HashMap<String, String>,
+    },
+    /// A YAML/JSON secrets file, referenced as `secretfile://<name>/<key>`.
+    File {
+        /// Backend name used in the `secretfile://<name>/...` reference.
+        name: String,
+        /// Path to the secrets file.
+        path: std::path::PathBuf,
+        /// File format.
+        #[serde(default)]
+        format: SecretFileFormat,
+    },
+}
+
+/// Format of a `file` secret backend's contents (WOR-1767).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretFileFormat {
+    /// YAML (default).
+    #[default]
+    Yaml,
+    /// JSON.
+    Json,
 }
 
 /// HashiCorp Vault connection settings.
@@ -5194,6 +5241,46 @@ map:
             cfg.map.get("db_password").map(|s| s.as_str()),
             Some("secret/data/prod/db_password")
         );
+    }
+
+    #[test]
+    fn secrets_config_backends_deserialization() {
+        // WOR-1767: the provider-URI backend surface.
+        let yaml = r#"
+backend: env
+backends:
+  - type: local
+    name: app
+    entries:
+      openai_key: "${OPENAI_KEY}"
+  - type: file
+    name: shared
+    path: /etc/sbproxy/secrets.yaml
+    format: json
+"#;
+        let cfg: SecretsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.backends.len(), 2);
+        match &cfg.backends[0] {
+            SecretBackendConfig::Local { name, entries } => {
+                assert_eq!(name, "app");
+                assert_eq!(
+                    entries.get("openai_key").map(|s| s.as_str()),
+                    Some("${OPENAI_KEY}")
+                );
+            }
+            other => panic!("expected local backend, got {other:?}"),
+        }
+        match &cfg.backends[1] {
+            SecretBackendConfig::File { name, path, format } => {
+                assert_eq!(name, "shared");
+                assert_eq!(path.to_str(), Some("/etc/sbproxy/secrets.yaml"));
+                assert!(matches!(format, SecretFileFormat::Json));
+            }
+            other => panic!("expected file backend, got {other:?}"),
+        }
+        // Default: no backends when omitted.
+        let bare: SecretsConfig = serde_yaml::from_str("backend: env\n").unwrap();
+        assert!(bare.backends.is_empty());
     }
 
     #[test]

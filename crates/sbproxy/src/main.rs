@@ -514,6 +514,11 @@ fn pick_run_path(cli: &Cli) -> Option<PathBuf> {
 fn run_proxy(config_path: Option<&std::path::Path>, grace: sbproxy_core::GraceConfig) {
     match config_path {
         Some(path) => {
+            // WOR-1767: build + install the process secret resolver from
+            // `proxy.secrets.backends` before the server compiles its config,
+            // so provider-URI references in api_key / client_secret resolve
+            // (or fail loud) instead of reaching the wire verbatim.
+            install_secret_resolver(path);
             let path_str = path.to_string_lossy();
             if let Err(e) = sbproxy_core::run(&path_str, grace) {
                 eprintln!("Fatal: {e:#}");
@@ -527,6 +532,95 @@ fn run_proxy(config_path: Option<&std::path::Path>, grace: sbproxy_core::GraceCo
             std::process::exit(1);
         }
     }
+}
+
+/// Whole-value `${VAR}` env substitution for a `local` backend entry, so
+/// real secret values can stay in the environment rather than the YAML.
+/// A non-`${VAR}` value is used as-is; an unset var leaves the ref (which
+/// then fails resolution, loudly, rather than silently blanking).
+fn env_interp(value: &str) -> String {
+    match value
+        .strip_prefix("${")
+        .and_then(|inner| inner.strip_suffix('}'))
+    {
+        Some(var) => std::env::var(var).unwrap_or_else(|_| value.to_string()),
+        None => value.to_string(),
+    }
+}
+
+/// Build the process secret resolver from `proxy.secrets` and install it
+/// (WOR-1767). Provider-URI references (`secret://`, `secretfile://`, ...)
+/// in config values then resolve at handler-build; an unresolved reference
+/// hard-fails at that point. A misconfigured backend here (e.g. a missing
+/// secrets file) fails loud rather than starting with unresolved secrets.
+///
+/// A read/parse error is left for `sbproxy_core::run` to report; when there
+/// is no `proxy.secrets` block, nothing is installed and references pass
+/// through (caught by plan-time validation).
+fn install_secret_resolver(path: &std::path::Path) {
+    let Ok(yaml) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(&yaml) else {
+        return;
+    };
+    let Some(secrets_val) = root.get("proxy").and_then(|p| p.get("secrets")) else {
+        return;
+    };
+    let secrets: sbproxy_config::SecretsConfig = match serde_yaml::from_value(secrets_val.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Fatal: invalid proxy.secrets config: {e:#}");
+            std::process::exit(1);
+        }
+    };
+    if secrets.backends.is_empty() && secrets.map.is_empty() {
+        return;
+    }
+
+    let mut manager = sbproxy_vault::VaultManager::new();
+    for backend in &secrets.backends {
+        match backend {
+            sbproxy_config::SecretBackendConfig::Local { name, entries } => {
+                let vault = sbproxy_vault::LocalVault::new();
+                for (k, v) in entries {
+                    if let Err(e) = vault.set_secret(k, &env_interp(v)) {
+                        eprintln!("Fatal: secret backend '{name}': {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+                manager.register_backend(
+                    sbproxy_vault::VaultProviderType::LocalSecret,
+                    name.clone(),
+                    Box::new(vault),
+                );
+            }
+            sbproxy_config::SecretBackendConfig::File { name, path, format } => {
+                let format = match format {
+                    sbproxy_config::SecretFileFormat::Yaml => sbproxy_vault::FileFormat::Yaml,
+                    sbproxy_config::SecretFileFormat::Json => sbproxy_vault::FileFormat::Json,
+                };
+                match sbproxy_vault::FileVaultBackend::new(sbproxy_vault::FileVaultConfig {
+                    path: path.clone(),
+                    format,
+                }) {
+                    Ok(b) => manager.register_backend(
+                        sbproxy_vault::VaultProviderType::SecretFile,
+                        name.clone(),
+                        Box::new(b),
+                    ),
+                    Err(e) => {
+                        eprintln!("Fatal: secret backend '{name}' ({}): {e:#}", path.display());
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+
+    let resolver = sbproxy_vault::SecretResolver::new(None, secrets.map)
+        .with_manager(std::sync::Arc::new(manager));
+    sbproxy_vault::install_process_resolver(std::sync::Arc::new(resolver));
 }
 
 /// Print the load-bearing version line.

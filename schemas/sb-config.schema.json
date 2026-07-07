@@ -1405,6 +1405,14 @@
           "description": "Fallback strategy when the vault backend is unavailable.\n\nSupported values: `\"cache\"` (default), `\"reject\"`, `\"env\"`.",
           "default": "cache",
           "type": "string"
+        },
+        "backends": {
+          "description": "Named secret backends that provider-URI references resolve against (WOR-1767). A `secret://<name>/<key>` reference resolves against the `local` backend named `<name>`; `secretfile://<name>/<key>` against the `file` backend named `<name>`. An unresolved reference in an `api_key` or `client_secret` fails startup rather than reaching the wire verbatim.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SecretBackendConfig"
+          }
         }
       }
     },
@@ -1453,6 +1461,92 @@
           "minimum": 0.0
         }
       }
+    },
+    "SecretBackendConfig": {
+      "description": "One named secret backend for provider-URI resolution (WOR-1767).\n\nConfig-native (does not depend on the vault crate). The binary builds a vault manager from these at boot.",
+      "oneOf": [
+        {
+          "description": "In-config secrets, referenced as `secret://<name>/<key>`. Entry values may themselves be `${ENV}` so real secrets stay out of YAML.",
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "local"
+              ]
+            },
+            "name": {
+              "description": "Backend name used in the `secret://<name>/...` reference.",
+              "type": "string"
+            },
+            "entries": {
+              "description": "Key to value map.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "description": "A YAML/JSON secrets file, referenced as `secretfile://<name>/<key>`.",
+          "type": "object",
+          "required": [
+            "name",
+            "path",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "file"
+              ]
+            },
+            "name": {
+              "description": "Backend name used in the `secretfile://<name>/...` reference.",
+              "type": "string"
+            },
+            "path": {
+              "description": "Path to the secrets file.",
+              "type": "string"
+            },
+            "format": {
+              "description": "File format.",
+              "default": "yaml",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SecretFileFormat"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "SecretFileFormat": {
+      "description": "Format of a `file` secret backend's contents (WOR-1767).",
+      "oneOf": [
+        {
+          "description": "YAML (default).",
+          "type": "string",
+          "enum": [
+            "yaml"
+          ]
+        },
+        {
+          "description": "JSON.",
+          "type": "string",
+          "enum": [
+            "json"
+          ]
+        }
+      ]
     },
     "KeyManagementConfig": {
       "description": "Top-level `key_management:` block: the runtime key plane (mutable store, policy cache, at-rest crypto, OIDC claim map, declarative seed).",

@@ -4,7 +4,7 @@
 //! embedded in config string values.  Plain strings are passed through unchanged.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -13,6 +13,25 @@ use crate::vault_ref::{
     legacy_vault_env_name, legacy_vault_reference_replacement, warn_legacy_vault_reference_once,
     VaultRef,
 };
+
+/// Process-wide secret resolver, installed once at binary boot (WOR-1767).
+static PROCESS_RESOLVER: OnceLock<Arc<SecretResolver>> = OnceLock::new();
+
+/// Install the process-wide secret resolver used to resolve provider-URI
+/// references (`secret://`, `secretfile://`, `vault://`, ...) in config
+/// values at handler-build time (WOR-1767). Call once at boot, before the
+/// server compiles its config. A second call is ignored.
+pub fn install_process_resolver(resolver: Arc<SecretResolver>) {
+    let _ = PROCESS_RESOLVER.set(resolver);
+}
+
+/// The process-wide secret resolver, if one was installed. Returns `None`
+/// in contexts that never reach the wire (the `validate`/`plan`
+/// subcommands, unit tests), where secret references are left as-is and
+/// caught by plan-time validation instead.
+pub fn process_resolver() -> Option<Arc<SecretResolver>> {
+    PROCESS_RESOLVER.get().cloned()
+}
 
 /// Behaviour when the vault backend is unavailable and a `secret:` reference
 /// needs to be resolved.

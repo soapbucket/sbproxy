@@ -1,6 +1,6 @@
 # Secret Backends
 
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-07*
 
 SBproxy resolves secret material through provider-specific reference schemes. The scheme names the provider type, the authority names the configured backend instance, and the path is interpreted by that provider:
 
@@ -261,18 +261,25 @@ Both `data` and `stringData` fields are honoured. `data` keys are base64-decoded
 
 Use `secretfile://` for a backend-configured YAML or JSON secret file. Use `secret://` for a backend-configured static secret map. Keep `file:/path/to/secret` and `secret:<name>` for legacy configs that already use those forms.
 
+Configure these backends under `proxy.secrets.backends`. Each has a `name` used in the reference. A `local` backend's `entries` values may be `${ENV}` so real secrets stay in the environment rather than the config file. A reference in an AI provider `api_key` resolves against these at startup, and an unresolved reference stops the proxy from starting rather than being sent verbatim as a bearer token.
+
 ```yaml
 proxy:
-  vault:
-    - name: local
-      type: file
-      path: /etc/sbproxy/secrets.yaml
-      format: yaml
+  secrets:
+    backends:
+      - type: file
+        name: local
+        path: /etc/sbproxy/secrets.yaml
+        format: yaml
+      - type: local
+        name: app
+        entries:
+          openai_key: "${OPENAI_KEY}"
 ```
 
 ```text
 secretfile://local/openai-prod?key=api_key
-secret://local/openai-prod
+secret://app/openai_key
 ```
 
 ## Tenant Isolation
