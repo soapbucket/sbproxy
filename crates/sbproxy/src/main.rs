@@ -153,6 +153,13 @@ enum Cmd {
     Projections(ProjectionsCmd),
     /// AI gateway tools (usage ledger verification, ...).
     Ai(AiCmd),
+    /// Serve a model in one command, with no YAML. `sbproxy run
+    /// qwen3-14b` (or `sbproxy run hf:Org/Repo:Q4_K_M --name coder`)
+    /// synthesizes a minimal serving config, checks the model can run
+    /// here, and boots the gateway with an OpenAI-compatible endpoint on
+    /// loopback. The engine and weights are acquired on the first
+    /// request.
+    Run(RunArgs),
     /// Diagnose what this binary can do on the current host: compiled
     /// capability features, visible GPUs, inference engines on PATH,
     /// and whether a `serve:` provider could admit a model here.
@@ -313,6 +320,36 @@ struct RenderArgs {
     /// compiled config.
     #[arg(short = 'H', long = "hostname")]
     hostname: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct RunArgs {
+    /// The model to serve: a catalog id (`qwen3-14b`) or an explicit
+    /// `hf:Org/Repo:QUANT` reference. A raw reference needs `--name`.
+    #[arg(value_name = "MODEL")]
+    model: String,
+    /// The model id clients request (and the routing id). Defaults to
+    /// the catalog id; required when MODEL is a raw `hf:` reference.
+    #[arg(long = "name")]
+    name: Option<String>,
+    /// Loopback port to serve on.
+    #[arg(long = "port", default_value_t = 8080)]
+    port: u16,
+    /// Engine to serve with: `auto` (default), `vllm`, `llama_cpp`, or
+    /// `embedded`.
+    #[arg(long = "engine", default_value = "auto")]
+    engine: String,
+    /// Acceleration to acquire an engine build for: `auto` (default),
+    /// `cuda`, `vulkan`, `metal`, or `cpu`.
+    #[arg(long = "accel", default_value = "auto")]
+    accel: String,
+    /// Weight/engine cache directory. Defaults to the platform cache.
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
+    /// Print the synthesized config and the resolution, then exit
+    /// without serving. For inspection / CI.
+    #[arg(long = "dry-run")]
+    dry_run: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -484,6 +521,9 @@ fn main() {
         }
         Some(Cmd::Ai(cmd)) => {
             run_subcommand("ai", 2, handle_ai_subcommand(&cmd));
+        }
+        Some(Cmd::Run(args)) => {
+            handle_run_subcommand(&args, grace);
         }
         Some(Cmd::Doctor(args)) => {
             run_subcommand("doctor", 2, handle_doctor_subcommand(&args));
@@ -1121,6 +1161,170 @@ fn extract_serve_and_catalog(
     Some((merged, catalog))
 }
 
+// --- `run` handler (WOR-1802) ---
+
+/// `sbproxy run <model>`: synthesize a minimal serving config, check the
+/// model can run here, and boot the gateway. On a preflight failure it
+/// exits non-zero with the remediation; on success it serves (blocks).
+fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
+    // Resolve the model id every plane sees (routing + the served name).
+    let name = match resolve_run_name(&args.model, args.name.as_deref()) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("sbproxy run: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Build the `serve:` block once as JSON, reused for the preflight
+    // (parsed to a ModelHostConfig) and for the synthesized config.
+    let serve_value = build_run_serve_value(args);
+    let serve_cfg: sbproxy_model_host::ModelHostConfig =
+        match serde_json::from_value(serve_value.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("sbproxy run: could not build serve config: {e}");
+                std::process::exit(2);
+            }
+        };
+
+    // Preflight against this host (offline: engine viability + fit), the
+    // same detection layer `doctor` uses, so a model that cannot run
+    // here fails now with a remediation instead of 502-ing later.
+    let report = sbproxy_core::doctor::DoctorReport::collect();
+    let catalog = sbproxy_model_host::Catalog::builtin();
+    let entries = report.evaluate_serve(&serve_cfg, &catalog);
+    for e in &entries {
+        println!(
+            "model {} -> {} [{}]: {}",
+            e.model, e.engine_reason, e.fit.verdict, e.fit.detail
+        );
+    }
+    if let Some(bad) = entries.iter().find(|e| !e.runnable) {
+        eprintln!(
+            "\nsbproxy run: '{}' has no viable engine on this host: {}",
+            bad.model,
+            bad.blocker.as_deref().unwrap_or("engine unavailable")
+        );
+        if let Some(rec) = &report.local_serving.recommendation {
+            eprintln!("try: {rec}");
+        }
+        eprintln!("run `sbproxy doctor` for the full host report");
+        std::process::exit(1);
+    }
+
+    // Synthesize the full config: one ai_proxy origin under both the
+    // loopback IP and localhost (origins match the port-stripped Host
+    // exactly, with no wildcard), so a plain curl to either routes.
+    let action = serde_json::json!({
+        "type": "ai_proxy",
+        "providers": [{
+            "name": "local",
+            "default_model": name,
+            "serve": serve_value,
+        }],
+    });
+    let origin = serde_json::json!({ "action": action });
+    let config = serde_json::json!({
+        "proxy": { "http_bind_port": args.port },
+        "origins": { "127.0.0.1": origin, "localhost": origin },
+    });
+    let yaml = match serde_yaml::to_string(&config) {
+        Ok(y) => y,
+        Err(e) => {
+            eprintln!("sbproxy run: could not serialize config: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    if args.dry_run {
+        println!("\n# synthesized config\n{yaml}");
+        return;
+    }
+
+    // Write the synthesized config to a temp file (the serve boot path
+    // takes a path, not an in-memory config).
+    let path = std::env::temp_dir().join(format!("sbproxy-run-{}.yml", std::process::id()));
+    if let Err(e) = std::fs::write(&path, &yaml) {
+        eprintln!("sbproxy run: could not write {}: {e}", path.display());
+        std::process::exit(1);
+    }
+
+    let port = args.port;
+    println!("\nServing {name} on http://127.0.0.1:{port}");
+    println!(
+        "Try: curl http://127.0.0.1:{port}/v1/chat/completions \\\n  \
+         -H 'content-type: application/json' \\\n  \
+         -d '{{\"model\":\"{name}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}]}}'"
+    );
+    println!(
+        "The first request acquires the engine and downloads the weights; \
+         watch the log for progress.\n"
+    );
+
+    // Boot the gateway (blocks until shutdown). Reuses the serve path, so
+    // an invalid synthesized config fails loud here rather than at a
+    // request.
+    run_proxy(Some(&path), grace);
+}
+
+/// The served model id for `sbproxy run`: the explicit `--name`, else
+/// the catalog id in MODEL. A raw `hf:`/pathy reference needs `--name`,
+/// mirroring [`sbproxy_model_host::ServeEntry::effective_name`].
+fn resolve_run_name(model: &str, name: Option<&str>) -> Result<String, String> {
+    if let Some(n) = name {
+        if n.trim().is_empty() {
+            return Err("--name is empty".to_string());
+        }
+        return Ok(n.to_string());
+    }
+    if model.starts_with("hf:") || model.contains(':') || model.contains('/') {
+        return Err(format!(
+            "'{model}' is a raw model reference; pass --name to set the served model id"
+        ));
+    }
+    Ok(model.to_string())
+}
+
+/// Build the `serve:` block (as JSON) for `sbproxy run`: one model, with
+/// the engine / accel / cache-dir overrides applied.
+fn build_run_serve_value(args: &RunArgs) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("model".to_string(), serde_json::json!(args.model));
+    if let Some(n) = &args.name {
+        entry.insert("name".to_string(), serde_json::json!(n));
+    }
+    if args.engine != "auto" {
+        entry.insert("engine".to_string(), serde_json::json!(args.engine));
+    }
+
+    let mut serve = serde_json::Map::new();
+    serve.insert(
+        "models".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::Object(entry)]),
+    );
+    if let Some(cd) = &args.cache_dir {
+        serve.insert(
+            "cache_dir".to_string(),
+            serde_json::json!(cd.to_string_lossy()),
+        );
+    }
+    if args.accel != "auto" {
+        // Accel steers the acquired binary build; key it under the engine
+        // that reads it (llama.cpp), or the forced engine.
+        let engine_key = if args.engine == "vllm" {
+            "vllm"
+        } else {
+            "llama_cpp"
+        };
+        serve.insert(
+            "engines".to_string(),
+            serde_json::json!({ engine_key: { "acquire": { "accel": args.accel } } }),
+        );
+    }
+    serde_json::Value::Object(serve)
+}
+
 // --- `projections` handler ---
 
 /// Dispatch the `projections render` subcommand.
@@ -1602,6 +1806,74 @@ fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i3
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn run_name_defaults_to_catalog_id_and_hf_ref_needs_name() {
+        // A plain catalog id is its own name.
+        assert_eq!(resolve_run_name("qwen3-14b", None).unwrap(), "qwen3-14b");
+        // A raw hf: ref without a name is an error.
+        assert!(resolve_run_name("hf:Qwen/Qwen3-8B-GGUF:Q4_K_M", None).is_err());
+        // With a name it resolves to the name.
+        assert_eq!(
+            resolve_run_name("hf:Qwen/Qwen3-8B-GGUF:Q4_K_M", Some("coder")).unwrap(),
+            "coder"
+        );
+        // An empty name is rejected.
+        assert!(resolve_run_name("qwen3-14b", Some("  ")).is_err());
+    }
+
+    #[test]
+    fn run_serve_value_parses_into_a_valid_model_host_config() {
+        // The synthesized serve block must round-trip into a
+        // ModelHostConfig the runtime accepts, with the overrides applied.
+        let args = RunArgs {
+            model: "hf:Qwen/Qwen3-8B-GGUF:Q4_K_M".to_string(),
+            name: Some("coder".to_string()),
+            port: 8080,
+            engine: "llama_cpp".to_string(),
+            accel: "metal".to_string(),
+            cache_dir: None,
+            dry_run: false,
+        };
+        let value = build_run_serve_value(&args);
+        let cfg: sbproxy_model_host::ModelHostConfig =
+            serde_json::from_value(value).expect("serve config parses");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.models.len(), 1);
+        assert_eq!(cfg.models[0].effective_name().unwrap(), "coder");
+        assert_eq!(
+            cfg.models[0].engine,
+            sbproxy_model_host::EngineChoice::LlamaCpp
+        );
+        // accel override keyed under the llama_cpp engine's acquire block.
+        let prov = cfg
+            .engines
+            .get(&sbproxy_model_host::EngineKind::LlamaCpp)
+            .expect("llama_cpp engine provisioning");
+        assert_eq!(
+            prov.acquire.as_ref().unwrap().accel,
+            sbproxy_model_host::EngineAccel::Metal
+        );
+    }
+
+    #[test]
+    fn run_serve_value_minimal_has_no_engines_block() {
+        // A plain catalog id with auto engine + auto accel needs no
+        // engines/acquire override.
+        let args = RunArgs {
+            model: "qwen3-14b".to_string(),
+            name: None,
+            port: 8080,
+            engine: "auto".to_string(),
+            accel: "auto".to_string(),
+            cache_dir: None,
+            dry_run: false,
+        };
+        let cfg: sbproxy_model_host::ModelHostConfig =
+            serde_json::from_value(build_run_serve_value(&args)).unwrap();
+        assert!(cfg.engines.is_empty());
+        assert_eq!(cfg.models[0].engine, sbproxy_model_host::EngineChoice::Auto);
+    }
 
     #[test]
     fn parses_open_files_soft_limit() {
