@@ -50,6 +50,28 @@ pub trait KVStore: Send + Sync + 'static {
     fn incr_with_ttl(&self, _key: &[u8], _ttl_secs: u64) -> Result<i64> {
         anyhow::bail!("incr_with_ttl: not supported by this backend")
     }
+
+    /// Try to acquire a lock: set `key` to the caller's unique `token`
+    /// only if `key` is absent, expiring after `ttl_secs`. Returns `true`
+    /// when acquired, `false` when another holder has it (WOR-1774).
+    ///
+    /// The default acquires unconditionally: a local, single-node backend
+    /// (memory / redb / file on one host) has no cross-node contention, so
+    /// there is nothing to serialize against. A shared backend (redis)
+    /// overrides this with an atomic `SET NX PX` lease so a fleet issues a
+    /// cert once instead of stampeding the ACME CA.
+    fn try_lock(&self, _key: &[u8], _token: &[u8], _ttl_secs: u64) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Release a lock previously acquired via [`Self::try_lock`] with the
+    /// same `token`. An implementation must delete the key only when the
+    /// stored value still matches `token`, so a node never releases a lock
+    /// another node acquired after this one's lease expired. The default is
+    /// a no-op (pairs with the always-acquire default).
+    fn unlock(&self, _key: &[u8], _token: &[u8]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Async helper: invoke `KVStore::incr_with_ttl` inside `spawn_blocking`

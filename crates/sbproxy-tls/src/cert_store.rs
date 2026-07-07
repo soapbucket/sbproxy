@@ -23,6 +23,12 @@ fn meta_key(hostname: &str) -> String {
     format!("{}{}", META_PREFIX, hostname)
 }
 
+const LOCK_PREFIX: &str = "acme:lock:";
+
+fn lock_key(hostname: &str) -> String {
+    format!("{}{}", LOCK_PREFIX, hostname)
+}
+
 // --- CertMeta ---
 
 /// Metadata associated with a stored certificate.
@@ -176,6 +182,23 @@ impl CertStore {
         self.put_meta(hostname, meta)?;
         Ok(())
     }
+
+    /// Try to acquire the ACME issuance lock for `hostname`, held with the
+    /// caller's unique `token` and expiring after `ttl_secs` (WOR-1774).
+    /// Returns `true` when acquired. On a local backend this always
+    /// succeeds (no cross-node contention); on a shared backend (redis) it
+    /// is an atomic lease so a fleet issues a cert once.
+    pub fn try_issue_lock(&self, hostname: &str, token: &[u8], ttl_secs: u64) -> Result<bool> {
+        self.store
+            .try_lock(lock_key(hostname).as_bytes(), token, ttl_secs)
+    }
+
+    /// Release the issuance lock for `hostname` held with `token`. Safe to
+    /// call after the lease has already expired (a mismatched token is a
+    /// no-op on the backend).
+    pub fn release_issue_lock(&self, hostname: &str, token: &[u8]) -> Result<()> {
+        self.store.unlock(lock_key(hostname).as_bytes(), token)
+    }
 }
 
 // --- Tests ---
@@ -227,6 +250,19 @@ mod tests {
         assert!(reopened.get_meta("example.com").unwrap().is_some());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn local_backend_issue_lock_is_a_noop_that_acquires() {
+        // WOR-1774: on a local (single-node) backend the issuance lock has
+        // no cross-node contention, so it always acquires and release is a
+        // no-op. The real distributed lease lives in the redis backend.
+        let cs = store();
+        assert!(cs.try_issue_lock("example.com", b"token-1", 30).unwrap());
+        // A second acquire also succeeds; nothing to serialize on one node.
+        assert!(cs.try_issue_lock("example.com", b"token-2", 30).unwrap());
+        // Release is a no-op and does not error.
+        cs.release_issue_lock("example.com", b"token-1").unwrap();
     }
 
     #[test]

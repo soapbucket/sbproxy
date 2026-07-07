@@ -118,11 +118,44 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVSto
                 }
             }
         }
+        "redis" => {
+            // storage_path holds the redis address (host:port) for the
+            // shared cert store; connections open lazily. The distributed
+            // issuance lock (SET NX PX) makes a fleet issue a cert once
+            // instead of stampeding the CA (WOR-1774).
+            let cfg = sbproxy_platform::storage::RedisConfig {
+                addr: acme.storage_path.clone(),
+                ..Default::default()
+            };
+            info!(addr = %acme.storage_path, "cert store backend: redis (shared, cluster-safe)");
+            Arc::new(sbproxy_platform::storage::RedisKVStore::new(cfg))
+        }
         other => {
             warn!(backend = %other,
-                "cert store: '{other}' backend not yet wired (shared file, s3/gcs, redis, cluster \
+                "cert store: '{other}' backend not yet wired (shared file, s3/gcs, cluster \
                  land in WOR-1773); certs will NOT persist (in-memory fallback)");
             Arc::new(MemoryKVStore::new(0))
+        }
+    }
+}
+
+/// RAII release of the ACME per-host issuance lock (WOR-1774). Dropping
+/// the guard releases the lease, so every exit from the issuance block (an
+/// early `continue` on error, or normal completion) unlocks - a peer in a
+/// fleet is never left waiting on a lock this node abandoned.
+struct IssueLockGuard<'a> {
+    store: &'a CertStore,
+    hostname: &'a str,
+    token: Vec<u8>,
+}
+
+impl Drop for IssueLockGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.store.release_issue_lock(self.hostname, &self.token) {
+            warn!(
+                hostname = self.hostname,
+                "failed to release ACME issuance lock: {e:#}"
+            );
         }
     }
 }
@@ -289,6 +322,61 @@ impl TlsState {
 
                     if !needs_issuance {
                         continue;
+                    }
+
+                    // WOR-1774: serialize issuance across a fleet. Acquire a
+                    // per-host lock - an atomic lease on a shared backend
+                    // (redis), a no-op on a local one. Wait briefly for a peer
+                    // that is mid-issue, long enough to cover a typical ACME
+                    // order, so the loser reads the peer's cert rather than
+                    // racing the CA.
+                    let mut token = [0u8; 16];
+                    if ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut token)
+                        .is_err()
+                    {
+                        error!(hostname, "failed to generate issuance lock token; skipping");
+                        continue;
+                    }
+                    let mut acquired = false;
+                    for attempt in 0..15 {
+                        match cert_store.try_issue_lock(hostname, &token, 120) {
+                            Ok(true) => {
+                                acquired = true;
+                                break;
+                            }
+                            Ok(false) => {
+                                if attempt == 0 {
+                                    info!(hostname, "ACME issuance lock held by a peer; waiting");
+                                }
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
+                            Err(e) => {
+                                warn!(hostname, "ACME issuance lock error: {e:#}; skipping tick");
+                                break;
+                            }
+                        }
+                    }
+                    if !acquired {
+                        info!(hostname, "did not acquire ACME issuance lock; retrying next tick");
+                        continue;
+                    }
+                    // Releases on every exit path below (Drop).
+                    let _issue_lock = IssueLockGuard {
+                        store: &cert_store,
+                        hostname: hostname.as_str(),
+                        token: token.to_vec(),
+                    };
+
+                    // Re-check under the lock: a peer may have issued while we
+                    // waited, so we do not double-issue and burn CA quota.
+                    if let Ok(Some(ref meta)) = cert_store.get_meta(hostname) {
+                        if !cert_needs_renewal(meta, acme_config.renew_before_days) {
+                            info!(
+                                hostname,
+                                "certificate already present after acquiring lock; skipping issuance"
+                            );
+                            continue;
+                        }
                     }
 
                     // --- Issue or renew certificate via ACME ---
