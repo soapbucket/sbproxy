@@ -2,13 +2,13 @@
 # Point your coding assistant at your own GPU.
 #
 # One provider, no base_url: the `serve:` block makes the gateway host
-# the model itself. It resolves glm-4-flash from the built-in catalog,
+# the model itself. It fetches the named Qwen3 weights,
 # fits an engine and quant to the local GPU, spawns and supervises the
 # engine, and routes to it over loopback.
 #
 # The serve entry's `name:` is the model id every plane sees. Naming it
 # claude-sonnet-4-5 means a client that asks for Claude's model id gets
-# the local GLM instead, so Claude Code needs only a base-URL change.
+# the local Qwen instead, so Claude Code needs only a base-URL change.
 # The inbound Anthropic-format bridge (POST /v1/messages, the wire
 # Claude Code speaks) and the OpenAI wire (POST /v1/chat/completions,
 # for Cline and Continue) both resolve the same alias; neither needs
@@ -52,13 +52,17 @@ origins:
             - claude-sonnet-4-5
           serve:
             models:
-              # glm-4-flash is a catalog id: the built-in catalog supplies
-              # the Hugging Face repo and quant variants, and the fit
-              # planner picks the quant the GPU can run. `name:` is the
+              # The weights are named explicitly: Hugging Face repo, quant,
+              # and file. (Bare catalog ids like `qwen3-14b` resolve here
+              # once catalog-driven GGUF serving lands; today the explicit
+              # form is the one certified on hardware.) `name:` is the
               # alias requests resolve; without it the model would only
-              # answer to glm-4-flash.
-              - model: glm-4-flash
+              # answer to its own id.
+              - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
+                gguf_file: Qwen3-14B-Q4_K_M.gguf
                 name: claude-sonnet-4-5
+                # llama-server applies the GGUF's embedded chat template.
+                extra_args: ["--jinja"]
                 # Unload after 30 idle minutes so the VRAM comes back.
                 keep_alive: 30m
 

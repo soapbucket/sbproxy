@@ -54,7 +54,14 @@ origins:
             - qwen3-14b
           serve:
             models:
-              - model: qwen3-14b
+              # Explicit weights source: repo, quant, file. Bare catalog
+              # ids resolve here once catalog-driven GGUF serving lands;
+              # this form is the one certified on hardware today.
+              - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
+                gguf_file: Qwen3-14B-Q4_K_M.gguf
+                name: qwen3-14b
+                # llama-server applies the GGUF's embedded chat template.
+                extra_args: ["--jinja"]
                 # Idle time before the engine unloads to free VRAM.
                 keep_alive: 30m
 

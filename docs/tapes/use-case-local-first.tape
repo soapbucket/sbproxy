@@ -33,15 +33,15 @@ Sleep 1.4s
 Enter
 Sleep 500ms
 
-Type `curl -s localhost:8080/v1/chat/completions -H 'Host: ai.local' -d '{"model":"qwen3-14b","messages":[{"role":"user","content":"In one sentence, what is a reverse proxy?"}]}' | jq -r '.model, .choices[0].message.content'`
+Type `curl -s localhost:8080/v1/chat/completions -H 'Host: ai.local' -d '{"model":"qwen3-14b","messages":[{"role":"user","content":"In one sentence, what is a reverse proxy?"}]}' | jq -r '(.model|split("/")|last), .choices[0].message.content'`
 Enter
-Sleep 5s
+Sleep 16s
 
 Type `# A training-sensitive prompt may only land on providers marked no_prompt_training: here, only local.`
 Enter
-Type `curl -s localhost:8080/v1/chat/completions -H 'Host: ai.local' -H 'x-sbproxy-disallow-prompt-training: true' -d '{"model":"qwen3-14b","messages":[{"role":"user","content":"Summarize this internal memo in one line: Q3 margins improved."}]}' | jq -r '.model'`
+Type `curl -s localhost:8080/v1/chat/completions -H 'Host: ai.local' -H 'x-sbproxy-disallow-prompt-training: true' -d '{"model":"qwen3-14b","messages":[{"role":"user","content":"Summarize this internal memo in one line: Q3 margins improved."}]}' | jq -r '.model|split("/")|last'`
 Enter
-Sleep 4s
+Sleep 14s
 
 Type `# Both lanes land in one tamper-evident ledger. The split, then the dollars the GPU displaced:`
 Enter
