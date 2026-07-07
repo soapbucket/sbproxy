@@ -1,5 +1,7 @@
 # Operator quickstart: first 24 hours
 
+*Last modified: 2026-07-06*
+
 This is the minimum production bring-up path for the OSS Kubernetes operator. Use
 [`kubernetes.md`](kubernetes.md) for the full CRD and hot-reload reference after
 the first deploy is healthy.

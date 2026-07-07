@@ -1,7 +1,7 @@
 # Edge feature flags
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-06*
 
-`sbproxy-extension` ships a small, sticky-bucketing feature-flag store and a `flag_enabled(name, key)` CEL helper. Flags are evaluated against a per-request bucketing key (user id, tenant id, JWT subject) so a request that lands inside a 25% rollout stays inside it across calls. The OSS implementation is config-driven; the enterprise build will layer a Redis Streams update channel for sub-second propagation across replicas.
+`sbproxy-extension` ships a small, sticky-bucketing feature-flag store and a `flag_enabled(name, key)` CEL helper. Flags are evaluated against a per-request bucketing key (user id, tenant id, JWT subject) so a request that lands inside a 25% rollout stays inside it across calls. The OSS store is seeded from code by the embedding binary today; the enterprise build will layer a Redis Streams update channel for sub-second propagation across replicas.
 
 ## Rule grammar
 
@@ -39,7 +39,7 @@ let store = FlagStore::from_configs(vec![
 set_global_store(Arc::new(store));
 ```
 
-A follow-up wires a top-level `flags:` block in `sb.yml` so operators can declare flags in YAML without writing Rust. The schema is identical:
+A follow-up wires a top-level `flags:` block in `sb.yml` so operators can declare flags in YAML without writing Rust. That block has not shipped; the YAML below shows the intended shape, and the config loader ignores it today:
 
 ```yaml
 flags:

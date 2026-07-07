@@ -1,5 +1,7 @@
 # Operator runbook
 
+*Last modified: 2026-07-06*
+
 This runbook is the dashboard/action companion to
 [`quickstart-operator.md`](quickstart-operator.md). Use the quickstart for first
 deploys; use this page when a dashboard panel is red.

@@ -131,7 +131,7 @@ services:
     networks:
       - obsnet
 
-  # --- Arize Phoenix: LLM-native trace backend (WOR-1227) ---
+  # --- Arize Phoenix: LLM-native trace backend ---
   #
   # Renders SBproxy AI spans as full LLM trajectories: the proxy emits the
   # OpenTelemetry GenAI (`gen_ai.*`) plus OpenInference (`llm.*`) vocabulary,

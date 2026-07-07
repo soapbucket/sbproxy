@@ -1,0 +1,95 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Meter and monetize the AI crawlers reading your site.
+#
+# Two independent gates on one origin:
+#
+#   1. Identity: `bot_auth` verifies RFC 9421 HTTP Message Signatures
+#      (the IETF Web Bot Auth pattern). Unsigned requests get 401.
+#   2. Metering: `ai_crawl_control` charges verified crawlers per
+#      request. No `crawler-payment` token means a 402 challenge;
+#      a seeded token redeems exactly once, then charging resumes.
+#
+# Run:
+#   sbproxy serve -f sb.yml
+#
+# Test (unsigned crawler, 401 before the paywall is even consulted):
+#   curl -s -o /dev/null -w '%{http_code}\n' \
+#        -H 'Host: blog.local' \
+#        -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/anything/article
+#   # => 401
+#
+# Test (signed crawler without payment, 402 challenge):
+#   see ../../docs/use-case-meter-crawlers.md for the signing helper
+#   invocation; the signed request without a token returns the 402
+#   challenge body, and a retry with `crawler-payment: demo-tok-001`
+#   returns 200 exactly once.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "blog.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # Gate 1: identity. Every request on this origin must carry a valid
+    # RFC 9421 signature from a key in this directory. Requests that
+    # fail here never reach the paywall, so the ledger only ever sees
+    # crawlers you have already identified.
+    authentication:
+      type: bot_auth
+      clock_skew_seconds: 30            # tolerance on the `created` param
+      agents:
+        - name: openai-gptbot
+          key_id: openai-2026-01
+          algorithm: ed25519
+          # Demo key only: this is the well-known RFC 8032 test vector,
+          # the same pair docs/web-bot-auth.md uses, so the walkthrough
+          # can sign requests without generating keys. In production,
+          # paste the vendor's published Web Bot Auth key here.
+          public_key: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+          # The signature must cover verb, URL, and host so it cannot
+          # be replayed against a different route or origin.
+          required_components:
+            - "@method"
+            - "@target-uri"
+            - "@authority"
+
+        - name: anthropic-claudebot
+          key_id: anthropic-2026-01
+          algorithm: ed25519
+          # Placeholder so the example boots; replace with the vendor's
+          # real published key before trusting this entry.
+          public_key: "2233445566778899001122334455667788990011223344556677889900112233"
+
+    # Gate 2: metering. Signed crawlers still pay per GET. The 402
+    # response carries a JSON challenge naming the price and the header
+    # to retry with.
+    policies:
+      - type: ai_crawl_control
+        price: 0.001                    # USD per crawl, in the challenge body
+        currency: USD
+        header: crawler-payment         # default; shown for the walkthrough
+
+        # Case-insensitive User-Agent substrings that mark a crawler.
+        # With bot_auth in front, this list decides who is *charged*;
+        # bot_auth decides who gets *in*.
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - Google-Extended
+          - PerplexityBot
+          - CCBot
+
+        # OSS in-memory ledger seed. Each token redeems exactly once;
+        # the demo issues them by hand, a real deployment issues them
+        # from a billing system via the HTTPS ledger client (see
+        # docs/ai-crawl-control.md). Settlement on real payment rails
+        # is the enterprise build.
+        valid_tokens:
+          - demo-tok-001
+          - demo-tok-002
+          - demo-tok-003

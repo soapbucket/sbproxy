@@ -92,6 +92,10 @@ The enterprise tier reads the same `CompiledPolicy` struct shape produced by the
 
 ## request_validator
 
+![a JSON body with the required field accepted, then one missing name rejected with the failure's JSON path](assets/request-validator.gif)
+
+Validation happens at the edge before the upstream sees the body ([config](../examples/request-validator/)).
+
 Validates request bodies against a JSON Schema at the edge. The schema is compiled at config-load time, so each request is a cheap dispatch. Source: `crates/sbproxy-modules/src/policy/request_validator.rs`. Only requests whose `Content-Type` matches one of `content_types` (default `application/json`) are validated; other media types pass through. Remote `$ref` resolution is disabled at the workspace level so a malicious schema cannot become an SSRF primitive. Rejection responses report the failure location (JSON path) without echoing the attacker-controlled payload.
 
 ```yaml
@@ -113,6 +117,10 @@ policies:
 Runnable example: `examples/request-validator/sb.yml`.
 
 ## concurrent_limit
+
+![five parallel 3-second requests: three take permits, the other two are rejected 503 immediately](assets/concurrent-limit.gif)
+
+`max: 3` caps in-flight requests per key ([config](../examples/concurrent-limit/)).
 
 Caps in-flight requests per key. Distinct from `rate_limiting`, which throttles requests per second. Concurrent limits protect backends with low concurrency budgets: legacy SOAP services, DB-bound endpoints, GPU inference workers. Source: `crates/sbproxy-modules/src/policy/concurrent_limit.rs`. Each accepted request takes a permit; the permit releases when the request finishes. When `max` permits are already issued for a key, new requests are rejected immediately with `status` (default 503).
 
@@ -155,6 +163,10 @@ policies:
 The policy has no tunable knobs today; the defense set is hard-coded because each violation maps to a known smuggling primitive.
 
 ## a2a
+
+![an A2A invoke passing at chain depth 1, then rejected with 429 when the declared depth exceeds the cap](assets/a2a-protocol.gif)
+
+Depth, cycles, and caller and callee lists are all enforced before the upstream ([config](../examples/a2a-protocol/)).
 
 Per-route enforcement for agent-to-agent calls. Source: `crates/sbproxy-modules/src/policy/a2a.rs`. The policy fires after authentication and after the resolver chain has populated `caller_agent_id`. Detection runs automatically on two header signals (`Content-Type: application/a2a+json` and `MCP-Method: agents.invoke`); `route_glob` is the operator escape hatch.
 

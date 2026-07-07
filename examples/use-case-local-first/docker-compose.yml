@@ -1,0 +1,24 @@
+# Local first, spill to cloud: one sbproxy with a local serve: lane and a
+# hosted spill lane. See ../../docs/use-case-local-first.md for the story.
+#
+# Bring up:    docker compose up
+# Tear down:   docker compose down
+# Validate:    docker compose config
+#
+# Set OPENAI_API_KEY in your shell (or a .env file) for the spill lane.
+# The local lane needs a GPU passed through to the container; uncomment
+# the `gpus` line on a host with the NVIDIA container toolkit installed.
+# Without a GPU the config still boots and every request spills to the
+# cloud lane, which proves the failover but defeats the savings.
+
+services:
+  sbproxy:
+    image: ghcr.io/soapbucket/sbproxy:latest
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-not-set}
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    ports:
+      - "8080:8080"
+    # gpus: all

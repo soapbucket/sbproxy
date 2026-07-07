@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-04*
+*Last modified: 2026-07-06*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -67,6 +67,10 @@ vault, which reads external secrets you do not own.
   from `token_env`), `aws` (default credential chain), or `local` (in-memory, for
   dev and tests). Only writable managers are supported; read-only backends are
   not offered here.
+
+![a key minted on node A, read immediately from node B, then revoked with both replicas seeing it, no reload](assets/ai-dynamic-keys-cluster.gif)
+
+Two replicas share a Redis store with a mesh cache in front ([config](../examples/ai-dynamic-keys-cluster/)).
 
 ## The policy cache
 
@@ -136,8 +140,13 @@ weighed an outage of the store against an outage of your gateway.
 
 ## The admin API
 
-Mounted on the existing admin server, under the same bind and basic auth. Enable
-the admin server first:
+Mounted on the existing admin server, under the same bind and basic auth. Every
+call below also has a point-and-click equivalent on the Keys page of the
+[built-in web UI](admin.md#the-built-in-web-ui):
+
+![The Keys page of the admin UI: active keys with policy, budget, expiry, and per-key Edit, Rotate, Block, Revoke, and Delete actions](assets/admin-keys.png)
+
+Enable the admin server first:
 
 ```yaml
 proxy:
@@ -156,6 +165,10 @@ curl -s -u admin:change-me -X POST http://127.0.0.1:9090/admin/keys \
   -d '{"name":"ci-runner","max_requests_per_minute":60,"allowed_models":["gpt-4o-mini"]}'
 # { "token": "sk-ab12cd34-...", "key": { "key_id": "ab12cd34", ... } }
 ```
+
+![a virtual key minted, listed, rotated with a grace window, and revoked through the admin API with no reload](assets/ai-dynamic-keys.gif)
+
+The plaintext token appears once at mint; list calls only ever show the key_id ([config](../examples/ai-dynamic-keys/)).
 
 | Method and path | Effect |
 |---|---|

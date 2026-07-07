@@ -1,0 +1,27 @@
+# Stack for the use-case-meter-crawlers example: a single sbproxy
+# container enforcing Web Bot Auth (RFC 9421) plus the ai_crawl_control
+# paywall per ./sb.yml. The upstream is the public echo service at
+# test.sbproxy.dev, so no other services and no API keys are needed.
+#
+# Bring up:    docker compose up
+# Validate:    docker compose config
+# Tear down:   docker compose down
+
+services:
+  sbproxy:
+    image: ghcr.io/soapbucket/sbproxy:latest
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      - SB_LOG_LEVEL=info
+    healthcheck:
+      # The data plane serves /health on its main listener regardless of
+      # Host header; the admin port is not enabled in this example.
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s

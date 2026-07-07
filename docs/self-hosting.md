@@ -21,7 +21,7 @@ Configuration-first, no build step.
 
 ```bash
 # curl installer
-curl -fsSL https://sbproxy.dev/install.sh | sh
+curl -fsSL https://download.sbproxy.dev | sh
 
 # Homebrew
 brew install soapbucket/tap/sbproxy
@@ -30,6 +30,9 @@ brew install soapbucket/tap/sbproxy
 docker run --rm -p 8080:8080 -v "$PWD/sb.yml:/etc/sbproxy/sb.yml" \
   ghcr.io/soapbucket/sbproxy:latest
 ```
+
+Binary downloads and the rest of the install matrix are in the
+[runtime manual](manual.md#1-installation).
 
 ## Serve a model
 
@@ -68,29 +71,36 @@ secret reference, the default engine, and a pull policy (`on_boot`,
 `on_demand`, or `manual`). A curated manifest with digests doubles as a
 supply-chain allowlist.
 
-Warm the cache ahead of a first request, or in a container build, with
-the pull command instead of paying the download on the first call:
-
-```bash
-sbproxy models pull -f sb.yml
-```
+Weight acquisition happens under the serve lifecycle, driven by each
+entry's pull policy. To warm the cache ahead of a first request (or
+bake weights into a container image), set `pull: on_boot` on the entry
+and boot the proxy once; the download runs at startup instead of on
+the first call. `on_demand` pays the download when the first request
+arrives, and `manual` never downloads: it expects the weights already
+present in the cache directory, which is the right setting for
+air-gapped hosts.
 
 ## Check the box before it serves
 
-`sbproxy plan` runs an engine doctor: for each model it reports what
-`auto` resolved to and why, and whether the box can actually run it
-(binary on PATH, container runtime present, GPU found). A missing
-dependency is a plan-time message, not a spawn failure at 2am on the
-first request.
+`sbproxy doctor` answers "can this host serve models" with no config
+at all: build capabilities, visible GPUs, engines on PATH, container
+runtime, the model cache, and a serve-readiness verdict with every
+blocker listed. For a missing engine it prints the prerequisites and
+the manual steps to install one (a prebuilt release on PATH, or a
+container runtime); sbproxy diagnoses, it does not install engines
+for you. A missing dependency is a doctor-time message, not a spawn
+failure at 2am on the first request.
 
-`sbproxy doctor` gives the host-wide version of the same answer with
-no config at all: visible GPUs, engines on PATH, container runtime,
-and a readiness verdict with every blocker listed. For a missing
-engine it prints the prerequisites and the manual steps to install
-one (a prebuilt release on PATH, or a container runtime); sbproxy
-diagnoses, it does not install engines for you.
-The proxy also re-checks these prerequisites every time a config with
-`serve:` loads, and logs a warning per missing piece, so a
+`sbproxy validate <path>` parses and validates the config offline,
+and `sbproxy plan -f sb.yml [--against baseline.yml]` diffs it: it
+prints the added, changed, and removed origins plus a max-blast-radius
+line, and exits 0 when the config is a no-op, 2 when there are
+changes, and 3 on semantic errors. Wire that exit code into CI so a
+rollout that touches more origins than you expected stops before it
+ships.
+
+The proxy also re-checks the doctor's prerequisites every time a
+config with `serve:` loads, and logs a warning per missing piece, so a
 freshly-imaged box that lost its engine or driver tells you at boot,
 not at the first request.
 
@@ -108,13 +118,23 @@ serve:
       name: claude-sonnet-4-5
 ```
 
+One caveat before you bet a workflow on this: the serving path is
+landing in phases, and real-GPU engine bring-up is certified per
+hardware target, so check the
+[model host status](model-host.md#status) for what is proven on your
+card today.
+
 ## Spill to cloud, with policy attached
 
 Put a hosted provider after the local one in the same fallback array.
 When the local engine is saturated or a request carries a strict TTFT
-need, the request overflows to the cloud, and it honors `zdr` and
-`no_prompt_training` per request so a training-sensitive prompt only
-lands on providers you marked safe.
+need, the request overflows to the cloud, with zero data retention
+still enforceable per request: mark the providers that are safe for
+training-sensitive prompts with the provider-level
+`no_prompt_training: true` flag, and a request carrying the
+`x-sbproxy-disallow-prompt-training: true` header only routes to
+providers with that flag. If no provider in the chain is marked, the
+request gets a 400 rather than landing somewhere you did not approve.
 
 ```yaml
 providers:
@@ -150,7 +170,7 @@ your own GPUs.
 | Fallback + provider routing preferences | Fallback chain, cost/latency routing, prefix-affinity, least-token-usage | GPU-aware and prefix-cache-aware routing across a node fleet |
 | Virtual keys | Virtual keys with per-key scopes | Tenants, RBAC |
 | Spend limits and accounting | Budgets, hierarchical quotas, usage ledger, dollars-saved report | Audit trail, per-tenant accounting |
-| Zero-data-retention routing | `zdr` / `no_prompt_training` per-request routing | Air-gapped: guardrails, redaction, and generation all local |
+| Zero-data-retention routing | `no_prompt_training` provider flag + `x-sbproxy-disallow-prompt-training` request header | Air-gapped: guardrails, redaction, and generation all local |
 | Bring your own key | Provider keys plus a credential resolver (env, secret stores, vault) | Managed key rotation, mesh-distributed key cache |
 | 400-plus hosted-model marketplace | 66 hosted providers plus models on your GPUs | Same providers, fleet placement |
 

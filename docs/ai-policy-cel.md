@@ -1,5 +1,5 @@
 # AI policy plane (CEL)
-*Last modified: 2026-06-24*
+*Last modified: 2026-07-06*
 
 The AI policy plane is one sandboxed CEL expression that expresses
 cross-cutting rules over the AI decision pipeline. Instead of spreading a
@@ -75,10 +75,15 @@ disabled (fail-open).
 | `ai.tokens.input_est` | int | Estimated prompt tokens. |
 
 The guardrail-verdict and budget-fraction dimensions are richest when the
-[guardrail mesh](ai-gateway.md) and predictive budgets are configured,
-which produce the multi-verdict set and live burn rate the policy fuses.
+[guardrail mesh](ai-guardrail-mesh.md) and
+[predictive budgets](ai-predictive-budget.md) are configured, which
+produce the multi-verdict set and live burn rate the policy fuses.
 
 ## Try it
 
 The runnable example is in
 [`examples/ai-policy-cel/`](../examples/ai-policy-cel/).
+
+![a request without a tenant header rejected 403, then an unlisted X-Tenant: stranger rejected before any provider call](assets/ai-cel-tenant-gate.gif)
+
+A related recording shows CEL gating tenants at the network layer ([config](../examples/ai-cel-tenant-gate/)).

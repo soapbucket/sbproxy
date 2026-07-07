@@ -8,11 +8,10 @@
 # sbproxy translates the request and the response so every answer comes back
 # in OpenAI chat-completion shape.
 #
-# (Routing strategies like round_robin and fallback_chain pick among the
-# providers within a single origin and forward the model as-is; they do not
-# select a provider from the requested model. Use one provider per origin
-# when you want a specific vendor, as below, or an aggregator like OpenRouter
-# when you want many models behind one key.)
+# (Each provider below declares a models: list, so the requested model
+# narrows the eligible providers first; the routing strategy then picks
+# among the eligible ones and the model name is forwarded as-is. A request
+# for claude-haiku-4-5 lands on Anthropic without any per-vendor URL.)
 #
 # Setup (bring your own keys):
 #   export OPENAI_API_KEY=sk-...

@@ -1,0 +1,121 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Production ops: the observability surface an on-call engineer needs,
+# in one self-contained config. Walkthrough: docs/use-case-production-ops.md.
+#
+# Three origins, each standing in for a stage of an incident:
+#
+#   app.local      - a healthy service (static action, so the demo needs
+#                    no network; in production this is `type: proxy`
+#                    with your upstream URL, e.g. https://test.sbproxy.dev)
+#   checkout.local - an upstream that just died. The URL points at a
+#                    dead local port, so every request fails at connect
+#                    time and the client sees a 502.
+#   payments.local - the same dead upstream, but with a fallback origin
+#                    declared. Clients get a 200 and a degraded body
+#                    instead of the 502.
+#
+# Run:
+#   sbproxy examples/use-case-production-ops/sb.yml
+#   # or, with Prometheus + Grafana wired to the bundled dashboards:
+#   docker compose up   (from this directory)
+#
+# Test:
+#   curl -s -H 'Host: app.local'      http://127.0.0.1:8080/
+#   curl -si -H 'Host: checkout.local' http://127.0.0.1:8080/ | head -n 1
+#   curl -s -H 'Host: payments.local' http://127.0.0.1:8080/
+#   curl -s http://127.0.0.1:8080/metrics | grep 'sbproxy_requests_total{'
+
+proxy:
+  http_bind_port: 8080
+
+  # Control plane, on its own port so you can firewall it separately
+  # from customer traffic. It serves the unauthenticated health probes
+  # (/livez, /readyz, /health), the recent-request ring buffer
+  # (/api/requests), and a second copy of /metrics. Port 9091 rather
+  # than the 9090 default so the compose file's Prometheus can keep its
+  # own well-known port.
+  admin:
+    enabled: true
+    port: 9091
+    # Bound beyond loopback so the compose network (and your browser,
+    # via the mapped port) can reach it. The allowlist below limits
+    # callers to loopback and private ranges; add TLS before exposing
+    # this to anything wider (see docs/admin.md).
+    bind: 0.0.0.0
+    allow_ips: ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    username: admin
+    password: change-this   # demo value; rotate before real use
+    # Size of the in-memory request log the admin UI and /api/requests
+    # read from. Big enough to cover the minutes around an incident.
+    max_log_entries: 1000
+
+# Off by default; production wants it on. One JSON line per completed
+# request on stdout, ready for whatever log shipper you already run.
+access_log:
+  enabled: true
+  # Sampling protects the log pipeline at high volume, but the two
+  # forced-emission knobs make sure the lines you need during an
+  # incident always land: every 5xx, and everything slower than 1s,
+  # bypasses the sampler.
+  sample_rate: 1.0
+  always_log_errors: true
+  slow_request_threshold_ms: 1000
+  capture_headers:
+    # user-agent tells you who is hitting you; x-request-id ties the
+    # line to the caller's own logs.
+    request: ["user-agent", "x-request-id"]
+
+origins:
+  # The healthy service. A static action keeps the example dependency-free;
+  # swap it for `type: proxy` + your upstream URL in production.
+  "app.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        service: app
+        status: ok
+
+  # The failure you will meet first: the upstream is gone. Port 9 is
+  # the discard port; nothing listens there, so connects are refused
+  # instantly. Retries soak transient blips but cannot save a dead
+  # host: the client gets a 502, and the failure shows up in
+  # sbproxy_requests_total{status="502"} and as an access-log line
+  # with error_class "upstream_5xx" and no upstream_ttfb_ms field.
+  "checkout.local":
+    action:
+      type: proxy
+      url: http://127.0.0.1:9
+      retry:
+        max_attempts: 2
+        retry_on: [connect_error, timeout, 502, 503]
+        backoff_ms: 50
+
+  # Same dead upstream, different blast radius. The fallback origin
+  # answers when the primary fails at transport level (on_error) or
+  # returns one of the listed statuses, so clients see a degraded 200
+  # instead of an error page while the upstream heals.
+  "payments.local":
+    action:
+      type: proxy
+      url: http://127.0.0.1:9
+    fallback_origin:
+      on_error: true
+      on_status: [502, 503, 504]
+      # Adds a debug header flagging the response as served from the
+      # fallback path, so you can tell degraded traffic from normal.
+      add_debug_header: true
+      origin:
+        id: payments-degraded
+        hostname: payments-degraded
+        workspace_id: examples
+        version: "1.0.0"
+        action:
+          type: static
+          status: 200
+          content_type: application/json
+          json_body:
+            status: degraded
+            message: "payments upstream temporarily unavailable, serving degraded response"
+            retry_after_secs: 30

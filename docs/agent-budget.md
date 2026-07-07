@@ -1,6 +1,10 @@
 # agent_budget policy
 *Last modified: 2026-05-31*
 
+![70 rapid requests from a Cursor user agent: 200s until the per-agent budget trips and the rest return 429](assets/agent-budget.gif)
+
+The budget keys on the resolved agent_id, not the client IP ([config](../examples/agent-budget/)).
+
 The `agent_budget` policy is a semantic rate-limit primitive keyed on the resolved `agent_id`. Standard per-IP / per-user / per-key limits assume humans pause between requests; agents driven by an LLM loop fire at network speed and trip those buckets immediately. Datadog reports roughly a third of LLM-span errors in production are rate-limit denials for exactly that reason.
 
 One bucket per named agent collapses "every request from the Cursor instance" or "every request from the same OpenAI Assistant" into a single budget that an operator can actually size. The `agent_id` comes from the agent-class resolver (`sbproxy-agent-detect` / `sbproxy-classifiers`); when no `agent_id` resolved, the policy applies the `on_anonymous` rule.

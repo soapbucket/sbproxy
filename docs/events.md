@@ -1,8 +1,8 @@
 # SBproxy events
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-06*
 
-SBproxy has a small in-process event bus. The proxy publishes typed events from a few well-known points in the request lifecycle, and code-level embedders register handler closures against them. Nothing crosses the process boundary; OSS has no webhook, file, or Lua sink.
+SBproxy has a small in-process event bus in `sbproxy-observe`. It defines a closed set of typed lifecycle events and a bus that code-level embedders publish to and register handler closures against. The shipped `sbproxy` binary does not publish to a global bus today; its own request telemetry flows through the `sbproxy_*` Prometheus metrics, the access log, and the request-event sink. The bus is the seam for embedders building on the workspace crates. Nothing crosses the process boundary; OSS has no webhook, file, or Lua sink.
 
 ## Event types
 
@@ -24,18 +24,21 @@ SBproxy has a small in-process event bus. The proxy publishes typed events from 
 
 `circuit_breaker_*`, `analytics_*`, and `buffer_*` are metrics in OSS, not events. See [metrics-stability.md](metrics-stability.md).
 
+The three AI variants (`provider_selected`, `budget_exceeded`, `guardrail_triggered`) name AI-gateway moments, but the shipped AI path records those through the `sbproxy_ai_*` metrics and the [usage ledger](ai-usage-ledger.md) rather than through this bus. Use the enum variants when your embedding code publishes its own events; use the metrics and ledger when you want the gateway's built-in accounting.
+
 ## Event shape
 
 ```rust,no_run
 pub struct ProxyEvent {
     pub event_type: EventType,
     pub hostname: String,
+    pub tenant_id: String,         // empty when no tenant resolved
     pub timestamp: u64,            // Unix epoch milliseconds
     pub data: serde_json::Value,   // event-specific payload
 }
 ```
 
-`data` is a free-form JSON map; keys vary per event. The bus does not stamp severity, `workspace_id`, or tags. Derive those from `data` in your handler.
+`data` is a free-form JSON map; keys vary per event. The event carries a `tenant_id` (empty string in single-tenant deployments) so handlers can filter per tenant without parsing `data`. The bus does not stamp severity, `workspace_id`, or tags; derive those from `data` in your handler.
 
 ## Subscribing programmatically
 
@@ -64,5 +67,6 @@ The OSS bus is a code-level extension point, so there is no `events:` config. We
 ## See also
 
 - [metrics-stability.md](metrics-stability.md) - Prometheus metrics that overlap with these events.
-- [architecture.md](architecture.md) - where in the pipeline events publish.
+- [ai-usage-ledger.md](ai-usage-ledger.md) - per-request AI usage records, the built-in path for the accounting these AI event types describe.
+- [architecture.md](architecture.md) - the request pipeline the event types map onto.
 - [troubleshooting.md](troubleshooting.md) - debugging missed events.

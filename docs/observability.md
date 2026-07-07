@@ -13,6 +13,10 @@ SBproxy ships metrics, logs, and traces from one process. This guide covers the 
 
 All three speak the same correlation triple: every log line and every span attribute carries `request_id` (UUIDv7 rendered as 32 lowercase hex chars without hyphens; RFC 9562 monotonic + time-ordered), `trace_id` (32-hex), and `span_id` (16-hex). One inbound 402 with one trace stitches metrics, logs, and traces together without join-by-timestamp. The UUIDv7 leading 48 bits are a Unix-millisecond timestamp so a ClickHouse `ORDER BY request_id` partitions naturally by ingest time.
 
+![a proxy-minted request id echoed on the response, then a caller-supplied X-Request-Id adopted end to end](assets/correlation-id.gif)
+
+The correlation_id policy threads one identifier through logs, webhooks, and the upstream ([config](../examples/correlation-id/)).
+
 ## Configuration
 
 The currently shipped schema lives under `proxy.observability:` and groups the `log` (tracing-subscriber filter + format + sampling) and `telemetry` (OTLP exporter) blocks. When the block is absent, CLI flags and env vars are the only source of truth.

@@ -1,6 +1,10 @@
 # Exposed credentials check
 *Last modified: 2026-04-27*
 
+![a basic-auth request using a known-leaked password stamped with the exposed-credential-check header on its way upstream](assets/exposed-credentials.gif)
+
+Tag mode lets the backend decide; block mode rejects outright ([config](../examples/exposed-credentials/)).
+
 The `exposed_credentials` policy detects requests carrying a known-leaked password and either tags the upstream request or blocks the request outright. Modeled after Cloudflare's "Exposed Credential Check" header signaling.
 
 ## How it works

@@ -1,4 +1,4 @@
-# Model manifest for the sbproxy model host (WOR-1681).
+# Model manifest for the sbproxy model host.
 #
 # This is the fleet fact sheet: which models exist, where their weights
 # come from, and the digests to verify them against. sb.yml is the box

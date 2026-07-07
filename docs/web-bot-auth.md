@@ -1,6 +1,10 @@
 # Web Bot Auth
 *Last modified: 2026-06-17*
 
+![an unsigned crawler request rejected with 401 and a signature-required challenge](assets/web-bot-auth.gif)
+
+Only requests signed by a key in the agent directory pass ([config](../examples/web-bot-auth/)).
+
 The `bot_auth` provider verifies cryptographically-signed AI agents per the IETF "Web Bot Auth" pattern. AI crawlers sign each request with an Ed25519 key under [RFC 9421 HTTP Message Signatures](https://www.rfc-editor.org/rfc/rfc9421.html) and advertise their `keyid` in the `Signature-Input` header; the gateway looks up the matching public key in its directory and verifies the signature. Agents that pass come through; everything else gets `401`.
 
 ## Wire shape

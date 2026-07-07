@@ -1,0 +1,153 @@
+# Production ops stack: SBproxy + Prometheus + Grafana, wired to the
+# bundled dashboards and alert rules under ../../dashboards/.
+# Walkthrough: docs/use-case-production-ops.md.
+#
+# Bring up:    docker compose up -d
+# Tear down:   docker compose down -v
+# Validate:    docker compose config     (needs Compose v2.23+ for inline configs)
+#
+# Then open:
+#   Proxy       http://localhost:8080   (data plane; /metrics lives here too)
+#   Admin       http://localhost:9091   (admin / change-this; probes + request log)
+#   Prometheus  http://localhost:9090   (alerts from dashboards/prometheus/alerts.yml)
+#   Grafana     http://localhost:3000   (admin / admin; dashboards pre-provisioned)
+
+services:
+
+  sbproxy:
+    image: ghcr.io/soapbucket/sbproxy:latest
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    ports:
+      - "8080:8080"   # data plane; Prometheus scrapes /metrics on this port
+      - "9091:9091"   # admin server: /livez, /readyz, /health, /api/requests
+    networks:
+      - opsnet
+
+  # One-shot job that copies the bundled Grafana dashboards into a shared
+  # volume, rewriting the ${DS_PROMETHEUS} import placeholder to the
+  # datasource uid provisioned below. dashboards/README.md documents this
+  # substitution; doing it here keeps the JSON files in dashboards/
+  # untouched and still importable by hand.
+  dashboards-init:
+    image: alpine:3.20
+    volumes:
+      - ../../dashboards/grafana:/src:ro
+      - dashboards:/out
+    command: >
+      sh -c 'for f in /src/*.json; do
+               sed "s/\$${DS_PROMETHEUS}/prometheus/g" "$$f" > "/out/$$(basename "$$f")";
+             done'
+    networks:
+      - opsnet
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=24h"
+    configs:
+      - source: prometheus-config
+        target: /etc/prometheus/prometheus.yml
+    volumes:
+      # The bundled recording rules and alerts consume the sbproxy_*
+      # metrics directly; the alert expressions reference the recorded
+      # series, so both files load together.
+      - ../../dashboards/prometheus/recording-rules.yml:/etc/prometheus/rules/recording-rules.yml:ro
+      - ../../dashboards/prometheus/alerts.yml:/etc/prometheus/rules/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - opsnet
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      # Default admin login is admin / admin. Change for any non-local use.
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    configs:
+      - source: grafana-datasource
+        target: /etc/grafana/provisioning/datasources/datasources.yml
+      - source: grafana-dashboards
+        target: /etc/grafana/provisioning/dashboards/sbproxy.yml
+    volumes:
+      - dashboards:/var/lib/grafana/dashboards/sbproxy:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      dashboards-init:
+        condition: service_completed_successfully
+    networks:
+      - opsnet
+
+configs:
+
+  prometheus-config:
+    content: |
+      global:
+        scrape_interval: 15s
+        evaluation_interval: 15s
+      rule_files:
+        - /etc/prometheus/rules/recording-rules.yml
+        - /etc/prometheus/rules/alerts.yml
+      scrape_configs:
+        - job_name: sbproxy
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["sbproxy:8080"]
+              labels:
+                service: sbproxy
+
+  grafana-datasource:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          uid: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+          editable: false
+          jsonData:
+            timeInterval: 15s
+            httpMethod: POST
+
+  grafana-dashboards:
+    content: |
+      apiVersion: 1
+      providers:
+        - name: sbproxy
+          orgId: 1
+          folder: SBproxy
+          type: file
+          disableDeletion: true
+          updateIntervalSeconds: 30
+          allowUiUpdates: false
+          options:
+            path: /var/lib/grafana/dashboards/sbproxy
+            foldersFromFilesStructure: false
+
+networks:
+  opsnet:
+    driver: bridge
+
+# Named volumes survive `docker compose restart`. Use `docker compose
+# down -v` to drop them and start clean.
+volumes:
+  prometheus_data:
+  grafana_data:
+  dashboards:

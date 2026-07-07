@@ -11,11 +11,11 @@
 #
 #   - `lb_method: plugin` and `strategy: lora-aware` are how the
 #     LoadBalancerAction will dispatch into the trait once the wiring
-#     follow-up lands. The Fail-6 trait scaffold parses, registers, and
+#     follow-up lands. The trait scaffold parses, registers, and
 #     unit-tests the strategy today; the load balancer does not yet
 #     consult `RoutingStrategy::select` on the request hot path. The
 #     follow-up that wires it through `LoadBalancerAction.custom_strategy`
-#     is tracked under Fail-6.
+#     has not landed yet.
 #
 #   - The `metadata.loaded_adapters` array on each target is the
 #     metadata contract the strategy reads. Operators populate it for

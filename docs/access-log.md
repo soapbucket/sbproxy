@@ -2,6 +2,10 @@
 
 *Last modified: 2026-05-04*
 
+![a GET and a POST proxied through an origin that emits a structured JSON access-log line for each](assets/access-log.gif)
+
+stdout JSON lines, ready for any log shipper ([config](../examples/access-log/)).
+
 Structured-JSON access logs give every completed request a single line on
 stdout, ready to ship to ELK, Loki, Datadog, or any pipeline that already
 speaks JSON. The proxy emits the line via the `access_log` tracing target
@@ -178,6 +182,10 @@ Optional fields are omitted from the JSON object when their value is
 `None`.
 
 ## Custom fields
+
+![a request carrying X-Tier: gold whose value lands in the log line's custom object](assets/custom-log-fields.gif)
+
+`custom_fields` computes per-request values without forking the schema ([config](../examples/custom-log-fields/)).
 
 `observability.log.custom_fields:` adds operator-defined keys to each
 line's `custom` object, so you can pivot logs on dimensions the built-in

@@ -117,6 +117,10 @@ format with `type`, `title`, `status`, `detail`, `instance` fields.
 }
 ```
 
+![an unauthenticated request answered with an RFC 9457 application/problem+json body](assets/problem-details.gif)
+
+problem_details.enabled turns proxy-generated errors into typed problem documents ([config](../examples/problem-details/)).
+
 On upstream failures the `detail` field carries the same RFC 9209
 error token that lands in the `Proxy-Status` header so downstream
 tooling reading either signal sees the same vocabulary.

@@ -1,7 +1,31 @@
 # SBproxy documentation
-*Last modified: 2026-06-25*
+*Last modified: 2026-07-06*
 
-Govern the AI you call and the AI that calls you. One binary, built on Pingora, that routes your traffic across 200+ models with guardrails on the prompt and the response, governs the AI agents hitting your own APIs, and runs every API gateway feature in the same runtime.
+Call any model. Serve your own. Govern both. SBproxy is the open-source OpenRouter alternative: one Apache-2.0 binary that routes to 66 providers or serves the weights on your GPUs, with the guardrails, keys, budgets, and spend ledger applying to every model the same way, and a real Pingora-based reverse proxy underneath for the rest of your traffic.
+
+## Solve a problem
+
+Each walkthrough takes one problem end to end: a story doc, a runnable example directory, a `docker compose up`, and a recording of the outcome.
+
+| Your problem | Walkthrough |
+|---|---|
+| API keys scattered across teams, no accounting | [Stand up your own OpenRouter](use-case-own-openrouter.md) |
+| You want your coding assistant on hardware you control | [Point Claude Code at your own GPU](use-case-coding-assistant.md) |
+| GCP credits and an afternoon | [Serve Qwen, GLM, or Gemma on a cloud L4](use-case-serve-on-l4.md) |
+| A GPU that has to pay for itself | [Local first, spill to cloud](use-case-local-first.md) |
+| Weights and prompts that must never leave the network | [Air-gapped and sovereign AI](use-case-air-gapped.md) |
+| A LiteLLM proxy you want off of | [Migrate off LiteLLM in an afternoon](migration-litellm.md) |
+| Shadow Ollama under someone's desk | [Guardrails on every prompt, local or hosted](use-case-guardrails-everywhere.md) |
+| AI crawlers eating your content for free | [Meter and monetize the AI that calls you](use-case-meter-crawlers.md) |
+| It works on your laptop and on-call starts Monday | [Run it in production](use-case-production-ops.md) |
+
+Broader estate guides, same shape:
+
+- [getting-started-api-estate.md](getting-started-api-estate.md) - put SBproxy in front of existing APIs with auth, rate limits, and header rewrites.
+- [getting-started-content-estate.md](getting-started-content-estate.md) - HTML-to-markdown and content transformation for agents.
+- [getting-started-ai-estate.md](getting-started-ai-estate.md) - run SBproxy as the LLM gateway in front of model providers.
+- [getting-started-agent-identity.md](getting-started-agent-identity.md) - issue and enforce agent identity at the edge.
+- [getting-started-sovereign-multicloud.md](getting-started-sovereign-multicloud.md) - Kubernetes, sidecar, and secret-backend deployment.
 
 ## Where to start
 
@@ -11,11 +35,6 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 
 ### Getting started
 - [manual.md](manual.md) - install, CLI, runtime, TLS, deployment patterns.
-- [getting-started-api-estate.md](getting-started-api-estate.md) - put SBproxy in front of existing APIs with auth, rate limits, and header rewrites.
-- [getting-started-content-estate.md](getting-started-content-estate.md) - HTML-to-markdown and content transformation for agents.
-- [getting-started-ai-estate.md](getting-started-ai-estate.md) - run SBproxy as the LLM gateway in front of model providers.
-- [getting-started-agent-identity.md](getting-started-agent-identity.md) - issue and enforce agent identity at the edge.
-- [getting-started-sovereign-multicloud.md](getting-started-sovereign-multicloud.md) - Kubernetes, sidecar, and secret-backend deployment.
 - [configuration.md](configuration.md) - every `sb.yml` field with examples.
 - [json-schema.md](json-schema.md) - JSON Schema for editor autocomplete + validation of `sb.yml`.
 - [mcp-schema-drift.md](mcp-schema-drift.md) - CI-friendly schema-drift detection for converted MCP servers (the `sbproxy-mcp-drift` CLI).
@@ -25,7 +44,15 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [faq.md](faq.md) - quick answers to the questions operators hit most often.
 
 ### AI gateway
+
+Govern the AI you call, the AI that calls you, and the AI you run.
+
 - [ai-gateway.md](ai-gateway.md) - providers, routing strategies, guardrails, budgets, streaming.
+- [self-hosting.md](self-hosting.md) - single binary to self-host: install, the serve-only quickstart, the model manifest, aliases, spill-to-cloud, and the OpenRouter parity map.
+- [model-host.md](model-host.md) - the gateway hosts the LLM itself: catalog, the `serve:` block, the GPU fit planner, and the engine supervisor (single-node local serving).
+- [gpu-fit-planning.md](gpu-fit-planning.md) - how the fit planner picks a quant for your GPU: capability tiers, the weights + KV math, throughput, and why it refuses an impossible config.
+- [model-host-certification.md](model-host-certification.md) - provisioning a cloud L4 GPU and running the model-host Definition-of-Done certification (the `gpu-nvidia` / `weights` features).
+- [security-model-host.md](security-model-host.md) - the config-spawn attack surface: engine allowlist (no cmd:), sha256 weights, PATH/pinned binaries, and what the spawn phase must enforce.
 - [ai-usage-ledger.md](ai-usage-ledger.md) - the verifiable usage ledger: hash-chained, Ed25519-signed spend receipts you can re-derive and verify.
 - [key-management.md](key-management.md) - dynamic virtual keys: mint, revoke, and rotate at runtime through the admin API, hashed at rest, with a fail-closed policy cache.
 - [ai-policy-cel.md](ai-policy-cel.md) - the unified CEL policy plane: one sandboxed expression over guardrails, budgets, routing, and principal that emits a closed action set.
@@ -34,11 +61,6 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [ai-predictive-budget.md](ai-predictive-budget.md) - predictive budgets with soft-landing: warn, then downgrade, then block as a scope approaches its cap.
 - [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md) - classify upstream failures (timeout, rate-limit, context-window, content-policy) and set per-error retry counts.
 - [local-inference.md](local-inference.md) - run embeddings (semantic cache) and prompt-injection classify on local ONNX models via the sidecar or in-process.
-- [self-hosting.md](self-hosting.md) - single binary to self-host: install, the serve-only quickstart, the model manifest, aliases, spill-to-cloud, and the OpenRouter parity map.
-- [model-host.md](model-host.md) - the gateway hosts the LLM itself: catalog, the `serve:` block, the GPU fit planner, and the engine supervisor (single-node local serving).
-- [gpu-fit-planning.md](gpu-fit-planning.md) - how the fit planner picks a quant for your GPU: capability tiers, the weights + KV math, throughput, and why it refuses an impossible config.
-- [model-host-certification.md](model-host-certification.md) - provisioning a cloud L4 GPU and running the model-host Definition-of-Done certification (the `gpu-nvidia` / `weights` features).
-- [security-model-host.md](security-model-host.md) - the config-spawn attack surface: engine allowlist (no cmd:), sha256 weights, PATH/pinned binaries, and what the spawn phase must enforce.
 - [ai-lb-benchmark.md](ai-lb-benchmark.md) - P50/P95/P99/P99.9 latency comparison across AI router strategies under skewed load.
 - [providers.md](providers.md) - the catalog of supported LLM providers.
 - [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.
@@ -113,11 +135,8 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 ## Quick start
 
 ```bash
-# Build
-make build-release
-
-# Run with a config
-make run CONFIG=examples/basic-proxy/sb.yml
+curl -fsSL https://download.sbproxy.dev | sh
+sbproxy sb.yml
 ```
 
 Minimal `sb.yml`:
@@ -133,10 +152,13 @@ origins:
       url: http://backend:3000
 ```
 
+Building from source instead? See [build.md](build.md).
+
 ## What's in the box
 
 - Reverse proxy: HTTP/1.1, HTTP/2, WebSocket, gRPC, connection pooling, hot reload.
-- AI gateway: 200+ LLM models, 15 routing strategies, OpenAI-compatible API, guardrails, budgets, virtual keys, MCP server.
+- AI gateway: 66 providers behind one OpenAI/Anthropic-compatible API, 16 routing strategies, guardrails, budgets, virtual keys, MCP server.
+- Model host: a `serve:` block that resolves weights, fits an engine and quant to your GPU, and supervises vLLM or llama.cpp as a local provider.
 - Authentication: API key, basic, bearer, JWT, digest, forward auth, noop.
 - Policies: rate limiting, IP filter, CEL expressions, WAF, DDoS, CSRF, security headers.
 - Transforms: 18 request and response transforms (JSON, HTML, Markdown, CSS, Lua, JavaScript, encoding, and more).

@@ -1,6 +1,6 @@
 # Getting started: Content estate (HTML-to-markdown / content transformation for agents)
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-06*
 
 ## What you will build
 
@@ -8,51 +8,21 @@ You will put SBproxy in front of an HTML upstream and have it convert each page 
 
 ## Prerequisites
 
-- Rust 1.95 or newer, if you build from source. The prebuilt binary has no toolchain requirement.
 - `curl` to send test requests.
 - An HTML upstream to transform. This guide uses `test.sbproxy.dev`, the public request-inspection service hosted by SoapBucket, so the config is self-contained. Swap the upstream URL for your own HTML site when you are ready.
 
-## Install and build
+## Install
 
-Pick one install path. End users do not need a Rust toolchain.
-
-curl (macOS / Linux):
+One line installs the prebuilt binary on macOS or Linux. The script detects your OS and architecture, fetches the matching release binary, and drops it in `~/.local/bin`:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
 ```
 
-The script detects your OS and architecture, fetches the matching release binary, and drops it in `~/.local/bin`.
-
-Homebrew (macOS / Linux):
+Homebrew, Docker, binary downloads, and source builds are in the [runtime manual's installation section](manual.md#1-installation). Run the gateway against a config file:
 
 ```bash
-brew tap soapbucket/tap
-brew install sbproxy
-```
-
-Docker:
-
-```bash
-docker pull ghcr.io/soapbucket/sbproxy:latest
-```
-
-From source, build a debug binary:
-
-```bash
-make build
-```
-
-Or build an optimised release binary, which lands at `target/release/sbproxy`:
-
-```bash
-cargo build --release -p sbproxy
-```
-
-Run the gateway against a config file:
-
-```bash
-./target/release/sbproxy serve -f sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Minimal config
@@ -85,7 +55,7 @@ origins:
 Start the proxy:
 
 ```bash
-./target/release/sbproxy serve -f sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The upstream serves HTML:

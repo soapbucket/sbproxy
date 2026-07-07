@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Serve an open-weight model on a single cloud GPU (one NVIDIA L4)
+# behind the SBproxy gateway. The walkthrough for this config lives in
+# docs/use-case-serve-on-l4.md.
+#
+# Run (on the L4 box):
+#   sbproxy examples/use-case-serve-on-l4/sb.yml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          # No base_url: a served provider is hosted on this box, so
+          # the gateway resolves the engine's loopback port itself.
+          # Writing base_url next to serve: is a config error.
+          default_model: qwen3-14b
+          # The provider's model list still names the serve entry
+          # today; routing, budgets, and the ledger all see this id.
+          models:
+            - qwen3-14b
+          serve:
+            models:
+              # A catalog id, resolved by the built-in model catalog.
+              # engine defaults to auto (safetensors picks vLLM, GGUF
+              # picks llama.cpp) and the fit planner picks the quant
+              # this card can run: FP8 on an L4 (Ada, compute 8.9),
+              # a Q4 GGUF on a T4 that has no FP8 kernels.
+              - model: qwen3-14b
+                # Unload after 30 idle minutes so the L4's 24 GB is
+                # free for whatever you load next.
+                keep_alive: 30m

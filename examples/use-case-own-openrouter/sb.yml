@@ -1,0 +1,97 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Your own OpenRouter: one governed endpoint in front of OpenAI and Anthropic,
+# virtual keys minted per team at runtime, a deliberately tiny per-key budget
+# cap, and a hash-chained spend ledger.
+#
+# Setup (bring your own provider keys; they stay in the environment):
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   sbproxy examples/use-case-own-openrouter/sb.yml
+#
+# Mint a key for a team (the plaintext token comes back exactly once):
+#   TOKEN=$(curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys \
+#     -d '{"name":"team-payments"}' | jq -r .token)
+#
+# One endpoint, the model field picks the vendor:
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H "Authorization: Bearer $TOKEN" \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#   ...and the same request with "claude-haiku-4-5" reaches Anthropic.
+#
+# Read the ledger, then watch the budget cap refuse the spent key with 402:
+#   tail -n 2 /tmp/sbproxy-own-openrouter-ledger.jsonl | jq .
+#   sbproxy ai ledger verify /tmp/sbproxy-own-openrouter-ledger.jsonl
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin   # demo credentials; change both before any real use
+    # The docker-compose file publishes this port, and Docker connections
+    # arrive from the bridge network rather than loopback, so bind wide but
+    # admit only loopback and private-range clients. Tighten the list and add
+    # TLS before exposing the admin surface anywhere real (docs/admin.md).
+    bind: 0.0.0.0
+    allow_ips: ["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded   # single node; use redis when replicas share keys
+      path: /tmp/sbproxy-own-openrouter-keys.redb
+    cache:
+      ttl_secs: 60
+    crypto:
+      # Inline demo values so this file boots with nothing but provider keys
+      # in the environment. In production point these at env:NAME or
+      # file:PATH; if the pepper changes, previously stored key hashes stop
+      # verifying.
+      pepper: demo-pepper-not-for-production
+      master_key: demo-master-not-for-production
+    # Deny requests carrying a virtual key when the store is unreachable,
+    # rather than letting ungoverned traffic through.
+    failure_mode_allow: false
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      # Two vendors behind one origin. The requested model narrows the
+      # provider set before any routing strategy runs, so the request's
+      # `model` field picks the vendor and clients only ever see one URL.
+      # Any of the 66 providers slots in the same way.
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-haiku-4-5
+          models:
+            - claude-haiku-4-5
+
+      # Deliberately tiny so the cap trips within a demo session: two short
+      # completions cross 90 tokens, and the next request on that key is
+      # refused with 402 and a budget_exceeded body. Each key gets its own
+      # daily bucket. Requests that present no key skip this limit, so put
+      # an auth gate in front when every caller must carry one.
+      budget:
+        on_exceed: block
+        limits:
+          - scope: api_key
+            max_tokens: 90
+            period: daily
+
+      # Append every completed call to a hash-chained ledger: provider,
+      # model, tokens, cost, and the key that spent it. Editing any past
+      # entry breaks verification from that point on. Add signing_seed_hex
+      # to also Ed25519-sign each entry (docs/ai-usage-ledger.md).
+      usage_sinks:
+        - type: ledger
+          path: /tmp/sbproxy-own-openrouter-ledger.jsonl

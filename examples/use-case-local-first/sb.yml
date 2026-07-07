@@ -1,0 +1,87 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Local first, spill to cloud: one provider array, two lanes.
+#
+# Provider zero runs the weights on this box via a serve: block. A hosted
+# provider sits after it in the same fallback chain for overflow and for
+# anything the local card cannot take. A request that carries
+# `x-sbproxy-disallow-prompt-training: true` routes only to providers
+# marked `no_prompt_training`, and every completed call from either lane
+# lands in the same hash-chained usage ledger, which is where the
+# dollars-saved number comes from. Full walkthrough:
+# docs/use-case-local-first.md.
+#
+# NOTE ON STATUS: the engine-spawn lifecycle needs a GPU host; the
+# hardware bring-up is certified in phases (see docs/model-host.md). On a
+# box without a GPU or engine the serve: block validates but starts no
+# engine, and every request spills to the cloud lane. Run `sbproxy doctor`
+# to see what this host can serve.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   sbproxy doctor
+#   make run CONFIG=examples/use-case-local-first/sb.yml
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      # Try the lanes in priority order; advance when an attempt fails at
+      # the transport level, returns a retriable 5xx, or (for a served
+      # provider) the local engine cannot be brought up.
+      routing:
+        strategy: fallback_chain
+
+      providers:
+        # Lane one: the model runs on this box. No base_url: the gateway
+        # resolves the engine's loopback port itself once the engine is
+        # ready. `engine` defaults to auto (GGUF or no container runtime
+        # picks llama.cpp, safetensors picks vLLM) and the fit planner
+        # picks the quant the card can actually run.
+        - name: local
+          priority: 1
+          # Tokens never leave the box, so the local lane is safe for
+          # prompts that opt out of training. Without this flag, a
+          # request carrying x-sbproxy-disallow-prompt-training would
+          # skip the local lane too.
+          no_prompt_training: true
+          default_model: qwen3-14b
+          # Still enumerated explicitly today; the serve entry name is
+          # the model id every plane sees.
+          models:
+            - qwen3-14b
+          serve:
+            models:
+              - model: qwen3-14b
+                # Idle time before the engine unloads to free VRAM.
+                keep_alive: 30m
+
+        # Lane two: cloud spill. It declares the same logical model so it
+        # stays eligible when the chain advances, and model_map renames
+        # it to what the upstream actually serves, so the response's
+        # `model` field tells you which lane answered.
+        #
+        # Deliberately NOT marked no_prompt_training: a flagged prompt
+        # pins to the local lane and fails closed rather than spilling
+        # here. If your cloud account has a zero-data-retention or
+        # no-training agreement, add `no_prompt_training: true` and
+        # flagged prompts may spill too.
+        - name: openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          priority: 2
+          default_model: gpt-4o-mini
+          models:
+            - qwen3-14b
+          model_map:
+            qwen3-14b: gpt-4o-mini
+
+      # Both lanes append to the same tamper-evident ledger: provider,
+      # model, tokens, cost per completed call. Summing it with jq gives
+      # the dollars the GPU displaced. Add `signing_seed_hex` to
+      # Ed25519-sign each entry (see docs/ai-usage-ledger.md).
+      usage_sinks:
+        - type: ledger
+          path: /tmp/sb-local-first-ledger.jsonl

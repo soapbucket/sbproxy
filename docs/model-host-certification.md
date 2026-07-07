@@ -139,7 +139,7 @@ of these.
 
 ## Embedded engine (mistral.rs)
 
-The in-process embedded engine (WOR-1658, `engine: embedded`) runs a
+The in-process embedded engine (`engine: embedded`) runs a
 model inside the gateway with no subprocess, behind the off-by-default
 `embedded` cargo feature. It has its own cert mode, since it neither
 spawns a process nor uses the Hugging Face weight-pull path (mistral.rs

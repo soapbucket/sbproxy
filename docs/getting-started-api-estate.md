@@ -1,6 +1,6 @@
 # Getting started: API estate governance (reverse proxy in front of existing APIs)
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-06*
 
 ## What you will build
 
@@ -8,55 +8,21 @@ You will put SBproxy in front of a set of existing HTTP APIs as a reverse proxy,
 
 ## Prerequisites
 
-- Rust 1.95+ and `cargo` (only needed to build from source).
 - `curl` for testing requests.
 - A reachable upstream API. This guide uses `https://test.sbproxy.dev`, the project's public HTTP echo service (request inspection, similar to httpbin), as a stand-in for your real backend. Swap in your own upstream URL when you are ready.
 
-You do not need Rust at all if you install a prebuilt binary (see below).
+## Install
 
-## Install and build
-
-Pick one install path.
-
-Prebuilt binary with curl (macOS / Linux):
+One line installs the prebuilt binary on macOS or Linux. The script detects your OS and architecture, fetches the matching release binary, and drops it in `~/.local/bin`:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
 ```
 
-The script detects your OS and architecture, fetches the matching release binary, and drops it in `~/.local/bin`.
-
-Homebrew (macOS / Linux):
+Homebrew, Docker, binary downloads, and source builds are in the [runtime manual's installation section](manual.md#1-installation). Run the gateway against a config file:
 
 ```bash
-brew tap soapbucket/tap
-brew install sbproxy
-```
-
-Docker:
-
-```bash
-docker pull ghcr.io/soapbucket/sbproxy:latest
-```
-
-From source:
-
-```bash
-git clone https://github.com/soapbucket/sbproxy
-cd sbproxy
-make build
-```
-
-`make build` produces a debug binary at `target/debug/sbproxy`. For an optimised binary at `target/release/sbproxy`, run:
-
-```bash
-cargo build --release -p sbproxy
-```
-
-Run the gateway against a config file:
-
-```bash
-./target/release/sbproxy serve -f sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The proxy binds to `127.0.0.1:8080` by default.
@@ -110,7 +76,7 @@ To route different paths to different backends from the same hostname, add a `fo
 Start the gateway:
 
 ```bash
-./target/release/sbproxy serve -f sb.yml
+sbproxy serve -f sb.yml
 ```
 
 A request with no token is rejected before the upstream is contacted:

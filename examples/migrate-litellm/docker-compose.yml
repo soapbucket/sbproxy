@@ -1,0 +1,37 @@
+# LiteLLM and SBproxy side by side, each serving the matching config from
+# this directory: LiteLLM runs config.yaml on port 4000, SBproxy runs the
+# imported sb.yml on port 8080. Send the same OpenAI-shaped request to both
+# and diff the responses (see README.md).
+#
+# Bring up:    docker compose up
+# Tear down:   docker compose down
+# Validate:    docker compose config
+#
+# Set OPENAI_API_KEY and ANTHROPIC_API_KEY in your shell (or a .env file).
+# LITELLM_MASTER_KEY defaults to the demo value sk-1234; LiteLLM requires it
+# as a Bearer token on every request, SBproxy does not (the importer flags
+# master_key as a manual follow-up).
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-not-set}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-sk-not-set}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-1234}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      - "4000:4000"
+
+  sbproxy:
+    image: ghcr.io/soapbucket/sbproxy:latest
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-not-set}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-sk-not-set}
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    ports:
+      - "8080:8080"

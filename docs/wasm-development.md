@@ -1,6 +1,6 @@
 # WASM transform development guide
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-06*
 
 This guide covers writing WebAssembly modules for sbproxy's `wasm`
 transform. Two minimal example modules live in `examples/wasm/`,
@@ -63,8 +63,11 @@ Build:
 cargo build --release --target wasm32-wasi
 ```
 
-The output `target/wasm32-wasi/release/<crate>.wasm` is what you
-point sbproxy at. The full example is in `examples/wasm/echo-rust/`,
+Newer Rust toolchains renamed the target `wasm32-wasip1`; either name
+produces the same WASI preview-1 module, so use whichever your
+toolchain accepts. The output
+`target/wasm32-wasi/release/<crate>.wasm` is what you point sbproxy
+at. The full example is in `examples/wasm/echo-rust/`,
 including a Docker-based build script so contributors do not need
 to install rustup or the `wasm32-wasi` target locally.
 
@@ -102,6 +105,10 @@ needs a real OS), but the basics (`io`, `bytes`, `strings`, `unicode`,
 `encoding/json`, `regexp`) all work.
 
 ## Configuring a transform
+
+![a response body piped through a sandboxed wasm32-wasi module, stdin to stdout, and served back](assets/wasm-transform.gif)
+
+The echo module round-trips the body unchanged inside the sandbox limits ([config](../examples/wasm-transform/)).
 
 ```yaml
 origins:

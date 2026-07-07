@@ -11,7 +11,7 @@ Pick whichever fits your platform:
 
 ```bash
 # Linux / macOS, single static binary, no Rust toolchain required:
-curl -fsSL https://sbproxy.dev/install.sh | sh
+curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
 brew install soapbucket/tap/sbproxy

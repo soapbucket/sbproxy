@@ -1,0 +1,39 @@
+# Point your coding assistant at your own GPU: SBproxy serving glm-4-flash
+# under the alias claude-sonnet-4-5, with the Anthropic-format /v1/messages
+# bridge and the OpenAI wire both on port 8080.
+#
+# Bring up:    docker compose up
+# Tear down:   docker compose down
+# Validate:    docker compose config
+#
+# The engine only boots when the container can see a GPU. Install the
+# NVIDIA Container Toolkit and uncomment the device reservation below.
+# Without it the config still loads and validates, but requests to the
+# local model fail because no engine is running.
+
+services:
+  sbproxy:
+    image: ghcr.io/soapbucket/sbproxy:latest
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+      # Model-weight cache. Persisting it means the download happens once,
+      # not on every container restart.
+      - model-cache:/var/lib/sbproxy/models
+    ports:
+      - "8080:8080"
+    # Only needed if you uncomment the cloud-spill provider in sb.yml:
+    # environment:
+    #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    #
+    # GPU passthrough. Requires the NVIDIA Container Toolkit on the host.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  model-cache:

@@ -39,6 +39,10 @@ The rejection body lists the failing JSON pointer (e.g. `/age`) but never echoes
 
 ## Example
 
+![a spec-conformant JSON body accepted, then a body missing a required field rejected at the edge](assets/openapi-validation.gif)
+
+Paths and methods outside the spec pass through untouched ([config](../examples/openapi-validation/)).
+
 ```yaml
 origins:
   "api.example.com":

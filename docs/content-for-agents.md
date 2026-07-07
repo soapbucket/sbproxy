@@ -71,6 +71,10 @@ Caption: the same request produces three things. A 402 challenge that prices the
 
 The two-pass shape resolution is automatic for any origin that has an `ai_crawl_control` policy. The compiler synthesises an `auto_content_negotiate` action at the head of the response pipeline so neither the operator's `action:` nor `transforms:` block has to mention shape resolution explicitly.
 
+![the same /article served as Markdown or as the JSON envelope depending on the Accept header](assets/content-shape-negotiation.gif)
+
+Shape resolution reads Accept q-values per request ([config](../examples/content-shape-negotiation/)).
+
 ### Auto-prepended action
 
 When an origin declares `ai_crawl_control` with no explicit `content_negotiate` action, the compiler prepends one:
@@ -129,6 +133,10 @@ Pass 2 is q-value-aware. When two recognised media types tie at the same q-value
 The pricing pass remains declaration-order first-match. Operators express pricing intent through the order of tiers in the `ai_crawl_control` policy; agents express transformation preference through q-values. The two surfaces are deliberately independent.
 
 ### Worked examples
+
+![a browser getting the HTML page while GPTBot asking for text/markdown receives the Markdown rendering](assets/markdown-for-agents.gif)
+
+Same URL, two shapes, chosen by agent class and Accept header ([config](../examples/markdown-for-agents/)).
 
 ```bash
 # Markdown shape, Markdown tier, Markdown response.

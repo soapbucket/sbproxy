@@ -1,6 +1,6 @@
 # Getting started: Sovereign / multi-cloud deployment
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-06*
 
 ## What you will build
 
@@ -8,53 +8,24 @@ You will run SBproxy as a cluster-edge gateway that serves more than one tenant,
 
 ## Prerequisites
 
-- Rust 1.82 or newer with `cargo` (the workspace `rust-version` is 1.82). Needed only if you build from source.
 - `curl` for the test requests.
-- A pre-built binary is fine too. You do not need the toolchain if you install with the release script, Homebrew, or Docker (see the next section).
 - Scenario-specific: nothing extra to start. The runnable example uses `${ENV}` references, which the shipping resolver serves straight from the proxy process environment, so you can run the sovereign shape locally without standing up HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, or a cluster secret store. The provider-specific vault references are shown in `examples/vault-reference` for production wiring.
 
-## Install and build
+## Install
 
-Pick one install path. Do not push end users at `cargo install`.
-
-Release script (detects OS and architecture, drops the binary in `~/.local/bin`):
+One line installs the prebuilt binary on macOS or Linux (the script detects OS and architecture and drops the binary in `~/.local/bin`):
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
 ```
 
-Homebrew (macOS / Linux):
+Homebrew, Docker, binary downloads, and source builds are in the [runtime manual's installation section](manual.md#1-installation). Run the binary against a config file:
 
 ```bash
-brew tap soapbucket/tap
-brew install sbproxy
+sbproxy serve -f sb.yml
 ```
 
-Docker:
-
-```bash
-docker pull ghcr.io/soapbucket/sbproxy:latest
-```
-
-From source. A debug build:
-
-```bash
-make build
-```
-
-Or an optimised release build, which produces `target/release/sbproxy`:
-
-```bash
-cargo build --release -p sbproxy
-```
-
-Run the binary against a config file:
-
-```bash
-./target/release/sbproxy serve -f sb.yml
-```
-
-`serve -f <config>` and the no-subcommand `--config <config>` form are equivalent. `make run CONFIG=<file>` wraps the debug build plus run in one step.
+`serve -f <config>` and the no-subcommand `--config <config>` form are equivalent.
 
 ## Minimal config
 
@@ -132,7 +103,7 @@ Export the bearer token the config references, then start the gateway:
 
 ```bash
 export INTERNAL_BEARER_TOKEN=test-bearer-1
-./target/release/sbproxy serve -f sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Send a request as if it arrived through the Ingress. The trusted-proxy block recovers the real client IP from `X-Forwarded-For`, and `correlation_id` echoes an `X-Request-Id` on the response:
