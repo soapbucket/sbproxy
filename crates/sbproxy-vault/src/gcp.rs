@@ -1065,13 +1065,20 @@ mod tests {
             Arc::new(MockTokenProvider::new("token", None)),
             Arc::new(MockSecretManagerTransport::with_response(
                 403,
-                r#"{"error":"forbidden"}"#,
+                r#"{"error":{"code":403,"message":"Permission 'secretmanager.versions.access' denied on resource.","status":"PERMISSION_DENIED"}}"#,
             )),
         );
 
         let err = b.get("denied").expect_err("403 should error");
         let msg = format!("{err:#}").to_ascii_lowercase();
-        assert!(msg.contains("permission denied"));
+        // The 403 surfaces as an access failure carrying GCP's own message,
+        // not a raw JSON dump.
+        assert!(msg.contains("cannot access"), "got: {msg}");
+        assert!(
+            msg.contains("permission") && msg.contains("denied"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains('{'), "should not dump raw JSON: {msg}");
     }
 
     #[test]
