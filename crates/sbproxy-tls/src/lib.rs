@@ -5,6 +5,7 @@
 
 pub mod acme;
 pub mod alt_svc;
+pub mod cert_object_store;
 pub mod cert_resolver;
 pub mod cert_store;
 pub mod challenges;
@@ -130,10 +131,44 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVSto
             info!(addr = %acme.storage_path, "cert store backend: redis (shared, cluster-safe)");
             Arc::new(sbproxy_platform::storage::RedisKVStore::new(cfg))
         }
+        "file" => {
+            // storage_path is a directory; on a shared filesystem (NFS/EFS)
+            // this gives a fleet a shared cert store, with a cross-node
+            // issuance lock via atomic lock files (WOR-1776).
+            match sbproxy_platform::storage::FileKVStore::new(&acme.storage_path) {
+                Ok(s) => {
+                    info!(path = %acme.storage_path, "cert store backend: file (shared filesystem)");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    warn!(path = %acme.storage_path, error = %e,
+                        "cert store: file backend open failed; certs will NOT persist (in-memory fallback)");
+                    Arc::new(MemoryKVStore::new(0))
+                }
+            }
+        }
+        "s3" | "gcs" | "azure" => {
+            // storage_path is an object-store URL (s3://bucket/prefix,
+            // gs://bucket/prefix, az://...); credentials come from the
+            // environment. The issuance lock uses the atomic conditional
+            // create the object store provides (WOR-1775).
+            match crate::cert_object_store::ObjectStoreCertKv::from_url(&acme.storage_path) {
+                Ok(s) => {
+                    info!(url = %acme.storage_path, backend = %acme.storage_backend,
+                        "cert store backend: object storage (shared, cluster-safe)");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    warn!(url = %acme.storage_path, error = %e,
+                        "cert store: object-store backend open failed; certs will NOT persist (in-memory fallback)");
+                    Arc::new(MemoryKVStore::new(0))
+                }
+            }
+        }
         other => {
             warn!(backend = %other,
-                "cert store: '{other}' backend not yet wired (shared file, s3/gcs, cluster \
-                 land in WOR-1773); certs will NOT persist (in-memory fallback)");
+                "cert store: '{other}' backend not recognized (use redb, file, redis, s3, gcs, \
+                 azure, or memory); certs will NOT persist (in-memory fallback)");
             Arc::new(MemoryKVStore::new(0))
         }
     }
