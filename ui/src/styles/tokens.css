@@ -25,9 +25,10 @@
  */
 
 :root {
-  /* Type families (extracted from sbproxy.dev). No web font is loaded
-     so an air-gapped deploy stays self contained; the named faces are
-     used when present, otherwise the system stack takes over. */
+  /* Type families (matching sbproxy.dev). The faces ship with the app
+     as bundled woff2 (imported in main.ts from @fontsource), so an
+     air-gapped deploy stays self contained and still renders the brand
+     type; the system stack remains as the fallback. */
   --sb-font-sans: "Instrument Sans", ui-sans-serif, system-ui,
     -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --sb-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
