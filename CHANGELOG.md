@@ -44,6 +44,13 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **`sbproxy config print`: see the effective config, with secrets
+  masked.** Prints the config after built-in defaults + the file +
+  `${ENV}` interpolation, so it is obvious what a box will actually do.
+  Inline secret values (an `api_key`, `client_secret`, `token`, ...) are
+  masked; secret *references* (`vault://`, `${ENV}`, `file:`, ...) are
+  shown, since they are pointers, not the secret. `--json` for tooling,
+  YAML by default.
 - **`sbproxy models list` / `show`: discover what this host can run.**
   `sbproxy models` (or `models list`) prints one row per catalog model
   with a real per-GPU fit verdict (reusing the same probe `doctor` uses),
