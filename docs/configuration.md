@@ -3616,7 +3616,7 @@ origins:
 | `enabled` | bool | false | Master switch for ACME-managed TLS |
 | `email` | string | | Account contact email registered with the ACME directory |
 | `directory_url` | string | Let's Encrypt production | ACME directory URL |
-| `challenge_types` | list | `[tls-alpn-01, http-01]` | Allowed challenge types in priority order |
+| `challenge_types` | list | `[http-01]` | Allowed challenge types in priority order. Only `http-01` is driven today. |
 | `storage_backend` | string | `redb` | Where issued certs live: `redb` (local file, default), `file`, `redis`, `s3`, `gcs`, `azure`, or `memory`. See below. |
 | `storage_path` | string | `/var/lib/sbproxy/certs` | The store's location: a directory (`redb`, `file`), a `host:port` (`redis`), or a URL like `s3://bucket/prefix` (`s3`/`gcs`/`azure`) |
 | `renew_before_days` | int | 30 | Days before expiry to attempt renewal |

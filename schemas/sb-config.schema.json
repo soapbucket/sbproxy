@@ -561,9 +561,8 @@
           "type": "string"
         },
         "challenge_types": {
-          "description": "Allowed ACME challenge types in priority order (e.g. `tls-alpn-01`, `http-01`).",
+          "description": "Allowed ACME challenge types in priority order. Defaults to `[http-01]`, the only type the proxy currently drives; `tls-alpn-01` is accepted in the list but is not yet served.",
           "default": [
-            "tls-alpn-01",
             "http-01"
           ],
           "type": "array",
