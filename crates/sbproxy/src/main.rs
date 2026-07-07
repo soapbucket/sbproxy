@@ -240,6 +240,20 @@ enum ConfigSub {
     Migrate(ConfigMigrateArgs),
     /// Convert a LiteLLM config.yaml into an equivalent sbproxy sb.yml.
     ImportLitellm(ImportLitellmArgs),
+    /// Print the effective config after defaults + file + `${ENV}`
+    /// interpolation, with secret values masked. Shows what this box
+    /// will actually do.
+    Print(ConfigPrintArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ConfigPrintArgs {
+    /// Config file to print. Defaults to `-f/--config` or
+    /// `SB_CONFIG_FILE`.
+    config_path: Option<PathBuf>,
+    /// Emit JSON instead of the default YAML.
+    #[arg(long = "json")]
+    json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1641,6 +1655,131 @@ fn handle_config_subcommand(cmd: &ConfigCmd) -> anyhow::Result<i32> {
     match &cmd.sub {
         ConfigSub::Migrate(args) => handle_config_migrate(args),
         ConfigSub::ImportLitellm(args) => handle_config_import_litellm(args),
+        ConfigSub::Print(args) => handle_config_print(args),
+    }
+}
+
+/// `sbproxy config print`: the effective config after built-in defaults +
+/// the file + `${ENV}` interpolation, with secret values masked. Makes
+/// it obvious what a box will actually do (WOR-1805).
+fn handle_config_print(args: &ConfigPrintArgs) -> anyhow::Result<i32> {
+    let path = args
+        .config_path
+        .clone()
+        .or_else(|| std::env::var_os("SB_CONFIG_FILE").map(PathBuf::from))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no config file: pass a path or set -f/--config / SB_CONFIG_FILE")
+        })?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("read config '{}': {e}", path.display()))?;
+    // Apply the same `${ENV}` interpolation the compiler does, so an
+    // env-overridden value shows through as its resolved value.
+    let interpolated = interpolate_env_vars(&raw);
+    // Deserialize to the typed config (serde fills built-in defaults),
+    // then re-serialize so defaults show explicitly.
+    let config: sbproxy_config::ConfigFile = serde_yaml::from_str(&interpolated)
+        .map_err(|e| anyhow::anyhow!("parse config '{}': {e}", path.display()))?;
+    let mut value = serde_json::to_value(&config)?;
+    mask_secrets(&mut value);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print!("{}", serde_yaml::to_string(&value)?);
+    }
+    Ok(0)
+}
+
+/// `${VAR}` interpolation matching the config compiler: a set variable
+/// is substituted, an unset one is left literal.
+fn interpolate_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' && chars.peek() == Some(&'{') {
+            chars.next();
+            let mut name = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == '}' {
+                    closed = true;
+                    break;
+                }
+                name.push(c);
+            }
+            match (closed && !name.is_empty(), std::env::var(&name)) {
+                (true, Ok(val)) => out.push_str(&val),
+                _ => {
+                    out.push_str("${");
+                    out.push_str(&name);
+                    if closed {
+                        out.push('}');
+                    }
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Field names whose string value is a secret unless it is a resolver
+/// reference.
+fn is_secret_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    matches!(
+        k.as_str(),
+        "api_key"
+            | "apikey"
+            | "client_secret"
+            | "token"
+            | "password"
+            | "secret"
+            | "secret_key"
+            | "access_key"
+            | "access_key_id"
+            | "secret_access_key"
+            | "aws_secret_access_key"
+            | "private_key"
+    )
+}
+
+/// Whether a string value is a secret *reference* (safe to show) rather
+/// than an inline secret (which must be masked).
+fn is_secret_reference(value: &str) -> bool {
+    sbproxy_vault::looks_like_secret_reference_uri(value)
+        || value.starts_with("${")
+        || value.starts_with("env:")
+        || value.starts_with("secret:")
+        || value.starts_with("file:")
+        || value.starts_with("secretfile:")
+}
+
+/// Recursively mask inline secret values in a serialized config: a
+/// string under a secret-named key that is not a resolver reference is
+/// replaced with a placeholder. References (`vault://`, `${ENV}`,
+/// `file:`, ...) are shown, since they are pointers, not the secret.
+fn mask_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if is_secret_key(k) {
+                    if let serde_json::Value::String(s) = v {
+                        if !is_secret_reference(s) {
+                            *s = "***MASKED***".to_string();
+                            continue;
+                        }
+                    }
+                }
+                mask_secrets(v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                mask_secrets(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2114,6 +2253,42 @@ mod tests {
             prov.acquire.as_ref().unwrap().accel,
             sbproxy_model_host::EngineAccel::Metal
         );
+    }
+
+    #[test]
+    fn config_print_masks_inline_secrets_but_shows_references() {
+        let mut v = serde_json::json!({
+            "providers": [
+                { "name": "a", "api_key": "sk-REALSECRET123" },
+                { "name": "b", "api_key": "vault://primary/openai" },
+                { "name": "c", "api_key": "${OPENAI_API_KEY}" },
+                { "name": "d", "client_secret": "literal-secret" },
+                { "name": "e", "base_url": "https://api.example.com" },
+            ]
+        });
+        mask_secrets(&mut v);
+        let arr = v["providers"].as_array().unwrap();
+        // Inline literal secrets are masked.
+        assert_eq!(arr[0]["api_key"], "***MASKED***");
+        assert_eq!(arr[3]["client_secret"], "***MASKED***");
+        // References (a pointer, not the secret) are shown.
+        assert_eq!(arr[1]["api_key"], "vault://primary/openai");
+        assert_eq!(arr[2]["api_key"], "${OPENAI_API_KEY}");
+        // Non-secret fields are untouched.
+        assert_eq!(arr[4]["base_url"], "https://api.example.com");
+    }
+
+    #[test]
+    fn config_print_env_interpolation_substitutes_and_passes_through() {
+        // An unset variable is left literal.
+        assert_eq!(
+            interpolate_env_vars("y=${SB_DEFINITELY_UNSET_XYZZY}"),
+            "y=${SB_DEFINITELY_UNSET_XYZZY}"
+        );
+        // A set variable (PATH is always set) is substituted.
+        let out = interpolate_env_vars("p=${PATH}");
+        assert_ne!(out, "p=${PATH}");
+        assert!(out.starts_with("p="));
     }
 
     #[test]
