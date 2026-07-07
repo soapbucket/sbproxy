@@ -22,8 +22,17 @@ default = []
 # runtime uses a zero-GPU probe, so serve: providers reject admission
 # cleanly rather than pretending to serve on a CPU box.
 gpu-nvidia = ["sbproxy-model-host/gpu-nvidia"]
+# WOR-1800: Apple Silicon (Metal) unified-memory discovery for the model
+# host. The `sbproxy` binary forwards this in by default; it only affects
+# macOS builds (the probe module is `target_os = "macos"`-gated) and is
+# harmless elsewhere.
+gpu-apple = ["sbproxy-model-host/gpu-apple"]
 # Hugging Face weight download for the model host. Same gating.
 model-weights = ["sbproxy-model-host/weights"]
+# WOR-1658: the in-process embedded engine, forwarded to the model host.
+# Off by default (mistral.rs is a large dep tree); `sbproxy doctor`
+# reports whether this build compiled it in.
+embedded = ["sbproxy-model-host/embedded"]
 # Pulls the resolver in `sbproxy-modules::policy::agent_class` and the
 # reverse-DNS verifier in `sbproxy-security::agent_verify` into the
 # request pipeline. Off by default for library consumers; the

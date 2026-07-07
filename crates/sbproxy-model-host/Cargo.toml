@@ -14,6 +14,13 @@ default = []
 # everywhere because NVML is dlopen'd at runtime and a host without the
 # driver just probes zero GPUs.
 gpu-nvidia = ["dep:nvml-wrapper"]
+# Apple Silicon (Metal) GPU discovery for the fit planner (WOR-1800).
+# Reports unified memory as the serving budget so a Mac admits models
+# that fit. Dependency-free (reads `sysctl`); the module only compiles on
+# macOS. Off by default at the crate level; the `sbproxy` binary enables
+# it by default, harmless on non-Apple hosts where the CPU probe answers
+# instead.
+gpu-apple = []
 # Hugging Face weight download. Off by default at the crate level;
 # enabled by default in the `sbproxy` binary.
 weights = ["dep:reqwest"]

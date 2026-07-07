@@ -721,6 +721,76 @@ mod tests {
         }
     }
 
+    // A ~0.6B model (Qwen3-0.6B-ish): small enough to serve on CPU / a
+    // laptop's unified memory.
+    fn meta_small() -> ModelMetadata {
+        ModelMetadata {
+            params: 600_000_000,
+            layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+            max_context: 32768,
+        }
+    }
+
+    #[test]
+    fn cpu_budget_admits_a_small_gguf_and_rejects_a_big_one() {
+        // WOR-1800: a CPU-only host (no NVIDIA, no Metal) reports a
+        // system-RAM budget through CpuProbe, and the fit planner admits
+        // a small GGUF against it rather than returning NoGpu. An 8 GiB
+        // CPU budget fits a 0.6B Q4 model, but not a 14B one.
+        use crate::probe_cpu::CpuProbe;
+        let probe = CpuProbe::with_budget(8 * GIB);
+        let candidates = ["Q4_K_M".to_string()];
+
+        let ok = plan_fit_auto(&probe, &meta_small(), &candidates, 4096, DEFAULT_OVERHEAD)
+            .expect("a small Q4 model fits an 8 GiB CPU budget");
+        assert_eq!(ok.quant, Quant::Int4);
+
+        let too_big = plan_fit_auto(&probe, &meta_14b(), &candidates, 4096, DEFAULT_OVERHEAD);
+        assert!(
+            matches!(too_big, Err(FitError::TooLarge { .. })),
+            "a 14B model must not fit an 8 GiB CPU budget: {too_big:?}"
+        );
+    }
+
+    #[test]
+    fn cpu_budget_refuses_fp8_by_capability_not_size() {
+        // The CPU device reports no FP8 kernels, so an FP8-only model is
+        // capability-refused (as on a T4), never silently admitted.
+        use crate::probe_cpu::CpuProbe;
+        let probe = CpuProbe::with_budget(64 * GIB);
+        let err = plan_fit_auto(
+            &probe,
+            &meta_small(),
+            &["FP8".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, FitError::Incompatible { .. }),
+            "FP8 on CPU is a capability refusal: {err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_cpu_budget_still_reports_no_gpu() {
+        // Opting out (fraction 0) reverts to the pre-WOR-1800 behaviour:
+        // no device, so admission returns NoGpu.
+        use crate::probe_cpu::CpuProbe;
+        let probe = CpuProbe::with_budget(0);
+        let err = plan_fit_auto(
+            &probe,
+            &meta_small(),
+            &["Q4_K_M".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .unwrap_err();
+        assert_eq!(err, FitError::NoGpu);
+    }
+
     #[test]
     fn fp8_capability_gate() {
         assert!(!fp8_supported((7, 5)), "Turing T4 has no FP8");

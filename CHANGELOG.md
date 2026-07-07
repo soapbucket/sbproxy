@@ -54,21 +54,30 @@ of the new YAML fields below until the version that ships them.
   `--features gpu-nvidia,model-weights` is no longer needed for local
   model serving. Library consumers of the workspace crates still opt in
   per crate.
-- **`sbproxy doctor`.** New subcommand that reports what the binary can
-  do on the current host: compiled capability features, the GPUs the
-  `serve:` admission path sees (same probe, so they cannot disagree),
-  which inference engines (`vllm`, `llama-server`) resolve on `PATH`,
-  container runtime availability, the model-weight cache directory, and
-  a readiness verdict for local model serving with every blocker
-  listed. `--format json` emits a stable machine-readable report;
-  collection is read-only.
-- **`sbproxy doctor --install`.** Acquires a missing engine on the
-  spot: `vllm` through `uv` or `pipx`, `llama-cpp` through Homebrew or
-  a pinned sha256-verified ggml-org release (`--llama-tag` +
-  `--llama-sha256`, linked into `--bin-dir`). Every command is a fixed
-  argument list printed before it runs, nothing runs unconfirmed
-  (`--yes` for provisioning scripts), and GPU drivers are never
-  installed.
+- **`sbproxy doctor` is the self-host front door.** The subcommand now
+  reports the full picture of what the binary can do on this host and
+  how to make it serve: OS and arch, CPU and RAM, free disk in the cache
+  directory, the GPU (or CPU / unified-memory budget) the `serve:`
+  admission path sees, NVIDIA driver and CUDA / Metal / ROCm, container
+  runtimes and daemon liveness, package managers, Python and uv, and
+  Hugging Face reach plus whether `HF_TOKEN` is set. For each engine
+  (llama.cpp, vLLM, embedded) it lists what is installed (with version)
+  and which acquisition sources are viable here, each with a reason.
+  Pass a config file (`sbproxy doctor sb.yml`) and it adds, per `serve:`
+  model, what `engine: auto` resolves to and a coarse fit preview, and
+  exits non-zero when a configured model has no viable engine.
+  `--format json` emits a stable machine-readable report; collection is
+  read-only.
+- **Local model serving runs on Macs and CPU boxes, not just NVIDIA.**
+  The fit planner used to see zero devices on anything but an NVIDIA GPU,
+  so a `serve:` block on a Mac or a GPU-less server rejected every model.
+  The GPU probe is now layered: NVIDIA discrete GPUs first, then Apple
+  Silicon unified memory (reported as the working-set budget), then a CPU
+  budget sized to a fraction of system RAM. A small GGUF is admitted
+  against unified memory or RAM and served by llama.cpp or the embedded
+  engine; FP8 and other datacenter quants are still refused on hardware
+  that lacks the kernels. Set `SBPROXY_CPU_MEMORY_FRACTION=0` to opt back
+  into rejecting admission on a GPU-less host.
 - **Serve-preflight warnings at config load.** A config that declares
   `serve:` on a host with no visible GPU, or with a serve entry whose
   engine has no binary and no container runtime, now logs a warning at

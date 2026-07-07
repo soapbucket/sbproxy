@@ -40,6 +40,7 @@ default = [
   "tls-fingerprint",
   "inprocess-embed",
   "gpu-nvidia",
+  "gpu-apple",
   "model-weights",
 ]
 tiered-pricing = ["sbproxy-modules/tiered-pricing"]
@@ -71,7 +72,15 @@ embed-admin-ui = ["sbproxy-core/embed-admin-ui"]
 # cleanly. Library consumers of sbproxy-core still opt in per crate.
 # `sbproxy doctor` reports what the running host supports.
 gpu-nvidia = ["sbproxy-core/gpu-nvidia"]
+# WOR-1800: Apple Silicon (Metal) unified-memory discovery. On by default
+# so the released macOS artifact admits models that fit unified memory;
+# a no-op on Linux (the probe module is macOS-gated) where the CPU probe
+# answers instead.
+gpu-apple = ["sbproxy-core/gpu-apple"]
 model-weights = ["sbproxy-core/model-weights", "sbproxy-model-host/weights"]
+# WOR-1658: in-process embedded engine (mistral.rs). Off by default; a
+# single-binary / zero-external-engine deploy opts in.
+embedded = ["sbproxy-core/embedded"]
 
 [dependencies]
 tracing.workspace = true
