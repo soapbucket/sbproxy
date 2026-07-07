@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useAuth } from "../composables/useAuth";
+import BrandMark from "./BrandMark.vue";
 
 const { username, role, logout } = useAuth();
 
@@ -21,13 +22,7 @@ const nav = [
 
 <template>
   <aside class="sidebar">
-    <div class="brand">
-      <span class="brand__mark">sb</span>
-      <div class="brand__text">
-        <span class="brand__name">SBproxy</span>
-        <span class="brand__role">Admin</span>
-      </div>
-    </div>
+    <BrandMark class="sidebar__brand" />
     <nav class="nav">
       <RouterLink
         v-for="item in nav"
@@ -63,37 +58,8 @@ const nav = [
   top: 0;
   height: 100vh;
 }
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+.sidebar__brand {
   padding: 0 8px var(--sb-space-5);
-}
-.brand__mark {
-  font-family: var(--sb-font-mono);
-  font-weight: 700;
-  font-size: 0.95rem;
-  color: var(--sb-on-navy);
-  background: var(--sb-navy);
-  width: 30px;
-  height: 30px;
-  display: grid;
-  place-items: center;
-  border-radius: var(--sb-radius-sm);
-}
-.brand__text {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.15;
-}
-.brand__name {
-  font-weight: 600;
-}
-.brand__role {
-  font-size: 0.72rem;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--sb-text-faint);
 }
 .nav {
   display: flex;
@@ -160,7 +126,7 @@ const nav = [
     border-right: none;
     border-bottom: 1px solid var(--sb-border);
   }
-  .brand {
+  .sidebar__brand {
     padding: 0;
   }
   .nav {

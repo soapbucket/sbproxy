@@ -2,6 +2,7 @@
 import { ref } from "vue";
 import { useAuth } from "../composables/useAuth";
 import { ApiError } from "../api";
+import BrandMark from "../components/BrandMark.vue";
 
 const { login } = useAuth();
 const username = ref("");
@@ -30,13 +31,7 @@ async function submit() {
 <template>
   <div class="login">
     <form class="sb-card card" @submit.prevent="submit">
-      <div class="brand">
-        <span class="mark">sb</span>
-        <div>
-          <div class="name">SBproxy</div>
-          <div class="role">Admin</div>
-        </div>
-      </div>
+      <BrandMark class="card__brand" :size="30" />
       <label>
         <span class="lbl">Username</span>
         <input v-model="username" class="sb-input" autocomplete="username" />
@@ -76,31 +71,8 @@ async function submit() {
   flex-direction: column;
   gap: var(--sb-space-4);
 }
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+.card__brand {
   margin-bottom: var(--sb-space-2);
-}
-.mark {
-  font-family: var(--sb-font-mono);
-  font-weight: 700;
-  color: var(--sb-on-navy);
-  background: var(--sb-navy);
-  width: 32px;
-  height: 32px;
-  display: grid;
-  place-items: center;
-  border-radius: var(--sb-radius-sm);
-}
-.name {
-  font-weight: 600;
-}
-.role {
-  font-size: 0.72rem;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--sb-text-faint);
 }
 label {
   display: flex;
