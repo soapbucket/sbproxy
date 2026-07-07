@@ -58,9 +58,16 @@ All metrics below are currently `stable`.
 
 | Label | Description | Example values |
 |---|---|---|
-| `origin` | Virtual hostname (origin key from sb.yml) | `api.example.com` |
+| `hostname` | Virtual hostname (origin key from sb.yml) | `api.example.com` |
 | `method` | HTTP method of the request | `GET`, `POST` |
 | `status` | HTTP status code returned to the client | `200`, `404`, `502` |
+| `agent_id` | Resolved agent identity, `human` when none | `gptbot`, `human` |
+| `agent_class` | Resolved agent class | `crawler`, `unknown` |
+| `agent_vendor` | Resolved agent vendor | `openai`, `unknown` |
+| `payment_rail` | Payment rail that settled the request, empty when none | `x402`, `` |
+| `content_shape` | Negotiated content shape, empty when none | `markdown`, `` |
+
+Label order is positional on the wire and append-only; the five agent-era labels sit after the original three.
 
 ---
 
@@ -76,9 +83,7 @@ All metrics below are currently `stable`.
 
 | Label | Description | Example values |
 |---|---|---|
-| `origin` | Virtual hostname | `api.example.com` |
-| `method` | HTTP method | `GET`, `POST` |
-| `status` | HTTP status code | `200`, `502` |
+| `hostname` | Virtual hostname | `api.example.com` |
 
 ---
 
@@ -248,6 +253,22 @@ The same observations appear as `auth_ms` / `upstream_ttfb_ms` / `response_filte
 
 ---
 
+#### `sbproxy_cache_reserve_hits_total` / `sbproxy_cache_reserve_misses_total` / `sbproxy_cache_reserve_writes_total` / `sbproxy_cache_reserve_evictions_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **stable** |
+| Description | Cache-reserve (cold tier) traffic: hits served from the reserve, misses, entries written on admission, and explicit evictions. See [cache-reserve.md](cache-reserve.md). |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `origin` | Virtual hostname | `api.example.com` |
+
+---
+
 ### Circuit breaker
 
 #### `sbproxy_circuit_breaker_transitions_total`
@@ -332,14 +353,14 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 |---|---|
 | Type | Counter |
 | Stability | **stable** |
-| Description | Total AI tokens processed. Counts input and output tokens separately. |
+| Description | Total AI tokens processed. Counts input and output tokens separately. Per-model token counts live in the attributed series below. |
 
 **Labels:**
 
 | Label | Description | Example values |
 |---|---|---|
+| `hostname` | Virtual hostname | `api.example.com` |
 | `provider` | AI provider name | `openai`, `anthropic` |
-| `model` | Model identifier | `gpt-4o`, `claude-3-5-sonnet` |
 | `direction` | Token direction | `input`, `output` |
 
 ---

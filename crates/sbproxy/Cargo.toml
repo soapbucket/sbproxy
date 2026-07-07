@@ -74,6 +74,7 @@ gpu-nvidia = ["sbproxy-core/gpu-nvidia"]
 model-weights = ["sbproxy-core/model-weights", "sbproxy-model-host/weights"]
 
 [dependencies]
+tracing.workspace = true
 sbproxy-core.workspace = true
 sbproxy-config.workspace = true
 # `doctor --install`: PATH probes, the pinned llama.cpp release

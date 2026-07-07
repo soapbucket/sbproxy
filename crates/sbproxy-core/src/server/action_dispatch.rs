@@ -635,6 +635,12 @@ pub(super) async fn handle_action(
         }
 
         Action::Mock(m) => {
+            // Why: stamp the mock's status onto ctx, mirroring the
+            // static arm above. A mock response never goes through
+            // Pingora's response_filter, so without this the access
+            // log and sbproxy_requests_total record status="0" for a
+            // request that got a 200 on the wire (WOR-1782).
+            ctx.response_status = Some(m.status);
             let num_headers = 1 + m.headers.len();
             let mut header = pingora_http::ResponseHeader::build(m.status, Some(num_headers))
                 .map_err(|e| {

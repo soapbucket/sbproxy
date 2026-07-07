@@ -73,6 +73,10 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/sbproxy /etc/sbproxy/sb.yml
 Restart=on-failure
+# Pingora accepts many concurrent sockets and the model host fetches
+# weights over HTTPS; the systemd default soft limit (1024) starves
+# both under load.
+LimitNOFILE=65536
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 Environment=RUST_LOG=info
 # Add HF_TOKEN here if serving a gated model.

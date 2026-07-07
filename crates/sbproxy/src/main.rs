@@ -511,7 +511,45 @@ fn pick_run_path(cli: &Cli) -> Option<PathBuf> {
 }
 
 /// Run the proxy or print the usage stub on a missing config path.
+/// Warn at proxy start when the file-descriptor soft limit is low
+/// (WOR-1809). Pingora holds a socket per connection and the model
+/// host fetches weights over HTTPS; the 1024 systemd/shell default
+/// surfaces as `Accept() failed: Too many open files` and failed
+/// outbound fetches under modest load. Read from `/proc/self/limits`
+/// so the crate stays free of unsafe; on platforms without procfs
+/// (macOS dev boxes) the check is a silent no-op, which is fine
+/// because the limit that bites in production is the Linux one.
+fn warn_low_fd_limit() {
+    let Ok(limits) = std::fs::read_to_string("/proc/self/limits") else {
+        return;
+    };
+    let Some(soft) = parse_open_files_soft_limit(&limits) else {
+        return;
+    };
+    if soft < 8192 {
+        tracing::warn!(
+            soft_limit = soft,
+            "file-descriptor soft limit is low for a proxy; raise it \
+             (`ulimit -n 65536`, or `LimitNOFILE=65536` in the systemd unit) \
+             or accepts and weight downloads can fail under load"
+        );
+    }
+}
+
+/// Extract the soft "Max open files" value from `/proc/self/limits`
+/// content. Returns `None` when the row is absent or unparseable
+/// (including an `unlimited` soft value, which needs no warning).
+fn parse_open_files_soft_limit(limits: &str) -> Option<u64> {
+    let line = limits.lines().find(|l| l.starts_with("Max open files"))?;
+    line["Max open files".len()..]
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 fn run_proxy(config_path: Option<&std::path::Path>, grace: sbproxy_core::GraceConfig) {
+    warn_low_fd_limit();
     match config_path {
         Some(path) => {
             // WOR-1767: build + install the process secret resolver from
@@ -1485,6 +1523,21 @@ fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i3
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn parses_open_files_soft_limit() {
+        let limits = "Limit                     Soft Limit           Hard Limit           Units\n\
+                      Max cpu time              unlimited            unlimited            seconds\n\
+                      Max open files            1024                 524288               files\n";
+        assert_eq!(parse_open_files_soft_limit(limits), Some(1024));
+        assert_eq!(
+            parse_open_files_soft_limit(
+                "Max open files            unlimited            unlimited            files\n"
+            ),
+            None
+        );
+        assert_eq!(parse_open_files_soft_limit(""), None);
+    }
 
     // env::set_var / env::remove_var aren't safe to interleave across
     // threads. Serialize the env-var tests through this lock.

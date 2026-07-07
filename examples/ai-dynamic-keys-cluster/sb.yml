@@ -21,6 +21,13 @@ proxy:
     port: 9090
     username: admin
     password: admin
+    # The compose file publishes this port, and Docker connections
+    # arrive from the bridge network rather than loopback, so bind wide
+    # but admit only loopback and private-range clients. Tighten the
+    # list and add TLS before exposing the admin surface anywhere real
+    # (docs/admin.md).
+    bind: 0.0.0.0
+    allow_ips: ["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
   key_management:
     enabled: true

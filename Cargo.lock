@@ -8216,6 +8216,7 @@ dependencies = [
  "sbproxy-plugin",
  "sbproxy-vault",
  "serde_json",
+ "tracing",
  "tracing-subscriber",
  "yaml_serde",
 ]

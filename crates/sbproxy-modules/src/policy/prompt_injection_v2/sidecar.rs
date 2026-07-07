@@ -5,7 +5,10 @@
 //! or the richer enterprise one) implements the shared `InferenceService`; this
 //! detector owns one lazily-connected client and maps its response onto the v2
 //! label vocabulary, reusing the ONNX detector's score cutoffs so the two
-//! report identically.
+//! report identically. The gRPC channel is built on the first `detect` call,
+//! not at construction: tonic channel creation spawns onto the Tokio runtime
+//! and config-load runs outside one, so building it eagerly panicked the
+//! proxy at boot (WOR-1783).
 //!
 //! The [`Detector`] trait is synchronous and runs on the request hot path,
 //! while the gRPC client is async. We bridge with `tokio::task::block_in_place`
@@ -88,7 +91,14 @@ fn default_threshold() -> f64 {
 
 /// Detector that delegates classification to the classifier sidecar.
 pub struct SidecarDetector {
-    client: ClassifierClient,
+    /// Validated at config load; the channel is built on first use.
+    endpoint: String,
+    timeout: Duration,
+    /// The lazily-built client. `OnceLock` because construction must
+    /// happen on a runtime thread (first `detect`), not at config load
+    /// (WOR-1783). A lost set race just drops a cheap unconnected
+    /// channel.
+    client: std::sync::OnceLock<ClassifierClient>,
     model: String,
     injection_label: String,
     threshold: f64,
@@ -99,17 +109,20 @@ pub struct SidecarDetector {
 impl SidecarDetector {
     /// Build from the policy's `detector_config` block.
     ///
-    /// Only an invalid endpoint URI fails here; the connection is lazy, so a
-    /// sidecar that is not yet up does not block startup. Per-request transport
-    /// errors are routed through the fail policy in [`detect`](Detector::detect).
+    /// Only an invalid endpoint URI fails here; the channel is built on the
+    /// first `detect` call, so a sidecar that is not yet up does not block
+    /// startup and construction is safe outside a Tokio runtime. Per-request
+    /// transport errors are routed through the fail policy in
+    /// [`detect`](Detector::detect).
     pub fn from_config(value: &serde_json::Value) -> anyhow::Result<Arc<dyn Detector>> {
         let cfg: SidecarDetectorConfig = serde_json::from_value(value.clone())
             .map_err(|e| anyhow::anyhow!("sidecar detector config: {e}"))?;
-        let client =
-            ClassifierClient::connect_lazy(&cfg.endpoint, Duration::from_millis(cfg.timeout_ms))
-                .map_err(|e| anyhow::anyhow!("sidecar detector: {e}"))?;
+        ClassifierClient::validate_endpoint(&cfg.endpoint)
+            .map_err(|e| anyhow::anyhow!("sidecar detector: {e}"))?;
         Ok(Arc::new(Self {
-            client,
+            endpoint: cfg.endpoint,
+            timeout: Duration::from_millis(cfg.timeout_ms),
+            client: std::sync::OnceLock::new(),
             model: cfg.model,
             injection_label: cfg.injection_label,
             threshold: cfg.threshold,
@@ -139,8 +152,20 @@ impl Detector for SidecarDetector {
         // The trait is sync; bridge to the async client on the multi-thread
         // runtime worker we are already on. block_in_place keeps the other
         // workers free while this one drives the RPC to completion.
+        // Build the channel on first use: we are on a runtime worker
+        // here, which construction requires (WOR-1783).
+        let client = match self.client.get() {
+            Some(c) => c,
+            None => match ClassifierClient::connect_lazy(&self.endpoint, self.timeout) {
+                Ok(c) => {
+                    let _ = self.client.set(c);
+                    self.client.get().expect("client just set")
+                }
+                Err(e) => return self.on_error(&e),
+            },
+        };
         let outcome = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.client.classify(&self.model, prompt))
+            tokio::runtime::Handle::current().block_on(client.classify(&self.model, prompt))
         });
         match outcome {
             Ok(resp) => {
@@ -193,6 +218,20 @@ mod tests {
             "fail_closed": fail_closed,
         }))
         .expect("valid config")
+    }
+
+    #[test]
+    fn construction_outside_a_runtime_does_not_panic() {
+        // WOR-1783 regression: tonic channel construction spawns onto
+        // the Tokio runtime, and policy construction at config load
+        // runs outside one. With an eager channel this test panics with
+        // "there is no reactor running"; the detector must defer the
+        // channel to the first detect() call.
+        let det = SidecarDetector::from_config(&serde_json::json!({
+            "endpoint": "http://127.0.0.1:9440",
+        }))
+        .expect("valid config");
+        assert_eq!(det.name(), SIDECAR_DETECTOR_NAME);
     }
 
     #[test]

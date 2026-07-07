@@ -86,12 +86,28 @@ impl ClassifierClient {
         })
     }
 
+    /// Validate an endpoint URI without building a channel.
+    ///
+    /// Channel construction, even the lazy kind, spawns onto the Tokio
+    /// runtime and panics without one (WOR-1783). Config-load code calls
+    /// this for eager URI validation and defers
+    /// [`connect_lazy`](Self::connect_lazy) to the first call made on a
+    /// runtime thread.
+    pub fn validate_endpoint(endpoint: &str) -> Result<(), ClassifierClientError> {
+        Endpoint::from_shared(endpoint.to_string())
+            .map(|_| ())
+            .map_err(|e| ClassifierClientError::Connect(e.to_string()))
+    }
+
     /// Build a client that connects lazily on first use.
     ///
-    /// Unlike [`connect`](Self::connect) this does not dial immediately, so it
-    /// is safe to call from synchronous config-load code: the connection (and
-    /// any failure) surfaces on the first `classify`/`version` call, bounded by
-    /// `call_timeout`. Only an invalid endpoint URI fails here.
+    /// Unlike [`connect`](Self::connect) this does not dial immediately: the
+    /// connection (and any failure) surfaces on the first `classify`/`version`
+    /// call, bounded by `call_timeout`. Only an invalid endpoint URI fails
+    /// here. CALLER BEWARE: building the underlying channel still requires a
+    /// live Tokio runtime; call this from runtime context (see
+    /// [`validate_endpoint`](Self::validate_endpoint) for the config-load
+    /// half).
     pub fn connect_lazy(
         endpoint: &str,
         call_timeout: Duration,

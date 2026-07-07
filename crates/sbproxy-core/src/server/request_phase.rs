@@ -944,7 +944,10 @@ pub(super) async fn request_filter(
             warn!(hostname = %hostname, "no origin configured for hostname");
             send_error(session, 404, "not found").await?;
             // Record the real 404 so the request log / metrics do not show
-            // the unset-status 0 sentinel for an unmatched host (WOR-1746).
+            // the unset-status 0 sentinel for an unmatched host (WOR-1746),
+            // and bump the unrouted-request series this path had skipped
+            // while the alternate dispatch path recorded it (WOR-1782).
+            sbproxy_observe::metrics::record_unrouted_request("unknown_host");
             ctx.response_status = Some(404);
             return Ok(true);
         }
