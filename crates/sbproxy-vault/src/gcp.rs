@@ -244,13 +244,13 @@ impl GcpSecretManagerBackend {
             }
             404 => Ok(None),
             401 | 403 => Err(anyhow!(
-                "GCP Secret Manager: permission denied accessing {name}: HTTP {}: {}",
+                "GCP Secret Manager: cannot access {name} (HTTP {}): {}",
                 response.status,
-                body_excerpt(&response.body)
+                gcp_error_detail(&response.body)
             )),
             status => Err(anyhow!(
-                "GCP Secret Manager: AccessSecretVersion {name} failed with HTTP {status}: {}",
-                body_excerpt(&response.body)
+                "GCP Secret Manager: AccessSecretVersion {name} failed (HTTP {status}): {}",
+                gcp_error_detail(&response.body)
             )),
         }
     }
@@ -486,6 +486,48 @@ fn body_excerpt(body: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{}...", &trimmed[..MAX])
+    }
+}
+
+/// Turn a GCP JSON error body into a readable error detail instead of dumping
+/// the raw JSON. Returns GCP's `error.message`, and when the failure is a
+/// disabled Secret Manager API (a common first-run trap that GCP reports as a
+/// 403, not a 404) prefixes an actionable hint so the operator enables the API
+/// rather than chasing an IAM permission that is not the problem. Falls back to
+/// a short body excerpt when the body is not the expected shape.
+fn gcp_error_detail(body: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        error: Option<ErrorDetail>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ErrorDetail {
+        message: Option<String>,
+        #[serde(default)]
+        details: Vec<serde_json::Value>,
+    }
+    let Ok(ErrorBody {
+        error: Some(detail),
+    }) = serde_json::from_str::<ErrorBody>(body)
+    else {
+        return body_excerpt(body);
+    };
+    let message = detail.message.unwrap_or_default();
+    let api_disabled = detail
+        .details
+        .iter()
+        .any(|d| d.get("reason").and_then(|r| r.as_str()) == Some("SERVICE_DISABLED"))
+        || message.contains("has not been used")
+        || message.contains("it is disabled");
+    if api_disabled {
+        format!(
+            "the Secret Manager API is not enabled for this project; enable it \
+             (gcloud services enable secretmanager.googleapis.com) and retry. GCP said: {message}"
+        )
+    } else if message.is_empty() {
+        body_excerpt(body)
+    } else {
+        message
     }
 }
 
@@ -1023,13 +1065,20 @@ mod tests {
             Arc::new(MockTokenProvider::new("token", None)),
             Arc::new(MockSecretManagerTransport::with_response(
                 403,
-                r#"{"error":"forbidden"}"#,
+                r#"{"error":{"code":403,"message":"Permission 'secretmanager.versions.access' denied on resource.","status":"PERMISSION_DENIED"}}"#,
             )),
         );
 
         let err = b.get("denied").expect_err("403 should error");
         let msg = format!("{err:#}").to_ascii_lowercase();
-        assert!(msg.contains("permission denied"));
+        // The 403 surfaces as an access failure carrying GCP's own message,
+        // not a raw JSON dump.
+        assert!(msg.contains("cannot access"), "got: {msg}");
+        assert!(
+            msg.contains("permission") && msg.contains("denied"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains('{'), "should not dump raw JSON: {msg}");
     }
 
     #[test]
@@ -1100,5 +1149,40 @@ mod tests {
         };
 
         assert_eq!(provider.load_subject_token().unwrap(), "subject-token");
+    }
+
+    #[test]
+    fn gcp_error_detail_extracts_message_not_raw_json() {
+        let body = r#"{"error":{"code":403,"message":"Permission 'secretmanager.versions.access' denied on resource.","status":"PERMISSION_DENIED"}}"#;
+        let out = gcp_error_detail(body);
+        assert_eq!(
+            out,
+            "Permission 'secretmanager.versions.access' denied on resource."
+        );
+        assert!(!out.contains('{'), "should not dump raw JSON");
+    }
+
+    #[test]
+    fn gcp_error_detail_flags_disabled_api_by_reason() {
+        let body = r#"{"error":{"code":403,"message":"Secret Manager API has not been used in project foo before or it is disabled.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}"#;
+        let out = gcp_error_detail(body);
+        assert!(
+            out.contains("the Secret Manager API is not enabled"),
+            "got: {out}"
+        );
+        assert!(out.contains("gcloud services enable secretmanager.googleapis.com"));
+    }
+
+    #[test]
+    fn gcp_error_detail_flags_disabled_api_by_message() {
+        // Some responses omit the details[] ErrorInfo; fall back to the text.
+        let body = r#"{"error":{"code":403,"message":"Cloud Secret Manager API has not been used in project 42."}}"#;
+        assert!(gcp_error_detail(body).contains("not enabled"));
+    }
+
+    #[test]
+    fn gcp_error_detail_falls_back_on_non_json() {
+        let body = "upstream proxy error, not json";
+        assert_eq!(gcp_error_detail(body), "upstream proxy error, not json");
     }
 }
