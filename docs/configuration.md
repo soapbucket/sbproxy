@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-07*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -3617,9 +3617,23 @@ origins:
 | `email` | string | | Account contact email registered with the ACME directory |
 | `directory_url` | string | Let's Encrypt production | ACME directory URL |
 | `challenge_types` | list | `[tls-alpn-01, http-01]` | Allowed challenge types in priority order |
-| `storage_backend` | string | `redb` | Backing store for issued certificates (`redb`, `sqlite`) |
-| `storage_path` | string | `/var/lib/sbproxy/certs` | Filesystem path for the certificate store |
+| `storage_backend` | string | `redb` | Where issued certs live: `redb` (local file, default), `file`, `redis`, `s3`, `gcs`, `azure`, or `memory`. See below. |
+| `storage_path` | string | `/var/lib/sbproxy/certs` | The store's location: a directory (`redb`, `file`), a `host:port` (`redis`), or a URL like `s3://bucket/prefix` (`s3`/`gcs`/`azure`) |
 | `renew_before_days` | int | 30 | Days before expiry to attempt renewal |
+
+#### Certificate store backends
+
+A single node keeps its certificates in a local `redb` file (the default), so a restart reuses the cert instead of asking the CA for a fresh one. A fleet behind a load balancer needs a shared store, or every node issues its own cert and runs into the CA's rate limits. Point `storage_backend` at a shared store and the nodes coordinate: whichever one wins a per-hostname issuance lock issues the certificate, and the rest read it back.
+
+| Backend | `storage_path` | Use |
+|---|---|---|
+| `redb` | a directory | single node (default); survives restarts |
+| `file` | a shared directory | a fleet on shared storage (NFS/EFS) |
+| `redis` | `host:port` | a fleet with Redis |
+| `s3`, `gcs`, `azure` | `s3://bucket/prefix`, `gs://bucket/prefix`, `az://...` | a fleet on object storage; credentials come from the environment |
+| `memory` | ignored | tests only; nothing persists |
+
+The shared backends hold the issuance lock as an atomic create with a lease. A node that crashes mid-issue does not wedge the others: the lease expires and another node takes over.
 
 ### Local development (Pebble)
 

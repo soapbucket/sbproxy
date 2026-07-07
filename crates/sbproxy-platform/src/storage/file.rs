@@ -117,6 +117,62 @@ impl KVStore for FileKVStore {
 
         Ok(results)
     }
+
+    fn try_lock(&self, key: &[u8], token: &[u8], ttl_secs: u64) -> Result<bool> {
+        // WOR-1776: a cross-node lock over a shared filesystem. Atomic
+        // `create_new` (O_CREAT|O_EXCL) is the primitive; the lock file's
+        // existence is the lock and its bytes are the holder's token.
+        // Advisory fcntl locks are unreliable over NFS, so this uses the
+        // atomic create plus an mtime-based lease instead.
+        let _guard = self._lock.lock().expect("lock poisoned");
+        let path = self.path_for(key);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(token)
+                    .with_context(|| format!("write lock {:?}", path))?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                // Held. Steal it only if the holder's lease has expired
+                // (mtime older than the TTL), so a crashed holder cannot
+                // deadlock the fleet. The steal is best-effort over a shared
+                // FS; the ACME task re-checks the cert under the lock, so a
+                // rare double-acquire does not cause a double-issue.
+                let stale = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|age| age.as_secs() > ttl_secs)
+                    .unwrap_or(false);
+                if stale {
+                    fs::write(&path, token).with_context(|| format!("steal lock {:?}", path))?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            Err(e) => Err(e).with_context(|| format!("acquire lock {:?}", path)),
+        }
+    }
+
+    fn unlock(&self, key: &[u8], token: &[u8]) -> Result<()> {
+        // Compare-and-delete: only remove the lock while it still holds our
+        // token, so a node never releases a lock a peer acquired after this
+        // one's lease expired.
+        let _guard = self._lock.lock().expect("lock poisoned");
+        let path = self.path_for(key);
+        if let Ok(contents) = fs::read(&path) {
+            if contents == token {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +184,49 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = FileKVStore::new(dir.path()).unwrap();
         (store, dir)
+    }
+
+    #[test]
+    fn file_lock_is_exclusive_and_token_scoped() {
+        let (store, _dir) = make_store();
+        let key = b"acme:lock:example.com";
+        assert!(store.try_lock(key, b"tokenA", 60).unwrap(), "A acquires");
+        assert!(
+            !store.try_lock(key, b"tokenB", 60).unwrap(),
+            "B blocked while held"
+        );
+        // A non-owner release is a no-op (token mismatch).
+        store.unlock(key, b"tokenB").unwrap();
+        assert!(
+            !store.try_lock(key, b"tokenC", 60).unwrap(),
+            "still held after non-owner release"
+        );
+        // The owner releases; the lock is free again.
+        store.unlock(key, b"tokenA").unwrap();
+        assert!(
+            store.try_lock(key, b"tokenD", 60).unwrap(),
+            "free after owner release"
+        );
+        store.unlock(key, b"tokenD").unwrap();
+    }
+
+    #[test]
+    fn file_lock_steals_an_expired_lease() {
+        let (store, _dir) = make_store();
+        let key = b"acme:lock:stale.example";
+        // Acquire with a 0s TTL so any later attempt sees it as expired.
+        assert!(store.try_lock(key, b"old", 0).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            store.try_lock(key, b"new", 0).unwrap(),
+            "an expired lease is stolen"
+        );
+        // The stale holder's release must not free the new holder's lock.
+        store.unlock(key, b"old").unwrap();
+        assert!(
+            !store.try_lock(key, b"other", 60).unwrap(),
+            "new holder still holds after the stale owner's release"
+        );
     }
 
     #[test]

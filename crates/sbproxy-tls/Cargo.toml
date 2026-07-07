@@ -53,6 +53,9 @@ serde_json.workspace = true
 
 # HTTP client (ACME API calls)
 reqwest.workspace = true
+object_store = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }
 
 # Concurrency
 arc-swap.workspace = true
@@ -96,4 +99,5 @@ regex = "1"
 chrono.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util"] }
