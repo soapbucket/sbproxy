@@ -160,6 +160,11 @@ enum Cmd {
     /// loopback. The engine and weights are acquired on the first
     /// request.
     Run(RunArgs),
+    /// Discover models: what can this host run. `sbproxy models` (or
+    /// `models list`) prints one row per catalog model with a real
+    /// per-GPU fit verdict and cache status; `models show <id>` prints
+    /// the full entry.
+    Models(ModelsCmd),
     /// Diagnose what this binary can do on the current host: compiled
     /// capability features, visible GPUs, inference engines on PATH,
     /// and whether a `serve:` provider could admit a model here.
@@ -353,6 +358,48 @@ struct RunArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct ModelsCmd {
+    #[command(subcommand)]
+    sub: Option<ModelsSub>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelsSub {
+    /// List catalog models with a per-GPU fit verdict and cache status.
+    List(ModelsListArgs),
+    /// Show the full catalog entry for a model id.
+    Show(ModelsShowArgs),
+}
+
+#[derive(clap::Args, Debug, Default)]
+struct ModelsListArgs {
+    /// Output format. `text` (default) is a table; `json` is structured.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+    /// Operator catalog/manifest file, replacing the built-in catalog.
+    #[arg(long = "catalog-file")]
+    catalog_file: Option<PathBuf>,
+    /// Weight cache directory to check for pulled models.
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct ModelsShowArgs {
+    /// The catalog id to show.
+    id: String,
+    /// Output format. `text` (default) or `json`.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+    /// Operator catalog/manifest file, replacing the built-in catalog.
+    #[arg(long = "catalog-file")]
+    catalog_file: Option<PathBuf>,
+    /// Weight cache directory to check for pulled models.
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
 struct DoctorArgs {
     /// Optional config file. When given, doctor also reports how each
     /// `serve:` model resolves on this host (engine + fit preview) and
@@ -365,8 +412,9 @@ struct DoctorArgs {
     format: OutputFormat,
 }
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
 enum OutputFormat {
+    #[default]
     Text,
     Json,
 }
@@ -524,6 +572,9 @@ fn main() {
         }
         Some(Cmd::Run(args)) => {
             handle_run_subcommand(&args, grace);
+        }
+        Some(Cmd::Models(cmd)) => {
+            run_subcommand("models", 2, handle_models_subcommand(&cmd));
         }
         Some(Cmd::Doctor(args)) => {
             run_subcommand("doctor", 2, handle_doctor_subcommand(&args));
@@ -1325,6 +1376,215 @@ fn build_run_serve_value(args: &RunArgs) -> serde_json::Value {
     serde_json::Value::Object(serve)
 }
 
+// --- `models` handler (WOR-1803) ---
+
+fn handle_models_subcommand(cmd: &ModelsCmd) -> anyhow::Result<i32> {
+    match &cmd.sub {
+        // `sbproxy models` with no subcommand lists.
+        None => handle_models_list(&ModelsListArgs::default()),
+        Some(ModelsSub::List(a)) => handle_models_list(a),
+        Some(ModelsSub::Show(a)) => handle_models_show(a),
+    }
+}
+
+fn load_models_catalog(
+    catalog_file: Option<&std::path::Path>,
+) -> anyhow::Result<sbproxy_model_host::Catalog> {
+    match catalog_file {
+        Some(p) => {
+            let yaml = std::fs::read_to_string(p)
+                .map_err(|e| anyhow::anyhow!("read catalog '{}': {e}", p.display()))?;
+            sbproxy_model_host::Catalog::from_yaml(&yaml)
+                .map_err(|e| anyhow::anyhow!("parse catalog '{}': {e}", p.display()))
+        }
+        None => Ok(sbproxy_model_host::Catalog::builtin()),
+    }
+}
+
+fn model_cache_root(cache_dir: Option<&std::path::Path>) -> PathBuf {
+    let configured = cache_dir.map(|p| p.to_string_lossy().into_owned());
+    let hf_home = std::env::var("HF_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    sbproxy_model_host::resolve_cache_dir(configured.as_deref(), hf_home.as_deref())
+}
+
+/// Whether any weights for `entry` are present in the cache dir.
+fn model_is_cached(root: &std::path::Path, entry: &sbproxy_model_host::CatalogEntry) -> bool {
+    let revision = entry.revision.as_deref().unwrap_or("main");
+    let dir = sbproxy_model_host::weights::cache_dir(root, &entry.hf_repo, revision);
+    std::fs::read_dir(&dir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+}
+
+/// One row of `sbproxy models list`.
+#[derive(serde::Serialize)]
+struct ModelRow {
+    id: String,
+    params: String,
+    license: String,
+    family: String,
+    quants: Vec<String>,
+    /// The engine `auto` resolves to on this host.
+    engine: String,
+    /// Fit verdict: fits / too-large / capability-refused / unknown.
+    fit: String,
+    estimated_vram_gib: Option<f64>,
+    /// cached (weights present in the cache dir) or not-pulled. Resident
+    /// / serving state needs a running gateway and is not shown here.
+    status: String,
+}
+
+/// Build the model rows from a catalog, the host report, and the cache
+/// dir. Pure over its inputs (the report/probe is passed in), so it is
+/// unit-testable.
+fn build_model_rows(
+    catalog: &sbproxy_model_host::Catalog,
+    report: &sbproxy_core::doctor::DoctorReport,
+    cache_root: &std::path::Path,
+) -> Vec<ModelRow> {
+    // One serve entry per catalog id, so the doctor resolves engine +
+    // fit per model against the detected GPU.
+    let models_json: Vec<_> = catalog
+        .models
+        .keys()
+        .map(|id| serde_json::json!({ "model": id }))
+        .collect();
+    let serve: sbproxy_model_host::ModelHostConfig =
+        serde_json::from_value(serde_json::json!({ "models": models_json })).unwrap_or_default();
+    let entries = report.evaluate_serve(&serve, catalog);
+    let fit_by_id: std::collections::HashMap<&str, _> =
+        entries.iter().map(|e| (e.model.as_str(), e)).collect();
+
+    catalog
+        .models
+        .iter()
+        .map(|(id, entry)| {
+            let e = fit_by_id.get(id.as_str());
+            ModelRow {
+                id: id.clone(),
+                params: entry.params.clone(),
+                license: entry.license.clone(),
+                family: entry.family.clone(),
+                quants: entry.quants.clone(),
+                engine: e.map(|e| e.engine.clone()).unwrap_or_default(),
+                fit: e.map(|e| e.fit.verdict.to_string()).unwrap_or_default(),
+                estimated_vram_gib: e.and_then(|e| e.fit.estimated_vram_gib),
+                status: if model_is_cached(cache_root, entry) {
+                    "cached".to_string()
+                } else {
+                    "not-pulled".to_string()
+                },
+            }
+        })
+        .collect()
+}
+
+fn handle_models_list(args: &ModelsListArgs) -> anyhow::Result<i32> {
+    let catalog = load_models_catalog(args.catalog_file.as_deref())?;
+    let root = model_cache_root(args.cache_dir.as_deref());
+    let report = sbproxy_core::doctor::DoctorReport::collect();
+    let rows = build_model_rows(&catalog, &report, &root);
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+        OutputFormat::Text => {
+            println!(
+                "{:<22} {:<9} {:<18} {:<10} {:<12} STATUS",
+                "MODEL", "PARAMS", "FIT", "VRAM(GiB)", "ENGINE"
+            );
+            for r in &rows {
+                let vram = r
+                    .estimated_vram_gib
+                    .map(|v| format!("~{v:.0}"))
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{:<22} {:<9} {:<18} {:<10} {:<12} {}",
+                    r.id, r.params, r.fit, vram, r.engine, r.status
+                );
+            }
+            println!(
+                "\n(resident / serving state needs a running gateway; this view merges the \
+                 catalog + weight cache + per-GPU fit)"
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// The full catalog entry for `sbproxy models show <id>`.
+#[derive(serde::Serialize)]
+struct ModelDetail {
+    id: String,
+    hf_repo: String,
+    source: String,
+    revision: String,
+    sha256: std::collections::BTreeMap<String, String>,
+    engine: String,
+    pull: String,
+    quants: Vec<String>,
+    params: String,
+    license: String,
+    family: String,
+    min_vram_hint_gib: f64,
+    cached: bool,
+}
+
+fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
+    let catalog = load_models_catalog(args.catalog_file.as_deref())?;
+    let root = model_cache_root(args.cache_dir.as_deref());
+    let Some(entry) = catalog.get(&args.id) else {
+        eprintln!("sbproxy models show: '{}' is not in the catalog", args.id);
+        return Ok(2);
+    };
+    let detail = ModelDetail {
+        id: args.id.clone(),
+        hf_repo: entry.hf_repo.clone(),
+        source: entry
+            .source
+            .clone()
+            .unwrap_or_else(|| format!("hf:{}", entry.hf_repo)),
+        revision: entry.revision.clone().unwrap_or_else(|| "main".to_string()),
+        sha256: entry.sha256.clone(),
+        engine: format!("{:?}", entry.engine).to_lowercase(),
+        pull: format!("{:?}", entry.pull).to_lowercase(),
+        quants: entry.quants.clone(),
+        params: entry.params.clone(),
+        license: entry.license.clone(),
+        family: entry.family.clone(),
+        min_vram_hint_gib: entry.min_vram_hint_gib,
+        cached: model_is_cached(&root, entry),
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&detail)?),
+        OutputFormat::Text => {
+            println!("{}", detail.id);
+            println!("  hf_repo:      {}", detail.hf_repo);
+            println!("  source:       {}", detail.source);
+            println!("  revision:     {}", detail.revision);
+            println!("  params:       {}", detail.params);
+            println!("  license:      {}", detail.license);
+            println!("  family:       {}", detail.family);
+            println!("  quants:       {}", detail.quants.join(", "));
+            println!("  engine:       {}", detail.engine);
+            println!("  pull:         {}", detail.pull);
+            println!("  min VRAM:     ~{:.0} GiB", detail.min_vram_hint_gib);
+            println!(
+                "  cached:       {}",
+                if detail.cached { "yes" } else { "no" }
+            );
+            if !detail.sha256.is_empty() {
+                println!("  sha256:");
+                for (file, digest) in &detail.sha256 {
+                    println!("    {file}: {digest}");
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
 // --- `projections` handler ---
 
 /// Dispatch the `projections render` subcommand.
@@ -1854,6 +2114,25 @@ mod tests {
             prov.acquire.as_ref().unwrap().accel,
             sbproxy_model_host::EngineAccel::Metal
         );
+    }
+
+    #[test]
+    fn models_list_rows_cover_the_catalog_with_a_fit_verdict() {
+        let catalog = sbproxy_model_host::Catalog::builtin();
+        let report = sbproxy_core::doctor::DoctorReport::collect();
+        // A cache root that does not exist -> everything reads not-pulled.
+        let root = std::env::temp_dir().join("sbproxy-models-test-nonexistent");
+        let rows = build_model_rows(&catalog, &report, &root);
+        assert_eq!(rows.len(), catalog.len());
+        for r in &rows {
+            // Catalog ids resolve, so the fit is a real verdict, never empty.
+            assert!(!r.fit.is_empty(), "row {} has no fit verdict", r.id);
+            assert!(
+                r.status == "cached" || r.status == "not-pulled",
+                "unexpected status {}",
+                r.status
+            );
+        }
     }
 
     #[test]
