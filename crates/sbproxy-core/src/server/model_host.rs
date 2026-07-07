@@ -81,22 +81,36 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     }
 }
 
-/// The GPU probe for the runtime, selected at compile time. Also used
-/// by [`crate::doctor`] so the diagnostics report the same devices the
-/// admission path will see.
+/// The GPU probe for the runtime. Also used by [`crate::doctor`] so the
+/// diagnostics report the same devices the admission path will see.
+///
+/// The probe is layered so one binary adapts to any host (WOR-1800):
+/// NVIDIA discrete GPUs first (when the `gpu-nvidia` feature is
+/// compiled and NVML sees cards), then Apple Silicon unified memory
+/// (`gpu-apple` on macOS), then a CPU / system-RAM budget as the
+/// universal fallback. The CPU budget means a `serve:` provider admits
+/// small models on a Mac or a GPU-less server instead of rejecting
+/// everything; set `SBPROXY_CPU_MEMORY_FRACTION=0` to opt back into
+/// hard rejection.
 pub(crate) fn make_probe() -> Arc<dyn GpuProbe> {
     #[cfg(feature = "gpu-nvidia")]
     {
-        Arc::new(sbproxy_model_host::NvmlGpuProbe::new())
+        let nvml = sbproxy_model_host::NvmlGpuProbe::new();
+        if !nvml.probe().is_empty() {
+            return Arc::new(nvml);
+        }
     }
-    #[cfg(not(feature = "gpu-nvidia"))]
+    #[cfg(all(target_os = "macos", feature = "gpu-apple"))]
     {
-        // No GPUs reported -> residency budget 0 -> admission rejects,
-        // so a serve: provider on a CPU-only build fails with a clear
-        // "residency" error instead of launching an engine that cannot
-        // fit. Building with --features gpu-nvidia enables real serving.
-        Arc::new(sbproxy_model_host::StaticGpuProbe::new(Vec::new()))
+        let metal = sbproxy_model_host::MetalGpuProbe::new();
+        if !metal.probe().is_empty() {
+            return Arc::new(metal);
+        }
     }
+    // Universal fallback: a fraction of system RAM as the serving
+    // budget. Reports no device (so admission still rejects) when RAM
+    // cannot be read or the operator set the fraction to 0.
+    Arc::new(sbproxy_model_host::CpuProbe::from_system())
 }
 
 /// Warn, at pipeline load time (startup and every hot reload), about

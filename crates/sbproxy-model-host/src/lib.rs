@@ -40,6 +40,9 @@ pub mod launch;
 pub mod llama_release;
 pub mod lora;
 pub mod manifest;
+pub mod probe_cpu;
+#[cfg(all(target_os = "macos", feature = "gpu-apple"))]
+pub mod probe_metal;
 #[cfg(feature = "gpu-nvidia")]
 pub mod probe_nvidia;
 pub mod pull;
@@ -74,6 +77,9 @@ pub use llama_release::{asset_url as llama_asset_url, resolve_on_path, Platform}
 pub use llama_release::{ensure_llama_server, ensure_llama_server_blocking};
 pub use lora::{AdapterRoute, LoraCache};
 pub use manifest::{resolve_cache_dir, validate_serve_against_manifest, SourceScheme};
+pub use probe_cpu::{detect_total_memory_bytes, CpuProbe};
+#[cfg(all(target_os = "macos", feature = "gpu-apple"))]
+pub use probe_metal::MetalGpuProbe;
 #[cfg(feature = "gpu-nvidia")]
 pub use probe_nvidia::NvmlGpuProbe;
 pub use pull::{pull_plan, PullItem, PullMode};

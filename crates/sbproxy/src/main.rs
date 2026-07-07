@@ -317,6 +317,11 @@ struct RenderArgs {
 
 #[derive(clap::Args, Debug)]
 struct DoctorArgs {
+    /// Optional config file. When given, doctor also reports how each
+    /// `serve:` model resolves on this host (engine + fit preview) and
+    /// exits non-zero if a configured model has no viable engine.
+    #[arg(value_name = "CONFIG")]
+    config: Option<PathBuf>,
     /// Output format. `text` (default) prints the human report; `json`
     /// emits a single structured object for tooling.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
@@ -1034,12 +1039,86 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
 /// finding, not an error); the report maps any missing serve:
 /// prerequisites and how to install them.
 fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
-    let report = sbproxy_core::doctor::DoctorReport::collect();
+    let mut report = sbproxy_core::doctor::DoctorReport::collect_deep();
+    // With a config, add per-serve-entry resolution + a fit preview, and
+    // let the exit code reflect whether a configured model can run here.
+    let config_path = args
+        .config
+        .clone()
+        .or_else(|| std::env::var_os("SB_CONFIG_FILE").map(PathBuf::from));
+    let mut exit = 0;
+    if let Some(path) = config_path {
+        match std::fs::read_to_string(&path) {
+            Ok(yaml) => {
+                if let Some((serve, catalog)) = extract_serve_and_catalog(&yaml) {
+                    report = report.with_serve_config(&serve, &catalog);
+                    exit = report.exit_code();
+                }
+            }
+            Err(e) => {
+                eprintln!("doctor: could not read config '{}': {e}", path.display());
+            }
+        }
+    }
     match args.format {
         OutputFormat::Text => print!("{}", report.render_text()),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
     }
-    Ok(0)
+    Ok(exit)
+}
+
+/// Extract the merged `serve:` block (across every `ai_proxy` provider)
+/// and the model catalog to resolve ids against, for `sbproxy doctor
+/// <config>`. Best-effort and read-only: a config with no `serve:`
+/// block yields `None`. An operator `catalog_file` on the first serve
+/// block replaces the built-in catalog for id resolution.
+fn extract_serve_and_catalog(
+    yaml: &str,
+) -> Option<(
+    sbproxy_model_host::ModelHostConfig,
+    sbproxy_model_host::Catalog,
+)> {
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    let origins = root.get("origins")?.as_mapping()?;
+    let mut merged: Option<sbproxy_model_host::ModelHostConfig> = None;
+    for (_, origin) in origins {
+        let Some(action) = origin.get("action") else {
+            continue;
+        };
+        // action.type must be ai_proxy (or a bare providers list).
+        let providers = action.get("providers").and_then(|p| p.as_sequence());
+        let Some(providers) = providers else {
+            continue;
+        };
+        for provider in providers {
+            let Some(serve_val) = provider.get("serve") else {
+                continue;
+            };
+            let Ok(serve) =
+                serde_yaml::from_value::<sbproxy_model_host::ModelHostConfig>(serve_val.clone())
+            else {
+                continue;
+            };
+            match &mut merged {
+                None => merged = Some(serve),
+                Some(m) => {
+                    m.models.extend(serve.models);
+                    for (k, v) in serve.engines {
+                        m.engines.entry(k).or_insert(v);
+                    }
+                }
+            }
+        }
+    }
+    let merged = merged?;
+    // An operator catalog_file replaces the built-in catalog.
+    let catalog = merged
+        .catalog_file
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|c| sbproxy_model_host::Catalog::from_yaml(&c).ok())
+        .unwrap_or_else(sbproxy_model_host::Catalog::builtin);
+    Some((merged, catalog))
 }
 
 // --- `projections` handler ---
