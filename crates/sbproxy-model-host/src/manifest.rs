@@ -122,7 +122,65 @@ pub fn resolve_cache_dir(configured: Option<&str>, hf_home: Option<&str>) -> Pat
     if let Some(h) = hf_home.filter(|h| !h.trim().is_empty()) {
         return PathBuf::from(h);
     }
-    PathBuf::from("/var/lib/sbproxy/models")
+    PathBuf::from(SERVICE_CACHE_DIR)
+}
+
+/// The service weight-cache path, used for root / service installs.
+pub const SERVICE_CACHE_DIR: &str = "/var/lib/sbproxy/models";
+
+/// The default weight-cache directory for a *running* host (WOR-1797),
+/// reading the environment the pure [`resolve_cache_dir`] cannot: an
+/// explicit `cache_dir` wins, then `$HF_HOME`, then the service path
+/// `/var/lib/sbproxy/models` when this process can actually write there
+/// (a root / service install), else the per-user `~/.cache/sbproxy/models`.
+///
+/// This is the resolver the runtime and CLI should call so serving works
+/// out of the box for a non-root user, instead of failing to create the
+/// root-owned service path. It never creates the cache directory itself;
+/// the writability check only creates and removes a probe file in an
+/// already-existing ancestor of the service path.
+pub fn resolve_cache_dir_default(configured: Option<&str>) -> PathBuf {
+    if let Some(c) = configured.filter(|c| !c.trim().is_empty()) {
+        return PathBuf::from(c);
+    }
+    if let Some(h) = std::env::var("HF_HOME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+    {
+        return PathBuf::from(h);
+    }
+    let service = PathBuf::from(SERVICE_CACHE_DIR);
+    if ancestor_is_writable(&service) {
+        return service;
+    }
+    if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.trim().is_empty()) {
+        return PathBuf::from(home).join(".cache/sbproxy/models");
+    }
+    service
+}
+
+/// Whether this process can write under `path`, probed at the nearest
+/// existing ancestor without creating `path` itself. Creates and removes
+/// a temp file in that ancestor.
+fn ancestor_is_writable(path: &std::path::Path) -> bool {
+    let mut probe = path;
+    let dir = loop {
+        if probe.exists() {
+            break probe;
+        }
+        match probe.parent() {
+            Some(p) => probe = p,
+            None => return false,
+        }
+    };
+    let test = dir.join(".sbproxy-cache-write-test");
+    match std::fs::File::create(&test) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&test);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Validate that every model a `serve:` block names either resolves in
@@ -226,6 +284,24 @@ mod tests {
             resolve_cache_dir(Some("  "), None),
             PathBuf::from("/var/lib/sbproxy/models")
         );
+    }
+
+    #[test]
+    fn cache_dir_default_honors_explicit_and_ignores_blank() {
+        // An explicit cache_dir always wins.
+        assert_eq!(
+            resolve_cache_dir_default(Some("/custom")),
+            PathBuf::from("/custom")
+        );
+        // A blank string is treated as unconfigured (falls through to the
+        // env / service / user-cache resolution, same as None).
+        assert_eq!(
+            resolve_cache_dir_default(Some("   ")),
+            resolve_cache_dir_default(None)
+        );
+        // The unconfigured default is a real, non-empty weight-cache path
+        // (the service path or the per-user cache, depending on the host).
+        assert!(!resolve_cache_dir_default(None).as_os_str().is_empty());
     }
 
     #[test]

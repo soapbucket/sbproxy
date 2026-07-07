@@ -118,7 +118,10 @@ of the new YAML fields below until the version that ships them.
   against unified memory or RAM and served by llama.cpp or the embedded
   engine; FP8 and other datacenter quants are still refused on hardware
   that lacks the kernels. Set `SBPROXY_CPU_MEMORY_FRACTION=0` to opt back
-  into rejecting admission on a GPU-less host.
+  into rejecting admission on a GPU-less host. The weight cache defaults to
+  `~/.cache/sbproxy/models` for a non-root run (and the service path
+  `/var/lib/sbproxy/models` when running as root), so serving works out of
+  the box without configuring `cache_dir`.
 - **Serve-preflight warnings at config load.** A config that declares
   `serve:` on a host with no visible GPU, or with a serve entry whose
   engine has no binary and no container runtime, now logs a warning at

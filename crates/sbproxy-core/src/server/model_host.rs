@@ -200,7 +200,7 @@ fn build_runtime(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<Proces
         tracing::error!("model host: merged serve config is invalid: {e}");
         return None;
     }
-    let cache_root = sbproxy_model_host::resolve_cache_dir(merged.cache_dir.as_deref(), None);
+    let cache_root = sbproxy_model_host::resolve_cache_dir_default(merged.cache_dir.as_deref());
     let metadata = Arc::new(ConfigDirMetadataProvider {
         cache_root,
         revision: "main".to_string(),

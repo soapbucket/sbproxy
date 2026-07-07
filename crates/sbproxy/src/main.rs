@@ -1417,10 +1417,7 @@ fn load_models_catalog(
 
 fn model_cache_root(cache_dir: Option<&std::path::Path>) -> PathBuf {
     let configured = cache_dir.map(|p| p.to_string_lossy().into_owned());
-    let hf_home = std::env::var("HF_HOME")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    sbproxy_model_host::resolve_cache_dir(configured.as_deref(), hf_home.as_deref())
+    sbproxy_model_host::resolve_cache_dir_default(configured.as_deref())
 }
 
 /// Whether any weights for `entry` are present in the cache dir.

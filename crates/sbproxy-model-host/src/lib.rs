@@ -81,7 +81,10 @@ pub use llama_release::{
 #[cfg(feature = "weights")]
 pub use llama_release::{ensure_llama_server, ensure_llama_server_blocking};
 pub use lora::{AdapterRoute, LoraCache};
-pub use manifest::{resolve_cache_dir, validate_serve_against_manifest, SourceScheme};
+pub use manifest::{
+    resolve_cache_dir, resolve_cache_dir_default, validate_serve_against_manifest, SourceScheme,
+    SERVICE_CACHE_DIR,
+};
 pub use probe_cpu::{detect_total_memory_bytes, CpuProbe};
 #[cfg(all(target_os = "macos", feature = "gpu-apple"))]
 pub use probe_metal::MetalGpuProbe;

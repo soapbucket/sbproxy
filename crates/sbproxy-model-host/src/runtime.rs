@@ -621,7 +621,8 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         let model = entry
             .effective_name()
             .unwrap_or_else(|_| model_ref.hf_repo.clone());
-        let cache_root = crate::manifest::resolve_cache_dir(self.config.cache_dir.as_deref(), None);
+        let cache_root =
+            crate::manifest::resolve_cache_dir_default(self.config.cache_dir.as_deref());
         let started = std::time::Instant::now();
         let outcome =
             crate::weights::ensure_weight_file(&cache_root, &model_ref.hf_repo, "main", file, None)
@@ -669,7 +670,8 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         accel: crate::config::EngineAccel,
         sha256: Option<&str>,
     ) -> Result<std::path::PathBuf, String> {
-        let cache_root = crate::manifest::resolve_cache_dir(self.config.cache_dir.as_deref(), None);
+        let cache_root =
+            crate::manifest::resolve_cache_dir_default(self.config.cache_dir.as_deref());
         crate::llama_release::ensure_llama_server(&cache_root, tag, accel, sha256).await
     }
 
