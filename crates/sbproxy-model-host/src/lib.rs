@@ -67,8 +67,7 @@ pub use fit::{
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
 pub use kv_tiering::{KvTier, KvTieringPolicy, TierDecision};
 pub use launch::{
-    build_launch_spec, chunk_size_for_ttft, parse_duration, serving_flags, should_speculate,
-    ProcessEngineLauncher,
+    build_launch_spec, chunk_size_for_ttft, serving_flags, should_speculate, ProcessEngineLauncher,
 };
 pub use llama_release::{asset_url as llama_asset_url, resolve_on_path, Platform};
 #[cfg(feature = "weights")]

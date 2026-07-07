@@ -50,12 +50,6 @@ licensing-tdmrep = []
 # Marker flag for the `llms.txt` + `llms-full.txt`
 # projections. Same contract as `licensing-rsl`.
 llms-txt = []
-# Opt-in wiring of the CAP verifier into the future
-# `sbproxy-rate-limit` middleware. Off today because the crate
-# does not exist on this branch; see WATCH.md for the follow-up. CAP
-# verification still happens with the flag off; the bucket
-# registration is the only gated behaviour.
-rate-limit = []
 # A2A protocol envelope parsers. Detection and policy
 # enforcement run with these flags off (the proxy treats matched
 # requests as plain POSTs and applies route limits without parsed
@@ -67,6 +61,7 @@ a2a = ["a2a-anthropic", "a2a-google"]
 
 [dependencies]
 sbproxy-plugin.workspace = true
+sbproxy-util.workspace = true
 sbproxy-config.workspace = true
 sbproxy-middleware.workspace = true
 sbproxy-extension.workspace = true

@@ -15,12 +15,9 @@
 //! * Verifies `sub` matches the resolved `agent_id` from the resolver
 //!   chain (when present on the request context).
 //! * Verifies the request path matches the token's `glob` allow-list.
-//! * Optionally registers / consults a per-token rate-limit bucket
-//!   keyed by `jti` with capacity `rps` and a daily byte budget. The
-//!   rate-limit binding lives behind a `cfg(feature = "rate-limit")`
-//!   stub today (the middleware lands later). When the feature is off
-//!   the verifier degrades to verify-only mode and emits a warning so
-//!   operators see the gap.
+//! * Surfaces the per-token rate-limit budget (`rps`, daily bytes) on
+//!   the returned view so a downstream limiter can enforce it. The
+//!   verifier itself does not register buckets today.
 //! * Returns a [`CapVerdict`] capturing the result. The `Verified`
 //!   arm carries a [`CapTokenView`] suitable for stamping onto
 //!   `RequestContext.cap_token` (the field is added by a separate
@@ -461,17 +458,6 @@ impl CapVerifier {
         // multi-segment wildcards.
         if !glob_matches(&claims.glob, request_path) {
             return CapVerdict::Invalid(CapError::PathNotAuthorized);
-        }
-
-        // Optional rate-limit registration. The R2.3 middleware contract
-        // is pinned but the crate does not yet exist in the workspace;
-        // the call site is gated on the `rate-limit` cargo feature so
-        // OSS builds compile today and turn the bucket on later. See
-        // `WATCH.md` for the wiring task.
-        #[cfg(feature = "rate-limit")]
-        {
-            // sbproxy_rate_limit::register_token_bucket(&claims.jti,
-            //     claims.rps, claims.bytes);
         }
 
         CapVerdict::Verified(CapTokenView {

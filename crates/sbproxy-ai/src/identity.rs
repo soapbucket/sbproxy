@@ -180,7 +180,7 @@ impl PrincipalSelectorConfig {
             if principal
                 .virtual_key
                 .as_ref()
-                .is_some_and(|vk| glob_match(pattern, &vk.name))
+                .is_some_and(|vk| sbproxy_util::prefix_glob_match(pattern, &vk.name))
             {
                 return true;
             }
@@ -224,15 +224,6 @@ impl PrincipalSelectorConfig {
         }
         false
     }
-}
-
-fn glob_match(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    pattern
-        .strip_suffix('*')
-        .map_or_else(|| pattern == value, |prefix| value.starts_with(prefix))
 }
 
 fn claim_value_matches(actual: &serde_json::Value, expected: &str) -> bool {

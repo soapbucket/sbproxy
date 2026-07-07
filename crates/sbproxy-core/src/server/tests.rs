@@ -2546,34 +2546,56 @@ fn csp_report_invalid_json_returns_empty() {
 
 // --- WOR-45: SSRF guard ---
 
-#[test]
-fn ssrf_guard_rejects_metadata_ip_literal() {
+#[tokio::test]
+async fn ssrf_guard_rejects_metadata_ip_literal() {
     let err = guard_upstream("169.254.169.254", 80, false, &[])
+        .await
         .expect_err("metadata endpoint must be blocked");
     let s = format!("{err}");
     assert!(s.contains("SSRF") || s.contains("private"), "got: {s}");
 }
 
-#[test]
-fn ssrf_guard_allows_public_ip() {
+#[tokio::test]
+async fn ssrf_guard_allows_public_ip() {
     // 1.1.1.1 is a global anycast address; the validator's
-    // private/loopback/link-local checks must not flag it.
-    guard_upstream("1.1.1.1", 443, true, &[]).expect("public ip ok");
+    // private/loopback/link-local checks must not flag it. It is an IP
+    // literal, so the guard takes the no-DNS fast path.
+    guard_upstream("1.1.1.1", 443, true, &[])
+        .await
+        .expect("public ip ok");
 }
 
-#[test]
-fn ssrf_guard_allowlist_permits_metadata_range() {
+#[tokio::test]
+async fn ssrf_guard_allowlist_permits_metadata_range() {
     // Operator opted in to 169.254.0.0/16 (e.g. for a trusted IMDS
-    // sidecar). The same URL that fails the default check now
-    // passes when the resolved IP falls inside the allowlist.
+    // sidecar). The same address that fails the default check now
+    // passes when it falls inside the allowlist.
     let allow: Vec<ipnetwork::IpNetwork> = vec!["169.254.0.0/16".parse().expect("cidr")];
-    guard_upstream("169.254.169.254", 80, false, &allow).expect("allowlisted private IP must pass");
+    guard_upstream("169.254.169.254", 80, false, &allow)
+        .await
+        .expect("allowlisted private IP must pass");
 }
 
-#[test]
-fn ssrf_guard_rejects_loopback_v6() {
-    let err = guard_upstream("::1", 80, false, &[]).expect_err("loopback v6 blocked");
+#[tokio::test]
+async fn ssrf_guard_rejects_loopback_v6() {
+    let err = guard_upstream("::1", 80, false, &[])
+        .await
+        .expect_err("loopback v6 blocked");
     let _ = format!("{err}");
+}
+
+#[tokio::test]
+async fn ssrf_guard_async_fails_closed_on_unresolvable_host() {
+    // WOR-1689: the async resolve path must fail CLOSED. The reserved
+    // `.invalid` TLD (RFC 6761) never resolves, so this is hermetic
+    // (no network) and bounded by the 2s resolve timeout. Even with an
+    // empty allowlist and no private literal involved, an unresolvable
+    // upstream host must be rejected, not fail open.
+    let err = guard_upstream("nonexistent-host.invalid", 80, false, &[])
+        .await
+        .expect_err("unresolvable host must be blocked, not fail open");
+    let s = format!("{err}");
+    assert!(s.contains("SSRF") || s.contains("blocked"), "got: {s}");
 }
 
 // --- WOR-46: trust-bounded X-Forwarded-Proto ---

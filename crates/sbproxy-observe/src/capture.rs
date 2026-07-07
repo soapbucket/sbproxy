@@ -696,26 +696,7 @@ where
 /// `<= max_bytes` bytes. Truncation is byte-aligned to the nearest
 /// preceding UTF-8 char boundary so the result remains valid UTF-8.
 fn truncate_with_suffix(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let suffix = HEADER_TRUNCATION_SUFFIX;
-    if max_bytes <= suffix.len() {
-        // Cap is too tight to fit even the suffix; return a prefix of
-        // the suffix itself so the result still respects max_bytes.
-        return suffix[..max_bytes].to_string();
-    }
-    let keep = max_bytes - suffix.len();
-    // Walk back to the nearest char boundary so we never split a
-    // multi-byte codepoint.
-    let mut boundary = keep;
-    while boundary > 0 && !s.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    let mut out = String::with_capacity(boundary + suffix.len());
-    out.push_str(&s[..boundary]);
-    out.push_str(suffix);
-    out
+    sbproxy_util::truncate_utf8_with_marker(s, max_bytes, HEADER_TRUNCATION_SUFFIX).into_owned()
 }
 
 #[cfg(test)]

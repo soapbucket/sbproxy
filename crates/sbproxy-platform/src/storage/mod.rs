@@ -8,9 +8,6 @@ mod redb_store;
 mod redis;
 mod sqlite;
 
-#[cfg(feature = "postgres-store")]
-mod postgres;
-
 pub use async_kv::AsyncKVStore;
 pub use async_redis::{AsyncRedisConfig, AsyncRedisKVStore};
 pub use file::FileKVStore;
@@ -18,9 +15,6 @@ pub use memory::MemoryKVStore;
 pub use redb_store::RedbKVStore;
 pub use redis::{RedisConfig, RedisKVStore};
 pub use sqlite::SqliteKVStore;
-
-#[cfg(feature = "postgres-store")]
-pub use postgres::PostgresKVStore;
 
 use anyhow::Result;
 use bytes::Bytes;

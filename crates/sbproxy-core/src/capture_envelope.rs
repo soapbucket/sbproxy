@@ -49,7 +49,7 @@ use crate::context::RequestContext;
 /// Drop counters from the helpers are not surfaced here; the
 /// dispatching counter wire-up lives in a follow-up slice that hooks
 /// into the Prometheus registry directly.
-// The dimension count is locked by the Wave 8 envelope schema:
+// The dimension count is locked by the capture envelope schema:
 // properties + sessions + users + workspace + auth-source pair are
 // all mandatory inputs to the capture pipeline. Bundling them into
 // a struct would obscure the call sites without removing any of the
@@ -68,7 +68,7 @@ pub fn capture_dimensions(
     // Mint the envelope's ULID alongside the existing UUID-based
     // ctx.request_id. The UUID continues to feed the correlation
     // header / webhook envelopes / access logs (callers depend on its
-    // 32-hex format); the ULID feeds the Wave 8 envelope which the
+    // 32-hex format); the ULID feeds the capture envelope which the
     // enterprise ingest pipeline consumes verbatim.
     if ctx.envelope_request_id.is_none() {
         ctx.envelope_request_id = Some(Ulid::new());

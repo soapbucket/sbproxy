@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 sbproxy-plugin.workspace = true
+sbproxy-util.workspace = true
 sbproxy-config.workspace = true
 sbproxy-cache.workspace = true
 sbproxy-security.workspace = true

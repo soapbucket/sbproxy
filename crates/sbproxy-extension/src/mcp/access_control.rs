@@ -78,12 +78,12 @@ impl McpPrincipalSelector {
                 .as_ref()
                 .map(|v| v.name.as_str())
                 .unwrap_or("");
-            if !glob_match(vk_pattern, name) {
+            if !sbproxy_util::prefix_glob_match(vk_pattern, name) {
                 return false;
             }
         }
         if let Some(sub_pattern) = &self.sub {
-            if !glob_match(sub_pattern, &principal.sub) {
+            if !sbproxy_util::prefix_glob_match(sub_pattern, &principal.sub) {
                 return false;
             }
         }
@@ -113,18 +113,6 @@ impl McpPrincipalSelector {
             }
         }
         true
-    }
-}
-
-/// Trailing-`*` glob: `vk_*` matches `vk_foo`; exact-match otherwise.
-/// Mirrors the credential-resolver glob behaviour so an operator who
-/// learned the pattern on the credentials block sees the same one
-/// here.
-fn glob_match(pattern: &str, value: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        value.starts_with(prefix)
-    } else {
-        pattern == value
     }
 }
 
@@ -413,26 +401,7 @@ fn principal_id_for(principal: &Principal) -> String {
 /// Returns an error on empty input, an unsupported suffix, or a
 /// non-numeric prefix.
 pub fn parse_quota_window(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty duration".into());
-    }
-    let split_at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (num_part, unit) = (&s[..split_at], &s[split_at..]);
-    let value: u64 = num_part
-        .parse()
-        .map_err(|e| format!("invalid duration number '{}': {}", num_part, e))?;
-    match unit {
-        "ms" => Ok(Duration::from_millis(value)),
-        "s" | "" => Ok(Duration::from_secs(value)),
-        "m" => Ok(Duration::from_secs(value * 60)),
-        "h" => Ok(Duration::from_secs(value * 60 * 60)),
-        "d" => Ok(Duration::from_secs(value * 60 * 60 * 24)),
-        other => Err(format!(
-            "unsupported duration unit '{}' (use ms, s, m, h, d)",
-            other
-        )),
-    }
+    sbproxy_util::parse_duration(s)
 }
 
 // --- Tests ---

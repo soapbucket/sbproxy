@@ -31,7 +31,6 @@
 #![deny(missing_docs)]
 
 pub mod backend;
-pub mod backoff;
 pub mod bootstrap;
 pub mod bridge;
 pub mod cluster_metrics;

@@ -601,18 +601,6 @@ where
     serde_json::from_value::<RoutingStrategy>(strategy_value).map_err(Error::custom)
 }
 
-impl AiResilienceConfig {
-    /// Maximum total provider attempts when a request fails. Falls
-    /// back to the count of enabled providers when no
-    /// `circuit_breaker.failure_threshold` is configured (i.e. just
-    /// "try every provider once" semantics).
-    pub fn max_attempts(&self, num_providers: usize) -> usize {
-        // Cap at provider count; the client also short-circuits when
-        // it sees the same provider twice in a row.
-        std::cmp::max(1, num_providers).min(num_providers.max(1))
-    }
-}
-
 impl AiHandlerConfig {
     /// Build from a generic JSON value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
@@ -764,47 +752,11 @@ impl AiHandlerConfig {
     }
 }
 
-/// Detected AI API path type.
-///
-/// Superseded by [`AiSurface`], which covers the full OpenAI-compatible
-/// surface area (assistants, threads, batches, fine-tuning, files,
-/// realtime, image, audio, moderations, reranking) in addition to the
-/// three originally recognised endpoints. Kept for source compatibility
-/// with downstream callers; new code should use `AiSurface`.
-#[derive(Debug, PartialEq, Eq)]
-pub enum AiApiPath {
-    /// OpenAI-compatible chat completions endpoint.
-    ChatCompletions,
-    /// Model listing endpoint.
-    Models,
-    /// Embeddings creation endpoint.
-    Embeddings,
-    /// Path did not match any known AI endpoint.
-    Unknown,
-}
-
-/// Parse a request path to determine the AI API endpoint type.
-///
-/// Superseded by [`classify_surface`]. Retained for source-compatible
-/// callers; the dispatch path now uses `classify_surface`.
-pub fn parse_ai_path(path: &str) -> AiApiPath {
-    if path.ends_with("/chat/completions") {
-        AiApiPath::ChatCompletions
-    } else if path.ends_with("/models") {
-        AiApiPath::Models
-    } else if path.ends_with("/embeddings") {
-        AiApiPath::Embeddings
-    } else {
-        AiApiPath::Unknown
-    }
-}
-
 /// Classified AI API surface for a given request.
 ///
-/// Unifies the older `AiApiPath` and `AiEndpoint` enums. Every variant
-/// corresponds to a distinct dispatch path inside `handle_ai_proxy`.
-/// New variants may be added in minor releases; pattern matches must
-/// include a wildcard arm.
+/// Every variant corresponds to a distinct dispatch path inside
+/// `handle_ai_proxy`. New variants may be added in minor releases;
+/// pattern matches must include a wildcard arm.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AiSurface {
@@ -995,34 +947,6 @@ mod tests {
         assert_eq!(sinks[1].name(), "webhook");
         // The lazy accessor returns the same built instances on repeat calls.
         assert_eq!(cfg.usage_sinks().len(), 2);
-    }
-
-    #[test]
-    fn parse_ai_path_chat_completions() {
-        assert_eq!(
-            parse_ai_path("/v1/chat/completions"),
-            AiApiPath::ChatCompletions
-        );
-        assert_eq!(
-            parse_ai_path("/api/v1/chat/completions"),
-            AiApiPath::ChatCompletions
-        );
-    }
-
-    #[test]
-    fn parse_ai_path_models() {
-        assert_eq!(parse_ai_path("/v1/models"), AiApiPath::Models);
-    }
-
-    #[test]
-    fn parse_ai_path_embeddings() {
-        assert_eq!(parse_ai_path("/v1/embeddings"), AiApiPath::Embeddings);
-    }
-
-    #[test]
-    fn parse_ai_path_unknown() {
-        assert_eq!(parse_ai_path("/v1/completions"), AiApiPath::Unknown);
-        assert_eq!(parse_ai_path("/health"), AiApiPath::Unknown);
     }
 
     #[test]

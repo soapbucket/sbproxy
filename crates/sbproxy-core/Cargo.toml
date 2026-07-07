@@ -58,6 +58,7 @@ inprocess-embed = ["dep:sbproxy-classifiers"]
 
 [dependencies]
 sbproxy-plugin.workspace = true
+sbproxy-util.workspace = true
 sbproxy-config.workspace = true
 sbproxy-tls.workspace = true
 sbproxy-modules.workspace = true
@@ -70,7 +71,6 @@ tokio-rustls = { workspace = true }
 # are called here.
 sbproxy-transport.workspace = true
 sbproxy-middleware.workspace = true
-sbproxy-httpkit.workspace = true
 sbproxy-observe.workspace = true
 sbproxy-extension.workspace = true
 sbproxy-ai.workspace = true

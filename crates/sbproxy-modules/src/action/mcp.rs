@@ -791,28 +791,7 @@ mod duration_str {
     }
 
     fn parse(s: &str) -> Result<Duration, String> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Err("empty duration".into());
-        }
-        let (num_part, unit) = split_unit(s);
-        let value: u64 = num_part
-            .parse()
-            .map_err(|e| format!("invalid duration number '{}': {}", num_part, e))?;
-        match unit {
-            "ms" => Ok(Duration::from_millis(value)),
-            "s" | "" => Ok(Duration::from_secs(value)),
-            "m" => Ok(Duration::from_secs(value * 60)),
-            other => Err(format!(
-                "unsupported duration unit '{}' (use ms, s, m)",
-                other
-            )),
-        }
-    }
-
-    fn split_unit(s: &str) -> (&str, &str) {
-        let split_at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-        (&s[..split_at], &s[split_at..])
+        sbproxy_util::parse_duration(s)
     }
 }
 
@@ -857,7 +836,11 @@ impl McpInjectSource {
                     continue;
                 }
             }
-            if !filter.is_empty() && !filter.iter().any(|f| glob_match(f, &entry.name)) {
+            if !filter.is_empty()
+                && !filter
+                    .iter()
+                    .any(|f| sbproxy_util::prefix_glob_match(f, &entry.name))
+            {
                 continue;
             }
             // The entry JSON is `{"name","description","inputSchema",_meta?}`.
@@ -899,14 +882,6 @@ fn to_provider_tool(
             "description": description,
             "input_schema": schema,
         }),
-    }
-}
-
-/// Trailing-`*` glob or exact match, matching the ACL glob semantics.
-fn glob_match(pattern: &str, name: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => name.starts_with(prefix),
-        None => pattern == name,
     }
 }
 
@@ -1002,6 +977,7 @@ mod tests {
 
     #[test]
     fn glob_match_semantics() {
+        use sbproxy_util::prefix_glob_match as glob_match;
         assert!(glob_match("gh.*", "gh.search"));
         assert!(glob_match("search", "search"));
         assert!(!glob_match("gh.*", "db.query"));

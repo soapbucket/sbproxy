@@ -139,25 +139,13 @@ fn bound_audit_line(event: &PolicyVerdictEvent, line: String) -> String {
     );
     serde_json::json!({
         "event_id": event.event_id,
-        "request_id": truncate_on_char_boundary(&event.request_id, 256),
-        "policy_id": truncate_on_char_boundary(&event.policy_id, 256),
+        "request_id": sbproxy_util::truncate_utf8(&event.request_id, 256).to_string(),
+        "policy_id": sbproxy_util::truncate_utf8(&event.policy_id, 256).to_string(),
         "verdict": &event.verdict,
         "truncated": true,
         "original_bytes": line.len(),
     })
     .to_string()
-}
-
-/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
-fn truncate_on_char_boundary(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
 }
 
 /// Try to publish an audit event without blocking.
