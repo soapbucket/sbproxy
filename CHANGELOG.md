@@ -70,6 +70,13 @@ of the new YAML fields below until the version that ships them.
   engine and weights are acquired on the first request. Flags override
   the port, engine, acceleration, and cache directory; `--dry-run` prints
   the resolution and the synthesized config without serving.
+- **Model pull honors manifest pins and works for safetensors/vLLM on a
+  fresh box.** A model's weight pull now uses the manifest `revision`
+  (was hard-coded `main`) and verifies the per-file `sha256` when one is
+  pinned, so a digest mismatch fails the pull loudly instead of serving
+  bad weights. And a safetensors model served via vLLM now pre-fetches
+  its `config.json` on first use, so it admits on a box that has never
+  pulled it (previously it failed with "no model metadata").
 - **sbproxy acquires the inference engine, not just finds it on PATH.**
   A `serve:` block can now carry a per-engine `engines.<engine>.acquire:`
   block: for llama.cpp, `source: release` (the default) fetches a pinned

@@ -623,10 +623,20 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             .unwrap_or_else(|_| model_ref.hf_repo.clone());
         let cache_root =
             crate::manifest::resolve_cache_dir_default(self.config.cache_dir.as_deref());
+        // WOR-1807: honor the manifest revision + sha256 for this file
+        // (both were ignored before; revision was hard-coded "main" and
+        // the digest was never verified). A pinned digest that does not
+        // match fails the pull loudly instead of serving bad weights.
+        let (revision, sha) = self.resolved_pin(model_ref, file);
         let started = std::time::Instant::now();
-        let outcome =
-            crate::weights::ensure_weight_file(&cache_root, &model_ref.hf_repo, "main", file, None)
-                .await;
+        let outcome = crate::weights::ensure_weight_file(
+            &cache_root,
+            &model_ref.hf_repo,
+            &revision,
+            file,
+            sha.as_deref(),
+        )
+        .await;
         let secs = started.elapsed().as_secs_f64();
         match outcome {
             Ok(path) => {
@@ -656,6 +666,77 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         _entry: &crate::config::ServeEntry,
         _model_ref: &ModelRef,
     ) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// The pinned revision + optional sha256 for `filename`, from the
+    /// resolved catalog / manifest entry (WOR-1807). A raw `hf:` ref (no
+    /// catalog id) or an entry with no pins defaults to revision `main`
+    /// and no digest.
+    #[cfg(feature = "weights")]
+    fn resolved_pin(&self, model_ref: &ModelRef, filename: &str) -> (String, Option<String>) {
+        let entry = model_ref
+            .catalog_id
+            .as_ref()
+            .and_then(|id| self.catalog.get(id));
+        let revision = entry
+            .and_then(|e| e.revision.clone())
+            .unwrap_or_else(|| "main".to_string());
+        let sha = entry.and_then(|e| e.sha256.get(filename).cloned());
+        (revision, sha)
+    }
+
+    /// Prefetch `config.json` for a safetensors / vLLM model and read the
+    /// fit metadata from it (WOR-1807). A fresh box has no `config.json`
+    /// cached, so a vLLM model's admission would fail `NoMetadata`; this
+    /// fetches it (revision- and sha256-aware) and parses the shape.
+    /// Returns `None` on a fetch/parse failure so the caller can fall back
+    /// to the cache-reading metadata provider.
+    #[cfg(feature = "weights")]
+    async fn prefetch_config_metadata(
+        &self,
+        model_ref: &ModelRef,
+        params_fallback: u64,
+    ) -> Option<ModelMetadata> {
+        let cache_root =
+            crate::manifest::resolve_cache_dir_default(self.config.cache_dir.as_deref());
+        let (revision, sha) = self.resolved_pin(model_ref, "config.json");
+        let path = match crate::weights::ensure_weight_file(
+            &cache_root,
+            &model_ref.hf_repo,
+            &revision,
+            "config.json",
+            sha.as_deref(),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    "model host: config.json pre-fetch failed for {}: {e}",
+                    model_ref.hf_repo
+                );
+                return None;
+            }
+        };
+        let text = tokio::fs::read_to_string(&path).await.ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let params = if params_fallback > 0 {
+            params_fallback
+        } else {
+            v.get("num_parameters")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0)
+        };
+        ModelMetadata::from_hf_config(&v, params)
+    }
+
+    #[cfg(not(feature = "weights"))]
+    async fn prefetch_config_metadata(
+        &self,
+        _model_ref: &ModelRef,
+        _params_fallback: u64,
+    ) -> Option<ModelMetadata> {
         None
     }
 
@@ -768,7 +849,16 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             Some(path) => Self::gguf_header_metadata(path, params_fallback)
                 .await
                 .or_else(|| self.metadata.metadata(&model_ref)),
-            None => self.metadata.metadata(&model_ref),
+            // Safetensors / vLLM path: prefer an already-cached config.json
+            // (the provider), else prefetch it (WOR-1807) so a fresh box
+            // admits instead of failing NoMetadata.
+            None => match self.metadata.metadata(&model_ref) {
+                Some(m) => Some(m),
+                None => {
+                    self.prefetch_config_metadata(&model_ref, params_fallback)
+                        .await
+                }
+            },
         }
         .ok_or_else(|| RuntimeError::NoMetadata {
             name: name.to_string(),
@@ -1567,5 +1657,46 @@ mod tests {
         ));
         let port = rt.ensure_ready("local-14b").await.expect("ready");
         assert!(port > 0);
+    }
+
+    #[cfg(feature = "weights")]
+    #[test]
+    fn resolved_pin_reads_revision_and_sha_from_the_manifest() {
+        // WOR-1807: a manifest entry's revision + per-file sha256 are
+        // honored; a raw ref or missing pin defaults to main / no digest.
+        let catalog: Catalog = serde_yaml::from_str(
+            "models:\n  pinned:\n    hf_repo: Org/Repo\n    params: \"1B\"\n    \
+             license: apache-2.0\n    family: x\n    min_vram_hint_gib: 1\n    \
+             revision: v2.0\n    sha256:\n      config.json: abc123\n",
+        )
+        .unwrap();
+        let rt = ModelHostRuntime::new(
+            config("models:\n  - model: pinned\n"),
+            catalog,
+            Arc::new(StaticGpuProbe::new(vec![])),
+            Arc::new(FixtureMeta),
+            Box::new(SpecPortLauncher::default),
+            false,
+        );
+        let pinned = ModelRef {
+            hf_repo: "Org/Repo".into(),
+            quant: String::new(),
+            catalog_id: Some("pinned".into()),
+        };
+        let (rev, sha) = rt.resolved_pin(&pinned, "config.json");
+        assert_eq!(rev, "v2.0");
+        assert_eq!(sha.as_deref(), Some("abc123"));
+        // A file with no listed digest keeps the revision but no sha.
+        assert!(rt.resolved_pin(&pinned, "model.safetensors").1.is_none());
+        // A raw hf: ref (no catalog id) defaults to main / no digest.
+        let raw = ModelRef {
+            hf_repo: "Org/Repo".into(),
+            quant: String::new(),
+            catalog_id: None,
+        };
+        assert_eq!(
+            rt.resolved_pin(&raw, "config.json"),
+            ("main".to_string(), None)
+        );
     }
 }
