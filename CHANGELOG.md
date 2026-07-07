@@ -44,6 +44,16 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **`sbproxy run <model>`: serve a model in one command, no YAML.**
+  `sbproxy run qwen3-14b` (or `sbproxy run hf:Org/Repo:Q4_K_M --name
+  coder`) synthesizes a minimal serving config, checks the model can run
+  on this host (the same detection `sbproxy doctor` uses, so a model with
+  no viable engine fails now with a remediation instead of a later 502),
+  and boots the gateway with an OpenAI-compatible endpoint on loopback at
+  `http://127.0.0.1:<port>` (both the IP and `localhost` route). The
+  engine and weights are acquired on the first request. Flags override
+  the port, engine, acceleration, and cache directory; `--dry-run` prints
+  the resolution and the synthesized config without serving.
 - **sbproxy acquires the inference engine, not just finds it on PATH.**
   A `serve:` block can now carry a per-engine `engines.<engine>.acquire:`
   block: for llama.cpp, `source: release` (the default) fetches a pinned
