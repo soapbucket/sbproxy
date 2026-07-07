@@ -658,6 +658,35 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         None
     }
 
+    /// Fetch (and cache) a pinned llama.cpp release binary for the
+    /// resolved tag + accel, returning its path (WOR-1801). Behind the
+    /// `weights` feature; without it, acquisition can only use `PATH` or
+    /// an explicit `acquire.path`, so this reports the missing feature.
+    #[cfg(feature = "weights")]
+    async fn acquire_llama_release(
+        &self,
+        tag: &str,
+        accel: crate::config::EngineAccel,
+        sha256: Option<&str>,
+    ) -> Result<std::path::PathBuf, String> {
+        let cache_root = crate::manifest::resolve_cache_dir(self.config.cache_dir.as_deref(), None);
+        crate::llama_release::ensure_llama_server(&cache_root, tag, accel, sha256).await
+    }
+
+    #[cfg(not(feature = "weights"))]
+    async fn acquire_llama_release(
+        &self,
+        _tag: &str,
+        _accel: crate::config::EngineAccel,
+        _sha256: Option<&str>,
+    ) -> Result<std::path::PathBuf, String> {
+        Err(
+            "llama-server is not on PATH and this build lacks the `model-weights` feature \
+             to fetch a release; install llama.cpp or set engines.llama_cpp.acquire.path"
+                .to_string(),
+        )
+    }
+
     /// Read the fit metadata (`layers`, `kv_heads`, `head_dim`, params,
     /// context) from a local GGUF file's header (WOR-1769). A GGUF-only
     /// HF repo has no transformers `config.json`, so the header is the
@@ -831,6 +860,47 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                 crate::launch::llama_use_local_model(&mut spec.args, &local);
             } else if let Some(file) = &entry.gguf_file {
                 crate::launch::llama_set_hf_file(&mut spec.args, file);
+            }
+        }
+
+        // WOR-1801: acquire the engine binary rather than relying on
+        // PATH alone. The `acquire:` plan resolves it (PATH, an explicit
+        // operator path, or a pinned prebuilt release); a release fetch
+        // happens here so a box with no engine still serves. Best-effort:
+        // it only overrides `spec.program` on success and otherwise
+        // leaves the PATH name for the launcher to resolve (or fail
+        // cleanly on). That keeps a fake/embedded launcher and an on-box
+        // PATH install unaffected, and a genuinely blocked engine (e.g.
+        // vLLM, which is not a single binary) still spawns from PATH as
+        // before rather than aborting admission here. A misconfigured
+        // acquire block is caught earlier, at config validate/plan time.
+        // In-process engines have no binary to acquire.
+        if !engine_kind.is_in_process() {
+            let prov = self.config.engines.get(&engine_kind);
+            let on_path = crate::llama_release::resolve_on_path(engine_kind.binary_name());
+            match crate::acquire::plan_binary_acquire(engine_kind, prov, on_path) {
+                crate::acquire::BinaryAcquirePlan::OnPath(p)
+                | crate::acquire::BinaryAcquirePlan::Explicit(p) => {
+                    spec.program = p.to_string_lossy().into_owned();
+                }
+                crate::acquire::BinaryAcquirePlan::FetchRelease { tag, accel, sha256 } => {
+                    match self
+                        .acquire_llama_release(&tag, accel, sha256.as_deref())
+                        .await
+                    {
+                        Ok(p) => spec.program = p.to_string_lossy().into_owned(),
+                        Err(e) => tracing::warn!(
+                            engine = engine_kind.binary_name(),
+                            "engine release acquisition failed: {e}; falling back to PATH"
+                        ),
+                    }
+                }
+                crate::acquire::BinaryAcquirePlan::Blocked(reason) => {
+                    tracing::debug!(
+                        engine = engine_kind.binary_name(),
+                        "engine binary not acquired ({reason}); using PATH"
+                    );
+                }
             }
         }
 

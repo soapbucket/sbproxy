@@ -51,6 +51,46 @@ impl Platform {
             Platform::MacOsX64 => "macos-x64",
         }
     }
+
+    /// The asset infix for a requested acceleration flavour (WOR-1801).
+    /// macOS assets already carry Metal, so the accel is only meaningful
+    /// on Linux, where a GPU build means the Vulkan asset (ggml-org ships
+    /// no CUDA Linux prebuilt, so `cuda` maps to `vulkan`).
+    fn asset_infix_accel(self, accel: crate::config::EngineAccel) -> &'static str {
+        use crate::config::EngineAccel::*;
+        match self {
+            Platform::MacOsArm64 => "macos-arm64",
+            Platform::MacOsX64 => "macos-x64",
+            Platform::LinuxX64 => match accel {
+                Cuda | Vulkan => "ubuntu-vulkan-x64",
+                Auto | Cpu | Metal => "ubuntu-x64",
+            },
+        }
+    }
+}
+
+/// The default pinned llama.cpp release tag used when
+/// `engines.llama_cpp.acquire.version` is unset (WOR-1801). Operators
+/// pin their own; bump this as ggml-org ships. No digest is bundled
+/// (assets differ per platform + accel), so an unpinned default fetch
+/// logs a warning: pin `acquire.sha256` to verify.
+pub const DEFAULT_LLAMA_RELEASE_TAG: &str = "b4589";
+
+/// The download URL for a pinned ggml-org/llama.cpp release binary asset
+/// for a requested acceleration flavour (WOR-1801). Like [`asset_url`]
+/// but accel-aware (Linux GPU builds use the Vulkan asset).
+pub fn asset_url_accel(
+    tag: &str,
+    platform: Platform,
+    accel: crate::config::EngineAccel,
+) -> Result<String, String> {
+    if tag.trim().is_empty() || tag == "latest" {
+        return Err(format!("llama.cpp release tag must be pinned, not '{tag}'"));
+    }
+    Ok(format!(
+        "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/llama-{tag}-bin-{}.zip",
+        platform.asset_infix_accel(accel)
+    ))
 }
 
 /// The download URL for a pinned ggml-org/llama.cpp release binary
@@ -81,14 +121,20 @@ pub fn resolve_on_path(name: &str) -> Option<PathBuf> {
 
 /// Ensure a `llama-server` binary is available: prefer one on `PATH`,
 /// else download the pinned release for this platform into
-/// `cache_dir`, verify its sha256, unzip it, and return the extracted
-/// `llama-server` path. Behind the `weights` feature (the download
-/// reuses reqwest); shells out to `unzip`.
+/// `cache_dir`, verify its sha256 (when a digest is pinned), unzip it,
+/// and return the extracted `llama-server` path. Behind the `weights`
+/// feature (the download reuses reqwest); shells out to `unzip`.
+///
+/// `expected_sha256` is `Some(hex)` to pin and verify the digest (the
+/// WOR-1663 supply-chain posture), or `None` to accept the tagged asset
+/// unverified (a warning is logged). A pinned tag is always required;
+/// only the digest is optional.
 #[cfg(feature = "weights")]
 pub async fn ensure_llama_server(
     cache_dir: &std::path::Path,
     tag: &str,
-    expected_sha256: &str,
+    accel: crate::config::EngineAccel,
+    expected_sha256: Option<&str>,
 ) -> Result<PathBuf, String> {
     if let Some(p) = resolve_on_path("llama-server") {
         return Ok(p);
@@ -100,7 +146,7 @@ pub async fn ensure_llama_server(
             std::env::consts::ARCH
         )
     })?;
-    let url = asset_url(tag, platform)?;
+    let url = asset_url_accel(tag, platform, accel)?;
     let dest_dir = cache_dir.join("llama.cpp").join(tag);
     tokio::fs::create_dir_all(&dest_dir)
         .await
@@ -120,8 +166,15 @@ pub async fn ensure_llama_server(
         .await
         .map_err(|e| format!("write {}: {e}", zip_path.display()))?;
 
-    // Verify the pinned digest before using it.
-    crate::weights::verify_sha256(&zip_path, expected_sha256)?;
+    // Verify the pinned digest before using it, when one is pinned.
+    match expected_sha256 {
+        Some(hex) => crate::weights::verify_sha256(&zip_path, hex)?,
+        None => tracing::warn!(
+            tag,
+            "llama.cpp release {tag} fetched without a pinned sha256; set \
+             engines.llama_cpp.acquire.sha256 to verify the download"
+        ),
+    }
 
     // Extract (shell out to unzip to avoid an archive crate dependency).
     let status = tokio::process::Command::new("unzip")
@@ -152,21 +205,21 @@ pub async fn ensure_llama_server(
     ))
 }
 
-/// Blocking wrapper around [`ensure_llama_server`] for synchronous CLI
-/// callers (`sbproxy doctor --install llama-cpp`). Spins a
-/// current-thread runtime for the one download; not for use inside the
-/// serving runtime, which is already async.
+/// Blocking wrapper around [`ensure_llama_server`] for synchronous
+/// callers. Spins a current-thread runtime for the one download; not
+/// for use inside the serving runtime, which is already async.
 #[cfg(feature = "weights")]
 pub fn ensure_llama_server_blocking(
     cache_dir: &std::path::Path,
     tag: &str,
-    expected_sha256: &str,
+    accel: crate::config::EngineAccel,
+    expected_sha256: Option<&str>,
 ) -> Result<PathBuf, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?
-        .block_on(ensure_llama_server(cache_dir, tag, expected_sha256))
+        .block_on(ensure_llama_server(cache_dir, tag, accel, expected_sha256))
 }
 
 #[cfg(test)]
