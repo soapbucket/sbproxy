@@ -383,7 +383,7 @@ impl DoctorReport {
             engine_report("embedded", "embedded", &env),
         ];
 
-        let model_cache_dir = sbproxy_model_host::resolve_cache_dir(None, hf_home().as_deref());
+        let model_cache_dir = sbproxy_model_host::resolve_cache_dir_default(None);
         let model_cache_exists = model_cache_dir.is_dir();
         let model_cache_free_bytes = free_disk_bytes(&model_cache_dir);
 
@@ -956,12 +956,6 @@ fn vendor_label(v: GpuVendor) -> &'static str {
 /// the weights are resolved.
 fn looks_gguf(reference: &str) -> bool {
     reference.to_ascii_lowercase().contains("gguf")
-}
-
-fn hf_home() -> Option<String> {
-    std::env::var("HF_HOME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
 }
 
 fn env_present(key: &str) -> bool {
