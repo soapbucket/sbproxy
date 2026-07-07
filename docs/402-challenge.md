@@ -137,8 +137,8 @@ application/sbproxy-multi-rail+json`.
 Notes:
 
 - `rails[].kind` is a closed enum: `x402`, `mpp`, `lightning`. Adding
-  a rail follows the closed-enum amendment rule in
-  [`adr-fast-track-amendment.md`](adr-fast-track-amendment.md).
+  a rail is a schema amendment, not a config change; unknown kinds are
+  rejected at validate time.
 - `rails[].quote_token` is a JWS. One nonce per rail per response, so
   the agent cannot replay a quote across rails. JWKS publication and
   token replay are covered by the

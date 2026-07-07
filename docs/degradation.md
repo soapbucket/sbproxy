@@ -38,6 +38,10 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 
 When every target is ejected at once, the LB falls back to the unfiltered list rather than failing the client.
 
+![20 requests against a two-target pool while the always-503 target crosses the failure threshold and is ejected](assets/outlier-detection.gif)
+
+Ejection lasts ejection_duration_secs, then the target gets another chance ([config](../examples/outlier-detection/)).
+
 **Log level:** `WARN` on first failure, `WARN` again when a target is ejected, `INFO` on recovery.
 
 **Alert:** yes. Configure via `proxy.alerting.channels`. Alerts include the standard `X-Sbproxy-*` identity headers and (when `secret` is set) HMAC-SHA256 signatures.
@@ -68,7 +72,15 @@ action:
         healthy_threshold: 2
 ```
 
+![a request to a connection-refused upstream retried up to max_attempts before the proxy reports the failure](assets/upstream-retries.gif)
+
+Connect errors, timeouts, and listed status codes qualify for retry ([config](../examples/upstream-retries/)).
+
 See [`examples/resilience-stack/sb.yml`](../examples/resilience-stack/sb.yml).
+
+![a healthy request passing, then a 20-request burst exercising retries, circuit breaker, and outlier ejection together](assets/resilience-stack.gif)
+
+All four signals come from one config ([config](../examples/resilience-stack/)).
 
 ---
 
@@ -133,6 +145,10 @@ proxy:
 ---
 
 ### Upstream DNS (service_discovery)
+
+![four requests dispatched while the resolver refreshes and rotates the upstream A-record set round-robin](assets/service-discovery.gif)
+
+service_discovery re-resolves every refresh_secs instead of pinning the pooled IP ([config](../examples/service-discovery/)).
 
 **When down:** the OS resolver times out or returns NXDOMAIN.
 

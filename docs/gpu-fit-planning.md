@@ -1,6 +1,6 @@
 # GPU fit planning
 
-*Last modified: 2026-07-04*
+*Last modified: 2026-07-06*
 
 When you name a model, the fit planner decides which quantization to
 run on the GPU you have, and it refuses a configuration the card cannot
@@ -83,6 +83,52 @@ the free VRAM and the smallest estimate it could find. When it picks,
 it reports the quant and the estimated VRAM at your context. The engine
 doctor in `sbproxy plan` shows the same resolution per model before
 anything spawns.
+
+## A worked example
+
+The built-in catalog lists `qwen3-14b` with its quants in preference
+order, `[FP8, Q4_K_M]`. Name it in a `serve:` block (the shape is the
+same as [`examples/ai-local-serving`](../examples/ai-local-serving)):
+
+```yaml
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          default_model: qwen3-14b
+          models: [qwen3-14b]
+          serve:
+            eviction: lru
+            cache_budget_gib: 200
+            models:
+              - model: qwen3-14b   # catalog id; the quant list comes from the catalog
+                engine: vllm
+                keep_alive: 30m
+```
+
+On an L4 the planner takes the first quant that both runs and fits.
+FP8 passes the capability gate (compute 8.9), and 14B parameters at
+1.0 bytes per weight is about 13 GiB of weights, plus the KV cache at
+the planned context and the 1.15x headroom factor, inside the card's
+24 GB. The plan records the chosen quant, the estimated VRAM, and the
+context length the estimate assumed.
+
+On a T4 the FP8 candidate is skipped at the capability gate and the
+walk continues to `Q4_K_M`, roughly 7.3 GiB of weights, which runs and
+fits in 16 GB. You only see a refusal when every candidate fails, and
+the message says which gate failed:
+
+```text
+no candidate quant runs on Tesla T4: FP8 needs FP8 kernels but Tesla T4 (compute 7.5) has none
+no candidate quant fits 15.0 GiB free on Tesla T4: smallest estimate was 18.2 GiB
+```
+
+The first is a capability refusal: nothing in the quant list can
+execute on this card. The second is a size refusal: everything could
+execute, nothing fits, and the planner reports the smallest estimate
+it found so you know how far off you are.
 
 ## Related
 

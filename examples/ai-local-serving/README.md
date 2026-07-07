@@ -34,7 +34,7 @@ make run CONFIG=examples/ai-local-serving/sb.yml
   config error, never an arbitrary command.
 - `keep_alive` per model and an `eviction: lru` host policy.
 - No address anywhere: a served provider carries no `base_url`, so the
-  gateway resolves the engine's loopback port itself (WOR-1680).
+  gateway resolves the engine's loopback port itself.
   Writing `base_url` alongside `serve:` is now a config error;
   `base_url` + `allow_private_base_url` stay only for a
   separately-running engine (an unmanaged Ollama, a remote vLLM box).

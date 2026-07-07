@@ -2,7 +2,7 @@
 
 ![ai-agent-alignment](../../docs/assets/ai-agent-alignment.gif)
 
-Demonstrates the `agent_alignment` input guardrail (WOR-801).
+Demonstrates the `agent_alignment` input guardrail.
 
 The guardrail audits the assistant's `tool_calls` array against an
 operator-declared ruleset: allow + deny lists, a forbidden-substring

@@ -253,6 +253,22 @@ writes; the session cookie carries the rest. It inherits whatever auth,
 roles, and TLS the admin server is configured with, so put it behind TLS
 before using it over anything but loopback.
 
+![The admin sign-in form: username and password fields on a plain card](assets/admin-login.png)
+
+After sign-in, the Overview page shows live health with per-component checks, version, uptime, and the model host at a glance:
+
+![The Overview page: health ok, per-component checks, a request-log count, and the model host section](assets/admin-overview.png)
+
+The Keys page lists every virtual key with its status, policy, budget, and expiry, and carries the mint, edit, rotate, block, revoke, and delete actions inline:
+
+![The Keys page: three active keys in a table with per-key Edit, Rotate, Block, Revoke, and Delete buttons](assets/admin-keys.png)
+
+Logs is the queryable view over the recent-request ring buffer, filterable by method, status, and path, with a control that retargets the tracing level at runtime:
+
+![The Logs page: recent requests with method, path, status, and duration, plus a tracing-level control](assets/admin-logs.png)
+
+The screenshots above were captured against a `--features embed-admin-ui` release build running a key-management example; to recapture after a UI change, boot `examples/use-case-own-openrouter/` and sign in.
+
 ## Security notes
 
 - Change the default `username` and `password`. The defaults exist for a

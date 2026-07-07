@@ -1,6 +1,6 @@
 # Getting started: AI estate (LLM gateway in front of model providers)
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-06*
 
 ## What you will build
 
@@ -8,48 +8,21 @@ A single OpenAI-compatible endpoint that sits in front of your model providers. 
 
 ## Prerequisites
 
-- Rust 1.95 or newer, only if you build from source. The published binary needs no toolchain.
 - A provider API key for Anthropic (`ANTHROPIC_API_KEY`) and one for OpenRouter (`OPENROUTER_API_KEY`) for the fallback path.
 - `curl` for sending requests, and `jq` if you want to pretty-print JSON responses.
 
-## Install and build
+## Install
 
-Most users install the prebuilt binary. Pick the option that fits your platform:
+One line installs the prebuilt binary on macOS or Linux; no toolchain required:
 
 ```bash
-# Linux / macOS, single static binary, no Rust toolchain required:
-curl -fsSL https://sbproxy.dev/install.sh | sh
-
-# macOS via Homebrew:
-brew install soapbucket/tap/sbproxy
-
-# Docker / Kubernetes:
-docker pull soapbucket/sbproxy:latest
+curl -fsSL https://download.sbproxy.dev | sh
 ```
 
-To build from source, use the debug or release target from the repository root:
+Homebrew, Docker, binary downloads, and source builds are in the [runtime manual's installation section](manual.md#1-installation). Run the gateway by pointing the binary at your config:
 
 ```bash
-# Debug build:
-make build
-
-# Release build, produces target/release/sbproxy:
-cargo build --release -p sbproxy
-```
-
-Run the gateway by pointing the binary at your config:
-
-```bash
-./target/release/sbproxy serve -f sb.yml
-```
-
-With Docker, mount the config and pass the same flag:
-
-```bash
-docker run --rm -p 8080:8080 \
-  -v "$PWD/sb.yml:/etc/sbproxy/sb.yml:ro" \
-  soapbucket/sbproxy:latest \
-  serve -f /etc/sbproxy/sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Minimal config
@@ -109,7 +82,7 @@ Export your keys and start the gateway:
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 export OPENROUTER_API_KEY=sk-or-...
-./target/release/sbproxy serve -f sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Send a clean request. Clients send OpenAI-shaped requests; the gateway translates to and from Anthropic and returns OpenAI shape:

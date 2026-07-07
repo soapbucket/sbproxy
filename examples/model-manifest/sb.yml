@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# Model host driven by a manifest (WOR-1681).
+# Model host driven by a manifest.
 #
 # The provider's serve.catalog_file points at models.yaml (the fleet
 # fact sheet). sb.yml stays the box fact sheet: what this box serves and
@@ -17,8 +17,9 @@ origins:
       type: ai_proxy
       providers:
         - name: local
-          base_url: http://127.0.0.1:8000/v1
-          allow_private_base_url: true
+          # No base_url: a served provider is hosted on this box, so the
+          # gateway resolves the engine's loopback port itself. Pairing
+          # base_url with serve: is rejected fatally at gateway boot.
           default_model: qwen3-14b
           models:
             - qwen3-14b

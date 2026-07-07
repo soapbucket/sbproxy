@@ -1,5 +1,5 @@
 # Performance
-*Last modified: 2026-04-24*
+*Last modified: 2026-07-06*
 
 What SBproxy delivers on real hardware, with the methodology you'd need to reproduce it.
 
@@ -52,6 +52,7 @@ Be honest with yourself about coverage:
 - **Localhost numbers in older docs are lower.** Single-laptop runs hit ephemeral-port exhaustion around 150 concurrent connections and conflate proxy work with the load generator's CPU. Use the c3 numbers above as the trustworthy floor; expect higher on bigger hardware.
 - **Hardware matters.** c3-standard-8 is a Sapphire Rapids instance with dedicated cores. Burstable VMs (e2, t-series) or AMD Milan (n2d) will land lower; recent EPYC and bare metal will land higher.
 - **Configuration matters.** Logging at `debug`, full-body logging, or expensive Lua transforms can each cut throughput in half.
+- **The AI rows predate the current AI-gateway feature set.** The matrix-v7 run measured the AI proxy path before the usage ledger, the CEL policy engine, the guardrail mesh, outcome-aware routing, and predictive budgets landed, and before the model host could serve weights on a local GPU. Each of those adds work per request, so treat the AI rows as a ceiling for a fully configured gateway and re-run the recipe with your config. For AI router strategy comparisons (round-robin vs peak-EWMA vs prefix-affinity and friends), see [ai-lb-benchmark.md](ai-lb-benchmark.md). Requests answered by the [model host](model-host.md) are bound by the engine's token generation rate, like the streaming row, not by the proxy.
 
 If you need numbers for your scenario, run the benchmark recipe yourself. Don't take the table above on faith.
 
@@ -145,10 +146,10 @@ See [architecture.md](architecture.md) for the full pipeline and [comparison.md]
 For your own dashboards, the metrics that move first:
 
 - `sbproxy_request_duration_seconds` (p50, p95, p99). The single most useful gauge.
-- `sbproxy_upstream_duration_seconds`. Subtract from above to get pure proxy overhead.
+- `sbproxy_phase_duration_seconds{phase="upstream_ttfb"}`. Time from the request's first byte to the first upstream response byte. Compare against the total request duration to see what the proxy itself adds.
 - `sbproxy_active_connections`. Sustained climb means your upstream is slower than incoming.
-- `sbproxy_cache_hit_ratio`. The number that moves p99 the most when caching is configured.
+- `sbproxy_cache_results_total`. Compute the hit ratio as `hit / (hit + miss)` from the `result` label. It is the number that moves p99 the most when caching is configured.
 - `sbproxy_config_reload_total`. A spike means your reload tooling is flapping.
-- `sbproxy_panic_total`. Should be zero. Page on it.
+- `sbproxy_silent_degradations_total`. Best-effort operations that failed and would otherwise be invisible. Should stay near zero; alert on growth.
 
 See [metrics-stability.md](metrics-stability.md) for the full catalogue and stability tier of every metric.

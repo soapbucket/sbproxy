@@ -1,6 +1,6 @@
 # Model host security
 
-*Last modified: 2026-07-05*
+*Last modified: 2026-07-06*
 
 The model host lets configuration start inference-engine subprocesses
 inside a gateway that also holds provider API keys. Spawning processes
@@ -45,6 +45,26 @@ in `sbproxy-model-host::config`:
 - **Unknown fields do not silently pass.** An unrecognized engine
   value is a config error, not a fallthrough.
 
+This is the entire executable-selecting surface a config gets. The
+shape matches [`examples/ai-local-serving`](../examples/ai-local-serving):
+
+```yaml
+serve:
+  eviction: lru
+  cache_budget_gib: 200
+  models:
+    - model: qwen3-14b
+      engine: vllm          # allowlisted: vllm, llama_cpp, or embedded
+                            # (default `auto` resolves to one of these at boot)
+      keep_alive: 30m
+      extra_args:           # one argv element per entry; a `$(...)` or `;`
+        - "--max-model-len" # inside a value is inert data because no
+        - "8192"            # shell ever parses the line
+```
+
+Writing `engine: run-my-script` fails the config load. There is no
+field anywhere in the block that names a program.
+
 ## What the shipped engine-spawn phase enforces
 
 The runtime launcher (`ProcessEngineLauncher`) has landed and been
@@ -79,6 +99,35 @@ certified on a real NVIDIA L4. The review of that surface:
 - **Container images are pinned.** An `engines:` container launch is
   rejected at `plan` time unless it names a tagged/digest image (no
   `latest`, no untagged).
+
+### Pinning weights in the manifest
+
+The model manifest is where the digest pins live: each entry names its
+source, pins a revision, and carries per-file sha256 digests, so a
+curated manifest doubles as a supply-chain allowlist. This stanza is
+from [`examples/model-manifest`](../examples/model-manifest), an
+air-gapped model whose weights never touch the network but still
+verify before the engine reads them:
+
+```yaml
+models:
+  offline-coder:
+    hf_repo: local/offline-coder
+    source: file:/var/lib/sbproxy/weights/qwen3-coder-gguf
+    quants: [Q4_K_M]
+    params: 30B-A3B
+    license: apache-2.0
+    family: qwen
+    min_vram_hint_gib: 18.0
+    engine: llama_cpp
+    pull: manual
+    sha256:
+      model.gguf: "0000000000000000000000000000000000000000000000000000000000000000"
+```
+
+Point `serve.catalog_file` at the manifest. A file whose digest does
+not match aborts the launch. A gated repo's `hf_token` is a secret
+reference (`${HF_TOKEN}`), never a literal in the file.
 
 ### Remaining hardening (not yet enforced)
 

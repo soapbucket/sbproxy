@@ -1,8 +1,10 @@
 # Migrating from LiteLLM
 
-*Last modified: 2026-06-24*
+*Last modified: 2026-07-06*
 
-This guide moves a LiteLLM proxy deployment to SBproxy. Your OpenAI-format clients keep working unchanged; you translate the config once and point traffic at SBproxy.
+![The importer translating a LiteLLM config, then a completion served through the migrated result](assets/migrate-litellm.gif)
+
+This guide moves a LiteLLM proxy deployment to SBproxy in an afternoon. Your OpenAI-format clients keep working unchanged; you translate the config once and point traffic at the new port. What replaces the Python service is the "Call any model. Serve your own. Govern both." binary: a single Apache-2.0 executable that routes to 66 providers, can serve the weights on your own GPUs, and works as a general reverse proxy at the same time, so the LLM gateway and the edge in front of it no longer have to be separate processes.
 
 ## TL;DR
 
@@ -13,11 +15,36 @@ sbproxy sb.yml
 
 `import-litellm` reads a LiteLLM `config.yaml` and writes an equivalent SBproxy `sb.yml` with one `ai_proxy` origin. It prints a warnings report to stderr listing every key that needs manual attention, and never fails on an unmapped key (only on a YAML parse error). Clients that already speak the OpenAI API need no change: keep calling `/v1/chat/completions`, `/v1/embeddings`, and the rest. `os.environ/VAR` references become SBproxy's `${VAR}` interpolation.
 
+## What you will build
+
+By the end you have an `sb.yml` that answers the same `/v1/chat/completions` calls your clients already make, keeping the public model names, per-model rate caps, and cache behavior your LiteLLM config declared. Anything the importer could not translate lands on a warnings list for you to handle by hand. The repo ships this walkthrough as a runnable pair in [examples/migrate-litellm/](../examples/migrate-litellm/): the LiteLLM `config.yaml`, the imported `sb.yml` annotated field by field, and a compose file that runs both proxies side by side so you can diff their answers before cutting over.
+
 ## Why migrate
 
 - SBproxy is a native-Rust proxy today. LiteLLM is mid-rewrite of its transformation core to Rust; you can skip the wait and run a Rust proxy now.
 - One config covers both the AI gateway and a general reverse proxy, so the gateway, routing, auth, rate limiting, and WAF live in a single binary.
 - The guardrail stack (injection, PII, jailbreak, toxicity, schema, context-poisoning, agent-alignment) is built in.
+
+## Prerequisites
+
+- A LiteLLM `config.yaml`. To rehearse on a safe copy first, use the one at `examples/migrate-litellm/config.yaml`; the commands below run against it.
+- `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` exported, since that example declares one model on each provider.
+- `curl` for sending requests and `jq` if you want readable JSON. You do not need a Rust toolchain or a Python environment.
+
+## Install
+
+```bash
+# Linux / macOS, single static binary:
+curl -fsSL https://download.sbproxy.dev | sh
+
+# macOS via Homebrew:
+brew install soapbucket/tap/sbproxy
+
+# Docker / Kubernetes:
+docker pull ghcr.io/soapbucket/sbproxy:latest
+```
+
+The [runtime manual](manual.md#1-installation) has the rest of the install matrix.
 
 ## Automated migration
 
@@ -101,20 +128,73 @@ origins:
       semantic_cache: { enabled: true }
 ```
 
+The committed version of this pair at [examples/migrate-litellm/](../examples/migrate-litellm/) adds two more LiteLLM keys, a budget kwarg and a `master_key`, so you can watch the warning path fire on input the importer cannot translate.
+
+## Run it
+
+Point the importer at the shipped example. It writes `sb.yml` and reports the two keys that need hands:
+
+```console
+$ sbproxy config import-litellm examples/migrate-litellm/config.yaml --out sb.yml
+config import-litellm: wrote sb.yml
+warning: model 'claude': litellm_params.max_budget has no sbproxy mapping; review manually
+warning: general_settings.master_key has no direct sbproxy mapping; configure proxy authentication (see the migration guide)
+config import-litellm: 2 key(s) need manual attention (see warnings above)
+```
+
+Both warnings are expected here; the [What needs manual migration](#what-needs-manual-migration) section covers them. Validate, then serve:
+
+```console
+$ sbproxy validate sb.yml
+ok: sb.yml is a valid sbproxy config
+$ export OPENAI_API_KEY=sk-...
+$ export ANTHROPIC_API_KEY=sk-ant-...
+$ sbproxy sb.yml
+```
+
+Send the request your clients already send, changing only the port:
+
+```console
+$ curl -s http://127.0.0.1:8080/v1/chat/completions \
+    -H 'Host: ai.local' \
+    -H 'Content-Type: application/json' \
+    -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Say hi."}]}'
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "model": "gpt-4o-mini-2024-07-18",
+  "choices": [{"message": {"role": "assistant", "content": "Hi! How can I assist you today?"}, "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 10, "completion_tokens": 9, "total_tokens": 19}
+}
+```
+
+The `model` field in the reply names the upstream model the public name mapped to through `model_map`. A request for `"model": "claude"` routes to Anthropic the same way.
+
+To watch both proxies answer the same request before you retire LiteLLM, run `docker compose up` inside `examples/migrate-litellm/`. It starts LiteLLM from `config.yaml` on port 4000 and SBproxy from `sb.yml` on port 8080; the README there has the diff commands.
+
 ## What needs manual migration
 
 These have no automatic translation; the importer warns and points here.
 
 - Python hooks given as module paths: `custom_auth`, `custom_sso`, `custom_key_generate`, and callback classes. SBproxy's analog is CEL, Lua, JavaScript, or WebAssembly scripting; rewrite the logic in one of those.
-- Open-ended `litellm_params` keyword arguments: the importer maps the known keys and warns on the rest, so review each warned key.
+- Open-ended `litellm_params` keyword arguments: the importer maps the known keys and warns on the rest, so review each warned key. Budget kwargs, for example, become an action-level `budget:` block ([examples/ai-budget](../examples/ai-budget/)).
 - External guardrail providers (Presidio, Lakera, Aporia, Bedrock): map each to a built-in SBproxy guardrail or an external guardrail adapter.
-- `general_settings.master_key`: set up proxy authentication explicitly.
+- `general_settings.master_key`: set up proxy authentication explicitly. Client keys move out of LiteLLM's database and into config, as `virtual_keys` or a `credentials` block ([examples/ai-virtual-keys](../examples/ai-virtual-keys/)).
 
 ## What is deferred
 
-Runtime parity for callback sinks, external guardrail adapters, multi-window budgets, per-error retry policy, and the `/model/info` family of endpoints is tracked separately and lands incrementally. The importer emits warnings where a target is not yet available so nothing is silently dropped.
+Runtime parity for callback sinks, external guardrail adapters, multi-window budgets, per-error retry policy, and the `/model/info` family of endpoints is tracked separately and lands incrementally. The importer emits a warning for every unmapped `litellm_params` entry and wherever a mapped feature's target is not yet available. One known gap: unknown keys under `litellm_settings`, `general_settings`, and `router_settings` are ignored without a warning today, so diff the emitted sb.yml against your source config before you delete the original.
 
-## See also
+## You are done when
 
-- [docs/ai-gateway.md](ai-gateway.md) for the AI gateway and routing strategies.
-- [docs/configuration.md](configuration.md) for the full config schema.
+- `sbproxy validate sb.yml` prints `ok: sb.yml is a valid sbproxy config`.
+- Every public model name from your `model_list` returns `200` through SBproxy with `usage.total_tokens` filled in, from the same client code that called LiteLLM.
+- Each line of the importer's warnings report is either resolved (a `budget:` block, `virtual_keys`, a rewritten hook) or deliberately parked.
+
+## Next steps
+
+- [examples/migrate-litellm/](../examples/migrate-litellm/) - the runnable pair from this guide, plus the side-by-side compose file
+- [examples/ai-virtual-keys/](../examples/ai-virtual-keys/) - per-team client keys, the follow-up for `master_key`
+- [examples/ai-budget/](../examples/ai-budget/) - budget enforcement, the follow-up for budget kwargs
+- [docs/ai-gateway.md](ai-gateway.md) - the AI gateway and routing strategies
+- [docs/configuration.md](configuration.md) - the full config schema, including `virtual_keys` and `budget`

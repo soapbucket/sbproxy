@@ -1,0 +1,21 @@
+# The gateway half of docs/use-case-serve-on-l4.md: SBproxy with a
+# one-model serve: config. Local serving needs a GPU and an engine
+# visible to the process, so a plain Docker host boots the gateway,
+# validates the serve: block, and logs a startup warning naming the
+# blocker instead of starting an engine. First-token serving runs the
+# binary on the L4 box itself, as the story doc walks through.
+#
+# Bring up:    docker compose up
+# Tear down:   docker compose down
+# Validate:    docker compose config
+#
+# No provider keys are needed: the config has no cloud provider.
+
+services:
+  sbproxy:
+    image: ghcr.io/soapbucket/sbproxy:latest
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    ports:
+      - "8080:8080"

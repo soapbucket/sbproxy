@@ -1,6 +1,6 @@
 # Getting started: Agent identity issuance and enforcement
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-06*
 
 ## What you will build
 
@@ -10,45 +10,23 @@ A gateway that gives AI agents a verifiable identity and enforces it at the edge
 
 - A shell with `curl`.
 - `openssl` (used below to generate an Ed25519 keypair for a test agent).
-- To build from source: Rust 1.82 or newer plus a C toolchain. You do not need the toolchain if you install a prebuilt binary (see the next section).
 - An upstream to proxy to. This guide uses `test.sbproxy.dev` as the placeholder upstream, following the repo convention.
 
-## Install and build
+## Install
 
-You do not have to compile anything to run SBproxy. Pick one of the install paths:
+You do not have to compile anything to run SBproxy. One line installs the prebuilt binary on macOS or Linux (the script detects OS and architecture and drops the binary in `~/.local/bin`):
 
 ```bash
-# curl (macOS / Linux): detects OS/arch, drops the binary in ~/.local/bin
 curl -fsSL https://download.sbproxy.dev | sh
-
-# Homebrew (macOS / Linux)
-brew tap soapbucket/tap
-brew install sbproxy
-
-# Docker
-docker pull ghcr.io/soapbucket/sbproxy:latest
 ```
 
-If you are working from a clone of the repo, build the binary locally:
+Homebrew, Docker, binary downloads, and source builds are in the [runtime manual's installation section](manual.md#1-installation). Run the gateway with a config file:
 
 ```bash
-git clone https://github.com/soapbucket/sbproxy
-cd sbproxy
-
-# Debug build -> target/debug/sbproxy
-make build
-
-# Optimised release build -> target/release/sbproxy
-cargo build --release -p sbproxy
+sbproxy serve -f sb.yml
 ```
 
-Run the gateway with a config file:
-
-```bash
-./target/release/sbproxy serve -f sb.yml
-```
-
-The same `serve -f <config>` form works for the installed binary (`sbproxy serve -f sb.yml`) and the Docker image (`ghcr.io/soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml`).
+The same `serve -f <config>` form works for the Docker image (`ghcr.io/soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml`).
 
 ## Minimal config
 
@@ -107,7 +85,7 @@ openssl pkey -in openai-bot.pem -pubout -outform DER | tail -c 32 | xxd -p -c 64
 Start the gateway:
 
 ```bash
-./target/release/sbproxy serve -f sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Enforcement: an unsigned request is rejected with `401`.

@@ -1,5 +1,7 @@
 # SBproxy threat model
 
+*Last modified: 2026-07-06*
+
 This is the OSS threat-model companion to [`operator-runbook.md`](operator-runbook.md).
 It records the operator-facing assumptions that should be revisited at the end
 of each implementation wave.

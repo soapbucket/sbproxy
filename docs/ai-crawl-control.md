@@ -1,6 +1,10 @@
 # AI Crawl Control + Pay Per Crawl
 *Last modified: 2026-07-05*
 
+![GPTBot receiving a 402 challenge, then the article after presenting a Crawler-Payment token](assets/ai-crawl-control.gif)
+
+Each token redeems exactly once ([config](../examples/ai-crawl-control/)).
+
 The `ai_crawl_control` policy implements the "Pay Per Crawl" pattern: AI crawlers that arrive without a valid `Crawler-Payment` token receive `402 Payment Required` along with a JSON challenge body. A crawler that wants the content reads the challenge, posts a payment to your billing system, and retries with the issued token in the `Crawler-Payment` header. Each token redeems exactly once.
 
 The OSS implementation ships an in-memory ledger seeded from config and an HTTPS-only HTTP ledger client for production. The enterprise build extends the same `Ledger` trait with managed adapters so the proxy can authorise tokens against Stripe, x402, MPP, and Lightning rails.
@@ -79,6 +83,10 @@ policies:
 Only `GET` and `HEAD` requests are subject to charging today. `POST`, `PUT`, `PATCH`, and `DELETE` pass through without charge.
 
 ## Tiered pricing
+
+![a crawler hitting a charged article URL and getting 402 while the free preview path returns 200](assets/ai-crawl-tiered.gif)
+
+Tiers price full HTML, Markdown feeds, and previews differently ([config](../examples/ai-crawl-tiered/)).
 
 A flat per-site price is the right starting point but not the right long-term shape. Different routes carry different commercial value, and the same article in three formats (HTML, Markdown, PDF) is worth three different prices to a training crawler. The `tiers:` field lets you price by route pattern and content shape without forking the policy.
 

@@ -67,7 +67,7 @@ The example only carries the PUBLIC key. The matching private key lives outside 
 3. Publish the public half here so verifiers can discover it.
 4. To rotate: add the new public key to the `web_bot_auth_publish` block (when multi-key publish ships) alongside the old one, swap the signer, then drop the old key once outstanding signatures have aged out.
 
-The signing primitive that consumes the private side is `sbproxy_middleware::signatures::MessageSignatureSigner` (shipped in WOR-805 AC#3).
+The signing primitive that consumes the private side is `sbproxy_middleware::signatures::MessageSignatureSigner`.
 
 ## See also
 

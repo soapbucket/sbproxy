@@ -1,0 +1,36 @@
+# A small but realistic LiteLLM proxy config, the "before" side of the
+# migration pair in this directory. Run the importer against it:
+#
+#   sbproxy config import-litellm examples/migrate-litellm/config.yaml
+#
+# and compare the output with the committed sb.yml next to this file.
+# See docs/migration-litellm.md for the field-by-field mapping.
+model_list:
+  # Public name "gpt-4", served by OpenAI's gpt-4o-mini, with per-deployment
+  # request and token caps. All three map automatically.
+  - model_name: gpt-4
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+      rpm: 100
+      tpm: 200000
+  # Public name "claude", served by Anthropic. The budget kwarg has no
+  # automatic translation; the importer warns and points at the migration
+  # guide instead of dropping it silently.
+  - model_name: claude
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      max_budget: 25.0
+router_settings:
+  # Maps to SBproxy's lowest_latency routing strategy.
+  routing_strategy: latency-based-routing
+litellm_settings:
+  # Maps to semantic_cache.enabled on the SBproxy side.
+  cache: true
+general_settings:
+  # The admin key that gates LiteLLM's virtual-key API. Virtual keys
+  # themselves live in LiteLLM's database, not in this file, so the importer
+  # flags this line for a manual follow-up: SBproxy declares keys in config
+  # (virtual_keys / credentials) rather than behind a master key.
+  master_key: os.environ/LITELLM_MASTER_KEY

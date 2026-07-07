@@ -1,0 +1,82 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Air-gapped AI gateway: local weights, local guardrails, zero egress.
+#
+# There is no cloud provider anywhere in this file. The only provider is
+# the box itself (a serve: block), the weights come from a file: source
+# named in models.yaml, and every check that inspects a prompt runs in
+# process or over loopback. The config gives the gateway nothing to
+# call out to.
+#
+# Run (from the repo root):
+#   sbproxy examples/use-case-air-gapped/sb.yml
+# Or:
+#   docker compose up   (from this directory; internal-only network)
+#
+# Story doc: ../../docs/use-case-air-gapped.md
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.internal":
+    action:
+      type: ai_proxy
+      providers:
+        # A served provider carries no api_key and no base_url: the
+        # gateway hosts the model itself and resolves the loopback
+        # endpoint internally. Nothing here names an external address.
+        - name: local
+          default_model: offline-coder
+          models: [offline-coder]
+          serve:
+            # The manifest is the reviewable allowlist: sources,
+            # revisions, digests, pull policy. Path is relative to the
+            # repo root; the compose file mounts it at the same path.
+            catalog_file: examples/use-case-air-gapped/models.yaml
+            # Weight cache for managed pulls. Unused for file: sources
+            # (weights are read in place) but pinned here so nothing
+            # falls back to $HF_HOME conventions.
+            cache_dir: /var/lib/sbproxy/models
+            eviction: lru
+            models:
+              # Names a manifest id; engine and pull policy come from
+              # the manifest entry.
+              - model: offline-coder
+
+      guardrails:
+        input:
+          # Both guardrails are in-process pattern checks. They block
+          # before any dispatch, and in this config there is nowhere
+          # external to dispatch to anyway.
+          - type: injection
+            detect_common: true
+            action: block
+          - type: pii
+            patterns: [email, phone, ssn, credit_card]
+            action: block
+
+      # Near-duplicate prompts served from cache. source: sidecar keeps
+      # the embedding model on this box (ONNX over loopback gRPC); the
+      # default source would call a provider's /v1/embeddings API, which
+      # is exactly the kind of quiet egress this config exists to avoid.
+      # With no sidecar running, lookups degrade to misses.
+      semantic_cache:
+        enabled: true
+        threshold: 0.85
+        ttl_secs: 3600
+        max_entries: 1024
+        source: sidecar
+        sidecar:
+          endpoint: http://127.0.0.1:9440
+          model: all-MiniLM-L6-v2
+          timeout_ms: 500
+
+    policies:
+      # Second injection layer with its own threshold. heuristic-v1 is
+      # the zero-dependency in-process detector; the on-box ONNX
+      # classifier (detector: sidecar) is the documented upgrade once a
+      # classifier sidecar runs on this host. See
+      # ../../docs/local-inference.md.
+      - type: prompt_injection_v2
+        threshold: 0.8
+        action: block
+        detector: heuristic-v1

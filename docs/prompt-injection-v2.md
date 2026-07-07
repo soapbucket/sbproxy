@@ -56,7 +56,7 @@ pre-loads state at startup, not in `detect` itself.
 
 ### In-process detection (the `inprocess` detector)
 
-For a single binary, run the ONNX classifier in the proxy. WOR-612 removed the original in-process detector because an unsandboxed model parse could exhaust the proxy; this brings it back only behind the explicit `detector: inprocess` choice plus a hard `max_model_bytes` cap, and the operator supplies the model and tokenizer paths (OSS ships no weights).
+For a single binary, run the ONNX classifier in the proxy. The original in-process detector was removed because an unsandboxed model parse could exhaust the proxy; this brings it back only behind the explicit `detector: inprocess` choice plus a hard `max_model_bytes` cap, and the operator supplies the model and tokenizer paths (OSS ships no weights).
 
 ```yaml
 policies:

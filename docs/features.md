@@ -1,8 +1,8 @@
 # SBproxy features manual
 
-*Last modified: 2026-06-08*
+*Last modified: 2026-07-06*
 
-Reference for SBproxy features. Each section covers what a feature does, how to configure it, and a working example against `test.sbproxy.dev`.
+The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
 ---
 
@@ -21,23 +21,19 @@ Core capabilities:
 ### Install
 
 ```bash
-git clone https://github.com/soapbucket/sbproxy
-cd sbproxy
-make build-release
-# Binary at target/release/sbproxy
-
-# Docker
-docker pull ghcr.io/soapbucket/sbproxy:latest
+curl -fsSL https://download.sbproxy.dev | sh
 ```
+
+Homebrew, Docker, binary downloads, and source builds are covered in the [runtime manual's installation section](manual.md#1-installation).
 
 ### Run
 
 ```bash
-make run CONFIG=sb.yml           # Convenience runner
 sbproxy serve -f sb.yml          # Start from config file
 sbproxy validate --config sb.yml # Validate config without starting
-sbproxy version                  # Show version
 ```
+
+The full CLI (plan, apply, doctor, projections, flags) is in the [runtime manual](manual.md#2-cli-reference).
 
 ### Minimal config
 
@@ -55,6 +51,10 @@ origins:
 ```bash
 curl -H "Host: test.sbproxy.dev" http://localhost:8080/echo
 ```
+
+![two curls through the minimal config, /echo and /health both answered by the upstream echo service](assets/basic-proxy.gif)
+
+The recording drives the simplest runnable config, one origin proxying to test.sbproxy.dev ([config](../examples/basic-proxy/)).
 
 ---
 
@@ -147,20 +147,7 @@ See [providers.md](providers.md) for the full provider matrix.
 
 ### Routing strategies
 
-The `routing.strategy` field controls how requests are distributed across providers.
-
-| Strategy | Description |
-|---|---|
-| `round_robin` | Cycle through providers in order |
-| `weighted` | Distribute by provider weight |
-| `fallback_chain` | Try in order, fall back on failure |
-| `random` | Pick a provider uniformly at random |
-| `lowest_latency` | Route to the fastest responding provider |
-| `cost_optimized` | Route to cheapest provider per token |
-| `least_connections` | Route to provider with fewest active requests |
-| `token_rate` | Balance by token consumption rate |
-| `sticky` | Pin requests to a provider using session/key |
-| `race` | Fan out to every healthy provider in parallel; first non-error response wins, the rest are cancelled |
+The `routing.strategy` field controls how requests are distributed across providers. Sixteen strategies ship, from the simple (`round_robin`, `weighted`, `fallback_chain`, `random`, `sticky`) through load- and cost-driven (`lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`) to the quality- and outcome-driven set (`race`, `cascade`, `cost_quality`, `outcome_aware`). [ai-gateway.md](ai-gateway.md#routing-strategies) documents each one; `outcome_aware`, which routes on realized cost-per-success, has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
 
 ```yaml
 action:
@@ -169,20 +156,22 @@ action:
     - name: primary
       api_key: ${OPENAI_API_KEY}
       models: [gpt-4o]
-      weight: 3
     - name: fallback
       api_key: ${ANTHROPIC_API_KEY}
       models: [claude-sonnet-4-5]
-      weight: 1
   routing:
     strategy: fallback_chain
 ```
 
-Provider order in the `providers` list determines fallback order. The router walks the list and tries each provider until one succeeds.
+With `fallback_chain`, provider order in the `providers` list determines fallback order. The router walks the list and tries each provider until one succeeds.
 
 ### Streaming
 
-All providers stream responses over Server-Sent Events (SSE). Set `"stream": true` in the request body.
+![a chat completion with "stream": true arriving as server-sent-events chunks in real time](assets/ai-streaming.gif)
+
+Streaming needs no gateway config; the client's request body selects it ([config](../examples/ai-streaming/)).
+
+All providers stream responses over Server-Sent Events (SSE). Set `"stream": true` in the request body; no proxy config is needed. Per-provider usage extraction from streamed chunks is covered in [ai-gateway.md](ai-gateway.md#streaming).
 
 ```bash
 curl -H "Host: ai.test.sbproxy.dev" \
@@ -193,7 +182,7 @@ curl -H "Host: ai.test.sbproxy.dev" \
 
 ### Budget enforcement
 
-Cap AI spend and token usage by workspace, API key, or user:
+Cap AI spend and token usage by workspace, API key, user, model, origin, or tag. When a limit fires, `on_exceed` decides whether the request is blocked, logged through, or downgraded to a cheaper model:
 
 ```yaml
 action:
@@ -206,49 +195,30 @@ action:
       - scope: workspace
         max_cost_usd: 500.00
         period: monthly
-      - scope: api_key
-        max_tokens: 1000000
-        period: daily
-        downgrade_to: gpt-4o-mini    # Per-limit downgrade target
-    on_exceed: block                  # "block", "log", or "downgrade"
+    on_exceed: block    # "block", "log", or "downgrade"
 ```
 
-`on_exceed` is one of:
-- `block`: reject the request with 429 (default)
-- `log`: log a warning but allow the request through
-- `downgrade`: rewrite the request's model to the limit's `downgrade_to` value
+Scopes, periods, downgrade targets, and cluster-shared counters are in [ai-gateway.md](ai-gateway.md#budgets). To taper spend as a scope approaches its cap instead of hitting a cliff, add a `soft_landing` block; see [ai-predictive-budget.md](ai-predictive-budget.md).
 
 ### Unified model registry
 
-When clients send requests with any model name, SBproxy routes to the provider that serves it (based on each provider's `models:` list). No extra flag is required:
+Clients send any model name and SBproxy routes to the provider that declares it in its `models:` list, so one endpoint fronts every vendor. A request for `"model": "claude-sonnet-4-5"` routes to Anthropic; `"model": "gpt-4o"` routes to OpenAI. Wildcard providers and pass-through of undeclared models are in [ai-gateway.md](ai-gateway.md#model-based-provider-selection).
 
-```yaml
-action:
-  type: ai_proxy
-  providers:
-    - name: openai
-      api_key: ${OPENAI_API_KEY}
-      models: [gpt-4o, gpt-4o-mini]
-    - name: anthropic
-      api_key: ${ANTHROPIC_API_KEY}
-      models: [claude-sonnet-4-5]
-```
+### Cost attribution
 
-A request for `"model": "claude-sonnet-4-5"` routes to Anthropic; a request for `"model": "gpt-4o"` routes to OpenAI.
+Per-request provider, model, token counts, and estimated USD cost land on the `sbproxy_ai_*` Prometheus metrics, partitioned by tenant and credential; they are not emitted as response headers. See [ai-gateway.md](ai-gateway.md#per-request-attribution). For a tamper-evident spend record you can verify after the fact, configure the usage ledger sink; see [ai-usage-ledger.md](ai-usage-ledger.md).
 
-### Cost headers
+### Guardrails, policy, and resilience
 
-AI responses pick up cost headers:
-
-- `X-Sb-Cost-Usd`: estimated cost in USD
-- `X-Sb-Tokens-In`: input tokens
-- `X-Sb-Tokens-Out`: output tokens
-- `X-Sb-Provider`: provider that handled the request
-- `X-Sb-Model`: model used
+The AI path composes with input/output guardrails (nine detector types plus an opt-in [guardrail mesh](ai-guardrail-mesh.md) that fuses verdicts under a quorum rule), a one-expression [AI policy plane](ai-policy-cel.md) over the pipeline's own signals, and [LLM-aware resilience](ai-llm-aware-resilience.md) that classifies upstream failures into typed causes and retries per class. Each link is the owning reference; [ai-gateway.md](ai-gateway.md) carries the end-to-end picture.
 
 ---
 
 ## 4. Load balancing
+
+![six consecutive requests dispatched round-robin across a two-target pool, each returning 200](assets/load-balancer.gif)
+
+A minimal two-target round-robin pool serves them ([config](../examples/load-balancer/)).
 
 The `load_balancer` action distributes traffic across multiple upstream targets.
 
@@ -336,6 +306,10 @@ Each target is an object with `url` plus optional fields:
 
 ### Deployment modes
 
+![a blue-green pool with active: green routing every request to the green group's upstream](assets/load-balancer-deployment.gif)
+
+Flip `active:` and reload to cut traffic over without touching the targets list ([config](../examples/load-balancer-deployment/)).
+
 Set `deployment_mode:` for blue-green or canary rollouts. Targets must be tagged with the matching `group:`.
 
 Blue-green - 100 percent of traffic goes to the active group:
@@ -371,6 +345,10 @@ action:
 
 Each target has its own health check. Unhealthy targets are dropped from rotation until they recover.
 
+![requests answered 200 by the healthy target while the failing one is probed and held out of rotation](assets/active-health-checks.gif)
+
+One of the two targets always returns 503, so the probe loop marks it unhealthy ([config](../examples/active-health-checks/)).
+
 ```yaml
 action:
   type: load_balancer
@@ -393,6 +371,10 @@ action:
 SBproxy supports 7 authentication types. Pick one per origin under `authentication:`.
 
 ### API key (`api_key`)
+
+![a request without X-Api-Key rejected with 401, then accepted once the key header is present](assets/auth-api-key.gif)
+
+Two curls against the same origin show the deny and allow paths ([config](../examples/auth-api-key/)).
 
 Accept requests with a valid API key in the `X-API-Key` header.
 
@@ -421,6 +403,10 @@ curl -H "Host: api.test.sbproxy.dev" http://localhost:8080/echo
 
 ### Basic auth (`basic_auth`)
 
+![an unauthenticated request getting 401, then a 200 with the right username and password](assets/auth-basic.gif)
+
+Recorded against the runnable basic-auth origin ([config](../examples/auth-basic/)).
+
 Standard HTTP Basic authentication.
 
 ```yaml
@@ -440,6 +426,10 @@ curl -H "Host: api.test.sbproxy.dev" \
 ```
 
 ### Bearer token (`bearer`)
+
+![a request denied 401 until it carries Authorization: Bearer with a listed token](assets/auth-bearer.gif)
+
+The token list lives in the origin's `authentication` block ([config](../examples/auth-bearer/)).
 
 Accept requests with a valid token in the `Authorization: Bearer` header.
 
@@ -476,6 +466,10 @@ curl -H "Host: api.test.sbproxy.dev" \
 ```
 
 ### Forward auth (`forward_auth`)
+
+![a bearer-carrying request approved by the external auth service and proxied through](assets/auth-forward.gif)
+
+The proxy consults the forward-auth endpoint before the action runs ([config](../examples/auth-forward/)).
 
 Delegate authentication to an external service. The subrequest result decides access.
 
@@ -520,6 +514,10 @@ authentication:
 Policies run after authentication, in order. Every policy in the list must pass.
 
 ### WAF (web application firewall)
+
+![a clean request passing the WAF, then a SQL injection in the query string blocked with 403](assets/waf.gif)
+
+The OWASP Core Rule Set screens each request before the upstream sees it ([config](../examples/waf/)).
 
 The WAF policy applies ModSecurity-compatible rules, with the OWASP Core Rule Set (CRS) available as an option.
 
@@ -720,6 +718,10 @@ There is no measurable per-request cost; the policy reads two headers from a `Ha
 
 ### DDoS protection
 
+![30 parallel requests from one IP: the first ten pass, the rest return 429 while the block holds](assets/ddos-protection.gif)
+
+Once the 1-second rate threshold trips, the source IP stays blocked for the configured duration ([config](../examples/ddos-protection/)).
+
 Detect and mitigate traffic spikes and volumetric attacks.
 
 ```yaml
@@ -739,6 +741,10 @@ policies:
 ```
 
 ### Rate limiting
+
+![30 rapid requests sorted into 200s for the admitted burst and 429s for the excess](assets/rate-limiting.gif)
+
+A 5 requests-per-second token bucket with burst 10 protects the upstream ([config](../examples/rate-limiting/)).
 
 Cap request rates per client IP with four algorithm choices.
 
@@ -795,6 +801,10 @@ Common keying idioms:
 
 ### IP filtering
 
+![a loopback request accepted, then one claiming a public source address rejected with 403](assets/ip-filter.gif)
+
+Only loopback and one private range are whitelisted ([config](../examples/ip-filter/)).
+
 Allow or block requests by IP address or CIDR range.
 
 ```yaml
@@ -812,6 +822,10 @@ If `whitelist` is non-empty, the client IP must match an entry. `blacklist` alwa
 
 ### CSRF protection
 
+![a GET issuing the csrf_token cookie, then a POST without the matching token rejected with 403](assets/csrf.gif)
+
+Safe methods hand out the token; state-changing methods must echo it back ([config](../examples/csrf/)).
+
 Protect state-changing requests from cross-site forgery.
 
 ```yaml
@@ -827,6 +841,10 @@ policies:
 ```
 
 ### Security headers
+
+![one response arriving with the full hardening set: HSTS, X-Frame-Options, nosniff, Referrer-Policy, Permissions-Policy, and CSP](assets/security-headers.gif)
+
+A single `security_headers` policy stamps them all ([config](../examples/security-headers/)).
 
 Inject security-oriented HTTP response headers.
 
@@ -855,7 +873,15 @@ policies:
       #     policy: "default-src 'self' admin.example.com"
 ```
 
+![a response carrying Strict-Transport-Security with a one-year max-age, includeSubDomains, and preload](assets/hsts.gif)
+
+The standalone `hsts` block emits just this header when you do not want the full set ([config](../examples/hsts/)).
+
 ### Request limiting
+
+![a small JSON POST passing, then a 4 KB body rejected at the edge for exceeding the 1 KB cap](assets/request-limit.gif)
+
+`request_limit` also caps header count and URL length before the upstream is contacted ([config](../examples/request-limit/)).
 
 Enforce limits on request size and complexity.
 
@@ -874,6 +900,10 @@ Any limit set to `null` (or omitted) is unchecked. Sizes accept either a raw byt
 
 ### SRI (subresource integrity)
 
+![a page with a stylesheet missing its integrity attribute, and the sbproxy_policy_triggers_total counter recording the violation](assets/sri.gif)
+
+Observation mode logs and counts; the body is never modified ([config](../examples/sri/)).
+
 Validate resource integrity hashes in HTML responses.
 
 ```yaml
@@ -884,6 +914,10 @@ policies:
 ```
 
 ### Expression policy (CEL/Lua)
+
+![requests without the required X-Tenant: acme header rejected with 403 by a one-line CEL expression](assets/cel-policy.gif)
+
+The whole policy is a single CEL comparison on a request header ([config](../examples/cel-policy/)).
 
 Evaluate custom access control logic per request.
 
@@ -920,6 +954,10 @@ CEL has access to:
 ## 7. Caching
 
 ### Response cache
+
+![the first request logging x-sbproxy-cache: MISS and the identical second one returning HIT](assets/response-caching.gif)
+
+Same URL, same key, no second upstream call ([config](../examples/response-caching/)).
 
 Cache upstream responses to reduce backend load.
 
@@ -1093,6 +1131,10 @@ Transforms modify request or response bodies. Multiple transforms run in order. 
 
 ### JSON field filtering
 
+![a four-field JSON document reduced to just id and title by the whitelist projection](assets/transform-json-projection.gif)
+
+`json_projection` keeps the listed fields and drops the rest ([config](../examples/transform-json-projection/)).
+
 Keep or remove specific fields from JSON responses:
 
 ```yaml
@@ -1116,6 +1158,10 @@ curl -H "Host: api.test.sbproxy.dev" http://localhost:8080/echo
 
 ### JSON field manipulation
 
+![an upstream post reshaped in flight: userId renamed to author_id, body removed, and a source field added](assets/transform-json.gif)
+
+The `json` transform applies renames, removals, and sets before the client sees the body ([config](../examples/transform-json/)).
+
 Set, remove, or rename top-level fields in a JSON response:
 
 ```yaml
@@ -1133,6 +1179,10 @@ transforms:
 
 ### JSON schema validation
 
+![a schema-conforming response passing through, then a body with wrong field types replaced by a synthetic 502](assets/transform-json-schema.gif)
+
+With `fail_on_error: true` a violating upstream body never reaches the client ([config](../examples/transform-json-schema/)).
+
 Reject responses that don't conform to a schema:
 
 ```yaml
@@ -1148,6 +1198,10 @@ transforms:
 ```
 
 ### HTML transforms
+
+![an HTML page rewritten in flight: the h1 removed, a banner div prepended, and data-rewritten stamped on each paragraph](assets/transform-html.gif)
+
+The upstream page is fetched live and rewritten before it is served ([config](../examples/transform-html/)).
 
 Inject or remove HTML content and rewrite element attributes:
 
@@ -1184,6 +1238,10 @@ transforms:
 
 ### String replacement
 
+![a body with internal.example.com swapped to public.example.com and a 16-digit number redacted by regex](assets/transform-replace-strings.gif)
+
+Literal and regex rules run together in one pass ([config](../examples/transform-replace-strings/)).
+
 Find and replace strings in response bodies:
 
 ```yaml
@@ -1202,6 +1260,10 @@ transforms:
 
 ### Payload size limit
 
+![the same 4096-byte upstream response measured direct, then cut to the configured cap through the proxy](assets/transform-payload-limit.gif)
+
+curl's size_download makes the truncation visible ([config](../examples/transform-payload-limit/)).
+
 Truncate or reject oversized responses:
 
 ```yaml
@@ -1212,6 +1274,10 @@ transforms:
 ```
 
 ### Markdown to HTML
+
+![a Markdown release-notes document served as rendered HTML with tables and smart punctuation](assets/transform-markdown.gif)
+
+pulldown-cmark does the conversion inside the proxy ([config](../examples/transform-markdown/)).
 
 Render Markdown responses as HTML:
 
@@ -1235,6 +1301,10 @@ transforms:
 ```
 
 ### HTML to Markdown / HTML optimization
+
+![the upstream HTML page returned as clean Markdown](assets/transform-html-to-markdown.gif)
+
+Useful for feeding pages to agents without shipping markup ([config](../examples/transform-html-to-markdown/)).
 
 Convert rendered HTML to Markdown for downstream LLM consumers, or shrink HTML for size:
 
@@ -1271,6 +1341,14 @@ transforms:
 ```
 
 The Lua entrypoint receives a decoded JSON value and returns the modified value. The JavaScript entrypoint receives the body as a string and returns a string (or any value, which SBproxy serializes via JSON).
+
+![a lua_json script uppercasing the title, deriving word_count, dropping body, and stamping transformed_by: lua](assets/transform-lua.gif)
+
+The script receives the decoded JSON as a Lua table ([config](../examples/transform-lua/)).
+
+![a QuickJS transform adding title_length and a reversed title, trimming the body, and stamping transformed_by: javascript](assets/transform-javascript.gif)
+
+The JavaScript entrypoint works on the raw body string ([config](../examples/transform-javascript/)).
 
 ### Content negotiation and licensing for AI agents
 
@@ -1582,6 +1660,10 @@ X-Sb-Session-Id: 01HQRP1KJVH3JPCJ8SAVAV6F4Z
 
 ### Forward rules
 
+![one gateway host sending /api to a JSON upstream with the prefix stripped and /admin to a static banner](assets/forward-rules.gif)
+
+Rules evaluate in order and each embeds a full child origin ([config](../examples/forward-rules/)).
+
 Route requests to different origins based on request attributes. Forward rules evaluate in order; first match wins.
 
 ```yaml
@@ -1662,6 +1744,10 @@ curl -H "Host: api.test.sbproxy.dev" http://localhost:8080/api/v2/foo  # Routes 
 
 ### Custom error pages
 
+![a 401 rendered by the custom error-page table, then as JSON when the client sends Accept: application/json](assets/error-pages.gif)
+
+`error_pages` intercepts proxy-generated errors and negotiates the representation ([config](../examples/error-pages/)).
+
 Return branded error responses instead of the default proxy errors:
 
 ```yaml
@@ -1685,6 +1771,10 @@ error_pages:
 ```
 
 ### Sessions
+
+![a first response setting the encrypted sb_session cookie and a second request presenting it back](assets/sessions.gif)
+
+The static action makes cookie issuance visible without a backend ([config](../examples/sessions/)).
 
 SBproxy keeps a session layer for cookie-based state:
 
@@ -1712,7 +1802,15 @@ on_request:
 
 The matching `on_response` hook fires after the action and can shape outgoing data (audit logs, side-channel notifications).
 
+![a proxied request whose lifecycle webhooks go out with X-Sbproxy-Timestamp and an HMAC X-Sbproxy-Signature header](assets/webhook-signing.gif)
+
+Set `secret` on a callback and every delivery is signed for receiver verification ([config](../examples/webhook-signing/)).
+
 ### Compression
+
+![the same response served brotli then gzip, picked from Accept-Encoding, with content-length showing the savings](assets/compression.gif)
+
+`min_size` keeps tiny payloads uncompressed ([config](../examples/compression/)).
 
 SBproxy can compress responses with gzip, Brotli, or Zstandard:
 
@@ -1739,6 +1837,10 @@ curl -H "Host: api.test.sbproxy.dev" \
 
 ### CORS
 
+![injected request and response headers plus an OPTIONS preflight answered for https://example.com](assets/headers-and-cors.gif)
+
+One origin combines request_modifiers, response_modifiers, and a cors block ([config](../examples/headers-and-cors/)).
+
 Add Cross-Origin Resource Sharing headers.
 
 ```yaml
@@ -1755,6 +1857,10 @@ cors:
 ```
 
 ### Variables and templates
+
+![declared variables and environment values interpolated into request headers and echoed back by the upstream](assets/variables-template.gif)
+
+Interpolation happens at request time, including nested keys ([config](../examples/variables-template/)).
 
 Define variables to use in header values, bodies, and callbacks:
 
@@ -1882,6 +1988,10 @@ Brief schemas for actions, policies, transforms, and origin fields not covered a
 | `websocket` | Proxy upstream WebSocket connections |
 | `grpc` | Proxy to an upstream gRPC server |
 
+![an index page and a CSS file served from an object-store backend with content-type and etag headers](assets/storage-action.gif)
+
+The `storage` action here uses the local backend; s3, gcs, and azure swap in with credentials ([config](../examples/storage-action/)).
+
 WebSocket and gRPC actions take an upstream URL plus optional protocol-specific tuning:
 
 ```yaml
@@ -1926,6 +2036,14 @@ transforms:
       }
 ```
 
+![a JSON order document rendered into a plaintext receipt by a minijinja template](assets/transform-template.gif)
+
+The `template` transform parses the body as JSON and renders it as the new response ([config](../examples/transform-template/)).
+
+![a JSON body served base64-encoded by the encoding transform, then decoded back with base64 -d](assets/transform-encoding.gif)
+
+base64_decode, url_encode, and url_decode are the other modes ([config](../examples/transform-encoding/)).
+
 ### Origin-level extras
 
 | Field | Description |
@@ -1936,6 +2054,10 @@ transforms:
 | `traffic_capture` | Mirror or capture request/response traffic |
 | `message_signatures` | RFC 9421 HTTP message signatures |
 | `connection_pool` | Per-origin pool tuning (size, idle timeout) |
+
+![the primary upstream answering 503 while the client receives the fallback's 200 degraded body with an X-Fallback header](assets/fallback-origin.gif)
+
+`fallback_origin` serves a backup action on listed statuses or transport errors ([config](../examples/fallback-origin/)).
 
 ### Proxy-level extras
 

@@ -69,7 +69,7 @@ exporters:
     tls:
       insecure: true
 
-  # Traces -> Arize Phoenix (WOR-1227), the LLM-native backend that renders
+  # Traces -> Arize Phoenix, the LLM-native backend that renders
   # SBproxy AI spans as full generations. Phoenix accepts OTLP HTTP on 6006.
   # The x-project-name header pre-provisions/routes traces into a stable
   # Phoenix project instead of the default bucket.

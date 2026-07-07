@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-07*
+*Last modified: 2026-07-06*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -525,7 +525,7 @@ origins:
 
 ### Credentials at the tenant scope
 
-Each tenant can declare its own `credentials:` block alongside the proxy default. Resolution at request time walks origin → tenant → proxy. The same credential `name:` re-declared at a more specific scope shadows the broader scope, so a tenant can override the proxy default key + budget without rewriting the rest. See [Credentials block](#credentials-block) below and `docs/migration-credentials.md` for the worked migration from the legacy `virtual_keys:` shape.
+Each tenant can declare its own `credentials:` block alongside the proxy default. Resolution at request time walks origin → tenant → proxy. The same credential `name:` re-declared at a more specific scope shadows the broader scope, so a tenant can override the proxy default key + budget without rewriting the rest. See [migration-credentials.md](migration-credentials.md) for the worked migration from the legacy `virtual_keys:` shape.
 
 ---
 
@@ -648,6 +648,10 @@ origins:
 The same `host_override` and `disable_*_header` flags are accepted on every URL-bearing action: `proxy`, `load_balancer` targets, `websocket`, `grpc` (via the `:authority` field), `graphql`, `a2a`, and `forward_auth`.
 
 ### static
+
+![A static action answering with fixed body and headers next to a mock action templating the request back](assets/static-and-mock.gif)
+
+([config](../examples/static-and-mock/))
 
 Return a fixed response without proxying to any upstream. Good for health check endpoints, maintenance pages, and mock APIs.
 
@@ -921,10 +925,12 @@ origins:
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
-| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. |
+| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
+| `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
+| `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
 
-Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each.
+Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`, `outcome_aware`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
 
 `default_model` is a per-provider field, not an action-level field. Set it on each `providers[]` entry.
 
@@ -947,6 +953,7 @@ Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowe
 | `timeout_ms` | int | unset | Request timeout in milliseconds. |
 | `organization` | string | | Organization identifier for providers that scope keys per org. |
 | `api_version` | string | | API version header value (e.g. for Anthropic and Azure OpenAI). |
+| `no_prompt_training` | bool | `false` | Marks the provider safe for training-sensitive prompts. Requests carrying the `x-sbproxy-disallow-prompt-training: true` header only route to providers with this flag; a request with the header and no marked provider in the chain gets a 400 `no_compliant_provider`. |
 
 #### Virtual keys (`virtual_keys[]`)
 
@@ -987,6 +994,7 @@ virtual_keys:
 |-------|------|---------|-------------|
 | `limits` | list | `[]` | Budget rules. See below. |
 | `on_exceed` | string | `block` | Action when a limit is hit: `block`, `log`, `downgrade`. |
+| `soft_landing` | object | unset | Graceful degradation before the cap (`warn_at`, `downgrade_at`, `downgrade_to`). See [ai-predictive-budget.md](ai-predictive-budget.md). |
 
 Each `limits[]` entry:
 
@@ -1038,10 +1046,11 @@ per_surface_rate_limits:
 |-------|------|---------|-------------|
 | `input` | list | `[]` | Guardrails evaluated against the incoming request body. |
 | `output` | list | `[]` | Guardrails evaluated against the model output. |
+| `mesh` | object | unset | Runs input detectors as a cascade and fuses verdicts under a quorum rule (`block_threshold`, `redact_on_flag`, `cache`, `cache_capacity`, `latency_budget_ms`). See [ai-guardrail-mesh.md](ai-guardrail-mesh.md). |
 
-Each entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`. See [ai-gateway.md](ai-gateway.md) for per-guardrail fields.
+Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
 
-See the [AI Gateway Guide](ai-gateway.md) for CEL selectors, Lua hooks, guardrails, context window validation, cost headers, and streaming behavior.
+See the [AI Gateway Guide](ai-gateway.md) for CEL selectors, Lua hooks, guardrails, context window validation, per-request attribution, and streaming behavior.
 
 #### Resilience (`resilience`)
 
@@ -1067,6 +1076,8 @@ resilience:
 ```
 
 When `resilience` is set, retries fan across providers up to `min(providers.len(), 5)` attempts; ejected providers are skipped on the second and later attempts.
+
+The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class retry counts, e.g. `rate_limit: 3`), `llm_aware.context_compress` plus `llm_aware.completion_reserve_tokens` (fit an over-long prompt to the model's window before dispatch), and `content_policy_fallback` (route a content-policy refusal to the next provider in priority order). Semantics and the failure-cause table are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
 
 #### Shadow (`shadow`)
 
@@ -2252,6 +2263,10 @@ malformed `aipref` headers leave all three values at `true`.
 
 ## Request modifiers
 
+![A request gaining an injected header and a rewritten path before the upstream sees it](assets/request-modifiers.gif)
+
+([config](../examples/request-modifiers/))
+
 Request modifiers run before the action and edit the request. Each entry is an object with one or more of `headers`, `url`, `query`, `method`, `body`, `lua_script`, or `js_script`. Multiple entries are applied in order.
 
 ### Header / URL / query / method / body
@@ -2330,6 +2345,10 @@ request_modifiers:
 ---
 
 ## Response modifiers
+
+![An upstream response with headers rewritten and a body substitution applied on the way out](assets/response-modifiers.gif)
+
+([config](../examples/response-modifiers/))
 
 Response modifiers run after the action and edit the response. Each entry is an object with one or more of `headers`, `status`, `body`, `lua_script`, or `js_script`. Multiple entries are applied in order.
 
@@ -3026,6 +3045,10 @@ For shadow traffic that is wired into the OSS request path, use [`mirror`](#requ
 
 ## Host header semantics
 
+![A request whose Host header is rewritten before it reaches the upstream, shown by the echoed request](assets/host-override.gif)
+
+([config](../examples/host-override/))
+
 When the proxy forwards a request to an upstream, it controls the upstream `Host` header explicitly:
 
 1. The default is the upstream URL's hostname. So `url: https://api.upstream.com:8443` causes the upstream to see `Host: api.upstream.com:8443`. This works correctly with vhost-routed services like Vercel, Cloudflare-fronted origins, S3 website endpoints, and AWS ALBs out of the box.
@@ -3039,6 +3062,10 @@ The same `host_override` field is accepted on every URL-bearing action: `proxy`,
 ---
 
 ## Origin overrides
+
+![An origin dialing a fixed IP with a custom SNI while the client-facing hostname stays unchanged](assets/sni-resolve-override.gif)
+
+([config](../examples/sni-resolve-override/))
 
 Three knobs control how the proxy reaches the upstream, all independent so they compose:
 
@@ -3084,6 +3111,14 @@ action:
 
 ## Trusted proxies and forwarding headers
 
+![X-Forwarded-For, X-Forwarded-Proto, and X-Forwarded-Host arriving at the upstream, then suppressed via the disable flags](assets/forwarding-headers.gif)
+
+([config](../examples/forwarding-headers/))
+
+![The client IP resolved from X-Forwarded-For only when the peer is a trusted proxy](assets/trusted-proxies.gif)
+
+([config](../examples/trusted-proxies/))
+
 When SBproxy is itself behind another load balancer or CDN (Cloudflare, AWS ALB, Fly.io, internal LB), the immediate TCP peer is that LB, not the real client. To recover the real client identity safely, configure `proxy.trusted_proxies` with the source ranges of those upstream hops:
 
 ```yaml
@@ -3115,6 +3150,10 @@ All flags live on the action (or per-target on a load balancer). Default is enab
 ---
 
 ## Request mirror
+
+![Production traffic answered by the primary while a copy of each request arrives at the mirror upstream](assets/request-mirror.gif)
+
+([config](../examples/request-mirror/))
 
 Send a fire-and-forget copy of every matched request to a shadow upstream. The mirror response is read and discarded; the client only ever sees the primary's response. Useful for safe rollouts of new backends, replay-style testing, and capturing production traffic patterns without affecting end-users.
 
@@ -3264,7 +3303,7 @@ action:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `threshold` | float | `0.5` | Failure rate at which to eject (0.0–1.0). |
+| `threshold` | float | `0.5` | Failure rate at which to eject (0.0-1.0). |
 | `window_secs` | int | `60` | Sliding window length in seconds. |
 | `min_requests` | int | `5` | Minimum requests in the window before ejection is considered. |
 | `ejection_duration_secs` | int | `30` | How long to keep an ejected target out of rotation. |
@@ -3729,7 +3768,7 @@ This catches:
 
 Validate every config change before deploying to production. Metrics are exposed via the embedded admin server: set `proxy.admin.enabled: true`, `proxy.admin.port: 9090`, and tune `proxy.metrics.max_cardinality_per_label` for high-traffic deployments.
 
-For production deployments, the planned `sbproxy plan` and `sbproxy apply` subcommands give a Terraform-style diff-and-confirm path on top of `validate`. The audit and design for those subcommands lives in [adr-config-plan-apply.md](adr-config-plan-apply.md); they are not implemented in this release.
+For production deployments, the `sbproxy plan` and `sbproxy apply` subcommands give a Terraform-style diff-and-confirm path on top of `validate`: `plan -f` diffs a proposed config against a baseline (exit 0 no-op, 2 changes present, 3 semantic errors) and `apply` validates and reloads in place. See [manual.md](manual.md) for the full CLI reference.
 
 ---
 

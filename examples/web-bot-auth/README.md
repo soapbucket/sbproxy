@@ -39,7 +39,7 @@ eval $(./bin/sign-request.sh \
         --key openai-bot.pem \
         --keyid openai-2026-01 \
         --method GET \
-        --target-uri http://127.0.0.1:8080/article \
+        --target-uri /article \
         --authority blog.local)
 curl -i -H 'Host: blog.local' \
      -H "Signature-Input: $SIG_INPUT" \
@@ -56,7 +56,7 @@ eval $(./bin/sign-request.sh \
         --key openai-bot.pem \
         --keyid not-in-directory \
         --method GET \
-        --target-uri http://127.0.0.1:8080/article \
+        --target-uri /article \
         --authority blog.local)
 curl -i -H 'Host: blog.local' \
      -H "Signature-Input: $SIG_INPUT" \

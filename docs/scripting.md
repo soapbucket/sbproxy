@@ -95,6 +95,10 @@ key: 'jwt.claims.tenant_id'
 key: 'jwt.claims.tenant_id + ":" + jwt.claims.sub'
 ```
 
+![a JWT-bearing request rate-limited per tenant_id claim, each tenant getting its own token bucket](assets/ratelimit-by-claim.gif)
+
+When the claim expression comes back empty the limiter falls back to client IP ([config](../examples/ratelimit-by-claim/)).
+
 #### `connection` - peer information
 
 | Field | Type | Description |

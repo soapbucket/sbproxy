@@ -1,0 +1,81 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Point your coding assistant at your own GPU.
+#
+# One provider, no base_url: the `serve:` block makes the gateway host
+# the model itself. It resolves glm-4-flash from the built-in catalog,
+# fits an engine and quant to the local GPU, spawns and supervises the
+# engine, and routes to it over loopback.
+#
+# The serve entry's `name:` is the model id every plane sees. Naming it
+# claude-sonnet-4-5 means a client that asks for Claude's model id gets
+# the local GLM instead, so Claude Code needs only a base-URL change.
+# The inbound Anthropic-format bridge (POST /v1/messages, the wire
+# Claude Code speaks) and the OpenAI wire (POST /v1/chat/completions,
+# for Cline and Continue) both resolve the same alias; neither needs
+# its own config key.
+#
+# STATUS: engine spawn and GPU fit need a GPU host with an engine on
+# PATH (`sbproxy doctor` gives the verdict). On a CPU-only box this
+# config parses and validates but starts no engine. See
+# docs/model-host.md for the phased status.
+#
+# Check, then run:
+#   sbproxy validate sb.yml
+#   sbproxy doctor
+#   sbproxy sb.yml            # or: docker compose up
+#
+# Test (Anthropic wire, the one Claude Code speaks):
+#   curl http://localhost:8080/v1/messages \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-sonnet-4-5","max_tokens":128,
+#          "messages":[{"role":"user","content":"Say hello."}]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  # "localhost" matches what Claude Code sends when ANTHROPIC_BASE_URL is
+  # http://localhost:8080 (the port is stripped before matching). Serving
+  # a LAN GPU box, key this with the hostname your clients will use.
+  "localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          # No base_url: a served provider is hosted on this box, so the
+          # gateway resolves the engine's loopback port itself.
+          default_model: claude-sonnet-4-5
+          # The routing plane sees serve-entry names, so the model list
+          # carries the alias, not the catalog id. A request for any
+          # other model name is rejected with a 400.
+          models:
+            - claude-sonnet-4-5
+          serve:
+            models:
+              # glm-4-flash is a catalog id: the built-in catalog supplies
+              # the Hugging Face repo and quant variants, and the fit
+              # planner picks the quant the GPU can run. `name:` is the
+              # alias requests resolve; without it the model would only
+              # answer to glm-4-flash.
+              - model: glm-4-flash
+                name: claude-sonnet-4-5
+                # Unload after 30 idle minutes so the VRAM comes back.
+                keep_alive: 30m
+
+        # Spill to the hosted API when the box is saturated or down: put a
+        # cloud provider after the local one and uncomment the routing line
+        # below so the chain is tried in order.
+        # - name: anthropic
+        #   api_key: ${ANTHROPIC_API_KEY}
+        #   default_model: claude-sonnet-4-5
+
+      # routing: fallback_chain
+
+      # Governance treats the local model like any hosted one. This budget
+      # only logs; switch on_exceed to block to enforce it.
+      budget:
+        on_exceed: log
+        limits:
+          - scope: workspace
+            max_tokens: 2000000
+            period: daily

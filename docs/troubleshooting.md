@@ -1,7 +1,32 @@
 # Troubleshooting
-*Last modified: 2026-06-08*
+*Last modified: 2026-07-06*
 
-When something breaks, this is the first place to look. For *why* these things happen, see [architecture.md](architecture.md).
+When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
+
+Jump by symptom:
+
+| Symptom | Section |
+|---|---|
+| A config key does nothing | [A config setting seems to be ignored](#a-config-setting-seems-to-be-ignored) |
+| 404 on every request | [404, origin not found](#404-origin-not-found) |
+| 502 on one origin | [Clients get 502 Bad Gateway](#clients-get-502-bad-gateway) |
+| Errors come in bursts, then pause | [A circuit breaker keeps opening](#a-circuit-breaker-keeps-opening) |
+| Config edits don't take effect | [Hot reload did not pick up changes](#hot-reload-did-not-pick-up-changes) |
+| A config change made things worse | [Rolling back a bad config change](#rolling-back-a-bad-config-change) |
+| AI routes erroring | [AI requests fail with provider error](#ai-requests-fail-with-provider-error) |
+| Unexpected 429s | [Rate limiter rejecting requests unexpectedly](#rate-limiter-rejecting-requests-unexpectedly) |
+| High latency | [Requests are slow](#requests-are-slow) |
+| No access-log lines | [No access-log lines appear](#no-access-log-lines-appear) |
+| Prometheus scrape empty or failing | [The metrics endpoint returns an empty body](#the-metrics-endpoint-returns-an-empty-body) |
+| No traces in the backend | [Traces never arrive at the collector](#traces-never-arrive-at-the-collector) |
+| Admin port dead or 401/403 | [The admin server is unreachable or rejects you](#the-admin-server-is-unreachable-or-rejects-you) |
+| Dashboards empty | [Grafana dashboards show no data](#grafana-dashboards-show-no-data) |
+| Cluster limits or shared cache misbehaving | [Redis went down and cluster behavior changed](#redis-went-down-and-cluster-behavior-changed) |
+| TLS errors | [TLS handshake fails](#tls-handshake-fails) |
+| Cert expiring, renewal not happening | [ACME renewal is failing](#acme-renewal-is-failing) |
+| No HTTP/3 | [HTTP/3 requests fall back to HTTP/2](#http3-requests-fall-back-to-http2) |
+| Local model never becomes ready | [A local model will not serve](#a-local-model-will-not-serve) |
+| Example compose stack broken | [An example docker compose stack will not start](#an-example-docker-compose-stack-will-not-start) |
 
 ## A config setting seems to be ignored
 
@@ -22,6 +47,27 @@ Check:
 - Run `sbproxy validate --config sb.yml` to confirm the config parses.
 - Confirm the request's `Host` header matches the origin name exactly, including any port suffix.
 - SBproxy uses a bloom filter for fast hostname lookup. If you just added an origin via hot reload, wait a second and retry.
+- These 404s land in `sbproxy_requests_total` under the client-supplied hostname (the cardinality limiter collapses excess values into `__other__`) and in the access log with `error_class: "not_found"`, so a flood of them is visible: it is usually a DNS record pointing at the proxy for a hostname you never configured, or scanning traffic.
+
+## Clients get 502 Bad Gateway
+
+The upstream behind that origin is unreachable: connect refused, DNS failure, timeout, or the retry chain exhausted itself against 5xx responses.
+
+Check:
+- Look at the access-log line for the failed request. A missing `upstream_ttfb_ms` field means the proxy never got a first byte from the upstream, so the failure was at connect time, not a slow backend. A present `upstream_status` shows what the upstream actually said before a retry or fallback rewrote it.
+- Curl the upstream directly from the proxy host. If that fails too, the backend or the network path is down and the proxy is reporting it accurately.
+- Confirm `sbproxy_requests_total{hostname="...",status="502"}` is rising for one origin only. If every origin is failing at once, suspect DNS or an egress network change instead of one dead backend.
+- If the origin is a `load_balancer`, check which targets are ejected via `GET /api/health/targets` on the admin server. Active health checks, outlier detection, and the circuit breaker each eject targets independently; with every target ejected the LB falls back to the unfiltered list rather than failing the client.
+- Give the origin `retry` (connect errors and 502/503 are retryable), and consider a `fallback_origin` block so callers get a degraded response instead of the 502 while the upstream heals. See [degradation.md](degradation.md) and `examples/fallback-origin/`.
+
+## A circuit breaker keeps opening
+
+Errors arrive in bursts separated by quiet periods: the breaker trips on consecutive failures, holds requests off the target for `open_duration_secs`, lets a few probes through in HalfOpen, then trips again because the target is still bad.
+
+Check:
+- `sbproxy_circuit_breaker_transitions_total{origin,from_state,to_state}` tells you how often and in which direction the breaker is moving. A steady `open -> half_open -> open` cycle means the upstream never actually recovered.
+- Fix the upstream, or if a recent origin config change caused the failures, roll it back and watch the transitions stop.
+- Do not just raise `failure_threshold` to quiet the breaker; that trades fast isolation for more client-visible failures. Tune `open_duration_secs` and `success_threshold` if the defaults recover too slowly for your workload.
 
 ## Hot reload did not pick up changes
 
@@ -31,6 +77,17 @@ Check:
 - A config with a validation error gets logged and rejected. The old config keeps running. Run `sbproxy validate --config sb.yml` to see the error.
 - The file watcher reacts to in-place writes. Saves that replace the file by atomic rename (many editors, `sed -i`, and Kubernetes ConfigMap symlink swaps) may not be detected. After a ConfigMap update, send `SIGHUP` or restart the pod to force the reload.
 - The `agent_classes`, `agent_detect`, and `tls_fingerprint` installers are applied at startup and are not currently re-applied on reload. Restart the process to pick up changes to those blocks.
+- Watch `sbproxy_config_reload_total{result}`: a rising `failure` count or a stalled `success` cadence is the reload path telling you it is stuck.
+
+## Rolling back a bad config change
+
+Traffic degraded right after a config rollout and you need the old behavior back now.
+
+Check:
+- Revert `sb.yml` to the last-good revision, then send `SIGHUP` or `POST /admin/reload`. Validation runs first and a config that fails validation is rejected while the old pipeline keeps serving, so a rushed rollback cannot take the proxy down.
+- Before re-applying, `sbproxy plan -f sb.yml --against last-good.yml` prints the added, changed, and removed origins with a max-blast-radius line. Exit code 0 means no-op, 2 means changes present, 3 means semantic errors. Wire it into CI so oversized diffs stop before they ship.
+- One thing hot reload deliberately does not reset: the AI budget accumulators. Budget windows are wall-clock-relative, so a reload (or rollback) does not zero already-spent budget. To zero a budget intentionally, restart the process or use the per-scope reset on the admin surface.
+- On Kubernetes, `helm history sbproxy` and `helm rollback` walk the same ladder at the deployment layer; [operator-runbook.md](operator-runbook.md) has the exact commands.
 
 ## AI requests fail with provider error
 
@@ -40,6 +97,7 @@ Check in order:
 3. Check the structured log for `provider` and `status_code` fields on the failed request.
 4. If using a fallback chain, check that at least one provider in the chain has available capacity. The log will show which provider was attempted last.
 5. If the error is "context window exceeded," the requested model does not support the token count in the prompt. Add a model with a larger context window to the provider list.
+6. `sbproxy_ai_provider_errors_total{provider,error_kind}` splits the failures into transport, timeout, 4xx, 5xx, and parse classes, and `sbproxy_ai_failovers_total` shows whether the routing chain is absorbing them.
 
 ## Rate limiter rejecting requests unexpectedly
 
@@ -57,6 +115,70 @@ SBproxy adds well under 1 ms of overhead under normal load. If you see more, the
 2. If `upstream_latency_ms` is low but total latency is high, suspect DNS. SBproxy caches DNS with a 30-second TTL; the first request after a cache miss pays the resolver round trip.
 3. Turn on OpenTelemetry tracing (`telemetry` block) to get a per-span breakdown across the phase pipeline.
 4. If you have Lua, JavaScript, or CEL configured, set `scripting.timeout_ms` to cap runaway scripts.
+5. The `sbproxy_phase_duration_seconds{phase}` histogram (and the matching `auth_ms` / `upstream_ttfb_ms` / `response_filter_ms` access-log fields) splits end-to-end latency into auth, upstream wait, and response transforms, so you can see which phase grew without tracing.
+
+## No access-log lines appear
+
+The access log is off by default. No `access_log` block, no lines; metrics and traces are unaffected.
+
+Check:
+- The config has `access_log.enabled: true` at the top level. See [access-log.md](access-log.md).
+- `sample_rate: 0.0` disables emission entirely, and low sample rates drop most lines by design. Set `always_log_errors: true` and `slow_request_threshold_ms` so error and slow-request lines bypass the sampler.
+- The lines are emitted at info level through the `access_log` tracing target. A log filter like `RUST_LOG=warn` silences them; use `RUST_LOG=warn,access_log=info` (or the `--request-log-level` flag) to keep operator logs quiet while keeping access logs.
+- `status_codes` and `methods` filters narrow what gets logged; an empty list matches everything, but a list that omits your test request's method logs nothing for it.
+- If you configured `output.type: file`, the lines go to that path, not stdout. Check the file and its rotation suffixes.
+
+## The metrics endpoint returns an empty body
+
+Two harmless-looking behaviors cause most confusion here.
+
+Check:
+- `/metrics` is served on the data-plane port (`http_bind_port`, default 8080), not a separate telemetry listener. The admin server exposes a second copy on its own port when enabled.
+- Scrapes are rate-limited to one per second; back-to-back requests get an empty body. A curl right after your Prometheus scrape hits this. Wait a second and retry. Scrape intervals of 15s never notice.
+- Metrics are per-instance. In a cluster, each process reports only its own counters; aggregate across instances in Prometheus (the bundled dashboards already sum with PromQL).
+
+## Traces never arrive at the collector
+
+Tracing is off by default; the exporter only starts when the telemetry block enables it.
+
+Check:
+- `proxy.observability.telemetry.enabled: true` is set and the process was restarted or reloaded after adding it.
+- Transport and port agree: `transport: grpc` pairs with collector port 4317, `transport: http` with 4318. A gRPC exporter pointed at an HTTP receiver fails quietly.
+- Sampling: with `sample_rate: 0.1`, ninety percent of healthy-traffic traces are dropped on purpose. Set `always_sample_errors: true` so error traces always export, and send a 5xx through the proxy as a test.
+- The telemetry block does not expose per-exporter auth headers. For API-key backends (Datadog, Honeycomb, Langfuse Cloud), put an OpenTelemetry Collector in the middle and let it attach credentials. [observability.md](observability.md) has the verified backend matrix and Collector snippets.
+- The reference Compose stack in `examples/observability-stack/` receives OTLP on host port 4327 (not 4317, which Tempo owns there).
+
+## The admin server is unreachable or rejects you
+
+The admin server is off by default, binds loopback only, and authenticates everything except the health probes.
+
+Check:
+- `proxy.admin.enabled: true` is set. Without it there is no admin listener at all.
+- From another machine you need `bind` set to a reachable address and your caller's IP in `allow_ips`. An empty `allow_ips` keeps the loopback-only default even with `bind: 0.0.0.0`.
+- A 401 means missing or wrong credentials: HTTP Basic with the configured `username` / `password`, or a browser session from `POST /admin/login`. A 403 on a mutation means your operator has the `read_only` role.
+- With `tls` configured, plaintext requests to the port fail. Use `https://` (and `-k` for a self-signed cert).
+- The probe routes (`/healthz`, `/health`, `/readyz`, `/livez`) are intentionally unauthenticated; if those work but `/api/requests` gets 401, connectivity is fine and the failure is credentials.
+- The web UI at `/admin/ui` only exists in binaries built with the `embed-admin-ui` feature. The API works either way. See [admin.md](admin.md).
+
+## Grafana dashboards show no data
+
+The bundled dashboards under `dashboards/grafana/` render nothing when the datasource reference or the scrape is broken.
+
+Check:
+- Prometheus's targets page first. If the `sbproxy` job is down, fix the scrape: the target should be the data-plane port (default 8080) or the admin port, path `/metrics`.
+- The dashboard JSON references the datasource as `${DS_PROMETHEUS}`. Importing through the Grafana UI resolves it with a prompt; file-based provisioning does not, so replace the placeholder with your datasource UID (the compose file in `examples/use-case-production-ops/` shows a one-line `sed` doing exactly this). See `dashboards/README.md`.
+- Send some traffic. Counters that have never incremented emit no series, and a fresh proxy with zero requests renders empty panels that look broken but are not.
+- Alert panels need the recording rules: `dashboards/prometheus/alerts.yml` references series computed by `dashboards/prometheus/recording-rules.yml`, so load both files.
+
+## Redis went down and cluster behavior changed
+
+With `proxy.l2_cache_settings` on Redis, an outage does not stop traffic, but shared state degrades to per-node until it reconnects.
+
+Check:
+- Expected during the outage: rate-limit counters go node-local (a multi-replica fleet lets slightly more traffic through a global limit), and response-cache entries written meanwhile stay local. This is the designed fallback behavior; see [degradation.md](degradation.md).
+- `sbproxy_redis_connection_errors_total` confirms the proxy sees the outage; the log shows `ERROR` on disconnect and `INFO` on recovery.
+- Reconnection is automatic with exponential backoff behind a circuit breaker. There is nothing to restart; fix Redis and the proxy re-attaches.
+- Alert on this when running clustered, since the visible symptom (limits slightly leaky, cache hit rate down) is easy to miss.
 
 ## TLS handshake fails
 
@@ -66,6 +188,16 @@ Check:
 - Run `openssl s_client -servername <host> -connect <host>:443` to see the server's offered chain.
 - The TLS layer uses `rustls` with the `ring` crypto provider. TLS 1.3 by default with TLS 1.2 fallback.
 
+## ACME renewal is failing
+
+Renewal failures are quiet at first because the existing certificate keeps serving until expiry.
+
+Check:
+- The log: each failed renewal logs `WARN` with time-to-expiry, escalating to `ERROR` once the active cert has expired. `sbproxy_acme_errors_total` counts the failures.
+- Renewals retry on exponential backoff from 1 minute up to 24 hours, so a transient CA outage heals itself. A renewal that has been failing for days is usually a changed DNS record, a firewall now blocking the challenge port, or an account/rate-limit problem at the CA.
+- If a listener has no usable cert at all (fresh boot, ACME never succeeded), the proxy serves a self-signed bootstrap cert and logs loudly rather than refusing to start. Clients will see trust errors until the first real issuance lands; that is the visible symptom to chase.
+- The bundled alerting fires when expiry is within 14 days and renewal keeps failing. Do not wait for the expiry page.
+
 ## HTTP/3 requests fall back to HTTP/2
 
 Cause: HTTP/3 is currently disabled until native QUIC support lands in Pingora. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
@@ -73,6 +205,16 @@ Cause: HTTP/3 is currently disabled until native QUIC support lands in Pingora. 
 Check:
 - The `proxy.http3` block still parses, but it is inert. Setting `enabled: true` only logs a warning and starts no listener, so the absence of an `Alt-Svc: h3` header on responses is expected.
 - If you need a UDP/QUIC path today, terminate HTTP/3 at an upstream edge or CDN and forward HTTP/2 to SBproxy.
+
+## A local model will not serve
+
+A `serve:` block parses and validates on any host, but an engine only launches where the hardware and runtime support it.
+
+Check:
+- Run `sbproxy doctor`. It reports the host-wide verdict with no config needed: build capabilities, visible GPUs, inference engines on PATH, container runtime, the model cache, and a serve-readiness verdict listing every blocker. For a missing engine it prints the prerequisites and the manual install steps; it diagnoses, it does not install engines for you.
+- The proxy re-checks the same prerequisites whenever a config with `serve:` loads and logs a warning per missing piece, naming the model and the blocker. Read boot logs before chasing anything else.
+- `sbproxy_model_host_ensure_failures_total{reason}` separates a model that cannot fit the GPU (`fit`) from an engine that crash-loops (`launch`) from a bad reference (`unknown_model`, `resolve`). The bundled `SBProxyModelHostEngineLaunchFailing` alert points at GPU VRAM, the engine binary on PATH, and weight integrity as the first three suspects.
+- Weight downloads are governed by the manifest entry's pull policy (`on_boot`, `on_demand`, `manual`). With `manual`, the weights must already be in the cache directory; with `on_demand`, the first request pays the download, which can look like a hang on a multi-GB pull. `sbproxy_model_host_weight_download_seconds` makes the slow pull visible. See [model-host.md](model-host.md).
 
 ## An example docker compose stack will not start
 
@@ -92,6 +234,8 @@ make build                          # -> target/debug/sbproxy
 cargo build --release -p sbproxy    # -> target/release/sbproxy
 # Validate a config offline before serving
 sbproxy validate --config ./sb.yml
+# Diff a proposed config against a baseline (exit 0 no-op / 2 changes / 3 errors)
+sbproxy plan -f ./sb.yml --against ./last-good.yml
 # Run
 ./target/release/sbproxy serve -f ./sb.yml
 ```
@@ -106,6 +250,8 @@ The fields below are the ones most useful when triage-grepping the JSON access l
 | `origin` | Origin name matched. |
 | `method`, `path`, `status` | Request summary. |
 | `latency_ms` | End-to-end request duration, milliseconds. |
+| `auth_ms`, `upstream_ttfb_ms`, `response_filter_ms` | Phase splits of `latency_ms`; a missing `upstream_ttfb_ms` means the request never reached an upstream. |
+| `upstream_status` | Upstream's status when a retry, fallback, or modifier rewrote what the client saw. |
 | `client_ip` | Resolved client IP after trusted-proxy unwrapping. |
 | `request_id`, `trace_id` | Correlation ids; `trace_id` is set when an OTLP exporter is wired. |
 | `cache_result` | `hit`, `miss`, `stale`, or `bypass`. |

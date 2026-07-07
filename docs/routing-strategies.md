@@ -1,9 +1,9 @@
 # Routing Strategies
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-06*
 
-The `RoutingStrategy` trait is an opt-in extension point for plugging custom upstream selection logic into a `load_balancer` action. It lives in `sbproxy-modules::action::routing` and is the OSS scaffold that production work (LoRA-aware, GPU-aware, contextual-bandit routing) will build against. The trait runs on the request hot path, so it is synchronous, takes a borrowed slice of already-projected target state, and returns the index of the chosen target or `None` to fall through to the configured `lb_method`.
+The `RoutingStrategy` trait is an opt-in extension point for plugging custom upstream selection logic into a `load_balancer` action. It lives in `sbproxy-modules::action::routing`. The trait runs on the request hot path, so it is synchronous, takes a borrowed slice of already-projected target state, and returns the index of the chosen target or `None` to fall through to the configured load-balancing algorithm. The production strategies this scaffold was built for (LoRA affinity, GPU-utilisation routing, bandit routing) have since shipped against it; the full list is below.
 
-The existing built-in algorithms (`round_robin`, `weighted`, `least_connections`, `consistent_hash`, `random`, `priority`, ...) are unchanged and are not yet behind this trait. They continue to handle every request the way they always have. Strategies plug in alongside them: when a `RoutingStrategy` returns `None`, the configured built-in `lb_method` runs as the fall-back. The migration of the built-ins to live behind the trait, plus the three concrete production strategies, is tracked separately under Fail-6 in the roadmap.
+The built-in algorithms (`round_robin`, `weighted_random`, `least_connections`, `ip_hash`, `uri_hash`, `header_hash`, `cookie_hash`; see [configuration.md](configuration.md#load_balancer)) are not behind this trait and continue to handle selection the way they always have. Every strategy honours the same fall-back contract: returning `None` from `select` means "defer to the configured `algorithm:`". One caveat to be upfront about: the `load_balancer` action does not yet consult a registered strategy on the request hot path. Strategies register, build from config, and are unit-tested, and the `lb_method: plugin` / `strategy:` keys in the examples below are accepted, but live selection still runs through `algorithm:` until the wiring follow-up lands. Migrating the built-ins behind the trait is planned as part of that same follow-up.
 
 ## Trait shape
 
@@ -70,7 +70,17 @@ inventory::submit! {
 
 Once the crate is linked into the proxy binary, the strategy is discoverable by name. Configuration consumes it the same way an enterprise auth plugin would: by referencing the registered name in the load-balancer config and letting `build_routing_strategy` resolve it to an `Arc<dyn RoutingStrategy>`.
 
-The OSS tree ships two built-in strategies: `first-healthy` (`AlwaysFirstHealthyStrategy`), a reference implementation that always picks the first healthy target, and `lora-aware` (`LoraAwareStrategy`), a production strategy described in detail below. The remaining production strategies (GPU-aware, contextual-bandit) are tracked under Fail-6; until they land, deployments that do not need LoRA affinity should continue to use the existing `lb_method` algorithms.
+The OSS tree ships five registered strategies:
+
+| Name | What it does |
+|------|--------------|
+| `first-healthy` | Reference implementation for docs and tests. Picks the lowest-index healthy target. |
+| `lora` | Strict LoRA-adapter match. Picks a healthy target that advertises the requested adapter, or defers; it never routes to a cold target on its own. |
+| `lora-aware` | Load-weighted LoRA affinity, described in detail below. |
+| `gpu-aware` | Picks the healthy target with the lowest reported GPU utilisation. Targets advertise a `gpu_utilization` number in `[0.0, 1.0]` in their `metadata` map; when no target has a valid signal, the strategy round-robins across healthy targets deterministically. |
+| `bandit` | Epsilon-greedy multi-armed bandit. Learns a per-target success rate from recorded outcomes and exploits the best arm, exploring a random healthy target with probability epsilon (default 0.1). |
+
+The `gpu-aware` strategy is a pure consumer of telemetry; it never polls a device itself. On a gateway that also runs the [model host](model-host.md), the per-device `sbproxy_model_host_gpu_utilization` gauge carries the same signal, so a scrape or control-plane hook can copy it into each target's metadata.
 
 ## LoRA-aware routing
 
@@ -97,7 +107,7 @@ targets:
 
 A missing key, a non-array value, or non-string elements are all treated as "no adapters loaded" rather than producing an error: the strategy is intentionally lenient so a single misconfigured target cannot poison routing for the rest of the pool.
 
-Populating this metadata is operator work. Today the supported path is hand-pinned YAML (per the example above). The live-feed path, where each upstream reports its adapter inventory back to the proxy via either pull (Prometheus-style scrape) or push (sidecar), is the same telemetry plane the GPU-aware sibling card will productionise; both paths land together as part of Fail-6.
+Populating this metadata is operator work. Today the supported path is hand-pinned YAML (per the example above) or a control-plane hook that rewrites target metadata on config reload. There is no built-in live feed where each upstream reports its adapter inventory back to the proxy; the same is true of the `gpu-aware` strategy's utilisation signal, which operators feed from a metrics scrape or a sidecar.
 
 ### Fall-back semantics
 

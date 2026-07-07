@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# AI gateway that HOSTS the model locally (WOR-1652 model host).
+# AI gateway that HOSTS the model locally (model host).
 #
 # Instead of proxying base_url to an already-running server, the
 # provider's `serve:` block declares models the gateway itself runs:
@@ -25,12 +25,12 @@ origins:
       providers:
         - name: local
           # No address: a served provider is hosted on this box, so the
-          # gateway resolves the engine's loopback port itself (WOR-1680).
+          # gateway resolves the engine's loopback port itself.
           # Writing base_url here is now a config error. base_url +
           # allow_private_base_url stay only for a separately-running
           # engine (an unmanaged Ollama, a remote vLLM box).
           default_model: qwen3-14b
-          # The names below are the serve-entry names (WOR-1683): the
+          # The names below are the serve-entry names: the
           # model id every plane sees. Once the serve -> provider
           # derivation is wired into the compiler this list becomes
           # optional, derived from serve.models[].name.

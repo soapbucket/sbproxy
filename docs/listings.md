@@ -196,6 +196,10 @@ finding the next time `sbproxy plan` runs against the Repo.
 
 ## Example
 
+![a request proxied through the origin declared by the pinned listing](assets/listing-primitive.gif)
+
+The listing supplies the origin; the proxy serves it like any other ([config](../examples/listing-primitive/)).
+
 The runnable example in `examples/listing-primitive/` ships:
 
 - `sb.yml` with one origin (`api.example.com`).

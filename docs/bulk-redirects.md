@@ -1,6 +1,10 @@
 # Bulk redirects
 *Last modified: 2026-04-27*
 
+![/old/about answered with a 301 from a CSV row and a shop path answered 308 from an inline row](assets/bulk-redirects.gif)
+
+Rows compile into an O(1) path lookup at config load ([config](../examples/bulk-redirects/)).
+
 The `redirect` action accepts a list of source-to-destination rows
 in addition to (or instead of) a single `url:`. Each origin owns its
 own list. The proxy compiles the rows once at config-load time into

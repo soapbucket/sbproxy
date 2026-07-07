@@ -1,0 +1,34 @@
+# Guardrails on every prompt, local or hosted: one SBproxy in front of a
+# hosted OpenAI lane and an unmanaged local Ollama lane, with the same
+# guardrail mesh screening both.
+#
+# Bring up:    docker compose up
+# Tear down:   docker compose down
+# Validate:    docker compose config
+#
+# Set OPENAI_API_KEY in your shell (or a .env file) for the hosted lane.
+# The blocked-prompt demo needs no key at all: the mesh answers before
+# any provider is contacted.
+
+services:
+  sbproxy:
+    image: ghcr.io/soapbucket/sbproxy:latest
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    ports:
+      - "8080:8080"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-not-set}
+    # The local lane in sb.yml points at 127.0.0.1:11434, which inside a
+    # container is the container's own loopback. To reach an Ollama on
+    # the Docker host, change base_url in sb.yml to
+    # http://host.docker.internal:11434/v1 and uncomment:
+    #
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    #
+    # The access log writes to /tmp/sbproxy-access.log inside the
+    # container. To read verdicts via `docker compose logs` instead,
+    # delete the access_log output block in sb.yml so lines emit on
+    # stderr.

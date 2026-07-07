@@ -1,0 +1,24 @@
+# Your own OpenRouter in one container: the governed data plane on 8080 and
+# the admin API on 9090. Provider keys come from your shell (or a .env file
+# next to this compose file); they never land in the config.
+#
+# Bring up:    docker compose up
+# Tear down:   docker compose down
+# Validate:    docker compose config
+#
+# The mounted sb.yml admits admin clients from loopback and private ranges
+# only, which covers the Docker bridge. See docs/admin.md before exposing
+# the admin port beyond your machine.
+
+services:
+  sbproxy:
+    image: ghcr.io/soapbucket/sbproxy:latest
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    ports:
+      - "8080:8080" # data plane: /v1/chat/completions
+      - "9090:9090" # admin API: /admin/keys, /admin/ui

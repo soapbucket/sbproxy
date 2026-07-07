@@ -130,6 +130,10 @@ curl http://127.0.0.1:8080/
 
 In production, expose the Service via an Ingress, a LoadBalancer Service, or a Gateway API Gateway.
 
+![a request with a spoofable X-Forwarded-For sent through the cluster-edge config, showing which forwarded headers reach the upstream](assets/k8s-gateway.gif)
+
+The dataplane shape behind an Ingress: trusted_proxies, service_discovery, host_override, and a threaded X-Request-Id ([config](../examples/k8s-gateway/)).
+
 ## Leader election
 
 The operator runs more than one replica safely. Each replica races for a `coordination.k8s.io/v1` Lease named `sbproxy-operator-leader` in its own namespace. The replica that wins the race runs the reconciler; the others wait. When the leader's pod is deleted, restarted, or partitioned from the API server, the renew loop fails, the leader exits with code 0, and a standby replica wins the next acquire pass within ~15s (the lease duration).

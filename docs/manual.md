@@ -30,6 +30,22 @@ For configuration, see [configuration.md](configuration.md). For features, see [
 
 ## 1. Installation
 
+This section is the canonical install reference; other docs link here rather than repeating it.
+
+### Install script
+
+The quickest path on macOS and Linux. The script detects your OS and architecture, fetches the matching release binary, and drops it in `~/.local/bin`:
+
+```bash
+curl -fsSL https://download.sbproxy.dev | sh
+```
+
+### Homebrew
+
+```bash
+brew install soapbucket/tap/sbproxy
+```
+
 ### Binary download
 
 Pre-built binaries for Linux, macOS, and Windows are on the releases page. Download the archive for your platform, extract it, and put the `sbproxy` binary somewhere in your `PATH`.
@@ -165,8 +181,7 @@ a terraform-style text diff by default; `--format json` emits the
 stable plan envelope for tooling. `--out <file>` writes the JSON
 plan-file envelope (which records the baseline revision) so a later
 `sbproxy apply -p <file>` can replay against the same baseline and
-refuse on drift. See [adr-config-plan-apply.md](adr-config-plan-apply.md)
-for the envelope schema.
+refuse on drift.
 
 ```bash
 sbproxy plan -f proposed.yml
@@ -208,9 +223,7 @@ reload.
 The `-p` form is intentionally env-var driven for the YAML path and
 baseline: the plan file does not embed an on-disk path, so the
 operator points apply at the YAML through `SB_APPLY_CONFIG` and
-optionally overrides the baseline with `SB_APPLY_BASELINE`. See
-[adr-config-plan-apply.md](adr-config-plan-apply.md) for the
-rationale.
+optionally overrides the baseline with `SB_APPLY_BASELINE`.
 
 ```bash
 SB_APPLY_CONFIG=/etc/sbproxy/sb.yml sbproxy apply -p /tmp/sb.plan
@@ -998,6 +1011,10 @@ make certs
 ## 8. Connection tuning
 
 Connection pool behavior and timeouts are configurable per origin. Place these settings at the origin level alongside the `action` block.
+
+![ten concurrent requests completing over a bounded upstream pool, per-request timing shown](assets/connection-pool.gif)
+
+A 32-connection pool with idle and lifetime caps absorbs the burst ([config](../examples/connection-pool/)).
 
 ### Per-origin transport fields
 

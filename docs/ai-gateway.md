@@ -1,8 +1,14 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-05*
+*Last modified: 2026-07-06*
+
+![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
+
+Three providers behind one wire format ([config](../examples/ai-gateway-quickstart/)).
 
 SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 66 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
+
+This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, and per-request attribution. Six features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [predictive budgets with soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), and [LLM-aware resilience](ai-llm-aware-resilience.md). For those six, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
 
 ## Provider setup
 
@@ -28,7 +34,6 @@ origins:
 API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files.
 
 ### Native providers
-
 66 native providers ship in-tree alongside native translators for Anthropic, Gemini, and Bedrock. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
 
 Any model a listed provider serves works without extra config. For a self-hosted or proprietary endpoint, point `vllm` or any provider at it with a custom `base_url`. `openrouter` is available as one of the providers when you want many vendors behind a single key. See `providers.md` for the full per-provider table.
@@ -85,7 +90,6 @@ routing:
 ```
 
 ### fallback_chain
-
 Tries providers in priority order. When the selected provider fails or returns 5xx, the router moves to the next provider.
 
 ```yaml
@@ -149,6 +153,10 @@ routing:
 
 ### race
 
+![one request fanned out to every provider, the first 2xx returned and the slow racer cancelled](assets/ai-race-routing.gif)
+
+Lower tail latency at the cost of duplicate upstream calls ([config](../examples/ai-race-routing/)).
+
 Fans the request out to every eligible provider in parallel, returns the first 2xx, cancels the in-flight losers. Optimizes p99 latency at the cost of N times the API spend per request. Pair with `resilience` so persistently slow providers fall out of the eligible set.
 
 ```yaml
@@ -156,7 +164,7 @@ routing:
   strategy: race
 ```
 
-See [examples/ai-race](../examples/ai-race/sb.yml).
+See [examples/ai-race](../examples/ai-race/sb.yml). Billing implications, streaming behavior, and the interaction with the failover loop are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#hedged-raced-requests).
 
 ### least_token_usage
 
@@ -216,6 +224,16 @@ routing:
   cost_threshold: 0.5
 ```
 
+### outcome_aware
+
+Scores each provider by realized cost per successful request, learned from the gateway's own completed calls. A provider whose refusal or error rate is rising gets demoted; between two healthy providers, the one with the lower realized cost-per-success wins, which is not always the lower list price. Until every provider has a few samples the strategy round-robins, so enabling it on a fresh deployment is safe.
+
+```yaml
+routing: outcome_aware
+```
+
+The scoring formula, warm-up behavior, and the feedback store are in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
+
 ## Resilience
 
 Per-provider circuit breaker, outlier detection, and active health probes layered on top of the routing strategy. Each signal independently ejects a provider; when every provider is ejected, the router falls back to the unfiltered enabled list rather than refusing the request.
@@ -241,6 +259,20 @@ resilience:
 
 See [examples/ai-resilience](../examples/ai-resilience/sb.yml). Field reference in [configuration.md#resilience-resilience](configuration.md#resilience-resilience).
 
+### LLM-aware resilience
+
+Status-code retries treat every failure the same. The gateway can instead classify each upstream failure into a typed cause (rate limit, context-window overflow, content-policy refusal, auth, malformed request) and apply a retry count per class, so a transient failure retries while a request that would only fail again goes to a fallback. Switch it on with a `retry_policy` under `resilience`:
+
+```yaml
+resilience:
+  retry_policy:
+    rate_limit: 3      # retry a 429 up to 3 times
+    server_error: 2
+    content_policy: 0  # never retry a refusal in place
+```
+
+The same block hosts `llm_aware.context_compress`, which fits an over-long prompt to the resolved model's window instead of letting it fail, and `content_policy_fallback`, which routes a refusal to the next provider in priority order. The failure-cause table, compression rules, and hedged requests are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
+
 ## Shadow eval
 
 Mirror each request to a second provider concurrently. The primary's response is what the client sees; the shadow body is drained and metrics are emitted at `target=sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish_reason). Useful for prompt regression checks before swapping a primary model.
@@ -264,6 +296,10 @@ SBproxy is a proxy first, so AI traffic composes with everything else the proxy 
 | Mixed AI + non-AI on one hostname (health probes, docs, model catalog) | `forward_rules` with inline child origins | [94-ai-mixed-traffic](../examples/ai-mixed-traffic/sb.yml) |
 | Custom DLP beyond built-in PII (codenames, ticket IDs, internal hostnames) | `guardrails.input` with `regex` patterns | [95-ai-regex-dlp](../examples/ai-regex-dlp/sb.yml) |
 | Topic enforcement (allow-list of approved keywords) | `regex` guardrail with `action: allow` | [95-ai-regex-dlp](../examples/ai-regex-dlp/sb.yml) |
+
+![a benign prompt passing while one naming the internal codename Project Bluebird is blocked before egress](assets/ai-regex-dlp.gif)
+
+Regex DLP rules run in the guardrail stage, so the rejection costs no tokens ([config](../examples/ai-regex-dlp/)).
 
 CEL policies and request modifiers run before the AI handler dispatches, so a rejection costs no provider tokens. Forward rules dispatch by path, which means health checks and probe traffic can stay on the same hostname without billing a model. Regex guardrails inspect the parsed prompt body and slot in next to PII, injection, jailbreak, and schema guardrails.
 
@@ -342,7 +378,11 @@ The sliding window is one minute, shared across all configured origins (state is
 
 ## Guardrails
 
-The proxy supports nine guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, and `agent_alignment`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. See the CEL guardrails section below for inline CEL conditions, and `features.md` for the higher-level configuration of each guardrail type.
+![a prompt-injection attempt and an SSN-bearing prompt both rejected before any provider is contacted](assets/ai-guardrails.gif)
+
+Input guardrails inspect the parsed prompt ahead of egress ([config](../examples/ai-guardrails/)).
+
+The proxy supports nine guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, and `agent_alignment`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. See the CEL guardrails section below for inline CEL conditions, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
 
 Input guardrails apply to whichever body field the surface carries user text in:
 
@@ -355,6 +395,23 @@ Input guardrails apply to whichever body field the surface carries user text in:
 | `moderations` | `body["input"]` |
 
 A single guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the input-guardrail check today because their bodies are forwarded byte-transparently; output-side scanning for those surfaces is reserved for a follow-up.
+
+### Guardrail mesh
+
+By default the input guardrails run as a serial chain that blocks on the first detector to flag. The opt-in mesh runs them as a cascade instead, collects the full verdict set, and fuses it under a quorum rule, with optional redact-and-continue, a verdict cache, and a latency budget for the expensive classifiers. Switch it on with a `mesh` block under `guardrails`:
+
+```yaml
+guardrails:
+  input:
+    - type: injection
+    - type: pii
+      patterns: [email]
+  mesh:
+    block_threshold: 2     # block only when >= 2 detectors flag
+    redact_on_flag: true   # below the threshold, mask the prompt and continue
+```
+
+Fusion semantics, verdict-cache keying, and the latency cascade are in [ai-guardrail-mesh.md](ai-guardrail-mesh.md).
 
 ### Streaming policy
 
@@ -377,6 +434,10 @@ On the buffered (non-streaming) path the proxy runs every configured output guar
 Operators that want a non-safe guardrail to apply to streaming responses anyway should accept the partial-window risk explicitly and run a second buffered pass once the stream closes; the per-entry `streaming_safe` override surface for that case rides a follow-up.
 
 ### Context-poisoning guardrail
+
+![a clean tool result summarised normally, then a tool result carrying an embedded instruction blocked](assets/ai-context-poisoning.gif)
+
+The guardrail scans tool and retrieval content, not just the user turn ([config](../examples/ai-context-poisoning/)).
 
 The `context_poisoning` input guardrail flags untrusted retrieval content that tries to manipulate the model before a downstream tool call. This is the indirect prompt injection vector from Greshake et al. (2023): a RAG pipeline pulls a poisoned page into the model's context, and the model then issues a tool call influenced by that content.
 
@@ -410,6 +471,10 @@ Every hit emits `sbproxy_ai_context_poisoning_findings_total{rule_id, action}`. 
 See `examples/ai-context-poisoning/` for a complete sample configuration and curl commands.
 
 ### Agent-alignment guardrail
+
+![a search tool call matching the user's ask allowed, then an off-task delete_account call stopped](assets/ai-agent-alignment.gif)
+
+The guardrail compares each tool call against the stated user goal ([config](../examples/ai-agent-alignment/)).
 
 The `agent_alignment` input guardrail audits the assistant's `tool_calls` array against operator-declared rules: an allow list of tools the agent is permitted to invoke, an explicit deny list that always trips even when allowed elsewhere, a forbidden-substring scan over the tool arguments, and a per-turn budget on the number of tool calls. The check is the LlamaFirewall (arXiv:2505.03574) "Agent Alignment Check" use case rendered as a deterministic ruleset so the per-request cost is bounded; an LLM-judge advisory variant rides a follow-up and slots into the same configuration.
 
@@ -495,6 +560,23 @@ origins:
               : {}
 ```
 
+## AI policy plane (CEL)
+
+Where CEL guardrails and request modifiers act on the raw HTTP request, the AI policy plane is one sandboxed CEL expression over the signals the AI pipeline itself computes: `ai.surface`, `ai.principal.*`, `ai.guardrails.*`, `ai.budget.*`, `ai.tokens.*`. It runs after guardrail evaluation and before provider selection, and it can only emit actions from a closed set (allow, block, redact, `route_to:<model>`, `set_sink_tag:<tag>`, `audit:<priority>`). Off until you add an `ai_policy` block:
+
+```yaml
+action:
+  type: ai_proxy
+  ai_policy:
+    expression: |
+      ai.principal.tier == "free" && ai.guardrails.flagged_count >= 2
+        ? ["redact", "route_to:gpt-4o-mini", "audit:high"]
+        : ["allow"]
+    on_error: allow
+```
+
+The action table, the full `ai.*` namespace, and the fail-open semantics are in [ai-policy-cel.md](ai-policy-cel.md).
+
 ## Budgets
 
 Set token or dollar caps that apply across a workspace, a single virtual key, an end user, a model, an origin, or a metadata tag. The `budget` block sits under `action` and is parsed by `BudgetConfig` in `crates/sbproxy-ai/src/budget.rs`.
@@ -552,6 +634,25 @@ action:
 - `on_exceed: downgrade` swaps the request's model to the firing limit's `downgrade_to` and proceeds. If `downgrade_to` is unset, the request is blocked.
 - Setting only `max_tokens` and leaving `max_cost_usd` unset (or vice versa) is supported. A limit with neither field is a no-op.
 - A hierarchical view (`org`, `team`, `project`, `user`, `model` keys with 80% warning band) is exposed to in-process callers via `HierarchicalBudget` in `hierarchical_budget.rs`. There is no top-level YAML knob for it today; it is wired by the runtime when the gateway tracks spend.
+
+### Soft-landing (predictive budgets)
+
+A hard budget is a cliff: requests pass until the cap, then block at 100%. The opt-in `soft_landing` block tapers instead. Past `warn_at` the request is allowed and a warning is logged; past `downgrade_at` the model is rewritten to a cheaper target; at the cap the hard `on_exceed` action takes over as before.
+
+```yaml
+budget:
+  limits:
+    - scope: workspace
+      max_cost_usd: 10.0
+      period: daily
+  on_exceed: block
+  soft_landing:
+    warn_at: 0.8
+    downgrade_at: 0.95
+    downgrade_to: gpt-4o-mini
+```
+
+Window selection, the downgrade-target resolution order, and how a downgrade is tagged in the spend history are in [ai-predictive-budget.md](ai-predictive-budget.md).
 
 ### Model prices
 
@@ -630,6 +731,10 @@ Hashes the request body and serves byte-for-byte hits. Implemented in `prompt_ca
 The exact-match path is a runtime construct rather than an `action` field today. It is enabled implicitly when the gateway is built with a cache backing store. There are no YAML knobs for the exact prompt cache.
 
 ### Semantic cache
+
+![a first prompt logging x-semcache MISS, then a reworded equivalent served as HIT in a fraction of the time](assets/semantic-cache.gif)
+
+Different words, same meaning, no provider call ([config](../examples/semantic-cache-openai/)).
 
 Stores responses keyed by the SHA-256 of the messages array with TTL and capacity bounds. Implemented in `semantic_cache.rs` as `SemanticCache`. The constructor takes `max_entries: usize` and `ttl_secs: u64`; entries are evicted with an insert-order LRU when the cache is full, and lazily expired on lookup.
 
@@ -872,7 +977,7 @@ If the requested model is not in the registry, overflow checks are skipped (no w
 
 `crates/sbproxy-ai/src/context_compress.rs` does cost-aware history trimming. `estimate_message_tokens` uses a four-characters-per-token approximation. `trim_to_budget` always keeps the leading system message, then walks remaining messages newest-to-oldest, including each one only if it fits in the remaining token budget, then restores chronological order before returning.
 
-This module exposes pure functions; it is invoked by the routing strategy and overflow handler. There is no `context_compress:` YAML block.
+This module exposes pure functions; it is invoked by the routing strategy and overflow handler. The operator-facing switch lives under `resilience` as `llm_aware.context_compress`; see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#context-window-compression).
 
 ## Streaming analytics
 
@@ -1017,6 +1122,21 @@ off by default; every captured value runs through the secret redactor, the
 origin's configured PII redactor when present, and an 8 KiB payload cap with a
 `...[truncated]` marker. Streaming responses are assembled from forwarded
 chunks before the completion is recorded.
+
+## Verifiable usage ledger
+
+The `ledger` usage sink turns the stream of completed LLM calls into a tamper-evident record: each entry is hash-chained to the one before it, so editing any past record breaks every link after it, and with a signing seed configured each entry is Ed25519-signed. Appends happen after the response is already sent, so the ledger never adds latency to the call it records.
+
+```yaml
+action:
+  type: ai_proxy
+  usage_sinks:
+    - type: ledger
+      path: /var/lib/sbproxy/usage-ledger.jsonl
+      signing_seed_hex: ${LEDGER_SIGNING_SEED_HEX}   # optional; enables signing
+```
+
+Verify the chain (and, with the seed, the signatures) with `sbproxy ai ledger verify <path>`. The entry format, dedup semantics, durability guarantees, and the verify CLI are in [ai-usage-ledger.md](ai-usage-ledger.md).
 
 ## Token usage metrics
 
@@ -1232,4 +1352,13 @@ The process-wide AI budget tracker is deliberately left alone on reload. Budget 
 - [providers.md](providers.md) - full provider table and per-provider model lists.
 - [scripting.md](scripting.md) - CEL and Lua reference, including AI selector and guardrail variables.
 - [configuration.md](configuration.md) - general configuration model, origin schema, and the full `sb.yml` field reference.
-- [features.md](features.md) - higher-level overview of features including guardrails.
+- [features.md](features.md) - the capability tour across the whole proxy, AI and non-AI.
+
+Deep-dive pages summarized in this guide:
+
+- [ai-guardrail-mesh.md](ai-guardrail-mesh.md) - quorum blocking, redact-and-continue, verdict cache.
+- [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md) - routing on realized cost-per-success.
+- [ai-policy-cel.md](ai-policy-cel.md) - one CEL expression over the AI decision pipeline.
+- [ai-predictive-budget.md](ai-predictive-budget.md) - soft-landing budget degradation.
+- [ai-usage-ledger.md](ai-usage-ledger.md) - hash-chained, signable spend records.
+- [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md) - typed failure causes, per-error retries, hedging.

@@ -6,7 +6,7 @@
 
 Point any OpenAI-shaped client at sbproxy and reach OpenAI, Anthropic, or Google without changing how you build requests or parse responses. Each vendor is a separate origin here, so you pick the upstream by host (`openai.local`, `claude.local`, `gemini.local`); sbproxy translates the request on the way out and the response on the way back, so every answer returns in OpenAI chat-completion shape.
 
-Routing strategies such as `round_robin` and `fallback_chain` choose among the providers *within* a single origin and forward the model name as-is; they do not select a provider from the requested model. Use one provider per origin when you want a specific vendor (as below), or an aggregator like OpenRouter when you want many models behind one key.
+Each provider declares a `models:` list, so the requested model first narrows which providers are eligible; routing strategies such as `round_robin` and `fallback_chain` then choose among the eligible providers, and the model name is forwarded as-is. One endpoint, one key, and the `model` field picks the vendor.
 
 ## Run
 
