@@ -2125,7 +2125,9 @@ pub struct AcmeConfig {
     /// ACME directory URL. Defaults to Let's Encrypt production.
     #[serde(default = "default_acme_directory")]
     pub directory_url: String,
-    /// Allowed ACME challenge types in priority order (e.g. `tls-alpn-01`, `http-01`).
+    /// Allowed ACME challenge types in priority order. Defaults to
+    /// `[http-01]`, the only type the proxy currently drives; `tls-alpn-01`
+    /// is accepted in the list but is not yet served.
     #[serde(default = "default_challenge_types")]
     pub challenge_types: Vec<String>,
     /// Backing store for issued certificates (`redb`, `sqlite`, etc.).
@@ -2144,7 +2146,12 @@ fn default_acme_directory() -> String {
 }
 
 fn default_challenge_types() -> Vec<String> {
-    vec!["tls-alpn-01".to_string(), "http-01".to_string()]
+    // WOR-1771: only http-01 is driven by the proxy today; tls-alpn-01 is
+    // not, so leading with it made a default `acme:` config fail issuance
+    // ("challenge type 'tls-alpn-01' selected but only http-01 is driven").
+    // Default to http-01 so a fresh config issues; add tls-alpn-01 back when
+    // the listener drives it.
+    vec!["http-01".to_string()]
 }
 
 fn default_storage_backend() -> String {
@@ -4814,7 +4821,7 @@ email: "admin@example.com"
             acme.directory_url,
             "https://acme-v02.api.letsencrypt.org/directory"
         );
-        assert_eq!(acme.challenge_types, vec!["tls-alpn-01", "http-01"]);
+        assert_eq!(acme.challenge_types, vec!["http-01"]);
         assert_eq!(acme.storage_backend, "redb");
         assert_eq!(acme.storage_path, "/var/lib/sbproxy/certs");
         assert_eq!(acme.renew_before_days, 30);
