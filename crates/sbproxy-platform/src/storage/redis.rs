@@ -316,6 +316,40 @@ impl KVStore for RedisKVStore {
         })
     }
 
+    fn try_lock(&self, key: &[u8], token: &[u8], ttl_secs: u64) -> Result<bool> {
+        // Atomic lease: SET <key> <token> NX PX <ttl_ms>. The reply is "OK"
+        // when the key was set (lock acquired) or nil when it already
+        // exists (another holder has it). WOR-1774.
+        let encoded = Self::encode_key(key);
+        let ttl_ms = ttl_secs.saturating_mul(1000).to_string();
+        self.with_conn(|c| {
+            match c.call(&[
+                b"SET",
+                encoded.as_bytes(),
+                token,
+                b"NX",
+                b"PX",
+                ttl_ms.as_bytes(),
+            ])? {
+                RespValue::Bytes(b) if b == b"OK" => Ok(true),
+                RespValue::Nil => Ok(false),
+                other => bail!("unexpected SET NX response: {:?}", other),
+            }
+        })
+    }
+
+    fn unlock(&self, key: &[u8], token: &[u8]) -> Result<()> {
+        // Compare-and-delete via EVAL so we only delete the lock while it is
+        // still ours: a bare DEL could remove a lock a different node
+        // acquired after this one's lease had expired.
+        const RELEASE: &[u8] = b"if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+        let encoded = Self::encode_key(key);
+        self.with_conn(|c| {
+            c.call(&[b"EVAL", RELEASE, b"1", encoded.as_bytes(), token])?;
+            Ok(())
+        })
+    }
+
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         // Build a SCAN MATCH glob: hex(prefix)* (safe because hex output
         // contains only [0-9a-f] which has no glob special characters).
@@ -509,5 +543,34 @@ mod tests {
         // subsequent checkout succeeds.
         drop(held);
         let _ = s.checkout().expect("checkout after release");
+    }
+
+    #[test]
+    #[ignore = "requires a running Redis instance on 127.0.0.1:6379"]
+    fn try_lock_is_exclusive_and_release_is_token_scoped() {
+        // WOR-1774: the distributed issuance lock. Exercises SET NX PX +
+        // the Lua compare-and-delete release against a real Redis.
+        let s = RedisKVStore::new(RedisConfig::default());
+        let key = b"test:wor1774:issue-lock";
+        s.delete(key).ok();
+
+        // First holder acquires; a different token cannot while it is held.
+        assert!(s.try_lock(key, b"token-A", 30).unwrap(), "A acquires");
+        assert!(!s.try_lock(key, b"token-B", 30).unwrap(), "B blocked");
+
+        // A non-owner release is a no-op (token mismatch): still held.
+        s.unlock(key, b"token-B").unwrap();
+        assert!(
+            !s.try_lock(key, b"token-C", 30).unwrap(),
+            "still held after non-owner release"
+        );
+
+        // The owner releases; the lock is now free to acquire again.
+        s.unlock(key, b"token-A").unwrap();
+        assert!(
+            s.try_lock(key, b"token-D", 30).unwrap(),
+            "free after owner release"
+        );
+        s.unlock(key, b"token-D").unwrap();
     }
 }
