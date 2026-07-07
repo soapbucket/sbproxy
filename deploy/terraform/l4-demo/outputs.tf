@@ -1,6 +1,11 @@
 output "external_ip" {
   value       = google_compute_address.demo.address
-  description = "Point var.acme_domain's A record at this address, then TLS issues on first request."
+  description = "The instance's external IP."
+}
+
+output "endpoint" {
+  value       = local.tls_enabled ? "https://${var.acme_domain}" : "http://${google_compute_address.demo.address}"
+  description = "The data-plane endpoint. Send requests with Authorization: Bearer <token>."
 }
 
 output "ssh" {
@@ -9,17 +14,33 @@ output "ssh" {
 }
 
 output "admin_url" {
-  value       = "https://${var.acme_domain}/admin/ui"
-  description = "Admin UI once DNS resolves and the cert is issued."
+  value       = local.tls_enabled ? "https://${var.acme_domain}/admin/ui" : "http://127.0.0.1:9090/admin/ui (via SSH tunnel -L 9090:localhost:9090)"
+  description = "Admin UI (loopback; tunnel over SSH in plain-HTTP mode)."
+}
+
+locals {
+  next_tls = <<-EOT
+    TLS mode (${var.install_mode}):
+    1. Point ${var.acme_domain} A record -> ${google_compute_address.demo.address}
+    2. Start after DNS: gcloud compute ssh ${var.name} -- 'sudo systemctl start sbproxy'
+       (watch: sudo journalctl -u sbproxy -f). The first request acquires the
+       engine, pulls the weights, and serves.
+    3. Data plane: https://${var.acme_domain} with `Authorization: Bearer <token>`.
+    4. terraform destroy when done.
+  EOT
+
+  next_plain = <<-EOT
+    One-command mode (${var.install_mode}): sbproxy is already starting.
+    1. First request (acquires engine + pulls weights, so allow a few minutes):
+         curl http://${google_compute_address.demo.address}/v1/chat/completions \
+           -H "Authorization: Bearer <token>" -H "content-type: application/json" \
+           -d '{"model":"${coalesce(var.serve_models[0].name, var.serve_models[0].model)}","messages":[{"role":"user","content":"hello"}]}'
+       (watch: gcloud compute ssh ${var.name} -- 'sudo journalctl -u sbproxy -f')
+    2. terraform destroy when done.
+  EOT
 }
 
 output "next_steps" {
-  value = <<-EOT
-    1. Point ${var.acme_domain} A record -> ${google_compute_address.demo.address}
-    2. Wait for the startup script to build sbproxy + fetch the model
-       (watch: gcloud compute ssh ${var.name} -- 'sudo journalctl -u sbproxy -f').
-    3. Admin UI: https://${var.acme_domain}/admin/ui
-    4. Data plane: send requests with `Authorization: Bearer <token>`.
-    5. terraform destroy when done.
-  EOT
+  value       = local.tls_enabled ? local.next_tls : local.next_plain
+  description = "What to do after apply."
 }

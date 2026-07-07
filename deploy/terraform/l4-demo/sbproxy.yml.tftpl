@@ -1,10 +1,18 @@
 # Rendered by Terraform (deploy/terraform/l4-demo). Serves local models
-# behind a public, Let's-Encrypt-TLS, bearer-token-protected data plane.
+# behind sbproxy. Two modes, selected by whether an ACME domain is set:
+#
+#   tls_enabled = true  : public HTTPS via Let's Encrypt (needs the domain
+#                         resolving to this box first; started by the
+#                         runbook after DNS).
+#   tls_enabled = false : plain HTTP on port 80 keyed to the public IP,
+#                         started automatically at boot (the one-command
+#                         demo). Still bearer-token protected.
+#
 # The admin server stays on loopback; reach it over an SSH tunnel:
-#   gcloud compute ssh ${acme_domain} -- -L 9090:localhost:9090
+#   gcloud compute ssh <instance> -- -L 9090:localhost:9090
 proxy:
-  # Port 80 carries the ACME http-01 challenge; 443 is the TLS data plane
-  # (tls-alpn-01 also works here). sbproxy manages the cert lifecycle.
+%{ if tls_enabled ~}
+  # Port 80 carries the ACME http-01 challenge; 443 is the TLS data plane.
   http_bind_port: 80
   https_bind_port: 443
   acme:
@@ -17,6 +25,10 @@ proxy:
     # unset challenge_types fails issuance (WOR-1771).
     challenge_types: ["http-01"]
     storage_path: /var/lib/sbproxy/certs
+%{ else ~}
+  # Plain HTTP: the one-command demo starts immediately, no DNS/ACME wait.
+  http_bind_port: 80
+%{ endif ~}
   admin:
     enabled: true
     bind: "127.0.0.1"
@@ -25,7 +37,7 @@ proxy:
     password: ${admin_password}
 
 origins:
-  "${acme_domain}":
+  "${public_host}":
     # Every request must present Authorization: Bearer <token>.
     authentication:
       type: bearer
@@ -43,6 +55,15 @@ origins:
           serve:
             eviction: lru
             cache_budget_gib: ${cache_budget_gib}
+            # sbproxy acquires the engine (WOR-1801): no hand-built
+            # llama.cpp. On Linux + NVIDIA there is no upstream CUDA
+            # prebuilt, so `accel: cuda` resolves to the Vulkan asset;
+            # set `accel: cpu` to force the CPU build.
+            engines:
+              llama_cpp:
+                acquire:
+                  source: release
+                  accel: ${engine_accel}
             models:
 %{ for m in serve_models ~}
               - model: "${m.model}"

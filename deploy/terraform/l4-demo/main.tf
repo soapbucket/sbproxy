@@ -24,11 +24,27 @@ provider "google" {
 }
 
 locals {
+  # A domain means public HTTPS via ACME (start after DNS); no domain
+  # means the plain-HTTP one-command demo keyed to the public IP, started
+  # at boot.
+  tls_enabled = var.acme_domain != ""
+  # In plain-HTTP mode the origin is keyed to the public IP, which is not
+  # known at plan time (templatefile forbids unknown values), so we render
+  # a sentinel and the startup script substitutes the real IP at boot.
+  public_host = local.tls_enabled ? var.acme_domain : "SBPROXY_PUBLIC_HOST"
+  auto_start  = !local.tls_enabled
+
+  # release mode: curl-install the binary + let sbproxy acquire the
+  # engine. source mode: build sbproxy + CUDA llama.cpp from source.
+  startup_script = var.install_mode == "release" ? "startup-release.sh" : "startup.sh"
+
   # Render the sbproxy config from the model list. default_model is the
   # first served model's plane-visible name.
   sbproxy_config = templatefile("${path.module}/sbproxy.yml.tftpl", {
-    acme_domain      = var.acme_domain
+    tls_enabled      = local.tls_enabled
+    public_host      = local.public_host
     acme_email       = var.acme_email
+    engine_accel     = var.engine_accel
     admin_password   = var.bearer_token
     bearer_token     = var.bearer_token
     default_model    = coalesce(var.serve_models[0].name, var.serve_models[0].model)
@@ -101,12 +117,15 @@ resource "google_compute_instance" "demo" {
 
   metadata = {
     # The startup script (static; reads its inputs from metadata to avoid
-    # Terraform interpolating bash) builds sbproxy, writes the rendered
-    # config from `sbproxy-config`, and installs a systemd unit. It does
-    # not start sbproxy: ACME issuance needs the domain resolving first.
-    startup-script = file("${path.module}/startup.sh")
+    # Terraform interpolating bash) installs sbproxy, writes the rendered
+    # config from `sbproxy-config`, and installs a systemd unit. In
+    # release mode it curl-installs the binary and lets sbproxy acquire
+    # the engine, then auto-starts (plain HTTP) or waits for DNS (TLS).
+    startup-script = file("${path.module}/${local.startup_script}")
     sbproxy-config = local.sbproxy_config
-    repo-url       = var.repo_url
+    install-url    = var.install_url
+    auto-start     = tostring(local.auto_start)
+    repo-url       = var.repo_url # source mode only
     ssh-keys       = "${var.ssh_user}:${var.ssh_public_key}"
     # DLVM images install the NVIDIA driver on first boot when this is set.
     install-nvidia-driver = "True"

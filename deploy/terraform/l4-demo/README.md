@@ -1,21 +1,66 @@
 # L4 GPU demo: run your own models behind sbproxy
 
 Terraform to stand up a single-GPU box on GCP that serves local models
-through sbproxy, reachable over a public IP with Let's Encrypt TLS and a
-bearer token. It is the "call any model, serve your own, govern both"
+through sbproxy. It is the "call any model, serve your own, govern both"
 demo you can run end to end and then tear down.
+
+Two modes, chosen by `install_mode`:
+
+- **`release` (default): one command, no build.** Installs the released
+  sbproxy binary via the curl installer and lets sbproxy **acquire the
+  inference engine itself** (WOR-1801), so there is no source build and no
+  hand-built llama.cpp. With no `acme_domain` it serves plain HTTP on the
+  public IP and **auto-starts at boot**, so `terraform apply` reaches a
+  served model on the first request with no manual engine step. Requires a
+  release with `gpu-nvidia` + `model-weights` (v1.5.0+).
+- **`source`: build from source.** Builds sbproxy + a native-CUDA
+  llama.cpp on the box (slower first boot, native-CUDA engine). This is
+  the original demo path.
+
+Set an `acme_domain` in either mode for public HTTPS via Let's Encrypt
+(started after DNS resolves, see below).
 
 ## What it creates
 
 - A `g2-standard-4` (1 NVIDIA L4, 24 GB) on a Deep Learning VM image
-  (NVIDIA driver + CUDA preinstalled).
+  (NVIDIA driver preinstalled).
 - A reserved external IP, and firewall rules for 80/443 (public) and 22
   (locked to your CIDR).
-- A startup script that builds sbproxy from source and serves the models
-  you list, behind a bearer-token-authed, TLS data plane.
+- A startup script that installs (or builds) sbproxy and serves the
+  models you list, bearer-token protected.
 
 Cost: the L4 box is about $0.71/hr on-demand (~$516/mo), plus a small
 disk and the static IP. Run `terraform destroy` when you are done.
+
+## One command (release mode)
+
+```hcl
+# terraform.tfvars
+project         = "your-project"
+bearer_token    = "PASTE_A_LONG_RANDOM_VALUE"   # openssl rand -hex 32
+ssh_public_key  = "ssh-ed25519 AAAA... you@host"
+ssh_source_cidr = "203.0.113.4/32"              # your IP
+# no acme_domain -> plain HTTP on the public IP, auto-starts at boot
+```
+
+```bash
+terraform init && terraform apply
+# The box installs sbproxy and starts it. The first request acquires the
+# engine, pulls the weights, and serves (allow a few minutes):
+curl http://<external_ip>/v1/chat/completions \
+  -H "Authorization: Bearer $BEARER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"codegeex4-all-9b","messages":[{"role":"user","content":"hello"}]}'
+```
+
+No DNS, no source build, no manual engine install. For public HTTPS, set
+`acme_domain` and follow the TLS section below.
+
+### Cloud-agnostic variant
+
+`cloud-init.yaml` is the same bootstrap as plain user-data for any GPU box
+whose image carries the NVIDIA driver (a GCP DLVM, an AWS DLAMI, ...):
+edit the bearer token and pass it as the instance user-data. It
+curl-installs sbproxy, lets it acquire the engine, and serves.
 
 ## Serving models: both reference types
 
@@ -39,10 +84,10 @@ serve_models = [
 
 Swap or add entries to test your own; both above fit a 24 GB L4.
 
-## Run it
+## Public HTTPS (Let's Encrypt)
 
-You need `gcloud` auth, a project, an SSH key, and a DNS name you
-control. Create `terraform.tfvars`:
+For a public TLS endpoint, add a DNS name you control. Create
+`terraform.tfvars`:
 
 ```hcl
 project         = "your-project"
@@ -51,6 +96,7 @@ acme_email      = "you@example.com"             # optional; LE expiry notices go
 bearer_token    = "PASTE_A_LONG_RANDOM_VALUE"   # e.g. openssl rand -hex 32
 ssh_public_key  = "ssh-ed25519 AAAA... you@host"
 ssh_source_cidr = "203.0.113.4/32"              # your IP
+# install_mode  = "source"  # optional: build a native-CUDA engine instead
 ```
 
 Then:
@@ -61,9 +107,11 @@ terraform apply
 
 # 1. Point the A record at the printed external_ip:
 #    demo.sbproxy.dev -> <external_ip>
-# 2. Watch the build (about 20-30 min the first time):
+# 2. Watch the boot (release mode: seconds to install; source mode:
+#    about 20-30 min to build):
 gcloud compute ssh sbproxy-l4-demo -- 'sudo journalctl -u sbproxy -f'
-# 3. Once DNS resolves, start sbproxy so ACME can issue:
+# 3. Once DNS resolves, start sbproxy so ACME can issue (TLS mode does not
+#    auto-start, since issuance needs the domain live first):
 gcloud compute ssh sbproxy-l4-demo -- 'sudo systemctl start sbproxy'
 ```
 
