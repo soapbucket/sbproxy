@@ -561,6 +561,18 @@
             "string",
             "null"
           ]
+        },
+        "acquire": {
+          "description": "How to acquire the binary when [`EngineLaunchMethod::Binary`] (WOR-1801). `None` keeps the pre-WOR-1801 behaviour: resolve from `PATH` only.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EngineAcquire"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -586,6 +598,113 @@
           "type": "string",
           "enum": [
             "venv"
+          ]
+        }
+      ]
+    },
+    "EngineAcquire": {
+      "description": "The `acquire:` block on a binary engine's provisioning (WOR-1801): how to obtain the binary. Engine *identity* stays the allowlisted [`EngineKind`]; only the acquisition method is configurable, so the config-spawn posture (no arbitrary `cmd:`) is unchanged.",
+      "type": "object",
+      "properties": {
+        "source": {
+          "description": "Where the binary comes from. Defaults to a pinned release.",
+          "default": "release",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AcquireSource"
+            }
+          ]
+        },
+        "version": {
+          "description": "Release tag to pin (for `release`); `None` uses the built-in default pin. Never `latest`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "accel": {
+          "description": "Acceleration flavour to fetch (for `release`).",
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EngineAccel"
+            }
+          ]
+        },
+        "path": {
+          "description": "Explicit binary path (required for `path`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha256": {
+          "description": "Expected sha256 hex of the release asset. Verifies the download when set; a `release` fetch without it logs a warning.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "AcquireSource": {
+      "description": "How a *binary* engine (llama.cpp today) is obtained when it is not already on `PATH` (WOR-1801). Container / venv acquisition is a separate [`EngineLaunchMethod`]; this covers the single-binary path.",
+      "oneOf": [
+        {
+          "description": "A pinned prebuilt release for the platform + accel, sha256 verified when a digest is pinned (default). PATH is always tried first.",
+          "type": "string",
+          "enum": [
+            "release"
+          ]
+        },
+        {
+          "description": "An operator-installed binary at an explicit `path`.",
+          "type": "string",
+          "enum": [
+            "path"
+          ]
+        }
+      ]
+    },
+    "EngineAccel": {
+      "description": "Hardware-acceleration flavour to acquire a binary engine build for (WOR-1801). `Auto` picks from the host GPU: Apple gets the Metal build (built into the macOS asset), an NVIDIA Linux box gets the Vulkan build (ggml-org ships no CUDA Linux prebuilt), everything else gets the CPU build.",
+      "oneOf": [
+        {
+          "description": "Detect from the host GPU.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "CUDA. For llama.cpp on Linux this resolves to the Vulkan prebuilt (no upstream CUDA Linux asset); a CUDA container or source build is the alternative.",
+          "type": "string",
+          "enum": [
+            "cuda"
+          ]
+        },
+        {
+          "description": "Vulkan (a portable GPU path on Linux).",
+          "type": "string",
+          "enum": [
+            "vulkan"
+          ]
+        },
+        {
+          "description": "Apple Metal (built into the macOS asset).",
+          "type": "string",
+          "enum": [
+            "metal"
+          ]
+        },
+        {
+          "description": "CPU-only.",
+          "type": "string",
+          "enum": [
+            "cpu"
           ]
         }
       ]

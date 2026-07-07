@@ -44,6 +44,21 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **sbproxy acquires the inference engine, not just finds it on PATH.**
+  A `serve:` block can now carry a per-engine `engines.<engine>.acquire:`
+  block: for llama.cpp, `source: release` (the default) fetches a pinned
+  ggml-org prebuilt for the host platform and acceleration
+  (`accel: auto|cuda|vulkan|metal|cpu`; on Linux a GPU build means the
+  Vulkan asset, since there is no upstream CUDA Linux prebuilt),
+  sha256-verified when a digest is pinned, while `source: path` points at
+  an operator-installed binary for an air-gapped box. A host with no
+  engine now serves a GGUF model instead of failing at the first request,
+  and a bad acquisition (a `path` source with no path, a `latest`
+  version) is rejected at config load, not at runtime. Engine identity
+  stays the allowlisted set (`vllm`, `llama_cpp`, `embedded`); only how
+  the binary is obtained is configurable. The gateway also detects a
+  container runtime now, so `engine: auto` can resolve to vLLM's
+  container path for safetensors weights.
 - **The released binary is GPU-aware out of the box.** The `gpu-nvidia`
   (NVML GPU discovery with an `nvidia-smi` fallback) and `model-weights`
   (Hugging Face weight download) features moved into the `sbproxy`

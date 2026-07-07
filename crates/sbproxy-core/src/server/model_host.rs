@@ -215,9 +215,12 @@ fn build_runtime(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<Proces
         // readiness probe a generous budget so the first request does
         // not fail over while the engine is still loading.
         Box::new(|| ProcessEngineLauncher::with_timeout(std::time::Duration::from_secs(600))),
-        // Container-runtime detection is a later refinement; the binary
-        // path is the default and llama.cpp/vLLM resolve from PATH.
-        false,
+        // Real container-runtime detection (WOR-1801): a present
+        // docker/podman lets `engine: auto` resolve to vLLM (its
+        // container path) for safetensors weights, instead of always
+        // falling back to llama.cpp.
+        sbproxy_model_host::resolve_on_path("docker").is_some()
+            || sbproxy_model_host::resolve_on_path("podman").is_some(),
     )
     .with_health_recheck(true)
     .with_observer(Arc::new(MetricsObserver));

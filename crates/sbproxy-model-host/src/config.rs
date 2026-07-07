@@ -148,6 +148,73 @@ pub enum EngineLaunchMethod {
     Venv,
 }
 
+/// Hardware-acceleration flavour to acquire a binary engine build for
+/// (WOR-1801). `Auto` picks from the host GPU: Apple gets the Metal
+/// build (built into the macOS asset), an NVIDIA Linux box gets the
+/// Vulkan build (ggml-org ships no CUDA Linux prebuilt), everything else
+/// gets the CPU build.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineAccel {
+    /// Detect from the host GPU.
+    #[default]
+    Auto,
+    /// CUDA. For llama.cpp on Linux this resolves to the Vulkan prebuilt
+    /// (no upstream CUDA Linux asset); a CUDA container or source build
+    /// is the alternative.
+    Cuda,
+    /// Vulkan (a portable GPU path on Linux).
+    Vulkan,
+    /// Apple Metal (built into the macOS asset).
+    Metal,
+    /// CPU-only.
+    Cpu,
+}
+
+/// How a *binary* engine (llama.cpp today) is obtained when it is not
+/// already on `PATH` (WOR-1801). Container / venv acquisition is a
+/// separate [`EngineLaunchMethod`]; this covers the single-binary path.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquireSource {
+    /// A pinned prebuilt release for the platform + accel, sha256
+    /// verified when a digest is pinned (default). PATH is always tried
+    /// first.
+    #[default]
+    Release,
+    /// An operator-installed binary at an explicit `path`.
+    Path,
+}
+
+/// The `acquire:` block on a binary engine's provisioning (WOR-1801):
+/// how to obtain the binary. Engine *identity* stays the allowlisted
+/// [`EngineKind`]; only the acquisition method is configurable, so the
+/// config-spawn posture (no arbitrary `cmd:`) is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EngineAcquire {
+    /// Where the binary comes from. Defaults to a pinned release.
+    #[serde(default)]
+    pub source: AcquireSource,
+    /// Release tag to pin (for `release`); `None` uses the built-in
+    /// default pin. Never `latest`.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Acceleration flavour to fetch (for `release`).
+    #[serde(default)]
+    pub accel: EngineAccel,
+    /// Explicit binary path (required for `path`).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Expected sha256 hex of the release asset. Verifies the download
+    /// when set; a `release` fetch without it logs a warning.
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
 /// Provisioning for one engine (how to acquire it), keyed by engine in
 /// [`ModelHostConfig::engines`].
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -160,6 +227,11 @@ pub struct EngineProvisioning {
     /// ends in `:latest` or has no tag.
     #[serde(default)]
     pub image: Option<String>,
+    /// How to acquire the binary when [`EngineLaunchMethod::Binary`]
+    /// (WOR-1801). `None` keeps the pre-WOR-1801 behaviour: resolve from
+    /// `PATH` only.
+    #[serde(default)]
+    pub acquire: Option<EngineAcquire>,
 }
 
 impl EngineProvisioning {
@@ -545,6 +617,21 @@ impl ModelHostConfig {
                     return Err(format!(
                         "engine {kind:?} image is not pinned (avoid :latest / untagged): {:?}",
                         prov.image
+                    ));
+                }
+            }
+            // Acquire-block coherence (WOR-1801): a `path` source needs a
+            // path; a pinned `version` must not be `latest`.
+            if let Some(acq) = &prov.acquire {
+                if acq.source == AcquireSource::Path && acq.path.as_deref().unwrap_or("").is_empty()
+                {
+                    return Err(format!(
+                        "engine {kind:?} acquire.source: path needs a non-empty `path`"
+                    ));
+                }
+                if acq.version.as_deref() == Some("latest") {
+                    return Err(format!(
+                        "engine {kind:?} acquire.version must be pinned, not `latest`"
                     ));
                 }
             }
@@ -988,17 +1075,20 @@ models:
         let bad = EngineProvisioning {
             launch: EngineLaunchMethod::Container,
             image: Some("vllm/vllm-openai:latest".into()),
+            ..Default::default()
         };
         assert!(!bad.image_is_pinned());
         let untagged = EngineProvisioning {
             launch: EngineLaunchMethod::Container,
             image: Some("vllm/vllm-openai".into()),
+            ..Default::default()
         };
         assert!(!untagged.image_is_pinned());
         // A digest is pinned.
         let digest = EngineProvisioning {
             launch: EngineLaunchMethod::Container,
             image: Some("vllm/vllm-openai@sha256:abc123".into()),
+            ..Default::default()
         };
         assert!(digest.image_is_pinned());
     }

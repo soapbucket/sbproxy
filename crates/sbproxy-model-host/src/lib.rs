@@ -29,6 +29,7 @@
 //!   ready, evict, restart) over an abstract launcher.
 //! - [`config`] - the `serve:` config block an operator writes.
 
+pub mod acquire;
 pub mod catalog;
 pub mod config;
 #[cfg(feature = "embedded")]
@@ -57,11 +58,12 @@ pub mod supply_chain;
 pub mod tokenize;
 pub mod weights;
 
+pub use acquire::{plan_binary_acquire, BinaryAcquirePlan};
 pub use catalog::{Catalog, CatalogEntry, ModelRef, PullPolicy, ResolveError};
 pub use config::{
-    ChunkedPrefill, EngineChoice, EngineDoctor, EngineEnv, EngineKind, EngineLaunchMethod,
-    EngineProvisioning, EvictionPolicy, KvCacheQuant, LoraAdapter, ModelHostConfig, ServeEntry,
-    SpecMethod, SpeculativeConfig,
+    AcquireSource, ChunkedPrefill, EngineAccel, EngineAcquire, EngineChoice, EngineDoctor,
+    EngineEnv, EngineKind, EngineLaunchMethod, EngineProvisioning, EvictionPolicy, KvCacheQuant,
+    LoraAdapter, ModelHostConfig, ServeEntry, SpecMethod, SpeculativeConfig,
 };
 pub use fit::{
     estimate_throughput, fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
@@ -72,7 +74,10 @@ pub use kv_tiering::{KvTier, KvTieringPolicy, TierDecision};
 pub use launch::{
     build_launch_spec, chunk_size_for_ttft, serving_flags, should_speculate, ProcessEngineLauncher,
 };
-pub use llama_release::{asset_url as llama_asset_url, resolve_on_path, Platform};
+pub use llama_release::{
+    asset_url as llama_asset_url, asset_url_accel as llama_asset_url_accel, resolve_on_path,
+    Platform, DEFAULT_LLAMA_RELEASE_TAG,
+};
 #[cfg(feature = "weights")]
 pub use llama_release::{ensure_llama_server, ensure_llama_server_blocking};
 pub use lora::{AdapterRoute, LoraCache};
