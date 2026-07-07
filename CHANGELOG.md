@@ -44,6 +44,13 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **`sbproxy update`: is any of it out of date.** A dry-run freshness
+  report: `sbproxy update` checks the inference engine release feed (the
+  pinned llama.cpp prebuilt vs the latest) and the cached models (flagging
+  any that track a moving ref like `main` and could be behind upstream);
+  `--self` also checks the sbproxy binary against its release channel.
+  `--json` for tooling. Reports only, nothing is mutated; a pinned artifact
+  is never swapped without an explicit run.
 - **`sbproxy config print`: see the effective config, with secrets
   masked.** Prints the config after built-in defaults + the file +
   `${ENV}` interpolation, so it is obvious what a box will actually do.
