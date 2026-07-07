@@ -44,6 +44,15 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **`sbproxy models list` / `show`: discover what this host can run.**
+  `sbproxy models` (or `models list`) prints one row per catalog model
+  with a real per-GPU fit verdict (reusing the same probe `doctor` uses),
+  the resolved engine, params, and cache status (cached / not-pulled).
+  `sbproxy models show <id>` prints the full entry: HF repo, source,
+  revision, sha256 digests, engine, pull policy, and quants. `--json` on
+  both for scripts and the admin UI; `--catalog-file` points at an
+  operator manifest. Resident / serving state needs a running gateway and
+  is not shown by this offline view.
 - **`sbproxy run <model>`: serve a model in one command, no YAML.**
   `sbproxy run qwen3-14b` (or `sbproxy run hf:Org/Repo:Q4_K_M --name
   coder`) synthesizes a minimal serving config, checks the model can run
