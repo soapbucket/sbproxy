@@ -1,0 +1,79 @@
+#cloud-config
+# One-command GPU model server (WOR-1806), cloud-agnostic variant. Pass
+# this as the instance user-data on any GPU box whose image already has
+# the NVIDIA driver (a Deep Learning VM, an AWS DLAMI, etc.). It installs
+# the released sbproxy binary via the curl installer and lets sbproxy
+# acquire the inference engine itself (no source build, no hand-built
+# llama.cpp), then serves a GGUF model on plain HTTP :80, bearer-token
+# protected. The first request acquires the engine + pulls the weights.
+#
+# EDIT before use: set a real bearer token, and (if the model is gated)
+# an HF_TOKEN in the systemd unit. For public HTTPS use the Terraform
+# module with an ACME domain instead.
+#
+# Requires a released binary with gpu-nvidia + model-weights (v1.5.0+).
+
+write_files:
+  - path: /etc/sbproxy/sb.yml
+    permissions: "0644"
+    content: |
+      proxy:
+        http_bind_port: 80
+        admin:
+          enabled: true
+          bind: "127.0.0.1"
+          port: 9090
+          username: admin
+          password: CHANGE-ME-ADMIN
+      origins:
+        # Requests must send Host: <this box's public IP or name>. Set the
+        # key to match, or curl with -H "Host: model.local" and use that.
+        "model.local":
+          authentication:
+            type: bearer
+            tokens:
+              - CHANGE-ME-BEARER-TOKEN
+          action:
+            type: ai_proxy
+            providers:
+              - name: local
+                default_model: codegeex4-all-9b
+                serve:
+                  eviction: lru
+                  cache_budget_gib: 20
+                  engines:
+                    llama_cpp:
+                      acquire:
+                        source: release
+                        accel: cuda   # -> Vulkan prebuilt on Linux/NVIDIA
+                  models:
+                    - model: "hf:zai-org/codegeex4-all-9b-GGUF:Q4_K_M"
+                      name: codegeex4-all-9b
+                      gguf_file: codegeex4-all-9b-Q4_K_M.gguf
+                      keep_alive: 30m
+
+  - path: /etc/systemd/system/sbproxy.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=sbproxy
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      ExecStart=/usr/local/bin/sbproxy /etc/sbproxy/sb.yml
+      Restart=on-failure
+      LimitNOFILE=65536
+      AmbientCapabilities=CAP_NET_BIND_SERVICE
+      Environment=RUST_LOG=info
+      # Environment=HF_TOKEN=hf_...   # for a gated model
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - apt-get update -y
+  - apt-get install -y curl unzip libvulkan1
+  - install -d /var/lib/sbproxy/models
+  - SBPROXY_INSTALL_DIR=/usr/local/bin sh -c 'curl -fsSL https://download.sbproxy.dev | sh'
+  - /usr/local/bin/sbproxy doctor /etc/sbproxy/sb.yml || true
+  - systemctl daemon-reload
+  - systemctl enable --now sbproxy

@@ -50,9 +50,43 @@ variable "ssh_source_cidr" {
   description = "CIDR allowed to SSH (lock to your IP, e.g. 203.0.113.4/32)."
 }
 
+variable "install_mode" {
+  type        = string
+  default     = "release"
+  description = <<-EOT
+    How the box gets sbproxy and the inference engine:
+      release : install the released binary via the curl installer and let
+                sbproxy acquire the engine (WOR-1801). One command, no build.
+                Requires a release with gpu-nvidia + model-weights (v1.5.0+).
+      source  : build sbproxy + a CUDA llama.cpp from source (the original
+                demo path; slower, but a native-CUDA engine).
+  EOT
+  validation {
+    condition     = contains(["release", "source"], var.install_mode)
+    error_message = "install_mode must be \"release\" or \"source\"."
+  }
+}
+
+variable "engine_accel" {
+  type        = string
+  default     = "cuda"
+  description = "Acceleration for the acquired llama.cpp build (release mode). cuda -> the Vulkan prebuilt on Linux; or cpu."
+  validation {
+    condition     = contains(["cuda", "vulkan", "metal", "cpu"], var.engine_accel)
+    error_message = "engine_accel must be one of cuda, vulkan, metal, cpu."
+  }
+}
+
+variable "install_url" {
+  type        = string
+  default     = "https://download.sbproxy.dev"
+  description = "The curl-installer URL used in release mode."
+}
+
 variable "acme_domain" {
   type        = string
-  description = "Public hostname for the Let's Encrypt cert (must resolve to the instance's external IP)."
+  default     = ""
+  description = "Public hostname for a Let's Encrypt cert (must resolve to the instance's external IP). Leave empty for the plain-HTTP, auto-starting one-command demo."
 }
 
 variable "acme_email" {

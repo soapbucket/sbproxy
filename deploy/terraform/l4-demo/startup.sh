@@ -62,6 +62,13 @@ install -m 0755 /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-serve
 # 3. Config + state dirs.
 install -d /etc/sbproxy /var/lib/sbproxy/certs /var/lib/sbproxy/models
 meta sbproxy-config >/etc/sbproxy/sb.yml
+# Plain-HTTP mode leaves a public-IP sentinel Terraform cannot resolve at
+# plan time; substitute the real external IP here.
+if grep -q SBPROXY_PUBLIC_HOST /etc/sbproxy/sb.yml; then
+  PUBLIC_IP="$(curl -s -H "Metadata-Flavor: Google" \
+    http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)"
+  sed -i "s/SBPROXY_PUBLIC_HOST/${PUBLIC_IP}/g" /etc/sbproxy/sb.yml
+fi
 
 # 4. systemd unit. Binds :80/:443 via CAP_NET_BIND_SERVICE.
 cat >/etc/systemd/system/sbproxy.service <<'UNIT'
@@ -87,4 +94,12 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable sbproxy
-echo "[bootstrap] done. After DNS resolves the ACME domain: systemctl start sbproxy"
+
+# Auto-start in plain-HTTP mode (no ACME domain); TLS mode waits for DNS.
+AUTO_START="$(meta auto-start || echo false)"
+if [ "$AUTO_START" = "true" ]; then
+  systemctl start sbproxy
+  echo "[bootstrap] sbproxy started. First request acquires/uses the engine + pulls weights."
+else
+  echo "[bootstrap] done. After DNS resolves the ACME domain: systemctl start sbproxy"
+fi
