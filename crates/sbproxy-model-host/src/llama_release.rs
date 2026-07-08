@@ -13,9 +13,9 @@
 //! known digest.
 //!
 //! The platform detection, asset-URL construction, and PATH lookup are
-//! pure and unit-tested. The actual download + unzip is behind the
+//! pure and unit-tested. The actual download + extract is behind the
 //! `weights` feature (it reuses the reqwest fetch) and shells out to
-//! `unzip`, so no archive crate is pulled into the lean build.
+//! `tar`, so no archive crate is pulled into the lean build.
 
 use std::path::PathBuf;
 
@@ -74,7 +74,18 @@ impl Platform {
 /// pin their own; bump this as ggml-org ships. No digest is bundled
 /// (assets differ per platform + accel), so an unpinned default fetch
 /// logs a warning: pin `acquire.sha256` to verify.
-pub const DEFAULT_LLAMA_RELEASE_TAG: &str = "b4589";
+///
+/// Pinned to a tag that ships the `ubuntu-vulkan-x64` asset (the Linux
+/// GPU path): the older `b4589` had only a CPU `ubuntu-x64` build, so a
+/// `cuda`/`vulkan` acquisition 404'd on Linux. From this tag the macOS
+/// and Linux assets are `.tar.gz` (they were `.zip` at `b4589`).
+pub const DEFAULT_LLAMA_RELEASE_TAG: &str = "b9905";
+
+/// The archive extension for a platform's release asset. macOS and Linux
+/// assets are `.tar.gz`; only Windows (unsupported here) would be `.zip`.
+fn archive_ext(_platform: Platform) -> &'static str {
+    "tar.gz"
+}
 
 /// The download URL for a pinned ggml-org/llama.cpp release binary asset
 /// for a requested acceleration flavour (WOR-1801). Like [`asset_url`]
@@ -88,21 +99,23 @@ pub fn asset_url_accel(
         return Err(format!("llama.cpp release tag must be pinned, not '{tag}'"));
     }
     Ok(format!(
-        "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/llama-{tag}-bin-{}.zip",
-        platform.asset_infix_accel(accel)
+        "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/llama-{tag}-bin-{}.{}",
+        platform.asset_infix_accel(accel),
+        archive_ext(platform)
     ))
 }
 
 /// The download URL for a pinned ggml-org/llama.cpp release binary
-/// asset. `tag` is a release tag (for example `b4589`); it must not be
+/// asset. `tag` is a release tag (for example `b9905`); it must not be
 /// `latest`, so the acquisition stays pinned.
 pub fn asset_url(tag: &str, platform: Platform) -> Result<String, String> {
     if tag.trim().is_empty() || tag == "latest" {
         return Err(format!("llama.cpp release tag must be pinned, not '{tag}'"));
     }
     Ok(format!(
-        "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/llama-{tag}-bin-{}.zip",
-        platform.asset_infix()
+        "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/llama-{tag}-bin-{}.{}",
+        platform.asset_infix(),
+        archive_ext(platform)
     ))
 }
 
@@ -121,9 +134,9 @@ pub fn resolve_on_path(name: &str) -> Option<PathBuf> {
 
 /// Ensure a `llama-server` binary is available: prefer one on `PATH`,
 /// else download the pinned release for this platform into
-/// `cache_dir`, verify its sha256 (when a digest is pinned), unzip it,
+/// `cache_dir`, verify its sha256 (when a digest is pinned), extract it,
 /// and return the extracted `llama-server` path. Behind the `weights`
-/// feature (the download reuses reqwest); shells out to `unzip`.
+/// feature (the download reuses reqwest); shells out to `tar`.
 ///
 /// `expected_sha256` is `Some(hex)` to pin and verify the digest (the
 /// WOR-1663 supply-chain posture), or `None` to accept the tagged asset
@@ -151,7 +164,7 @@ pub async fn ensure_llama_server(
     tokio::fs::create_dir_all(&dest_dir)
         .await
         .map_err(|e| format!("create {}: {e}", dest_dir.display()))?;
-    let zip_path = dest_dir.join("llama.zip");
+    let archive_path = dest_dir.join(format!("llama.{}", archive_ext(platform)));
 
     // Download.
     let resp = reqwest::Client::new()
@@ -162,13 +175,13 @@ pub async fn ensure_llama_server(
         .error_for_status()
         .map_err(|e| format!("download {url}: {e}"))?;
     let bytes = resp.bytes().await.map_err(|e| format!("read {url}: {e}"))?;
-    tokio::fs::write(&zip_path, &bytes)
+    tokio::fs::write(&archive_path, &bytes)
         .await
-        .map_err(|e| format!("write {}: {e}", zip_path.display()))?;
+        .map_err(|e| format!("write {}: {e}", archive_path.display()))?;
 
     // Verify the pinned digest before using it, when one is pinned.
     match expected_sha256 {
-        Some(hex) => crate::weights::verify_sha256(&zip_path, hex)?,
+        Some(hex) => crate::weights::verify_sha256(&archive_path, hex)?,
         None => tracing::warn!(
             tag,
             "llama.cpp release {tag} fetched without a pinned sha256; set \
@@ -176,20 +189,23 @@ pub async fn ensure_llama_server(
         ),
     }
 
-    // Extract (shell out to unzip to avoid an archive crate dependency).
-    let status = tokio::process::Command::new("unzip")
-        .args(["-o", "-q"])
-        .arg(&zip_path)
-        .arg("-d")
+    // Extract. macOS/Linux assets are gzip tarballs (shell out to `tar` to
+    // avoid an archive crate dependency in the lean build).
+    let status = tokio::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive_path)
+        .arg("-C")
         .arg(&dest_dir)
         .status()
         .await
-        .map_err(|e| format!("unzip: {e}"))?;
+        .map_err(|e| format!("tar: {e}"))?;
     if !status.success() {
-        return Err(format!("unzip of {} failed", zip_path.display()));
+        return Err(format!("tar extract of {} failed", archive_path.display()));
     }
 
-    // The binary lands under a bin/ dir in the archive.
+    // The binary lands under a bin/ dir in the archive. Check the common
+    // layouts first, then fall back to a recursive scan (the layout has
+    // shifted across ggml-org releases).
     for candidate in [
         dest_dir.join("build/bin/llama-server"),
         dest_dir.join("bin/llama-server"),
@@ -199,10 +215,37 @@ pub async fn ensure_llama_server(
             return Ok(candidate);
         }
     }
+    if let Some(found) = find_file_named(&dest_dir, "llama-server") {
+        return Ok(found);
+    }
     Err(format!(
         "llama-server not found in the extracted release under {}",
         dest_dir.display()
     ))
+}
+
+/// Recursively search `root` for a file named `name`, returning the first
+/// match. Bounded to a small depth: release archives are shallow.
+#[cfg(feature = "weights")]
+pub(crate) fn find_file_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
+    fn walk(dir: &std::path::Path, name: &str, depth: usize) -> Option<PathBuf> {
+        if depth == 0 {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(hit) = walk(&path, name, depth - 1) {
+                    return Some(hit);
+                }
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+    walk(root, name, 6)
 }
 
 /// Blocking wrapper around [`ensure_llama_server`] for synchronous
@@ -228,13 +271,29 @@ mod tests {
 
     #[test]
     fn asset_url_is_pinned_and_platform_specific() {
+        // macOS and Linux assets are gzip tarballs.
         assert_eq!(
-            asset_url("b4589", Platform::LinuxX64).unwrap(),
-            "https://github.com/ggml-org/llama.cpp/releases/download/b4589/llama-b4589-bin-ubuntu-x64.zip"
+            asset_url("b9905", Platform::LinuxX64).unwrap(),
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9905/llama-b9905-bin-ubuntu-x64.tar.gz"
         );
         assert_eq!(
-            asset_url("b4589", Platform::MacOsArm64).unwrap(),
-            "https://github.com/ggml-org/llama.cpp/releases/download/b4589/llama-b4589-bin-macos-arm64.zip"
+            asset_url("b9905", Platform::MacOsArm64).unwrap(),
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9905/llama-b9905-bin-macos-arm64.tar.gz"
+        );
+    }
+
+    #[test]
+    fn accel_url_uses_vulkan_asset_on_linux_gpu() {
+        use crate::config::EngineAccel;
+        // A Linux GPU acquisition must resolve to the Vulkan asset that
+        // actually ships (the CPU `ubuntu-x64` build has no GPU offload).
+        assert_eq!(
+            asset_url_accel("b9905", Platform::LinuxX64, EngineAccel::Cuda).unwrap(),
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9905/llama-b9905-bin-ubuntu-vulkan-x64.tar.gz"
+        );
+        assert_eq!(
+            asset_url_accel("b9905", Platform::LinuxX64, EngineAccel::Cpu).unwrap(),
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9905/llama-b9905-bin-ubuntu-x64.tar.gz"
         );
     }
 

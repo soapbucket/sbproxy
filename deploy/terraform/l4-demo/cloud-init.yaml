@@ -72,6 +72,9 @@ write_files:
 runcmd:
   - apt-get update -y
   - apt-get install -y curl unzip libvulkan1
+  # vLLM (GPU path via uvx) JIT-compiles a Triton CUDA shim at startup:
+  # it needs a C toolchain + Python headers, or the engine core fails.
+  - apt-get install -y build-essential python3-dev
   - install -d /var/lib/sbproxy/models
   - SBPROXY_INSTALL_DIR=/usr/local/bin sh -c 'curl -fsSL https://download.sbproxy.dev | sh'
   - /usr/local/bin/sbproxy doctor /etc/sbproxy/sb.yml || true

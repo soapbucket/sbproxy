@@ -44,6 +44,15 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **vLLM, provisioned with `uvx`.** vLLM is a Python package, not a
+  single-binary release, so sbproxy now acquires it by fetching `uv`
+  (Astral's single-binary package manager) and running the engine through
+  `uv tool run` (`uvx`): a cached, ephemeral environment that uv sets up
+  on first use, bringing its own Python if the host lacks one. The default
+  wheel is CUDA-enabled, so a safetensors model offloads to an NVIDIA GPU
+  on a box that carries only the driver. Opt in with
+  `engines.vllm.acquire.source: uvx`; `sbproxy run <model>` sets it for
+  you. `sbproxy doctor` reports it as the recommended vLLM path.
 - **`sbproxy update`: is any of it out of date.** A dry-run freshness
   report: `sbproxy update` checks the inference engine release feed (the
   pinned llama.cpp prebuilt vs the latest) and the cached models (flagging

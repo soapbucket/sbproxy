@@ -56,6 +56,7 @@ pub mod supervisor;
 pub mod supply_chain;
 #[cfg(feature = "tokenizer")]
 pub mod tokenize;
+pub mod uv_release;
 pub mod weights;
 
 pub use acquire::{plan_binary_acquire, BinaryAcquirePlan};
