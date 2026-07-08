@@ -13,9 +13,17 @@ Two modes, chosen by `install_mode`:
   public IP and **auto-starts at boot**, so `terraform apply` reaches a
   served model on the first request with no manual engine step. Requires a
   release with `gpu-nvidia` + `model-weights` (v1.5.0+).
+
+  Caveat for GGUF on NVIDIA: the acquired llama.cpp is a **Vulkan** build
+  (ggml-org ships no Linux CUDA prebuilt), and the Deep Learning VM image
+  does not carry a working NVIDIA Vulkan driver, so a GGUF model serves on
+  **CPU** here even though the GPU is present and detected. For GPU
+  throughput on this image, use `install_mode = "source"` (native CUDA) or
+  serve a safetensors model on vLLM. Verified on an L4: acquisition +
+  serving work, but `llama.cpp`/Vulkan does not offload to the L4.
 - **`source`: build from source.** Builds sbproxy + a native-CUDA
-  llama.cpp on the box (slower first boot, native-CUDA engine). This is
-  the original demo path.
+  llama.cpp on the box (slower first boot, native-CUDA engine that
+  offloads to the GPU). This is the original demo path.
 
 Set an `acme_domain` in either mode for public HTTPS via Let's Encrypt
 (started after DNS resolves, see below).
