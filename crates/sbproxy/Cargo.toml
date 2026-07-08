@@ -128,3 +128,10 @@ fs2.workspace = true
 # log-level resolver).
 clap = { version = "4", features = ["derive", "env", "wrap_help", "string"] }
 clap_complete = "4"
+
+# WOR-1809: raise the file-descriptor soft limit to the hard cap at
+# startup so `sbproxy run` and any shell invocation do not inherit the
+# 1024 default. `rlimit` is a safe getrlimit/setrlimit wrapper (the binary
+# is `#![forbid(unsafe_code)]`, so no raw libc); dual MIT/Apache-2.0, no
+# NOTICE entry required.
+rlimit = "0.10"

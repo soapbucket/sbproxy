@@ -439,13 +439,15 @@ impl DoctorReport {
             vllm_on_path: self.engine_path("vllm").is_some(),
             llama_server_on_path: self.engine_path("llama_cpp").is_some(),
             container_runtime: container_for_resolution,
+            // uvx provisions vLLM on Linux (sbproxy fetches uv itself).
+            vllm_uvx: self.host.os == "linux",
             gpu_present: !self.gpus.is_empty(),
         };
         serve
             .models
             .iter()
             .map(|entry| {
-                let is_gguf = looks_gguf(&entry.model);
+                let is_gguf = looks_gguf(&entry.model) || entry.gguf_file.is_some();
                 let doc = EngineDoctor::for_entry(entry, is_gguf, &env);
                 // If the resolved engine's binary is absent from PATH but
                 // an acquisition option exists, sbproxy can acquire it, so
