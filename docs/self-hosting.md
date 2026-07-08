@@ -54,10 +54,14 @@ origins:
 ```
 
 That is the whole provider. The engine defaults to `auto`, which reads
-the weights and the box: GGUF or no container runtime picks llama.cpp,
-safetensors picks vLLM. The fit planner picks the quant the card can
-run, so an L4 takes FP8 and a T4 falls back to an int4 GGUF instead of
-a kernel the hardware lacks.
+the weights and the box: a GGUF model picks llama.cpp, a safetensors
+model picks vLLM. sbproxy acquires either one for you, so a bare box
+serves without a manual install: it fetches a pinned llama.cpp binary,
+or fetches `uv` and runs vLLM through `uv tool run`. The fit planner
+picks the quant the card can run, so an L4 takes FP8 and a T4 falls back
+to an int4 GGUF instead of a kernel the hardware lacks. See
+[model-host.md](model-host.md#inference-engines) for the two engines and
+their prerequisites.
 
 ## The model manifest
 
@@ -85,11 +89,13 @@ air-gapped hosts.
 `sbproxy doctor` answers "can this host serve models" with no config
 at all: build capabilities, visible GPUs, engines on PATH, container
 runtime, the model cache, and a serve-readiness verdict with every
-blocker listed. For a missing engine it prints the prerequisites and
-the manual steps to install one (a prebuilt release on PATH, or a
-container runtime); sbproxy diagnoses, it does not install engines
-for you. A missing dependency is a doctor-time message, not a spawn
-failure at 2am on the first request.
+blocker listed. For each engine it names the acquisition options viable
+here (a pinned llama.cpp release, or vLLM via uvx), and the runtime then
+acquires the engine on first use. What doctor still cannot supply is a
+host prerequisite it can only report: a GPU driver, or the
+`build-essential` and `python3-dev` that vLLM's Triton compile needs. A
+missing prerequisite is a doctor-time message, not a spawn failure at
+2am on the first request.
 
 `sbproxy validate <path>` parses and validates the config offline,
 and `sbproxy plan -f sb.yml [--against baseline.yml]` diffs it: it
