@@ -690,7 +690,22 @@ fn parse_open_files_soft_limit(limits: &str) -> Option<u64> {
         .ok()
 }
 
+/// Raise the file-descriptor soft limit toward the hard cap at startup
+/// (WOR-1809). `sbproxy run` and any shell invocation otherwise inherit
+/// the 1024 default, and Pingora's socket-per-connection plus engine
+/// provisioning (vLLM's uv environment, weight downloads) exhaust it,
+/// which surfaces as `Too many open files` and, once fds run out, a
+/// failing GPU probe that wrongly rejects admission. Raising our own soft
+/// limit means no `ulimit` or systemd tuning is required.
+fn raise_fd_limit() {
+    // Widen the soft limit toward the hard cap; `increase_nofile_limit`
+    // targets min(requested, hard) and handles the macOS per-process
+    // ceiling, so a request above the cap is clamped, not an error.
+    let _ = rlimit::increase_nofile_limit(1_048_576);
+}
+
 fn run_proxy(config_path: Option<&std::path::Path>, grace: sbproxy_core::GraceConfig) {
+    raise_fd_limit();
     warn_low_fd_limit();
     match config_path {
         Some(path) => {
@@ -1340,8 +1355,17 @@ fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
     }
 
     // Write the synthesized config to a temp file (the serve boot path
-    // takes a path, not an in-memory config).
-    let path = std::env::temp_dir().join(format!("sbproxy-run-{}.yml", std::process::id()));
+    // takes a path, not an in-memory config). Use a dedicated per-run
+    // directory, not the shared temp dir: the hot-reload watcher watches
+    // the config's *directory*, and while an engine provisions (vLLM's uv
+    // env, weight downloads) the shared temp dir churns, which would
+    // otherwise fire a reload storm and exhaust file descriptors.
+    let run_dir = std::env::temp_dir().join(format!("sbproxy-run-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&run_dir) {
+        eprintln!("sbproxy run: could not create {}: {e}", run_dir.display());
+        std::process::exit(1);
+    }
+    let path = run_dir.join("sb.yml");
     if let Err(e) = std::fs::write(&path, &yaml) {
         eprintln!("sbproxy run: could not write {}: {e}", path.display());
         std::process::exit(1);
