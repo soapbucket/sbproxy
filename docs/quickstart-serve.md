@@ -30,9 +30,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 The same command runs on a Linux GPU server, an Apple Silicon Mac, or a
 plain CPU box. sbproxy detects what it is running on and picks a path:
 
-- An NVIDIA GPU: it uses the GPU. GGUF models run on llama.cpp, which
-  sbproxy fetches for you; safetensors models run on vLLM, which you
-  supply (a container or an install).
+- An NVIDIA GPU: it uses the GPU. GGUF models run on llama.cpp and
+  safetensors models run on vLLM, and sbproxy provisions both for you
+  (llama.cpp is a fetched binary; vLLM runs through `uv`, which sbproxy
+  also fetches). See [model-host.md](model-host.md) for the engines.
 - An Apple Silicon Mac: it uses Metal and unified memory, with llama.cpp.
 - A CPU-only box: it serves small models against a slice of system RAM.
 
@@ -51,9 +52,13 @@ carries no `config.json` for the planner to read:
 sbproxy run hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF \
   --name qwen --gguf-file qwen2.5-0.5b-instruct-q4_k_m.gguf
 
-# A catalog id on a GPU box (safetensors, served by vLLM):
+# A catalog id on a GPU box (safetensors, served by vLLM via uv):
 sbproxy run qwen3-14b
 ```
+
+On an NVIDIA GPU box, a safetensors model needs a C toolchain and the
+Python headers (`build-essential`, `python3-dev`) for vLLM's runtime
+compile step. GGUF models on llama.cpp need neither.
 
 Flags override the port, engine, acceleration, and cache directory. Add
 `--dry-run` to see the config and the resolution without serving.

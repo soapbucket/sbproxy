@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-08*
 
 The model host lets the gateway run the model itself, not just proxy to
 a model server someone else started. You name a model in a provider's
@@ -20,13 +20,15 @@ engine-supervisor state machine, the process launcher (it builds the
 engine argv, spawns the subprocess, polls a loopback readiness probe,
 and kills it), the VRAM-budget residency manager (LRU eviction under a
 byte budget), and the hybrid pieces (model aliases and the dollars-saved
-math). GPU discovery, Hugging Face weight download, and a real vLLM /
+math). GPU discovery, Hugging Face weight download, and real vLLM /
 llama.cpp bring-up plug in behind the traits this core defines
-(`GpuProbe`, `EngineLauncher`) and are certified against actual GPUs in
-later phases. The launcher's spawn / probe / kill machinery is tested
-against a fake process; what it cannot prove without hardware is that a
-real engine boots and serves tokens. On a host with no GPU or no engine
-binary, a `serve:` block parses and validates but starts no engine.
+(`GpuProbe`, `EngineLauncher`). These are certified on real GPUs: a GGUF
+model serves on Metal on an Apple Silicon Mac, and a safetensors model
+serves on an NVIDIA L4 through vLLM with the weights resident in GPU
+memory. The launcher's spawn / probe / kill machinery is also tested
+against a fake process so the lifecycle is exercised with no hardware. On
+a host with no GPU or no engine binary, a `serve:` block parses and
+validates but starts no engine.
 
 The real GPU bindings ship in the released binary: `gpu-nvidia` (an
 NVML `GpuProbe` with an `nvidia-smi` fallback) and `model-weights`
@@ -37,16 +39,15 @@ linked, so the same binary runs on a GPU-free host (the probe reports
 zero GPUs and `serve:` admission rejects cleanly) and discovers real
 devices on a GPU host with no rebuild. Run `sbproxy doctor` to see what
 the current host supports: compiled features, visible GPUs, engines on
-`PATH`, container runtime, and the `serve:` readiness verdict; for a
-missing engine it maps the prerequisites and the manual steps to
-install one (a prebuilt `llama-server` on PATH, the `ubuntu-vulkan-x64`
-asset for NVIDIA GPU without a CUDA build, or vLLM via uv/pipx/a
-container). sbproxy diagnoses; it does not install engines. The same
-prerequisites are
-checked when a config loads: a `serve:` block on a host with no
-visible GPU, or a serve entry whose engine has no binary and no
-container runtime, logs a warning at startup and on every hot reload
-naming the model and the blocker. Library consumers of the workspace
+`PATH`, container runtime, and the `serve:` readiness verdict, plus the
+acquisition options viable here for each engine. The runtime then
+acquires the engine on first use rather than leaving you to install it:
+it fetches the pinned llama.cpp release binary, or fetches `uv` and runs
+vLLM through `uv tool run` (see [Inference engines](#inference-engines)).
+The same prerequisites are checked when a config loads: a `serve:` block
+on a host with no visible GPU, or a serve entry whose engine cannot be
+acquired here, logs a warning at startup and on every hot reload naming
+the model and the blocker. Library consumers of the workspace
 crates still opt into these features per crate. The bindings are exercised on
 a GPU host; see
 [model-host-certification.md](model-host-certification.md) for the
@@ -88,6 +89,84 @@ free VRAM; `eviction` decides what happens under VRAM pressure, `lru`
 evicts the least-recently-used idle model, `never` pins residency and
 refuses a new model when full. See
 [`examples/ai-local-serving`](../examples/ai-local-serving).
+
+## Inference engines
+
+The model host runs the model through one of two engines. You pick one
+per serve entry with `engine:`, or leave it `auto` and the host chooses
+by model format. Either way sbproxy acquires the engine for you, so a
+bare box serves without a manual install.
+
+| | llama.cpp | vLLM |
+|---|---|---|
+| Model format | GGUF | safetensors (the Hugging Face default) |
+| How sbproxy gets it | fetches a pinned ggml-org prebuilt binary | fetches `uv`, runs vLLM through `uv tool run` |
+| GPU | Metal on Apple Silicon, Vulkan on Linux | CUDA, NVIDIA only |
+| Host prerequisites | none beyond the GPU driver | NVIDIA driver, `build-essential`, `python3-dev` |
+| Good for | a Mac, a laptop, a CPU box, one GGUF file | an NVIDIA GPU serving a safetensors model at throughput |
+
+### llama.cpp (GGUF)
+
+llama.cpp serves GGUF weights. sbproxy fetches a pinned ggml-org prebuilt
+`llama-server` for the host platform (a `.tar.gz` release asset), so
+there is no build step and no compiler on the box. On an Apple Silicon
+Mac it uses Metal and the unified memory. On a CPU-only box it runs on
+the CPU against a slice of system RAM. On Linux with an NVIDIA GPU it
+uses the Vulkan build.
+
+One caveat on that last case: a stock cloud image such as the GCP Deep
+Learning VM often ships no working NVIDIA Vulkan driver, so the model
+serves on the CPU there even though the GPU is present and `sbproxy
+doctor` detects it. For GPU throughput on Linux with an NVIDIA card,
+serve a safetensors model on vLLM (below), or build llama.cpp from source
+with CUDA and put it on `PATH`. This path is certified: a GGUF model
+serves on Metal on an M4 Max, engine fetched and spawned by sbproxy.
+
+### vLLM (safetensors, via uvx)
+
+vLLM serves safetensors weights, the format most Hugging Face models
+publish, and it is the throughput path on an NVIDIA GPU. vLLM is a Python
+package rather than a single binary, so sbproxy acquires it with `uv`: it
+fetches `uv` (Astral's single static binary, a pinned GitHub release like
+the llama.cpp one) and runs vLLM through `uv tool run`, also known as
+`uvx`. uv provisions and caches the environment on first use and brings
+its own Python, so the box does not need one. The default vLLM wheel is
+CUDA-enabled, so the model offloads to the GPU.
+
+Opt in with `engines.vllm.acquire.source: uvx`, or let `sbproxy run
+<model>` set it for you:
+
+```yaml
+serve:
+  models:
+    - model: hf:Qwen/Qwen2.5-0.5B-Instruct   # a safetensors repo
+      name: qwen
+      engine: vllm
+  engines:
+    vllm:
+      acquire:
+        source: uvx          # fetch uv, run vLLM via `uv tool run`
+        # version: 0.24.0    # pin the vLLM package version (optional)
+```
+
+The host needs two things: the NVIDIA driver, and a C toolchain plus the
+Python headers (`build-essential`, `python3-dev`). vLLM's Triton
+JIT-compiles a small CUDA helper at engine startup, and that compile
+fails without them, so the engine core will not initialize. The
+Terraform demo installs both on the release path.
+
+This is certified: on an L4, sbproxy fetched `uv`, ran vLLM through
+`uv tool run`, and served a safetensors model with the weights resident
+in GPU memory (about 21 GiB, 84% GPU utilization). vLLM is Linux and CUDA
+only; a Mac has no GPU passthrough for it.
+
+### Choosing an engine
+
+`engine: auto` is the default, and it is what `sbproxy run` uses. It
+picks by model format and host: a GGUF reference goes to llama.cpp, a
+safetensors model goes to vLLM. Set `engine:` on a serve entry to force
+one. `sbproxy doctor` reports which engines the host can run, and for one
+it cannot, the single thing to install.
 
 ## The catalog
 
