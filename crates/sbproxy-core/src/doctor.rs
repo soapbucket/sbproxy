@@ -439,6 +439,8 @@ impl DoctorReport {
             vllm_on_path: self.engine_path("vllm").is_some(),
             llama_server_on_path: self.engine_path("llama_cpp").is_some(),
             container_runtime: container_for_resolution,
+            // uvx provisions vLLM on Linux (sbproxy fetches uv itself).
+            vllm_uvx: self.host.os == "linux",
             gpu_present: !self.gpus.is_empty(),
         };
         serve

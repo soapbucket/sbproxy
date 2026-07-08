@@ -95,37 +95,34 @@ pub enum EngineChoice {
 
 impl EngineChoice {
     /// Resolve to a concrete [`EngineKind`]. `Auto` picks llama.cpp for
-    /// GGUF weights or when no container runtime is available (the
-    /// zero-dependency path), and vLLM otherwise (safetensors / FP8 /
-    /// tensor parallelism, which is the datacenter default). A forced
+    /// GGUF weights and vLLM for everything else (safetensors, the
+    /// Hugging Face default). vLLM is the only engine that loads
+    /// safetensors, so `Auto` never sends a safetensors model to
+    /// llama.cpp: since vLLM is acquired via uvx (WOR-1812) it no longer
+    /// needs a container runtime, and a host that genuinely cannot run it
+    /// fails the serve preflight with a clear reason rather than silently
+    /// falling back to an engine that cannot load the weights either. The
+    /// `container_runtime` hint no longer changes the choice. A forced
     /// choice is returned unchanged.
-    pub fn resolve(self, is_gguf: bool, container_runtime: bool) -> EngineKind {
+    pub fn resolve(self, is_gguf: bool, _container_runtime: bool) -> EngineKind {
         match self {
             EngineChoice::Vllm => EngineKind::Vllm,
             EngineChoice::LlamaCpp => EngineKind::LlamaCpp,
             EngineChoice::Embedded => EngineKind::Embedded,
-            EngineChoice::Auto => {
-                if is_gguf || !container_runtime {
-                    EngineKind::LlamaCpp
-                } else {
-                    EngineKind::Vllm
-                }
-            }
+            EngineChoice::Auto if is_gguf => EngineKind::LlamaCpp,
+            EngineChoice::Auto => EngineKind::Vllm,
         }
     }
 
     /// A short human-readable reason for the `Auto` resolution, for the
     /// plan-time engine doctor.
-    pub fn resolve_reason(self, is_gguf: bool, container_runtime: bool) -> &'static str {
+    pub fn resolve_reason(self, is_gguf: bool, _container_runtime: bool) -> &'static str {
         match self {
             EngineChoice::Vllm => "engine: vllm (forced)",
             EngineChoice::LlamaCpp => "engine: llama_cpp (forced)",
             EngineChoice::Embedded => "engine: embedded (forced, in-process)",
             EngineChoice::Auto if is_gguf => "auto -> llama_cpp (GGUF weights)",
-            EngineChoice::Auto if !container_runtime => {
-                "auto -> llama_cpp (no container runtime for vLLM)"
-            }
-            EngineChoice::Auto => "auto -> vllm (safetensors, container runtime present)",
+            EngineChoice::Auto => "auto -> vllm (safetensors)",
         }
     }
 }
@@ -668,6 +665,10 @@ pub struct EngineEnv {
     pub llama_server_on_path: bool,
     /// A container runtime (docker/podman) is available.
     pub container_runtime: bool,
+    /// vLLM can be acquired here via `uvx` (sbproxy fetches `uv` and runs
+    /// `uv tool run`). True on Linux, the platform vLLM's CUDA wheel
+    /// targets; the runtime still needs a C toolchain for the Triton JIT.
+    pub vllm_uvx: bool,
     /// At least one GPU was discovered.
     pub gpu_present: bool,
 }
@@ -683,6 +684,9 @@ impl EngineEnv {
             llama_server_on_path: resolve_on_path("llama-server").is_some(),
             container_runtime: resolve_on_path("docker").is_some()
                 || resolve_on_path("podman").is_some(),
+            // sbproxy fetches uv itself, so uvx is viable wherever vLLM's
+            // wheel runs: Linux.
+            vllm_uvx: cfg!(target_os = "linux"),
             gpu_present,
         }
     }
@@ -720,12 +724,15 @@ impl EngineDoctor {
                 (!env.llama_server_on_path).then(|| "llama-server not found on PATH".to_string()),
             ),
             EngineKind::Vllm => {
-                // vLLM runs from PATH or a container; either satisfies.
-                let ok = env.vllm_on_path || env.container_runtime;
+                // vLLM runs from PATH, a container, or a uvx-provisioned
+                // env that sbproxy sets up; any of the three satisfies.
+                let ok = env.vllm_on_path || env.container_runtime || env.vllm_uvx;
                 (
                     ok,
                     (!ok).then(|| {
-                        "vLLM needs the `vllm` binary on PATH or a container runtime".to_string()
+                        "vLLM needs the `vllm` binary on PATH, a container runtime, or a Linux \
+                         host for the uvx path"
+                            .to_string()
                     }),
                 )
             }
@@ -1057,16 +1064,14 @@ models:
     // --- WOR-1684: engine auto-resolution + provisioning + doctor ---
 
     #[test]
-    fn engine_auto_resolves_by_format_and_runtime() {
-        // GGUF -> llama.cpp regardless of runtime.
+    fn engine_auto_resolves_by_format() {
+        // GGUF -> llama.cpp.
         assert_eq!(EngineChoice::Auto.resolve(true, true), EngineKind::LlamaCpp);
-        // safetensors + container runtime -> vLLM.
+        // safetensors -> vLLM, whether or not a container runtime is
+        // present: vLLM is the only engine that loads safetensors, and it
+        // is acquired via uvx, so the container hint no longer matters.
         assert_eq!(EngineChoice::Auto.resolve(false, true), EngineKind::Vllm);
-        // safetensors but no container runtime -> llama.cpp (zero-dep).
-        assert_eq!(
-            EngineChoice::Auto.resolve(false, false),
-            EngineKind::LlamaCpp
-        );
+        assert_eq!(EngineChoice::Auto.resolve(false, false), EngineKind::Vllm);
         // A forced choice ignores the environment.
         assert_eq!(EngineChoice::Vllm.resolve(true, false), EngineKind::Vllm);
     }
@@ -1169,6 +1174,7 @@ models:
             vllm_on_path: false,
             llama_server_on_path: true,
             container_runtime: false,
+            vllm_uvx: false,
             gpu_present: true,
         };
         let d = EngineDoctor::for_entry(&entry, true, &env);
@@ -1176,10 +1182,14 @@ models:
         assert!(d.runnable);
         assert!(d.reason.contains("llama_cpp"));
 
-        // Box with nothing: safetensors + no runtime -> llama.cpp, and
-        // llama-server is absent, so it is not runnable with a blocker.
+        // Box with nothing: safetensors -> vLLM, and with no vllm on PATH
+        // and no container runtime this pure doctor cannot see the uvx
+        // acquisition, so it reports not-runnable with a blocker. (The
+        // richer `evaluate_serve` layers the uvx acquisition on top and
+        // marks it runnable on a Linux host.)
         let bare = EngineEnv::default();
         let d2 = EngineDoctor::for_entry(&entry, false, &bare);
+        assert_eq!(d2.resolved, EngineKind::Vllm);
         assert!(!d2.runnable);
         assert!(d2.blocker.is_some());
     }
