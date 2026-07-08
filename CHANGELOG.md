@@ -8,8 +8,15 @@ repository.
 ## [Unreleased]
 
 Work that has merged to `main` since the latest tag and is queued for
-the next version cut. No promises about backward compatibility for any
-of the new YAML fields below until the version that ships them.
+the next version cut.
+
+## [1.5.0] - 2026-07-08
+
+Model serving lands: run open models on your own GPU behind the same
+gateway that fronts the 66 hosted providers, plus the engine-acquisition
+and self-host work queued since v1.4.0. No promises about backward
+compatibility for any of the new YAML fields below until a later version
+pins them.
 
 ### Changed
 
