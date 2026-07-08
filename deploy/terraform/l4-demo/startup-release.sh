@@ -28,6 +28,10 @@ meta() {
 #    runtime; install docker if you serve a catalog/safetensors model.
 apt-get update -y
 apt-get install -y curl unzip libvulkan1 vulkan-tools
+# vLLM (the GPU path via `uvx`) JIT-compiles a Triton CUDA shim at engine
+# startup, which needs a C toolchain and the Python dev headers; without
+# them vLLM's engine core fails to initialize. (llama.cpp needs neither.)
+apt-get install -y build-essential python3-dev
 
 # 2. Install the released sbproxy binary to /usr/local/bin (the systemd
 #    unit runs it from there). The installer drops it in a per-user dir;

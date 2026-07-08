@@ -864,10 +864,14 @@ fn vllm_acquisition(env: &EngineEnvView, on_path: bool) -> Vec<AcquisitionOption
         detail: if !linux {
             "vLLM's native install is Linux/CUDA only; use a container here".to_string()
         } else if env.uv {
-            "uv present; sbproxy runs vLLM via `uv tool run` (engines.vllm.acquire.source: uvx)"
+            "uv present; sbproxy runs vLLM via `uv tool run` (engines.vllm.acquire.source: uvx). \
+             Needs a C toolchain + python3 headers (build-essential, python3-dev) for vLLM's \
+             Triton JIT"
                 .to_string()
         } else {
-            "sbproxy fetches uv and runs vLLM via `uv tool run` (engines.vllm.acquire.source: uvx)"
+            "sbproxy fetches uv and runs vLLM via `uv tool run` (engines.vllm.acquire.source: uvx). \
+             Needs a C toolchain + python3 headers (build-essential, python3-dev) for vLLM's \
+             Triton JIT"
                 .to_string()
         },
     });
