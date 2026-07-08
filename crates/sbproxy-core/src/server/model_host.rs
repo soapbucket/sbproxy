@@ -151,7 +151,8 @@ fn warn_missing_serve_prereqs(config: &AiHandlerConfig) {
         // GGUF-ness steers the `auto` engine choice toward llama.cpp;
         // at this preflight the weights are not resolved yet, so the
         // reference string is the best available signal.
-        let is_gguf = entry.model.to_ascii_lowercase().contains("gguf");
+        let is_gguf =
+            entry.model.to_ascii_lowercase().contains("gguf") || entry.gguf_file.is_some();
         let doctor = sbproxy_model_host::EngineDoctor::for_entry(entry, is_gguf, &env);
         if !doctor.runnable {
             tracing::warn!(

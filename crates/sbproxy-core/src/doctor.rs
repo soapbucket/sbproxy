@@ -447,7 +447,7 @@ impl DoctorReport {
             .models
             .iter()
             .map(|entry| {
-                let is_gguf = looks_gguf(&entry.model);
+                let is_gguf = looks_gguf(&entry.model) || entry.gguf_file.is_some();
                 let doc = EngineDoctor::for_entry(entry, is_gguf, &env);
                 // If the resolved engine's binary is absent from PATH but
                 // an acquisition option exists, sbproxy can acquire it, so

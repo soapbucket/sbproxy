@@ -900,10 +900,17 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         )
         .map_err(|e| RuntimeError::Fit(e.to_string()))?;
 
-        let engine_kind = entry.engine.resolve(
-            looks_gguf(&plan.quant_name, &model_ref.hf_repo),
-            self.container_runtime,
-        );
+        // A GGUF source routes to llama.cpp; everything else is
+        // safetensors and goes to vLLM. The signal is an explicit
+        // `gguf_file` or a ref/repo that names GGUF, the same signal the
+        // preflight uses. The fit-planner quant name is not reliable here:
+        // a raw safetensors ref can be assigned a GGUF-style default
+        // quant, and routing it to llama.cpp then fails with no file to
+        // load (there is no GGUF in a safetensors repo).
+        let is_gguf = entry.gguf_file.is_some()
+            || entry.model.to_ascii_lowercase().contains("gguf")
+            || model_ref.hf_repo.to_ascii_lowercase().contains("gguf");
+        let engine_kind = entry.engine.resolve(is_gguf, self.container_runtime);
 
         // Admit against the VRAM budget, evicting the models the
         // residency manager chooses. WOR-1672: use the cost-minimizing
@@ -1150,13 +1157,6 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
 /// Whether the resolved weights are GGUF (so `engine: auto` picks
 /// llama.cpp): a GGUF-style quant name (`Q4_K_M`, `Q5_0`, ...) or a
 /// repo whose name advertises GGUF.
-fn looks_gguf(quant_name: &str, hf_repo: &str) -> bool {
-    let q = quant_name.to_ascii_lowercase();
-    let gguf_quant = q.starts_with('q')
-        && (q.contains("_k") || q.ends_with("_0") || q.ends_with("_1") || q.contains("_k_"));
-    gguf_quant || hf_repo.to_ascii_lowercase().contains("gguf")
-}
-
 /// Estimate an engine's reload cost from its VRAM footprint (WOR-1672).
 /// Preemption cost is dominated by reloading the weights, so a bigger
 /// model costs more to bring back; this is a size proxy (roughly
