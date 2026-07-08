@@ -369,6 +369,12 @@ struct RunArgs {
     /// Weight/engine cache directory. Defaults to the platform cache.
     #[arg(long = "cache-dir")]
     cache_dir: Option<PathBuf>,
+    /// For a GGUF (llama.cpp) model, the exact GGUF filename in the repo,
+    /// e.g. `qwen2.5-0.5b-instruct-q4_k_m.gguf`. A GGUF-only repo has no
+    /// `config.json`, so the model host needs this to fetch the file and
+    /// read its header for the fit metadata.
+    #[arg(long = "gguf-file")]
+    gguf_file: Option<String>,
     /// Print the synthesized config and the resolution, then exit
     /// without serving. For inspection / CI.
     #[arg(long = "dry-run")]
@@ -1387,6 +1393,9 @@ fn build_run_serve_value(args: &RunArgs) -> serde_json::Value {
     }
     if args.engine != "auto" {
         entry.insert("engine".to_string(), serde_json::json!(args.engine));
+    }
+    if let Some(f) = &args.gguf_file {
+        entry.insert("gguf_file".to_string(), serde_json::json!(f));
     }
 
     let mut serve = serde_json::Map::new();
@@ -2524,6 +2533,7 @@ mod tests {
             engine: "llama_cpp".to_string(),
             accel: "metal".to_string(),
             cache_dir: None,
+            gguf_file: Some("qwen3-8b-q4_k_m.gguf".to_string()),
             dry_run: false,
         };
         let value = build_run_serve_value(&args);
@@ -2535,6 +2545,11 @@ mod tests {
         assert_eq!(
             cfg.models[0].engine,
             sbproxy_model_host::EngineChoice::LlamaCpp
+        );
+        // The GGUF filename threads through to the serve entry (WOR-1808).
+        assert_eq!(
+            cfg.models[0].gguf_file.as_deref(),
+            Some("qwen3-8b-q4_k_m.gguf")
         );
         // accel override keyed under the llama_cpp engine's acquire block.
         let prov = cfg
@@ -2635,6 +2650,7 @@ mod tests {
             engine: "auto".to_string(),
             accel: "auto".to_string(),
             cache_dir: None,
+            gguf_file: None,
             dry_run: false,
         };
         let cfg: sbproxy_model_host::ModelHostConfig =

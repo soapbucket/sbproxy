@@ -48,6 +48,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 Govern the AI you call, the AI that calls you, and the AI you run.
 
 - [ai-gateway.md](ai-gateway.md) - providers, routing strategies, guardrails, budgets, streaming.
+- [quickstart-serve.md](quickstart-serve.md) - run your first model in 60 seconds: `curl | sh`, then `sbproxy run <model>`, on a Linux GPU, a Mac, or a CPU box.
 - [self-hosting.md](self-hosting.md) - single binary to self-host: install, the serve-only quickstart, the model manifest, aliases, spill-to-cloud, and the OpenRouter parity map.
 - [model-host.md](model-host.md) - the gateway hosts the LLM itself: catalog, the `serve:` block, the GPU fit planner, and the engine supervisor (single-node local serving).
 - [gpu-fit-planning.md](gpu-fit-planning.md) - how the fit planner picks a quant for your GPU: capability tiers, the weights + KV math, throughput, and why it refuses an impossible config.
