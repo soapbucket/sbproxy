@@ -33,6 +33,15 @@ const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 30_000;
 /// print the load-bearing `sbproxy <semver> (rev <sha>, built
 /// <date>)` shape ourselves. The marketing site (`Hero.vue`) and the
 /// Homebrew formula assert on that exact format.
+/// The `--help` footer: homepage + a copyright line whose year comes from
+/// the build date (`build.rs`), so it tracks the release year instead of
+/// being hand-edited. The authoritative dated notice lives in `LICENSE`.
+const HELP_FOOTER: &str = concat!(
+    "Homepage: https://sbproxy.dev\nCopyright (c) ",
+    env!("SBPROXY_BUILD_YEAR"),
+    " Soap Bucket LLC. Apache-2.0 licensed."
+);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "sbproxy",
@@ -42,6 +51,10 @@ const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 30_000;
     disable_version_flag = true,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
+    // A homepage + copyright footer on `--help`. Kept off the `--version`
+    // line, whose exact `sbproxy <semver> (rev <sha>, built <date>)` shape
+    // the Homebrew formula and the marketing site assert on.
+    after_help = HELP_FOOTER,
 )]
 struct Cli {
     /// Print the version line and exit. Output shape:

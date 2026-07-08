@@ -14,8 +14,13 @@ fn main() {
     let sha = run("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let date = run("date", &["-u", "+%Y-%m-%d"]).unwrap_or_else(|| "unknown".into());
 
+    // The year, for the copyright footer in `--help`. Derived from the
+    // build date so it never goes stale (and needs no hand-edit each year).
+    let year = date.split('-').next().unwrap_or("").to_string();
+
     println!("cargo:rustc-env=SBPROXY_GIT_SHA={sha}");
     println!("cargo:rustc-env=SBPROXY_BUILD_DATE={date}");
+    println!("cargo:rustc-env=SBPROXY_BUILD_YEAR={year}");
 
     // Re-run when HEAD or any branch ref changes, so amends and new tags
     // refresh the embedded SHA on the next incremental build.
