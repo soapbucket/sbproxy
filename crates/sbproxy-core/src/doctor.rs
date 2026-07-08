@@ -812,6 +812,15 @@ fn llama_acquisition(env: &EngineEnvView, on_path: bool) -> Vec<AcquisitionOptio
         method: "prebuilt-release",
         available: prebuilt.is_some(),
         detail: match prebuilt {
+            // The Linux prebuilt is a Vulkan build, which runs on CPU where
+            // the GPU's Vulkan driver is absent (e.g. the GCP Deep Learning
+            // VM). Say so, and point at the GPU paths.
+            Some(infix) if env.os == "linux" => format!(
+                "sbproxy fetches the pinned ggml-org llama.cpp {infix} prebuilt (a Vulkan build; \
+                 it runs on CPU where the NVIDIA Vulkan driver is absent, e.g. the GCP Deep \
+                 Learning VM). For GPU offload, build with CUDA (see the source option) or serve a \
+                 safetensors model on vLLM"
+            ),
             Some(infix) => {
                 format!("sbproxy can fetch the pinned ggml-org llama.cpp {infix} release binary")
             }
@@ -838,7 +847,13 @@ fn llama_acquisition(env: &EngineEnvView, on_path: bool) -> Vec<AcquisitionOptio
         detail: if env.os == "macos" {
             "build from source with -DGGML_METAL=ON".to_string()
         } else {
-            "build from source with -DGGML_CUDA=ON (or -DGGML_VULKAN=ON)".to_string()
+            // The copy-pasteable GPU path for a GGUF on Linux/NVIDIA. On
+            // PATH, sbproxy prefers this over the fetched Vulkan prebuilt.
+            "GPU offload: git clone https://github.com/ggml-org/llama.cpp && \
+             cmake llama.cpp -B build -DGGML_CUDA=ON && \
+             cmake --build build -j --target llama-server && \
+             export PATH=\"$PWD/build/bin:$PATH\""
+                .to_string()
         },
     });
     opts

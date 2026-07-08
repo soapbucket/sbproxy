@@ -117,10 +117,26 @@ uses the Vulkan build.
 One caveat on that last case: a stock cloud image such as the GCP Deep
 Learning VM often ships no working NVIDIA Vulkan driver, so the model
 serves on the CPU there even though the GPU is present and `sbproxy
-doctor` detects it. For GPU throughput on Linux with an NVIDIA card,
-serve a safetensors model on vLLM (below), or build llama.cpp from source
-with CUDA and put it on `PATH`. This path is certified: a GGUF model
-serves on Metal on an M4 Max, engine fetched and spawned by sbproxy.
+doctor` detects it. Two ways to get the GPU on Linux with an NVIDIA card:
+
+- Serve a safetensors model on vLLM (below), which uses CUDA.
+- Or put a CUDA-built `llama-server` on `PATH`. sbproxy prefers a
+  `PATH` binary over the fetched Vulkan prebuilt, so this takes over with
+  no config change. `sbproxy doctor` prints these same commands under the
+  llama.cpp acquisition options:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cmake llama.cpp -B build -DGGML_CUDA=ON
+cmake --build build -j --target llama-server
+export PATH="$PWD/build/bin:$PATH"   # or install it somewhere on PATH
+```
+
+  Building needs the CUDA toolkit (`nvcc`) and a C++ compiler; the Deep
+  Learning VM already carries them.
+
+The Metal path is certified: a GGUF model serves on Metal on an M4 Max,
+the engine fetched and spawned by sbproxy.
 
 ### vLLM (safetensors, via uvx)
 
