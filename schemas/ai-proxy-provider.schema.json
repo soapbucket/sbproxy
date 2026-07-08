@@ -666,6 +666,13 @@
           "enum": [
             "path"
           ]
+        },
+        {
+          "description": "Provision via `uvx` (`uv tool run`): fetch the `uv` single binary and run the engine in a cached, ephemeral environment that uv sets up on first use, bringing its own Python if needed. This is the acquisition path for vLLM, which is a Python package rather than a single-binary release. `version` pins the *engine package* version (the vLLM version); the `uv` version is pinned internally.",
+          "type": "string",
+          "enum": [
+            "uvx"
+          ]
         }
       ]
     },

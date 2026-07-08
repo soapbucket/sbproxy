@@ -188,6 +188,13 @@ pub enum AcquireSource {
     Release,
     /// An operator-installed binary at an explicit `path`.
     Path,
+    /// Provision via `uvx` (`uv tool run`): fetch the `uv` single binary
+    /// and run the engine in a cached, ephemeral environment that uv sets
+    /// up on first use, bringing its own Python if needed. This is the
+    /// acquisition path for vLLM, which is a Python package rather than a
+    /// single-binary release. `version` pins the *engine package* version
+    /// (the vLLM version); the `uv` version is pinned internally.
+    Uvx,
 }
 
 /// The `acquire:` block on a binary engine's provisioning (WOR-1801):
@@ -632,6 +639,15 @@ impl ModelHostConfig {
                 if acq.version.as_deref() == Some("latest") {
                     return Err(format!(
                         "engine {kind:?} acquire.version must be pinned, not `latest`"
+                    ));
+                }
+                // `uvx` provisions a Python package via `uv tool run`, which
+                // is the vLLM path; a binary engine (llama.cpp) uses a
+                // release or an explicit path instead.
+                if acq.source == AcquireSource::Uvx && *kind != EngineKind::Vllm {
+                    return Err(format!(
+                        "engine {kind:?} acquire.source: uvx is only for vllm (a Python package); \
+                         use release or path for a binary engine"
                     ));
                 }
             }

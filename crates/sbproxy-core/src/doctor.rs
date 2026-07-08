@@ -852,9 +852,26 @@ fn vllm_acquisition(env: &EngineEnvView, on_path: bool) -> Vec<AcquisitionOption
             detail: "already installed on PATH".to_string(),
         });
     }
-    // vLLM needs CUDA, so it is Linux-only in practice: a macOS
-    // container has no GPU passthrough. On Linux a container is the
-    // portable path when a runtime is present.
+    // vLLM needs CUDA, so it is Linux-only in practice: a macOS host has
+    // no GPU passthrough. uvx is the recommended native path: sbproxy
+    // fetches the `uv` binary itself (it does not need to be
+    // pre-installed) and runs vLLM via `uv tool run`, so a Linux box needs
+    // only the NVIDIA driver. uv even brings its own Python. Set
+    // engines.vllm.acquire.source: uvx.
+    opts.push(AcquisitionOption {
+        method: "uvx",
+        available: linux,
+        detail: if !linux {
+            "vLLM's native install is Linux/CUDA only; use a container here".to_string()
+        } else if env.uv {
+            "uv present; sbproxy runs vLLM via `uv tool run` (engines.vllm.acquire.source: uvx)"
+                .to_string()
+        } else {
+            "sbproxy fetches uv and runs vLLM via `uv tool run` (engines.vllm.acquire.source: uvx)"
+                .to_string()
+        },
+    });
+    // A container is the alternative when a runtime is present.
     opts.push(AcquisitionOption {
         method: "container",
         available: linux && env.container,
@@ -864,17 +881,6 @@ fn vllm_acquisition(env: &EngineEnvView, on_path: bool) -> Vec<AcquisitionOption
             "run the pinned vLLM image via the serve: engines.launch: container path".to_string()
         } else {
             "install docker or podman, then run the pinned vLLM container image".to_string()
-        },
-    });
-    opts.push(AcquisitionOption {
-        method: "uv",
-        available: linux && env.uv,
-        detail: if !linux {
-            "vLLM's native install is Linux/CUDA only; use a container here".to_string()
-        } else if env.uv {
-            "uv tool install vllm".to_string()
-        } else {
-            "install uv, then uv tool install vllm".to_string()
         },
     });
     opts.push(AcquisitionOption {

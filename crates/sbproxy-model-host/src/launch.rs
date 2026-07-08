@@ -125,6 +125,33 @@ pub fn build_launch_spec(
     }
 }
 
+/// Wrap a vLLM launch spec to run through `uvx` (`uv tool run`), so vLLM
+/// is provisioned by `uv` at `uv_path` rather than needing `vllm` on PATH
+/// (WOR-1812). The original argv (`serve <repo> ...`) is preserved after
+/// the `vllm` command name: `uv tool run --from vllm[==<v>] vllm <argv>`.
+/// The engine, env, and VRAM estimate carry over unchanged.
+pub fn wrap_uvx(spec: &LaunchSpec, uv_path: &str, vllm_version: Option<&str>) -> LaunchSpec {
+    let from = match vllm_version {
+        Some(v) => format!("vllm=={v}"),
+        None => "vllm".to_string(),
+    };
+    let mut args = vec![
+        "tool".to_string(),
+        "run".to_string(),
+        "--from".to_string(),
+        from,
+        "vllm".to_string(),
+    ];
+    args.extend(spec.args.iter().cloned());
+    LaunchSpec {
+        engine: spec.engine,
+        program: uv_path.to_string(),
+        args,
+        env: spec.env.clone(),
+        vram_bytes: spec.vram_bytes,
+    }
+}
+
 /// Retarget a llama.cpp launch argv from a Hugging Face download to a
 /// locally pre-fetched GGUF (WOR-1656). Replaces the `--hf-repo <repo>`
 /// pair with `--model <path>`, so llama.cpp loads the file directly and
@@ -682,6 +709,45 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "VLLM_SERVER_DEV_MODE" && v == "1"));
         assert_eq!(spec.vram_bytes, 12 * crate::fit::GIB);
+    }
+
+    #[test]
+    fn wrap_uvx_prefixes_uv_tool_run_and_preserves_argv() {
+        let spec = build_launch_spec(
+            EngineKind::Vllm,
+            &model(),
+            &plan("FP8"),
+            8001,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        let wrapped = wrap_uvx(&spec, "/opt/uv/uv", Some("0.6.3"));
+        assert_eq!(wrapped.program, "/opt/uv/uv");
+        assert_eq!(
+            &wrapped.args[..5],
+            &["tool", "run", "--from", "vllm==0.6.3", "vllm"]
+        );
+        // The original vLLM argv follows verbatim.
+        assert_eq!(wrapped.args[5], "serve");
+        assert_eq!(wrapped.args[6], "Qwen/Qwen3-14B");
+        // engine, env, and VRAM estimate carry over.
+        assert_eq!(wrapped.engine, EngineKind::Vllm);
+        assert_eq!(wrapped.vram_bytes, spec.vram_bytes);
+        assert!(wrapped.env.iter().any(|(k, _)| k == "VLLM_SERVER_DEV_MODE"));
+    }
+
+    #[test]
+    fn wrap_uvx_without_version_uses_bare_from() {
+        let spec = build_launch_spec(
+            EngineKind::Vllm,
+            &model(),
+            &plan("FP8"),
+            8001,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        let wrapped = wrap_uvx(&spec, "/opt/uv/uv", None);
+        assert_eq!(&wrapped.args[..4], &["tool", "run", "--from", "vllm"]);
     }
 
     #[test]

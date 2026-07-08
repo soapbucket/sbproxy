@@ -40,6 +40,14 @@ pub enum BinaryAcquirePlan {
         /// Expected sha256 hex, or `None` to fetch unverified (warned).
         sha256: Option<String>,
     },
+    /// Provision vLLM via `uvx` (`uv tool run`): fetch the `uv` binary,
+    /// then run `uv tool run --from vllm[==version] vllm ...`. uv sets up
+    /// and caches the environment (and its own Python) on first use.
+    ProvisionUvx {
+        /// The vLLM package version to pin (`--from vllm==<v>`), or `None`
+        /// for the latest resolvable.
+        vllm_version: Option<String>,
+    },
     /// The binary cannot be acquired here; the reason is for `plan` /
     /// `doctor`, surfaced before a request rather than at first use.
     Blocked(String),
@@ -96,11 +104,23 @@ pub fn plan_binary_acquire(
             let sha256 = acquire.and_then(|a| a.sha256.clone());
             BinaryAcquirePlan::FetchRelease { tag, accel, sha256 }
         }
-        EngineKind::Vllm => BinaryAcquirePlan::Blocked(
-            "vLLM is not a single-binary release; run it from a container (engines.vllm.launch: \
-             container) or a managed venv"
-                .to_string(),
-        ),
+        EngineKind::Vllm => match acquire.map(|a| a.source) {
+            // Opt-in `uvx` provisioning: fetch uv and run vLLM through an
+            // ephemeral, cached environment (uv brings its own Python).
+            // The vLLM package version is the acquire block's `version`.
+            Some(AcquireSource::Uvx) => BinaryAcquirePlan::ProvisionUvx {
+                vllm_version: acquire.and_then(|a| a.version.clone()),
+            },
+            // Default: vLLM is not a single-binary release, so without an
+            // explicit acquisition method it is not fetched here (it still
+            // spawns from PATH if installed). Left Blocked so a default
+            // config does not trigger a heavy environment build.
+            _ => BinaryAcquirePlan::Blocked(
+                "vLLM is not a single-binary release; set engines.vllm.acquire.source: uvx to run \
+                 it via `uv tool run`, use a container, or install it on PATH"
+                    .to_string(),
+            ),
+        },
         EngineKind::Embedded => BinaryAcquirePlan::Blocked(
             "the embedded engine runs in-process; there is no binary to acquire".to_string(),
         ),
@@ -204,6 +224,8 @@ mod tests {
 
     #[test]
     fn vllm_and_embedded_have_no_binary_release() {
+        // Default vLLM (no acquire block) is not fetched: it stays Blocked
+        // so a plain config never triggers a heavy env build.
         assert!(matches!(
             plan_binary_acquire(EngineKind::Vllm, None, None),
             BinaryAcquirePlan::Blocked(_)
@@ -215,6 +237,59 @@ mod tests {
         // ...unless vLLM happens to be on PATH.
         assert_eq!(
             plan_binary_acquire(EngineKind::Vllm, None, Some(PathBuf::from("/usr/bin/vllm"))),
+            BinaryAcquirePlan::OnPath(PathBuf::from("/usr/bin/vllm"))
+        );
+    }
+
+    #[test]
+    fn vllm_uvx_source_provisions_via_uvx() {
+        let prov = EngineProvisioning {
+            acquire: Some(EngineAcquire {
+                source: AcquireSource::Uvx,
+                version: Some("0.6.3".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_binary_acquire(EngineKind::Vllm, Some(&prov), None),
+            BinaryAcquirePlan::ProvisionUvx {
+                vllm_version: Some("0.6.3".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn vllm_uvx_without_version_is_unpinned() {
+        let prov = EngineProvisioning {
+            acquire: Some(EngineAcquire {
+                source: AcquireSource::Uvx,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_binary_acquire(EngineKind::Vllm, Some(&prov), None),
+            BinaryAcquirePlan::ProvisionUvx { vllm_version: None }
+        );
+    }
+
+    #[test]
+    fn vllm_on_path_wins_over_uvx() {
+        let prov = EngineProvisioning {
+            acquire: Some(EngineAcquire {
+                source: AcquireSource::Uvx,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // A host vLLM install is preferred over provisioning a new env.
+        assert_eq!(
+            plan_binary_acquire(
+                EngineKind::Vllm,
+                Some(&prov),
+                Some(PathBuf::from("/usr/bin/vllm"))
+            ),
             BinaryAcquirePlan::OnPath(PathBuf::from("/usr/bin/vllm"))
         );
     }

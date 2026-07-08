@@ -1409,19 +1409,22 @@ fn build_run_serve_value(args: &RunArgs) -> serde_json::Value {
             serde_json::json!(cd.to_string_lossy()),
         );
     }
+    // Engines block. vLLM is provisioned via uvx (fetch uv, run
+    // `uv tool run`), so a safetensors model serves on a GPU box with no
+    // manual install; this is harmless when llama.cpp is the resolved
+    // engine. Accel steers the acquired llama.cpp binary build.
+    let mut engines = serde_json::Map::new();
+    engines.insert(
+        "vllm".to_string(),
+        serde_json::json!({ "acquire": { "source": "uvx" } }),
+    );
     if args.accel != "auto" {
-        // Accel steers the acquired binary build; key it under the engine
-        // that reads it (llama.cpp), or the forced engine.
-        let engine_key = if args.engine == "vllm" {
-            "vllm"
-        } else {
-            "llama_cpp"
-        };
-        serve.insert(
-            "engines".to_string(),
-            serde_json::json!({ engine_key: { "acquire": { "accel": args.accel } } }),
+        engines.insert(
+            "llama_cpp".to_string(),
+            serde_json::json!({ "acquire": { "accel": args.accel } }),
         );
     }
+    serve.insert("engines".to_string(), serde_json::Value::Object(engines));
     serde_json::Value::Object(serve)
 }
 
@@ -2640,9 +2643,10 @@ mod tests {
     }
 
     #[test]
-    fn run_serve_value_minimal_has_no_engines_block() {
-        // A plain catalog id with auto engine + auto accel needs no
-        // engines/acquire override.
+    fn run_serve_value_defaults_vllm_to_uvx() {
+        // A plain catalog id (auto engine + accel) defaults vLLM to uvx
+        // acquisition, so a safetensors model serves on a GPU box with no
+        // manual install; no llama_cpp override is added.
         let args = RunArgs {
             model: "qwen3-14b".to_string(),
             name: None,
@@ -2655,8 +2659,19 @@ mod tests {
         };
         let cfg: sbproxy_model_host::ModelHostConfig =
             serde_json::from_value(build_run_serve_value(&args)).unwrap();
-        assert!(cfg.engines.is_empty());
         assert_eq!(cfg.models[0].engine, sbproxy_model_host::EngineChoice::Auto);
+        let vllm = cfg
+            .engines
+            .get(&sbproxy_model_host::EngineKind::Vllm)
+            .expect("vllm provisioning");
+        assert_eq!(
+            vllm.acquire.as_ref().unwrap().source,
+            sbproxy_model_host::AcquireSource::Uvx
+        );
+        // No llama.cpp override when accel is auto.
+        assert!(!cfg
+            .engines
+            .contains_key(&sbproxy_model_host::EngineKind::LlamaCpp));
     }
 
     #[test]

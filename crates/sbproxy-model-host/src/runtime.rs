@@ -770,6 +770,24 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         )
     }
 
+    /// Fetch the pinned `uv` binary for the vLLM `uvx` path (WOR-1812),
+    /// returning its path. Behind the `weights` feature.
+    #[cfg(feature = "weights")]
+    async fn acquire_uv(&self) -> Result<std::path::PathBuf, String> {
+        let cache_root =
+            crate::manifest::resolve_cache_dir_default(self.config.cache_dir.as_deref());
+        crate::uv_release::ensure_uv(&cache_root, crate::uv_release::DEFAULT_UV_VERSION).await
+    }
+
+    #[cfg(not(feature = "weights"))]
+    async fn acquire_uv(&self) -> Result<std::path::PathBuf, String> {
+        Err(
+            "uv is not on PATH and this build lacks the `model-weights` feature to fetch it; \
+             install uv or set engines.vllm.acquire.path"
+                .to_string(),
+        )
+    }
+
     /// Read the fit metadata (`layers`, `kv_heads`, `head_dim`, params,
     /// context) from a local GGUF file's header (WOR-1769). A GGUF-only
     /// HF repo has no transformers `config.json`, so the header is the
@@ -984,6 +1002,31 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                         Err(e) => tracing::warn!(
                             engine = engine_kind.binary_name(),
                             "engine release acquisition failed: {e}; falling back to PATH"
+                        ),
+                    }
+                }
+                crate::acquire::BinaryAcquirePlan::ProvisionUvx { vllm_version } => {
+                    // Fetch uv, then run vLLM through `uv tool run`. uv sets
+                    // up (and caches) the environment, and its default wheel
+                    // is CUDA-enabled, so this offloads to an NVIDIA GPU on a
+                    // box that only carries the driver. Best-effort: on
+                    // failure, fall back to spawning `vllm` from PATH.
+                    match self.acquire_uv().await {
+                        Ok(uv) => {
+                            spec = crate::launch::wrap_uvx(
+                                &spec,
+                                &uv.to_string_lossy(),
+                                vllm_version.as_deref(),
+                            );
+                            tracing::info!(
+                                engine = "vllm",
+                                "running vLLM via uvx; the first launch provisions the environment \
+                                 (this can take several minutes and a few GB)"
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            engine = "vllm",
+                            "uv acquisition for the vLLM uvx path failed: {e}; falling back to PATH"
                         ),
                     }
                 }

@@ -227,7 +227,7 @@ pub async fn ensure_llama_server(
 /// Recursively search `root` for a file named `name`, returning the first
 /// match. Bounded to a small depth: release archives are shallow.
 #[cfg(feature = "weights")]
-fn find_file_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn find_file_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
     fn walk(dir: &std::path::Path, name: &str, depth: usize) -> Option<PathBuf> {
         if depth == 0 {
             return None;
