@@ -79,6 +79,16 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [auth-oidc.md](auth-oidc.md) - the `oidc` auth provider: OpenID Connect Relying-Party login flow (authorization-code + PKCE, sealed session cookie, optional userinfo trust-header projection, RP-initiated logout).
 - [prompt-injection-v2.md](prompt-injection-v2.md) - the v2 guardrail: swappable detector returning score + label, with score-to-action mapping.
 
+### Integrations
+
+Point a framework you already run at the gateway: chat completions through the OpenAI-compatible endpoint, tools through the MCP gateway. Every snippet on these pages was validated against a running proxy.
+
+- [langchain.md](langchain.md) - LangChain (python): ChatOpenAI with a gateway base_url, MCP tools via langchain-mcp-adapters.
+- [vercel-ai-sdk.md](vercel-ai-sdk.md) - Vercel AI SDK (typescript): the openai-compatible provider, MCP tools via the AI SDK's MCP client.
+- [pydantic-ai.md](pydantic-ai.md) - Pydantic AI (python): OpenAIChatModel through the gateway, MCP toolsets on an Agent.
+- [mastra.md](mastra.md) - Mastra (typescript): agents on a gateway-backed model, tools from the MCP client.
+- [n8n.md](n8n.md) - n8n: the OpenAI credential's base URL, the MCP Client Tool node, and federating n8n's own MCP trigger.
+
 ### Operations
 - [access-log.md](access-log.md) - structured JSON access log: filters, sampling, header capture, redaction.
 - [audit-log.md](audit-log.md) - tamper-evident audit log of admin actions.
