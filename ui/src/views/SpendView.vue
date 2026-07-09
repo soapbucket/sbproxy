@@ -24,25 +24,31 @@ const families = computed<MetricFamily[]>(() => {
   return text ? parsePrometheus(text) : [];
 });
 
-// Cost by (provider, model): the base AI cost counter.
+// The attributed families are what the live AI path populates
+// (emit_ai_billing_event); they carry model/provider plus the
+// attribution partitions (team, project, api_key_id) in one counter.
+// The unattributed names are kept as fallbacks for older builds.
 const costFamily = computed(() =>
-  findFamily(families.value, "sbproxy_ai_cost_dollars_total"),
+  findFamily(
+    families.value,
+    "sbproxy_ai_cost_dollars_attributed_total",
+    "sbproxy_ai_cost_dollars_total",
+  ),
 );
-// Tokens by (provider, model, direction: input|output).
+// Tokens by direction (input|output, plus cache/reasoning variants).
 const tokensFamily = computed(() =>
-  findFamily(families.value, "sbproxy_ai_tokens_total"),
+  findFamily(
+    families.value,
+    "sbproxy_ai_tokens_attributed_total",
+    "sbproxy_ai_tokens_total",
+  ),
 );
-// AI request count by (provider, model, ...).
 const aiRequestsFamily = computed(() =>
-  findFamily(families.value, "sbproxy_ai_requests_total"),
-);
-// Per-virtual-key cost.
-const keyCostFamily = computed(() =>
-  findFamily(families.value, "sbproxy_ai_key_cost_dollars_total"),
-);
-// Attributed cost carries project/team/environment partitions.
-const attributedCostFamily = computed(() =>
-  findFamily(families.value, "sbproxy_ai_cost_dollars_attributed_total"),
+  findFamily(
+    families.value,
+    "sbproxy_ai_requests_attributed_total",
+    "sbproxy_ai_requests_total",
+  ),
 );
 
 const totalSpend = computed(() => sumSamples(costFamily.value));
@@ -54,18 +60,25 @@ const tokensOut = computed(() =>
 );
 const totalAiRequests = computed(() => sumSamples(aiRequestsFamily.value));
 
+// Attribution labels are empty strings for uncredentialed traffic and
+// "(none)" when the label is absent entirely; both mean "no data" for
+// a breakdown row.
+function labeled(rows: { key: string; value: number }[]) {
+  return rows.filter((r) => r.key !== "" && r.key !== "(none)" && r.value > 0);
+}
+
 const spendByModel = computed(() => groupByLabel(costFamily.value, "model"));
 const spendByProvider = computed(() =>
   groupByLabel(costFamily.value, "provider"),
 );
 const spendByKey = computed(() =>
-  groupByLabel(keyCostFamily.value, "virtual_key"),
+  labeled(groupByLabel(costFamily.value, "api_key_id")),
 );
 const spendByTeam = computed(() =>
-  groupByLabel(attributedCostFamily.value, "team"),
+  labeled(groupByLabel(costFamily.value, "team")),
 );
 const spendByProject = computed(() =>
-  groupByLabel(attributedCostFamily.value, "project"),
+  labeled(groupByLabel(costFamily.value, "project")),
 );
 
 // Per-model detail rows: cost + tokens + requests joined on model.
@@ -93,14 +106,10 @@ const modelRows = computed<ModelRow[]>(() =>
 );
 
 const hasSpend = computed(() => totalSpend.value > 0);
-// Attribution partitions only exist when credentials carry tags; hide
-// empty breakdowns rather than showing a lone "(none)" row.
-const hasTeams = computed(() =>
-  spendByTeam.value.some((r) => r.key !== "(none)" && r.value > 0),
-);
-const hasProjects = computed(() =>
-  spendByProject.value.some((r) => r.key !== "(none)" && r.value > 0),
-);
+// Attribution partitions only exist when credentials carry tags; the
+// sections hide entirely rather than showing a lone empty row.
+const hasTeams = computed(() => spendByTeam.value.length > 0);
+const hasProjects = computed(() => spendByProject.value.length > 0);
 const hasKeys = computed(() => spendByKey.value.length > 0);
 </script>
 
@@ -127,7 +136,7 @@ const hasKeys = computed(() => spendByKey.value.length > 0);
 
     <section class="panel">
       <h2>Spend by model</h2>
-      <MiniBars :items="spendByModel" unit="$" />
+      <MiniBars :items="spendByModel" :format="formatUsd" />
       <table class="detail">
         <thead>
           <tr>
@@ -152,22 +161,22 @@ const hasKeys = computed(() => spendByKey.value.length > 0);
 
     <section class="panel">
       <h2>Spend by provider</h2>
-      <MiniBars :items="spendByProvider" unit="$" />
+      <MiniBars :items="spendByProvider" :format="formatUsd" />
     </section>
 
     <section class="panel" v-if="hasKeys">
-      <h2>Spend by virtual key</h2>
-      <MiniBars :items="spendByKey" unit="$" />
+      <h2>Spend by API key</h2>
+      <MiniBars :items="spendByKey" :format="formatUsd" />
     </section>
 
     <section class="panel" v-if="hasTeams">
       <h2>Spend by team</h2>
-      <MiniBars :items="spendByTeam" unit="$" />
+      <MiniBars :items="spendByTeam" :format="formatUsd" />
     </section>
 
     <section class="panel" v-if="hasProjects">
       <h2>Spend by project</h2>
-      <MiniBars :items="spendByProject" unit="$" />
+      <MiniBars :items="spendByProject" :format="formatUsd" />
     </section>
   </template>
 </template>
