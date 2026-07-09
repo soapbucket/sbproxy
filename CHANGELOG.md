@@ -10,6 +10,24 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+### Added
+
+- Streaming responses now run every built-in output guardrail, with
+  verdicts matching the buffered path. A per-stream session matches the
+  substring guardrails (injection, toxicity, jailbreak, content safety)
+  over a cumulative window of decoded deltas, so a pattern split across
+  chunk boundaries still blocks, and word-boundary rules never
+  false-block on split words.
+- Streamed tool calls are assembled per call and judged by the
+  agent-alignment guardrail as each call completes. Block mode holds
+  tool-call frames until their call is judged while text keeps flowing;
+  flag mode logs and counts without touching the stream.
+- Per-entry `stream_policy` (`chunk`, `close`, `off`) on output
+  guardrails, plus new metrics:
+  `sbproxy_ai_stream_guardrail_violations_total`,
+  `sbproxy_ai_stream_guardrail_skipped_total`, and
+  `sbproxy_ai_stream_guardrail_decode_fallback_total`.
+
 ## [1.5.0] - 2026-07-08
 
 Model serving lands: run open models on your own GPU behind the same
