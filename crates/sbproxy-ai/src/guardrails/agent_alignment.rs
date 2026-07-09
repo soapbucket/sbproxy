@@ -263,51 +263,93 @@ impl AgentAlignmentGuardrail {
             }
             for tc in tool_calls {
                 let name = extract_tool_name(tc).unwrap_or_default();
-                let name_lc = name.to_ascii_lowercase();
+                let args_json = extract_tool_args_json(tc);
+                violations.extend(self.call_violations(&name, &args_json, principal));
+            }
+        }
 
-                if !self.denied_tools_lc.is_empty() && self.denied_tools_lc.contains(&name_lc) {
-                    violations.push(format!("tool {:?} is in denied_tools", name));
-                    continue;
-                }
+        violations
+    }
 
-                // WOR-1645: the shared MCP RBAC policy, evaluated by
-                // the same code the MCP action uses, so a deny rule
-                // written once governs this lane too. Runs before the
-                // static allow list so a policy deny is decisive.
-                if let (Some(policy), Some(principal)) = (self.cfg.rbac_policy.as_ref(), principal)
-                {
-                    if matches!(
-                        policy.check(principal, &name),
-                        sbproxy_extension::mcp::ToolAccessDecision::Deny,
-                    ) {
-                        violations.push(format!(
-                            "tool {:?} is denied by the shared MCP rbac_policy for this principal",
-                            name
-                        ));
-                        continue;
-                    }
-                }
+    /// Every violation for a single tool call, in rule order: denied
+    /// list, shared MCP rbac_policy (WOR-1645), allowed list, then one
+    /// entry per forbidden argument substring. This is the exact rule
+    /// slice `find_violations_with_principal` applies per call; the
+    /// streamed tool-call lane (WOR-1810) judges assembled calls
+    /// through the same sequence.
+    fn call_violations(
+        &self,
+        name: &str,
+        args_json: &str,
+        principal: Option<&sbproxy_plugin::Principal>,
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+        let name_lc = name.to_ascii_lowercase();
 
-                if !self.allowed_tools_lc.is_empty() && !self.allowed_tools_lc.contains(&name_lc) {
-                    violations.push(format!("tool {:?} is not in allowed_tools", name));
-                    continue;
-                }
+        if !self.denied_tools_lc.is_empty() && self.denied_tools_lc.contains(&name_lc) {
+            violations.push(format!("tool {:?} is in denied_tools", name));
+            return violations;
+        }
 
-                if !self.forbidden_arg_substrings_lc.is_empty() {
-                    let args_lc = extract_tool_args_json(tc).to_ascii_lowercase();
-                    for needle in &self.forbidden_arg_substrings_lc {
-                        if args_lc.contains(needle) {
-                            violations.push(format!(
-                                "tool {:?} arguments contain forbidden substring {:?}",
-                                name, needle
-                            ));
-                        }
-                    }
+        // WOR-1645: the shared MCP RBAC policy, evaluated by
+        // the same code the MCP action uses, so a deny rule
+        // written once governs this lane too. Runs before the
+        // static allow list so a policy deny is decisive.
+        if let (Some(policy), Some(principal)) = (self.cfg.rbac_policy.as_ref(), principal) {
+            if matches!(
+                policy.check(principal, name),
+                sbproxy_extension::mcp::ToolAccessDecision::Deny,
+            ) {
+                violations.push(format!(
+                    "tool {:?} is denied by the shared MCP rbac_policy for this principal",
+                    name
+                ));
+                return violations;
+            }
+        }
+
+        if !self.allowed_tools_lc.is_empty() && !self.allowed_tools_lc.contains(&name_lc) {
+            violations.push(format!("tool {:?} is not in allowed_tools", name));
+            return violations;
+        }
+
+        if !self.forbidden_arg_substrings_lc.is_empty() {
+            let args_lc = args_json.to_ascii_lowercase();
+            for needle in &self.forbidden_arg_substrings_lc {
+                if args_lc.contains(needle) {
+                    violations.push(format!(
+                        "tool {:?} arguments contain forbidden substring {:?}",
+                        name, needle
+                    ));
                 }
             }
         }
 
         violations
+    }
+
+    /// First violation for one assembled tool call, or `None` when the
+    /// call passes every rule. Streaming entry point (WOR-1810): the
+    /// relay judges each completed streamed call here. `enabled: false`
+    /// keeps this inert, matching the buffered walk.
+    pub fn check_tool_call(
+        &self,
+        name: &str,
+        args_json: &str,
+        principal: Option<&sbproxy_plugin::Principal>,
+    ) -> Option<String> {
+        if !self.cfg.enabled {
+            return None;
+        }
+        self.call_violations(name, args_json, principal)
+            .into_iter()
+            .next()
+    }
+
+    /// The configured enforcement mode (Block terminates a violating
+    /// stream; Flag logs and counts). Exposed for the streaming lane.
+    pub fn mode(&self) -> AgentAlignmentMode {
+        self.cfg.mode
     }
 }
 
@@ -366,6 +408,26 @@ mod tests {
                 {"role": "assistant", "content": null, "tool_calls": calls}
             ]
         })
+    }
+
+    #[test]
+    fn check_tool_call_evaluates_single_call() {
+        // WOR-1810: the streamed tool-call lane judges one assembled
+        // call at a time through the same rule sequence the buffered
+        // body walk applies.
+        let g = AgentAlignmentGuardrail::new(AgentAlignmentConfig {
+            enabled: true,
+            denied_tools: vec!["delete_db".into()],
+            forbidden_arg_substrings: vec!["rm -rf".into()],
+            ..Default::default()
+        });
+        assert!(g.check_tool_call("delete_db", "{}", None).is_some());
+        assert!(g
+            .check_tool_call("search", r#"{"cmd":"rm -rf /"}"#, None)
+            .is_some());
+        assert!(g.check_tool_call("search", r#"{"q":"ok"}"#, None).is_none());
+        // Case-insensitive like the buffered path.
+        assert!(g.check_tool_call("DELETE_DB", "{}", None).is_some());
     }
 
     #[test]
