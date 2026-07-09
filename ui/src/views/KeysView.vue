@@ -17,7 +17,7 @@ onMounted(keysReq.run);
 
 // ---- helpers ----
 function keyId(k: AdminKey): string {
-  return String(k.id ?? k.prefix ?? k.name ?? "");
+  return String(k.id ?? k.key_id ?? k.prefix ?? k.name ?? "");
 }
 function toList(s: string): string[] {
   return s
@@ -28,12 +28,39 @@ function toList(s: string): string[] {
 function fromList(v: unknown): string {
   return Array.isArray(v) ? v.join(", ") : "";
 }
+function listOf(k: AdminKey, field: keyof AdminKey): string {
+  return fromList(k[field] ?? k.policy?.[field as string]);
+}
+function stringOf(k: AdminKey, field: keyof AdminKey): string {
+  const v = k[field] ?? k.policy?.[field as string];
+  return typeof v === "string" ? v : "";
+}
+function boolOf(k: AdminKey, field: keyof AdminKey): boolean {
+  return Boolean(k[field] ?? k.policy?.[field as string]);
+}
 function budgetOf(k: AdminKey): number | undefined {
+  if (typeof k.policy?.max_budget_usd === "number") return k.policy.max_budget_usd;
   if (typeof k.policy?.budget_usd === "number") return k.policy.budget_usd;
-  const b = k.policy?.budget as any;
+  const b = (k.budget ?? k.policy?.budget) as any;
   if (typeof b === "number") return b;
+  if (b && typeof b === "object" && typeof b.max_cost_usd === "number") return b.max_cost_usd;
   if (b && typeof b === "object" && typeof b.usd === "number") return b.usd;
   return undefined;
+}
+function tokenBudgetOf(k: AdminKey): number | undefined {
+  const b = (k.budget ?? k.policy?.budget) as any;
+  if (b && typeof b === "object" && typeof b.max_tokens === "number") return b.max_tokens;
+  return undefined;
+}
+function jsonText(v: unknown): string {
+  if (!Array.isArray(v) || v.length === 0) return "";
+  return JSON.stringify(v, null, 2);
+}
+function parseJsonArray(s: string): unknown[] | undefined {
+  if (!s.trim()) return undefined;
+  const parsed = JSON.parse(s);
+  if (!Array.isArray(parsed)) throw new Error("Expected a JSON array.");
+  return parsed;
 }
 
 // ---- create ----
@@ -44,7 +71,17 @@ const createForm = reactive({
   blocked_models: "",
   allowed_providers: "",
   blocked_providers: "",
+  require_pii_redaction: "",
+  route_to_model: "",
+  max_requests_per_minute: "",
+  max_budget_tokens: "",
   budget_usd: "",
+  project: "",
+  user: "",
+  tenant_id: "",
+  bypass_prompt_injection: false,
+  principal_selectors: "",
+  inject_tools: "",
   tags: "",
   expires_at: "",
 });
@@ -60,7 +97,17 @@ function resetCreate() {
     blocked_models: "",
     allowed_providers: "",
     blocked_providers: "",
+    require_pii_redaction: "",
+    route_to_model: "",
+    max_requests_per_minute: "",
+    max_budget_tokens: "",
     budget_usd: "",
+    project: "",
+    user: "",
+    tenant_id: "",
+    bypass_prompt_injection: false,
+    principal_selectors: "",
+    inject_tools: "",
     tags: "",
     expires_at: "",
   });
@@ -73,9 +120,25 @@ function buildPolicy(f: typeof createForm) {
   if (f.blocked_models) policy.blocked_models = toList(f.blocked_models);
   if (f.allowed_providers) policy.allowed_providers = toList(f.allowed_providers);
   if (f.blocked_providers) policy.blocked_providers = toList(f.blocked_providers);
-  if (f.budget_usd && !Number.isNaN(Number(f.budget_usd))) {
-    policy.budget_usd = Number(f.budget_usd);
+  if (f.require_pii_redaction) policy.require_pii_redaction = toList(f.require_pii_redaction);
+  if (f.route_to_model) policy.route_to_model = f.route_to_model.trim();
+  if (f.max_requests_per_minute && !Number.isNaN(Number(f.max_requests_per_minute))) {
+    policy.max_requests_per_minute = Number(f.max_requests_per_minute);
   }
+  if (f.max_budget_tokens && !Number.isNaN(Number(f.max_budget_tokens))) {
+    policy.max_budget_tokens = Number(f.max_budget_tokens);
+  }
+  if (f.budget_usd && !Number.isNaN(Number(f.budget_usd))) {
+    policy.max_budget_usd = Number(f.budget_usd);
+  }
+  if (f.project) policy.project = f.project.trim();
+  if (f.user) policy.user = f.user.trim();
+  if (f.tenant_id) policy.tenant = f.tenant_id.trim();
+  if (f.bypass_prompt_injection) policy.bypass_prompt_injection = true;
+  const principalSelectors = parseJsonArray(f.principal_selectors);
+  if (principalSelectors) policy.principal_selectors = principalSelectors;
+  const injectTools = parseJsonArray(f.inject_tools);
+  if (injectTools) policy.inject_tools = injectTools;
   if (f.tags) policy.tags = toList(f.tags);
   return policy;
 }
@@ -84,7 +147,7 @@ async function submitCreate() {
   createBusy.value = true;
   createError.value = null;
   try {
-    const body: Record<string, unknown> = { policy: buildPolicy(createForm) };
+    const body: Record<string, unknown> = buildPolicy(createForm);
     if (createForm.name) body.name = createForm.name;
     if (createForm.tags) body.tags = toList(createForm.tags);
     if (createForm.expires_at) body.expires_at = createForm.expires_at;
@@ -112,7 +175,17 @@ const editForm = reactive({
   blocked_models: "",
   allowed_providers: "",
   blocked_providers: "",
+  require_pii_redaction: "",
+  route_to_model: "",
+  max_requests_per_minute: "",
+  max_budget_tokens: "",
   budget_usd: "",
+  project: "",
+  user: "",
+  tenant_id: "",
+  bypass_prompt_injection: false,
+  principal_selectors: "",
+  inject_tools: "",
   tags: "",
 });
 const editBusy = ref(false);
@@ -122,11 +195,22 @@ function openEdit(k: AdminKey) {
   editing.value = k;
   editError.value = null;
   Object.assign(editForm, {
-    allowed_models: fromList(k.policy?.allowed_models),
-    blocked_models: fromList(k.policy?.blocked_models),
-    allowed_providers: fromList(k.policy?.allowed_providers),
-    blocked_providers: fromList(k.policy?.blocked_providers),
+    allowed_models: listOf(k, "allowed_models"),
+    blocked_models: listOf(k, "blocked_models"),
+    allowed_providers: listOf(k, "allowed_providers"),
+    blocked_providers: listOf(k, "blocked_providers"),
+    require_pii_redaction: listOf(k, "require_pii_redaction"),
+    route_to_model: stringOf(k, "route_to_model"),
+    max_requests_per_minute:
+      typeof k.max_requests_per_minute === "number" ? String(k.max_requests_per_minute) : "",
+    max_budget_tokens: tokenBudgetOf(k) !== undefined ? String(tokenBudgetOf(k)) : "",
     budget_usd: budgetOf(k) !== undefined ? String(budgetOf(k)) : "",
+    project: stringOf(k, "project"),
+    user: stringOf(k, "user"),
+    tenant_id: stringOf(k, "tenant_id"),
+    bypass_prompt_injection: boolOf(k, "bypass_prompt_injection"),
+    principal_selectors: jsonText(k.principal_selectors ?? k.policy?.principal_selectors),
+    inject_tools: jsonText(k.inject_tools ?? k.policy?.inject_tools),
     tags: fromList(k.tags ?? k.policy?.tags),
   });
 }
@@ -136,7 +220,7 @@ async function submitEdit() {
   editBusy.value = true;
   editError.value = null;
   try {
-    await api.patchKey(keyId(editing.value), { policy: buildPolicy(editForm as any) });
+    await api.patchKey(keyId(editing.value), buildPolicy(editForm as any));
     editing.value = null;
     keysReq.run();
   } catch (e) {
@@ -236,25 +320,50 @@ function statusOf(k: AdminKey): string {
             </div>
           </td>
           <td class="policy">
-            <div v-if="k.policy?.allowed_models?.length" class="pol">
+            <div v-if="(k.allowed_models ?? k.policy?.allowed_models)?.length" class="pol">
               <span class="pol__k">allow models</span>
-              <span class="sb-mono">{{ k.policy.allowed_models.join(", ") }}</span>
+              <span class="sb-mono">{{ (k.allowed_models ?? k.policy?.allowed_models)?.join(", ") }}</span>
             </div>
-            <div v-if="k.policy?.blocked_models?.length" class="pol">
+            <div v-if="(k.blocked_models ?? k.policy?.blocked_models)?.length" class="pol">
               <span class="pol__k pol__k--block">block models</span>
-              <span class="sb-mono">{{ k.policy.blocked_models.join(", ") }}</span>
+              <span class="sb-mono">{{ (k.blocked_models ?? k.policy?.blocked_models)?.join(", ") }}</span>
             </div>
-            <div v-if="k.policy?.allowed_providers?.length" class="pol">
+            <div v-if="(k.allowed_providers ?? k.policy?.allowed_providers)?.length" class="pol">
               <span class="pol__k">allow providers</span>
-              <span class="sb-mono">{{ k.policy.allowed_providers.join(", ") }}</span>
+              <span class="sb-mono">{{ (k.allowed_providers ?? k.policy?.allowed_providers)?.join(", ") }}</span>
             </div>
-            <div v-if="k.policy?.blocked_providers?.length" class="pol">
+            <div v-if="(k.blocked_providers ?? k.policy?.blocked_providers)?.length" class="pol">
               <span class="pol__k pol__k--block">block providers</span>
-              <span class="sb-mono">{{ k.policy.blocked_providers.join(", ") }}</span>
+              <span class="sb-mono">{{ (k.blocked_providers ?? k.policy?.blocked_providers)?.join(", ") }}</span>
+            </div>
+            <div v-if="k.route_to_model ?? k.policy?.route_to_model" class="pol">
+              <span class="pol__k">pin model</span>
+              <span class="sb-mono">{{ k.route_to_model ?? k.policy?.route_to_model }}</span>
+            </div>
+            <div v-if="(k.require_pii_redaction ?? k.policy?.require_pii_redaction)?.length" class="pol">
+              <span class="pol__k">redact</span>
+              <span class="sb-mono">{{ (k.require_pii_redaction ?? k.policy?.require_pii_redaction)?.join(", ") }}</span>
+            </div>
+            <div v-if="k.max_requests_per_minute" class="pol">
+              <span class="pol__k">rpm</span>
+              <span class="sb-mono">{{ k.max_requests_per_minute }}</span>
+            </div>
+            <div v-if="k.bypass_prompt_injection ?? k.policy?.bypass_prompt_injection" class="pol">
+              <span class="pol__k pol__k--block">prompt scan</span>
+              <span class="sb-mono">bypassed</span>
             </div>
             <span
               class="sb-faint"
-              v-if="!k.policy || !Object.keys(k.policy).some((p) => (k.policy as any)[p]?.length)"
+              v-if="
+                !(k.allowed_models ?? k.policy?.allowed_models)?.length &&
+                !(k.blocked_models ?? k.policy?.blocked_models)?.length &&
+                !(k.allowed_providers ?? k.policy?.allowed_providers)?.length &&
+                !(k.blocked_providers ?? k.policy?.blocked_providers)?.length &&
+                !(k.route_to_model ?? k.policy?.route_to_model) &&
+                !(k.require_pii_redaction ?? k.policy?.require_pii_redaction)?.length &&
+                !k.max_requests_per_minute &&
+                !(k.bypass_prompt_injection ?? k.policy?.bypass_prompt_injection)
+              "
             >
               no restrictions
             </span>
@@ -340,13 +449,64 @@ function statusOf(k: AdminKey): string {
           <input class="sb-input" v-model="createForm.budget_usd" inputmode="decimal" placeholder="100" />
         </div>
         <div class="sb-field">
+          <label class="sb-label">Budget tokens</label>
+          <input class="sb-input" v-model="createForm.max_budget_tokens" inputmode="numeric" placeholder="1000000" />
+        </div>
+      </div>
+      <div class="two">
+        <div class="sb-field">
+          <label class="sb-label">Requests per minute</label>
+          <input class="sb-input" v-model="createForm.max_requests_per_minute" inputmode="numeric" placeholder="60" />
+        </div>
+        <div class="sb-field">
+          <label class="sb-label">Route to model</label>
+          <input class="sb-input" v-model="createForm.route_to_model" placeholder="qwen2.5-coder:1.5b" />
+        </div>
+      </div>
+      <div class="two">
+        <div class="sb-field">
           <label class="sb-label">Expires at (ISO 8601)</label>
           <input class="sb-input" v-model="createForm.expires_at" placeholder="2026-12-31T00:00:00Z" />
+        </div>
+        <div class="sb-field">
+          <label class="sb-label">Require PII redaction</label>
+          <input class="sb-input" v-model="createForm.require_pii_redaction" placeholder="email, credit_card" />
+        </div>
+      </div>
+      <div class="two">
+        <div class="sb-field">
+          <label class="sb-label">Project</label>
+          <input class="sb-input" v-model="createForm.project" placeholder="frontend" />
+        </div>
+        <div class="sb-field">
+          <label class="sb-label">User</label>
+          <input class="sb-input" v-model="createForm.user" placeholder="team or service" />
+        </div>
+      </div>
+      <div class="two">
+        <div class="sb-field">
+          <label class="sb-label">Tenant</label>
+          <input class="sb-input" v-model="createForm.tenant_id" placeholder="default" />
+        </div>
+        <div class="sb-field checkbox-field">
+          <label class="sb-label">Prompt-injection scan</label>
+          <label class="checkline">
+            <input type="checkbox" v-model="createForm.bypass_prompt_injection" />
+            <span>Bypass for this trusted key</span>
+          </label>
         </div>
       </div>
       <div class="sb-field">
         <label class="sb-label">Tags</label>
         <input class="sb-input" v-model="createForm.tags" placeholder="comma separated" />
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Principal selectors (JSON array)</label>
+        <textarea class="sb-input textarea" v-model="createForm.principal_selectors" placeholder='[{"project":"frontend"}]'></textarea>
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Inject tools (JSON array)</label>
+        <textarea class="sb-input textarea" v-model="createForm.inject_tools" placeholder='[{"type":"function","function":{"name":"search"}}]'></textarea>
       </div>
     </form>
     <template #footer>
@@ -404,9 +564,60 @@ function statusOf(k: AdminKey): string {
         <input class="sb-input" v-model="editForm.budget_usd" inputmode="decimal" />
       </div>
       <div class="sb-field">
+        <label class="sb-label">Budget tokens</label>
+        <input class="sb-input" v-model="editForm.max_budget_tokens" inputmode="numeric" />
+      </div>
+    </div>
+    <div class="two">
+      <div class="sb-field">
+        <label class="sb-label">Requests per minute</label>
+        <input class="sb-input" v-model="editForm.max_requests_per_minute" inputmode="numeric" />
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Route to model</label>
+        <input class="sb-input" v-model="editForm.route_to_model" />
+      </div>
+    </div>
+    <div class="two">
+      <div class="sb-field">
+        <label class="sb-label">Require PII redaction</label>
+        <input class="sb-input" v-model="editForm.require_pii_redaction" />
+      </div>
+      <div class="sb-field">
         <label class="sb-label">Tags</label>
         <input class="sb-input" v-model="editForm.tags" />
       </div>
+    </div>
+    <div class="two">
+      <div class="sb-field">
+        <label class="sb-label">Project</label>
+        <input class="sb-input" v-model="editForm.project" />
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">User</label>
+        <input class="sb-input" v-model="editForm.user" />
+      </div>
+    </div>
+    <div class="two">
+      <div class="sb-field">
+        <label class="sb-label">Tenant</label>
+        <input class="sb-input" v-model="editForm.tenant_id" />
+      </div>
+      <div class="sb-field checkbox-field">
+        <label class="sb-label">Prompt-injection scan</label>
+        <label class="checkline">
+          <input type="checkbox" v-model="editForm.bypass_prompt_injection" />
+          <span>Bypass for this trusted key</span>
+        </label>
+      </div>
+    </div>
+    <div class="sb-field">
+      <label class="sb-label">Principal selectors (JSON array)</label>
+      <textarea class="sb-input textarea" v-model="editForm.principal_selectors"></textarea>
+    </div>
+    <div class="sb-field">
+      <label class="sb-label">Inject tools (JSON array)</label>
+      <textarea class="sb-input textarea" v-model="editForm.inject_tools"></textarea>
     </div>
     <template #footer>
       <button class="sb-btn" @click="editing = null">Cancel</button>
@@ -492,6 +703,20 @@ function statusOf(k: AdminKey): string {
   border-radius: var(--sb-radius-sm);
   padding: 8px 12px;
   color: var(--sb-err);
+  font-size: 0.85rem;
+}
+.textarea {
+  min-height: 86px;
+  font-family: var(--sb-font-mono);
+}
+.checkbox-field {
+  align-self: end;
+}
+.checkline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--sb-text-muted);
   font-size: 0.85rem;
 }
 </style>

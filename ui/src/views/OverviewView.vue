@@ -69,8 +69,14 @@ const vram = computed(() => {
   const used = m.vram_used_bytes ?? m.vram_used;
   const total = m.vram_total_bytes ?? m.vram_total;
   if (used === undefined && total === undefined) return null;
-  return { used, total };
+  return {
+    used: typeof used === "number" ? used : undefined,
+    total: typeof total === "number" ? total : undefined,
+  };
 });
+function optionalNumber(v: unknown): number | undefined {
+  return typeof v === "number" ? v : undefined;
+}
 </script>
 
 <template>
@@ -152,7 +158,7 @@ const vram = computed(() => {
             <td class="sb-mono">{{ m.name ?? m.id ?? "unknown" }}</td>
             <td><StatusBadge :label="String(m.state ?? m.status ?? 'unknown')" /></td>
             <td class="sb-muted">{{ m.engine ?? "n/a" }}</td>
-            <td>{{ formatBytes(m.vram_bytes ?? m.vram) }}</td>
+            <td>{{ formatBytes(m.vram_bytes ?? optionalNumber(m.vram)) }}</td>
           </tr>
         </tbody>
       </table>

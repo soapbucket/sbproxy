@@ -29,7 +29,7 @@ function decisionTone(reason: string): string {
   return reason === "hit" ? "var(--sb-accent)" : "var(--sb-text-muted)";
 }
 
-const status = computed<CacheStatus | null>(() => statusReq.data.value);
+const status = computed<CacheStatus | null>(() => statusReq.data.value ?? null);
 const enabled = computed(() => !!status.value?.enabled);
 const backend = computed(() => status.value?.backend ?? "n/a");
 const prefixSupported = computed(() => !!status.value?.prefix_purge_supported);

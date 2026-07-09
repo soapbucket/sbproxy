@@ -70,6 +70,15 @@ fn parsed_upstream_url(url: &str) -> std::sync::Arc<ParsedUpstreamUrl> {
     info
 }
 
+fn final_response_status(
+    ctx: &RequestContext,
+    written: Option<&pingora_http::ResponseHeader>,
+) -> u16 {
+    ctx.response_status
+        .or_else(|| written.map(|header| header.status.as_u16()))
+        .unwrap_or(0)
+}
+
 fn retry_config_for_action(action: &Action) -> Option<&sbproxy_modules::action::RetryConfig> {
     match action {
         Action::Proxy(proxy) => proxy.retry.as_ref(),
@@ -3979,7 +3988,7 @@ impl ProxyHttp for SbProxy {
         // Record request metrics.
         let method = session.req_header().method.as_str().to_string();
         let hostname = ctx.hostname.to_string();
-        let status_u16 = ctx.response_status.unwrap_or(0);
+        let status_u16 = final_response_status(ctx, session.response_written());
 
         // WOR-1528 / WOR-1540: hand the completed AI call to the
         // configured usage sinks (the verifiable ledger among them).
@@ -4289,5 +4298,26 @@ mod tests {
         let b = parsed_upstream_url("https://memo.example.com/x");
         // A cache hit returns the same Arc, not a fresh parse.
         assert!(std::sync::Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn final_response_status_falls_back_to_written_header() {
+        let ctx = RequestContext::default();
+        let header = pingora_http::ResponseHeader::build(200, None).unwrap();
+
+        assert_eq!(final_response_status(&ctx, Some(&header)), 200);
+    }
+
+    #[test]
+    fn final_response_status_prefers_context_status() {
+        let mut ctx = RequestContext {
+            response_status: Some(429),
+            ..RequestContext::default()
+        };
+        let header = pingora_http::ResponseHeader::build(200, None).unwrap();
+
+        assert_eq!(final_response_status(&ctx, Some(&header)), 429);
+        ctx.response_status = None;
+        assert_eq!(final_response_status(&ctx, None), 0);
     }
 }

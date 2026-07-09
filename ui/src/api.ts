@@ -216,14 +216,26 @@ export interface KeyPolicy {
   blocked_models?: string[];
   allowed_providers?: string[];
   blocked_providers?: string[];
+  require_pii_redaction?: string[];
+  route_to_model?: string;
+  inject_tools?: unknown[];
+  principal_selectors?: unknown[];
+  bypass_prompt_injection?: boolean;
   budget?: unknown;
   budget_usd?: number;
+  max_budget_tokens?: number;
+  max_budget_usd?: number;
+  max_requests_per_minute?: number;
+  project?: string;
+  user?: string;
+  tenant_id?: string;
   tags?: string[];
   [k: string]: unknown;
 }
 
 export interface AdminKey {
   id?: string;
+  key_id?: string;
   name?: string;
   label?: string;
   prefix?: string;
@@ -235,6 +247,20 @@ export interface AdminKey {
   expires_at?: string;
   created_at?: string;
   tags?: string[];
+  allowed_models?: string[];
+  blocked_models?: string[];
+  allowed_providers?: string[];
+  blocked_providers?: string[];
+  require_pii_redaction?: string[];
+  route_to_model?: string;
+  inject_tools?: unknown[];
+  principal_selectors?: unknown[];
+  bypass_prompt_injection?: boolean;
+  max_requests_per_minute?: number;
+  budget?: unknown;
+  project?: string;
+  user?: string;
+  tenant_id?: string;
   policy?: KeyPolicy;
   [k: string]: unknown;
 }
