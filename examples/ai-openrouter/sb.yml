@@ -15,7 +15,7 @@
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "anthropic/claude-3.5-sonnet",
+#       "model": "anthropic/claude-sonnet-4.5",
 #       "messages": [{"role": "user", "content": "Hello!"}]
 #     }'
 
@@ -29,9 +29,9 @@ origins:
       providers:
         - name: openrouter
           api_key: ${OPENROUTER_API_KEY}
-          default_model: anthropic/claude-3.5-sonnet
+          default_model: anthropic/claude-sonnet-4.5
           models:
-            - anthropic/claude-3.5-sonnet
+            - anthropic/claude-sonnet-4.5
             - anthropic/claude-3-haiku
             - openai/gpt-4o-mini
             - meta-llama/llama-3.1-70b-instruct
@@ -39,7 +39,7 @@ origins:
       # Gateway-level model allowlist: requests for any other model are
       # rejected with 403 before an upstream call is made.
       allowed_models:
-        - anthropic/claude-3.5-sonnet
+        - anthropic/claude-sonnet-4.5
         - anthropic/claude-3-haiku
         - openai/gpt-4o-mini
         - meta-llama/llama-3.1-70b-instruct

@@ -139,9 +139,9 @@ Three options, roughly in order of preference:
 providers:
   - name: openrouter
     api_key: ${OPENROUTER_API_KEY}
-    default_model: anthropic/claude-3.5-sonnet
+    default_model: anthropic/claude-sonnet-4.5
     models:
-      - anthropic/claude-3.5-sonnet
+      - anthropic/claude-sonnet-4.5
       - meta-llama/llama-3.1-70b-instruct
       - mistralai/mistral-large
 ```

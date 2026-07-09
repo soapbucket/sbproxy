@@ -60,7 +60,7 @@ The provider produces one of five verdicts; only the first allows the request:
 | `Missing` | `401` | No `Signature-Input` header. |
 | `UnknownAgent` | `401` | `keyid` claimed in `Signature-Input` is not in the directory. |
 | `Failed` | `401` | Header parse failure, signature mismatch, expired, or required component missing. |
-| `DirectoryUnavailable` | `401` | The dynamic directory could not be fetched or validated (HTTPS violation, allowlist mismatch, fetch deadline, invalid self-signature, stale grace exceeded). The underlying reason lands in the structured log. |
+| `DirectoryUnavailable` | `401` | The dynamic directory could not be fetched or validated (HTTPS violation, allowlist mismatch, fetch deadline, invalid self-signature, stale grace exceeded). The underlying reason lands in the structured log, and each failed fetch increments `sbproxy_bot_auth_directory_fetch_failures_total{url}` for alerting. |
 
 The denial body is intentionally generic (`bot_auth: signature required` / `bot_auth: verification failed`); detailed reasons land in the structured log under the `sbproxy::auth` target so an operator can see exactly which check failed without leaking the same detail to a probing crawler.
 

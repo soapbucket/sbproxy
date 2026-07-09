@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Different models cost and behave differently, so they each need their own rate cap. The `model_rate_limits` map keys by model name and applies sliding one-minute windows for both requests and tokens. The cap fires regardless of which provider serves the model, so an alias or fallback chain that lands on the same upstream model still counts against the same window. Three caps are configured: `claude-sonnet-4-5` at 60 RPM / 200,000 TPM, `claude-haiku-4-5` at 240 RPM / 600,000 TPM, and the OpenRouter passthrough `anthropic/claude-3.5-sonnet` at 30 RPM / 100,000 TPM.
+Different models cost and behave differently, so they each need their own rate cap. The `model_rate_limits` map keys by model name and applies sliding one-minute windows for both requests and tokens. The cap fires regardless of which provider serves the model, so an alias or fallback chain that lands on the same upstream model still counts against the same window. Three caps are configured: `claude-sonnet-4-5` at 60 RPM / 200,000 TPM, `claude-haiku-4-5` at 240 RPM / 600,000 TPM, and the OpenRouter passthrough `anthropic/claude-sonnet-4.5` at 30 RPM / 100,000 TPM.
 
 ## Run
 

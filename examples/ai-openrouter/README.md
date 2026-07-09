@@ -2,7 +2,7 @@
 
 *Last modified: 2026-07-09*
 
-Routes OpenAI-compatible chat completion requests through OpenRouter. Clients speak the OpenAI protocol; SBproxy injects the OpenRouter API key, forwards the request to `https://openrouter.ai/api/v1`, and returns the response unchanged. Four model aliases are allowlisted via `allowed_models`, with `anthropic/claude-3.5-sonnet` as the default if a request arrives without an explicit `model` field. Routing is `fallback_chain`, but with a single provider the chain is effectively a passthrough; the gateway behaves like a thin authenticated proxy in front of OpenRouter.
+Routes OpenAI-compatible chat completion requests through OpenRouter. Clients speak the OpenAI protocol; SBproxy injects the OpenRouter API key, forwards the request to `https://openrouter.ai/api/v1`, and returns the response unchanged. Four model aliases are allowlisted via `allowed_models`, with `anthropic/claude-sonnet-4.5` as the default if a request arrives without an explicit `model` field. Routing is `fallback_chain`, but with a single provider the chain is effectively a passthrough; the gateway behaves like a thin authenticated proxy in front of OpenRouter.
 
 ## Run
 
@@ -20,14 +20,14 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
     -d '{
-      "model": "anthropic/claude-3.5-sonnet",
+      "model": "anthropic/claude-sonnet-4.5",
       "messages": [{"role": "user", "content": "Hello!"}]
     }'
 {
   "id": "gen-1714200000-abc123",
   "object": "chat.completion",
   "created": 1714200000,
-  "model": "anthropic/claude-3.5-sonnet",
+  "model": "anthropic/claude-sonnet-4.5",
   "choices": [
     {
       "index": 0,
@@ -59,7 +59,7 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{"messages":[{"role":"user","content":"Pick a colour."}]}' \
   | jq -r '.model'
-anthropic/claude-3.5-sonnet
+anthropic/claude-sonnet-4.5
 ```
 
 ## What this exercises

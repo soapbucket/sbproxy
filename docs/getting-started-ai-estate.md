@@ -51,9 +51,9 @@ origins:
         - name: openrouter
           api_key: ${OPENROUTER_API_KEY}
           priority: 2
-          default_model: anthropic/claude-3.5-sonnet
+          default_model: anthropic/claude-sonnet-4.5
           models:
-            - anthropic/claude-3.5-sonnet
+            - anthropic/claude-sonnet-4.5
             - anthropic/claude-3-haiku
 
       guardrails:

@@ -316,9 +316,12 @@ impl DirectoryCache {
         }
     }
 
-    /// Store a fetch failure. Sets the negative cache window and
-    /// records the failure reason for the next snapshot read.
+    /// Store a fetch failure. Sets the negative cache window, records
+    /// the failure reason for the next snapshot read, and increments
+    /// `sbproxy_bot_auth_directory_fetch_failures_total{url}` (the
+    /// counter the bot_auth rustdoc tells operators to alert on).
     pub fn store_failure(&self, url: &str, reason: String, negative_ttl: Duration) {
+        sbproxy_observe::metrics::record_bot_auth_directory_fetch_failure(url);
         let mut guard = self.entries.lock().expect("directory cache poisoned");
         let entry = guard.entry(url.to_string()).or_default();
         entry.negative_until = Some(Instant::now() + negative_ttl);
