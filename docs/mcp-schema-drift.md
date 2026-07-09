@@ -198,7 +198,7 @@ Out of scope today (follow-ups):
 The CLI is a thin wrapper around
 `sbproxy_extension::mcp::schema_drift`:
 
-```rust
+```rust,no_run
 use sbproxy_extension::mcp::schema_drift::{diff_openapi, DriftSeverity};
 
 let prev: serde_json::Value = serde_json::from_str(prev_json)?;
@@ -211,7 +211,7 @@ if report.severity == DriftSeverity::Breaking {
 
 Cassette mode is also available as a library API:
 
-```rust
+```rust,no_run
 use sbproxy_extension::mcp::cassette_drift::{
     cassette_contract_from_value, diff_cassette_against_tools, tools_from_value,
 };

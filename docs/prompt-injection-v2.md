@@ -345,7 +345,7 @@ supervisor passes the UDS path to the child; the proxy holds a
 lazy client at the same path; the first `classify` call races
 the child's bind exactly once.
 
-```rust
+```rust,no_run
 use std::path::PathBuf;
 use std::time::Duration;
 use sbproxy_classifier_client::{ClassifierClient, Supervisor, SupervisorConfig};

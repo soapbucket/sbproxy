@@ -129,7 +129,7 @@ Overflows fire the `sbproxy_label_cardinality_overflow_per_tenant_total{metric, 
 
 Every `SecurityAuditEntry` (policy denies, auth failures, framing violations) and every `ConfigAuditEntry` (config reloads, origin diffs) carries an optional `tenant_id` field. Stamp it on construction:
 
-```rust
+```rust,no_run
 SecurityAuditEntry::policy_violation(...)
     .with_tenant_id(ctx.tenant_id.to_string())
     .emit();
