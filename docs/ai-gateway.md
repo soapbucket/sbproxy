@@ -415,23 +415,38 @@ Fusion semantics, verdict-cache keying, and the latency cascade are in [ai-guard
 
 ### Streaming policy
 
-A guardrail is *streaming-safe* when its block decision is stable as soon as the chunk it sees is decided. The proxy classifies the built-in guardrails as follows:
+Every built-in output guardrail runs on streaming responses, and the verdicts match what the buffered path would decide for the same text. The proxy decodes each streamed delta (the JSON content, not the raw SSE frame bytes) and feeds it to a per-stream guardrail session that keeps matcher state across chunks, so a pattern split across two deltas still matches.
 
-| Guardrail | Streaming-safe | Reason |
+| Guardrail | On streaming output | How |
 |---|---|---|
-| `regex` | yes | per-chunk regex match is stable |
-| `pii` | yes | PII patterns match per-chunk |
-| `schema` | yes | JSON schema validation is decided on the parsed value |
+| `regex` | yes | runs per decoded delta; set `stream_policy: close` when a pattern must span delta boundaries |
+| `pii` | yes | runs per decoded delta |
+| `schema` | yes | decided on the parsed value |
 | `context_poisoning` | yes | rule matches are per-message |
-| `injection` | no | multi-token context windows; partial windows produce false negatives |
-| `toxicity` | no | full-text classifier; partial-window scores are misleading |
-| `jailbreak` | no | multi-pattern + multi-token detector |
-| `content_safety` | no | full-text classifier (self-harm, violence, etc.) |
-| `agent_alignment` | no | runs on the input body only (it inspects assistant tool_calls); streaming output is not in scope |
+| `injection` | yes | case-insensitive substring set, matched over a cumulative window |
+| `toxicity` | yes | operator keyword set, matched over a cumulative window |
+| `jailbreak` | yes | pattern set plus the standalone-DAN word rule, matched over a cumulative window; a word split across deltas (Dan + iel) never false-blocks |
+| `content_safety` | yes | category keyword sets, matched over a cumulative window |
+| `agent_alignment` | yes | streamed `tool_calls` deltas are assembled per call and judged when each call completes; block mode holds tool-call frames back until their call is judged, while text deltas flow |
 
-On the buffered (non-streaming) path the proxy runs every configured output guardrail against the full response. On the streaming output path the proxy runs only the streaming-safe guardrails on each chunk; non-safe guardrails are skipped because evaluating them against a partial window produces both false positives (tripping on benign mid-stream substrings) and false negatives (missing late-stream signal). Input guardrails always run against the full request regardless of `stream`.
+A block terminates the stream: the violating content and everything after it is withheld, and the response is never admitted to any cache. Headers are already sent by then, so the client sees the stream cut rather than an error status. Input guardrails always run against the full request regardless of `stream`.
 
-Operators that want a non-safe guardrail to apply to streaming responses anyway should accept the partial-window risk explicitly and run a second buffered pass once the stream closes; the per-entry `streaming_safe` override surface for that case rides a follow-up.
+Each output entry takes an optional `stream_policy` when the default live evaluation is not what you want:
+
+```yaml
+guardrails:
+  output:
+    - type: toxicity
+      keywords: [badword]          # default: evaluated live as deltas arrive
+    - type: regex
+      patterns: ["(?s)BEGIN.*END"] # spans deltas: check the full text at stream end
+      stream_policy: close
+    - type: content_safety
+      blocked_categories: [violence]
+      stream_policy: "off"         # never evaluated on streaming responses
+```
+
+`close` defers the check to stream end over the accumulated text. Mid-stream bytes have already reached the client by then, so its guarantees are the recorded verdict, the violation metric, and cache denial, not recall of delivered content. `off` skips the guardrail on streaming responses entirely and increments `sbproxy_ai_stream_guardrail_skipped_total` so the coverage gap stays visible. Violations under any policy increment `sbproxy_ai_stream_guardrail_violations_total`.
 
 ### Context-poisoning guardrail
 
