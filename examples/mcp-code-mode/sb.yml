@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # MCP gateway that serves a Cloudflare Code Mode TypeScript module.
 #
 # Any MCP federation origin also serves a typed TypeScript module at

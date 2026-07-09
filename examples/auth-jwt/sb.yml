@@ -15,8 +15,9 @@
 #
 #   # 200 - valid token (header/payload signed with dev-secret-change-me).
 #   # Header  : {"alg":"HS256","typ":"JWT"}
-#   # Payload : {"iss":"https://issuer.local","aud":"sbproxy-demo","sub":"alice"}
-#   TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5sb2NhbCIsImF1ZCI6InNicHJveHktZGVtbyIsInN1YiI6ImFsaWNlIn0.AYI4MIxc70VQ8kxGmAHPJiV5KrYJFzFRZkAJC4ahXUQ'
+#   # Payload : {"iss":"https://issuer.local","aud":"sbproxy-demo","sub":"alice","exp":4102444800}
+#   # exp 4102444800 = 2100-01-01T00:00:00Z (exp is required by default).
+#   TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5sb2NhbCIsImF1ZCI6InNicHJveHktZGVtbyIsInN1YiI6ImFsaWNlIiwiZXhwIjo0MTAyNDQ0ODAwfQ.syTwsoUALYR9V1TQCcdrRzGe1_Oj4IE9mMNeESMTWnQ'
 #   curl -i -H 'Host: jwt.local' -H "Authorization: Bearer $TOKEN" \
 #        http://127.0.0.1:8080/get
 

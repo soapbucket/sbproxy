@@ -42,8 +42,6 @@ An `alpha` metric may be renamed, relabeled, or removed in any release without n
 
 ## Metric catalogue
 
-All metrics below are currently `stable`.
-
 ### HTTP traffic
 
 #### `sbproxy_requests_total`
@@ -114,6 +112,35 @@ The same observations appear as `auth_ms` / `upstream_ttfb_ms` / `response_filte
 
 ---
 
+#### `sbproxy_active_connections`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Stability | **stable** |
+| Description | Current number of active client connections being handled by the proxy. |
+
+**Labels:** none. For the per-origin view use `sbproxy_origin_active_connections{origin}`, the in-flight request gauge per origin.
+
+---
+
+#### `sbproxy_bytes_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **stable** |
+| Description | Total bytes transferred through the proxy. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `origin` | Virtual hostname | `api.example.com` |
+| `direction` | Transfer direction relative to the proxy | `in` (client -> proxy), `out` (proxy -> client) |
+
+---
+
 ### Agent detection
 
 #### `sbproxy_agent_detect_total`
@@ -158,39 +185,6 @@ The same observations appear as `auth_ms` / `upstream_ttfb_ms` / `response_filte
 **Labels:** none.
 
 **Bucket schedule:** `0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01`.
-
----
-
-#### `sbproxy_active_connections`
-
-| Property | Value |
-|---|---|
-| Type | Gauge |
-| Stability | **stable** |
-| Description | Current number of active client connections being handled by the proxy. |
-
-**Labels:**
-
-| Label | Description | Example values |
-|---|---|---|
-| `origin` | Virtual hostname | `api.example.com` |
-
----
-
-#### `sbproxy_bytes_total`
-
-| Property | Value |
-|---|---|
-| Type | Counter |
-| Stability | **stable** |
-| Description | Total bytes transferred through the proxy. |
-
-**Labels:**
-
-| Label | Description | Example values |
-|---|---|---|
-| `origin` | Virtual hostname | `api.example.com` |
-| `direction` | Transfer direction relative to the proxy | `inbound` (client -> proxy), `outbound` (proxy -> client) |
 
 ---
 
@@ -974,7 +968,7 @@ engine-runtime phases land; names may change before they graduate.
 |---|---|
 | Type | Gauge |
 | Stability | **alpha** |
-| Description | GPU utilization fraction (0.0-1.0), per device. This is the signal the `gpu-aware` routing strategy reads. |
+| Description | GPU utilization fraction (0.0-1.0), per device. This gauge carries the utilization signal for observability; the `gpu-aware` routing strategy does not read it directly, it reads a `gpu_utilization` entry in each target's metadata that operators wire up from a scrape or sidecar. |
 
 **Labels:** `device`.
 

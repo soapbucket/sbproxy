@@ -7,12 +7,16 @@
 # balanced; more expensive providers get a higher weight so they only
 # run once cheaper providers are saturated.
 #
-# Three providers are configured here:
-#   - openrouter (weight 1): the cheapest path to a Haiku-class model.
+# Three providers are configured here, all declaring the same logical
+# model (claude-haiku-4-5) so every request can land on any of them;
+# model_map rewrites the logical name to what each upstream serves:
+#   - openrouter (weight 1): the cheapest path to a Haiku-class model,
+#     mapped to anthropic/claude-3-haiku.
 #   - anthropic-haiku (weight 5): direct Anthropic Haiku, slightly
 #     pricier than OpenRouter resale but lower latency.
-#   - anthropic-sonnet (weight 50): direct Anthropic Sonnet, picked
-#     only when both Haiku routes are loaded.
+#   - anthropic-sonnet (weight 50): mapped to claude-sonnet-4-5, so
+#     the spare tier picked when both Haiku routes are loaded serves
+#     the pricier model.
 #
 # Setup:
 #   export ANTHROPIC_API_KEY=sk-ant-...
@@ -53,9 +57,13 @@ origins:
           api_key: ${OPENROUTER_API_KEY}
           weight: 1
           default_model: anthropic/claude-3-haiku
+          # Serves the shared logical model; model_map rewrites it to
+          # the OpenRouter alias on the way out, and the response's
+          # `model` field reports that alias.
           models:
-            - anthropic/claude-3-haiku
-            - anthropic/claude-3.5-sonnet
+            - claude-haiku-4-5
+          model_map:
+            claude-haiku-4-5: anthropic/claude-3-haiku
 
         - name: anthropic-haiku
           provider_type: anthropic
@@ -69,6 +77,11 @@ origins:
           provider_type: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           weight: 50
-          default_model: claude-haiku-4-5
+          default_model: claude-sonnet-4-5
+          # Also serves the shared logical model, upgraded to Sonnet:
+          # the expensive spare tier only runs when the cheap routes
+          # are saturated.
           models:
             - claude-haiku-4-5
+          model_map:
+            claude-haiku-4-5: claude-sonnet-4-5

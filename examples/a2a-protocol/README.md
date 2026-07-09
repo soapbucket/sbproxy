@@ -1,6 +1,6 @@
 # A2A protocol envelope and policy
 
-*Last modified: 2026-05-07*
+*Last modified: 2026-07-09*
 
 ![A2A protocol envelope and policy](../../docs/assets/a2a-protocol.gif)
 
@@ -17,8 +17,9 @@ sbproxy serve -f sb.yml
 ## Try it
 
 ```bash
-# 200 - allowed callee, depth 1, no cycle. The Content-Type signal
-# triggers Google detection and the policy passes.
+# Allowed callee, depth 1, no cycle. The Content-Type signal
+# triggers Google detection and the policy passes the request
+# through to the upstream.
 $ curl -i -H 'Host: a2a.local' \
        -H 'Content-Type: application/a2a+json' \
        -H 'X-A2A-Caller-Agent-Id: agent:caller' \
@@ -26,8 +27,10 @@ $ curl -i -H 'Host: a2a.local' \
        -H 'X-A2A-Task-Id: task-1' \
        -H 'X-A2A-Chain-Depth: 1' \
        http://127.0.0.1:8080/agents/invoke
-HTTP/1.1 200 OK
+HTTP/1.1 404 Not Found
 ```
+
+The 404 comes from the upstream: the echo service at test.sbproxy.dev only implements `/get`, so any `/agents/*` path answers 404, and getting an upstream response at all (instead of a 4xx JSON error from the policy) demonstrates the policy allowed the request.
 
 ```bash
 # 429 - chain depth 7 exceeds the configured limit of 3.
@@ -71,11 +74,13 @@ HTTP/1.1 403 Forbidden
 ```
 
 ```bash
-# 200 via the operator escape hatch. No A2A protocol headers, but
-# the path matches the configured route_glob, so detection still
-# fires and the policy applies.
+# Pass-through via the operator escape hatch. No A2A protocol
+# headers, but the path matches the configured route_glob, so
+# detection still fires and the policy applies. The 404 is again the
+# upstream answering for a path it does not implement; the policy
+# let the request through.
 $ curl -i -H 'Host: a2a.local' http://127.0.0.1:8080/agents/ping
-HTTP/1.1 200 OK
+HTTP/1.1 404 Not Found
 ```
 
 ## When to enable the parser features

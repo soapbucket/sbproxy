@@ -1,5 +1,5 @@
 # Upgrade Guide
-*Last modified: 2026-06-08*
+*Last modified: 2026-07-09*
 
 ## Upgrading between versions
 
@@ -49,9 +49,8 @@ The following per-origin keys are new in v1.0:
 
 #### Migration steps
 
-1. Add `config_version: 1` to the top of your `sb.yml`. Required in v1.0.
-2. If you use `session_config:`, rename it to `session:`. The alias still works but will be removed in a future release.
-3. If you use security headers via flat fields (e.g. `x_frame_options`), move to the `response_modifiers` headers format:
+1. If you use `session_config:`, rename it to `session:`. The alias still works but will be removed in a future release.
+2. If you use security headers via flat fields (e.g. `x_frame_options`), move to the `response_modifiers` headers format:
 
    Before:
    ```yaml
@@ -68,10 +67,12 @@ The following per-origin keys are new in v1.0:
            X-Content-Type-Options: nosniff
    ```
 
-4. Validate the config before deploying:
+3. Validate the config before deploying:
 
    ```bash
-   sbproxy --config sb.yml --validate
+   sbproxy validate sb.yml
    ```
 
-5. Deploy with zero downtime via config hot reload. Send `SIGHUP` to the running process, or use the admin API.
+   The flag form `sbproxy --check -f sb.yml` dispatches to the same handler, which is handy in CI pipelines that only pass flags.
+
+4. Deploy with zero downtime via config hot reload. Send `SIGHUP` to the running process, or use the admin API.

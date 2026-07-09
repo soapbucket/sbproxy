@@ -37,8 +37,51 @@ fn collect_yml_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Dummy values for every environment variable the published examples
+/// interpolate. compile_config leaves an unset `${VAR}` literal (and
+/// hard-errors for admin credentials, WOR-1818), so the sweep exports
+/// placeholders the way a user following each README would.
+fn export_example_env_dummies() {
+    const DUMMIES: &[(&str, &str)] = &[
+        ("OPENAI_API_KEY", "sk-test-dummy-openai"),
+        ("ANTHROPIC_API_KEY", "sk-ant-test-dummy"),
+        ("OPENROUTER_API_KEY", "sk-or-test-dummy"),
+        ("GEMINI_API_KEY", "test-dummy-gemini"),
+        ("GROQ_API_KEY", "gsk-test-dummy"),
+        ("TEAM_FRONTEND_KEY", "team-frontend-dummy"),
+        ("TEAM_DATA_KEY", "team-data-dummy"),
+        ("VAULT_TOKEN_SHARED", "vault-shared-dummy"),
+        ("VAULT_TOKEN_ACME", "vault-acme-dummy"),
+        ("INTERNAL_BEARER_TOKEN", "internal-dummy"),
+        ("BEDROCK_AUTH", "bedrock-dummy"),
+        ("AWS_SESSION_TOKEN", "aws-session-dummy"),
+        ("ADMIN_PASSWORD", "admin-dummy"),
+        (
+            "MERCHANT_ADDRESS",
+            "0x000000000000000000000000000000000000dEaD",
+        ),
+        (
+            "LEDGER_SIGNING_SEED_HEX",
+            "abababababababababababababababababababababababababababababababab",
+        ),
+        ("SB_SEED", "127.0.0.1:7946"),
+        ("SB_NODE_ID", "node-test"),
+        ("SB_ADVERTISE", "127.0.0.1:7946"),
+        (
+            "DIGEST",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+        ("ENV_VAR", "dummy"),
+        ("VAR", "dummy"),
+    ];
+    for (k, v) in DUMMIES {
+        std::env::set_var(k, v);
+    }
+}
+
 #[test]
 fn every_oss_example_compiles() {
+    export_example_env_dummies();
     let root = examples_root();
     if !root.is_dir() {
         eprintln!(

@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-06-08*
+*Last modified: 2026-07-09*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -69,8 +69,8 @@ sbproxy/
                                           payload_limit, replace_strings,
                                           html_to_markdown, sse_chunking, noop
     sbproxy-ai/           - AI gateway: 66 native providers, routing,
-                              guardrails, budget enforcement, key vault,
-                              memory store, MCP federation.
+                              guardrails, budget enforcement, virtual keys,
+                              semantic cache, usage ledger.
     sbproxy-extension/    - Scripting and extension runtimes:
                               cel/       - cel-rust expression evaluation
                               lua/       - mlua + Luau scripting
@@ -112,9 +112,12 @@ sbproxy/
 ```
 
 The dependency graph is enforced by the workspace structure. `sbproxy-plugin` is the public
-API surface and depends only on `sbproxy-config`. Built-in modules depend on
-`sbproxy-plugin`, never on `sbproxy-core`. Third-party plugins built against the published
-`sbproxy-plugin` crate are link-compatible with the binary.
+API surface and sits at the bottom: it depends on no other workspace crate, only on small
+external ones (`inventory`, `serde`, `http`, `bytes`, `arc-swap`). `sbproxy-config` depends
+on `sbproxy-plugin`, not the other way round; its other workspace dependencies are
+`sbproxy-platform` and `sbproxy-observe`. Built-in modules depend on `sbproxy-plugin`,
+never on `sbproxy-core`. Third-party plugins built against the published `sbproxy-plugin`
+crate are link-compatible with the binary.
 
 ---
 
@@ -255,8 +258,9 @@ dereference followed by a virtual or static call.
 
 The `sbproxy-config` crate contains type definitions, serde derives, and the
 compilation step. Its workspace dependencies are limited to `sbproxy-plugin`,
-`sbproxy-httpkit`, and `sbproxy-platform` (for the `KVStore` trait used by `l2_store`).
-It does not pull in Pingora, the module set, or any networking runtime.
+`sbproxy-platform` (messenger configs plus the `KVStore` trait used by `build_l2_store`),
+and `sbproxy-observe`. It does not pull in Pingora, the module set, or any networking
+runtime.
 
 The serde tags in `sbproxy-config` are the canonical field names. When in doubt about a
 YAML field name, read the struct definition, not prose documentation.
@@ -267,16 +271,11 @@ YAML field name, read the struct definition, not prose documentation.
 sb.yml (YAML file or API-delivered bytes)
     |
     v
-serde_yaml::from_str -> ConfigFile { proxy, origins, secrets, ... }
+serde_yaml::from_str -> ConfigFile { proxy, origins, tenants, ... }
                             |
                             v
-           validate_schema()  - Reject unknown fields, type-check.
-                            |
-                            v
-           resolve_secrets()  - Expand ${secret.X} references via the vault.
-                            |
-                            v
-           apply_inheritance() - Parent / child origin merge.
+           env interpolation  - Expand ${VAR} (with shell-style defaults)
+                                in string values.
                             |
                             v
            compile_config()  - For each origin:
@@ -289,6 +288,12 @@ serde_yaml::from_str -> ConfigFile { proxy, origins, secrets, ... }
                               }
                             |
                             v
+           secret resolution  - The binary resolves secret-reference URIs
+                                (secret://, vault://, awssm://, ...) at
+                                boot; a dangling reference fails the load.
+                                The config crate itself stays vault-free.
+                            |
+                            v
            build host_map: bloom filter + HashMap of hostname -> origin index
                             |
                             v
@@ -299,12 +304,11 @@ serde_yaml::from_str -> ConfigFile { proxy, origins, secrets, ... }
                                  against the previous snapshot.
 ```
 
-### Parent/child origin inheritance
-
-Origins can declare a `parent` field that references another origin by name. The child
-inherits all fields from the parent and can override any of them. This is resolved at
-parse time, not at request time. The resulting child config is fully materialized before
-compilation.
+There is no `secrets:` key on `ConfigFile` and no `${secret.X}` interpolation form; secret
+material enters through `${ENV}` interpolation or through the secret-reference URI schemes
+on secret-bearing fields. There is also no parent/child origin inheritance: every origin
+is declared complete, and reuse happens at the YAML layer (anchors) or by generating the
+file.
 
 ### Hot reload
 
@@ -342,13 +346,11 @@ OpenAI-compatible API surface and routes requests to any supported LLM provider.
     |
     v
 +------------------+
-| Router           |  Selects provider and model based on routing strategy.
-|                  |  Strategies: round_robin, weighted, fallback_chain,
-|                  |  random, lowest_latency, least_connections,
-|                  |  cost_optimized, token_rate, sticky.
-|                  |  Context window validation: token count checked against
-|                  |  provider model limits. Oversized requests routed to a
-|                  |  model with a larger context window or rejected.
+| Router           |  Selects provider and model based on routing strategy
+|                  |  (16 strategies; see the table below).
+|                  |  Optional context compression: with
+|                  |  resilience.llm_aware.context_compress on, history is
+|                  |  trimmed to the model's window before dispatch.
 +------------------+
     |
     v
@@ -361,7 +363,7 @@ OpenAI-compatible API surface and routes requests to any supported LLM provider.
     v
 +------------------+
 | Provider         |  Translates normalized request to provider-specific
-|                  |  wire format. Injects API key from vault.
+|                  |  wire format. Injects the configured API key.
 +------------------+
     |
     v
@@ -369,11 +371,11 @@ OpenAI-compatible API surface and routes requests to any supported LLM provider.
     |
     v
 +------------------+
-| Response Handler |  For streaming: SSE proxy with buffered guardrail
-|                  |  evaluation on accumulated chunks. Token usage and
-|                  |  cost updated atomically. Conversation memory written.
-|                  |  For non-streaming: full response passed to post-request
-|                  |  guardrails before returning to client.
+| Response Handler |  For streaming: SSE relay running the streaming-safe
+|                  |  output guardrails per chunk. Token usage and cost
+|                  |  recorded when the stream closes.
+|                  |  For non-streaming: full response passed to every
+|                  |  output guardrail before returning to client.
 +------------------+
     |
     v
@@ -382,10 +384,14 @@ OpenAI-compatible API surface and routes requests to any supported LLM provider.
 
 ### Provider registry
 
-Providers register through the same `inventory` mechanism as actions. Each provider
-implements `sbproxy_ai::providers::Provider`. The provider list is also driven by
-`providers.yaml`, which maps provider names to their base URLs and supported models. Rust
-implementations handle request serialization and response normalization.
+Providers do not use the `inventory` mechanism and there is no per-provider trait to
+implement. The catalog is data: `data/ai_providers.yml` in the `sbproxy-ai` crate maps
+provider names to base URLs, auth header shapes, and aliases, and a gzipped copy is
+embedded in the binary at compile time so a fresh build needs no file on disk. Operators
+can override or extend the catalog at runtime by pointing `proxy.ai_providers_file` at
+their own YAML; the registry is held behind an `ArcSwap` and rebuilt on hot reload.
+Request serialization and response normalization are handled by the shared client plus
+the format translators (Anthropic, Gemini, Bedrock).
 
 66 native providers ship in-tree alongside a native Anthropic
 translator. The `model` field passes straight through to the upstream,
@@ -408,16 +414,24 @@ adapters (Hugging Face TGI, LM Studio, llama.cpp).
 | `least_connections` | Provider with the fewest in-flight requests. |
 | `cost_optimized`    | Lowest score of `connections * 1000 + weight`. Utilization dominates; weight breaks ties in favor of cheaper providers. |
 | `token_rate`        | Provider with the most remaining tokens-per-minute headroom. |
+| `least_token_usage` | Provider with the lowest recorded token throughput. |
+| `prefix_affinity`   | Hash the prompt prefix to a provider so shared-prefix sessions land on the same upstream cache. |
 | `sticky`            | Pin a session key to one provider. Falls back to round robin without a session key. |
 | `race`              | Fan out to every healthy provider in parallel; first non-error response wins, the rest are cancelled. |
+| `peak_ewma`         | Power-of-two-choices over observed latency: sample two eligible providers, route to the recently faster one. |
+| `cascade`           | Tiered dispatch from cheapest to most expensive (provider, model) pairs; a response below the tier's quality threshold retries on the next tier. |
+| `cost_quality`      | Score the prompt's difficulty and route simple prompts to a cheap model, hard prompts to a frontier model, on a `cost_threshold` dial. |
+| `outcome_aware`     | Route on realized cost-per-success; see [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). |
 
 ### Streaming
 
-The SSE proxy reads chunks from the upstream provider and forwards them to the client
-immediately. For guardrail evaluation, the proxy keeps a rolling window of the last N
-tokens. When the stream completes, a final guardrail pass runs against the accumulated
-content. If a violation shows up mid-stream, the proxy injects a stop chunk and closes
-the stream.
+The SSE relay reads chunks from the upstream provider and forwards them to the client
+immediately. On the streaming output path only the streaming-safe guardrails (`regex`,
+`pii`, `schema`, `context_poisoning`) run against each chunk; classifier-style guardrails
+are skipped because partial windows produce unreliable verdicts. Token usage is parsed
+from the stream's terminal frames and recorded against budgets when the stream closes.
+The per-guardrail streaming policy table is in
+[ai-gateway.md](ai-gateway.md#streaming-policy).
 
 ### Streaming cache recorder hook
 
@@ -456,40 +470,41 @@ Tool calls are routed to the registered upstream by name, with optional auth inj
 
 ## 7. Event system
 
-SBproxy uses two event mechanisms with different scopes and semantics.
+There is no single general-purpose event bus on the serving path. What ships is a set of
+narrow, purpose-built channels:
 
-### Internal bus (sbproxy-observe::events)
+### Policy verdict bus
 
-High-throughput, in-process publish/subscribe. Components call
-`events::emit(SystemEvent { ... })`. Subscribers register for specific event type strings.
-Used for:
+Every policy decision emits a `PolicyVerdictEvent` (type defined in
+`sbproxy-observe::events`) onto a bounded `tokio::sync::mpsc` channel in
+`sbproxy-core::policy_bus` (capacity 10,000). The hot path finishes as soon as the event
+is enqueued; a downstream consumer drains it asynchronously. In OSS the consumer writes
+JSON lines to stderr; the enterprise build replaces it with a NATS-backed audit-chain
+consumer. On overflow the dispatcher drops the event, increments
+`sbproxy_policy_audit_events_dropped_total{tenant}`, and continues; the hot path never
+blocks on the bus.
 
-- Circuit breaker state transitions.
-- Config hot-reload completion.
-- Buffer overflow warnings.
-- Rate limit threshold crossings.
-- Workspace quota alerts.
+### Tracing channels
 
-Events carry a `workspace_id` field. Per-workspace bounded queues (backed by
-`sbproxy-platform::messenger` with a 10k-entry cap) prevent one active workspace from
-starving event delivery to others. The bus is implemented over tokio broadcast channels
-plus per-subscriber filter predicates.
+Structured operator-facing streams (the access log, request events, and the config and
+security audit channels) are emitted as `tracing` events on dedicated targets, so the
+logging pipeline routes them like any other log output. The audit channels are documented
+in [audit-log.md](audit-log.md).
 
-### Public bus
+### Webhook callbacks
 
-The `EventBus` trait is exposed to external consumers via the embedding API. The default
-implementation is a no-op. Three built-in subscriber types ship with the binary:
+Per-origin `on_request` / `on_response` callbacks POST a JSON envelope to an operator URL,
+with optional HMAC signing via a per-entry `secret`, a timeout, and an error policy. This
+is the shipped push mechanism for request lifecycle events; the envelope and signing are
+specified in [configuration.md](configuration.md#webhook-envelope-and-signing).
 
-- log subscriber: writes events as structured JSON via `tracing`.
-- webhook subscriber: POSTs event payloads to a configurable HTTPS endpoint with HMAC
-  signing.
-- prometheus subscriber: increments labeled counters for each event type.
+### Embedder bus (library only)
 
-### Event filtering
-
-Subscribers declare a filter predicate at registration time. The bus evaluates predicates
-before delivering the event, so filtered subscribers never receive irrelevant events. The
-filter is evaluated inline (no spawn per delivery in the common case).
+`sbproxy-observe::events` also defines an `EventBus` with a closed `EventType` enum
+(`request_started`, `budget_exceeded`, `config_reloaded`, ...) and synchronous
+per-event-type handler fan-out. The shipped binary does not publish to it; it is a seam
+for code-level embedders building on the workspace crates. See [events.md](events.md) for
+the event shapes and subscription API.
 
 ---
 
@@ -518,8 +533,8 @@ Configurable per origin:
 | `memcached` | Distributed cache via memcached protocol. |
 | `redis`   | Shared cache across multiple proxy instances. Requires Redis 6+. JSON serialization with TTL. Circuit breaker on Redis failures. |
 
-The `Cacher` trait is the pluggable surface; new backends are added without touching the
-pipeline.
+The `CacheStore` trait (in `sbproxy-cache::store`) is the pluggable surface; new backends
+are added without touching the pipeline.
 
 ### Object cache
 
@@ -529,9 +544,11 @@ LRU eviction policy are configured independently.
 
 ### Cache key partitioning
 
-Keys are namespaced as `workspace_id:config_id:hostname:signature`. This prevents
-cross-tenant collisions when multiple origins share a backend store. A test-mode fallback
-omits the workspace and config prefix for isolation in unit tests.
+Response cache keys are built as
+`workspace:hostname:method:path:canonical_query:vary_fp`, where `canonical_query` is the
+query string canonicalised under the origin's query mode and `vary_fp` is a fingerprint of
+the configured `vary` header values. The leading workspace segment prevents cross-tenant
+collisions when multiple origins share a backend store.
 
 ---
 
@@ -542,24 +559,22 @@ and structured logging via `tracing`.
 
 ### Prometheus metrics
 
-When `telemetry.bind_port` is configured, SBproxy runs a dedicated HTTP server that exposes
-a `/metrics` endpoint in Prometheus exposition format. Metric names share a single
-`sbproxy_*` namespace. Core HTTP counters include `sbproxy_requests_total`,
-`sbproxy_request_duration_seconds`, `sbproxy_errors_total`, and
-`sbproxy_active_connections`. AI gateway metrics carry `sbproxy_ai_*`. Per-origin
-breakdowns use `sbproxy_origin_*` variants. Auth, policy, cache, and circuit breaker
-counters follow the same convention.
+SBproxy serves `/metrics` in Prometheus exposition format on the proxy listener itself,
+and on the admin listener when the admin API is enabled; there is no separate
+`telemetry.bind_port` key or dedicated metrics server. Metric names share a single
+`sbproxy_*` namespace. Core HTTP counters include `sbproxy_requests_total` and
+`sbproxy_request_duration_seconds`. AI gateway metrics carry `sbproxy_ai_*`. Auth, policy,
+cache, and circuit breaker counters follow the same convention; the full stable list is in
+[metrics-stability.md](metrics-stability.md).
 
-### Grafana dashboards
+### Grafana dashboards and alert rules
 
-Two Grafana dashboards ship in `crates/sbproxy-observe/dashboards/`:
-
-- `proxy-overview.json` - Request rates, latency, active connections,
-  cache hit ratio, error breakdown.
-- `mesh-overview.json` - Per-origin and per-edge topology view.
-
-Pre-built Prometheus alert rules are not bundled today; build your own
-against the `sbproxy_*` metric names.
+The repo-root `dashboards/` directory ships Grafana dashboards under `dashboards/grafana/`
+(overview, origins, security, policy verdicts, AI gateway, AI value, bot traffic, model
+host, judge backend) plus Prometheus recording rules and alerts under
+`dashboards/prometheus/` (`recording-rules.yml`, `alerts.yml`), including per-tenant and
+per-credential spend alerts. Two additional dashboards (`proxy-overview.json`,
+`mesh-overview.json`) live in `crates/sbproxy-observe/dashboards/`.
 
 ### Structured logging
 
@@ -572,9 +587,11 @@ the macro arguments are eliminated rather than evaluated and filtered at runtime
 Distributed tracing extracts W3C Trace Context (`traceparent` / `tracestate`)
 and B3 single / multi-header formats, generates a child span ID for each
 upstream call, and echoes the propagation headers back to the downstream
-client. Full OTLP export to an external collector is wireframed in
-`sbproxy-observe::export::otlp_grpc` but not yet shipped; the runtime
-emits structured logs and Prometheus counters today.
+client. OTLP export is shipped and wired: configure the
+`proxy.observability.telemetry` block (endpoint, transport, sampling) and the
+binary initialises the OTLP trace and metrics pipelines at startup via
+`sbproxy-observe::telemetry`. An OTLP logs sink is also available for shipping
+structured logs to the same collector. See [observability.md](observability.md).
 
 ---
 
@@ -736,9 +753,10 @@ production-tested at Cloudflare scale; SBproxy inherits its IO model directly.
 
 ### DNS cache
 
-`sbproxy-platform::dns` wraps the system resolver with an LRU cache. Cache entries are
-keyed by hostname and carry a configurable TTL (default: 30 seconds). Lookups are O(1).
-Eviction uses a doubly-linked list to maintain LRU order without O(n) scans. This matters
+`sbproxy-platform::dns` provides a `DnsCache`: a `DashMap` keyed by hostname whose entries
+carry a configurable TTL and a bounded maximum entry count, so lookups are lock-striped
+O(1) reads with lazy expiry. A `RefreshingResolver` layers proactive re-resolution on top
+so hot hostnames stay warm instead of taking a miss when their TTL lapses. This matters
 most for AI proxy routes, which resolve provider hostnames on every request.
 
 ### Bloom filter for hostname pre-check
@@ -772,9 +790,11 @@ without acquiring any lock or making any network call.
 
 ### Compiler optimizations
 
-Release builds use `lto = "fat"`, `codegen-units = 1`, and `panic = "abort"`. mimalloc
-replaces the system allocator. `tracing`'s `release_max_level_info` feature compile-strips
-all debug and trace logging from the binary.
+Release builds use `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, and
+`strip = "symbols"`; the release profile keeps the default unwinding panic runtime rather
+than `panic = "abort"`. mimalloc replaces the system allocator. `tracing`'s
+`release_max_level_info` feature compile-strips all debug and trace logging from the
+binary.
 
 ### Observed overhead
 

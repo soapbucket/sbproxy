@@ -1,6 +1,6 @@
 # Page Shield
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Page Shield](../../docs/assets/page-shield.gif)
 
@@ -32,10 +32,13 @@ curl -i -X POST http://127.0.0.1:8080/__sbproxy/csp-report \
 # HTTP/1.1 204 No Content
 ```
 
+The structured report event appears in the output of the single foreground `sbproxy serve` process from the Run step, under the `sbproxy::page_shield` tracing target. To filter as it streams, start the Run step piped through grep instead:
+
 ```bash
-# Tail the proxy logs to see the structured report event.
 sbproxy serve -f sb.yml 2>&1 | grep sbproxy::page_shield
 ```
+
+There is no second proxy instance; the intake and the logs live in the one process.
 
 ## What this exercises
 

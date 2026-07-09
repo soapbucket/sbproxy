@@ -2,7 +2,9 @@ services:
   sbproxy:
     build:
       context: ..
-      dockerfile: Dockerfile
+      # The repo ships Dockerfile.ci and Dockerfile.cloudbuild only;
+      # cloudbuild is the runnable release image.
+      dockerfile: Dockerfile.cloudbuild
     ports:
       - "8080:8080"
       - "8443:8443"

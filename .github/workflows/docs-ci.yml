@@ -18,10 +18,13 @@ name: docs-ci
 on:
   pull_request:
     paths:
-      - 'sbproxy-rust/docs/**'
-      - 'sbproxy-enterprise/docs/**'
+      # The docs live at the repo root's docs/; the old sbproxy-rust/
+      # prefix predates the repo split and matched nothing, so this
+      # workflow never fired on doc changes.
+      - 'docs/**'
       - 'scripts/docs-ci.sh'
       - 'scripts/check-spec-citations.sh'
+      - 'scripts/regen-llms-full.sh'
       - '.lycheeignore'
       - '.github/workflows/docs-ci.yml'
 
@@ -95,3 +98,9 @@ jobs:
       # the 2026-05-15 Public RFCs audit before they ship.
       - name: spec citation hygiene
         run: bash scripts/check-spec-citations.sh
+
+      # WOR-1826: docs/llms-full.txt is generated from docs/*.md; fail
+      # the PR when a doc change ships without regenerating it, so the
+      # corpus AI tools fetch never drifts from the docs users read.
+      - name: llms-full.txt is current
+        run: ./scripts/regen-llms-full.sh --check

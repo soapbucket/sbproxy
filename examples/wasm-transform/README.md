@@ -8,11 +8,13 @@ Demonstrates the `wasm` response-body transform. The upstream response body is p
 
 ## Run
 
+From the repository root:
+
 ```bash
-sbproxy serve -f sb.yml
+make run CONFIG=examples/wasm-transform/sb.yml
 ```
 
-The pre-built `echo.wasm` module is checked in at `examples/wasm/echo-rust/echo.wasm`. The path in `module_path` is resolved relative to the working directory the proxy is started from; use an absolute path in production.
+Run it from the repo root because the config's `module_path` (`examples/wasm/echo-rust/echo.wasm`) is resolved relative to the working directory the proxy is started from; use an absolute path in production.
 
 ## Try it
 

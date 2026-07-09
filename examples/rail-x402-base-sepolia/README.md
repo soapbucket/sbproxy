@@ -1,5 +1,5 @@
 # x402 billing rail on Base Sepolia (USDC)
-*Last modified: 2026-05-02*
+*Last modified: 2026-07-09*
 
 x402 v2 paywall in front of an article origin, wired against a local
 mock x402 facilitator so the example runs end-to-end without touching
@@ -53,9 +53,8 @@ publishes the verifying half at the admin endpoint
 `/.well-known/sbproxy/quote-keys.json` (see
 `examples/quote-token-replay-jwks/` for the JWKS demo).
 
-Per A3.1 () the proxy emits the
-multi-rail 402 body whenever the agent opts in via either the
-`Accept-Payment: x402` header or the `Accept:
+The proxy emits the multi-rail 402 body whenever the agent opts in
+via either the `Accept-Payment: x402` header or the `Accept:
 application/x402+json` MIME type. Legacy crawlers that send neither
 get the Wave 1 single-rail `Crawler-Payment` body so they keep
 working unchanged.
@@ -179,7 +178,7 @@ authorization. The end-to-end loop the README walks through is:
    forwards.
 
 For a full walkthrough against the live Base Sepolia facilitator,
-see `docs/billing-rails.md` (operator-facing billing docs).
+see `docs/ai-crawl-control.md` (operator-facing billing docs).
 
 ## Simulating reorgs
 
@@ -203,14 +202,32 @@ The companion file `sb-testnet.yml` keeps everything except the
 facilitator URL, the merchant `pay_to`, and the quote-token signing
 key as-is. Three operator steps to flip:
 
+First, create `.env.testnet` next to `docker-compose.yml`. The two
+variables feed the `${MERCHANT_ADDRESS}` interpolation and the
+`secret_ref.env` lookup in `sb-testnet.yml`. The values below are
+placeholders; replace both before running:
+
 ```bash
-export MERCHANT_ADDRESS=0xYOUR_BASE_SEPOLIA_ADDRESS
-export SBPROXY_QUOTE_TOKEN_SEED_HEX=$(openssl rand -hex 32)
+cat > .env.testnet <<'EOF'
+# Merchant receive address on Base Sepolia. FAKE placeholder;
+# replace with your own funded testnet wallet address.
+MERCHANT_ADDRESS=0x1111111111111111111111111111111111111111
+# 32-byte Ed25519 quote-token seed, 64 hex chars. FAKE placeholder;
+# replace with a fresh seed from: openssl rand -hex 32
+SBPROXY_QUOTE_TOKEN_SEED_HEX=2222222222222222222222222222222222222222222222222222222222222222
+EOF
+```
+
+Then bring the stack up with the env file:
+
+```bash
 docker compose --env-file .env.testnet up -d --wait
 ```
 
-Then mount `sb-testnet.yml` at `/etc/sbproxy/sb.yml` (override
-`docker-compose.yml`'s `volumes:` block via a compose override file).
+Then mount `sb-testnet.yml` at `/etc/sbproxy/sb.yml` and pass
+`MERCHANT_ADDRESS` and `SBPROXY_QUOTE_TOKEN_SEED_HEX` into the
+container's `environment:` (override `docker-compose.yml`'s
+`volumes:` and `environment:` blocks via a compose override file).
 The proxy talks to
 `https://facilitator.base-sepolia.x402.org` for verification and
 settlement; the mock container is unused on the testnet path.
@@ -219,7 +236,7 @@ You will need:
 
 - A funded Base Sepolia wallet (the merchant address). USDC test
   faucet: see the LF documentation linked from
-  `docs/billing-rails.md`.
+  `docs/ai-crawl-control.md`.
 - An Ed25519 seed for the quote-token signer. `openssl rand -hex 32`
   produces a usable seed in 64-char hex form.
 - An agent with Base Sepolia signing capability. The reference
@@ -237,13 +254,10 @@ ships the default feature set.
 
 ## Related docs
 
-- `docs/billing-rails.md` - operator-facing billing rails reference.
--  (A3.1) - wire shape of the
-  402 body.
--  (A3.2) - quote-token JWS shape and
-  JWKS publication.
--  - rail / asset / chain
-  mapping used by the multi-rail emission path.
+- `docs/402-challenge.md` - wire shape of the single-rail and
+  multi-rail 402 bodies, including the per-rail quote-token JWS.
+- `docs/ai-crawl-control.md` - configuration reference for the
+  `ai_crawl_control` policy, agent classes, ledger, and tiers.
 - `examples/rail-mpp-stripe-test/` - MPP rail counterpart.
 - `examples/multi-rail-accept-payment/` - both rails wired
   together with q-value negotiation.

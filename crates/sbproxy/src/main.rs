@@ -1160,15 +1160,32 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
     let path_str = path.to_string_lossy().into_owned();
     let json = matches!(args.format, OutputFormat::Json);
 
-    // Read + compile. The read and compile failures are the two
-    // "invalid config" outcomes; in JSON mode they are reported as
-    // `{"valid": false, ...}` with exit 2 rather than propagated.
+    // Read + compile + construct. Read and compile failures are the
+    // classic "invalid config" outcomes; in JSON mode they are reported
+    // as `{"valid": false, ...}` with exit 2 rather than propagated.
+    //
+    // WOR-1815: `compile_config` alone is not what boot runs. The
+    // per-origin module constructors (`CompiledPipeline::from_config`,
+    // the same call the server and the reload path make) hold the deep
+    // semantic checks: a provider that sets both `serve:` and
+    // `base_url:`, a policy field typo inside an opaque `policies:`
+    // blob, an unknown transform type. A config that passes only
+    // `compile_config` can still refuse to boot, so validate runs the
+    // full construction and throws the pipeline away. Outside a Tokio
+    // runtime (this subcommand) construction spawns nothing.
     let outcome = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))
         .and_then(|yaml| {
-            sbproxy_config::compile_config(&yaml)
+            let compiled = sbproxy_config::compile_config(&yaml)
+                .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
+            sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
                 .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "config '{path_str}' compiled, but a module failed to construct \
+                         (this would fail at boot):\n{e:#}"
+                    )
+                })
         });
 
     match (json, outcome) {
@@ -2263,14 +2280,39 @@ fn lookup_projection<'a>(
 /// "diff operates over the raw `ConfigFile`" rule), so we re-parse the
 /// file with `serde_yaml::from_str` after `compile_config` has signed
 /// it off.
-fn load_and_validate(path: &std::path::Path) -> anyhow::Result<sbproxy_config::ConfigFile> {
+fn load_and_validate(
+    path: &std::path::Path,
+) -> anyhow::Result<(sbproxy_config::ConfigFile, Option<String>)> {
     let path_str = path.to_string_lossy();
     let yaml = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))?;
-    sbproxy_config::compile_config(&yaml)
+    let compiled = sbproxy_config::compile_config(&yaml)
         .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
-    serde_yaml::from_str::<sbproxy_config::ConfigFile>(&yaml)
-        .map_err(|e| anyhow::anyhow!("failed to parse '{path_str}' as ConfigFile: {e}"))
+    // WOR-1815: run the boot-time module constructors too, so `plan`
+    // and `apply` catch a config that compiles but cannot boot. The
+    // error is returned as data rather than an abort so the callers
+    // can fold it into their findings report: `plan` renders it next
+    // to the other semantic findings and exits 3, the same channel
+    // the validate-rule findings use.
+    let construction_error = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
+        .err()
+        .map(|e| format!("{e:#}"));
+    let config = serde_yaml::from_str::<sbproxy_config::ConfigFile>(&yaml)
+        .map_err(|e| anyhow::anyhow!("failed to parse '{path_str}' as ConfigFile: {e}"))?;
+    Ok((config, construction_error))
+}
+
+/// Fold a boot-time construction failure into a plan report as an
+/// error-severity finding, so `plan` and `apply` surface it through
+/// the same findings channel (and exit code 3) as the semantic
+/// validation rules.
+fn push_construction_finding(report: &mut sbproxy_config::PlanReport, message: &str) {
+    report.findings.push(sbproxy_config::PlanFinding {
+        severity: sbproxy_config::Severity::Error,
+        rule_id: "module-construction".to_string(),
+        path: "origins".to_string(),
+        message: format!("a module failed to construct (this would fail at boot): {message}"),
+    });
 }
 
 /// Empty baseline used when `--against` is not supplied. Mirrors the
@@ -2286,17 +2328,23 @@ fn empty_config_file() -> sbproxy_config::ConfigFile {
 /// when `--against` is absent.
 fn load_plan_inputs(
     args: &PlanArgs,
-) -> anyhow::Result<(sbproxy_config::ConfigFile, sbproxy_config::ConfigFile)> {
+) -> anyhow::Result<(
+    sbproxy_config::ConfigFile,
+    sbproxy_config::ConfigFile,
+    Option<String>,
+)> {
     let config = args
         .config
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing -f / --config"))?;
-    let proposed = load_and_validate(config)?;
+    let (proposed, construction_error) = load_and_validate(config)?;
+    // The baseline is the operator's current state; only the proposed
+    // side's construction result gates the plan.
     let baseline = match args.against.as_deref() {
-        Some(p) => load_and_validate(p)?,
+        Some(p) => load_and_validate(p)?.0,
         None => empty_config_file(),
     };
-    Ok((baseline, proposed))
+    Ok((baseline, proposed, construction_error))
 }
 
 /// Diff `baseline` vs `proposed` and fold in the repo's `listings/*.yaml`
@@ -2388,12 +2436,15 @@ fn plan_exit_code(report: &sbproxy_config::PlanReport) -> i32 {
 }
 
 fn handle_plan_subcommand(args: &PlanArgs) -> anyhow::Result<i32> {
-    let (baseline, proposed) = load_plan_inputs(args)?;
+    let (baseline, proposed, construction_error) = load_plan_inputs(args)?;
     let config_path = args
         .config
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing -f / --config"))?;
-    let report = collect_plan_findings(config_path, &baseline, &proposed);
+    let mut report = collect_plan_findings(config_path, &baseline, &proposed);
+    if let Some(msg) = construction_error.as_deref() {
+        push_construction_finding(&mut report, msg);
+    }
     render_and_write_plan(&report, args, &baseline)?;
     Ok(plan_exit_code(&report))
 }
@@ -2462,9 +2513,12 @@ fn handle_apply_from_yaml(yaml_path: &std::path::Path) -> anyhow::Result<i32> {
     };
 
     // Validate first so apply never half-commits a broken config.
-    let proposed = load_and_validate(yaml_path)?;
+    let (proposed, construction_error) = load_and_validate(yaml_path)?;
     let baseline = empty_config_file();
-    let report = sbproxy_config::plan(&baseline, &proposed);
+    let mut report = sbproxy_config::plan(&baseline, &proposed);
+    if let Some(msg) = construction_error.as_deref() {
+        push_construction_finding(&mut report, msg);
+    }
     if report.has_errors() {
         eprintln!("apply: refusing to apply, semantic validation failed:");
         eprint!("{}", sbproxy_config::render_text(&report));
@@ -2508,14 +2562,14 @@ fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i3
         }
     };
 
-    let proposed = load_and_validate(&yaml_path_buf)?;
+    let (proposed, construction_error) = load_and_validate(&yaml_path_buf)?;
     // Recompute the plan against the same baseline shape as plan
     // time. We do not yet have an admin-socket "live baseline"
     // surface, so the on-disk baseline is "the empty config" by
     // default. The operator can override this with SB_APPLY_BASELINE
     // pointing at a YAML file.
     let baseline = match std::env::var("SB_APPLY_BASELINE").ok() {
-        Some(b) => load_and_validate(std::path::Path::new(&b))?,
+        Some(b) => load_and_validate(std::path::Path::new(&b))?.0,
         None => empty_config_file(),
     };
 
@@ -2529,7 +2583,10 @@ fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i3
         return Ok(5);
     }
 
-    let report = sbproxy_config::plan(&baseline, &proposed);
+    let mut report = sbproxy_config::plan(&baseline, &proposed);
+    if let Some(msg) = construction_error.as_deref() {
+        push_construction_finding(&mut report, msg);
+    }
     if report.has_errors() {
         eprintln!("apply: refusing to apply, semantic validation failed:");
         eprint!("{}", sbproxy_config::render_text(&report));
@@ -3319,7 +3376,8 @@ mod tests {
         let noop = sbproxy_config::plan(&empty_config_file(), &empty_config_file());
         assert_eq!(plan_exit_code(&noop), 0);
         let path = temp_config(MINIMAL_VALID);
-        let proposed = load_and_validate(&path).unwrap();
+        let (proposed, construction_error) = load_and_validate(&path).unwrap();
+        assert!(construction_error.is_none(), "{construction_error:?}");
         let changed = sbproxy_config::plan(&empty_config_file(), &proposed);
         assert_eq!(plan_exit_code(&changed), 2);
         let _ = std::fs::remove_file(&path);

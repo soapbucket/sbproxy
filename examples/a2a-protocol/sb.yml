@@ -29,7 +29,8 @@
 #   make run CONFIG=examples/a2a-protocol/sb.yml
 #
 # Test:
-#   # 200 - allowed callee, depth 1, no cycle
+#   # Allowed callee, depth 1, no cycle - passes through to the
+#   # upstream (which answers 404 for /agents/*; see README.md)
 #   curl -i -H 'Host: a2a.local' \
 #        -H 'Content-Type: application/a2a+json' \
 #        -H 'X-A2A-Caller-Agent-Id: agent:caller' \
@@ -62,7 +63,8 @@
 #        -H 'X-A2A-Chain-Depth: 1' \
 #        http://127.0.0.1:8080/agents/invoke
 #
-#   # 200 - operator route_glob match (no A2A headers, path under /agents)
+#   # Pass-through - operator route_glob match (no A2A headers, path
+#   # under /agents; the upstream itself answers 404)
 #   curl -i -H 'Host: a2a.local' http://127.0.0.1:8080/agents/ping
 
 proxy:

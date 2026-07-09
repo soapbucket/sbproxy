@@ -1,6 +1,6 @@
 # Migration: credentials block
 
-*Last modified: 2026-06-17*
+*Last modified: 2026-07-09*
 
 The legacy `virtual_keys:` YAML array under `origins[].action.providers` is no longer supported. The canonical replacement is the unified `credentials:` block, configurable at proxy, tenant, or origin scope.
 
@@ -23,7 +23,7 @@ Walk each origin's `action.providers[*].virtual_keys` array. Rewrite each entry 
 | `allowed_models` | `models.allow` |
 | `blocked_models` | `models.deny` |
 | `max_requests_per_minute` | `policies: [{ type: rate_limit, rpm: <n> }]` |
-| `max_tokens_per_minute` | `policies: [{ type: rate_limit, tpm: <n> }]` |
+| `max_tokens_per_minute` | drop; per-key tokens-per-minute caps are not supported. The rate_limit policy only takes `rpm`. The nearest substitute is a total-token ceiling via `attrs.budget.max_tokens`. |
 | `budget` | `attrs.budget` |
 | `tags` | `attrs.tags` |
 | `project` | `attrs.project` |
@@ -88,8 +88,9 @@ origins:
         policies:
           - type: rate_limit
             rpm: 30
-            tpm: 60000
 ```
+
+The legacy `max_tokens_per_minute: 60000` has no equivalent and is dropped; if the key needs a token ceiling, use `attrs.budget.max_tokens`.
 
 Behaviour is identical at runtime: the compile-time lowering materialises the credentials of type `ai_provider` as entries in the legacy `VirtualKeyConfig` registry the AI dispatch already reads. Existing access-log columns (`project`, `user`, `metadata`) and per-credential attribution metrics keep populating from the unified `Principal` write.
 
@@ -156,7 +157,7 @@ HashiCorp Vault owns `vault://` after the migration, so a HashiCorp reference sh
 vault://primary/secret/data/openai-prod?key=api_key
 ```
 
-The legacy `vault://<alias>/...` forms are accepted with a warning during the compatibility window. The shim is scheduled for removal in SBproxy `1.2.0`. Rewrite known aliases with:
+The legacy `vault://<alias>/...` forms are still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced. Rewrite known aliases with:
 
 ```bash
 sbproxy config migrate sb.yml --out sb.migrated.yml

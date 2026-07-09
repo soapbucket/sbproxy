@@ -1,5 +1,5 @@
 # Frequently asked questions
-*Last modified: 2026-06-08*
+*Last modified: 2026-07-09*
 
 Quick answers to the questions operators hit most often when standing up SBproxy, picking between OSS and enterprise, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
 
@@ -52,7 +52,7 @@ Everything in this repo:
 * The AI gateway: 66 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
 * Every auth provider (API key, Basic, Bearer, JWT, Digest, forward-auth, Web Bot Auth, CAP, OIDC).
 * Every policy (rate limit, WAF, IP filter, CORS, HSTS, CSRF, agent budget, content digest, BOLA / `object_authz`, ...).
-* Every transform (25 types, including `json`, `template`, `wasm`).
+* Every transform (26 types, including `json`, `template`, `wasm`).
 * Scripting via CEL, Lua, JavaScript, and WebAssembly.
 * The embedded admin server, the access log, the metrics and tracing wiring, the audit log.
 * All examples and dashboards.
@@ -82,7 +82,7 @@ The most common causes, in order:
 2. Trusted-proxy CIDRs are wrong. If SBproxy sits behind another LB, `X-Forwarded-For` headers from outside `proxy.trusted_proxies` are stripped on ingress and the real client IP is the LB. Auth providers that key off the client IP (rate-limit, IP allowlist, OIDC session bind) then see the wrong address.
 3. The auth header was stripped by a transform. `headers_to_forward` on the upstream block is an allowlist; auth headers absent from it never reach the upstream. The proxy still validates them locally, but a downstream that re-validates will see nothing.
 
-The structured access log carries `auth_provider` and `auth_ms` for every request; grep those to localise the failure.
+The structured access log carries `auth_type` and `auth_ms` for every request; grep those to localise the failure.
 
 ### How do I configure OIDC?
 
@@ -126,7 +126,7 @@ The log carries phase timings (`auth_ms`, `upstream_ttfb_ms`, `response_filter_m
 
 ### Where do traces go?
 
-OTLP exporter, configured via `OTEL_EXPORTER_OTLP_ENDPOINT`. The reference Compose stack at `examples/observability-stack/` runs an OTel Collector with Tempo, Grafana, Phoenix, and Langfuse for local development.
+OTLP exporter, configured via `proxy.observability.telemetry.endpoint` in `sb.yml`. The value supports `${ENV_VAR}` interpolation, so `endpoint: ${OTEL_COLLECTOR_URL}` works. The reference Compose stack at `examples/observability-stack/` runs an OTel Collector with Tempo, Grafana, Phoenix, and Langfuse for local development.
 
 ## Performance + capacity
 
@@ -136,13 +136,13 @@ Sub-millisecond p99 at 50k+ rps on commodity hardware for plain proxy paths; AI 
 
 ### How do I tune SBproxy for high concurrency?
 
-`performance.md` has the operator-facing tuning guide. The two settings that move the needle: `proxy.workers` (defaults to `num_cpus`) and the connection pool sizes per upstream.
+`performance.md` has the operator-facing tuning guide. The two settings that move the needle: the `SB_WORKER_THREADS` environment variable (defaults to the detected CPU parallelism, which honours cgroup quotas on Linux) and the connection pool sizes per upstream.
 
 ## Configuration patterns
 
 ### Where are the examples?
 
-`examples/` in this repo, indexed in `examples/README.md`. 119 examples on disk; pick the one closest to your scenario, copy `sb.yml`, and edit from there. Every example validates against the schema and ships with a README plus runnable curl commands.
+`examples/` in this repo, indexed in `examples/README.md`. 166 examples on disk; pick the one closest to your scenario, copy `sb.yml`, and edit from there. Every example validates against the schema and ships with a README plus runnable curl commands.
 
 ### How do I run an example against my local SBproxy?
 

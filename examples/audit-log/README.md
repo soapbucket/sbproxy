@@ -1,6 +1,6 @@
 # audit-log
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-09*
 
 Every state-mutating admin call emits a typed `AdminAuditEvent`
 envelope on the structured-log stream. Pair this example with the
@@ -96,7 +96,6 @@ sink is the breadcrumb path your shipper picks up.
 | `curl` | What it audits |
 |---|---|
 | `POST -u admin:demo /admin/reload` | Config reload (the example above) |
-| `POST -u admin:demo /admin/drain` | Connection drain on shutdown |
 | `POST -u admin:demo /admin/log-level?level=debug` | Log-level change (where supported) |
 
 See [`docs/admin-api-reference.md`](../../docs/admin-api-reference.md)

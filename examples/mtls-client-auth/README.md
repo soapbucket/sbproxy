@@ -6,9 +6,12 @@ Demonstrates mutual TLS at the listener. Incoming HTTPS clients must present a c
 
 ## Run
 
+Both commands run from the repository root; the config's cert paths
+are relative to it.
+
 ```bash
 bash examples/mtls-client-auth/generate-certs.sh
-sbproxy serve -f sb.yml
+make run CONFIG=examples/mtls-client-auth/sb.yml
 ```
 
 The bootstrap script writes a self-signed CA, a server cert (CN=localhost, SAN includes 127.0.0.1), and a client cert (CN=alice@example.com, SAN includes alice.local) into `examples/mtls-client-auth/certs/`. Re-run it whenever the certs expire (one year by default).

@@ -192,7 +192,10 @@ pub fn extract_type(value: &serde_json::Value) -> Result<String> {
 
 /// Interpolate `${VAR_NAME}` patterns in a string with environment variables.
 ///
-/// Unresolvable variables are left as-is (literal `${...}` in the output).
+/// `${VAR:-default}` takes the shell meaning: the variable's value when it
+/// is set and non-empty, the literal default otherwise. Unresolvable
+/// variables without a default are left as-is (literal `${...}` in the
+/// output), which `scan_yaml_hazards` reports after parsing.
 fn interpolate_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -211,14 +214,23 @@ fn interpolate_env_vars(input: &str) -> String {
                     var_name.push(c);
                 }
                 if found_close && !var_name.is_empty() {
-                    match std::env::var(&var_name) {
-                        Ok(val) => result.push_str(&val),
-                        Err(_) => {
-                            // Leave unresolved variable as literal.
-                            result.push_str("${");
-                            result.push_str(&var_name);
-                            result.push('}');
-                        }
+                    // `${VAR:-default}`: shell semantics, default wins
+                    // when the variable is unset or empty.
+                    let (name, default) = match var_name.split_once(":-") {
+                        Some((n, d)) => (n, Some(d)),
+                        None => (var_name.as_str(), None),
+                    };
+                    match std::env::var(name) {
+                        Ok(val) if !val.is_empty() => result.push_str(&val),
+                        _ => match default {
+                            Some(d) => result.push_str(d),
+                            None => {
+                                // Leave unresolved variable as literal.
+                                result.push_str("${");
+                                result.push_str(&var_name);
+                                result.push('}');
+                            }
+                        },
                     }
                 } else {
                     result.push_str("${");
@@ -235,6 +247,94 @@ fn interpolate_env_vars(input: &str) -> String {
         }
     }
     result
+}
+
+/// Pre-parse hazard scan: reject custom YAML tags, report unresolved
+/// `${VAR}` references.
+///
+/// Tags: serde_yaml resolves standard tags and silently strips unknown
+/// ones, keeping the bare scalar. `password: !env ADMIN_PASSWORD`
+/// therefore parses to the LITERAL string `ADMIN_PASSWORD`: the operator
+/// believes the value comes from the environment while it is actually a
+/// constant, which for credential fields is a published-password bug. No
+/// supported config form uses tags, so any tag fails the compile with a
+/// pointer at the `${VAR}` interpolation form.
+///
+/// Unresolved references: env interpolation leaves an unset `${VAR}` as
+/// the literal text (WOR-1818). The scan runs over the PARSED value tree
+/// (comments are gone by then) and returns `path: ${VAR}` pairs for the
+/// caller to warn about; credential fields upgrade the warning to a hard
+/// error at their typed checks.
+fn scan_yaml_hazards(yaml: &str) -> Result<Vec<String>> {
+    fn unresolved_refs_in(s: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = s;
+        while let Some(start) = rest.find("${") {
+            let tail = &rest[start..];
+            match tail.find('}') {
+                Some(end) => {
+                    out.push(&tail[..=end]);
+                    rest = &tail[end + 1..];
+                }
+                None => break,
+            }
+        }
+        out
+    }
+    fn walk(
+        value: &serde_yaml::Value,
+        path: &str,
+        tags: &mut Vec<String>,
+        unresolved: &mut Vec<String>,
+    ) {
+        match value {
+            serde_yaml::Value::Tagged(tagged) => {
+                let shown = if path.is_empty() { "<root>" } else { path };
+                tags.push(format!("{shown}: {}", tagged.tag));
+                walk(&tagged.value, path, tags, unresolved);
+            }
+            serde_yaml::Value::String(s) => {
+                for r in unresolved_refs_in(s) {
+                    unresolved.push(format!("{path}: {r}"));
+                }
+            }
+            serde_yaml::Value::Mapping(map) => {
+                for (k, v) in map {
+                    let key = k.as_str().map(str::to_owned).unwrap_or_else(|| "?".into());
+                    let child = if path.is_empty() {
+                        key
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(v, &child, tags, unresolved);
+                }
+            }
+            serde_yaml::Value::Sequence(seq) => {
+                for (i, v) in seq.iter().enumerate() {
+                    walk(v, &format!("{path}.{i}"), tags, unresolved);
+                }
+            }
+            _ => {}
+        }
+    }
+    // A file that fails to parse at all is reported by the main typed
+    // parse with better context; only inspect hazards when parsing works.
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return Ok(Vec::new());
+    };
+    let mut tags = Vec::new();
+    let mut unresolved = Vec::new();
+    walk(&root, "", &mut tags, &mut unresolved);
+    if !tags.is_empty() {
+        anyhow::bail!(
+            "config compile: unsupported YAML tag(s): {}. Tags are silently stripped by \
+             the parser, so the value would be the literal text after the tag (for \
+             `password: !env ADMIN_PASSWORD` the password becomes the string \
+             \"ADMIN_PASSWORD\"). Use `${{VAR}}` interpolation instead.",
+            tags.join(", ")
+        );
+    }
+    Ok(unresolved)
 }
 
 /// Recursively walk a JSON value and replace `{{vars.X}}` and `{{env.X}}`
@@ -778,6 +878,11 @@ fn validate_custom_log_fields(fields: &[crate::CustomLogFieldConfig]) -> Result<
 pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // Interpolate environment variables before parsing YAML.
     let yaml = interpolate_env_vars(yaml);
+    // Custom YAML tags are stripped by the parser, turning `!env VAR`
+    // into the literal string `VAR`; reject them before anything else
+    // reads the file. Unresolved `${VAR}` references are collected here
+    // and reported after the typed parse below.
+    let unresolved_env_refs = scan_yaml_hazards(&yaml)?;
     // Wave 5 day-6 Item 2: lift legacy `features.anomaly_detection`,
     // `features.reputation`, and `features.tls_fingerprint` blocks
     // into the canonical `proxy.extensions[...]` shape the bootstrap
@@ -845,6 +950,33 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              the origin's `extensions:`).",
             nested_unknowns.join(", ")
         );
+    }
+
+    // WOR-1818: report interpolation leftovers. An unset `${VAR}` stays
+    // literal, which for most fields degrades into a confusing runtime
+    // failure. Warn once, listing every remaining reference with its
+    // path; the admin credentials upgrade to a hard error because a
+    // literal `${ADMIN_PASSWORD}` login string defeats the operator's
+    // intent while still "working".
+    if !unresolved_env_refs.is_empty() {
+        tracing::warn!(
+            refs = %unresolved_env_refs.join(", "),
+            "config: unresolved ${{VAR}} reference(s) left as literal text; export the \
+             variable(s) before starting, or remove the reference"
+        );
+    }
+    if let Some(admin) = &config_file.proxy.admin {
+        if admin.enabled {
+            for (field, value) in [("password", &admin.password), ("username", &admin.username)] {
+                if value.contains("${") {
+                    anyhow::bail!(
+                        "proxy.admin.{field} contains the unresolved reference `{value}`; \
+                         export the environment variable before starting (admin \
+                         credentials must never fall back to literal placeholder text)"
+                    );
+                }
+            }
+        }
     }
 
     if let Some(log) = config_file
@@ -1404,6 +1536,59 @@ mod tests {
             engine: engine.map(str::to_string),
             source: source.map(str::to_string),
         }
+    }
+
+    // WOR-1818: `${VAR:-default}` resolves with shell semantics.
+    #[test]
+    fn env_interpolation_supports_shell_defaults() {
+        std::env::remove_var("SBPROXY_TEST_UNSET_XYZ");
+        std::env::set_var("SBPROXY_TEST_SET_XYZ", "live");
+        assert_eq!(
+            interpolate_env_vars("a ${SBPROXY_TEST_UNSET_XYZ:-fallback} b"),
+            "a fallback b"
+        );
+        assert_eq!(
+            interpolate_env_vars("a ${SBPROXY_TEST_SET_XYZ:-fallback} b"),
+            "a live b"
+        );
+        // No default: unresolved stays literal for the hazard scan.
+        assert_eq!(
+            interpolate_env_vars("a ${SBPROXY_TEST_UNSET_XYZ} b"),
+            "a ${SBPROXY_TEST_UNSET_XYZ} b"
+        );
+    }
+
+    // WOR-1817: custom YAML tags are stripped by the parser, so
+    // `password: !env ADMIN_PASSWORD` silently becomes the literal
+    // string "ADMIN_PASSWORD". Any tag must fail the compile with a
+    // pointer at ${VAR} interpolation.
+    #[test]
+    fn unknown_yaml_tag_fails_compile() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    username: admin
+    password: !env ADMIN_PASSWORD
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("custom YAML tag must fail compile");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("!env") && msg.contains("${VAR}"),
+            "error must name the tag and point at interpolation: {msg}"
+        );
+        assert!(
+            msg.contains("proxy.admin.password"),
+            "error must locate the tagged value: {msg}"
+        );
     }
 
     // WOR-1140: unknown-config-key handling.

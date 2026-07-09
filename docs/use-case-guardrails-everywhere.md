@@ -1,6 +1,6 @@
 # Guardrails on every prompt, local or hosted
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 ![One guardrail mesh blocking an injection aimed at a local model and redacting PII bound for a hosted one](assets/use-case-guardrails-everywhere.gif)
 
@@ -72,7 +72,7 @@ origins:
             - llama3.1
 ```
 
-Two lanes, one origin. Before any routing strategy runs, the proxy narrows the candidates to providers whose `models` list declares the requested model, so `gpt-4o-mini` goes to OpenAI and `llama3.1` goes to the box under the desk. The `base_url` points at an engine you already run; a loopback URL is rejected at config load as an SSRF risk, and `allow_private_base_url` opts this one provider back in. When the model-host serving path finishes GPU certification you can swap the `ollama` entry for a `serve:` block and have the gateway pull the weights and supervise the engine itself; [model-host.md](model-host.md) carries the phased status, and the example file has the swap as a comment.
+Two lanes, one origin. Before any routing strategy runs, the proxy narrows the candidates to providers whose `models` list declares the requested model, so `gpt-4o-mini` goes to OpenAI and `llama3.1` goes to the box under the desk. The `base_url` points at an engine you already run; a loopback URL is rejected at config load as an SSRF risk, and `allow_private_base_url` opts this one provider back in. On a GPU host (an Apple Silicon Mac counts; the engine runs on Metal there) you can swap the `ollama` entry for a `serve:` block today and have the gateway pull the weights and supervise the engine itself; [model-host.md](model-host.md) is the reference, and the example file has the swap as a comment.
 
 ```yaml
       pii:

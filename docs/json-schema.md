@@ -1,5 +1,5 @@
 # JSON Schema for `sb.yml`
-*Last modified: 2026-06-03*
+*Last modified: 2026-07-09*
 
 SBproxy publishes a JSON Schema describing every field its
 configuration accepts. Editors that understand the schema
@@ -47,8 +47,8 @@ config format; it just teaches the editor what to flag.
   every top-level field the runtime accepts.
 * **Type validation**. Typing a string where the field expects
   an integer underlines red.
-* **Enum hints**. Closed enums (`session.kind: cookie | header`)
-  drop down the allowed values.
+* **Enum hints**. Closed enums (`admin.operators[].role:
+  read_only | admin`) drop down the allowed values.
 * **Inline docs**. The doc comment on every `pub struct` field
   in `types.rs` lands in the schema's `description`, so an
   editor that surfaces tooltips shows the same description the
@@ -83,8 +83,8 @@ order across runs), so the diff is byte-for-byte.
   upgrade to draft-2020-12 is gated on the
   [yaml-language-server's draft-2020-12 PR](https://github.com/redhat-developer/yaml-language-server/pulls)
   shipping a stable release.
-* **`$ref` indirection**. Reusable types (e.g. a `Duration`,
-  an `IpAddrCidr`) appear as `$ref: #/definitions/X` references
+* **`$ref` indirection**. Reusable types (e.g. `PathMatcher`,
+  `HeaderMatcher`) appear as `$ref: #/definitions/X` references
   rather than inlined. Editors resolve these transparently;
   tools that diff the schema across versions can use
   [json-schema-diff](https://github.com/Stranger6667/jsonschema)

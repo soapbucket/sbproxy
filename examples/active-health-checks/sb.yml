@@ -19,7 +19,7 @@
 #
 # Test:
 #   curl -H 'Host: localhost' http://127.0.0.1:8080/get
-#   # While both targets respond 2xx on /healthz, traffic alternates
+#   # While both targets respond 2xx on /status/200, traffic alternates
 #   # between them. Take one down: after 3 consecutive failed probes
 #   # (~30s with the defaults) it is excluded; bring it back, after
 #   # 2 consecutive 2xx probes it returns to rotation.

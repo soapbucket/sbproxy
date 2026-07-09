@@ -12,7 +12,7 @@ This guide owns the end-to-end picture: provider setup, wire compatibility, rout
 
 ## Provider setup
 
-Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list:
+Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list. A provider entry can also carry a `default_model`, used when a request omits the `model` field:
 
 ```yaml
 origins:
@@ -23,15 +23,15 @@ origins:
         - name: openai
           api_key: ${OPENAI_API_KEY}
           models: [gpt-4o, gpt-4o-mini, gpt-4-turbo]
+          default_model: gpt-4o-mini
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           models: [claude-sonnet-4-20250514, claude-haiku-4-5]
-      default_model: gpt-4o-mini
       routing:
         strategy: round_robin
 ```
 
-API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files.
+API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files. Note that `default_model` is a per-provider field, not an `action`-level one; an action-level `default_model` key is ignored.
 
 ### Native providers
 66 native providers ship in-tree alongside native translators for Anthropic, Gemini, and Bedrock. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
@@ -341,7 +341,7 @@ origins:
         - name: openai
           api_key: ${OPENAI_API_KEY}
           models: [gpt-4o-mini]
-      default_model: gpt-4o-mini
+          default_model: gpt-4o-mini
       routing:
         strategy: round_robin
     policies:
@@ -382,7 +382,7 @@ The sliding window is one minute, shared across all configured origins (state is
 
 Input guardrails inspect the parsed prompt ahead of egress ([config](../examples/ai-guardrails/)).
 
-The proxy supports nine guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, and `agent_alignment`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. See the CEL guardrails section below for inline CEL conditions, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
+The proxy supports nine guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, and `agent_alignment`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
 
 Input guardrails apply to whichever body field the surface carries user text in:
 
@@ -515,9 +515,9 @@ See `examples/ai-agent-alignment/` for a runnable configuration that exercises e
 
 ## Lua hooks
 
-Use Lua scripts for more complex routing logic. Lua hooks run in a sandbox with access to request context variables.
+Lua request modifiers run on AI origins the same way they do on plain proxy origins: an entry in the `request_modifiers` list carries a `lua_script` that defines `modify_request(req, ctx)` and returns headers to set. Scripts run in a sandboxed VM with wall-clock and memory budgets; see [scripting.md](scripting.md) for the full contract.
 
-Example: route coding questions to Anthropic based on the request path:
+Note that a header set from Lua does not steer AI provider selection; the gateway picks a provider from the requested model and the `routing.strategy`. Use Lua for tagging and classification, and model-based selection for routing:
 
 ```yaml
 origins:
@@ -528,29 +528,29 @@ origins:
         - name: openai
           api_key: ${OPENAI_API_KEY}
           models: [gpt-4o-mini]
+          default_model: gpt-4o-mini
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           models: [claude-sonnet-4-20250514]
-      default_model: gpt-4o-mini
       routing:
         strategy: round_robin
     request_modifiers:
-      lua:
-        script: |
-          local path = request.path
-          if string.find(path, "/code") then
+      - lua_script: |
+          function modify_request(req, ctx)
+            local caller = "human"
+            local ua = req.headers["user-agent"] or ""
+            if string.find(ua, "python") or string.find(ua, "node") then
+              caller = "sdk"
+            end
             return {
-              add_headers = {
-                ["X-Preferred-Provider"] = "anthropic"
-              }
+              set_headers = { ["X-Caller-Kind"] = caller }
             }
           end
-          return {}
 ```
 
-## CEL guardrails
+## CEL request gating
 
-Block or modify AI requests with CEL expressions:
+Block AI requests with a CEL `expression` policy. The expression returns a boolean; `false` denies the request with the configured `deny_status` and `deny_message`. There is no `cel:` key under `request_modifiers`.
 
 ```yaml
 origins:
@@ -561,19 +561,19 @@ origins:
         - name: openai
           api_key: ${OPENAI_API_KEY}
           models: [gpt-4o-mini]
-      default_model: gpt-4o-mini
+          default_model: gpt-4o-mini
       routing:
         strategy: round_robin
     policies:
       - type: rate_limiting
         requests_per_minute: 100
-    request_modifiers:
-      cel:
-        - expression: >
-            request.headers['x-department'] == ''
-              ? {"set_headers": {"X-Block": "true"}}
-              : {}
+      - type: expression
+        expression: 'request.headers["x-department"] != ""'
+        deny_status: 403
+        deny_message: "requests must carry an x-department header"
 ```
+
+For CEL over the AI pipeline's own signals (surface, guardrail verdicts, budget state), use the AI policy plane below.
 
 ## AI policy plane (CEL)
 
@@ -582,6 +582,9 @@ Where CEL guardrails and request modifiers act on the raw HTTP request, the AI p
 ```yaml
 action:
   type: ai_proxy
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
   ai_policy:
     expression: |
       ai.principal.tier == "free" && ai.guardrails.flagged_count >= 2
@@ -601,6 +604,9 @@ By default the counters are per-instance (an in-process tracker), so a cluster o
 ```yaml
 action:
   type: ai_proxy
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
   budget:
     on_exceed: downgrade
     limits:
@@ -676,74 +682,85 @@ Cost tracking and cost-based routing need a per-model price. SBproxy ships a bui
 Inline prices, per model, in USD per million tokens:
 
 ```yaml
-- name: gateway
-  action:
-    type: ai_proxy
-    model_prices:
-      claude-haiku-4-5:
-        input_per_million: 1.0
-        output_per_million: 5.0
-      my-local-qwen:
-        input_per_million: 0.0        # self-hosted, no marginal token cost
-        output_per_million: 0.0
+action:
+  type: ai_proxy
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
+  model_prices:
+    claude-haiku-4-5:
+      input_per_million: 1.0
+      output_per_million: 5.0
+    my-local-qwen:
+      input_per_million: 0.0        # self-hosted, no marginal token cost
+      output_per_million: 0.0
 ```
 
 Or point at an external rate card in the LiteLLM `model_prices_and_context_window.json` schema (the ecosystem's canonical dataset, 2,900+ models):
 
 ```yaml
-    rate_card: /etc/sbproxy/model_prices.json
+  rate_card: /etc/sbproxy/model_prices.json
 ```
 
 Refresh the vendored file out of band with `scripts/refresh-model-prices.sh /etc/sbproxy/model_prices.json`; the gateway loads it at config load and never fetches at runtime, so an egress-restricted host is unaffected. Resolution order for a model's price is: `model_prices` (highest), then the rate card, then the built-in catalog, then the $5 / $5 fallback. A missing or malformed rate card is logged and skipped, not fatal. Cache-read and cache-write rates carry through from both sources; the built-in catalog does not yet include them.
 
-## Virtual API keys
+## Virtual API keys (`credentials:`)
 
-Issue per-team or per-app keys that the gateway validates locally. Each key can restrict allowed providers and models, set its own request and token rates, carry its own budget ceiling, and tag requests for downstream attribution. The `virtual_keys` list sits under `action` and is parsed by `VirtualKeyConfig` in `crates/sbproxy-ai/src/identity.rs`.
+Issue per-team or per-app keys that the gateway validates locally. Each key can pin a provider, restrict models, set its own request rate, carry its own budget ceiling, and tag requests for downstream attribution. The shipped shape is a `credentials:` list of `type: ai_provider` entries next to the origin's `action:` block; the same block also lives at `tenants[].credentials` and `proxy.credentials` scope, with origin shadowing tenant shadowing proxy for entries that share a `name`. The legacy `virtual_keys:` key is rejected at config compile with a pointer to [migration-credentials.md](migration-credentials.md).
 
 ```yaml
-action:
-  type: ai_proxy
-  virtual_keys:
-    - key: ${TEAM_A_KEY}
-      name: team-a
-      enabled: true
-      allowed_providers: [openai, anthropic]
-      allowed_models: [gpt-4o-mini, claude-haiku-4-5]
-      blocked_models: [gpt-4-turbo]
-      max_requests_per_minute: 60
-      max_tokens_per_minute: 200000
-      budget:
-        max_tokens: 5000000
-        max_cost_usd: 100
-      tags: [team-a, beta]
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o-mini, gpt-4o]
+    credentials:
+      - name: team-a
+        type: ai_provider
+        provider: openai
+        key: ${TEAM_A_KEY}
+        models:
+          allow: [gpt-4o-mini]
+          deny: [gpt-4o]
+        policies:
+          - type: rate_limit
+            rpm: 60
+        attrs:
+          project: checkout
+          tags: [team-a, beta]
+          budget:
+            max_tokens: 5000000
+            max_cost_usd: 100
 ```
 
-### `virtual_keys[]` fields
+### `credentials[]` fields (type: ai_provider)
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `key` | string | required | The token clients send. Treat it like a secret and inject via `${VAR}`. |
-| `name` | string | unset | Human label used in logs and metrics. |
-| `enabled` | bool | `true` | Disable a key without deleting the entry. |
-| `allowed_providers` | list of string | `[]` | Empty list allows all configured providers. |
-| `allowed_models` | list of string | `[]` | Empty list allows all models. Otherwise the request model must match one entry. |
-| `blocked_models` | list of string | `[]` | Takes precedence over `allowed_models`. A blocked model is rejected even if it appears in the allow list. |
-| `max_requests_per_minute` | u64 | unset | Per-key RPM cap. The 60-second window starts on the first request and resets after one minute of wall time. |
-| `max_tokens_per_minute` | u64 | unset | Per-key TPM cap. Tokens are recorded after the response is read. |
-| `budget` | object | unset | `KeyBudget` with `max_tokens` and `max_cost_usd`. Independent of the global `budget` block. |
-| `tags` | list of string | `[]` | Free-form labels attached to every request the key authenticates. Surfaced in logs and emitted in the `sbproxy_ai_key_*` metric labels. |
+| `name` | string | required | Stable operator-supplied name, unique within its scope. Used in logs and metrics. |
+| `type` | string | required | `ai_provider` for gateway-validated AI keys. |
+| `key` | string | required | The token clients send. Treat it like a secret and inject via `${VAR}` or a secret-reference scheme. |
+| `provider` | string | unset | Pins the credential to one configured provider. Requests that resolve to a different provider are rejected. |
+| `models.allow` | list of string | `[]` | Empty allows all models; otherwise the request model must match one entry. |
+| `models.deny` | list of string | `[]` | Takes precedence over `models.allow`. |
+| `principals` | list | `[]` | Principal selectors gating who may use the credential. Empty matches everyone. |
+| `policies` | list | `[]` | Closed set: `rate_limit` (with `rpm`) and `require_pii_redaction`. There is no per-key tokens-per-minute knob; cap token spend with `attrs.budget.max_tokens`. |
+| `attrs` | object | unset | Attribution: `project`, `user`, `team`, `cost_center`, `tags`, `metadata`, and `budget` (`max_tokens`, `max_cost_usd`, `reset`). The per-key budget is independent of the global `budget` block. |
+| `route_to_model` | string | unset | Pins every request from this credential to one model. |
+| `inject_tools` | list | `[]` | Provider-native tool definitions injected into requests from this credential. |
 
-Per-key usage shows up in the `sbproxy_ai_key_*` metrics.
+At compile time each `ai_provider` credential is lowered onto the runtime key registry (`VirtualKeyConfig` in `crates/sbproxy-ai/src/identity.rs`) that AI dispatch reads. Per-key usage shows up in the `sbproxy_ai_key_*` metrics.
 
 ## Caching
 
-Three independent caches sit in front of providers. Each has its own runtime configuration in `crates/sbproxy-ai/src/`. Hit and miss counts land in `sbproxy_ai_cache_results_total`.
+Two caches run on the serving path: the semantic cache and the idempotency middleware, both described below. Cache hit and miss counts land in `sbproxy_ai_cache_results_total`.
 
-### Exact prompt cache
+### Exact prompt cache (design stage)
 
-Hashes the request body and serves byte-for-byte hits. Implemented in `prompt_cache.rs`. The cache key is the SHA-256 of the canonicalised JSON `messages` array, so request key ordering does not affect lookups. The module also detects Anthropic's native `cache_control` blocks (top-level `system`, per-message, or per-content-part) and lets those pass through to the upstream provider.
-
-The exact-match path is a runtime construct rather than an `action` field today. It is enabled implicitly when the gateway is built with a cache backing store. There are no YAML knobs for the exact prompt cache.
+An exact-match prompt cache is design-stage library code, not part of the serving path: `prompt_cache.rs` in `crates/sbproxy-ai` implements SHA-256 keying over the canonicalised JSON `messages` array and detection of Anthropic's native `cache_control` blocks, but nothing in the dispatch pipeline calls it, and there are no YAML knobs for it. For byte-identical replay of retried requests today, use the idempotency middleware below; for near-duplicate prompts, use the semantic cache.
 
 ### Semantic cache
 
@@ -751,7 +768,7 @@ The exact-match path is a runtime construct rather than an `action` field today.
 
 Different words, same meaning, no provider call ([config](../examples/semantic-cache-openai/)).
 
-Stores responses keyed by the SHA-256 of the messages array with TTL and capacity bounds. Implemented in `semantic_cache.rs` as `SemanticCache`. The constructor takes `max_entries: usize` and `ttl_secs: u64`; entries are evicted with an insert-order LRU when the cache is full, and lazily expired on lookup.
+Serves cached responses to prompts that mean the same thing without a provider call. Implemented in `semantic_cache.rs` as `EmbeddingCache`: on a miss the dispatcher embeds the prompt once via the configured source, and on later requests a cosine-similarity scan over the stored vectors replays the closest response that meets `threshold`. Vectors are L2-normalised at insert time, eviction is LRU with a `max_entries` cap, entries past `ttl_secs` are dropped lazily on lookup, and every entry is scoped to the calling tenant and credential so one caller's cached response is never replayed to another. Embedding failures fail open to an uncached upstream call.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
@@ -859,6 +876,9 @@ For per-model rate limits configurable in YAML, use `model_rate_limits` on the `
 ```yaml
 action:
   type: ai_proxy
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
   model_rate_limits:
     gpt-4o:
       requests_per_minute: 200
@@ -873,9 +893,9 @@ action:
 | `requests_per_minute` | u64 | unset | Sliding one-minute window cap on requests for the model. |
 | `tokens_per_minute` | u64 | unset | Sliding one-minute window cap on tokens for the model. |
 
-## Model aliases
+## Model aliases (design stage)
 
-Map friendly names onto specific provider plus model pairs, with optional deprecation pointers. Implemented in `model_alias.rs` as `ModelAliasRegistry`, with each entry typed as `ModelAlias`. The registry is constructed by the runtime; entries deserialise from YAML or JSON when loaded.
+Model aliases are design-stage library code: `model_alias.rs` ships a `ModelAliasRegistry` with `ModelAlias` entries, but nothing on the serving path constructs the registry, and a `model_aliases:` key in the config is ignored. To map a friendly name onto an upstream model today, use the shipped per-provider `model_map` field, which rewrites the requested model name before dispatch. The rest of this section records the registry's intended shape.
 
 ```yaml
 model_aliases:
@@ -902,9 +922,7 @@ model_aliases:
 | `deprecated` | bool | `false` | When true, a warning is logged on every resolution. |
 | `replacement` | string | unset | Suggested alias to migrate to. Surfaces in the deprecation log line. |
 
-Resolution returns `None` for unknown names so the request falls back to literal model ID matching. Re-registering the same alias overwrites the previous entry.
-
-The alias registry is wired by the runtime rather than read off the `action` block. Treat the YAML above as the canonical shape when serialising aliases for code paths that load them.
+In the library code, resolution returns `None` for unknown names so a caller can fall back to literal model ID matching, and re-registering the same alias overwrites the previous entry. None of this runs per-request today.
 
 ## Supported endpoints
 
@@ -954,102 +972,61 @@ Image edits, image variations, audio transcription, and audio translation send m
 
 ### Per-surface configuration
 
-Per-surface knobs live under `per_surface_rate_limits` (see [Per-surface rate limits](#per-surface-rate-limits)) and apply automatically based on the classified surface. Surfaces have no dedicated YAML config block beyond that; they share the top-level `providers`, `routing`, `virtual_keys`, `budget`, `model_rate_limits`, `max_concurrent`, and `guardrails` settings.
+Per-surface knobs live under `per_surface_rate_limits` (see [Per-surface rate limits](#per-surface-rate-limits)) and apply automatically based on the classified surface. Surfaces have no dedicated YAML config block beyond that; they share the top-level `providers`, `routing`, `budget`, `model_rate_limits`, `max_concurrent`, and `guardrails` settings, plus the origin's `credentials:` list.
 
-### Surfaces marked enterprise-only
+### Reranking
 
-`reranking` is gated to ship dispatch in the enterprise build. In the OSS build the surface is classified (so observability still tags requests with `surface = "reranking"`) and the 501 gate fires unless an enterprise license check passes. The same surface label and matrix entry exist in both builds.
+`reranking` is not enterprise-gated. The OSS build classifies the surface, dispatches it when a configured provider supports it (Cohere today), and captures the request's document count for per-unit billing. The only gate is the capability check above: when no configured provider supports reranking, the proxy returns 501 before any upstream call, same as every other surface.
 
 ## Context handling
 
-Three modules handle prompts that approach or exceed a model's context window. They are layered: relay carries history across rotations, overflow decides what to do when the next request will not fit, and compress trims when the answer is to keep going with a smaller history.
+The shipped answer to a prompt that approaches a model's context window is context compression: an opt-in dispatch step that trims history so the request keeps fitting. Two neighbouring modules, context relay and context overflow, are design-stage library code with no serving-path callers; they are described here so their status is not mistaken for shipped behaviour.
 
-### Context relay
-
-`crates/sbproxy-ai/src/context_relay.rs` is a thread-safe map of session ID to message history. When the router rotates between providers or virtual keys mid-session, it pulls the prior message list out of the relay and replays it to the new provider so the conversation does not reset. Messages are kept as raw `serde_json::Value` so provider-specific shapes survive the round trip. No YAML config: it is internal state used by the router.
-
-### Context overflow
-
-`crates/sbproxy-ai/src/context_overflow.rs` ships a registry of context windows for the OpenAI, Anthropic, Gemini, Mistral, and Llama families and decides what to do when a request would overflow. Three actions are available:
-
-- `Error`: return a 4xx to the client.
-- `FallbackToLarger(model)`: resend to a larger-window model named in config.
-- `Truncate`: drop oldest turns and retry, available through `check_overflow_with_truncate`.
-
-The choice is driven by a `context_overflow` block on the AI handler:
-
-```yaml
-action:
-  type: ai_proxy
-  context_overflow:
-    fallback_model: gpt-4o      # used when the current model overflows and gpt-4o has a larger window
-    on_overflow: truncate       # error | fallback | truncate
-```
-
-If the requested model is not in the registry, overflow checks are skipped (no window to compare against) and the request is forwarded as-is.
-
-### Context compress
+### Context compress (shipped)
 
 `crates/sbproxy-ai/src/context_compress.rs` does cost-aware history trimming. `estimate_message_tokens` uses a four-characters-per-token approximation. `trim_to_budget` always keeps the leading system message, then walks remaining messages newest-to-oldest, including each one only if it fits in the remaining token budget, then restores chronological order before returning.
 
-This module exposes pure functions; it is invoked by the routing strategy and overflow handler. The operator-facing switch lives under `resilience` as `llm_aware.context_compress`; see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#context-window-compression).
+The operator-facing switch is `resilience.llm_aware.context_compress` on the AI action; when it is on, the dispatch pipeline calls `fit_messages_to_model` before forwarding. See [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#context-window-compression).
+
+### Context relay (design stage)
+
+Context relay is design-stage: nothing on the serving path uses it. `crates/sbproxy-ai/src/context_relay.rs` implements a thread-safe map of session ID to message history, intended to replay prior messages to a new provider when the router rotates mid-session so the conversation does not reset. The router does not call it today, and there is no YAML config for it.
+
+### Context overflow (design stage)
+
+The overflow decision layer is design-stage: `crates/sbproxy-ai/src/context_overflow.rs` ships a registry of context windows for the OpenAI, Anthropic, Gemini, Mistral, and Llama families plus typed overflow actions (`Error`, `FallbackToLarger`, `Truncate`), but no dispatch code drives those actions and a `context_overflow:` block in the config is ignored. The one part of the module that does run is its window registry, which context compression consults to size a model's budget. The shipped way to handle overflow is `resilience.llm_aware.context_compress` above.
 
 ## Streaming analytics
 
-`crates/sbproxy-ai/src/streaming_analytics.rs` tracks per-stream timing for SSE responses. `StreamTracker` records start time, first-token instant, and last-token instant; from these it computes Time to First Token (`ttft_ms`), Tokens Per Second (`tps`), and average inter-token latency (`avg_itl_ms`). `StreamRegistry` is the global map of in-flight streams keyed by request ID.
+Per-stream timing on the live path is limited to Time to First Token: the dispatch pipeline measures TTFT on streaming responses and records it to the `sbproxy_ai_ttft_seconds` histogram, labelled by provider and model.
 
-These values feed the `sbproxy_ai_request_duration_seconds` histogram and request-scoped log records. The module has no YAML config; it is wired in whenever streaming responses are observed.
+The richer per-stream tracker is design-stage: `crates/sbproxy-ai/src/streaming_analytics.rs` ships a `StreamTracker` (start, first-token, and last-token instants, with derived tokens-per-second and average inter-token latency) and a `StreamRegistry` map of in-flight streams, but nothing on the serving path constructs either type today.
 
-## Structured output
+## Structured output (design stage)
 
-`crates/sbproxy-ai/src/structured_output.rs` validates responses against a JSON Schema. The config struct sits on the AI handler:
+Gateway-side structured-output validation is design-stage: `crates/sbproxy-ai/src/structured_output.rs` implements the validator, but no dispatch code calls it and a `structured_output:` block in the config is ignored. Provider-enforced JSON output still works where the upstream supports it: `response_format` passes through to OpenAI-compatible upstreams (the Gemini translator drops it as an unsupported knob). What does not exist is the proxy re-checking the response.
 
-```yaml
-action:
-  type: ai_proxy
-  structured_output:
-    schema:                     # JSON Schema the response must conform to
-      type: object
-      required: [name, age]
-      properties:
-        name: {type: string}
-        age:  {type: integer}
-    retry_on_failure: true      # default: false
-    max_retries: 2              # default: 1
-```
-
-When `retry_on_failure` is true, a failed validation triggers a retry with the schema injected into the system prompt via `build_schema_instruction`. `extract_json` strips ` ```json ` and ` ``` ` fences before parsing, so models that wrap output in markdown still validate. Validation is structural: required-field presence and per-property type checks (`string`, `number`, `integer`, `boolean`, `array`, `object`, `null`). Full JSON Schema features such as `$ref` and `oneOf` are not implemented.
-
-The validator and the schema-instruction builder are live functions; the wiring that calls them on every chat response is a runtime construct rather than a top-level YAML field. The YAML block above is the shape that ships when a runtime caller threads `StructuredOutputConfig` into the chat handler. Source: `crates/sbproxy-ai/src/structured_output.rs`.
+The library code covers the intended flow: `extract_json` strips ` ```json ` and ` ``` ` fences before parsing so models that wrap output in markdown still validate, `validate_response` does structural checks (required-field presence and per-property type checks for `string`, `number`, `integer`, `boolean`, `array`, `object`, `null`; no `$ref` or `oneOf`), and `build_schema_instruction` renders the schema into a system-prompt retry instruction for a validation-failure retry loop.
 
 ## OpenAI surface-area modules
 
-The `sbproxy-ai` crate ships shape definitions and lightweight handlers for the OpenAI surface beyond chat completions: assistants, threads, batch jobs, image generation, audio, fine-tuning, realtime sessions, and structured output. The shapes are stable and round-trip through `serde_json`; the chat-path router (`crates/sbproxy-ai/src/handler.rs:parse_ai_path` and `crates/sbproxy-ai/src/api_routes.rs:parse_endpoint`) recognises a subset (chat, embeddings, models, rerank, moderations, image generation, audio transcription, audio speech) and falls back to `Unknown` for the rest. The remaining shapes are present so plugin authors can build on top of them and so the action config surface is forward-compatible.
+The `sbproxy-ai` crate ships shape definitions and lightweight handlers for the OpenAI surface beyond chat completions: assistants, threads, batch jobs, image generation, audio, fine-tuning, realtime sessions, and structured output. The shapes are stable and round-trip through `serde_json`. Path classification on the live dispatch path is done by two functions: `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs` labels every request with an `AiSurface` (the full table above), and `parse_endpoint(path)` in `crates/sbproxy-ai/src/api_routes.rs` types a narrower endpoint subset (chat, embeddings, models, rerank, moderations, image generation, audio transcription, audio speech) for the per-provider capability check, falling back to `Unknown` for the rest. There is no `parse_ai_path` function. The remaining shapes are present so plugin authors can build on top of them.
 
 The subsections below describe what each module contributes today.
 
 ### `assistants`
 
-Shape definitions for the OpenAI Assistants API. `AssistantHandler::route_request(path, method)` classifies a request into one of: `CreateAssistant`, `ListAssistants`, `GetAssistant(id)`, `CreateThread`, `CreateMessage(thread_id)`, `CreateRun(thread_id)`, `GetRun(thread_id, run_id)`, or `Unknown`. The optional `/v1` prefix is stripped before matching. `AssistantConfig { enabled: bool }` is the on/off shape.
+Assistants requests are served by the generic surface dispatch described above: `classify_surface` labels them, and the gateway forwards them passthrough to a provider that supports the surface (OpenAI). There is no `assistants:` config key; writing one is silently ignored, since the action config drops unknown fields rather than rejecting them.
 
-```yaml
-action:
-  type: ai_proxy
-  providers: [...]
-  # Forward-compatible flag, recognised by the parser but not yet enforced.
-  assistants:
-    enabled: true
-```
-
-The router classifier is implemented; routing into the chat dispatcher is not yet wired in the OSS build. Use chat completions for assistant-style flows until the dispatcher lands. Source: `crates/sbproxy-ai/src/assistants.rs:AssistantHandler`.
+The module itself is design-stage shape code with no serving-path callers: `AssistantHandler::route_request(path, method)` classifies a request into `CreateAssistant`, `ListAssistants`, `GetAssistant(id)`, `CreateThread`, `CreateMessage(thread_id)`, `CreateRun(thread_id)`, `GetRun(thread_id, run_id)`, or `Unknown` (optional `/v1` prefix stripped), and `AssistantConfig { enabled: bool }` is the intended on/off shape. Nothing constructs either today. Source: `crates/sbproxy-ai/src/assistants.rs:AssistantHandler`.
 
 ### `threads`
 
-In-memory `ThreadStore` for OpenAI-style threads and their messages. Stores `Thread { id, created_at, metadata }` and ordered `ThreadMessage { id, thread_id, role, content, created_at }`. The store is thread-safe (mutex-backed) and used by the assistants handler for local session continuity. There is no YAML field that selects a backing store today; the in-memory store is the only implementation. Source: `crates/sbproxy-ai/src/threads.rs:ThreadStore`.
+Threads requests, like assistants, are proxied passthrough by the generic surface dispatch. The `ThreadStore` module is design-stage with no serving-path callers: it implements an in-memory, mutex-backed store of `Thread { id, created_at, metadata }` and ordered `ThreadMessage { id, thread_id, role, content, created_at }`, intended for gateway-local session continuity, but nothing constructs it today and there is no YAML field for it. Source: `crates/sbproxy-ai/src/threads.rs:ThreadStore`.
 
 ### `batch`
 
-`BatchJob` shape (id, status, created_at, completed_at, total_requests, completed_requests, failed_requests, metadata) plus a `BatchStore` trait with one implementation, `MemoryBatchStore`. Status lifecycle: `pending`, `in_progress`, `completed`, `failed`, `cancelled`. The store is wired by the runtime when a batch dispatcher is constructed; there is no top-level `batch:` YAML block. Source: `crates/sbproxy-ai/src/batch.rs`.
+Batch requests are proxied passthrough by the generic surface dispatch (`batches` in the surface table). The module's `BatchJob` shape (id, status, created_at, completed_at, total_requests, completed_requests, failed_requests, metadata), `BatchStore` trait, and `MemoryBatchStore` implementation (status lifecycle `pending`, `in_progress`, `completed`, `failed`, `cancelled`) are design-stage code that nothing constructs today; there is no `batch:` YAML block. Source: `crates/sbproxy-ai/src/batch.rs`.
 
 ### `image`
 
@@ -1061,37 +1038,17 @@ Request and response shapes for audio transcription and speech synthesis. `Trans
 
 ### `finetune`
 
-Fine-tuning API classifier. `FinetuneHandler::route_request(path, method)` classifies into `CreateJob`, `ListJobs`, `GetJob(id)`, `CancelJob(id)`, `ListEvents(id)`, or `Unknown`, with the optional `/v1` prefix stripped. `FinetuneConfig { enabled: bool }` is the on/off shape.
-
-```yaml
-action:
-  type: ai_proxy
-  providers: [...]
-  # Forward-compatible flag, recognised by the parser but not yet enforced.
-  finetune:
-    enabled: true
-```
-
-Like `assistants`, the classifier is implemented; routing into the chat dispatcher is not yet wired in the OSS build. Source: `crates/sbproxy-ai/src/finetune.rs:FinetuneHandler`.
+Fine-tuning requests are proxied passthrough by the generic surface dispatch (`fine_tuning` in the surface table). There is no `finetune:` config key; writing one is silently ignored. The module's `FinetuneHandler::route_request(path, method)` classifier (`CreateJob`, `ListJobs`, `GetJob(id)`, `CancelJob(id)`, `ListEvents(id)`, `Unknown`) and `FinetuneConfig { enabled: bool }` shape are design-stage code with no serving-path callers. Source: `crates/sbproxy-ai/src/finetune.rs:FinetuneHandler`.
 
 ### `realtime`
 
-Shape definitions and config for OpenAI's Realtime websocket API. `RealtimeConfig { enabled, model }` defaults to `enabled: false` and `model: "gpt-4o-realtime-preview"`. `RealtimeSession { session_id, model, created_at, status }` and `RealtimeEvent { event_type, data }` round-trip through serde. The `/v1/realtime` websocket path is recognised by the proxy but session bridging requires a runtime-level dispatcher; the config shape above is the YAML form that the dispatcher reads.
+Realtime WebSocket proxying ships and is documented in the [Realtime](#realtime-1) section below: the gateway gates the upgrade on provider capability, applies `per_surface_rate_limits.realtime`, and forwards frames byte-transparently. There is no `realtime:` config key on the action; writing one is silently ignored. The knobs that exist are the provider list (a provider that supports Realtime must be configured) and the per-surface rate limit.
 
-```yaml
-action:
-  type: ai_proxy
-  providers: [...]
-  realtime:
-    enabled: true
-    model: gpt-4o-realtime-preview
-```
-
-Source: `crates/sbproxy-ai/src/realtime.rs`.
+The `realtime.rs` module itself is design-stage shape code with no serving-path callers: `RealtimeConfig { enabled, model }`, `RealtimeSession { session_id, model, created_at, status }`, and `RealtimeEvent { event_type, data }` round-trip through serde but nothing constructs them. Source: `crates/sbproxy-ai/src/realtime.rs`.
 
 ### `structured_output`
 
-Already covered above under [Structured output](#structured-output). Shape and validator are live (`extract_json`, `validate_response`, `build_schema_instruction`); the wiring that runs the validator on every chat response is a runtime construct rather than a top-level YAML field. Source: `crates/sbproxy-ai/src/structured_output.rs`.
+Design-stage; covered above under [Structured output](#structured-output-design-stage). The validator functions (`extract_json`, `validate_response`, `build_schema_instruction`) have no serving-path callers and there is no `structured_output:` config key. Source: `crates/sbproxy-ai/src/structured_output.rs`.
 
 ## Per-request attribution
 
@@ -1145,6 +1102,9 @@ The `ledger` usage sink turns the stream of completed LLM calls into a tamper-ev
 ```yaml
 action:
   type: ai_proxy
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
   usage_sinks:
     - type: ledger
       path: /var/lib/sbproxy/usage-ledger.jsonl
@@ -1155,7 +1115,7 @@ Verify the chain (and, with the seed, the signatures) with `sbproxy ai ledger ve
 
 ## Token usage metrics
 
-The proxy exposes aggregate AI usage as Prometheus metrics. When `telemetry.bind_port` is configured, the following counters and gauges are available at `/metrics` under the `sbproxy_ai_*` namespace:
+The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpoint is served on the proxy listener itself and on the admin listener when the admin API is enabled; there is no separate `telemetry.bind_port` key. The following counters and gauges appear under the `sbproxy_ai_*` namespace:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -1340,11 +1300,11 @@ origins:
           api_key: ${OPENAI_API_KEY}
           priority: 1
           models: [gpt-4o, gpt-4o-mini, gpt-4-turbo]
+          default_model: gpt-4o-mini
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           priority: 2
           models: [claude-sonnet-4-20250514, claude-haiku-4-5]
-      default_model: gpt-4o-mini
       routing:
         strategy: fallback_chain
     authentication:

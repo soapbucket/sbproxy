@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Soap Bucket LLC
 #
 # sign-x402.sh
@@ -57,12 +57,12 @@
 #     --token 0x036CbD53842c5426634e7929541eC2318f3dCF7e \
 #     --private-key "$X402_PRIVATE_KEY")
 #
-#   curl -i -H 'Host: blog.localhost' \
+#   curl -i -H 'Host: blog.test.sbproxy.dev' \
 #        -H 'User-Agent: GPTBot/1.0' \
 #        -H "crawler-payment: $TOKEN" \
 #        -H 'Content-Type: application/json' \
 #        --data-raw "$PAYLOAD" \
-#        http://localhost:8080/articles/foo
+#        http://localhost:8080/article
 
 set -euo pipefail
 

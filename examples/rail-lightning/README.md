@@ -1,5 +1,5 @@
 # Lightning Network billing rail (BOLT-12)
-*Last modified: 2026-05-07*
+*Last modified: 2026-07-09*
 
 Lightning rail in the `Accept-Payment` negotiation contract alongside
 x402 + MPP. The example shows how an operator declares `lightning` in
@@ -199,10 +199,8 @@ features are part of the enterprise build only.
 
 ## Related docs
 
--  (A3.1) - wire shape of the
-  402 body.
--  (A3.2) - quote-token JWS shape and
-  JWKS publication.
+- `docs/402-challenge.md` - wire shape of the 402 body, plus the
+  quote-token JWS shape and JWKS publication.
 - `examples/rail-x402-base-sepolia/` - x402 rail with a hermetic
   mock facilitator.
 - `examples/rail-mpp-stripe-test/` - MPP rail with Stripe test

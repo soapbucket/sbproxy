@@ -33,15 +33,20 @@ origins:
 
     policies:
       - type: object_authz
+        # Owner identity comes from the verified JWT subject (the
+        # secure default; `owner_from: header` needs a trusted
+        # upstream auth layer).
+        principal:
+          owner_from: sub
         object_rules:
           - path: /tenants/{owner}/orders/{order_id}
-            owner_segment: owner
-            owner_source: sub
+            owner_param: owner
+            object_param: order_id
         function_rules:
           - path: /admin/users/{user_id}
             methods: [DELETE, PUT]
-            required_role: admin
+            require_role: admin
         enumeration:
           enabled: true
           window_secs: 60
-          distinct_ids_threshold: 100
+          max_distinct: 100

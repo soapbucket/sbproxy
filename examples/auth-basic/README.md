@@ -1,6 +1,6 @@
 # HTTP Basic authentication
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![HTTP Basic authentication](../../docs/assets/auth-basic.gif)
 
@@ -34,7 +34,7 @@ $ curl -i -u admin:s3cret -H 'Host: basic.local' http://127.0.0.1:8080/get
 HTTP/1.1 200 OK
 content-type: application/json
 
-{"args":{},"headers":{"Authorization":"Basic YWRtaW46czNjcmV0","Host":"test.sbproxy.dev",...},"url":"https://test.sbproxy.dev/get"}
+{"method":"GET","url":"/get","headers":{"authorization":"Basic YWRtaW46czNjcmV0","host":"test.sbproxy.dev",...},"query":{},"timestamp":"2026-07-09T19:29:58.060Z"}
 ```
 
 Second user also works:

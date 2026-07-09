@@ -1,6 +1,6 @@
 # AI shadow / side-by-side evaluation
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 Each request is forwarded to the primary provider as usual; a copy is also sent to the shadow provider concurrently. The shadow response is drained and never reaches the client; metadata is logged at `target=sbproxy_ai_shadow` so it can be filtered into a dedicated stream with provider, status, latency_ms, prompt_tokens, completion_tokens, and finish_reason. Useful for validating a model swap before flipping primary traffic, comparing finish_reason or token counts across providers, and spot-checking guardrail or routing changes without exposing experimental output to users. `sample_rate: 0.1` mirrors 10% of traffic; set to 1.0 to mirror every request (doubles spend on the shadow leg).
 
@@ -24,9 +24,13 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 ```bash
-# Tail the proxy logs to see shadow events. The fire-and-forget mirror
-# never affects the client response status or body.
+# Shadow events show up in the log output of the proxy started in the
+# Run step; watch that terminal for target=sbproxy_ai_shadow lines. To
+# see only shadow events, stop that proxy (both would bind port 8080)
+# and restart it with the serve command piped through grep:
 sbproxy serve -f sb.yml 2>&1 | grep sbproxy_ai_shadow
+# The fire-and-forget mirror never affects the client response status
+# or body.
 ```
 
 ```bash

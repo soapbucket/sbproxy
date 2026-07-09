@@ -1,6 +1,6 @@
 # Getting started: AI estate (LLM gateway in front of model providers)
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 ## What you will build
 
@@ -30,7 +30,7 @@ sbproxy serve -f sb.yml
 Save this as `sb.yml`. It is adapted from `examples/ai-multi-provider/sb.yml`. Every key exists in `schemas/sb-config.schema.json` and the shipped examples. Provider keys are read from the environment with `${VAR}` interpolation, so no raw secrets land in the file.
 
 ```yaml
-# yaml-language-server: $schema=./schemas/sb-config.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
 proxy:
   http_bind_port: 8080
 
@@ -73,7 +73,7 @@ origins:
             period: daily
 ```
 
-The `fallback_chain` strategy tries Anthropic first (`priority: 1`) and falls back to OpenRouter (`priority: 2`) on a non-2xx upstream or timeout. The two input guardrails run before any provider call. The workspace budget uses `on_exceed: log`, so the gauge moves but requests still flow.
+The `fallback_chain` strategy tries Anthropic first (`priority: 1`) and falls back to OpenRouter (`priority: 2`) when the attempt fails in a retriable way: a transport error or timeout, an upstream 500, 502, or 503, or a rate-limit refusal under a configured retry policy. An ordinary 4xx client error does not fail over; it comes back to the caller as-is. The two input guardrails run before any provider call. The workspace budget uses `on_exceed: log`, so the gauge moves but requests still flow.
 
 ## Run it and expected output
 

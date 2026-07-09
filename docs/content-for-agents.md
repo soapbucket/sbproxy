@@ -1,8 +1,8 @@
 # Content for agents
 
-*Last modified: 2026-05-08*
+*Last modified: 2026-07-09*
 
-This guide is the operator-facing companion to the content-shaping pillar. If you have SBproxy running and you have already read [configuration.md](configuration.md) and [ai-crawl-control.md](ai-crawl-control.md), this is the next document. It covers how the proxy negotiates a content shape with an agent, how the body is transformed into that shape, what license posture the proxy advertises in four well-known documents, and how operators stamp the per-route editorial signal that ties everything together.
+This guide is the operator-facing companion to the content-shaping pillar. If you have SBproxy running and you have already read [configuration.md](configuration.md) and [ai-crawl-control.md](ai-crawl-control.md), this is the next document. It covers how the proxy negotiates a content shape with an agent, how the body is transformed into that shape, what license posture the proxy advertises in four well-known documents, and how operators stamp the per-origin editorial signal that ties everything together.
 
 The reader is a publisher or platform engineer who wants to turn on agent-aware content delivery. The audience is not Rust developers; the focus is configuration, wire shapes, and the operational guarantees you get for them.
 
@@ -12,12 +12,12 @@ The content-shaping surface area:
 
 - **Two-pass `Accept` resolution.** A pricing pass and a transformation pass. Agents declare a shape preference via `Accept`; the proxy matches a tier on the pricing pass and runs a body transform on the transformation pass. The two passes can diverge by design under q-value tie-breaks.
 - **JSON envelope.** A structured response shape for `Accept: application/json`. Wraps the page's Markdown body with title, URL, license URN, citation flag, token estimate, and pass-through schema.org JSON-LD. Versioned via the `Content-Type` profile parameter.
-- **`Content-Signal` response header.** A per-route editorial signal in a closed value set: `ai-train`, `ai-input`, `search`. Stamped on 200 responses; consumed by RSL projections, TDMRep projections, and the JSON envelope.
+- **`Content-Signal` response header.** A per-origin editorial signal in a closed value set: `ai-train`, `ai-input`, `search`. Declared with the origin-level `content_signal:` key, stamped on 200 responses, and consumed by the RSL projection, the TDMRep projection, and the JSON envelope.
 - **`x-markdown-tokens` response header.** Approximate token count of the Markdown body, computed once per response and stamped on Markdown and JSON envelope responses. Same value the JSON envelope's `token_estimate` field carries.
-- **Citation block transform.** Prepends a source / license / fetched-at line to Markdown bodies when the matched tier asserts `citation_required`.
-- **Boilerplate stripping.** Drops navigation, footer, aside, and comment-section nodes before the HTML-to-Markdown transform runs. Cuts token counts on typical news / blog pages by 30 to 60 percent without losing article content.
+- **Citation block transform.** Prepends a single citation line (source URL plus license URN) to Markdown bodies when the matched tier asserts `citation_required`.
+- **Boilerplate stripping.** Drops navigation, footer, aside, comment-section, ad, and sidebar nodes before the HTML-to-Markdown transform runs. Cuts token counts on typical news / blog pages by 30 to 60 percent without losing article content.
 - **Four projection documents.** `robots.txt`, `llms.txt` (and `llms-full.txt`), `/licenses.xml`, and `/.well-known/tdmrep.json`. Each is generated from the operator's compiled `ai_crawl_control` policy, regenerated atomically on every config reload, and served from the same hostname as the rest of the origin.
-- **aipref signal parsing.** The inbound `aipref:` request header is parsed into a typed signal and surfaced to the scripting layer (CEL / Lua / JavaScript / WASM). Default-permissive when the header is absent or malformed.
+- **aipref signal parsing.** The inbound `aipref:` request header is parsed into a typed signal and surfaced to CEL `expression` policies (`request.aipref.*`) and to the `ctx` argument of Lua and JavaScript modifier and JSON-transform functions (`ctx.request.aipref.*`). Default-permissive when the header is absent or malformed.
 
 ## Concept map
 
@@ -75,13 +75,14 @@ The two-pass shape resolution is automatic for any origin that has an `ai_crawl_
 
 Shape resolution reads Accept q-values per request ([config](../examples/content-shape-negotiation/)).
 
-### Auto-prepended action
+### Auto-synthesised negotiation
 
-When an origin declares `ai_crawl_control` with no explicit `content_negotiate` action, the compiler prepends one:
+When an origin declares `ai_crawl_control` (or any content-shaping transform), the compiler prepends the synthesised negotiation step:
 
 ```yaml
 origins:
   "blog.example.com":
+    content_signal: ai-train
     action:
       type: proxy
       url: https://test.sbproxy.dev
@@ -89,7 +90,6 @@ origins:
       - type: ai_crawl_control
         price: 0.001
         currency: USD
-        content_signal: ai-train
         tiers:
           - route_pattern: /articles/*
             content_shape: markdown
@@ -104,18 +104,19 @@ origins:
               currency: USD
 ```
 
-There is no `content_negotiate` action in the YAML. The compiler synthesises one with `default_content_shape: html`. An incoming `Accept: text/markdown` request is resolved as Markdown on both passes; an incoming `Accept: */*` falls back to HTML; an incoming `Accept: text/html;q=1.0, text/markdown;q=0.9` is priced as HTML (declaration order) and transformed as HTML (q-value winner).
+There is no negotiation action to declare in the YAML; it is not an `action:` type. The compiler synthesises the step with an HTML default. An incoming `Accept: text/markdown` request is resolved as Markdown on both passes; an incoming `Accept: */*` falls back to HTML; an incoming `Accept: text/html;q=1.0, text/markdown;q=0.9` is priced as HTML (declaration order) and transformed as HTML (q-value winner).
 
-### Override with an explicit action
+### Override the wildcard default
 
-When the operator wants control over the wildcard default, declare a `content_negotiate` action explicitly. The compiler skips the synthesis step in that case.
+When the operator wants control over the wildcard default, set the origin-level `default_content_shape:` key. The compiler threads it into the synthesised negotiation step.
 
 ```yaml
 origins:
   "docs.example.com":
+    default_content_shape: markdown
     action:
-      type: content_negotiate
-      default_content_shape: markdown
+      type: proxy
+      url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
         price: 0.001
@@ -124,7 +125,7 @@ origins:
 
 With `default_content_shape: markdown`, an `Accept: */*` request resolves to Markdown for both pricing and transformation. An agent that sends no `Accept` header at all gets the Markdown projection.
 
-The valid values for `default_content_shape` are `html`, `markdown`, `json`, `pdf`. Absence equals `html`.
+The recognised values for `default_content_shape` are `markdown`, `json`, `html`, `pdf`, and `other`. Absence equals `html`.
 
 ### Q-value tie-break
 
@@ -181,37 +182,36 @@ Served at `/robots.txt`. Format follows IETF draft-koster-rep-ai (the AI-extende
 
 ```text
 # Generated by SBproxy. Do not edit.
-# Config version: 0xa3f9d2c1
+# Config version: 0
 
-User-agent: GPTBot
+User-agent: openai-gptbot
 Disallow: /premium/*
 Crawl-delay: 1
-# SBproxy-AI-Extension: pay-per-crawl price=0.005 currency=USD shape=html
+# SBproxy-AI-Extension: pay-per-crawl price=0.005000 currency=USD shape=html
 
 User-agent: *
-Disallow:
+Disallow: /
+Crawl-delay: 1
+# SBproxy-AI-Extension: pay-per-crawl price=0.005000 currency=USD shape=any
 ```
 
-One `User-agent:` stanza per agent class with at least one priced tier. The `# SBproxy-AI-Extension:` comment lines carry pricing metadata for cooperative crawlers; the prefix is intentionally non-standard pending IETF standardisation. Agent classes resolved from `tiers[].agent_id` selectors; `*` is the wildcard.
+One `User-agent:` stanza per agent class with at least one priced tier, plus a wildcard stanza for the policy-level fallback price. The `# SBproxy-AI-Extension:` comment lines carry pricing metadata for cooperative crawlers; the prefix is intentionally non-standard pending IETF standardisation. Agent classes resolve from `tiers[].agent_id` selectors; `*` is the wildcard. The `# Config version:` stamp is the proxy's reload counter, rendered in decimal (the `projections render` CLI always prints `0`).
 
 ### `llms.txt` and `llms-full.txt`
 
-Served at `/llms.txt` (concise) and `/llms-full.txt` (full). Format follows the Anthropic / Mistral convention: a metadata block followed by a Markdown site description.
+Served at `/llms.txt` (concise) and `/llms-full.txt` (full). Format: a comment metadata block followed by a Markdown site description.
 
 ```text
 # sitename: blog.example.com
-# version: 0xa3f9d2c1
+# version: 0
 # payment: pay-per-request
-# shapes: html, markdown, json
 
-# Pay-per-crawl content
+# blog.example.com
 
-This site is monetized via SBproxy. Cooperative crawlers can read the
-license terms at /licenses.xml and the rights reservation at
-/.well-known/tdmrep.json.
+Crawler pricing for `blog.example.com` is enforced by SBproxy. Cooperative agents should fetch `/llms-full.txt` for the full priced-route listing, or `/.well-known/tdmrep.json` for the machine-readable text-and-data-mining policy.
 ```
 
-`llms-full.txt` adds a Markdown listing of every priced route. Both bodies regenerate at config reload time.
+`llms-full.txt` adds a `## Priced routes` Markdown listing with one line per priced route (pattern, agent, shape, price). Both bodies regenerate at config reload time; the `# version:` stamp is the decimal reload counter.
 
 ### `/licenses.xml`
 
@@ -221,18 +221,19 @@ Served at `/licenses.xml`. RSL 1.0 format. The root element is `<rsl xmlns="http
 <?xml version="1.0" encoding="UTF-8"?>
 <rsl xmlns="https://rslstandard.org/rsl" version="1.0">
   <content url="https://blog.example.com/*">
-    <license urn="urn:rsl:1.0:blog.example.com:0xa3f9d2c1">
+    <license urn="urn:rsl:1.0:blog.example.com:0">
       <origin hostname="blog.example.com" />
-      <ai-use type="training" licensed="true" />
+      <payment type="crawl" amount="0.001" currency="USD" />
+      <permits type="usage">ai-train</permits>
       <content-signal>ai-train</content-signal>
     </license>
   </content>
 </rsl>
 ```
 
-The `<content url>` value is the canonical "every URL on this origin" glob (`https://<hostname>/*`); the wire format follows the prose spec at https://rslstandard.org/rsl. The URN format is `urn:rsl:1.0:<origin_hostname>:<config_version_hash>`. The same URN appears in the `license` field of the JSON envelope so an agent that consumes the envelope and the licenses.xml document sees a consistent identifier.
+The `<content url>` value is the canonical "every URL on this origin" glob (`https://<hostname>/*`); the wire format follows the prose spec at https://rslstandard.org/rsl. The URN format is `urn:rsl:1.0:<origin_hostname>:<config_version>`, where the version is the proxy's decimal reload counter. The same URN appears in the `license` field of the JSON envelope so an agent that consumes the envelope and the licenses.xml document sees a consistent identifier.
 
-The `Content-Signal` to `<ai-use>` mapping is documented in detail in [rsl.md](rsl.md).
+The `content_signal` to `<permits type="usage">` / `<prohibits type="usage">` mapping is documented in detail in [rsl.md](rsl.md).
 
 ### `/.well-known/tdmrep.json`
 
@@ -256,9 +257,9 @@ The wire format follows the prose spec at https://www.w3.org/community/reports/t
 
 The four projections live in a single `Arc<ProjectionDocs>` cache, swapped atomically on every config reload via `ArcSwap::store`. Readers pay one atomic load per request; writers pay one store per reload. There is no locking on the data path.
 
-The reload path computes a config version hash, passes it to the projection engine, and stamps it on every regenerated document. The hot path checks the version against the live pipeline before serving so a stale cache hit is impossible in steady state.
+The reload path draws a config version from a monotonically increasing reload counter, passes it to the projection engine, and stamps it on every regenerated document. The hot path checks the version against the live pipeline before serving so a stale cache hit is impossible in steady state.
 
-Every projection regeneration emits one `AdminAuditEvent` per (hostname, projection kind) pair with `action: PolicyProjectionRefresh`, `target_kind: "PolicyProjection"`, and an `after.doc_hash` SHA-256 of the body. An operator with 10 origins sees 40 audit events per reload. The hash lets external auditors verify that the served document matches what was recorded at reload time.
+Every projection regeneration emits one `ProjectionRefreshEvent` per (hostname, projection kind) pair through the registered audit emitter. The event carries five fields: `hostname`, `projection_kind` (`robots`, `llms`, `llms-full`, `licenses`, or `tdmrep`), `config_version`, `doc_hash` (SHA-256 of the document body, lowercase hex), and `byte_len`. With five kinds per origin, an operator with 10 origins sees 50 events per reload. The hash lets external auditors verify that the served document matches what was recorded at reload time.
 
 ### Operator preview via CLI
 
@@ -273,22 +274,21 @@ sbproxy projections render --kind tdmrep --config ./sb.yml
 
 The output is byte-for-byte identical to the document the proxy would serve for the same config. Use it in CI to gate config changes on the projection content.
 
-## Per-tier `content_signal` config
+## Per-origin `content_signal` config
 
-`Content-Signal` is a per-route editorial declaration. Operators set it at the origin level (one value for the whole hostname) or at the tier level (overriding the origin value for matching routes).
+`Content-Signal` is a per-origin editorial declaration: one value for the whole hostname. It lives at the origin level, as a sibling of `action:`, not inside the `ai_crawl_control` policy block (the policy deserializer ignores unknown keys, so a `content_signal:` nested in the policy is silently dropped). Tiers carry no signal field; there is no per-route override.
 
 ```yaml
 origins:
   "blog.example.com":
+    content_signal: ai-train
     action:
       type: proxy
       url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
-        content_signal: ai-train          # origin-level default
         tiers:
           - route_pattern: /premium/*
-            content_signal: ai-input      # override: premium content licensed for inference, not training
             price:
               amount_micros: 5000
               currency: USD
@@ -298,11 +298,11 @@ origins:
               currency: USD
 ```
 
-The valid values are `ai-train`, `ai-input`, `search`. The set is closed; an unknown value rejects the config at load time with an error referencing this guide.
+The valid values are `ai-train`, `ai-input`, `search`. The set is closed; an unknown value rejects the config at load time with an error naming the allowed values.
 
-The matched tier's value (or the origin default when no tier matches) is stamped on `Content-Signal:` on every 200 response. A missing value means the response carries no header; existing crawlers see no change.
+The origin's value is stamped on `Content-Signal:` on every 200 response. A missing value means the response carries no `Content-Signal` header (the proxy stamps `TDM-Reservation: 1` instead); existing crawlers see no change.
 
-The `Content-Signal` header is a cooperative signal for standards-compliant crawlers and a mandatory field in the `<content-signal>` element of `/licenses.xml`. It is not security-critical; a motivated crawler can ignore it. The fact that it is asserted on the wire is what makes it actionable downstream: the JSON envelope's `license` URN and the `/licenses.xml` body together carry the operator's binding declaration of license terms.
+The `Content-Signal` header is a cooperative signal for standards-compliant crawlers and is echoed verbatim in the `<content-signal>` extension element of `/licenses.xml`. It is not security-critical; a motivated crawler can ignore it. The fact that it is asserted on the wire is what makes it actionable downstream: the JSON envelope's `license` URN and the `/licenses.xml` body together carry the operator's binding declaration of license terms.
 
 ## JSON envelope shape
 
@@ -313,7 +313,7 @@ When the agent sends `Accept: application/json` and the matched tier resolves to
   "schema_version": "1",
   "title": "Article Title",
   "url": "https://blog.example.com/articles/foo",
-  "license": "urn:rsl:1.0:blog.example.com:0xa3f9d2c1",
+  "license": "urn:rsl:1.0:blog.example.com:7",
   "content_md": "# Article Title\n\nBody in Markdown...",
   "fetched_at": "2026-05-01T12:00:00Z",
   "citation_required": true,
@@ -358,14 +358,12 @@ This is fail-safe over precision. A future revision can add a per-origin `pii_ex
 
 Four response-body transforms are added to the response pipeline in this order:
 
-1. **`boilerplate`**: drops `<nav>`, `<footer>`, `<aside>`, and comment-section elements from the HTML body before any other transform sees it. Cuts token counts on typical news / blog pages by 30 to 60 percent without losing article content. Conservative selectors: only the four element types listed; no class- or id-based heuristics. Operators who want stricter stripping can add a `replace_strings` or `html` transform after `boilerplate` runs.
-2. **`markup`**: HTML to Markdown via `pulldown-cmark`. Stamps `MarkdownProjection { body, title, token_estimate }` on the request context. Title is extracted from the first H1 heading in the body, falling back to the HTML `<title>` element when H1 is absent. Token estimate is computed once here using the configured `token_bytes_ratio` (default 0.25 tokens per byte for English prose) and is the only place the estimate is computed; downstream stages read it from the context.
-3. **`citation_block`**: prepends a citation header to the Markdown body when the matched tier asserts `citation_required: true`. The block carries source URL, license URN, and `fetched_at` timestamp:
+1. **`boilerplate`**: drops `<nav>`, `<footer>`, and `<aside>` elements, plus `<div>` elements whose `class` or `id` matches a comment, ad, or sidebar token (`comments`, `comment`, `comment-section`, `comment-list`, `comments-section`, `ad`, `ads`, `advert`, `advertisement`, `sidebar`), from the HTML body before any other transform sees it. Matching is case-insensitive and regex-based. Cuts token counts on typical news / blog pages by 30 to 60 percent without losing article content. Operators who want stricter stripping can add a `replace_strings` or `html` transform after `boilerplate` runs.
+2. **`markup`**: HTML to Markdown via a regex-based converter (the `pulldown-cmark` crate in this codebase only parses Markdown into HTML; it plays no part in this direction). Stamps `MarkdownProjection { body, title, token_estimate }` on the request context. Title is extracted from the first H1 heading in the produced Markdown, falling back to the HTML `<title>` element when H1 is absent. Token estimate is computed once here using the configured `token_bytes_ratio` (default 0.25 tokens per byte for English prose) and is the only place the estimate is computed; downstream stages read it from the context.
+3. **`citation_block`**: prepends a single citation line to the Markdown body when the matched tier asserts `citation_required: true`. The line carries the source URL and the license URN (falling back to `unknown` and `all-rights-reserved` respectively when unavailable); there is no fetched-at timestamp in the citation line:
 
    ```markdown
-   > Source: https://blog.example.com/articles/foo
-   > License: urn:rsl:1.0:blog.example.com:0xa3f9d2c1
-   > Fetched: 2026-05-01T12:00:00Z
+   > Citation required for AI training and inference. Source: https://blog.example.com/articles/foo. License: urn:rsl:1.0:blog.example.com:7.
 
    # Article Title
 
@@ -389,12 +387,14 @@ A small worked example for each of the four projections. Each shows the operator
 ```yaml
 origins:
   "blog.example.com":
+    content_signal: ai-train
     action:
       type: proxy
       url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
-        content_signal: ai-train
+        price: 0.001
+        currency: USD
         tiers:
           - route_pattern: /articles/*
             citation_required: true
@@ -409,9 +409,10 @@ origins:
 <?xml version="1.0" encoding="UTF-8"?>
 <rsl xmlns="https://rslstandard.org/rsl" version="1.0">
   <content url="https://blog.example.com/*">
-    <license urn="urn:rsl:1.0:blog.example.com:0xa3f9d2c1">
+    <license urn="urn:rsl:1.0:blog.example.com:0">
       <origin hostname="blog.example.com" />
-      <ai-use type="training" licensed="true" />
+      <payment type="crawl" amount="0.001" currency="USD" />
+      <permits type="usage">ai-train</permits>
       <content-signal>ai-train</content-signal>
     </license>
   </content>
@@ -425,12 +426,12 @@ origins:
 ```yaml
 origins:
   "docs.example.com":
+    content_signal: ai-input
     action:
       type: proxy
       url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
-        content_signal: ai-input
         tiers:
           - route_pattern: /api-reference/*
             price:
@@ -438,19 +439,19 @@ origins:
               currency: USD
 ```
 
-`/licenses.xml` asserts `<ai-use type="inference" licensed="true" />`. `/.well-known/tdmrep.json` emits one entry per priced route with `tdm-reservation: 1` and `tdm-policy` pointing at the companion `/licenses.xml` (the W3C TDMRep wire format does not encode the train-versus-inference distinction; it asserts only that rights are reserved and points the agent at the RSL document for the licensable terms). Crawlers attempting to use this content for training operate outside the licensed set; the absence of an `ai-train` declaration in the RSL document is the operator's signal that training is not licensed.
+`/licenses.xml` asserts `<permits type="usage">ai-input</permits>` and says nothing about `ai-train`. `/.well-known/tdmrep.json` emits one entry per priced route with `tdm-reservation: 1` and `tdm-policy` pointing at the companion `/licenses.xml` (the W3C TDMRep wire format does not encode the train-versus-inference distinction; it asserts only that rights are reserved and points the agent at the RSL document for the licensable terms). Crawlers attempting to use this content for training operate outside the permitted set; the absence of an `ai-train` grant in the RSL document is the operator's signal that training is not licensed. To make the prohibition explicit in the document body, use the plural `content_signals:` policy block described in [rsl.md](rsl.md).
 
-### Recipe 3: Block all AI use, default-deny
+### Recipe 3: Block all AI use, default-reserve
 
 ```yaml
 origins:
   "private.example.com":
+    # No content_signal: declared. The RSL document stays silent on usage.
     action:
       type: proxy
       url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
-        # No content_signal: declared. The default-deny rule applies.
         crawler_user_agents:
           - GPTBot
           - ClaudeBot
@@ -463,26 +464,25 @@ origins:
               currency: USD
 ```
 
-`/licenses.xml` asserts `<ai-use type="training" licensed="false" />` (the default-deny mapping). `/.well-known/tdmrep.json` emits an empty array `[]` (the absent `Content-Signal` produces "no right asserted equals right reserved"; the response middleware instead stamps `TDM-Reservation: 1` on every response so the right is reserved at the header layer). The high tier price on `/*` produces a 402 challenge with a price the operator does not actually expect to be paid; the policy is effectively a paywall on every AI-class request.
+`/licenses.xml` carries no `<permits>` or `<prohibits>` element at all: with no signal declared, the document is silent on usage (SBproxy emits no default-deny element because RSL 1.0 has none). `/.well-known/tdmrep.json` emits an empty array `[]`, and the response middleware stamps `TDM-Reservation: 1` on every response so the right is reserved at the header layer. The high tier price on `/*` produces a 402 challenge with a price the operator does not actually expect to be paid; the policy is effectively a paywall on every AI-class request.
 
 This is the recommended posture for content the operator does not want any AI use of.
 
-### Recipe 4: Per-route override
+### Recipe 4: Per-route pricing under one signal
 
-A single origin where `/premium/*` is licensed for AI training at a premium and `/public/*` is freely indexable for search but not training:
+A single origin where `/premium/*` is priced at a premium and `/public/*` is free, both under one origin-wide `search` signal:
 
 ```yaml
 origins:
   "blog.example.com":
+    content_signal: search
     action:
       type: proxy
       url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
-        content_signal: search                 # origin-level default
         tiers:
           - route_pattern: /premium/*
-            content_signal: ai-train           # override
             price:
               amount_micros: 5000
               currency: USD
@@ -492,7 +492,7 @@ origins:
               currency: USD
 ```
 
-`/premium/*` requests stamp `Content-Signal: ai-train` on the response; `/public/*` requests stamp `Content-Signal: search`. The `/licenses.xml` document carries a single `<content url="https://blog.example.com/*">` element wrapping one `<license>` body for the origin-level signal; the `urn:rsl:1.0:blog.example.com:<hash>` URN is the same for both routes (the URN is per-origin per config-version, not per-route). Per-route grouping inside `<rsl>` (one `<content>` per route) is a future extension. Operators expressing finer-grained rights today should rely on the TDMRep projection's per-route entries rather than splitting the URN.
+Every 200 response from this origin stamps `Content-Signal: search`; the signal is per-origin, and tiers carry no signal field, so there is no per-route override. The `/licenses.xml` document carries a single `<content url="https://blog.example.com/*">` element wrapping one `<license>` body; the `urn:rsl:1.0:blog.example.com:<version>` URN is the same for both routes (the URN is per-origin per config version, not per-route). Per-route grouping inside `<rsl>` (one `<content>` per route) is a future extension. Operators expressing finer-grained rights today should rely on the TDMRep projection's per-route entries, or split the routes onto separate hostnames with one signal each.
 
 Run `sbproxy projections render --kind licenses --config ./sb.yml` after making any of these changes to confirm the output before pushing to production.
 
@@ -512,16 +512,16 @@ Absence of a key means permissive. An agent that sends no `aipref:` header sees 
 
 ### Scripting surface
 
-The parsed signal is exposed in every scripting engine (CEL, Lua, JavaScript, WASM) via the `request.aipref` namespace:
+The parsed signal is exposed to CEL `expression` policies via the `request.aipref` namespace:
 
 ```yaml
 policies:
-  - type: cel
+  - type: expression
     expression: request.aipref.train || request.headers["x-research-license"] != ""
     deny_message: "Training use requires aipref: train=yes or a research license header."
 ```
 
-The same fields are available from Lua via `request.aipref.train`, from JavaScript via `request.aipref.train`, and from WASM via the host-allowlisted `request_aipref_train()` import.
+Lua and JavaScript see the same three booleans on the `ctx` argument their modifier and JSON-transform functions receive: `ctx.request.aipref.train`, `ctx.request.aipref.search`, and `ctx.request.aipref.ai_input`. There is no WASM binding for the signal; WASM body transforms only see the body bytes on stdin.
 
 The full parser contract lives in `crates/sbproxy-modules/src/policy/aipref.rs`. Malformed input (a directive missing its `=` separator, an empty key) falls through to the default-permissive signal and emits a structured warn log; valid input is surfaced to scripts unchanged.
 
@@ -529,9 +529,9 @@ The full parser contract lives in `crates/sbproxy-modules/src/policy/aipref.rs`.
 
 Companion documents:
 
-- [ai-crawl-control.md](ai-crawl-control.md): the `ai_crawl_control` policy reference (tiers, free preview, paywall position). `content_signal` and `citation_required` attach to the same tier shape.
-- [configuration.md](configuration.md): the full YAML reference (proxy settings, origins, transforms, policies). Look for the `content_negotiate` action and the new transform names.
-- [observability.md](observability.md): the metrics, logs, and traces surface. Content-shaping metrics include `sbproxy_content_shape_served_total{origin, shape}` and `sbproxy_projection_refresh_total{origin, kind}`.
+- [ai-crawl-control.md](ai-crawl-control.md): the `ai_crawl_control` policy reference (tiers, free preview, paywall position). `citation_required` attaches to the tier shape; `content_signal` is an origin-level key.
+- [configuration.md](configuration.md): the full YAML reference (proxy settings, origins, transforms, policies). Look for the origin-level `content_signal` and `default_content_shape` keys and the content-shaping transform names.
+- [observability.md](observability.md): the metrics, logs, and traces surface. The served content shape lands as the `content_shape` label on `sbproxy_requests_total`; projection health is observable via `sbproxy_projection_render_failures_total{projection}`, which stays at zero in a healthy deployment.
 - [rsl.md](rsl.md): the RSL 1.0 cookbook for license-term expression. Pair this guide with that one when writing `content_signal` config.
 
 External references:

@@ -1,5 +1,7 @@
 # Local embedding semantic cache
 
+*Last modified: 2026-07-09*
+
 Serves near-duplicate AI prompts from cache, vectorizing prompts on-box via the
 classifier sidecar instead of a paid provider embedding API. No per-call cost,
 no prompt egress, low loopback latency.
@@ -15,9 +17,10 @@ cargo run -p sbproxy-classifier-sidecar -- \
   --embed-model all-MiniLM-L6-v2=/models/minilm/model.onnx:/models/minilm/tokenizer.json
 ```
 
-Then the proxy:
+Then the proxy. The provider block in `sb.yml` reads `${OPENAI_API_KEY}`:
 
 ```bash
+export OPENAI_API_KEY=sk-...
 make run CONFIG=examples/semantic-cache-local/sb.yml
 ```
 

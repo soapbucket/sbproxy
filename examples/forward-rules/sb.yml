@@ -40,7 +40,7 @@ origins:
       url: https://test.sbproxy.dev/anything
 
     forward_rules:
-      # /api/* -> jsonplaceholder, with the /api prefix stripped by a modifier.
+      # /api/* -> dummyjson, with the /api prefix stripped by a modifier.
       - rules:
           - path:
               prefix: /api/

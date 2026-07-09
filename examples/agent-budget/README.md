@@ -1,6 +1,6 @@
 # agent_budget: per-agent semantic rate limit
 
-*Last modified: 2026-05-31*
+*Last modified: 2026-07-09*
 
 ![agent_budget: per-agent semantic rate limit](../../docs/assets/agent-budget.gif)
 
@@ -21,7 +21,7 @@ make run CONFIG=examples/agent-budget/sb.yml
 # First 60 in a 60s window return 200; the next 10 return 429.
 for i in $(seq 1 70); do
   curl -s -o /dev/null -w '%{http_code}\n' \
-    -H 'Host: ai.example.com' \
+    -H 'Host: ai.local' \
     -H 'User-Agent: Cursor/0.42.0' \
     http://127.0.0.1:8080/echo
 done

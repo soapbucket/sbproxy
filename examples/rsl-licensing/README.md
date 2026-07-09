@@ -1,5 +1,5 @@
 # RSL licensing
-*Last modified: 2026-05-08*
+*Last modified: 2026-07-09*
 
 Demonstrates the Wave 4 policy-graph projections. A single
 `ai_crawl_control` policy plus the per-origin `content_signal` field
@@ -176,8 +176,8 @@ as a per-projection table.
 
 ## Related docs
 
--  - A4.1 projections ADR.
--  - G4.1 content-negotiate ADR.
+- `docs/content-for-agents.md` - the four generated projections,
+  their refresh-on-reload semantics, and content-shape negotiation.
 - `examples/markdown-for-agents/` - companion bundle for the Markdown
   projection.
 - `examples/robots-llms-txt/` - companion bundle for `robots.txt` plus

@@ -2,10 +2,11 @@ apiVersion: 1
 
 # Grafana dashboard provider for the reference stack.
 #
-# This loads every JSON file in /etc/grafana/provisioning/dashboards/ at
-# startup. The real Wave 1 dashboards (overview, per-agent, policy
-# triggers, audit log, traces overview) ship in task B1.6 and will drop
-# into this same directory.
+# This loads every JSON file under /etc/grafana/provisioning/dashboards/
+# at startup, scanning subdirectories. docker-compose.yml mounts the
+# SBproxy dashboards from ../../deploy/dashboards/ (overview, per-agent,
+# policy triggers, audit log, traces overview, boilerplate stripping,
+# content shapes, licensing edits) into the sbproxy/ subdirectory here.
 
 providers:
   - name: sbproxy-reference

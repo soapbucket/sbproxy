@@ -6,7 +6,7 @@
 CARGO       ?= cargo
 DOCKER      ?= docker
 KIND        ?= kind
-CONFIG      ?= examples/00-basic-proxy/sb.yml
+CONFIG      ?= examples/basic-proxy/sb.yml
 LOG_LEVEL   ?= info
 BIND_PORT   ?= 8080
 KIND_CLUSTER ?= sbproxy-smoke

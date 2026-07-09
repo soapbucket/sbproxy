@@ -1,6 +1,6 @@
 # Exposed credentials
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Exposed credentials](../../docs/assets/exposed-credentials.gif)
 
@@ -21,15 +21,15 @@ curl -i -u alice:password -H 'Host: api.local' http://127.0.0.1:8080/get
 # HTTP/1.1 200 OK
 # (upstream view will include exposed-credential-check: leaked-password)
 
-curl -s -u alice:password -H 'Host: api.local' http://127.0.0.1:8080/get | jq '.headers["Exposed-Credential-Check"]'
+curl -s -u alice:password -H 'Host: api.local' http://127.0.0.1:8080/get | jq '.headers["exposed-credential-check"]'
 # "leaked-password"
 
 # Hash-only entry: SHA-1("hunter2") matches.
-curl -s -u alice:hunter2 -H 'Host: api.local' http://127.0.0.1:8080/get | jq '.headers["Exposed-Credential-Check"]'
+curl -s -u alice:hunter2 -H 'Host: api.local' http://127.0.0.1:8080/get | jq '.headers["exposed-credential-check"]'
 # "leaked-password"
 
 # Clean credential: no tag header.
-curl -s -u alice:'8sQ%2nT9.zR1@p#X' -H 'Host: api.local' http://127.0.0.1:8080/get | jq '.headers["Exposed-Credential-Check"] // "not present"'
+curl -s -u alice:'8sQ%2nT9.zR1@p#X' -H 'Host: api.local' http://127.0.0.1:8080/get | jq '.headers["exposed-credential-check"] // "not present"'
 # "not present"
 
 # To switch to hard-block, set action: block and the same request becomes:

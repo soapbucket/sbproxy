@@ -1,6 +1,6 @@
 # Production resilience stack
 
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-09*
 
 ![Production resilience stack](../../docs/assets/resilience-stack.gif)
 
@@ -12,16 +12,18 @@ Composes four signals on a single load balancer so a flaky backend gets isolated
 sbproxy serve -f sb.yml
 ```
 
-No setup required. Targets are `test.sbproxy.dev` and `test.sbproxy.dev/status/503`. Drive failures by hitting `/status/503`; healthy traffic via `/anything` and `/status/200`.
+No setup required. Targets are `test.sbproxy.dev` and `test.sbproxy.dev/status/503`; load balancer targets are addressed by scheme, host, and port only, so the second target's `/status/503` path is not applied to traffic and both lanes reach the same echo upstream. Drive failures by requesting `/status/503`, which the echo answers with 503 from either lane; healthy traffic via `/anything` and `/status/200`.
 
 ## Try it
 
 ```bash
-# Healthy traffic distributed round-robin across both targets.
+# Healthy traffic distributed round-robin across both targets; both
+# lanes answer 200.
 for i in 1 2 3 4; do
   curl -s -o /dev/null -w "%{http_code}\n" \
     -H 'Host: localhost' http://127.0.0.1:8080/status/200
 done
+# 200 (x4)
 ```
 
 ```bash
@@ -34,13 +36,18 @@ done
 ```
 
 ```bash
-# Simulate sustained 5xx; after 5 consecutive failures the breaker
-# trips and traffic shifts to the healthy peer until the open
-# duration elapses and HalfOpen probes succeed.
+# Simulate sustained 5xx. /status/503 answers 503 from either lane;
+# each 503 is retried per retry_on and recorded against the lane that
+# served it. After 5 consecutive failures a lane's breaker opens;
+# once every lane is open the LB falls back to the unfiltered list
+# rather than failing closed, and the path keeps returning 503 to
+# the client. Recovery runs via HalfOpen probes after
+# open_duration_secs.
 for i in 1 2 3 4 5 6; do
   curl -s -o /dev/null -w "%{http_code}\n" \
     -H 'Host: localhost' http://127.0.0.1:8080/status/503
 done
+# 503 (x6)
 ```
 
 ## What this exercises

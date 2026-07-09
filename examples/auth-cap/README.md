@@ -11,7 +11,7 @@ The example is offline-friendly: a TEST Ed25519 keypair lives under `tokens/`, a
 ## Files
 
 ```
-25-auth-cap/
+auth-cap/
   sb.yml                 - proxy config; auth.type: cap with static JWKS
   mint.py                - mints a sample CAP token from tokens/test-private.pem
   tokens/
@@ -104,7 +104,7 @@ HTTP/1.1 403 Forbidden
 
 ## smoke.json
 
-`smoke.json` ships four declarative cases mirroring the four scenarios above (missing, tampered, wrong audience, valid). It is consumed by `scripts/examples-smoke.sh` for examples that bundle a `docker-compose.yml`; this example does not, so the file is informational and pinned to the same shape as siblings such as `00-observability-stack/`.
+`smoke.json` ships four declarative cases mirroring the four scenarios above (missing, tampered, wrong audience, valid). It is consumed by `scripts/examples-smoke.sh` for examples that bundle a `docker-compose.yml`; this example does not, so the file is informational and pinned to the same shape as siblings such as `observability-stack/`.
 
 ## Production notes
 
@@ -116,5 +116,5 @@ HTTP/1.1 403 Forbidden
 ## See also
 
 - [docs/configuration.md](../../docs/configuration.md) - configuration schema reference
-- [examples/auth-jwt](../20-auth-jwt) - generic JWT auth (HS256 with a shared secret)
-- [examples/auth-forward](../23-auth-forward) - delegated auth via a subrequest
+- [examples/auth-jwt](../auth-jwt) - generic JWT auth (HS256 with a shared secret)
+- [examples/auth-forward](../auth-forward) - delegated auth via a subrequest

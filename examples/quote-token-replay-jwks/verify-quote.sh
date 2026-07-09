@@ -9,9 +9,11 @@
 #   3. Decode the JWS header + payload (base64url) and pretty-print.
 #   4. Verify the signature against the JWK using `openssl dgst`.
 #      Ed25519 signatures land via `openssl pkeyutl -verify`.
-#   5. Redeem the token by retrying the request with a
-#      `crawler-payment: <token>` header. Expect 200.
-#   6. Retry the redeem. Expect 409 (single-use enforcement).
+#   5. Explain the redeem step. Documented only, not executed: the
+#      in-memory ledger in this example cannot redeem a JWS quote
+#      token.
+#   6. Explain the replay guard. Documented only, not executed: a
+#      real ledger answers 409 on a second redeem of the same nonce.
 #
 # Requirements:
 #   - jq      (apt install jq / brew install jq)
@@ -134,12 +136,12 @@ fi
 # hard error and the proxy will respond 402 again, not 200.
 #
 # A real deployment wires `policies[].ledger:` at an HTTP ledger
-# (see docs/billing-rails.md) that knows how to verify the JWS
+# (see docs/ai-crawl-control.md) that knows how to verify the JWS
 # directly. The verify-then-redeem flow ends here for this example;
 # the README continues the walkthrough with a config snippet showing
 # the ledger wiring.
 echo "==> 5/6 Redeem step (documented; not executed)"
-echo "    See docs/billing-rails.md for the http-ledger wiring that"
+echo "    See docs/ai-crawl-control.md for the http-ledger wiring that"
 echo "    accepts a verified JWS as a valid redemption."
 
 # --- Step 6: replay attempt ---------------------------------------

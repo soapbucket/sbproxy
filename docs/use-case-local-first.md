@@ -1,10 +1,10 @@
 # You bought a GPU. Prove it pays for itself.
 
-*Last modified: 2026-07-07*
+*Last modified: 2026-07-09*
 
 ![A local Qwen3 answer from the GPU, a training-sensitive prompt pinned to the local lane, then the ledger split across both lanes and the dollars the GPU displaced](assets/use-case-local-first.gif)
 
-The recording above shows provider failover between two hosted providers, the closest recorded behavior to this story's local-to-cloud spill. The local-first recording lands with GPU certification.
+The recording above shows provider failover between two hosted providers, the closest recorded behavior to this story's local-to-cloud spill. The local-first recording is still to come.
 
 The card is racked, the driver loads, and most of your prompts would run fine on it. But traffic spikes past what one GPU can serve, a few requests genuinely need a frontier model, and finance keeps asking whether the hardware was worth it. SBproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that routes to 66 providers or runs the weights on your own GPUs. This page uses both halves at once, and the ledger that comes with them answers the finance question.
 
@@ -15,11 +15,11 @@ An OpenAI-compatible endpoint backed by a single provider array. Provider zero i
 ## Prerequisites
 
 - A Linux host with an NVIDIA GPU for the local lane. This story was written against an L4-class card. The released binary adapts at runtime: on a GPU-free host the same config validates and boots, but the `serve:` block starts no engine and every request spills to the cloud lane.
-- An inference engine the box can run: a prebuilt `llama-server` on `PATH`, or vLLM via a container runtime. `sbproxy doctor` reports what it found and names every blocker.
+- An inference engine, which SBproxy acquires on first use: a pinned `llama-server` prebuilt for GGUF weights, or vLLM run through `uv tool run` for safetensors. A binary already on `PATH` is preferred over any fetch. `sbproxy doctor` reports what it found and names every blocker.
 - An OpenAI API key (`OPENAI_API_KEY`) for the spill lane.
 - `curl` for sending requests, `jq` for reading responses and the ledger.
 
-One caveat. The model host is landing in phases. The catalog, the fit planner, the engine supervisor, and the `serve:` config surface ship today, and the real vLLM and llama.cpp bring-up is certified against actual GPUs in later phases. [model-host.md](model-host.md) says exactly where that stands; run `sbproxy doctor` before trusting a box.
+One caveat. The catalog, the fit planner, the engine supervisor, engine acquisition, and the `serve:` config surface all ship today, and the real vLLM and llama.cpp bring-up is certified on hardware: GGUF on Apple Silicon Metal, safetensors on an NVIDIA L4 through vLLM. Hosts still differ, so run `sbproxy doctor` before trusting a box; [model-host.md](model-host.md) has the reference.
 
 ## Install
 
@@ -73,7 +73,7 @@ Now the local lane:
                 keep_alive: 30m
 ```
 
-The `serve:` block is the part that makes this box a provider. There is no `base_url`: the gateway spawns the engine and resolves its loopback port itself. The weights are named explicitly (repo, quant, file), llama-server serves them with the GGUF's embedded chat template (`--jinja`), and `name:` is the model id every plane sees. Bare catalog ids with the fit planner choosing a quant for your card (FP8 on an L4, an int4 GGUF on a T4) take over once catalog-driven serving lands; the explicit form is the one certified on hardware today. `keep_alive: 30m` unloads an idle engine to free VRAM.
+The `serve:` block is the part that makes this box a provider. There is no `base_url`: the gateway spawns the engine and resolves its loopback port itself. The weights are named explicitly (repo, quant, file), llama-server serves them with the GGUF's embedded chat template (`--jinja`), and `name:` is the model id every plane sees. A bare catalog id works too, with the fit planner choosing a quant for your card (FP8 on an L4, an int4 GGUF on a T4); the explicit form pins the exact weights file. `keep_alive: 30m` unloads an idle engine to free VRAM.
 
 The `no_prompt_training: true` flag matters more than it looks. Tokens served here never leave the box, so the local lane is safe for prompts that opt out of training. The flag is also load-bearing: a request that opts out routes only to providers marked this way, so leaving it off would exclude the local lane from exactly the prompts it should keep.
 

@@ -51,6 +51,8 @@ origins:
           default_model: claude-haiku-4-5
           models:
             - claude-haiku-4-5
-            - claude-haiku-4-5
-            - claude-haiku-4-5
       routing: round_robin
+      # Gateway-level model allowlist: any other requested model is
+      # rejected with 403 before an upstream call is made.
+      allowed_models:
+        - claude-haiku-4-5

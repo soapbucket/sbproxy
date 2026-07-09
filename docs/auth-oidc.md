@@ -1,6 +1,6 @@
 # OIDC Relying-Party login
 
-*Last modified: 2026-06-03*
+*Last modified: 2026-07-09*
 
 The `oidc` auth provider turns SBproxy into an OpenID Connect
 Relying Party. Unlike the `jwt` provider, which only validates a
@@ -113,7 +113,7 @@ The headers stamped are:
 |---|---|
 | `X-Auth-Subject` | `sub` |
 | `X-Auth-Email` | `email` (when present and `email_verified` is `true`) |
-| `X-Auth-Name` | `name` (when present) |
+| `X-Auth-User` | `preferred_username`, falling back to `name` (first present) |
 | `X-Auth-Groups` | `groups` (comma-joined when array-shaped) |
 
 Upstreams MUST be configured to trust these headers only from

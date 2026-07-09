@@ -1,6 +1,6 @@
 # Forward rules
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Forward rules](../../docs/assets/forward-rules.gif)
 
@@ -27,11 +27,11 @@ curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/admin/dashboard
 
 # No rule matches -> default action proxies to test.sbproxy.dev/anything.
 curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/health
-# {"args":{},"data":"","headers":{...},"method":"GET","url":"https://test.sbproxy.dev/anything/health"}
+# {"method":"GET","url":"/anything/health","headers":{"host":"test.sbproxy.dev",...},"query":{},"timestamp":"2026-07-09T19:29:58.060Z"}
 
 # Verify the X-Routed-By header set by the /api/* child origin.
-curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/api/products/1 -o /dev/null -w '%{http_code}\n'
-# 200
+curl -si -H 'Host: gateway.local' http://127.0.0.1:8080/api/products/1 | grep -i x-routed-by
+# x-routed-by: forward-rule-api
 ```
 
 ## What this exercises

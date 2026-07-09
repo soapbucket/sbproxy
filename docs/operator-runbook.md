@@ -1,6 +1,6 @@
 # Operator runbook
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 This runbook is the dashboard/action companion to
 [`quickstart-operator.md`](quickstart-operator.md). Use the quickstart for first
@@ -63,9 +63,10 @@ fixing a typo in `ai_providers.yml` no longer requires a restart, and in-flight
 requests are not shed. The process-wide AI budget tracker is deliberately not
 part of the swap: per-scope token and cost accumulators must survive reloads
 because budget windows are wall-clock-relative (daily, monthly), and wiping
-them on reload would let already-spent budget through twice. To zero a budget
-intentionally, restart the process or call the per-scope reset path on the
-admin surface.
+them on reload would let already-spent budget through twice. Budget state is
+in-memory, so a full process restart resets every accumulator to zero; there
+is no admin endpoint for resetting a budget. Treat restarts during an active
+budget window accordingly: spend already recorded is forgotten.
 
 ## Origins
 

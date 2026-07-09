@@ -1,4 +1,4 @@
-# Stack for the `24-ai-crawl-tiered` example. Three containers on
+# Stack for the `ai-crawl-tiered` example. Three containers on
 # one bridge network:
 #
 #   sbproxy      - the gateway, mounts ./sb.yml read-only on :8080

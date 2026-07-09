@@ -1,5 +1,5 @@
 # Supported providers
-*Last modified: 2026-06-17*
+*Last modified: 2026-07-09*
 
 SBproxy ships native adapters for 66 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged. Anthropic, Bedrock, and Gemini use in-tree translators for OpenAI-shaped chat or embedding clients; SageMaker, Oracle, Watsonx, and other `Custom` formats pass through in their native shape.
 
@@ -13,7 +13,7 @@ Each provider has a default base URL and auth format. Override `base_url` if you
 |------|----------|--------|------|------------------|
 | `openai` | OpenAI | OpenAI | `Authorization: Bearer` | `https://api.openai.com/v1` |
 | `anthropic` | Anthropic Claude | Anthropic Messages | `x-api-key` | `https://api.anthropic.com/v1` |
-| `gemini` | Google Gemini | Google | `Authorization: Bearer` | `https://generativelanguage.googleapis.com/v1beta` |
+| `gemini` | Google Gemini | Google | `x-goog-api-key` | `https://generativelanguage.googleapis.com/v1beta` |
 | `azure` | Azure OpenAI | OpenAI | `api-key` | `https://{resource}.openai.azure.com/openai` |
 | `bedrock` | AWS Bedrock | Bedrock | Authorization (SigV4 signed externally)[^sigv4] | `https://bedrock-runtime.{region}.amazonaws.com` |
 | `cohere` | Cohere | OpenAI | `Authorization: Bearer` | `https://api.cohere.com/v2` |

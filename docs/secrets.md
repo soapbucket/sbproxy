@@ -1,6 +1,6 @@
 # Secret Backends
 
-*Last modified: 2026-07-07*
+*Last modified: 2026-07-09*
 
 SBproxy resolves secret material through provider-specific reference schemes. The scheme names the provider type, the authority names the configured backend instance, and the path is interpreted by that provider:
 
@@ -8,7 +8,7 @@ SBproxy resolves secret material through provider-specific reference schemes. Th
 <scheme>://<backend-name>/<provider-path>[?version=<n>][&key=<json-field>]
 ```
 
-The same reference text can resolve to different physical stores in a multi-tenant deployment because backend instances are declared at proxy, tenant, or origin scope. Resolution walks origin scope first, then tenant scope, then proxy scope, and uses the first backend whose name and provider type match the reference.
+Backend instances are declared once, at proxy scope, under `proxy.secrets.backends:`. There is no per-tenant or per-origin backend list. A reference resolves against the backend whose `name` matches the authority segment and whose provider type matches the scheme; to keep tenants on separate stores, declare one named backend per store and reference the right name from each origin.
 
 ## Scheme Table
 
@@ -29,7 +29,7 @@ file:/path/to/secret
 secret:<name>
 ```
 
-The old umbrella form, `vault://<alias>/...`, is accepted with a warning during the compatibility window. The shim is scheduled for removal in SBproxy `1.2.0`. To rewrite known aliases, run:
+The old umbrella form, `vault://<alias>/...`, is still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced. To rewrite known aliases, run:
 
 ```bash
 sbproxy config migrate sb.yml --out sb.migrated.yml
@@ -320,6 +320,6 @@ Every backend caches successful reads for the configured TTL. A `set` on the sam
 
 ## Related Reading
 
-* `docs/configuration.md` for proxy, tenant, and origin scopes.
+* `docs/configuration.md` for the `proxy.secrets` block and reference URI grammar.
 * `docs/multi-tenant.md` for the inheritance model and isolation guarantees.
 * `docs/migration-credentials.md` for the `virtual_keys:` to `credentials:` migration and the vault reference migration note.

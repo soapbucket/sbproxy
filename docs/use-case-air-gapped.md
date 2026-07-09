@@ -1,6 +1,6 @@
 # Air-gapped AI: weights, prompts, and verdicts that never leave your network
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 ![Terminal recording: sbproxy doctor reports the host, the manifest shows a file: source with pinned sha256 digests, validate and plan pass with no network access, and a prompt injection attempt is blocked on the box](assets/use-case-air-gapped.gif)
 
@@ -8,7 +8,7 @@ Some networks end at a wall. Classified enclaves, medical records systems, indus
 
 ## What you will build
 
-An AI gateway with nothing to say to the outside world, and a way to check that claim rather than take it. The model manifest lists one model whose `source` is a `file:` path, weights that were vetted on the connected side of the transfer and carried across by whatever your enclave uses (a data diode, a burned disk, a courier). The manifest pins a sha256 digest for each weight file, which turns it into a supply-chain allowlist: a reviewable document that says exactly which bytes are allowed to reach an inference engine. The pull policy is `manual`, so the gateway never decides on its own to fetch anything. Prompt injection and PII checks run in process, and the semantic cache's embedding model is an ONNX file on the box, reached over loopback. A Docker Compose file finishes the job by putting the gateway on an internal-only network, so the no-egress claim is enforced by the kernel instead of by everyone's good behavior.
+An AI gateway with nothing to say to the outside world, and a way to check that claim rather than take it. The model manifest lists one model whose `source` is a `file:` path, weights that were vetted on the connected side of the transfer and carried across by whatever your enclave uses (a data diode, a burned disk, a courier). The manifest pins a sha256 digest for each weight file, which turns it into a supply-chain allowlist: a reviewable document that says exactly which bytes are allowed to reach an inference engine. The pull policy is `manual`, so the gateway never decides on its own to fetch weights. Weights are not the only artifact with a fetch path, though: on a connected box the runtime acquires a missing inference engine on first use, so in the enclave you stage `llama-server` on `PATH` the same way you stage the weights. SBproxy prefers a `PATH` binary over any fetch, so no engine acquisition is ever attempted. Prompt injection and PII checks run in process, and the semantic cache's embedding model is an ONNX file on the box, reached over loopback. A Docker Compose file finishes the job by putting the gateway on an internal-only network, so the no-egress claim is enforced by the kernel instead of by everyone's good behavior.
 
 Two honesty notes before you start, both from [model-host.md](model-host.md). The model host is landing in phases: the manifest's config surface (sources, digests, pull policy) parses and validates everywhere, and the runtime half that acts on it runs end to end on a GPU host. Digest verification happens inside the serve lifecycle, when weights are pulled or an engine is about to be spawned, and a mismatch aborts the launch; there is no standalone CLI command that verifies a manifest against the disk. On a host with no GPU, a `serve:` block parses and validates but starts no engine, so every governance surface on this page works on your laptop while actual tokens need the GPU box.
 
@@ -119,12 +119,13 @@ The on-box ONNX pieces:
 
 The semantic cache's default `source` is `provider`, which calls a provider's `/v1/embeddings` API: exactly the quiet egress this deployment exists to prevent. `source: sidecar` keeps the embedding model on the box, a ~90 MB Apache-2.0 ONNX file served by `sbproxy-classifier-sidecar` over loopback gRPC on a pure-Rust engine, no Python. If the sidecar is not running, lookups degrade to misses and requests proceed. `prompt_injection_v2` adds a second injection layer with its own threshold; `heuristic-v1` is the zero-dependency in-process detector, and the same sidecar can host the ONNX injection classifier once you stage its model files. [local-inference.md](local-inference.md) covers both models, their digests, and the air-gapped staging procedure.
 
-So, the accounting the auditor asked for. What leaves the box: nothing. Per channel:
+So, the accounting the auditor asked for. What leaves the box: nothing. One channel is closed by staging rather than by config: the runtime would fetch a missing inference engine on first use (a pinned llama.cpp release, or `uv` for vLLM), so the engine binary is carried across the wall like the weights are. Per channel:
 
 | Potential egress | Why it is closed here |
 |---|---|
 | Provider API calls | No cloud provider in the config. The one provider is a `serve:` block with no `base_url` and no key. |
 | Weight downloads | `source: file:` reads staged weights in place; `pull: manual` forbids fetching; no `hf_token` exists to use. |
+| Engine acquisition | `llama-server` is staged on `PATH`, and a `PATH` binary is preferred over the pinned-release fetch, so no download is attempted. |
 | Guardrail verdicts | Injection, PII, and `heuristic-v1` are in-process pattern checks. No moderation API. |
 | Embeddings | `source: sidecar` is loopback to an on-box ONNX model, replacing the default provider-API path. |
 | Metrics and traces | The Prometheus endpoint is scraped (inbound); the OTLP exporter is off by default and not configured here ([observability.md](observability.md)). |
@@ -147,7 +148,7 @@ $ sbproxy plan -f examples/use-case-air-gapped/sb.yml
 Plan: 1 added, 0 changed, 0 removed. max-blast-radius: reload
 ```
 
-`plan` exits 2 for "changes present, no errors" (against an empty baseline the whole origin is an add), 3 if semantic validation fails, 0 for a no-op. Then ask the host what it can do:
+`plan` exits 2 for "changes present, no errors" (against an empty baseline the whole origin is an add), 3 if semantic validation fails, 0 for a no-op. Then ask the host what it can do. The report below is abbreviated; run `sbproxy doctor` on your box for the live report:
 
 ```console
 $ sbproxy doctor
@@ -156,10 +157,10 @@ model cache
   /var/lib/sbproxy/models (not created yet)
 
 local model serving (serve:): not available
-  - no NVIDIA GPU detected (NVML not loadable and nvidia-smi absent or reporting no devices)
+  - ...
 ```
 
-On a laptop that verdict is correct and the gateway is honest about it at boot too:
+On a host that cannot admit the model, that verdict is correct: the report ends with `not available` and names each blocker. The gateway is honest about it at boot too; with no GPU visible it logs:
 
 ```console
 $ sbproxy examples/use-case-air-gapped/sb.yml

@@ -49,6 +49,10 @@ services:
       - "3000:3000"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # SBproxy dashboard JSON from the repo. The dashboards.yml provider
+      # scans /etc/grafana/provisioning/dashboards recursively, so these
+      # load into the SBproxy folder at startup.
+      - ../../deploy/dashboards:/etc/grafana/provisioning/dashboards/sbproxy:ro
       - grafana_data:/var/lib/grafana
     depends_on:
       prometheus:

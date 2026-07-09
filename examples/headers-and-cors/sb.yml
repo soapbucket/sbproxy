@@ -25,7 +25,7 @@ origins:
       - headers:
           set:
             X-Forwarded-By: sbproxy
-            X-Trace-Id: "{{ uuid() }}"
+            X-Trace-Id: "{{ request.id }}"
           delete:
             - cookie
 

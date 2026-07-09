@@ -1,6 +1,6 @@
 # GPU fit planning
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 When you name a model, the fit planner decides which quantization to
 run on the GPU you have, and it refuses a configuration the card cannot
@@ -80,9 +80,10 @@ Every decision is meant to be legible. When it refuses, the message
 distinguishes the two failure modes: a capability refusal names the
 kernel the card lacks (FP8 on a Turing T4), and a size refusal reports
 the free VRAM and the smallest estimate it could find. When it picks,
-it reports the quant and the estimated VRAM at your context. The engine
-doctor in `sbproxy plan` shows the same resolution per model before
-anything spawns.
+it reports the quant and the estimated VRAM at your context.
+`sbproxy doctor <config>` shows the same resolution per model before
+anything spawns, and `sbproxy models` prints a per-GPU fit verdict
+for every catalog model.
 
 ## A worked example
 
