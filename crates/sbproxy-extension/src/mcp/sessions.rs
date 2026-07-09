@@ -17,10 +17,44 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Session-level risk signals used by guardrails that need memory
+/// across multiple MCP requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionRisk {
+    /// The session has invoked at least one tool.
+    pub tool_access: bool,
+    /// The session has invoked a tool classified as private-data
+    /// access.
+    pub private_data: bool,
+    /// The session has invoked a tool classified as external
+    /// communication.
+    pub external_comm: bool,
+}
+
+impl SessionRisk {
+    /// The Archestra "lethal trifecta": tool access plus private data
+    /// plus external communication in one active session.
+    pub fn is_lethal_trifecta(self) -> bool {
+        self.tool_access && self.private_data && self.external_comm
+    }
+
+    fn merge(&mut self, other: SessionRisk) {
+        self.tool_access |= other.tool_access;
+        self.private_data |= other.private_data;
+        self.external_comm |= other.external_comm;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionEntry {
+    expires_at: Instant,
+    risk: SessionRisk,
+}
+
 /// In-memory session table with a sliding idle TTL.
 pub struct SessionStore {
     ttl: Duration,
-    inner: Mutex<HashMap<String, Instant>>,
+    inner: Mutex<HashMap<String, SessionEntry>>,
 }
 
 impl SessionStore {
@@ -42,7 +76,13 @@ impl SessionStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         Self::prune(&mut map);
-        map.insert(id.clone(), Instant::now() + self.ttl);
+        map.insert(
+            id.clone(),
+            SessionEntry {
+                expires_at: Instant::now() + self.ttl,
+                risk: SessionRisk::default(),
+            },
+        );
         id
     }
 
@@ -54,8 +94,8 @@ impl SessionStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         match map.get_mut(id) {
-            Some(expiry) if *expiry > Instant::now() => {
-                *expiry = Instant::now() + self.ttl;
+            Some(entry) if entry.expires_at > Instant::now() => {
+                entry.expires_at = Instant::now() + self.ttl;
                 true
             }
             Some(_) => {
@@ -73,8 +113,29 @@ impl SessionStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         match map.remove(id) {
-            Some(expiry) => expiry > Instant::now(),
+            Some(entry) => entry.expires_at > Instant::now(),
             None => false,
+        }
+    }
+
+    /// Merge risk signals into a live session and return its new
+    /// aggregate state. `None` means the session is unknown or expired.
+    pub fn record_risk(&self, id: &str, risk: SessionRisk) -> Option<SessionRisk> {
+        let mut map = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match map.get_mut(id) {
+            Some(entry) if entry.expires_at > Instant::now() => {
+                entry.expires_at = Instant::now() + self.ttl;
+                entry.risk.merge(risk);
+                Some(entry.risk)
+            }
+            Some(_) => {
+                map.remove(id);
+                None
+            }
+            None => None,
         }
     }
 
@@ -93,9 +154,9 @@ impl SessionStore {
         self.len() == 0
     }
 
-    fn prune(map: &mut HashMap<String, Instant>) {
+    fn prune(map: &mut HashMap<String, SessionEntry>) {
         let now = Instant::now();
-        map.retain(|_, expiry| *expiry > now);
+        map.retain(|_, entry| entry.expires_at > now);
     }
 }
 
@@ -147,5 +208,34 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.is_ascii());
         assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn risk_accumulates_within_one_live_session() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create();
+        let first = store
+            .record_risk(
+                &id,
+                SessionRisk {
+                    tool_access: true,
+                    private_data: true,
+                    external_comm: false,
+                },
+            )
+            .expect("live session");
+        assert!(!first.is_lethal_trifecta());
+
+        let second = store
+            .record_risk(
+                &id,
+                SessionRisk {
+                    tool_access: true,
+                    private_data: false,
+                    external_comm: true,
+                },
+            )
+            .expect("live session");
+        assert!(second.is_lethal_trifecta());
     }
 }

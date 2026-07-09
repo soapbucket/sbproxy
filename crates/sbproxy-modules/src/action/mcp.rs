@@ -70,8 +70,8 @@ use std::time::Duration;
 
 use sbproxy_extension::mcp::sessions::SessionStore;
 use sbproxy_extension::mcp::{
-    FederationIoSettings, McpFederation, McpServerConfig, NamespaceMode, ToolAccessPolicy,
-    ToolQuotaStore, ToolVersioningGate, VersioningMode,
+    EgressPolicy, FederationIoSettings, McpFederation, McpServerConfig, NamespaceMode,
+    ToolAccessPolicy, ToolQuotaStore, ToolVersioningGate, VersioningMode,
 };
 use serde::Deserialize;
 
@@ -96,6 +96,11 @@ pub struct McpActionConfig {
     /// List of upstream MCP servers to federate.
     #[serde(default)]
     pub federated_servers: Vec<McpFederatedServerConfig>,
+    /// Default egress policy for OpenAPI-backed REST tool calls.
+    /// Per-server `egress` overrides this block. Omitted preserves
+    /// the legacy allow-all behavior.
+    #[serde(default)]
+    pub egress: Option<EgressPolicy>,
     /// Inline guardrails applied at the gateway boundary before a
     /// `tools/call` is forwarded to its upstream.
     #[serde(default)]
@@ -156,6 +161,14 @@ pub struct McpActionConfig {
     /// stateless and ignores session headers entirely.
     #[serde(default)]
     pub sessions: Option<McpSessionConfig>,
+    /// Optional compaction for verbose MCP tool-result text blocks.
+    /// Disabled by default.
+    #[serde(default)]
+    pub token_compaction: Option<McpTokenCompactionConfig>,
+    /// Optional quarantine gate for suspicious MCP tool output.
+    /// Disabled by default.
+    #[serde(default)]
+    pub dual_llm_quarantine: Option<McpDualLlmQuarantineConfig>,
     /// Per-tool-call cost attribution (WOR-1644). MCP has no usage
     /// meter, so cost comes from this optional price map: a USD
     /// figure per advertised (namespaced) tool name. Counts and
@@ -241,6 +254,31 @@ pub struct McpSessionConfig {
     pub ttl: Option<Duration>,
 }
 
+/// Opt-in MCP tool-result compaction config (WOR-1795).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpTokenCompactionConfig {
+    /// Master switch. `false` keeps results unchanged even if the
+    /// block is present.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum UTF-8 bytes retained per text content block. Defaults
+    /// to 8192.
+    #[serde(default)]
+    pub max_text_bytes: Option<usize>,
+}
+
+/// Opt-in MCP tool-output quarantine config (WOR-1789).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpDualLlmQuarantineConfig {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Case-insensitive substrings that mark a tool result as
+    /// quarantined pending review by a secondary judge.
+    #[serde(default)]
+    pub suspicious_patterns: Vec<String>,
+}
+
 /// OAuth 2.0 Protected Resource Metadata (RFC 9728) for the MCP gateway.
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpOAuthConfig {
@@ -294,9 +332,20 @@ pub struct McpFederatedServerConfig {
     /// request layer. WOR-186.
     #[serde(default, with = "duration_str")]
     pub timeout: Option<Duration>,
+    /// Attach a bounded caller identity envelope to outbound tool
+    /// arguments so the upstream can authorize as the authenticated
+    /// user. Defaults off to preserve existing tool schemas.
+    #[serde(default)]
+    pub run_as_user_auth: bool,
     /// Transport name. Defaults to `streamable_http`; alternative is `sse`.
     #[serde(default)]
     pub transport: Option<String>,
+    /// Local executable for `transport: stdio`.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments for `transport: stdio`.
+    #[serde(default)]
+    pub args: Vec<String>,
     /// Upstream kind (WOR-1648). `mcp` (default) speaks MCP to the
     /// origin; `openapi` derives tools from an OpenAPI spec and
     /// dispatches `tools/call` as REST requests against the origin.
@@ -311,6 +360,11 @@ pub struct McpFederatedServerConfig {
     /// startup, not the hot path.
     #[serde(default)]
     pub spec_path: Option<String>,
+    /// Egress policy for this upstream's OpenAPI REST calls. Applies
+    /// only when `type: openapi`; omitted inherits action-level
+    /// `egress`, then allow-all.
+    #[serde(default)]
+    pub egress: Option<EgressPolicy>,
 }
 
 /// One entry in the gateway-level guardrails list.
@@ -323,6 +377,17 @@ pub enum McpGuardrailEntry {
         /// Fully-qualified tool names (e.g. `gh.search_repos`).
         #[serde(default)]
         allow: Vec<String>,
+    },
+    /// Deny a session once it combines tool access, private-data
+    /// access, and external communication. Tool patterns use the same
+    /// trailing-`*` glob convention as injected MCP filters.
+    LethalTrifecta {
+        /// Tool patterns classified as private-data access.
+        #[serde(default)]
+        private_data_tools: Vec<String>,
+        /// Tool patterns classified as external communication.
+        #[serde(default)]
+        external_comm_tools: Vec<String>,
     },
 }
 
@@ -356,6 +421,10 @@ pub struct McpAction {
     /// `None` when no allowlist guardrail was configured (open
     /// access). A set so per-tool checks are O(1) (WOR-1640).
     pub tool_allowlist: Option<HashSet<String>>,
+    /// Optional lethal-trifecta guardrail. When present, `tools/call`
+    /// records risk into the MCP session and denies calls that would
+    /// combine tool access, private data, and external communication.
+    pub lethal_trifecta: Option<McpLethalTrifectaGuardrail>,
     /// When `true`, `tools/list` advertises the `search` / `execute`
     /// meta-tools instead of the full catalogue (WOR-806).
     pub progressive_discovery: bool,
@@ -383,6 +452,10 @@ pub struct McpAction {
     /// reload invalidates them (the spec's 404-then-reinitialize
     /// flow covers exactly this).
     pub sessions: Option<Arc<SessionStore>>,
+    /// Opt-in result compaction config.
+    pub token_compaction: Option<McpTokenCompactionConfig>,
+    /// Opt-in tool-output quarantine config.
+    pub dual_llm_quarantine: Option<McpDualLlmQuarantineConfig>,
     /// Per-tool USD price map for cost attribution (WOR-1644).
     pub tool_pricing: HashMap<String, f64>,
     /// Built usage sinks for MCP tool-call attribution (WOR-1644),
@@ -403,6 +476,35 @@ pub struct McpServerPrefix {
     pub rbac: Option<String>,
     /// Optional per-server request timeout. WOR-186.
     pub timeout: Option<Duration>,
+    /// True when outbound tool calls should carry caller identity for
+    /// run-as-user upstream authorization.
+    pub run_as_user_auth: bool,
+}
+
+/// Configured tool classifications for the lethal-trifecta guardrail.
+#[derive(Debug, Clone, Default)]
+pub struct McpLethalTrifectaGuardrail {
+    /// Private-data tool globs.
+    pub private_data_tools: Vec<String>,
+    /// External-communication tool globs.
+    pub external_comm_tools: Vec<String>,
+}
+
+impl McpLethalTrifectaGuardrail {
+    /// Classify one tool call into session-risk bits.
+    pub fn classify(&self, tool_name: &str) -> sbproxy_extension::mcp::sessions::SessionRisk {
+        sbproxy_extension::mcp::sessions::SessionRisk {
+            tool_access: true,
+            private_data: self
+                .private_data_tools
+                .iter()
+                .any(|p| sbproxy_util::prefix_glob_match(p, tool_name)),
+            external_comm: self
+                .external_comm_tools
+                .iter()
+                .any(|p| sbproxy_util::prefix_glob_match(p, tool_name)),
+        }
+    }
 }
 
 impl McpAction {
@@ -459,6 +561,10 @@ impl McpAction {
             Vec::with_capacity(cfg.federated_servers.len());
         let mut prefixes: HashMap<String, McpServerPrefix> =
             HashMap::with_capacity(cfg.federated_servers.len());
+        let action_egress = cfg
+            .egress
+            .clone()
+            .unwrap_or_else(|| EgressPolicy::allow_all("action"));
 
         for upstream in cfg.federated_servers {
             // The upstream `name` doubles as the implicit collision-prefix
@@ -478,7 +584,19 @@ impl McpAction {
             // spec and dispatches REST; the origin is the REST base
             // URL, not an MCP endpoint.
             let is_openapi = upstream.server_type.as_deref() == Some("openapi");
-            let (url, openapi) = if is_openapi {
+            let is_stdio = transport == "stdio";
+            let (url, openapi) = if is_stdio {
+                let command = upstream.command.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "mcp action: stdio server '{}' needs command",
+                        upstream.origin
+                    )
+                })?;
+                (
+                    sbproxy_extension::mcp::encode_stdio_url(command, &upstream.args),
+                    None,
+                )
+            } else if is_openapi {
                 let base_url = normalize_rest_origin(&upstream.origin);
                 let spec = load_openapi_spec(&upstream)?;
                 let tools = sbproxy_extension::mcp::openapi_to_mcp_tools(&spec);
@@ -498,6 +616,11 @@ impl McpAction {
                         base_url,
                         tools,
                         routes,
+                        egress_policy: upstream
+                            .egress
+                            .clone()
+                            .unwrap_or_else(|| action_egress.clone())
+                            .with_scope(format!("server:{name}")),
                     }),
                 )
             } else {
@@ -518,6 +641,7 @@ impl McpAction {
                     prefix: upstream.prefix,
                     rbac: upstream.rbac,
                     timeout: upstream.timeout,
+                    run_as_user_auth: upstream.run_as_user_auth,
                 },
             );
         }
@@ -592,6 +716,7 @@ impl McpAction {
 
         // --- Collapse guardrails ---
         let tool_allowlist = collapse_allowlists(&cfg.guardrails);
+        let lethal_trifecta = collapse_lethal_trifecta(&cfg.guardrails);
 
         let has_principal_scoped_tools = prefixes.values().any(|p| p.rbac.is_some());
 
@@ -616,6 +741,7 @@ impl McpAction {
             rbac_policies: cfg.rbac_policies,
             federation,
             tool_allowlist,
+            lethal_trifecta,
             progressive_discovery: cfg.progressive_discovery,
             oauth: cfg.oauth,
             quota_store: Arc::new(ToolQuotaStore::new()),
@@ -626,6 +752,8 @@ impl McpAction {
                     s.ttl.unwrap_or(Duration::from_secs(30 * 60)),
                 ))
             }),
+            token_compaction: cfg.token_compaction.filter(|c| c.enabled),
+            dual_llm_quarantine: cfg.dual_llm_quarantine.filter(|c| c.enabled),
             tool_pricing: cfg.tool_pricing,
             usage_sinks: sbproxy_ai::usage_sink::build_sinks(&cfg.usage_sinks),
         })
@@ -654,6 +782,13 @@ impl McpAction {
         self.prefix_for(server_name)?.timeout
     }
 
+    /// Whether this upstream opted into run-as-user MCP auth.
+    pub fn run_as_user_for_server(&self, server_name: &str) -> bool {
+        self.prefix_for(server_name)
+            .map(|p| p.run_as_user_auth)
+            .unwrap_or(false)
+    }
+
     /// Returns true when the named tool is allowed by the configured
     /// guardrails. With no `tool_allowlist` guardrail this is always
     /// true (open access).
@@ -678,6 +813,7 @@ impl std::fmt::Debug for McpAction {
             .field("server_version", &self.server_version)
             .field("prefixes", &self.prefixes)
             .field("tool_allowlist", &self.tool_allowlist)
+            .field("lethal_trifecta", &self.lethal_trifecta)
             .finish()
     }
 }
@@ -763,6 +899,7 @@ fn collapse_allowlists(guardrails: &[McpGuardrailEntry]) -> Option<HashSet<Strin
                 found = true;
                 union.extend(allow.iter().cloned());
             }
+            McpGuardrailEntry::LethalTrifecta { .. } => {}
         }
     }
     if found {
@@ -770,6 +907,29 @@ fn collapse_allowlists(guardrails: &[McpGuardrailEntry]) -> Option<HashSet<Strin
     } else {
         None
     }
+}
+
+fn collapse_lethal_trifecta(
+    guardrails: &[McpGuardrailEntry],
+) -> Option<McpLethalTrifectaGuardrail> {
+    let mut found = false;
+    let mut private_data_tools = Vec::new();
+    let mut external_comm_tools = Vec::new();
+    for entry in guardrails {
+        if let McpGuardrailEntry::LethalTrifecta {
+            private_data_tools: private,
+            external_comm_tools: external,
+        } = entry
+        {
+            found = true;
+            private_data_tools.extend(private.iter().cloned());
+            external_comm_tools.extend(external.iter().cloned());
+        }
+    }
+    found.then_some(McpLethalTrifectaGuardrail {
+        private_data_tools,
+        external_comm_tools,
+    })
 }
 
 // --- duration parser for serde ---
@@ -929,6 +1089,10 @@ mod tests {
         let value = json!({
             "type": "mcp",
             "mode": "gateway",
+            "egress": {
+                "mode": "deny_by_default",
+                "suffixes": ["example.com"]
+            },
             "federated_servers": [{
                 "type": "openapi",
                 "origin": "api.example.com",
@@ -941,6 +1105,149 @@ mod tests {
         });
         let action = McpAction::from_config(value).expect("compile");
         assert_eq!(action.prefixes.len(), 1);
+    }
+
+    #[test]
+    fn openapi_server_accepts_per_server_egress_override() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "egress": {
+                "mode": "deny_by_default",
+                "hosts": ["api.example.com"]
+            },
+            "federated_servers": [{
+                "type": "openapi",
+                "origin": "api.internal.example",
+                "egress": {
+                    "mode": "deny_by_default",
+                    "hosts": ["api.internal.example"]
+                },
+                "spec": {
+                    "openapi": "3.0.0",
+                    "info": {"title": "t", "version": "1"},
+                    "paths": {"/pets": {"get": {"operationId": "listPets"}}}
+                }
+            }]
+        });
+
+        let action = McpAction::from_config(value).expect("compile");
+        assert_eq!(action.prefixes.len(), 1);
+    }
+
+    #[test]
+    fn lethal_trifecta_guardrail_compiles_and_classifies_tools() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{ "origin": "example.com" }],
+            "guardrails": [{
+                "type": "lethal_trifecta",
+                "private_data_tools": ["db.*"],
+                "external_comm_tools": ["slack.post", "email.*"]
+            }]
+        });
+
+        let action = McpAction::from_config(value).expect("compile");
+        let guardrail = action.lethal_trifecta.expect("guardrail");
+        let db = guardrail.classify("db.query");
+        assert!(db.tool_access);
+        assert!(db.private_data);
+        assert!(!db.external_comm);
+
+        let email = guardrail.classify("email.send");
+        assert!(email.tool_access);
+        assert!(!email.private_data);
+        assert!(email.external_comm);
+
+        let slack = guardrail.classify("slack.post");
+        assert!(slack.external_comm);
+    }
+
+    #[test]
+    fn run_as_user_auth_is_opt_in_per_server() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "origin": "github.example.com",
+                "prefix": "gh",
+                "run_as_user_auth": true
+            }]
+        });
+
+        let action = McpAction::from_config(value).expect("compile");
+        assert!(action.run_as_user_for_server("gh"));
+        assert!(!action.run_as_user_for_server("missing"));
+    }
+
+    #[test]
+    fn stdio_transport_requires_command_and_compiles_when_present() {
+        let missing = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "origin": "local",
+                "transport": "stdio"
+            }]
+        }))
+        .expect_err("stdio command required");
+        assert!(missing.to_string().contains("needs command"));
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "origin": "local",
+                "prefix": "local",
+                "transport": "stdio",
+                "command": "python3",
+                "args": ["-c", "print('ready')"]
+            }]
+        }))
+        .expect("compile");
+        assert!(action.prefix_for("local").is_some());
+    }
+
+    #[test]
+    fn token_compaction_is_disabled_by_default_and_enabled_explicitly() {
+        let disabled = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{ "origin": "example.com" }]
+        }))
+        .expect("compile");
+        assert!(disabled.token_compaction.is_none());
+
+        let enabled = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "token_compaction": { "enabled": true, "max_text_bytes": 128 },
+            "federated_servers": [{ "origin": "example.com" }]
+        }))
+        .expect("compile");
+        let cfg = enabled.token_compaction.expect("enabled");
+        assert_eq!(cfg.max_text_bytes, Some(128));
+    }
+
+    #[test]
+    fn dual_llm_quarantine_is_enabled_explicitly() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "dual_llm_quarantine": {
+                "enabled": true,
+                "suspicious_patterns": ["ignore previous instructions"]
+            },
+            "federated_servers": [{ "origin": "example.com" }]
+        }))
+        .expect("compile");
+
+        let cfg = action.dual_llm_quarantine.expect("enabled");
+        assert_eq!(
+            cfg.suspicious_patterns,
+            vec!["ignore previous instructions"]
+        );
     }
 
     #[test]
@@ -1307,10 +1614,14 @@ mod tests {
                 namespace: NamespaceMode::default(),
                 rbac: None,
                 timeout: Some(parse_duration_via_serde(raw)),
+                run_as_user_auth: false,
                 transport: None,
+                command: None,
+                args: Vec::new(),
                 server_type: None,
                 spec: None,
                 spec_path: None,
+                egress: None,
             };
             assert_eq!(entry.timeout, Some(expected), "parsed {raw}");
         }

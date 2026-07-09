@@ -7,12 +7,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use reqwest::Url;
 use sbproxy_plugin::mcp::{default_no_op_hook, mcp_policy_hooks, McpPolicyHook, McpToolCallCtx};
 use sbproxy_plugin::traits::PolicyDecision;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
+use super::egress::EgressPolicy;
 use super::sse_client::send_via_sse;
 use super::streamable::send_request;
 use super::types::{JsonRpcRequest, JsonRpcResponse};
@@ -71,6 +73,9 @@ pub struct OpenApiBacking {
     pub tools: Vec<serde_json::Value>,
     /// tool name -> (HTTP method, path template).
     pub routes: HashMap<String, (String, String)>,
+    /// Deterministic egress policy for REST calls made on behalf of
+    /// this OpenAPI-backed server.
+    pub egress_policy: EgressPolicy,
 }
 
 /// Configuration for one upstream MCP server.
@@ -254,9 +259,15 @@ pub struct McpFederation {
     /// gateway re-advertises on its own `initialize`.
     mcp_apps_capability: ArcSwap<Option<serde_json::Value>>,
     client: reqwest::Client,
+    /// REST-tool client with automatic redirects disabled. OpenAPI
+    /// tools must inspect each redirect target before following it so
+    /// an allowed host cannot bounce the gateway to an unlisted one.
+    openapi_client: reqwest::Client,
     /// Maximum upstream response bytes buffered per exchange
     /// (WOR-1639); passed to every transport send.
     max_response_bytes: usize,
+    /// Supervision deadline for local stdio MCP exchanges.
+    stdio_timeout: std::time::Duration,
     /// Monotonic catalogue generation. Bumps once per refresh that
     /// actually changed the tool or resource registry (content
     /// digest short-circuit), so consumers can key caches on it and
@@ -361,13 +372,22 @@ impl McpFederation {
             // back to the default client (same behaviour as before
             // WOR-1639) rather than panicking in a constructor.
             .unwrap_or_default();
+        let openapi_client = reqwest::Client::builder()
+            .connect_timeout(io.connect_timeout)
+            .timeout(io.request_timeout)
+            .pool_max_idle_per_host(8)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default();
         Self {
             servers,
             tools: ArcSwap::from_pointee(HashMap::new()),
             resources: ArcSwap::from_pointee(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
             client,
+            openapi_client,
             max_response_bytes: io.max_response_bytes,
+            stdio_timeout: io.request_timeout,
             generation: std::sync::atomic::AtomicU64::new(0),
             tools_generation: std::sync::atomic::AtomicU64::new(0),
             resources_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1111,7 +1131,9 @@ impl McpFederation {
             }
         }
         let base = backing.base_url.trim_end_matches('/');
-        let url = format!("{base}{path}");
+        let mut url = Url::parse(&format!("{base}{path}"))
+            .map_err(|e| anyhow::anyhow!("invalid OpenAPI REST URL for {federated_name}: {e}"))?;
+        backing.egress_policy.check_url(&url)?;
 
         let leftovers: serde_json::Map<String, serde_json::Value> = args_obj
             .into_iter()
@@ -1121,9 +1143,8 @@ impl McpFederation {
         let is_get = method.eq_ignore_ascii_case("GET");
         let http_method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| anyhow::anyhow!("invalid HTTP method {method}: {e}"))?;
-        let mut builder = self.client.request(http_method, &url);
-        if is_get {
-            let query: Vec<(String, String)> = leftovers
+        let query: Vec<(String, String)> = if is_get {
+            leftovers
                 .iter()
                 .map(|(k, v)| {
                     let val = match v {
@@ -1132,20 +1153,53 @@ impl McpFederation {
                     };
                     (k.clone(), val)
                 })
-                .collect();
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let body = if !is_get && !leftovers.is_empty() {
+            Some(serde_json::Value::Object(leftovers))
+        } else {
+            None
+        };
+
+        let mut redirects = 0usize;
+        let resp = loop {
+            let mut builder = self
+                .openapi_client
+                .request(http_method.clone(), url.clone());
             if !query.is_empty() {
                 builder = builder.query(&query);
             }
-        } else if !leftovers.is_empty() {
-            builder = builder.json(&serde_json::Value::Object(leftovers));
-        }
-
-        let resp = builder.send().await.map_err(|e| {
-            sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(
-                &anyhow::anyhow!(e.to_string()),
-            ));
-            anyhow::anyhow!("openapi REST call to {url} failed: {e}")
-        })?;
+            if let Some(body) = &body {
+                builder = builder.json(body);
+            }
+            let resp = builder.send().await.map_err(|e| {
+                sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(
+                    &anyhow::anyhow!(e.to_string()),
+                ));
+                anyhow::anyhow!("openapi REST call to {url} failed: {e}")
+            })?;
+            if !resp.status().is_redirection() {
+                break resp;
+            }
+            let Some(location) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
+                break resp;
+            };
+            redirects += 1;
+            if redirects > 10 {
+                anyhow::bail!("openapi REST call to {url} exceeded redirect limit");
+            }
+            let next = url
+                .join(location)
+                .map_err(|e| anyhow::anyhow!("invalid OpenAPI redirect target: {e}"))?;
+            backing.egress_policy.check_url(&next)?;
+            url = next;
+        };
         let status = resp.status();
         let body = super::streamable::read_body_capped(resp, self.max_response_bytes).await?;
         let text = String::from_utf8_lossy(&body).to_string();
@@ -1166,6 +1220,15 @@ impl McpFederation {
     ) -> anyhow::Result<JsonRpcResponse> {
         let result = match server.transport.as_str() {
             "sse" => send_via_sse(&self.client, &server.url, req, self.max_response_bytes).await,
+            "stdio" => {
+                super::stdio::send_via_stdio(
+                    &server.url,
+                    req,
+                    self.max_response_bytes,
+                    self.stdio_timeout,
+                )
+                .await
+            }
             // Default to streamable HTTP for "streamable_http" or unknown.
             _ => send_request(&self.client, &server.url, req, self.max_response_bytes).await,
         };
@@ -2248,6 +2311,43 @@ mod tests {
             openapi: None,
         };
         assert_eq!(config.transport, "sse");
+    }
+
+    #[tokio::test]
+    async fn openapi_tool_denies_unlisted_egress_host_before_io() {
+        let fed = McpFederation::new(vec![]);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "getPet".to_string(),
+            ("GET".to_string(), "/pets/{id}".to_string()),
+        );
+        let backing = OpenApiBacking {
+            base_url: "https://api.example.com".to_string(),
+            tools: vec![],
+            routes,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::DenyByDefault,
+                hosts: vec!["other.example.com".to_string()],
+                suffixes: vec![],
+                scope: "server:api".to_string(),
+            },
+        };
+        let server = McpServerConfig {
+            name: "api".to_string(),
+            url: "https://api.example.com".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: Some(backing.clone()),
+        };
+
+        let err = fed
+            .call_openapi_tool(&server, &backing, "getPet", &json!({"id": "123"}))
+            .await
+            .expect_err("unlisted host must be denied before request dispatch");
+        assert!(
+            err.to_string().contains("api.example.com"),
+            "denial should identify the blocked host, got: {err}"
+        );
     }
 
     // --- WOR-487: streaming detection ---
