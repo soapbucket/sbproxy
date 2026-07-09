@@ -11,7 +11,7 @@
 # Three models are governed here:
 #   - claude-sonnet-4-5: 60 RPM, 200k TPM. The expensive route.
 #   - claude-haiku-4-5: 240 RPM, 600k TPM. The cheap workhorse.
-#   - anthropic/claude-3.5-sonnet (OpenRouter passthrough): 30 RPM,
+#   - anthropic/claude-sonnet-4.5 (OpenRouter passthrough): 30 RPM,
 #     100k TPM, kept low because the resale path is slower.
 #
 # Setup:
@@ -66,9 +66,9 @@ origins:
             - claude-haiku-4-5
         - name: openrouter
           api_key: ${OPENROUTER_API_KEY}
-          default_model: anthropic/claude-3.5-sonnet
+          default_model: anthropic/claude-sonnet-4.5
           models:
-            - anthropic/claude-3.5-sonnet
+            - anthropic/claude-sonnet-4.5
             - anthropic/claude-3-haiku
 
       model_rate_limits:
@@ -78,6 +78,6 @@ origins:
         claude-haiku-4-5:
           requests_per_minute: 240
           tokens_per_minute: 600000
-        anthropic/claude-3.5-sonnet:
+        anthropic/claude-sonnet-4.5:
           requests_per_minute: 30
           tokens_per_minute: 100000

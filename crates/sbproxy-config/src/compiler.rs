@@ -372,6 +372,21 @@ pub fn interpolate_config_vars(
     }
 }
 
+/// Look up a possibly-dotted variable path (`api_version`,
+/// `feature_flags.beta_api`) in the origin's variables map. The first
+/// segment indexes the map; the rest walk nested JSON objects.
+fn lookup_variable_path<'a>(
+    variables: &'a std::collections::HashMap<String, serde_json::Value>,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut segments = path.split('.');
+    let mut current = variables.get(segments.next()?)?;
+    for segment in segments {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
 /// Resolve `{{vars.X}}` and `{{env.X}}` patterns in a single string.
 fn resolve_template_string(
     input: &str,
@@ -385,14 +400,29 @@ fn resolve_template_string(
         let after_open = &rest[start + 2..];
         if let Some(end) = after_open.find("}}") {
             let key = after_open[..end].trim();
-            if let Some(var_name) = key.strip_prefix("vars.") {
-                // Resolve {{vars.X}} from origin variables.
-                if let Some(val) = variables.get(var_name) {
+            // WOR-1828: `variables.` is the long form of `vars.`; the
+            // published variables-template example wrote it for months
+            // while nothing resolved it, so its headers shipped as
+            // literal template text. Accept both spellings.
+            if let Some(var_name) = key
+                .strip_prefix("vars.")
+                .or_else(|| key.strip_prefix("variables."))
+            {
+                // Resolve {{vars.X}} from origin variables. A dotted
+                // tail (`vars.feature_flags.beta_api`) walks nested
+                // objects, so a grouped variables: block interpolates
+                // without flattening.
+                if let Some(val) = lookup_variable_path(variables, var_name) {
                     match val {
                         serde_json::Value::String(s) => result.push_str(s),
                         other => result.push_str(&other.to_string()),
                     }
                 } else {
+                    tracing::warn!(
+                        template = %key,
+                        "config: template names a variable that is not defined on the \
+                         origin; the value ships as literal text"
+                    );
                     // Leave unresolved variable as-is.
                     result.push_str("{{");
                     result.push_str(&after_open[..end]);
@@ -409,7 +439,18 @@ fn resolve_template_string(
                     }
                 }
             } else {
-                // Leave other patterns (request.*, etc.) for runtime resolution.
+                // Leave `request.*` for runtime resolution (the modifier
+                // context binds it per request). Any other prefix resolves
+                // nowhere, at compile or at runtime, so the literal braces
+                // would reach the upstream; warn instead of staying silent
+                // (WOR-1828).
+                if !key.starts_with("request.") {
+                    tracing::warn!(
+                        template = %key,
+                        "config: unknown template prefix; the value ships as literal \
+                         text. Known prefixes: vars. (alias variables.), env., request."
+                    );
+                }
                 result.push_str("{{");
                 result.push_str(&after_open[..end]);
                 result.push_str("}}");
@@ -2877,6 +2918,31 @@ origins:
         interpolate_config_vars(&mut val, &vars);
         assert_eq!(val["url"].as_str().unwrap(), "http://backend.local:8080");
         assert_eq!(val["nested"]["label"].as_str().unwrap(), "backend.local");
+    }
+
+    // WOR-1828: `variables.` is an accepted alias of `vars.`, and a
+    // dotted tail walks nested objects, matching what the published
+    // variables-template example has always written.
+    #[test]
+    fn interpolate_accepts_variables_alias_and_dotted_paths() {
+        let vars: HashMap<String, serde_json::Value> = [
+            ("api_version".to_string(), serde_json::json!("v2")),
+            (
+                "feature_flags".to_string(),
+                serde_json::json!({"beta_api": false}),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut val = serde_json::json!({
+            "X-Api-Version": "{{ variables.api_version }}",
+            "X-Beta-Api": "{{ variables.feature_flags.beta_api }}",
+            "X-Short": "{{ vars.feature_flags.beta_api }}"
+        });
+        interpolate_config_vars(&mut val, &vars);
+        assert_eq!(val["X-Api-Version"].as_str().unwrap(), "v2");
+        assert_eq!(val["X-Beta-Api"].as_str().unwrap(), "false");
+        assert_eq!(val["X-Short"].as_str().unwrap(), "false");
     }
 
     #[test]

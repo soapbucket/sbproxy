@@ -24,7 +24,7 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
     -d '{
-      "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+      "model": "anthropic.claude-sonnet-4-5-20250929-v1:0",
       "messages": [
         {"role": "system", "content": "You write terse haiku."},
         {"role": "user", "content": "Write a haiku about caching."}

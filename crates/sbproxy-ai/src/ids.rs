@@ -116,7 +116,7 @@ string_newtype!(
 
 string_newtype!(
     /// A model identifier as written in config (`gpt-4o`,
-    /// `claude-3-5-sonnet`, ...). Logical model names are mapped to
+    /// `claude-sonnet-4-5`, ...). Logical model names are mapped to
     /// upstream names via `ProviderConfig::model_map`.
     ModelId
 );

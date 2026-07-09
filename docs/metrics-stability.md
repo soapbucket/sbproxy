@@ -298,7 +298,7 @@ The same observations appear as `auth_ms` / `upstream_ttfb_ms` / `response_filte
 | Label | Description | Example values |
 |---|---|---|
 | `provider` | AI provider name | `openai`, `anthropic`, `google`, `cohere` |
-| `model` | Model identifier | `gpt-4o`, `claude-3-5-sonnet`, `gemini-3.5-flash` |
+| `model` | Model identifier | `gpt-4o`, `claude-sonnet-4-5`, `gemini-3.5-flash` |
 | `status` | Request outcome | `success`, `error`, `timeout`, `rate_limited` |
 
 ---
@@ -372,7 +372,7 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 | Label | Description | Example values |
 |---|---|---|
 | `provider` | AI provider name | `openai`, `anthropic` |
-| `model` | Model identifier | `gpt-4o`, `claude-3-5-sonnet` |
+| `model` | Model identifier | `gpt-4o`, `claude-sonnet-4-5` |
 
 ---
 
@@ -401,7 +401,7 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 | Label | Description | Example values |
 |---|---|---|
 | `provider` | AI provider name | `openai`, `anthropic` |
-| `model` | Model identifier | `gpt-4o`, `claude-3-5-sonnet` |
+| `model` | Model identifier | `gpt-4o`, `claude-sonnet-4-5` |
 | `tenant_id` | Resolved tenant id for the matched origin | `acme`, `__default__` |
 
 ---
@@ -587,7 +587,7 @@ No labels.
 | Label | Description | Example values |
 |---|---|---|
 | `provider` | AI provider name | `openai`, `anthropic` |
-| `model` | Model identifier | `gpt-4o`, `claude-3-5-sonnet` |
+| `model` | Model identifier | `gpt-4o`, `claude-sonnet-4-5` |
 
 ---
 

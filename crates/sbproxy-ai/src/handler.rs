@@ -673,6 +673,26 @@ impl AiHandlerConfig {
                 }
             }
         }
+        // WOR-1683: on a served provider the serve-entry name IS the
+        // model id every plane sees, so an empty `models:` list derives
+        // from the serve entries instead of forcing the operator to
+        // write the same fact twice. An explicit list still wins (it
+        // may deliberately expose a subset). `serve.validate()` above
+        // already rejected duplicate and nameless entries.
+        for provider in &mut config.providers {
+            let Some(serve) = &provider.serve else {
+                continue;
+            };
+            if !provider.models.is_empty() {
+                continue;
+            }
+            for entry in &serve.models {
+                let name = entry
+                    .effective_name()
+                    .map_err(|e| anyhow::anyhow!("ai provider {:?} serve: {e}", provider.name))?;
+                provider.models.push(ModelId::from(name));
+            }
+        }
         // WOR-625: validate provider names and the model allow-list here
         // so a typo (`openAI` for `openai`) or an unknown model is caught
         // at config load rather than silently misrouting at request time.
@@ -1131,6 +1151,44 @@ mod tests {
         assert_eq!(config.providers[0].weight, 3);
         assert_eq!(config.allowed_models, vec!["gpt-4"]);
         assert_eq!(config.max_body_size, Some(1048576));
+    }
+
+    // WOR-1683: a served provider's empty models: list derives from the
+    // serve-entry names; an explicit list is left alone.
+    #[test]
+    fn served_provider_models_derive_from_serve_entry_names() {
+        let json = serde_json::json!({
+            "providers": [{
+                "name": "local",
+                "serve": {
+                    "models": [
+                        {"model": "qwen3-14b"},
+                        {"model": "hf:Qwen/Qwen3-8B-GGUF:Q4_K_M", "name": "local-coder"}
+                    ]
+                }
+            }]
+        });
+        let config = AiHandlerConfig::from_config(json).unwrap();
+        assert_eq!(config.providers[0].models, vec!["qwen3-14b", "local-coder"]);
+
+        let explicit = serde_json::json!({
+            "providers": [{
+                "name": "local",
+                "models": ["qwen3-14b"],
+                "serve": {
+                    "models": [
+                        {"model": "qwen3-14b"},
+                        {"model": "hf:Qwen/Qwen3-8B-GGUF:Q4_K_M", "name": "local-coder"}
+                    ]
+                }
+            }]
+        });
+        let config = AiHandlerConfig::from_config(explicit).unwrap();
+        assert_eq!(
+            config.providers[0].models,
+            vec!["qwen3-14b"],
+            "an explicit subset must win over derivation"
+        );
     }
 
     #[test]

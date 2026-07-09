@@ -1218,6 +1218,31 @@ pub fn record_capture_budget_drop(workspace_id: &str, dimension: &'static str) {
         .inc();
 }
 
+/// Record a bot-auth hosted-directory fetch failure on
+/// `sbproxy_bot_auth_directory_fetch_failures_total{url}`.
+///
+/// The rustdoc on `bot_auth` has pointed operators at this counter
+/// since the directory shipped, but nothing registered it, so a
+/// broken key-directory endpoint was observable only in logs
+/// (WOR-1828). The URL label is an operator-configured value (never
+/// client-controlled), sanitized through the cardinality limiter
+/// anyway for uniformity.
+pub fn record_bot_auth_directory_fetch_failure(url: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_bot_auth_directory_fetch_failures_total",
+            "Bot-auth hosted key-directory fetches that failed (the verifier serves stale or fails per nonce_policy)",
+            &["url"],
+        )
+        .expect("bot-auth directory counter registers")
+    });
+    let url = sanitize_label("url", url);
+    counter.with_label_values(&[url.as_str()]).inc();
+}
+
 /// Record a WAF persistent-block lifecycle event on
 /// `sbproxy_waf_persistent_blocks_total{origin, event, key_kind}`.
 ///

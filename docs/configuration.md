@@ -3554,7 +3554,7 @@ authentication:
 
 #### Backward compatibility
 
-Existing `${ENV}`, `file:/path/to/secret`, and `secret:<name>` shapes keep working unchanged. Legacy umbrella references shaped as `vault://<alias>/...` are still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced.
+Existing `${ENV}` and `file:/path/to/secret` shapes keep working unchanged. The Go-era `secret:<name>` colon form is removed and fails config load with a pointer at the `secret://<backend>/<name>` replacement. Legacy umbrella references shaped as `vault://<alias>/...` are still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced.
 
 Rewrite known legacy aliases with:
 

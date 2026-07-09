@@ -1,14 +1,14 @@
 //! Universal secret resolver.
 //!
-//! Resolves `secret:<name>`, `${ENV_VAR}`, and `file:/path/to/file` patterns
-//! embedded in config string values.  Plain strings are passed through unchanged.
+//! Resolves provider-URI references (`secret://`, `vault://`, ...),
+//! `${ENV_VAR}`, and `file:/path/to/file` patterns embedded in config
+//! string values.  Plain strings are passed through unchanged.
 
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 
-use crate::manager::{VaultBackend, VaultManager};
+use crate::manager::VaultManager;
 use crate::vault_ref::{
     legacy_vault_env_name, legacy_vault_reference_replacement, warn_legacy_vault_reference_once,
     VaultRef,
@@ -33,38 +33,21 @@ pub fn process_resolver() -> Option<Arc<SecretResolver>> {
     PROCESS_RESOLVER.get().cloned()
 }
 
-/// Behaviour when the vault backend is unavailable and a `secret:` reference
-/// needs to be resolved.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ResolveFallback {
-    /// Reserved for a future caller-managed last-good cache. NOT yet
-    /// implemented: the resolver has no backend to populate a cache from
-    /// on this path, so selecting `Cache` currently behaves like
-    /// [`ResolveFallback::Reject`] (it fails with an error). Do not rely
-    /// on it returning a cached value (WOR-1157).
-    Cache,
-    /// Fail with an error - the safest default.
-    Reject,
-    /// Try an environment variable whose name matches the vault path.
-    Env,
-}
-
 /// Resolves secret references from any string value in config.
 ///
 /// Supported reference patterns:
 ///
 /// | Pattern | Resolution |
 /// |---------|-----------|
-/// | `secret:<name>` | Look up `<name>` in the logical map, then query the vault backend. |
+/// | `secret://`, `vault://`, `awssm://`, ... | Resolve through the provider-scheme backend manager; a miss is a hard error. |
 /// | `${VAR_NAME}` | Read the environment variable `VAR_NAME`. |
 /// | `file:/some/path` | Read the file at `/some/path` (trimmed). |
 /// | anything else | Returned as-is. |
+///
+/// The Go-era `secret:<name>` (colon) form was removed after its compat
+/// window (WOR-1785); `secret://<backend>/<name>` is the replacement.
+#[derive(Default)]
 pub struct SecretResolver {
-    backend: Option<Arc<dyn VaultBackend>>,
-    /// Logical name -> vault path mapping.  Allows stable config names while the
-    /// physical vault path can change.
-    map: HashMap<String, String>,
-    fallback: ResolveFallback,
     /// Provider-scheme backends (`vault://`, `awssm://`, `secretfile://`,
     /// `secret://`, ...). When set, a recognized reference resolves
     /// through here and a miss is a hard error, never passed through
@@ -73,24 +56,11 @@ pub struct SecretResolver {
 }
 
 impl SecretResolver {
-    /// Create a new resolver.
-    ///
-    /// - `backend` - optional vault backend; when `None` the `fallback` strategy
-    ///   is used for `secret:` references.
-    /// - `map` - logical name to vault path mapping.
-    pub fn new(backend: Option<Arc<dyn VaultBackend>>, map: HashMap<String, String>) -> Self {
-        Self {
-            backend,
-            map,
-            fallback: ResolveFallback::Reject,
-            manager: None,
-        }
-    }
-
-    /// Set the fallback strategy used when the vault backend is unavailable.
-    pub fn with_fallback(mut self, fallback: ResolveFallback) -> Self {
-        self.fallback = fallback;
-        self
+    /// Create a new resolver. Attach provider-scheme backends with
+    /// [`Self::with_manager`]; without one, provider-URI references
+    /// fail loud with a pointer at `proxy.secrets.backends`.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Attach the provider-scheme backend manager used to resolve
@@ -107,8 +77,8 @@ impl SecretResolver {
     ///
     /// # Blocking I/O
     ///
-    /// `file:` references and the `secret:` path of HTTP-backed vault
-    /// backends issue blocking I/O. This function is intended for
+    /// `file:` references and HTTP-backed provider backends issue
+    /// blocking I/O. This function is intended for
     /// **synchronous contexts only**: config load on startup, CLI tools,
     /// and tests. From an async runtime, prefer [`Self::resolve_async`]
     /// (which dispatches the work to a blocking thread pool) so the
@@ -151,10 +121,15 @@ impl SecretResolver {
                 ),
             };
         }
-        // Deprecated `secret:<name>` (colon) form. Superseded by
-        // `secret://<backend>/<name>`; kept for the compat window.
+        // The Go-era `secret:<name>` (colon) form is gone (WOR-1785).
+        // `VaultRef::parse` above already claimed every `secret://` URI,
+        // so a bare `secret:name` here is a stale config; fail with the
+        // migration pointer rather than passing it through as a value.
         if let Some(name) = value.strip_prefix("secret:") {
-            return self.resolve_secret(name);
+            anyhow::bail!(
+                "the `secret:{name}` form was removed; use `secret://<backend>/{name}` \
+                 with a backend declared under proxy.secrets.backends (docs/secrets.md)"
+            );
         }
         // Plain value: passed through. WOR-1165: only a whole-value `${VAR}`
         // wrapper is expanded; an embedded `${..}` inside a larger string is
@@ -198,39 +173,6 @@ impl SecretResolver {
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     }
-
-    /// Return the logical name to vault path map.
-    pub fn map_entries(&self) -> &HashMap<String, String> {
-        &self.map
-    }
-
-    // --- private ---
-
-    fn resolve_secret(&self, name: &str) -> Result<String> {
-        let vault_path = self
-            .map
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| name.to_string());
-
-        match &self.backend {
-            Some(backend) => match backend.get(&vault_path)? {
-                Some(value) => Ok(value),
-                None => anyhow::bail!("secret not found in vault: {} (path: {})", name, vault_path),
-            },
-            None => match self.fallback {
-                ResolveFallback::Env => std::env::var(&vault_path).with_context(|| {
-                    format!("no vault backend and env var {} not set", vault_path)
-                }),
-                ResolveFallback::Reject => {
-                    anyhow::bail!("no vault backend configured for secret: {}", name)
-                }
-                ResolveFallback::Cache => {
-                    anyhow::bail!("no cached value for secret: {} (vault unavailable)", name)
-                }
-            },
-        }
-    }
 }
 
 #[cfg(test)]
@@ -243,65 +185,23 @@ mod tests {
     /// this test binary.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn backend_with(key: &str, value: &str) -> Arc<dyn VaultBackend> {
-        let vault = LocalVault::new();
-        vault.set_secret(key, value).unwrap();
-        Arc::new(vault)
-    }
-
     fn resolver_no_backend() -> SecretResolver {
-        SecretResolver::new(None, HashMap::new())
+        SecretResolver::new()
     }
 
-    // --- secret: prefix ---
+    // --- removed secret: colon form (WOR-1785) ---
 
     #[test]
-    fn resolve_secret_prefix_found() {
-        let resolver =
-            SecretResolver::new(Some(backend_with("my_key", "super_secret")), HashMap::new());
-        assert_eq!(resolver.resolve("secret:my_key").unwrap(), "super_secret");
-    }
-
-    #[test]
-    fn resolve_secret_not_found_returns_error() {
-        let resolver = SecretResolver::new(Some(backend_with("other", "val")), HashMap::new());
-        assert!(resolver.resolve("secret:missing_key").is_err());
-    }
-
-    #[test]
-    fn resolve_secret_via_logical_map() {
-        let mut map = HashMap::new();
-        map.insert("token".to_string(), "vault/path/token".to_string());
-        let resolver = SecretResolver::new(Some(backend_with("vault/path/token", "abc123")), map);
-        assert_eq!(resolver.resolve("secret:token").unwrap(), "abc123");
-    }
-
-    #[test]
-    fn resolve_secret_no_backend_env_fallback() {
-        // Hold the lock for the whole body so no other env-mutating test runs
-        // concurrently. SAFETY (for both unsafe blocks below): `set_var` /
-        // `remove_var` mutate process-global state; ENV_LOCK excludes the
-        // other env tests in this binary, and no vault code reads the
-        // environment except through these locked tests, so there is no
-        // concurrent environment access.
-        let _env = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("TEST_SECRET_ENV_FALLBACK", "from_env") };
-        let resolver = resolver_no_backend().with_fallback(ResolveFallback::Env);
-        let result = resolver.resolve("secret:TEST_SECRET_ENV_FALLBACK").unwrap();
-        assert_eq!(result, "from_env");
-        unsafe { std::env::remove_var("TEST_SECRET_ENV_FALLBACK") };
-    }
-
-    #[test]
-    fn resolve_secret_no_backend_reject_returns_error() {
-        let resolver = resolver_no_backend().with_fallback(ResolveFallback::Reject);
-        assert!(resolver.resolve("secret:anything").is_err());
-    }
-
-    #[test]
-    fn resolve_secret_no_backend_cache_returns_error() {
-        let resolver = resolver_no_backend().with_fallback(ResolveFallback::Cache);
-        assert!(resolver.resolve("secret:anything").is_err());
+    fn removed_secret_colon_form_errors_with_migration_pointer() {
+        let resolver = resolver_no_backend();
+        let err = resolver
+            .resolve("secret:openai_key")
+            .expect_err("the colon form must not resolve or pass through");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("secret://") && msg.contains("proxy.secrets.backends"),
+            "error must carry the migration pointer: {msg}"
+        );
     }
 
     // --- ${ENV} ---
@@ -387,7 +287,7 @@ mod tests {
     #[test]
     fn resolve_secret_scheme_via_manager() {
         let mgr = manager_with_local("local", "openai", "sk-resolved");
-        let resolver = SecretResolver::new(None, HashMap::new()).with_manager(mgr);
+        let resolver = SecretResolver::new().with_manager(mgr);
         assert_eq!(
             resolver.resolve("secret://local/openai").unwrap(),
             "sk-resolved"
@@ -411,7 +311,7 @@ mod tests {
     fn plain_url_still_passes_through_not_treated_as_reference() {
         // http:// is not a secret scheme; it must pass through unchanged.
         let resolver = manager_with_local("local", "k", "v");
-        let resolver = SecretResolver::new(None, HashMap::new()).with_manager(resolver);
+        let resolver = SecretResolver::new().with_manager(resolver);
         assert_eq!(
             resolver.resolve("http://example.com").unwrap(),
             "http://example.com"

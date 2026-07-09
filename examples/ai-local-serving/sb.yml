@@ -30,13 +30,9 @@ origins:
           # allow_private_base_url stay only for a separately-running
           # engine (an unmanaged Ollama, a remote vLLM box).
           default_model: qwen3-14b
-          # The names below are the serve-entry names: the
-          # model id every plane sees. Once the serve -> provider
-          # derivation is wired into the compiler this list becomes
-          # optional, derived from serve.models[].name.
-          models:
-            - qwen3-14b
-            - local-coder
+          # No models: list needed: on a served provider it derives
+          # from the serve-entry names below (the model id every plane
+          # sees). Write an explicit list only to expose a subset.
           serve:
             eviction: lru
             cache_budget_gib: 200

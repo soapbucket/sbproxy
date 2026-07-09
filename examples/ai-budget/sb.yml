@@ -49,9 +49,9 @@ origins:
             - claude-haiku-4-5
         - name: openrouter
           api_key: ${OPENROUTER_API_KEY}
-          default_model: anthropic/claude-3.5-sonnet
+          default_model: anthropic/claude-sonnet-4.5
           models:
-            - anthropic/claude-3.5-sonnet
+            - anthropic/claude-sonnet-4.5
             - anthropic/claude-3-haiku
 
       budget:
