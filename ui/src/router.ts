@@ -38,6 +38,12 @@ const routes = [
     meta: { title: "Metrics" },
   },
   {
+    path: "/spend",
+    name: "spend",
+    component: () => import("./views/SpendView.vue"),
+    meta: { title: "Spend" },
+  },
+  {
     path: "/prompts",
     name: "prompts",
     component: () => import("./views/PromptsView.vue"),

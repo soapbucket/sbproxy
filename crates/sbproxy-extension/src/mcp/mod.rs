@@ -18,12 +18,15 @@
 //! - [`compat`] - Tool-versioning compatibility oracle.
 //! - [`access_control`] - Principal-aware tool ACLs and per-tool quotas.
 //! - [`schema_drift`] / [`cassette_drift`] - CI drift detection (drift CLI).
+//! - [`egress`] - Deterministic allowlist for gateway-originated traffic.
+//! - [`stdio`] - Supervised local stdio MCP transport.
 
 pub mod access_control;
 pub mod cassette_drift;
 pub mod codemode_ts;
 pub mod compat;
 pub mod discovery;
+pub mod egress;
 pub mod federation;
 pub mod openapi_convert;
 pub mod rest_to_mcp;
@@ -35,6 +38,7 @@ pub mod rest_to_mcp;
 pub mod schema_drift;
 pub mod sessions;
 pub mod sse_client;
+pub mod stdio;
 pub mod streamable;
 pub mod types;
 
@@ -48,6 +52,7 @@ pub use cassette_drift::{
     tools_from_value, CassetteContract, CassetteDriftChange, CassetteDriftEvent, CassetteDriftKind,
     CassetteDriftReport, CassetteFieldContract, CassetteToolContract, CASSETTE_DRIFT_EVENT_TYPE,
 };
+pub use egress::{EgressDenied, EgressMode, EgressPolicy};
 pub use federation::{
     FederatedTool, FederationIoSettings, McpCallOutcome, McpFederation, McpServerConfig,
     NamespaceMode, OpenApiBacking, SerializedToolEntry, SerializedTools, ToolVersioningGate,
@@ -55,4 +60,5 @@ pub use federation::{
 };
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
 pub use rest_to_mcp::{create_mcp_handler, execute_tool_as_rest, RestToMcpConfig};
+pub use stdio::{encode_stdio_url, StdioCommand};
 pub use types::*;

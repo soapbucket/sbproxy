@@ -67,6 +67,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.
 - [wasm-development.md](wasm-development.md) - writing WebAssembly modules for the `wasm` transform against the WASI preview-1 contract.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
+- [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md) - Archestra-derived MCP guardrails: egress, session risk, quarantine, stdio, run-as-user, and compaction.
 - [tool-versioning.md](tool-versioning.md) - the compatibility oracle: a contract digest and a semver grade per tool (structural, behavioral, and judged), with a version-bump linter that fails an under-bump.
 - [a2a-gateway.md](a2a-gateway.md) - the `a2a` action: typed AgentCard, capability discovery, and modality negotiation helpers.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.

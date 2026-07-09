@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-07-03*
+*Last modified: 2026-07-09*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -96,6 +96,9 @@ struct is `McpActionConfig` in
 | `progressive_discovery` | bool | `false` | Advertise `search` / `execute` meta-tools instead of the full catalogue (see [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery)). |
 | `oauth` | object | unset | RFC 9728 auth discovery (see the OAuth section below and [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)). |
 | `sessions` | object | unset | Streamable HTTP session management: `{enabled, ttl}` (see [`examples/mcp-sessions`](../examples/mcp-sessions)). |
+| `egress` | object | unset | Default OpenAPI REST egress policy. See [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md). |
+| `token_compaction` | object | unset | Opt-in compaction for large MCP text result blocks. |
+| `dual_llm_quarantine` | object | unset | Opt-in quarantine gate for suspicious MCP text result blocks. |
 | `refresh_interval` | duration | `60s` | How often the background task re-fetches upstream catalogues. Inbound requests always serve the cached snapshot; this is the only steady-state fan-out. |
 | `upstream_connect_timeout` | duration | `5s` | TCP connect deadline per upstream exchange. |
 | `upstream_timeout` | duration | `30s` | Whole-request deadline per upstream exchange (refreshes, calls, reads). Per-server `timeout:` can only shorten it for `tools/call`. |
@@ -114,7 +117,10 @@ struct is `McpActionConfig` in
 | `prefix` | string | derived from host | Namespace prefix applied to every tool from this upstream. Tools become `<prefix>.<tool>`. |
 | `rbac` | string | unset | Label referencing a key in `rbac_policies`. Validated at config-load time. Enforced on every `tools/call`. |
 | `timeout` | duration | unset | Caps each `tools/call` dispatch. Accepts `250ms`, `10s`, `2m`. |
-| `transport` | string | `streamable_http` | Either `streamable_http` or `sse`. |
+| `transport` | string | `streamable_http` | `streamable_http`, `sse`, or supervised local `stdio`. |
+| `command` / `args` | string / list | unset | Required command and optional arguments for `transport: stdio`. |
+| `egress` | object | inherited | Per-server OpenAPI REST egress policy. |
+| `run_as_user_auth` | bool | `false` | Attach bounded caller identity to outbound tool arguments. |
 
 A `rbac` value that does not match a key in `rbac_policies` is a hard
 config error (see `McpAction::from_parsed` in
