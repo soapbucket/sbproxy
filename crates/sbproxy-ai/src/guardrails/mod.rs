@@ -11,10 +11,10 @@ mod context_poisoning_rules;
 pub mod injection;
 mod jailbreak;
 pub mod mesh;
-pub mod stream;
 mod pii;
 mod regex_guard;
 mod schema;
+pub mod stream;
 mod toxicity;
 
 pub use agent_alignment::{AgentAlignmentConfig, AgentAlignmentGuardrail, AgentAlignmentMode};
@@ -273,12 +273,8 @@ impl GuardrailPipeline {
     /// mismatch is a construction bug, so zip (which truncates) is
     /// safe. Pipelines built by hand (tests) without policies see an
     /// empty iterator, matching "no streaming policy configured".
-    pub fn output_with_policies(
-        &self,
-    ) -> impl Iterator<Item = (&Guardrail, StreamPolicy)> {
-        self.output
-            .iter()
-            .zip(self.output_policies.iter().copied())
+    pub fn output_with_policies(&self) -> impl Iterator<Item = (&Guardrail, StreamPolicy)> {
+        self.output.iter().zip(self.output_policies.iter().copied())
     }
 
     /// Check input messages. Returns first block encountered.
@@ -352,7 +348,6 @@ impl GuardrailPipeline {
         }
         None
     }
-
 }
 
 /// Public text view of a slice of messages, used by the guardrail mesh as
@@ -524,8 +519,7 @@ mod tests {
         }))
         .expect("config parses");
         let p = compile_pipeline(&cfg).expect("compiles");
-        let policies: Vec<StreamPolicy> =
-            p.output_with_policies().map(|(_, pol)| pol).collect();
+        let policies: Vec<StreamPolicy> = p.output_with_policies().map(|(_, pol)| pol).collect();
         assert_eq!(
             policies,
             vec![StreamPolicy::Chunk, StreamPolicy::Close, StreamPolicy::Off]

@@ -22,9 +22,7 @@
 use std::sync::Arc;
 
 use super::jailbreak::dan_only_at_end;
-use super::{
-    AgentAlignmentMode, Guardrail, GuardrailBlock, GuardrailPipeline, StreamPolicy,
-};
+use super::{AgentAlignmentMode, Guardrail, GuardrailBlock, GuardrailPipeline, StreamPolicy};
 use crate::format::HubToolCallDelta;
 
 /// Cap on the accumulated close-policy buffer and on assembled
@@ -116,8 +114,7 @@ impl StreamGuardSession {
 
         // `output_with_policies` zips; hand-built pipelines without
         // policies fall back to Chunk for every guard.
-        let policies: Vec<StreamPolicy> = if pipeline.output_policies.len()
-            == pipeline.output.len()
+        let policies: Vec<StreamPolicy> = if pipeline.output_policies.len() == pipeline.output.len()
         {
             pipeline.output_policies.to_vec()
         } else {
@@ -256,11 +253,7 @@ impl StreamGuardSession {
         delta: &HubToolCallDelta,
     ) -> Vec<ToolCallVerdict> {
         let mut done = Vec::new();
-        let lower: Vec<usize> = self
-            .pending
-            .range(..index)
-            .map(|(&k, _)| k)
-            .collect();
+        let lower: Vec<usize> = self.pending.range(..index).map(|(&k, _)| k).collect();
         for k in lower {
             if let Some(call) = self.pending.remove(&k) {
                 done.push(self.judge(k, call));
@@ -314,9 +307,11 @@ impl StreamGuardSession {
             let Guardrail::AgentAlignment(g) = &self.pipeline.output[i] else {
                 continue;
             };
-            if let Some(reason) =
-                g.check_tool_call(&completed.name, &completed.args_json, self.principal.as_ref())
-            {
+            if let Some(reason) = g.check_tool_call(
+                &completed.name,
+                &completed.args_json,
+                self.principal.as_ref(),
+            ) {
                 return ToolCallVerdict::Violation {
                     call: completed,
                     reason,
@@ -485,11 +480,7 @@ mod tests {
         assert!(s.on_close().is_some(), "close policy fires at stream end");
     }
 
-    fn tc_delta(
-        id: Option<&str>,
-        name: Option<&str>,
-        args: Option<&str>,
-    ) -> HubToolCallDelta {
+    fn tc_delta(id: Option<&str>, name: Option<&str>, args: Option<&str>) -> HubToolCallDelta {
         HubToolCallDelta {
             id: id.map(String::from),
             name: name.map(String::from),

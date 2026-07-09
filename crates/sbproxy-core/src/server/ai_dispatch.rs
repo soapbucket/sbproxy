@@ -4474,9 +4474,7 @@ fn process_guard_events(
                     }
                 }
                 ToolCallVerdict::Violation { call, reason, mode } => {
-                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation(
-                        "agent_alignment",
-                    );
+                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation("agent_alignment");
                     match mode {
                         AgentAlignmentMode::Block => {
                             return Some(GuardrailBlock {
@@ -4750,10 +4748,8 @@ pub(super) async fn relay_ai_stream(
     // Held-back streamed tool-call frames (Block mode), keyed by the
     // call's stream index; released on a Clean verdict, dropped when a
     // violation terminates the stream.
-    let mut held_tool_chunks: std::collections::BTreeMap<
-        usize,
-        Vec<sbproxy_ai::format::HubChunk>,
-    > = std::collections::BTreeMap::new();
+    let mut held_tool_chunks: std::collections::BTreeMap<usize, Vec<sbproxy_ai::format::HubChunk>> =
+        std::collections::BTreeMap::new();
     let bridge_ctx = sbproxy_ai::format::BridgeContext {
         inbound_format: format_args
             .inbound_format
@@ -4938,10 +4934,7 @@ pub(super) async fn relay_ai_stream(
                     // after this chunk's regular content.
                     let emit_now = hub_chunks.iter().filter(|hub| {
                         !(holds_tool_frames
-                            && matches!(
-                                hub,
-                                sbproxy_ai::format::HubChunk::ToolCallDelta { .. }
-                            ))
+                            && matches!(hub, sbproxy_ai::format::HubChunk::ToolCallDelta { .. }))
                     });
                     for hub in emit_now.chain(released_tool_chunks.iter()) {
                         match emitter.from_hub_stream(hub, &bridge_ctx) {
@@ -5065,10 +5058,7 @@ pub(super) async fn relay_ai_stream(
                 {
                     let emit_now = tail_events.iter().filter(|hub| {
                         !(holds_tool_frames
-                            && matches!(
-                                hub,
-                                sbproxy_ai::format::HubChunk::ToolCallDelta { .. }
-                            ))
+                            && matches!(hub, sbproxy_ai::format::HubChunk::ToolCallDelta { .. }))
                     });
                     let mut translated = String::new();
                     for hub in emit_now.chain(close_released.iter()) {
