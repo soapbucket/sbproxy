@@ -26,10 +26,9 @@ Environment variables keep the existing `${ENV_NAME}` form. Do not use an env UR
 ```text
 ${ENV_NAME}
 file:/path/to/secret
-secret:<name>
 ```
 
-The old umbrella form, `vault://<alias>/...`, is still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced. To rewrite known aliases, run:
+The Go-era `secret:<name>` colon form is removed: it now fails config load with a pointer at the `secret://<backend>/<name>` replacement, and the `proxy.secrets.map` key that served it parses but has no effect. The old umbrella form, `vault://<alias>/...`, is still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced. To rewrite known aliases, run:
 
 ```bash
 sbproxy config migrate sb.yml --out sb.migrated.yml

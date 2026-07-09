@@ -1011,8 +1011,18 @@ fn install_secret_resolver(path: &std::path::Path) {
         }
     }
 
-    let resolver = sbproxy_vault::SecretResolver::new(None, secrets.map)
-        .with_manager(std::sync::Arc::new(manager));
+    // WOR-1785: the `secret:<name>` colon form (and the logical-name map
+    // that served it) is gone. The config key still parses for
+    // schema-v1 compatibility, so tell the operator it does nothing.
+    if !secrets.map.is_empty() {
+        tracing::warn!(
+            entries = secrets.map.len(),
+            "proxy.secrets.map has no effect: the `secret:<name>` form was removed. \
+             Reference secrets as `secret://<backend>/<name>` with a backend declared \
+             under proxy.secrets.backends (docs/secrets.md)"
+        );
+    }
+    let resolver = sbproxy_vault::SecretResolver::new().with_manager(std::sync::Arc::new(manager));
     sbproxy_vault::install_process_resolver(std::sync::Arc::new(resolver));
 }
 

@@ -4115,10 +4115,10 @@ pub struct SecretsConfig {
     /// HashiCorp Vault connection settings. Required when `backend = "hashicorp"`.
     #[serde(default)]
     pub hashicorp: Option<HashiCorpSecretsConfig>,
-    /// Logical name to vault path mapping.
-    ///
-    /// Allows config files to refer to stable logical names while the physical
-    /// vault path can change independently.
+    /// Logical name to vault path mapping. INERT since the removal of
+    /// the `secret:<name>` colon form it served (WOR-1785); still
+    /// parsed for schema-v1 compatibility, and boot warns when set.
+    /// Use `secret://<backend>/<name>` references instead.
     #[serde(default)]
     pub map: HashMap<String, String>,
     /// Secret rotation settings.

@@ -1421,7 +1421,11 @@ pub struct LedgerSecretRef {
     /// Environment variable name that holds the hex-encoded HMAC key.
     #[serde(default)]
     pub env: Option<String>,
-    /// Logical `secret:<name>` reference resolved through sbproxy-vault.
+    /// Name of an environment variable holding the key. Behaviourally
+    /// identical to `env` since the removal of the resolver's
+    /// `secret:<name>` colon form (WOR-1785), whose vault-less fallback
+    /// was always an env lookup; kept as an accepted spelling so
+    /// existing configs keep resolving.
     #[serde(default)]
     pub secret: Option<String>,
 }
@@ -1432,11 +1436,9 @@ pub(super) fn resolve_secret_ref(sref: &LedgerSecretRef, context: &str) -> anyho
             .map_err(|_| anyhow::anyhow!("{context}.secret_ref.env: env var '{env}' not set"));
     }
     if let Some(secret) = sref.secret.as_deref() {
-        let resolver = sbproxy_vault::SecretResolver::new(None, std::collections::HashMap::new())
-            .with_fallback(sbproxy_vault::ResolveFallback::Env);
-        return resolver
-            .resolve(&format!("secret:{secret}"))
-            .map_err(|e| anyhow::anyhow!("{context}.secret_ref.secret: {e}"));
+        return std::env::var(secret).map_err(|_| {
+            anyhow::anyhow!("{context}.secret_ref.secret: env var '{secret}' not set")
+        });
     }
     anyhow::bail!("{context}.secret_ref requires either env or secret")
 }
