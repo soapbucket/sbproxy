@@ -103,6 +103,22 @@ impl InjectionGuardrail {
 
         None
     }
+
+    /// Longest pattern this guard can match, in bytes. Sizes the
+    /// streaming session's rolling tail window (WOR-1810).
+    pub(crate) fn max_pattern_len(&self) -> usize {
+        let common = if self.detect_common {
+            COMMON_INJECTION_PATTERNS
+                .iter()
+                .map(|p| p.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let custom = self.patterns.iter().map(|p| p.len()).max().unwrap_or(0);
+        common.max(custom)
+    }
 }
 
 #[cfg(test)]

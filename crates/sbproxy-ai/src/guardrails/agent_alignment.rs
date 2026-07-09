@@ -351,6 +351,12 @@ impl AgentAlignmentGuardrail {
     pub fn mode(&self) -> AgentAlignmentMode {
         self.cfg.mode
     }
+
+    /// The per-turn tool-call budget (0 = unlimited). The streaming
+    /// lane enforces it against its running completed-call count.
+    pub fn max_tool_calls_per_turn(&self) -> usize {
+        self.cfg.max_tool_calls_per_turn
+    }
 }
 
 /// Extract the tool name from a tool-call JSON shape. OpenAI carries

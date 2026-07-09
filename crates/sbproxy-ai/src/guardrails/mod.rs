@@ -11,6 +11,7 @@ mod context_poisoning_rules;
 pub mod injection;
 mod jailbreak;
 pub mod mesh;
+pub mod stream;
 mod pii;
 mod regex_guard;
 mod schema;

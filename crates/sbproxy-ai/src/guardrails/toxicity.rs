@@ -32,6 +32,12 @@ impl ToxicityGuardrail {
 
         None
     }
+
+    /// Longest keyword this guard can match, in bytes. Sizes the
+    /// streaming session's rolling tail window (WOR-1810).
+    pub(crate) fn max_pattern_len(&self) -> usize {
+        self.keywords.iter().map(|k| k.len()).max().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
