@@ -1539,7 +1539,15 @@ pub(super) async fn handle_mcp_action(
                         // WOR-1635: version-gate check first; a
                         // blocked tool is invisible in tools/list and
                         // must fail calls with the violation detail.
-                        if let Some(detail) = mcp.federation.version_blocked().get(&name) {
+                        if let Some(denial) = mcp_lethal_trifecta_denial(
+                            mcp,
+                            &name,
+                            mcp_session_id.as_deref(),
+                            &ctx.hostname,
+                            request.id.clone(),
+                        ) {
+                            denial
+                        } else if let Some(detail) = mcp.federation.version_blocked().get(&name) {
                             JsonRpcResponse::error(
                                 request.id.clone(),
                                 INVALID_PARAMS,
@@ -1696,8 +1704,18 @@ pub(super) async fn handle_mcp_action(
                                     None
                                 };
 
+                                let run_as_user = federated
+                                    .as_ref()
+                                    .map(|t| mcp.run_as_user_for_server(&t.server_name))
+                                    .unwrap_or(false);
+                                let outbound_arguments = if run_as_user {
+                                    mcp_attach_run_as_user(arguments, &ctx.principal)
+                                } else {
+                                    arguments
+                                };
+
                                 let call_started = std::time::Instant::now();
-                                let call = mcp.federation.call_tool(&name, arguments);
+                                let call = mcp.federation.call_tool(&name, outbound_arguments);
                                 let outcome = match timeout {
                                     Some(d) => match tokio::time::timeout(d, call).await {
                                         Ok(r) => r,
@@ -1763,7 +1781,21 @@ pub(super) async fn handle_mcp_action(
                                             "mcp_rbac",
                                             "allow",
                                         );
-                                        JsonRpcResponse::success(request.id.clone(), value)
+                                        if let Some(message) = mcp_quarantine_reason(mcp, &value) {
+                                            sbproxy_observe::metrics::record_policy(
+                                                ctx.hostname.as_str(),
+                                                "mcp_dual_llm_quarantine",
+                                                "deny",
+                                            );
+                                            JsonRpcResponse::error(
+                                                request.id.clone(),
+                                                INTERNAL_ERROR,
+                                                &message,
+                                            )
+                                        } else {
+                                            let value = mcp_compact_tool_result(mcp, value);
+                                            JsonRpcResponse::success(request.id.clone(), value)
+                                        }
                                     }
                                     Err(e) => JsonRpcResponse::error(
                                         request.id.clone(),
@@ -1788,6 +1820,154 @@ pub(super) async fn handle_mcp_action(
         Some(session_id) => write_jsonrpc_with_session(session, &response, session_id).await,
         None => write_jsonrpc(session, &response).await,
     }
+}
+
+/// WOR-1788: enforce the session-level lethal-trifecta guardrail before
+/// a tool call reaches upstream IO.
+fn mcp_lethal_trifecta_denial(
+    mcp: &sbproxy_modules::action::McpAction,
+    tool_name: &str,
+    mcp_session_id: Option<&str>,
+    hostname: &str,
+    request_id: Option<serde_json::Value>,
+) -> Option<sbproxy_extension::mcp::types::JsonRpcResponse> {
+    let guardrail = mcp.lethal_trifecta.as_ref()?;
+    let risk = guardrail.classify(tool_name);
+    let aggregate = match (mcp.sessions.as_deref(), mcp_session_id) {
+        (Some(store), Some(id)) => store.record_risk(id, risk).unwrap_or(risk),
+        _ => risk,
+    };
+    if !aggregate.is_lethal_trifecta() {
+        return None;
+    }
+    tracing::warn!(
+        target: "sbproxy::mcp::lethal_trifecta",
+        tool = %tool_name,
+        "MCP tools/call denied by lethal-trifecta session guardrail",
+    );
+    sbproxy_observe::metrics::record_policy(hostname, "mcp_lethal_trifecta", "deny");
+    Some(sbproxy_extension::mcp::types::JsonRpcResponse::error(
+        request_id,
+        sbproxy_extension::mcp::types::INVALID_PARAMS,
+        &format!(
+            "tool '{}' is blocked by lethal-trifecta session guardrail",
+            tool_name
+        ),
+    ))
+}
+
+/// WOR-1792: attach bounded caller identity for upstreams that opt into
+/// run-as-user MCP auth. Arbitrary claims and metadata are intentionally
+/// omitted; upstreams get stable attribution fields only.
+fn mcp_attach_run_as_user(
+    arguments: serde_json::Value,
+    principal: &sbproxy_plugin::Principal,
+) -> serde_json::Value {
+    let mut obj = arguments.as_object().cloned().unwrap_or_default();
+    let mut identity = serde_json::json!({
+        "tenant_id": principal.tenant_id.to_string(),
+        "sub": principal.sub,
+        "source": format!("{:?}", principal.source),
+    });
+    if let Some(vk) = principal.virtual_key.as_ref() {
+        identity["virtual_key"] = serde_json::json!({ "name": vk.name });
+    }
+    if let Some(user) = principal.attrs.user.as_ref() {
+        identity["user"] = serde_json::Value::String(user.clone());
+    }
+    if let Some(team) = principal.attrs.team.as_ref() {
+        identity["team"] = serde_json::Value::String(team.clone());
+    }
+    if let Some(project) = principal.attrs.project.as_ref() {
+        identity["project"] = serde_json::Value::String(project.clone());
+    }
+    if let Some(key_id) = principal.attrs.key_id.as_ref() {
+        identity["key_id"] = serde_json::Value::String(key_id.clone());
+    }
+    obj.insert("_sbproxy_run_as_user".to_string(), identity);
+    serde_json::Value::Object(obj)
+}
+
+/// WOR-1795: opt-in compaction for verbose MCP text result blocks.
+fn mcp_compact_tool_result(
+    mcp: &sbproxy_modules::action::McpAction,
+    mut value: serde_json::Value,
+) -> serde_json::Value {
+    let Some(cfg) = mcp.token_compaction.as_ref() else {
+        return value;
+    };
+    let max = cfg.max_text_bytes.unwrap_or(8 * 1024);
+    if max == 0 {
+        return value;
+    }
+    let Some(content) = value.get_mut("content").and_then(|v| v.as_array_mut()) else {
+        return value;
+    };
+    for block in content {
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) != Some("text") {
+            continue;
+        }
+        let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if text.len() <= max {
+            continue;
+        }
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let omitted = text.len().saturating_sub(end);
+        obj.insert(
+            "text".to_string(),
+            serde_json::Value::String(format!(
+                "{}\n[compacted by sbproxy: omitted {} bytes]",
+                &text[..end],
+                omitted
+            )),
+        );
+        obj.insert(
+            "_sbproxy_compacted".to_string(),
+            serde_json::json!({ "omitted_bytes": omitted }),
+        );
+    }
+    value
+}
+
+/// WOR-1789: quarantine suspicious MCP text output before it is handed
+/// back to the calling model/client.
+fn mcp_quarantine_reason(
+    mcp: &sbproxy_modules::action::McpAction,
+    value: &serde_json::Value,
+) -> Option<String> {
+    let cfg = mcp.dual_llm_quarantine.as_ref()?;
+    if cfg.suspicious_patterns.is_empty() {
+        return None;
+    }
+    let content = value.get("content").and_then(|v| v.as_array())?;
+    for block in content {
+        if block.get("type").and_then(|v| v.as_str()) != Some("text") {
+            continue;
+        }
+        let Some(text) = block.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let lower = text.to_ascii_lowercase();
+        if let Some(pattern) = cfg
+            .suspicious_patterns
+            .iter()
+            .find(|pattern| !pattern.is_empty() && lower.contains(&pattern.to_ascii_lowercase()))
+        {
+            return Some(format!(
+                "tool output quarantined by dual-LLM guardrail pattern '{}'",
+                pattern
+            ));
+        }
+    }
+    None
 }
 
 /// WOR-1186: ledger inputs captured before the federated call consumes
