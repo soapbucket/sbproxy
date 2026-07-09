@@ -11,6 +11,7 @@ const nav = [
   { to: "/config", label: "Config" },
   { to: "/logs", label: "Logs" },
   { to: "/metrics", label: "Metrics" },
+  { to: "/spend", label: "Spend" },
   { to: "/prompts", label: "Prompts" },
   { to: "/playground", label: "Playground" },
   { to: "/cache", label: "Cache" },
