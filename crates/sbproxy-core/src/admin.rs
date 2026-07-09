@@ -1846,16 +1846,15 @@ pub fn handle_admin_request(
     if path_only == "/api/usage/spend" {
         let snap = sbproxy_observe::metrics::metrics().snapshot_named(&[
             "sbproxy_ai_tokens_total",
+            "sbproxy_tokens_attributed_total",
+            "sbproxy_ai_tokens_attributed_total",
             "sbproxy_ai_cost_usd_micros_total",
+            "sbproxy_ai_cost_dollars_attributed_total",
         ]);
-        let tokens = snap.get("sbproxy_ai_tokens_total").copied().unwrap_or(0.0);
-        let micros = snap
-            .get("sbproxy_ai_cost_usd_micros_total")
-            .copied()
-            .unwrap_or(0.0);
+        let (tokens, cost_usd) = spend_totals_from_snapshot(&snap);
         let body = serde_json::json!({
             "tokens": tokens,
-            "cost_usd": micros / 1_000_000.0,
+            "cost_usd": cost_usd,
         })
         .to_string();
         return (200, "application/json", body);
@@ -2010,6 +2009,39 @@ pub fn handle_admin_request(
             r#"{"error":"Not Found"}"#.to_string(),
         ),
     }
+}
+
+fn snapshot_value(snap: &std::collections::HashMap<String, f64>, name: &str) -> f64 {
+    snap.get(name).copied().unwrap_or(0.0)
+}
+
+fn first_positive_snapshot_value(
+    snap: &std::collections::HashMap<String, f64>,
+    names: &[&str],
+) -> f64 {
+    names
+        .iter()
+        .map(|name| snapshot_value(snap, name))
+        .find(|value| *value > 0.0)
+        .unwrap_or(0.0)
+}
+
+fn spend_totals_from_snapshot(snap: &std::collections::HashMap<String, f64>) -> (f64, f64) {
+    let tokens = first_positive_snapshot_value(
+        snap,
+        &[
+            "sbproxy_ai_tokens_total",
+            "sbproxy_ai_tokens_attributed_total",
+            "sbproxy_tokens_attributed_total",
+        ],
+    );
+    let dollars = snapshot_value(snap, "sbproxy_ai_cost_dollars_attributed_total");
+    let cost_usd = if dollars > 0.0 {
+        dollars
+    } else {
+        snapshot_value(snap, "sbproxy_ai_cost_usd_micros_total") / 1_000_000.0
+    };
+    (tokens, cost_usd)
 }
 
 // --- Admin HTTP listener ---
@@ -3165,6 +3197,34 @@ mod tests {
         assert_eq!(ct, "application/json");
         // Empty log returns JSON array.
         assert_eq!(body, "[]");
+    }
+
+    #[test]
+    fn spend_totals_use_attributed_tokens_when_legacy_tokens_are_empty() {
+        let snap = std::collections::HashMap::from([
+            ("sbproxy_ai_tokens_total".to_string(), 0.0),
+            ("sbproxy_tokens_attributed_total".to_string(), 39.0),
+            ("sbproxy_ai_cost_usd_micros_total".to_string(), 195.0),
+        ]);
+
+        let (tokens, cost_usd) = spend_totals_from_snapshot(&snap);
+
+        assert_eq!(tokens, 39.0);
+        assert_eq!(cost_usd, 0.000195);
+    }
+
+    #[test]
+    fn spend_totals_accept_ai_prefixed_attributed_metric_name() {
+        let snap = std::collections::HashMap::from([
+            ("sbproxy_ai_tokens_total".to_string(), 0.0),
+            ("sbproxy_ai_tokens_attributed_total".to_string(), 44.0),
+            ("sbproxy_ai_cost_dollars_attributed_total".to_string(), 0.25),
+        ]);
+
+        let (tokens, cost_usd) = spend_totals_from_snapshot(&snap);
+
+        assert_eq!(tokens, 44.0);
+        assert_eq!(cost_usd, 0.25);
     }
 
     #[test]

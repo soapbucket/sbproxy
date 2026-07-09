@@ -43,7 +43,7 @@ const loadModel = () =>
 const evictModel = (name: string) =>
   act(`evict:${name}`, () => api.modelHostEvict(name), `Evicted "${name}".`);
 
-const status = computed<ModelHostStatus | null>(() => req.data.value);
+const status = computed<ModelHostStatus | null>(() => req.data.value ?? null);
 const serving = computed(() => !!status.value?.serving);
 const models = computed<ResidentModel[]>(() => status.value?.models ?? []);
 const vram = computed(() => status.value?.vram);

@@ -387,7 +387,7 @@ impl DoctorReport {
         let model_cache_exists = model_cache_dir.is_dir();
         let model_cache_free_bytes = free_disk_bytes(&model_cache_dir);
 
-        let local_serving = serving_verdict(&gpus, &engines);
+        let local_serving = serving_verdict(&gpus, &drivers, &engines);
 
         Self {
             host,
@@ -919,17 +919,31 @@ fn vllm_acquisition(env: &EngineEnvView, on_path: bool) -> Vec<AcquisitionOption
 /// Decide whether a `serve:` block would admit a model here: the host
 /// needs a memory budget (a GPU, Apple unified memory, or CPU RAM) and
 /// at least one runnable engine. Produces the single best remediation.
-fn serving_verdict(gpus: &[GpuDescriptor], engines: &[EngineBinary]) -> LocalServing {
+fn serving_verdict(
+    gpus: &[GpuDescriptor],
+    drivers: &DriverInfo,
+    engines: &[EngineBinary],
+) -> LocalServing {
     let mut blockers = Vec::new();
     let mut recommendation = None;
 
     if gpus.is_empty() {
-        blockers.push(
-            "no memory budget: no GPU is visible and CPU admission is disabled \
-             (SBPROXY_CPU_MEMORY_FRACTION=0). Unset it, add a GPU, or run on a box \
-             with RAM to spare"
-                .to_string(),
-        );
+        if drivers.metal {
+            blockers.push(
+                "Apple Metal is available, but the model-host admission path did not publish \
+                 an Apple unified-memory budget yet; use an external OpenAI-compatible local \
+                 server such as Ollama today, or install llama.cpp and use serve: once the \
+                 unified-memory probe reports a budget"
+                    .to_string(),
+            );
+        } else {
+            blockers.push(
+                "no memory budget: no GPU is visible and CPU admission is disabled \
+                 (SBPROXY_CPU_MEMORY_FRACTION=0). Unset it, add a GPU, or run on a box \
+                 with RAM to spare"
+                    .to_string(),
+            );
+        }
     }
 
     // "Installed" = a binary on PATH, or the embedded engine compiled
@@ -1207,6 +1221,45 @@ mod tests {
             "vLLM must be N/A on macOS: {:?}",
             vllm.acquisition
         );
+    }
+
+    #[test]
+    fn serving_verdict_names_apple_unified_memory_gap() {
+        let env = EngineEnvView {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            container: false,
+            brew: false,
+            uv: false,
+            pip: false,
+            embedded_feature: false,
+        };
+        let engines = vec![
+            engine_report("llama_cpp", "llama-server", &env),
+            engine_report("vllm", "vllm", &env),
+            engine_report("embedded", "embedded", &env),
+        ];
+        let verdict = serving_verdict(
+            &[],
+            &DriverInfo {
+                nvidia_driver: None,
+                cuda: None,
+                metal: true,
+                rocm: false,
+            },
+            &engines,
+        );
+
+        assert!(!verdict.ready);
+        assert!(verdict
+            .blockers
+            .iter()
+            .any(|b| b.contains("Apple Metal is available")));
+        assert!(verdict
+            .recommendation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("llama_cpp"));
     }
 
     #[test]

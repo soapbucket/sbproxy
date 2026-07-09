@@ -1002,8 +1002,18 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     );
     let mut server = Server::new_with_opt_and_conf(None, conf);
 
-    // Create the HTTP proxy service.
-    let mut proxy_service = http_proxy_service(&server.configuration, SbProxy);
+    // Create the HTTP proxy service. Pingora 0.8's rustls upstream
+    // connector unwraps native CA loading during construction; on
+    // sandboxed macOS sessions without a keychain that can panic before
+    // sbproxy can print a useful startup error.
+    let mut proxy_service = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        http_proxy_service(&server.configuration, SbProxy)
+    })) {
+        Ok(service) => service,
+        Err(payload) => {
+            return Err(proxy_service_startup_error(payload.as_ref()));
+        }
+    };
     proxy_service.add_tcp(&format!("0.0.0.0:{port}"));
 
     // --- HTTP/2 cleartext (h2c) ---
@@ -1578,6 +1588,24 @@ fn report_plugin_registrations() {
     for reg in inventory::iter::<sbproxy_plugin::AuthPluginRegistration>() {
         sbproxy_observe::metrics::record_plugin_registered("auth", reg.name);
     }
+}
+
+fn proxy_service_startup_error(payload: &(dyn std::any::Any + Send)) -> anyhow::Error {
+    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    };
+    let hint = if message.contains("Failed to load native certificates")
+        || message.contains("No keychain is available")
+    {
+        "failed to initialize upstream TLS trust roots. On macOS this can happen in sandboxed or non-login sessions where the system keychain is unavailable; run sbproxy from a normal login shell or set SSL_CERT_FILE to a readable CA bundle."
+    } else {
+        "failed to initialize Pingora proxy service"
+    };
+    anyhow::anyhow!("{hint}: {message}")
 }
 
 /// Shared process-global mutex any test that touches the global
@@ -2325,6 +2353,17 @@ fn compile_one_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_service_startup_error_preserves_native_cert_hint() {
+        let payload = "called `Result::unwrap()` on an `Err` value: Failed to load native certificates: No keychain is available";
+        let err = proxy_service_startup_error(&payload);
+        let text = format!("{err:#}");
+
+        assert!(text.contains("upstream TLS trust roots"));
+        assert!(text.contains("SSL_CERT_FILE"));
+        assert!(text.contains("No keychain is available"));
+    }
 
     /// WOR-1043 PR2 / PR3: installing the redact state from a compiled
     /// config that carries a proxy-scope PII block plus a tenant-scope
