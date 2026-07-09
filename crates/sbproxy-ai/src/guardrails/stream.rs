@@ -34,6 +34,9 @@ const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 /// A streamed tool call assembled from its deltas.
 #[derive(Debug, Clone)]
 pub struct CompletedToolCall {
+    /// Stream index of the call (`choices[].delta.tool_calls[].index`),
+    /// so a relay holding back frames can release the right ones.
+    pub index: usize,
     /// Provider-assigned call id (first delta), when present.
     pub id: Option<String>,
     /// Tool name (first delta). Empty when the provider never sent one.
@@ -260,7 +263,7 @@ impl StreamGuardSession {
             .collect();
         for k in lower {
             if let Some(call) = self.pending.remove(&k) {
-                done.push(self.judge(call));
+                done.push(self.judge(k, call));
             }
         }
 
@@ -288,12 +291,12 @@ impl StreamGuardSession {
     pub fn finish_tool_calls(&mut self) -> Vec<ToolCallVerdict> {
         let pending = std::mem::take(&mut self.pending);
         pending
-            .into_values()
-            .map(|call| self.judge(call))
+            .into_iter()
+            .map(|(idx, call)| self.judge(idx, call))
             .collect()
     }
 
-    fn judge(&mut self, call: PendingCall) -> ToolCallVerdict {
+    fn judge(&mut self, index: usize, call: PendingCall) -> ToolCallVerdict {
         self.completed_calls += 1;
         if call.truncated {
             tracing::warn!(
@@ -302,6 +305,7 @@ impl StreamGuardSession {
             );
         }
         let completed = CompletedToolCall {
+            index,
             id: call.id,
             name: call.name,
             args_json: call.args,

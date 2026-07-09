@@ -3004,6 +3004,9 @@ pub(super) async fn handle_ai_proxy(
                     .as_ref()
                     .and_then(cached_guardrails_pipeline)
                     .filter(|p| p.has_output()),
+                // WOR-1810: identity for the streamed tool-call rbac
+                // rule, mirroring the buffered input check.
+                Some(ctx.principal.clone()),
             )
             .await
         } else {
@@ -4355,6 +4358,7 @@ pub(super) struct StreamFormatArgs {
 /// surfaces override.
 pub(super) fn build_stream_translator(
     args: &StreamFormatArgs,
+    force_openai_reemit: bool,
 ) -> (
     Option<sbproxy_ai::format::NativeStreamTranslator>,
     Option<Box<dyn sbproxy_ai::format::ChatFormat>>,
@@ -4372,9 +4376,13 @@ pub(super) fn build_stream_translator(
         // but when a native-inbound surface (/v1/messages, /v1/responses)
         // streams against an OpenAI-format upstream, parse the OpenAI
         // SSE back into the hub so the inbound emitter re-frames it in
-        // Anthropic / Responses shape (WOR-799).
+        // Anthropic / Responses shape (WOR-799). WOR-1810: an
+        // agent-alignment guard in Block mode also forces the
+        // decode-and-re-emit path so tool-call frames can be held back
+        // until each call is judged.
         ProviderFormat::OpenAi | ProviderFormat::Custom => match args.inbound_format.as_deref() {
             Some("anthropic") | Some("responses") => Some(NativeStreamFormat::OpenAiChat),
+            _ if force_openai_reemit => Some(NativeStreamFormat::OpenAiChat),
             _ => None,
         },
     };
@@ -4389,6 +4397,107 @@ pub(super) fn build_stream_translator(
         None
     };
     (translator, emitter)
+}
+
+/// WOR-1810: run one batch of decoded hub events through the guardrail
+/// session (`finish` additionally completes every pending tool call,
+/// for message stop / stream close). Returns the first block verdict
+/// plus any held tool-call frames released by non-blocking verdicts.
+/// Flag-mode violations are logged and counted here without touching
+/// the stream.
+fn process_guard_events(
+    sessn: &mut sbproxy_ai::guardrails::stream::StreamGuardSession,
+    events: &[sbproxy_ai::format::HubChunk],
+    held: &mut std::collections::BTreeMap<usize, Vec<sbproxy_ai::format::HubChunk>>,
+    holding: bool,
+    finish: bool,
+) -> (
+    Option<sbproxy_ai::guardrails::GuardrailBlock>,
+    Vec<sbproxy_ai::format::HubChunk>,
+) {
+    use sbproxy_ai::format::{ContentPartDelta, HubChunk};
+    use sbproxy_ai::guardrails::stream::ToolCallVerdict;
+    use sbproxy_ai::guardrails::{AgentAlignmentMode, GuardrailBlock};
+
+    let mut released: Vec<HubChunk> = Vec::new();
+
+    fn handle_verdicts(
+        verdicts: Vec<ToolCallVerdict>,
+        held: &mut std::collections::BTreeMap<usize, Vec<HubChunk>>,
+        released: &mut Vec<HubChunk>,
+    ) -> Option<GuardrailBlock> {
+        for v in verdicts {
+            match v {
+                ToolCallVerdict::Clean(call) => {
+                    if let Some(frames) = held.remove(&call.index) {
+                        released.extend(frames);
+                    }
+                }
+                ToolCallVerdict::Violation { call, reason, mode } => {
+                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation(
+                        "agent_alignment",
+                    );
+                    match mode {
+                        AgentAlignmentMode::Block => {
+                            return Some(GuardrailBlock {
+                                name: "agent_alignment".to_string(),
+                                reason,
+                            });
+                        }
+                        AgentAlignmentMode::Flag => {
+                            warn!(
+                                tool = %call.name,
+                                %reason,
+                                "agent alignment flagged a streamed tool call"
+                            );
+                            if let Some(frames) = held.remove(&call.index) {
+                                released.extend(frames);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    for ev in events {
+        match ev {
+            HubChunk::ContentDelta {
+                delta: ContentPartDelta::Text(t),
+                ..
+            } => {
+                if let Some(block) = sessn.on_content_delta(t) {
+                    return (Some(block), released);
+                }
+            }
+            HubChunk::ToolCallDelta { index, delta } => {
+                if holding {
+                    held.entry(*index).or_default().push(ev.clone());
+                }
+                let verdicts = sessn.on_tool_call_delta(*index, delta);
+                if let Some(b) = handle_verdicts(verdicts, held, &mut released) {
+                    return (Some(b), released);
+                }
+            }
+            HubChunk::MessageStop { .. } => {
+                let verdicts = sessn.finish_tool_calls();
+                if let Some(b) = handle_verdicts(verdicts, held, &mut released) {
+                    return (Some(b), released);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if finish {
+        let verdicts = sessn.finish_tool_calls();
+        if let Some(b) = handle_verdicts(verdicts, held, &mut released) {
+            return (Some(b), released);
+        }
+    }
+
+    (None, released)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4411,11 +4520,17 @@ pub(super) async fn relay_ai_stream(
     // streaming restorer short-circuits per-chunk via
     // `StreamingReversibleRestore::is_noop`.
     reversible_pairs: Vec<(String, String, String)>,
-    // WOR-1141: streaming-safe OUTPUT guardrails. `None` when the origin
-    // declares no output guardrails. Each outbound chunk is fed through
-    // `check_output_chunk` (streaming-safe guardrails only, per the
-    // WOR-235 ADR); a match terminates the stream.
+    // WOR-1141 / WOR-1810: OUTPUT guardrails. `None` when the origin
+    // declares no output guardrails. A per-stream session runs every
+    // guardrail against decoded content deltas (cumulative window for
+    // the substring matchers) and judges assembled streamed tool
+    // calls; a block verdict terminates the stream.
     output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
+    // WOR-1810: the authenticated principal, mirroring the buffered
+    // path's `check_input_body_with_principal(..., Some(&ctx.principal))`
+    // so the agent-alignment rbac rule sees the same identity on
+    // streamed tool calls.
+    principal: Option<sbproxy_plugin::Principal>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
     record_ai_provider_response_failure(&ai_span, router_sink.provider_name, status, None);
@@ -4542,13 +4657,63 @@ pub(super) async fn relay_ai_stream(
         None
     };
 
+    // --- WOR-1810: per-stream output-guardrail session ---
+    //
+    // Runs every output guardrail over decoded content deltas
+    // (cumulative tail window for the substring matchers, per-delta
+    // for the rest) and judges streamed tool calls as they complete.
+    // Built before the translator because an agent-alignment guard in
+    // Block mode forces the decode-and-re-emit path.
+    let mut guard_session = output_guardrails.as_ref().map(|p| {
+        sbproxy_ai::guardrails::stream::StreamGuardSession::new(p.clone(), principal.as_ref())
+    });
+    if let (Some(p), Some(s)) = (output_guardrails.as_ref(), guard_session.as_ref()) {
+        if s.skipped_count() > 0 {
+            for (g, pol) in p.output_with_policies() {
+                if pol == sbproxy_ai::guardrails::StreamPolicy::Off {
+                    sbproxy_ai::ai_metrics::record_stream_guardrail_skipped(g.name(), 1);
+                }
+            }
+        }
+    }
+    let holds_tool_frames = guard_session
+        .as_ref()
+        .is_some_and(|s| s.holds_tool_frames());
+
     // --- Native-format streaming translator ---
     //
     // When the upstream emits a non-OpenAI native SSE shape we walk
     // every byte through a hub-format translator: native bytes ->
     // `HubChunk`s -> client's inbound wire shape. OpenAI in /
-    // OpenAI out stays a zero-cost pass-through.
-    let (mut native_translator, inbound_emitter) = build_stream_translator(&format_args);
+    // OpenAI out stays a zero-cost pass-through, except when tool-call
+    // hold-back (Block-mode alignment) forces re-emission.
+    let (mut native_translator, inbound_emitter) =
+        build_stream_translator(&format_args, holds_tool_frames);
+    // Decode-only extractor for the passthrough path: feeds the
+    // guardrail session and nothing else; outbound bytes stay the raw
+    // upstream frames.
+    let mut guard_decoder = if guard_session.is_some() && native_translator.is_none() {
+        Some(sbproxy_ai::format::NativeStreamTranslator::new(
+            sbproxy_ai::format::NativeStreamFormat::OpenAiChat,
+        ))
+    } else {
+        None
+    };
+    // Raw-fallback bookkeeping: if a substantial run of bytes flows
+    // and the decoder never yields a single event, the provider is not
+    // emitting OpenAI-shaped SSE; degrade that stream to raw-frame
+    // matching permanently (coverage over precision) and count it.
+    const GUARD_DECODE_FALLBACK_BYTES: usize = 128 * 1024;
+    let mut guard_decoder_bytes: usize = 0;
+    let mut guard_decoder_yielded = false;
+    let mut guard_raw_mode = false;
+    // Held-back streamed tool-call frames (Block mode), keyed by the
+    // call's stream index; released on a Clean verdict, dropped when a
+    // violation terminates the stream.
+    let mut held_tool_chunks: std::collections::BTreeMap<
+        usize,
+        Vec<sbproxy_ai::format::HubChunk>,
+    > = std::collections::BTreeMap::new();
     let bridge_ctx = sbproxy_ai::format::BridgeContext {
         inbound_format: format_args
             .inbound_format
@@ -4645,20 +4810,100 @@ pub(super) async fn relay_ai_stream(
                     parser.feed(&chunk_bytes);
                 }
 
+                // --- WOR-1810: decode + guardrail session ---
+                //
+                // Decode this chunk's hub events from whichever decoder
+                // is live (the format translator, or the decode-only
+                // extractor on the passthrough path) and run the
+                // guardrail session over them BEFORE any bytes are
+                // written. A block verdict terminates the stream.
+                let decoded: Option<Vec<sbproxy_ai::format::HubChunk>> =
+                    if let Some(t) = native_translator.as_mut() {
+                        Some(t.feed(&chunk_bytes))
+                    } else if guard_raw_mode {
+                        None
+                    } else if let Some(d) = guard_decoder.as_mut() {
+                        let events = d.feed(&chunk_bytes);
+                        guard_decoder_bytes += chunk_bytes.len();
+                        if !events.is_empty() {
+                            guard_decoder_yielded = true;
+                        } else if !guard_decoder_yielded
+                            && guard_decoder_bytes > GUARD_DECODE_FALLBACK_BYTES
+                        {
+                            // Nothing decodable this deep into the
+                            // stream: not an OpenAI-shaped SSE body.
+                            // Degrade to raw-frame matching so coverage
+                            // survives, and count the degradation.
+                            guard_raw_mode = true;
+                            sbproxy_ai::ai_metrics::record_stream_guardrail_decode_fallback();
+                        }
+                        Some(events)
+                    } else {
+                        None
+                    };
+
+                let mut released_tool_chunks: Vec<sbproxy_ai::format::HubChunk> = Vec::new();
+                if let Some(sessn) = guard_session.as_mut() {
+                    let pending_block = if let Some(events) = decoded.as_deref() {
+                        let (block, released) = process_guard_events(
+                            sessn,
+                            events,
+                            &mut held_tool_chunks,
+                            holds_tool_frames,
+                            false,
+                        );
+                        released_tool_chunks = released;
+                        block
+                    } else if guard_raw_mode {
+                        // Last-resort coverage: match the raw frame
+                        // text (JSON-escaped) through the same
+                        // cumulative session.
+                        std::str::from_utf8(&chunk_bytes)
+                            .ok()
+                            .and_then(|raw| sessn.on_content_delta(raw))
+                    } else {
+                        None
+                    };
+                    if let Some(block) = pending_block {
+                        warn!(
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: output guardrail blocked streaming response; terminating stream"
+                        );
+                        sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.reason,
+                        );
+                        output_guard_blocked = true;
+                        break 'relay;
+                    }
+                }
+
                 // If writing to the downstream client fails (client
                 // cancel, broken connection, ...), we propagate the
                 // error. The recorder guard's `Drop` impl will then
                 // emit a terminal `End { complete: false }` on the way
                 // out of this function.
-                let outbound_bytes = if let (Some(t), Some(emitter)) =
-                    (native_translator.as_mut(), inbound_emitter.as_ref())
+                let outbound_bytes = if let Some(emitter) = inbound_emitter
+                    .as_ref()
+                    .filter(|_| native_translator.is_some())
                 {
-                    let hub_chunks = t.feed(&chunk_bytes);
-                    if hub_chunks.is_empty() {
-                        continue;
-                    }
+                    let hub_chunks = decoded.as_deref().unwrap_or(&[]);
                     let mut translated = String::new();
-                    for hub in &hub_chunks {
+                    // In hold-back mode, tool-call frames for calls
+                    // still awaiting a verdict stay out of the client
+                    // stream; released frames (judged clean) append
+                    // after this chunk's regular content.
+                    let emit_now = hub_chunks.iter().filter(|hub| {
+                        !(holds_tool_frames
+                            && matches!(
+                                hub,
+                                sbproxy_ai::format::HubChunk::ToolCallDelta { .. }
+                            ))
+                    });
+                    for hub in emit_now.chain(released_tool_chunks.iter()) {
                         match emitter.from_hub_stream(hub, &bridge_ctx) {
                             Ok(frames) => {
                                 for f in frames {
@@ -4672,6 +4917,9 @@ pub(super) async fn relay_ai_stream(
                                 );
                             }
                         }
+                    }
+                    if translated.is_empty() {
+                        continue;
                     }
                     Bytes::from(translated)
                 } else {
@@ -4691,28 +4939,6 @@ pub(super) async fn relay_ai_stream(
                     // potential placeholder prefix. Skip the write
                     // and wait for the next chunk to flush.
                     continue;
-                }
-                // WOR-1141: run streaming-safe output guardrails against
-                // the client-facing chunk before it is written. A match
-                // terminates the stream (fail closed) so the violating
-                // content and everything after it is withheld.
-                if let Some(ref guardrails) = output_guardrails {
-                    if let Ok(text) = std::str::from_utf8(&outbound_bytes) {
-                        if let Some(block) = guardrails.check_output_chunk(text) {
-                            warn!(
-                                guardrail = %block.name,
-                                reason = %block.reason,
-                                "AI proxy: output guardrail blocked streaming chunk; terminating stream"
-                            );
-                            sbproxy_ai::tracing_spans::record_error(
-                                &ai_span,
-                                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                                &block.reason,
-                            );
-                            output_guard_blocked = true;
-                            break 'relay;
-                        }
-                    }
                 }
                 if let Some(trace) = trace_stream_content.as_mut() {
                     trace.feed(&outbound_bytes);
@@ -4740,35 +4966,90 @@ pub(super) async fn relay_ai_stream(
                 break;
             }
             None => {
+                // Flush tail events from whichever decoder is live so
+                // a frame straddling the last network read still
+                // surfaces (to the guardrails, and on the translation
+                // path to the client).
+                let tail_events: Vec<sbproxy_ai::format::HubChunk> =
+                    if let Some(t) = native_translator.as_mut() {
+                        t.flush()
+                    } else if let Some(d) = guard_decoder.as_mut() {
+                        d.flush()
+                    } else {
+                        Vec::new()
+                    };
+
+                // --- WOR-1810: final guardrail pass BEFORE tail
+                // emission: tail events, pending tool calls, the
+                // deferred word-boundary verdict, and stream_policy
+                // close guards. A block here suppresses every
+                // remaining write and leaves `upstream_complete`
+                // false so the recorder emits End { complete: false }
+                // (never cache-admitted).
+                let mut close_released: Vec<sbproxy_ai::format::HubChunk> = Vec::new();
+                let mut close_block = None;
+                if let Some(sessn) = guard_session.as_mut() {
+                    let (b, r) = process_guard_events(
+                        sessn,
+                        &tail_events,
+                        &mut held_tool_chunks,
+                        holds_tool_frames,
+                        true,
+                    );
+                    close_block = b;
+                    close_released = r;
+                    if close_block.is_none() {
+                        close_block = sessn.on_close();
+                    }
+                }
+                if let Some(block) = close_block {
+                    warn!(
+                        guardrail = %block.name,
+                        reason = %block.reason,
+                        "AI proxy: output guardrail blocked streaming response at stream close"
+                    );
+                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &block.reason,
+                    );
+                    output_guard_blocked = true;
+                    break;
+                }
                 upstream_complete = true;
-                // Flush any tail bytes from the translator so a frame
-                // straddling the last network read still surfaces.
-                if let (Some(t), Some(emitter)) =
-                    (native_translator.as_mut(), inbound_emitter.as_ref())
+
+                if let Some(emitter) = inbound_emitter
+                    .as_ref()
+                    .filter(|_| native_translator.is_some())
                 {
-                    let tail = t.flush();
-                    if !tail.is_empty() {
-                        let mut translated = String::new();
-                        for hub in &tail {
-                            if let Ok(frames) = emitter.from_hub_stream(hub, &bridge_ctx) {
-                                for f in frames {
-                                    translated.push_str(&f);
-                                }
+                    let emit_now = tail_events.iter().filter(|hub| {
+                        !(holds_tool_frames
+                            && matches!(
+                                hub,
+                                sbproxy_ai::format::HubChunk::ToolCallDelta { .. }
+                            ))
+                    });
+                    let mut translated = String::new();
+                    for hub in emit_now.chain(close_released.iter()) {
+                        if let Ok(frames) = emitter.from_hub_stream(hub, &bridge_ctx) {
+                            for f in frames {
+                                translated.push_str(&f);
                             }
                         }
-                        if !translated.is_empty() {
-                            let bytes = Bytes::from(translated);
-                            let bytes = if reversible_restore.is_noop() {
-                                bytes
-                            } else {
-                                reversible_restore.process_chunk(&bytes)
-                            };
-                            if !bytes.is_empty() {
-                                if let Some(trace) = trace_stream_content.as_mut() {
-                                    trace.feed(&bytes);
-                                }
-                                let _ = session.write_response_body(Some(bytes), false).await;
+                    }
+                    if !translated.is_empty() {
+                        let bytes = Bytes::from(translated);
+                        let bytes = if reversible_restore.is_noop() {
+                            bytes
+                        } else {
+                            reversible_restore.process_chunk(&bytes)
+                        };
+                        if !bytes.is_empty() {
+                            if let Some(trace) = trace_stream_content.as_mut() {
+                                trace.feed(&bytes);
                             }
+                            let _ = session.write_response_body(Some(bytes), false).await;
                         }
                     }
                 }

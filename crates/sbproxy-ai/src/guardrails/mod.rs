@@ -353,36 +353,6 @@ impl GuardrailPipeline {
         None
     }
 
-    /// Check a single streaming chunk against the output guardrails
-    /// declared streaming-safe by [`Guardrail::streaming_safe`].
-    ///
-    /// The future streaming relay (WOR-490 follow-up) will call this on
-    /// each emitted chunk. Non-streaming-safe guardrails are skipped
-    /// here per the WOR-235 ADR; they continue to run against the
-    /// full-text view via [`Self::check_output`] when the response is
-    /// non-streaming. Operators that want a non-safe guardrail to run
-    /// against streamed output anyway should evaluate the full
-    /// concatenated text once the stream closes.
-    pub fn check_output_chunk(&self, chunk: &str) -> Option<GuardrailBlock> {
-        for guard in &self.output {
-            if !guard.streaming_safe() {
-                continue;
-            }
-            if let Some(block) = guard.check(chunk) {
-                return Some(block);
-            }
-        }
-        None
-    }
-
-    /// Count of output guardrails that would be skipped on a streaming
-    /// response per [`Guardrail::streaming_safe`]. Operator-facing
-    /// observability hook: dashboards can compare this to the total
-    /// output-guardrail count to flag a misconfigured streaming
-    /// policy.
-    pub fn streaming_skip_count(&self) -> usize {
-        self.output.iter().filter(|g| !g.streaming_safe()).count()
-    }
 }
 
 /// Public text view of a slice of messages, used by the guardrail mesh as
