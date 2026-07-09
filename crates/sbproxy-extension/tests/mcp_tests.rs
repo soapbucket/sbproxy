@@ -76,8 +76,9 @@ fn tool_serialization_with_annotations() {
     let json = serde_json::to_value(&tool).unwrap();
     assert_eq!(json["name"], "get_weather");
     assert_eq!(json["inputSchema"]["type"], "object");
-    assert_eq!(json["annotations"]["read_only_hint"], true);
-    assert_eq!(json["annotations"]["destructive_hint"], false);
+    // Wire spelling is the spec's camelCase.
+    assert_eq!(json["annotations"]["readOnlyHint"], true);
+    assert_eq!(json["annotations"]["destructiveHint"], false);
 }
 
 #[test]
@@ -91,7 +92,7 @@ fn tool_result_text_content() {
     let json = serde_json::to_value(&result).unwrap();
     assert_eq!(json["content"][0]["type"], "text");
     assert_eq!(json["content"][0]["text"], "hello");
-    assert_eq!(json["is_error"], false);
+    assert_eq!(json["isError"], false);
 }
 
 #[test]

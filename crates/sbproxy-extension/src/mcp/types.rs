@@ -143,29 +143,40 @@ pub struct Tool {
 }
 
 /// Optional hints about tool behavior.
+///
+/// Wire spelling is the spec's camelCase (`readOnlyHint`, ...); the
+/// snake_case aliases keep annotations from older sbproxy nodes
+/// parseable (same interop bug as [`InitializeResult`]).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolAnnotations {
     /// Hint that the tool does not mutate any state.
-    #[serde(default)]
+    #[serde(default, alias = "read_only_hint")]
     pub read_only_hint: bool,
     /// Hint that the tool may perform destructive operations.
-    #[serde(default)]
+    #[serde(default, alias = "destructive_hint")]
     pub destructive_hint: bool,
     /// Hint that repeated invocations are safe to retry.
-    #[serde(default)]
+    #[serde(default, alias = "idempotent_hint")]
     pub idempotent_hint: bool,
     /// Hint that the tool interacts with an open world (e.g. the public internet).
-    #[serde(default)]
+    #[serde(default, alias = "open_world_hint")]
     pub open_world_hint: bool,
 }
 
 /// "tools/call" response result body.
+///
+/// The wire spelling is the spec's `isError`; strict SDK clients
+/// ignore the snake_case `is_error` this struct used to emit, which
+/// silently dropped tool error flags. The alias keeps results from
+/// older sbproxy nodes and snake_case upstreams parseable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolResult {
     /// Ordered list of content blocks returned from the tool.
     pub content: Vec<Content>,
     /// Indicates whether the tool reported an application-level error.
-    #[serde(default)]
+    #[serde(default, alias = "is_error")]
     pub is_error: bool,
 }
 
@@ -255,7 +266,14 @@ pub struct ServerCapabilities {
 }
 
 /// "initialize" response result body.
+///
+/// Serialized in camelCase: the MCP wire format requires
+/// `protocolVersion` and `serverInfo`, and the official SDKs
+/// hard-fail the handshake on the snake_case spellings this struct
+/// used to emit (found by validating the framework integration docs
+/// against a spec-conformant client).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
     /// MCP protocol version implemented by the server.
     pub protocol_version: String,
