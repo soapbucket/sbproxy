@@ -45,6 +45,25 @@ pub struct GuardrailBlock {
     pub reason: String,
 }
 
+/// Per-entry streaming evaluation policy (WOR-1810, absorbing the
+/// per-entry override WOR-490 promised). Buffered (non-streaming)
+/// responses ignore this field: every output guardrail always runs on
+/// the full text there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamPolicy {
+    /// Evaluate while the stream flows: cumulative window for the
+    /// substring guards, per-delta for the rest. The default.
+    #[default]
+    Chunk,
+    /// Skip per-delta evaluation; run one full-text check when the
+    /// stream closes, terminating before the final frame on a block.
+    Close,
+    /// Never evaluate on streaming responses. Counted in the skip
+    /// metric so a misconfigured policy stays visible.
+    Off,
+}
+
 /// Individual guardrail types.
 #[derive(Debug)]
 pub enum Guardrail {
@@ -211,6 +230,9 @@ pub struct GuardrailPipeline {
     pub input: SmallVec<[Guardrail; 4]>,
     /// Guardrails evaluated against model output content.
     pub output: SmallVec<[Guardrail; 4]>,
+    /// Streaming policy per output guardrail, built in lockstep with
+    /// `output` by [`compile_pipeline`] (WOR-1810).
+    pub output_policies: SmallVec<[StreamPolicy; 4]>,
     /// Mesh verdict cache, scoped to this compiled pipeline (WOR-1694).
     ///
     /// It lives here rather than on the per-request `GuardrailMesh` (which
@@ -234,6 +256,19 @@ impl GuardrailPipeline {
     /// Whether any output guardrails are configured.
     pub fn has_output(&self) -> bool {
         !self.output.is_empty()
+    }
+
+    /// Output guardrails zipped with their streaming policies. The two
+    /// vecs are built in lockstep by [`compile_pipeline`]; a length
+    /// mismatch is a construction bug, so zip (which truncates) is
+    /// safe. Pipelines built by hand (tests) without policies see an
+    /// empty iterator, matching "no streaming policy configured".
+    pub fn output_with_policies(
+        &self,
+    ) -> impl Iterator<Item = (&Guardrail, StreamPolicy)> {
+        self.output
+            .iter()
+            .zip(self.output_policies.iter().copied())
     }
 
     /// Check input messages. Returns first block encountered.
@@ -457,6 +492,15 @@ pub fn compile_pipeline(config: &GuardrailsConfig) -> Result<GuardrailPipeline> 
     }
     for guard_cfg in &config.output {
         pipeline.output.push(compile_guardrail(guard_cfg)?);
+        // Per-entry streaming policy rides the same raw entry; unknown
+        // to the individual guardrail structs (serde ignores it there).
+        let policy = guard_cfg
+            .get("stream_policy")
+            .map(|v| serde_json::from_value::<StreamPolicy>(v.clone()))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?
+            .unwrap_or_default();
+        pipeline.output_policies.push(policy);
     }
     Ok(pipeline)
 }
@@ -488,6 +532,28 @@ pub struct GuardrailsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_policy_parses_per_entry_and_defaults_to_chunk() {
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "output": [
+                {"type": "toxicity", "keywords": ["badword"]},
+                {"type": "toxicity", "keywords": ["x"], "stream_policy": "close"},
+                {"type": "regex", "patterns": ["SECRET"], "stream_policy": "off"},
+            ]
+        }))
+        .expect("config parses");
+        let p = compile_pipeline(&cfg).expect("compiles");
+        let policies: Vec<StreamPolicy> =
+            p.output_with_policies().map(|(_, pol)| pol).collect();
+        assert_eq!(
+            policies,
+            vec![StreamPolicy::Chunk, StreamPolicy::Close, StreamPolicy::Off]
+        );
+        // Buffered path ignores policies entirely: an "off" entry still
+        // blocks on the non-streaming check.
+        assert!(p.check_output("the SECRET is out").is_some());
+    }
 
     fn make_msg(content: &str) -> Message {
         Message {
