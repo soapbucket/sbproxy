@@ -1,6 +1,6 @@
 # ai-attribution-tags
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-09*
 
 Tokenomics layer: tag every AI request with the operator's
 project / feature / team / customer / env / agent_type / risk_tier /
@@ -91,7 +91,7 @@ This row's tag set:
 ## What lands on the spend record
 
 The same tag set rides on the access-log row, the
-`sbproxy_ai_tokens_total` and `sbproxy_ai_cost_usd_total`
+`sbproxy_ai_tokens_total` and `sbproxy_ai_cost_usd_micros_total`
 Prometheus counters (project / team / agent_type / environment
 labels), and the OpenTelemetry span attributes. A downstream
 Token-to-Value Ledger consumes the access log + the

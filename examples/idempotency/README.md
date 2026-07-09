@@ -1,8 +1,8 @@
-# Idempotency middleware (RFC 8594)
+# Idempotency middleware (IETF Idempotency-Key draft)
 
-*Last modified: 2026-05-11*
+*Last modified: 2026-07-09*
 
-The origin on `api.local` opts in to RFC 8594-style idempotency for
+The origin on `api.local` opts in to Idempotency-Key handling per the IETF draft draft-ietf-httpapi-idempotency-key-header for
 POST / PUT / PATCH requests carrying an `Idempotency-Key` header. The
 proxy caches each upstream response under `(workspace, key)` and
 short-circuits retries: a replay with the same key + same body returns
@@ -34,7 +34,7 @@ curl -sv -H 'Host: api.local' -H 'Idempotency-Key: order-42' \
      http://127.0.0.1:8080/orders 2>&1 | grep -i sbproxy
 # < x-sbproxy-idempotency: HIT
 
-# Same key, different body: 409 conflict per RFC 8594.
+# Same key, different body: 409 conflict per the draft.
 curl -s -H 'Host: api.local' -H 'Idempotency-Key: order-42' \
      -H 'Content-Type: application/json' \
      -d '{"sku":"xyz","qty":99}' \
@@ -70,4 +70,4 @@ correctness; the cache binds to the L2 store declared at
 ## See also
 
 - [docs/configuration.md](../../docs/configuration.md)
-- RFC 8594: <https://www.rfc-editor.org/rfc/rfc8594.html>
+- IETF draft draft-ietf-httpapi-idempotency-key-header: <https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/>

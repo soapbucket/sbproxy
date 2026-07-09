@@ -1,4 +1,4 @@
-# sb-testnet.yml: Base Sepolia override for the 30-rail-x402-base-sepolia
+# sb-testnet.yml: Base Sepolia override for the rail-x402-base-sepolia
 # example.
 #
 # Identical to sb.yml except:
@@ -13,9 +13,11 @@
 #
 # To run:
 #
-#   export MERCHANT_ADDRESS=0xYOUR_BASE_SEPOLIA_ADDRESS
-#   export SBPROXY_QUOTE_TOKEN_SEED_HEX=$(openssl rand -hex 32)
-#   docker compose --env-file .env.testnet up -d --wait
+#   1. Create `.env.testnet` next to docker-compose.yml (see the
+#      README's "Swapping in the Base Sepolia facilitator" section):
+#        MERCHANT_ADDRESS=0xYOUR_BASE_SEPOLIA_ADDRESS
+#        SBPROXY_QUOTE_TOKEN_SEED_HEX=<output of: openssl rand -hex 32>
+#   2. docker compose --env-file .env.testnet up -d --wait
 #
 # Then point the proxy at this file by mounting it as
 # /etc/sbproxy/sb.yml inside the container (override

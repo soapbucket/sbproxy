@@ -1,6 +1,6 @@
 # Forward auth
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Forward auth](../../docs/assets/auth-forward.gif)
 
@@ -12,7 +12,7 @@ Delegates the authentication decision to an external HTTP service. For each inbo
 make run CONFIG=examples/auth-forward/sb.yml
 ```
 
-No env vars required. Both the auth service and the upstream are httpbin.
+No env vars required. Both the auth service and the upstream are the echo upstream at `test.sbproxy.dev`.
 
 ## Try it
 
@@ -24,7 +24,7 @@ $ curl -i -H 'Host: fwd.local' -H 'Authorization: Bearer demo' \
 HTTP/1.1 200 OK
 content-type: application/json
 
-{"args":{},"headers":{"Authorization":"Bearer demo","Host":"test.sbproxy.dev",...},"url":"https://test.sbproxy.dev/get"}
+{"method":"GET","url":"/get","headers":{"authorization":"Bearer demo","host":"test.sbproxy.dev",...},"query":{},"timestamp":"2026-07-09T19:29:58.060Z"}
 ```
 
 Inspect the cost of the auth subrequest in latency:

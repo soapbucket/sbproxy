@@ -1,10 +1,10 @@
 # Header injection and CORS
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Header injection and CORS](../../docs/assets/headers-and-cors.gif)
 
-Combines three sibling blocks on one origin: `request_modifiers` injects `X-Forwarded-By: sbproxy` and a freshly generated `X-Trace-Id` (from the `uuid()` template helper) onto outbound requests while stripping the `Cookie` header; `response_modifiers` stamps `X-Served-By: sbproxy` and overrides `Cache-Control` on the way back; and `cors` handles preflight `OPTIONS` requests for browser clients on `https://example.com`. The CORS block allowlists three methods and two headers and caches preflight results for 600 seconds.
+Combines three sibling blocks on one origin: `request_modifiers` injects `X-Forwarded-By: sbproxy` and a per-request `X-Trace-Id` (from the `{{ request.id }}` template key) onto outbound requests while stripping the `Cookie` header; `response_modifiers` stamps `X-Served-By: sbproxy` and overrides `Cache-Control` on the way back; and `cors` handles preflight `OPTIONS` requests for browser clients on `https://example.com`. The CORS block allowlists three methods and two headers and caches preflight results for 600 seconds.
 
 ## Run
 
@@ -23,9 +23,10 @@ $ curl -s -H 'Host: api.local' -H 'Cookie: should-be-stripped=1' \
        http://127.0.0.1:8080/headers
 {
   "headers": {
-    "Host": "test.sbproxy.dev",
-    "X-Forwarded-By": "sbproxy",
-    "X-Trace-Id": "5b1e9b8a-2c4f-4d2a-9c4e-1f3a8e7d6c5b"
+    "host": "test.sbproxy.dev",
+    "x-forwarded-by": "sbproxy",
+    "x-trace-id": "5b1e9b8a-2c4f-4d2a-9c4e-1f3a8e7d6c5b",
+    ...
   }
 }
 ```
@@ -60,9 +61,9 @@ access-control-max-age: 600
 ## What this exercises
 
 - `request_modifiers.headers.set` and `delete` - rewrite outbound request headers
-- `{{ uuid() }}` template helper - generate a per-request trace ID
+- `{{ request.id }}` template key - stamp the per-request ID as a trace ID
 - `response_modifiers.headers.set` - stamp response headers, including overriding `Cache-Control`
-- `cors` - preflight handling, allowlisted origins, methods, headers, and `max_age_seconds`
+- `cors` - preflight handling, allowlisted origins, methods, headers, and `max_age`
 
 ## See also
 

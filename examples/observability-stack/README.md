@@ -1,8 +1,8 @@
 # SBproxy reference observability stack
 
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-09*
 
-A single `docker compose` command boots a complete metrics, logs, and traces stack pre-wired for SBproxy: Prometheus for metrics, Grafana for visualization, Tempo for traces, Loki for logs, Arize Phoenix and Langfuse for LLM-native traces, and an OpenTelemetry collector as the single OTLP ingress. This is the canonical evaluator-friendly stack referenced by the operator runbook (`docs/observability.md`) and the local examples smoke runner. The real Wave 1 dashboards land in task B1.6 of `../../docs/AIGOVERNANCE-BUILD.md`; an empty placeholder dashboard is provisioned here so Grafana starts cleanly.
+A single `docker compose` command boots a complete metrics, logs, and traces stack pre-wired for SBproxy: Prometheus for metrics, Grafana for visualization, Tempo for traces, Loki for logs, Arize Phoenix and Langfuse for LLM-native traces, and an OpenTelemetry collector as the single OTLP ingress. This is the canonical evaluator-friendly stack referenced by the operator runbook (`../../docs/observability.md`) and the local examples smoke runner. Grafana comes up pre-provisioned with the SBproxy dashboards from `../../deploy/dashboards/`: `overview.json`, `per-agent.json`, `policy-triggers.json`, `audit-log.json`, `traces-overview.json`, `boilerplate-stripping.json`, `content-shapes.json`, and `licensing-edits.json`.
 
 ## How to run
 
@@ -37,16 +37,30 @@ The infrastructure services should report `healthy`; Tempo, Phoenix, the OTel co
 
 ## How to point SBproxy at it
 
-Run SBproxy on the host with two extra flags:
+Run SBproxy on the host with its normal serve command:
 
 ```bash
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4327 \
-  sbproxy run --config sb.yml --metrics-listen 127.0.0.1:9091
+sbproxy serve -f <config>
 ```
 
-The OTLP endpoint targets the OTel collector (host port 4327, mapped to the container's 4317). The metrics listener on `127.0.0.1:9091` is what Prometheus scrapes via `host.docker.internal:9091` (see `prometheus/prometheus.yml`). On Linux Docker hosts where `host.docker.internal` does not resolve, add `--add-host host.docker.internal:host-gateway` to the Prometheus service or replace the scrape target with the host's LAN IP.
+No extra flags. Both wiring points live in the YAML:
 
-If you instead run SBproxy as a sibling container on the same Compose network, drop `host.docker.internal` and target `sbproxy:9091` directly. The `OTEL_EXPORTER_OTLP_ENDPOINT` then becomes `http://otel-collector:4317`.
+- Metrics: the proxy serves Prometheus `/metrics` on its data-plane listener (`proxy.http_bind_port`, unauthenticated) and on the admin port (`proxy.admin`, behind the admin basic auth). The stack's Prometheus job scrapes the data plane at `host.docker.internal:8080` (see `prometheus/prometheus.yml`); change that target if your `http_bind_port` is not 8080.
+- Traces and logs: the OTLP endpoint comes from `proxy.observability.telemetry` in the YAML, pointed at the OTel collector's host port 4327 (mapped to the container's 4317):
+
+```yaml
+proxy:
+  http_bind_port: 8080
+  observability:
+    telemetry:
+      enabled: true
+      endpoint: "http://localhost:4327"   # OTel collector: host 4327 -> container 4317
+      transport: grpc
+```
+
+On Linux Docker hosts where `host.docker.internal` does not resolve, add `--add-host host.docker.internal:host-gateway` to the Prometheus service or replace the scrape target with the host's LAN IP.
+
+If you instead run SBproxy as a sibling container on the same Compose network, point the Prometheus scrape target at `sbproxy:8080` and set `proxy.observability.telemetry.endpoint` to `http://otel-collector:4317`.
 
 For LLM-native views, enable content capture on the AI origin you are exercising:
 
@@ -89,18 +103,18 @@ The `-v` flag drops the named volumes for Prometheus, Grafana, Tempo, Loki, and 
 ```
 examples/observability-stack/
   docker-compose.yml
+  smoke.json
   prometheus/prometheus.yml
   grafana/provisioning/datasources/datasources.yml
   grafana/provisioning/dashboards/dashboards.yml
-  grafana/provisioning/dashboards/placeholder.json
   tempo/tempo.yaml
   loki/loki-config.yaml
   otel-collector/config.yaml
 ```
 
+The Grafana dashboards themselves live at `../../deploy/dashboards/` (`overview.json`, `per-agent.json`, `policy-triggers.json`, `audit-log.json`, `traces-overview.json`, `boilerplate-stripping.json`, `content-shapes.json`, `licensing-edits.json`); `docker-compose.yml` mounts that directory into Grafana's provisioning path so they load at startup.
+
 ## See also
 
-- `../../docs/AIGOVERNANCE-BUILD.md` section 4.6, task **B1.11** (this stack)
-- `../../docs/AIGOVERNANCE-BUILD.md` section 4.6, task **B1.6** (real Grafana dashboards land here)
-- `../../docs/AIGOVERNANCE-BUILD.md` section 15 (observability strategy)
-- `../../docs/` (forward-looking; lands in a later wave)
+- `../../docs/observability.md` - operator runbook for metrics, logs, traces, and this stack
+- `../../deploy/dashboards/` - the provisioned Grafana dashboard JSON

@@ -1,5 +1,5 @@
 # Policy engine
-*Last modified: 2026-05-10*
+*Last modified: 2026-07-09*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
@@ -193,13 +193,8 @@ policies:
     route_glob: "/agents/**"
 ```
 
-Runnable example: `examples/40-a2a-protocol/sb.yml`.
+Runnable example: `examples/a2a-protocol/sb.yml`.
 
 ## See also
 
-- `docs/adr-policy-compilation.md`: design rationale for the linter, the compiler, and the pinning contract.
-- `docs/adr-judge-trait.md`: contract the judge backend implements.
-- `docs/adr-policy-verdict-shape.md`: full design of the four-verdict `PolicyDecision` enum and the dispatcher resolution rules.
-- `docs/adr-policy-audit-binding.md`: shape of the `PolicyVerdictEvent` carried on the audit pipeline.
-- `docs/adr-policy-engine-unification.md`: long-term plan for the runtime that evaluates pinned Cedar policies.
 - [examples/semantic-constraint/sb.yml](../examples/semantic-constraint/sb.yml): runnable config exercising the YAML surface.

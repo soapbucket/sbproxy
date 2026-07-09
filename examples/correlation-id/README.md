@@ -1,6 +1,6 @@
 # Correlation ID
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Correlation ID](../../docs/assets/correlation-id.gif)
 
@@ -19,8 +19,9 @@ sbproxy serve -f sb.yml
 curl -sI -H 'Host: localhost' http://127.0.0.1:8080/headers | grep -i x-request-id
 # x-request-id: 4a1f6c8d2b3e7f0a9d8c7b6a5e4d3c2b
 
-# Upstream sees the same value (httpbin echoes the request headers).
-curl -s -H 'Host: localhost' http://127.0.0.1:8080/headers | jq '.headers["X-Request-Id"]'
+# Upstream sees the same value (the echo service returns the request
+# headers it received; keys are lowercase).
+curl -s -H 'Host: localhost' http://127.0.0.1:8080/headers | jq '.headers["x-request-id"]'
 # "4a1f6c8d2b3e7f0a9d8c7b6a5e4d3c2b"
 
 # Inbound header present: proxy adopts it verbatim.
@@ -32,7 +33,7 @@ curl -sI -H 'Host: localhost' \
 # Confirm the upstream view.
 curl -s -H 'Host: localhost' \
      -H 'X-Request-Id: my-trace-abc123' \
-     http://127.0.0.1:8080/headers | jq '.headers["X-Request-Id"]'
+     http://127.0.0.1:8080/headers | jq '.headers["x-request-id"]'
 # "my-trace-abc123"
 
 # Disable response echoing (set echo_response: false) and the same call

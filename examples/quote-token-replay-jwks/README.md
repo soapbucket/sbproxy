@@ -1,5 +1,5 @@
 # Quote token JWKS verification with replay protection
-*Last modified: 2026-05-02*
+*Last modified: 2026-07-09*
 
 Demonstrates the quote-token JWKS endpoint, end-to-end JWS
 verification, and single-use replay protection.
@@ -249,11 +249,10 @@ feature is needed.
 
 ## Related docs
 
-- `docs/billing-rails.md` - operator-facing billing rails reference.
--  (A3.2) - quote-token JWS shape and
-  JWKS publication contract.
--  (A3.1) - the 402 body that
-  carries the JWS.
+- `docs/ai-crawl-control.md` - operator-facing crawl-control and
+  billing reference.
+- `docs/402-challenge.md` - quote-token JWS shape, the JWKS
+  publication contract, and the 402 body that carries the JWS.
 - `examples/rail-x402-base-sepolia/` - x402 rail with the same
   JWKS publication path.
 - `examples/rail-mpp-stripe-test/` - MPP rail counterpart.

@@ -1,5 +1,5 @@
 # OpenAPI Emission
-*Last modified: 2026-05-03*
+*Last modified: 2026-07-09*
 
 SBproxy documents and governs your API. It does not just proxy it.
 
@@ -121,20 +121,14 @@ Auth blocks turn into OpenAPI `securitySchemes` and a `security` requirement att
 |---------------------|--------------------------------------------------------------------|
 | `api_keys`          | `apiKey` in header (uses `header:` from config)                    |
 | `basic_auth`        | `http` scheme `basic`                                              |
-| `bearer`            | `http` scheme `bearer`                                             |
-| `jwt`               | `http` scheme `bearer` + `bearerFormat: JWT`                       |
-| `digest`            | `http` scheme `digest`                                             |
 | `oauth_client_creds`| `oauth2` with `clientCredentials` flow + `tokenUrl`                |
-| `kya`               | Generic `apiKey` in header + `x-sbproxy-auth-type: kya`            |
-| `cap`               | Generic `apiKey` in header + `x-sbproxy-auth-type: cap`            |
-| `forward_auth`      | Generic `apiKey` placeholder + `x-sbproxy-auth-type: forward_auth` |
-| anything else       | Generic `apiKey` placeholder + `x-sbproxy-auth-type` extension     |
+| anything else (`bearer`, `jwt`, `digest`, `kya`, `cap`, `forward_auth`, ...) | Generic `apiKey` placeholder + `x-sbproxy-auth-type` extension naming the original type |
 
 Custom auth types can register their own mappers via the `AuthSchemeMapper` registry exposed from the OpenAPI emission engine.
 
 ## Limitations
 
-- Path templates and regex matchers describe routing surface, not upstream contract. Request and response body schemas are not emitted unless an upstream OpenAPI spec was fed in via the existing consumption path (`sbproxy-extension/openapi_convert.rs`); merging that spec into emitted operations is on the roadmap.
+- Path templates and regex matchers describe routing surface, not upstream contract. Request and response body schemas are not emitted unless an upstream OpenAPI spec was fed in via the existing consumption path (`crates/sbproxy-extension/src/mcp/openapi_convert.rs`); merging that spec into emitted operations is on the roadmap.
 - CORS is surfaced as an `x-sbproxy-cors` extension because OpenAPI 3.0 has no native CORS vocabulary.
 - The `info.version` field defaults to `1.0.0`; callers who want the live config revision should override it after `build()` returns.
 

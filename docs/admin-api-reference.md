@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-06-06*
+*Last modified: 2026-07-09*
 
 The embedded admin server publishes a small set of HTTP routes for
 operator tooling: liveness probes, request log, per-target health,
@@ -19,9 +19,13 @@ proxy:
     enabled: true
     port: 9090
     username: admin
-    password: !env ADMIN_PASSWORD
+    password: ${ADMIN_PASSWORD}
     max_log_entries: 1000
 ```
+
+The password resolves from the environment at config load
+(`export ADMIN_PASSWORD=...` before starting the proxy). YAML tags
+like `!env` are not a supported form and are rejected at compile.
 
 When `enabled: false` (the default) the admin listener does not bind
 and every route below is unreachable. The server binds on
@@ -80,25 +84,29 @@ running and the listener accepted my connection".
 
 ### `GET /health`
 
-Component-aware liveness with version and git SHA. Returns `200`
-with a JSON document that includes the proxy version, build commit,
-and a per-component status table:
+Component-aware health report with version and build metadata.
+Returns `200` with top-level `"status": "ok"` when every check is
+ready, `503` with `"status": "unready"` otherwise:
 
 ```json
 {
   "status": "ok",
-  "version": "1.1.0",
-  "commit": "abc1234",
-  "components": [
-    {"name": "config", "status": "ok"},
-    {"name": "cache_store", "status": "ok"}
+  "version": "1.5.0",
+  "build_hash": "abc1234",
+  "timestamp": "2026-07-09T10:15:32Z",
+  "uptime_seconds": 86400,
+  "checks": [
+    {"name": "ledger", "status": "healthy"},
+    {"name": "bot_auth_directory", "status": "not_configured"}
   ]
 }
 ```
 
-A component reporting `"status": "degraded"` returns the same `200`
-because the proxy still serves traffic on degraded components.
-Components in `"status": "failed"` flip the top-level status.
+Each entry in `checks` carries a `name`, a `status`, and an optional
+`detail` string. Statuses are `healthy`, `degraded`, `unhealthy`, and
+`not_configured`. A `degraded` or `not_configured` check still counts
+as ready, so the route keeps returning `200`; an `unhealthy` check
+flips the top-level status to `unready` and the response to `503`.
 
 ### `GET /readyz`, `GET /ready`
 
@@ -253,7 +261,9 @@ Basic counters summary.
 ```
 
 This is a placeholder; the authoritative metrics surface is the
-Prometheus `/metrics` endpoint exposed on the health port (see
+Prometheus `/metrics` endpoint, served on the data-plane port and
+mirrored on the admin port so ops can scrape via the
+access-controlled admin listener (see
 [metrics-stability.md](metrics-stability.md)).
 
 ### `GET /api/openapi.json`, `GET /api/openapi.yaml`
@@ -273,10 +283,13 @@ returns `Content-Type: application/json`; the `.yaml` route returns
 
 ### `POST /admin/reload`
 
-Re-reads `proxy.admin.config_path` from disk, recompiles the
-pipeline, and hot-swaps the in-memory pipeline. The route uses the
-same single-flight guard as the file watcher, so a manual reload
-during a file-watcher reload returns `409`.
+Re-reads the config file the proxy booted with (the `-f/--config`
+path, or `SB_CONFIG_FILE`) from disk, recompiles the pipeline, and
+hot-swaps the in-memory pipeline. There is no separate
+config-path setting on the admin block; the admin server is handed
+the boot path at startup. The route uses the same single-flight
+guard as the file watcher, so a manual reload during a file-watcher
+reload returns `409`.
 
 `GET /admin/reload` returns `405`; the route is gated on POST.
 
@@ -304,9 +317,9 @@ operator integration.
 
 ### `GET /admin/drift`
 
-Compares the on-disk config file at `proxy.admin.config_path`
-against the content hash captured the last time the proxy loaded a
-config (startup, file-watcher reload, or `POST /admin/reload`). Use
+Compares the on-disk config file the proxy booted with against the
+content hash captured the last time the proxy loaded a config
+(startup, file-watcher reload, or `POST /admin/reload`). Use
 this to detect when the running proxy has diverged from the
 declared config without triggering a reload.
 
@@ -348,15 +361,18 @@ someone hand-edited the file out of band.
 
 ## Admin UI (`GET /admin/ui`, `GET /`)
 
-The OSS admin server serves a minimal browser UI at `/admin/ui` for
+The admin server serves a browser dashboard at `/admin/ui` for
 configuration inspection, drift status, recent requests, and the
 runtime prompt-store overlay (see `/admin/prompts` below). `GET /`
-redirects to `/admin/ui` so browsing to the admin port lands on the
-UI without typing the path. Both routes are authenticated like the
-rest of `/api/*` and `/admin/*`.
+does not redirect there; it returns a small static HTML landing page
+(`200 text/html`) that lists the main API endpoints. Both routes are
+authenticated like the rest of `/api/*` and `/admin/*`.
 
-Response: `200 text/html`. The UI is a static SPA bundled into the
-binary; it does not require a separate build step or asset directory.
+The dashboard is only present when the binary was built with it
+embedded: build the UI assets first (`cd ui && pnpm install && pnpm
+build`), then compile the proxy with `--features embed-admin-ui`.
+Default builds skip the embed and `/admin/ui` returns a `404` whose
+body spells out those two steps.
 
 ---
 
@@ -366,8 +382,8 @@ Exposes the runtime prompt-store overlay. `GET /admin/prompts`
 returns the in-memory snapshot (every active prompt + pinned
 version + last-mutation metadata) as JSON. `POST /admin/prompts`
 mutators add a new version, pin a version, or roll back; mutations
-persist to the operator-configured redb file when `admin.prompt_store_path`
-is set, so changes survive restart.
+persist to the operator-configured redb file when
+`admin.prompt_persistence_path` is set, so changes survive restart.
 
 The full set of POST shapes and request schemas is documented in
 [ai-gateway.md](./ai-gateway.md) under "Stored prompts". This
@@ -387,15 +403,17 @@ it requires the `admin` role.
 | GET | `/admin/api/playground/endpoints` | List every AI origin the live pipeline serves, with each provider's declared models and default model. Read-only, sourced from the compiled pipeline, so a config reload updates it without a restart. |
 | POST | `/admin/api/playground/chat` | Run a chat completion against a chosen endpoint through the same AI client the data plane uses. Returns the upstream response plus token usage, cost, and latency. |
 
-Because the chat call routes through the production dispatch path, it
-honors the same origin and provider constraints as normal proxy
-traffic. Unauthenticated requests see `401 Unauthorized`; other verbs
-return `405 Method Not Allowed`.
+The playground is live: a chat call goes out to the real upstream
+through the same AI client the data plane uses, and the response
+carries actual token usage, cost, and latency. It calls the AI client
+directly, though, so it does not traverse the data-plane pipeline:
+per-origin policies, guardrails, transforms, and the
+`x-sbproxy-debug-*` header stamping do not apply. Pass `"debug": true`
+in the request body to get a `debug` block with a server-logged
+request id and the config revision for correlation instead.
 
-The path is reserved on the admin server (next to `/admin/reload`)
-rather than the production proxy listener. It is not a live chat API
-until a future implementation wires it to the production AI dispatch
-path.
+Unauthenticated requests see `401 Unauthorized`; other verbs return
+`405 Method Not Allowed`.
 
 ---
 

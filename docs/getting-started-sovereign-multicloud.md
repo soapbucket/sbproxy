@@ -1,6 +1,6 @@
 # Getting started: Sovereign / multi-cloud deployment
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 ## What you will build
 
@@ -32,7 +32,7 @@ sbproxy serve -f sb.yml
 Save this as `sb.yml`. It is the `examples/k8s-gateway` dataplane shape (trusted-proxy XFF recovery, service discovery, host override, correlation id, per-IP concurrency) with the `examples/vault-reference` multi-tenant model layered on: a declared tenant whose origin can read its upstream key from a tenant-scoped provider reference. `test.sbproxy.dev` stands in for the cluster Service so the config runs locally.
 
 ```yaml
-# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
 proxy:
   http_bind_port: 8080
 
@@ -68,7 +68,11 @@ origins:
       # In production this is the K8s Service DNS name, e.g.
       # url: http://backend.namespace.svc.cluster.local:8080
       url: https://test.sbproxy.dev
-      host_override: backend.namespace.svc.cluster.local
+      # Production value: the Service hostname the Pods route by, e.g.
+      # host_override: backend.namespace.svc.cluster.local
+      # The shared test upstream only serves its own hostname, so
+      # override to that for the local run:
+      host_override: test.sbproxy.dev
       service_discovery:
         enabled: true
         refresh_secs: 30
@@ -116,17 +120,17 @@ curl -i \
   http://127.0.0.1:8080/headers
 ```
 
-You get a `200 OK`. The response carries an `X-Request-Id` header, and the JSON body (the echo upstream reflects what it received) shows the recovered `X-Forwarded-For: 203.0.113.7` and the `Host` rewritten to the override value:
+You get a `200 OK`. The response carries an `x-request-id` header, and the JSON body (the echo upstream reflects what it received, with header names lowercased) shows the `host` rewritten to the override value and the same request id the proxy stamped. The body below is trimmed; the hosted echo sits behind a CDN that adds headers of its own, and that CDN also rewrites the forwarding headers in transit, so verify the trusted-proxy behavior through `x-request-id` and the gateway's own access log rather than the echoed `x-forwarded-for`:
 
 ```json
 {
   "headers": {
-    "Host": "backend.namespace.svc.cluster.local",
-    "X-Forwarded-For": "203.0.113.7",
-    "X-Request-Id": "…",
-    "Authorization": "Bearer test-bearer-1"
+    "host": "test.sbproxy.dev",
+    "x-request-id": "…",
+    "authorization": "Bearer test-bearer-1",
+    "…": "…"
   },
-  "url": "https://test.sbproxy.dev/headers"
+  "timestamp": "…"
 }
 ```
 
@@ -140,15 +144,7 @@ curl -i \
   http://127.0.0.1:8080/headers
 ```
 
-A spoofed XFF from outside the `trusted_proxies` ranges gets stripped, so the upstream sees the proxy's own IP, not the forged value:
-
-```bash
-curl -i \
-  -H 'Host: api.acme.example.com' \
-  -H 'Authorization: Bearer test-bearer-1' \
-  -H 'X-Forwarded-For: 8.8.8.8' \
-  http://127.0.0.1:8080/headers
-```
+The trusted-proxy rule is what decides whether that `X-Forwarded-For` counts. Your curl arrives from `127.0.0.1`, which is in `trusted_proxies`, so `203.0.113.7` is honored as the client IP for the gateway's own accounting: rate-limit keys and the `client_ip` field of the access log. The same header from a peer outside the trusted ranges is stripped before those decisions. Watch the gateway's access log to see which client IP each request was attributed to; the hosted echo cannot show it, because its CDN rewrites forwarding headers in transit.
 
 A request with no token, or the wrong token, is rejected by the bearer auth before it reaches the upstream:
 
@@ -160,9 +156,9 @@ curl -i -H 'Host: api.acme.example.com' http://127.0.0.1:8080/headers
 ## You are done when
 
 - `curl -i -H 'Host: api.acme.example.com' -H 'Authorization: Bearer test-bearer-1' -H 'X-Forwarded-For: 203.0.113.7' http://127.0.0.1:8080/headers` returns `200 OK`.
-- The response carries an `X-Request-Id` header (generated when absent, echoed back).
-- The echoed JSON body shows `"X-Forwarded-For": "203.0.113.7"` and `"Host": "backend.namespace.svc.cluster.local"`.
-- The same request with `X-Forwarded-For: 8.8.8.8` shows the proxy IP in the body, not `8.8.8.8`.
+- The response carries an `x-request-id` header (generated when absent, echoed back).
+- The echoed JSON body shows `"host": "test.sbproxy.dev"` (the override value) and an `"x-request-id"` matching the response header.
+- The same request with `X-Request-Id: client-supplied-1234` echoes that id back in both the response header and the body.
 - A request with no `Authorization` header returns `401 Unauthorized`.
 
 ## Next steps

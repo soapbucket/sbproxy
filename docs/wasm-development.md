@@ -1,6 +1,6 @@
 # WASM transform development guide
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 This guide covers writing WebAssembly modules for sbproxy's `wasm`
 transform. Two minimal example modules live in `examples/wasm/`,
@@ -182,11 +182,14 @@ Tips:
   ships ~200 KB of bytecode for a hello world. Adding `[profile.release]
   opt-level = "z"`, `lto = true`, and `strip = true` typically cuts
   that to under 50 KB. TinyGo with `-no-debug` is similar.
-- Avoid heap allocations in the hot path. The Rust echo example uses
-  `io::copy` to round-trip without buffering more than a stack frame.
+- Avoid heap allocations in the hot path where you can. The Rust echo
+  example takes the simple route and buffers the whole body with
+  `read_to_end` into a `Vec` before writing it back; that is fine for
+  small bodies and easy to follow.
 - Buffer the body to a `Vec` only when you actually need random
   access. Streaming transforms (uppercase, gzip, JSON-line filters)
-  can process stdin chunk by chunk.
+  can process stdin chunk by chunk, or round-trip with `io::copy`
+  without buffering more than a stack frame.
 - The first call after process start triggers compilation if the
   module has not been cached. Subsequent calls reuse the compiled
   module across requests.

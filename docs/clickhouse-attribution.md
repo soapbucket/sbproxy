@@ -1,6 +1,6 @@
 # ClickHouse attribution
 
-*Last modified: 2026-06-01*
+*Last modified: 2026-07-09*
 
 A canonical ClickHouse schema for the SBproxy access log, plus sample queries for the three reports an operator most often wants: monthly project cost, top users by token spend, and tag-level burndown against a budget. The schema mirrors the JSON shape emitted by the structured logger (`sbproxy-observe::access_log::AccessLogEntry`), so a Vector / Fluent Bit pipeline can ingest the proxy's stdout into ClickHouse without an intermediate transform.
 
@@ -100,7 +100,7 @@ The `TTL` is the recommended starting point for a SaaS deployment. Hot-data dash
 
 Two map columns carry per-request labels, from different sources:
 
-* `attribution` is the resolved business attribution tag set: the credential's `attrs:` defaults (project, team) merged with the inbound `SB-Attr-*` headers (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id). Per-request headers override the credential default. This is the **same tag set the Prometheus per-attribution metrics are labeled by** (`sbproxy_ai_tokens_attributed_total`, `sbproxy_ai_cost_dollars_attributed_total`), so a log query and a metric query answer "spend by feature/customer" identically. Pivot on any key with `attribution['feature']`, `attribution['customer']`, and so on.
+* `attribution` is the resolved business attribution tag set: the credential's `attrs:` defaults (project, team) merged with the inbound `SB-Attr-*` headers (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id). Per-request headers override the credential default. The metric side carries only a bounded projection of this, not the full map: `sbproxy_tokens_attributed_total{project,user,tag,direction}` counts tokens against the matched credential. Pivots on the higher-cardinality keys (`attribution['customer']`, `attribution['okr']`, and so on) are log-side queries; that is what this table is for.
 * `metadata` is free-form key/values the operator pins on the credential's `attrs.metadata:`. Use it for dimensions outside the fixed attribution schema (cost_center is lifted in here for back-compat).
 
 To pivot spend by any attribution dimension, group on the map value:
@@ -269,7 +269,7 @@ The dashboard query reads `access_log_daily_project` instead of `access_log`. On
 
 ## Ingestion
 
-Vector and Fluent Bit both speak ClickHouse's `JSONEachRow` format. A minimal Vector config that reads the proxy's stdout (or a sink configured under `proxy.observability.log.sinks` once dispatch lands) into the table above:
+Vector and Fluent Bit both speak ClickHouse's `JSONEachRow` format. A minimal Vector config that reads the proxy's stdout (or a sink configured under `proxy.observability.log.sinks`, which the proxy dispatches to directly) into the table above:
 
 ```toml
 [sources.sbproxy_stdout]

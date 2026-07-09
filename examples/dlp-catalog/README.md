@@ -1,6 +1,6 @@
 # DLP catalog
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![DLP catalog](../../docs/assets/dlp-catalog.gif)
 
@@ -34,7 +34,9 @@ curl -i -H 'Host: tag.local' \
 curl -i -H 'Host: tag.local' \
   -H 'X-Ticket: see TICKET-123456 for context' http://127.0.0.1:8080/anything
 # HTTP/1.1 200 OK
-# X-Notes is rewritten to "[REDACTED:TICKET]" before the upstream sees it.
+# The request is forwarded unchanged, with a `dlp-detection: internal_ticket`
+# header stamped on it so the upstream can react. Tag mode never rewrites
+# header values; the `replacement` field is reserved for body redaction.
 
 # Clean request -> no tag, no block.
 curl -i -H 'Host: tag.local' http://127.0.0.1:8080/anything

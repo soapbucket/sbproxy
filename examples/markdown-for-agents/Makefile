@@ -1,7 +1,7 @@
-# Convenience runner for the 17-markdown-for-agents example bundle.
+# Convenience runner for the markdown-for-agents example bundle.
 #
 # Targets:
-#   make up      - docker compose up -d --wait
+#   make up      - docker compose up -d, then wait for the listener
 #   make down    - docker compose down -v --remove-orphans
 #   make logs    - tail logs of the sbproxy service
 #   make test    - run a four-leg curl probe (browser HTML, agent
@@ -21,8 +21,17 @@ PROXY_HOST   ?= 127.0.0.1
 
 .PHONY: up down logs test clean
 
+# The sbproxy image is distroless (no shell, no wget), so the compose
+# file has no container healthcheck and `--wait` cannot be used. Poll
+# the listener from the host instead.
 up:
-	$(COMPOSE) up -d --wait
+	$(COMPOSE) up -d
+	@echo "waiting for sbproxy on http://$(PROXY_HOST):$(PROXY_PORT)/health ..."
+	@for i in $$(seq 1 30); do \
+	  curl -sf -o /dev/null http://$(PROXY_HOST):$(PROXY_PORT)/health && exit 0; \
+	  sleep 1; \
+	done; \
+	echo "sbproxy did not become ready within 30s" >&2; exit 1
 
 down:
 	$(COMPOSE) down -v --remove-orphans

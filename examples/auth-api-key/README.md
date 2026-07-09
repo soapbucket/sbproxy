@@ -1,6 +1,6 @@
 # API key authentication
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![API key authentication](../../docs/assets/auth-api-key.gif)
 
@@ -34,7 +34,7 @@ $ curl -i -H 'Host: api.local' -H 'X-Api-Key: dev-key-1' \
 HTTP/1.1 200 OK
 content-type: application/json
 
-{"args":{},"headers":{"Host":"test.sbproxy.dev","X-Api-Key":"dev-key-1",...},"url":"https://test.sbproxy.dev/get"}
+{"method":"GET","url":"/get","headers":{"host":"test.sbproxy.dev","x-api-key":"dev-key-1",...},"query":{},"timestamp":"2026-07-09T19:29:58.060Z"}
 ```
 
 Wrong key, also rejected:

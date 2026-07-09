@@ -1,5 +1,5 @@
 # MCP schema-drift detection
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-09*
 
 Schema drift is the most-cited open problem in the API-to-MCP
 space: when the upstream OpenAPI changes, MCP tools fail silently
@@ -40,9 +40,17 @@ classified change. The CLI maps it to an exit code:
 sbproxy-mcp-drift --previous prev.openapi.json --current cur.openapi.json
 sbproxy-mcp-drift --previous prev.openapi.yaml --current cur.openapi.yaml --format json
 sbproxy-mcp-drift --cassette session-ledger.ndjson --current-tools live-tools-list.json
+
+# Lockfile modes: snapshot a tools/list dump into a committed lockfile,
+# then gate CI on version-bump discipline against it. `-` reads stdin.
+sbproxy-mcp-drift --lock-tools live-tools.json --lockfile tool-versions.lock.yaml
+sbproxy-mcp-drift --check-tools live-tools.json --lockfile tool-versions.lock.yaml
 ```
 
-OpenAPI inputs accept JSON or YAML. Cassette mode accepts JSON, YAML,
+OpenAPI inputs accept JSON or YAML. The `--lock-tools` / `--check-tools`
+modes accept a `tools/list` JSON dump in any of three shapes: the full
+JSON-RPC response, the bare result object, or a plain tools array.
+Cassette mode accepts JSON, YAML,
 or NDJSON session-ledger records and looks for:
 
 * MCP `tools/list` result envelopes with a `tools` array.
@@ -55,13 +63,14 @@ or NDJSON session-ledger records and looks for:
 
 ```bash
 # Refuse to regenerate the MCP surface on a breaking change.
-# Operator overrides with --accept-drift in the regeneration
-# pipeline when the breaking change is intentional.
+# The --accept-drift override below is a convention for YOUR
+# regeneration pipeline, not a flag of sbproxy-mcp-drift itself;
+# the tool only reports and sets the exit code.
 if ! sbproxy-mcp-drift \
     --previous last-known.openapi.json \
     --current current.openapi.json ; then
     case $? in
-        1) echo "informational drift; review and ack with --accept-drift if intentional" ;;
+        1) echo "informational drift; review and ack with your pipeline's --accept-drift if intentional" ;;
         2) echo "BREAKING drift; refusing to regenerate MCP surface" >&2 ; exit 1 ;;
     esac
 fi
@@ -189,7 +198,7 @@ Out of scope today (follow-ups):
 The CLI is a thin wrapper around
 `sbproxy_extension::mcp::schema_drift`:
 
-```rust
+```rust,no_run
 use sbproxy_extension::mcp::schema_drift::{diff_openapi, DriftSeverity};
 
 let prev: serde_json::Value = serde_json::from_str(prev_json)?;
@@ -202,7 +211,7 @@ if report.severity == DriftSeverity::Breaking {
 
 Cassette mode is also available as a library API:
 
-```rust
+```rust,no_run
 use sbproxy_extension::mcp::cassette_drift::{
     cassette_contract_from_value, diff_cassette_against_tools, tools_from_value,
 };

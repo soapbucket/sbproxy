@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -304,8 +304,9 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `
 
 When enabled, the admin server binds `bind:<port>` (loopback by
 default), authenticates every request (HTTP Basic or a browser session),
-enforces the operator's role on mutations, and applies a 60-rps per-IP
-rate limit. Full auth, RBAC, remote-access, and endpoint reference is in
+enforces the operator's role on mutations, and applies a rate limit of
+60 requests per minute per client IP, with a global cap of 600 requests
+per minute across all clients. Full auth, RBAC, remote-access, and endpoint reference is in
 [admin.md](admin.md). Endpoints (abbreviated):
 
 | Path | Description |
@@ -409,7 +410,8 @@ proxy:
 | `channels[].type` | string | required | Channel type. Supported: `webhook`, `log`. |
 | `channels[].url` | string | | Webhook URL. Required when `type` is `webhook`. |
 | `channels[].headers` | map | `{}` | Extra HTTP headers added to webhook deliveries. |
-| `channels[].secret` | string | | Optional shared secret. When set, the dispatcher signs the payload with HMAC-SHA256 and emits `X-Sbproxy-Signature: v1=<hex>`. Receivers verify with `<X-Sbproxy-Timestamp>.<body>`. See [Webhook envelope and signing](#webhook-envelope-and-signing). |
+
+An alert channel accepts exactly these three keys. A `secret:` key on a channel is rejected at config load as an unknown key; alert-webhook payload signing is not configurable yet. To sign webhook deliveries, use the `secret` field on per-origin `on_request` / `on_response` callbacks instead. See [Webhook envelope and signing](#webhook-envelope-and-signing).
 
 Alert webhook deliveries also include the standard `X-Sbproxy-*` identity headers (`Event`, `Instance`, `Rule`, `Severity`, `Timestamp`) and a `User-Agent: sbproxy/<version>`. The body is wrapped in an envelope:
 
@@ -921,7 +923,6 @@ origins:
 | `max_body_size` | int | | Maximum request body size in bytes. |
 | `guardrails` | object | | Input/output guardrails pipeline. |
 | `budget` | object | | Budget enforcement configuration. |
-| `virtual_keys` | list | | Virtual API keys mapped to provider keys and scopes. |
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
@@ -955,38 +956,51 @@ Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowe
 | `api_version` | string | | API version header value (e.g. for Anthropic and Azure OpenAI). |
 | `no_prompt_training` | bool | `false` | Marks the provider safe for training-sensitive prompts. Requests carrying the `x-sbproxy-disallow-prompt-training: true` header only route to providers with this flag; a request with the header and no marked provider in the chain gets a 400 `no_compliant_provider`. |
 
-#### Virtual keys (`virtual_keys[]`)
+#### Credentials
 
-Virtual API keys map a client-facing key to provider keys, model allow-lists, and per-key rate limits.
+Per-team or per-app keys are declared under the origin-level `credentials:` block, a sibling of `action`. Each `type: ai_provider` credential maps a client-facing key to a provider, a per-key model gate, and attribution metadata. Clients send the credential's `key` in the `Authorization` header; the gateway matches it locally and swaps in the real upstream key before the call.
+
+A `virtual_keys:` list inside the `ai_proxy` action is a hard config error: the config fails to load with a message pointing at [migration-credentials.md](migration-credentials.md).
 
 ```yaml
-virtual_keys:
-  - key: vk-prod-abc123
-    name: production-app
-    allowed_models: [gpt-4o-mini, claude-haiku-4-5]
-    blocked_models: []
-    allowed_providers: [openai, anthropic]
-    max_tokens_per_minute: 10000
-    max_requests_per_minute: 60
-    budget:
-      max_tokens: 1000000
-      max_cost_usd: 50.0
-    tags: [team-frontend]
-    enabled: true
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models: [claude-haiku-4-5, claude-sonnet-4-5]
+    credentials:
+      - name: team-frontend
+        type: ai_provider
+        provider: anthropic
+        key: ${TEAM_FRONTEND_KEY}
+        models:
+          allow: [claude-haiku-4-5]
+        attrs:
+          tags: [team-frontend]
+          budget:
+            max_tokens: 500000
+            max_cost_usd: 10.0
+        policies:
+          - type: rate_limit
+            rpm: 30
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `key` | string | required | The virtual key string clients send. |
-| `name` | string | | Human-readable label. |
-| `allowed_models` | list | `[]` | Models this key may use. Empty allows all. |
-| `blocked_models` | list | `[]` | Models this key is blocked from using. |
-| `allowed_providers` | list | `[]` | Providers this key may route to. Empty allows all. |
-| `max_tokens_per_minute` | int | unset | Per-key tokens-per-minute limit. |
-| `max_requests_per_minute` | int | unset | Per-key requests-per-minute limit. |
-| `budget` | object | | Per-key total budget (`max_tokens`, `max_cost_usd`). |
-| `tags` | list | `[]` | Free-form tags surfaced in metrics. |
-| `enabled` | bool | true | When false, the key is rejected. |
+| `name` | string | required | Stable name, unique within its scope. Identifies the credential in metrics and logs. |
+| `type` | string | required | Credential kind. `ai_provider` for AI gateway keys; other kinds are `bearer`, `api_key`, `jwt`, `basic`, `oidc_client`, `outbound_token_exchange`, `outbound_client_credentials`. |
+| `provider` | string | | Provider this key routes to. Matches an entry in the action's `providers:` list. |
+| `key` | string | | Client-facing key material. Accepts `${ENV}` and secret reference URIs. |
+| `models.allow` / `models.deny` | list | | Per-key model gate, enforced with a 403 before any upstream call. Stacks on the origin-level allow-list; most restrictive wins. |
+| `attrs` | object | | Attribution metadata (`project`, `tags`, `budget`, ...) surfaced in the `sbproxy_ai_key_*` metrics. The `budget` here is attribution, not an enforced ceiling; enforced spend caps live in the action-level `budget:` block. |
+| `policies` | list | | Sub-policies that fire when this credential matches. `{type: rate_limit, rpm: <n>}` lowers to an enforced per-key requests-per-minute cap; there is no per-key tokens-per-minute knob. `{type: require_pii_redaction, rules: [...]}` gates dispatch on active PII redaction. |
+| `route_to_model` | string | | Pin the upstream `model` field; the client-supplied value is ignored. |
+| `inject_tools` | list | | Replace the request's `tools` array with these provider-native entries. |
+
+See [`examples/ai-virtual-keys/sb.yml`](https://github.com/soapbucket/sbproxy/blob/main/examples/ai-virtual-keys/sb.yml) for a runnable two-team setup and [migration-credentials.md](migration-credentials.md) for the field-by-field migration from the legacy shape.
 
 #### Budget (`budget`)
 
@@ -1177,7 +1191,7 @@ origins:
 
 ## Authentication
 
-The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships eight built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `bot_auth`, and `noop`.
+The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships ten built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
 
 `bot_auth` verifies cryptographically-signed AI agents per RFC 9421 + the IETF Web Bot Auth draft. Full reference: [web-bot-auth.md](web-bot-auth.md).
 
@@ -1518,7 +1532,7 @@ The access log records the matched principal's source under the `principal_kind`
 
 Policies are evaluated before the action runs. They enforce rate limits, security rules, and access controls. The `policies` field is a sibling of `action` and is an array of policy objects.
 
-SBproxy ships ten policy types: `rate_limiting`, `ip_filter`, `expression`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`.
+SBproxy ships twenty-seven policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, `peer_pricing_preflight`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
 
 ### rate_limiting
 
@@ -2024,7 +2038,7 @@ policies:
 
 Transforms modify the response body before it reaches the client. They are specified as a list under `transforms` and run in order. Reach for transforms when you need to reshape API responses for different consumers.
 
-SBproxy supports nineteen transform types: `json`, `json_projection`, `json_schema`, `template`, `replace_strings`, `normalize`, `encoding`, `format_convert`, `payload_limit`, `discard`, `sse_chunking`, `html`, `optimize_html`, `html_to_markdown`, `markdown`, `css`, `lua_json`, `javascript`, `js_json`, plus a `noop` for testing.
+SBproxy supports twenty-five transform types: `json`, `json_projection`, `json_schema`, `template`, `replace_strings`, `normalize`, `encoding`, `format_convert`, `payload_limit`, `discard`, `sse_chunking`, `html`, `optimize_html`, `html_to_markdown`, `markdown`, `css`, `lua_json`, `javascript`, `js_json`, `wasm`, `boilerplate`, `citation_block`, `json_envelope`, `cel`, `a2a_agent_card_rewrite`, plus a `noop` for testing.
 
 ### json
 
@@ -2041,23 +2055,24 @@ origins:
         # Field-level edits handled by this transform.
 ```
 
-For include/exclude projection, use `json_projection`:
+For include/exclude projection, use `json_projection`. The field list is flat on the transform itself, under `fields:` (alias `include:`); there is no nested `projection:` key, and a config using one fails at load with `missing field 'fields'`.
 
 ```yaml
 transforms:
   - type: json_projection
-    projection:
-      include: [id, name, email, role]
+    fields: [id, name, email, role]
 ```
 
-Or to remove sensitive fields:
+Or to remove sensitive fields, list them under `fields:` and set `exclude: true`:
 
 ```yaml
 transforms:
   - type: json_projection
-    projection:
-      exclude: [password, ssn, internal_notes]
+    fields: [password, ssn, internal_notes]
+    exclude: true
 ```
+
+The field reference for this transform is in the [json_projection](#json_projection) section below.
 
 ### html
 
@@ -2480,10 +2495,11 @@ origins:
             json_body:
               status: healthy
 
-      # Route mobile users to mobile backend
+      # Route clients that identify as mobile to the mobile backend
       - rules:
-          - user_agent:
-              os_families: [iOS, Android]
+          - header:
+              name: X-Client-Platform
+              prefix: mobile
         origin:
           id: mobile-backend
           hostname: mobile-backend
@@ -2496,15 +2512,21 @@ origins:
 
 ### Rule matching
 
-Each forward rule has a `rules` array where each entry is a path matcher. The OSS deserializer accepts these forms only:
+Each forward rule has a `rules` array where each entry is a matcher. The deserializer accepts these forms only:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `path.prefix` | string | Path starts with this value. |
-| `path.exact` | string | Path matches this value exactly. If both `prefix` and `exact` are set on the same matcher, `prefix` wins. |
+| `path.exact` | string | Path matches this value exactly. |
+| `path.template` | string | OpenAPI-style path template with named segments, e.g. `/users/{id}/posts/{post_id}`. Supports catch-all (`/static/{*rest}`) and per-segment regex constraints (`/users/{id:[0-9]+}`). Captured params surface on the request context as `path_params`. |
+| `path.regex` | string | Whole-path regex escape hatch. Named captures (`(?P<id>...)`) surface params on the request context. |
 | `match` | string | Shorthand. Equivalent to `path: { prefix: <value> }`. |
+| `header` | object | Header matcher: `{name, value}` for an exact match or `{name, prefix}` for a value-prefix match. When both are set, `value` wins. Header names compare case-insensitively; values case-sensitively. |
+| `query` | object | Query parameter matcher: `{name, value}` for an exact match, or `{name}` alone to match on presence. |
 
-When a rule has multiple matcher entries, the rule fires when any one of them matches. Other Go-era fields (`methods`, `headers`, `query`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) are not parsed by the Rust runtime today and are ignored if present.
+Set exactly one of `prefix`, `exact`, `template`, or `regex` on a path matcher. If more than one is set, precedence is `template` > `regex` > `exact` > `prefix` (so `exact` beats `prefix`).
+
+When a rule has multiple matcher entries, the rule fires when any one of them matches. Any other key on a matcher entry (Go-era fields such as `methods`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) is rejected at config load as an unknown key.
 
 ### Forward rule fields
 
@@ -2936,7 +2958,7 @@ origins:
 | `header_name` | string | `Idempotency-Key` | Request header carrying the key. |
 | `ttl_secs` | int | 86400 | Cache entry TTL in seconds. |
 | `methods` | list | `[POST, PUT, PATCH]` | HTTP methods that engage the middleware. Other methods pass through. |
-| `backend` | enum | `memory` | `memory` (per-origin, per-replica) or `redis` (binds to `proxy.l2_store` for cluster-wide replay). |
+| `backend` | enum | `memory` | `memory` (per-origin, per-replica) or `redis` (binds to `proxy.l2_cache_settings`, alias `l2_cache`, for cluster-wide replay). |
 | `max_request_body_bytes` | int | 1048576 (1 MiB) | Per-request cap on buffered body bytes. Bodies larger than this skip the cache; response carries `x-sbproxy-idempotency: SKIPPED-OVERSIZE-REQUEST`. |
 | `max_response_body_bytes` | int | 1048576 (1 MiB) | Per-response cap on cached body bytes. Responses larger than this stream through uncached. |
 | `max_concurrent_buffers` | int | 256 | Per-origin cap on concurrent buffered requests. When the pool is exhausted, new requests skip the cache; response carries `x-sbproxy-idempotency: SKIPPED-POOL-FULL`. Worst-case memory per origin is roughly `max_concurrent_buffers * max_request_body_bytes`. |
@@ -2944,19 +2966,18 @@ origins:
 The `memory` backend is per-origin and per-replica: suitable for
 single-instance deployments and clusters with sticky routing. The
 `redis` backend binds at config-compile time to the cluster L2 store
-configured under `proxy.l2_store`; an origin asking for `redis`
-without that block surfaces a clear config-load error rather than
-silently downgrading.
+configured under `proxy.l2_cache_settings` (alias `l2_cache`); an
+origin asking for `redis` without that block surfaces a clear
+config-load error rather than silently downgrading.
 
 See [`examples/idempotency/`](https://github.com/soapbucket/sbproxy/tree/main/examples/idempotency).
 
 Spec: <https://www.rfc-editor.org/rfc/rfc8594.html>.
 
-> **AI gateway note.** The AI proxy path (`action: ai_proxy`) does not
-> currently engage this middleware. The AI gateway has its own
-> request-flow model and response capture is more involved for
-> streaming completions. Track the follow-up in
-> `docs/missing.md`.
+> **AI gateway note.** The AI proxy path (`action: ai_proxy`) engages
+> the same middleware: when the origin has an `idempotency:` block,
+> AI requests get the same cached-replay, conflict, and skip semantics
+> as plain proxy traffic.
 
 ---
 
@@ -2984,54 +3005,36 @@ The origin-level `rate_limit_headers` block is accepted for forward compatibilit
 
 ---
 
-## Idempotency-Key middleware
-
-`crates/sbproxy-middleware/src/idempotency.rs` ships an
-`Idempotency-Key` middleware that implements the cached-retry vs
-conflict semantics from Wave 3 / R3.2:
-
-1. Request carries `Idempotency-Key`, cache miss: process the
-   request, capture the response, persist
-   `(workspace_id, key, body_hash, response, expires_at)` after the
-   response is final. Default TTL 24 h.
-2. Cache hit, body hash matches: return the cached response. The
-   rate-limit middleware does not consume a slot.
-3. Cache hit, body hash differs: return 409
-   `ledger.idempotency_conflict`. The rate-limit middleware does
-   consume a slot per the A3.4 DoS rule.
-4. No `Idempotency-Key` header: pass through.
-
-The middleware is library-level today and is consumed by the AI
-gateway path through `sbproxy-ai::idempotency`. There is no
-top-level `idempotency:` block on the origin schema yet; the AI
-handler enables the behaviour for AI traffic and the SHA-256
-body-hash + cached-response shape (`CachedResponse`) is reused
-across both surfaces. Cache backends are `InMemoryIdempotencyCache`
-(tests, single instance) and `KvIdempotencyCache` (any
-`sbproxy_platform::storage::KVStore` implementation, including the
-Redis backend).
-
 ## Message signatures
 
-The `message_signatures` block declares the schema for RFC 9421 HTTP Message Signatures. The configuration type is defined in `sbproxy-middleware`, but the signing and verification path is not wired into the OSS request pipeline yet. The block parses cleanly so configs that target a future release validate today.
+The `message_signatures` block configures RFC 9421 HTTP Message Signature verification for an origin. Verification is wired into the request pipeline: with `verify: true`, every inbound request must carry a `Signature-Input` + `Signature` header pair that matches the configured `key_id`, or it is rejected with `401 Unauthorized` and `WWW-Authenticate: Signature` before any downstream auth provider runs.
 
 ```yaml
 origins:
   "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
     message_signatures:
-      algorithm: hmac-sha256
+      verify: true
+      algorithm: hmac_sha256
       key_id: proxy-key-1
-      covered_components:
+      key: ${SIGNING_SHARED_SECRET}
+      required_components:
         - "@method"
         - "@target-uri"
         - content-digest
+      clock_skew_seconds: 30
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `algorithm` | string | | Signature algorithm identifier. Required. Examples: `hmac-sha256`, `ed25519`. |
-| `key_id` | string | | Key identifier emitted in the `Signature-Input` header. Required. |
-| `covered_components` | list | `[]` | HTTP message components covered by the signature, e.g. `@method`, `@target-uri`, `content-digest`. |
+| `verify` | bool | false | When true, enforce signature verification on inbound requests to this origin. |
+| `algorithm` | string | required | Signature algorithm: `hmac_sha256` or `ed25519`. An unrecognized value rejects all requests to the origin rather than silently bypassing the gate. |
+| `key_id` | string | required | The `keyid` value the signer is expected to advertise in `Signature-Input`. |
+| `key` | string | required | Verification key material. For `hmac_sha256`, the shared secret; for `ed25519`, the hex- or base64-encoded raw 32-byte public key. |
+| `required_components` | list | `[]` | Canonical components every accepted signature must cover, e.g. `@method`, `@target-uri`, `content-digest`. A signature covering a strict subset is rejected. |
+| `clock_skew_seconds` | int | 30 | Tolerance applied to the signature's `created` / `expires` timestamps. |
 
 ---
 
@@ -3471,7 +3474,7 @@ The signed material is `"<timestamp>.<body>"`. Receivers should:
 2. Compute `HMAC-SHA256(secret, timestamp + "." + raw_body)`.
 3. Compare to `X-Sbproxy-Signature` (`v1=<hex>`) using a constant-time comparison.
 
-The same `secret` field is accepted on alert webhook channels (`proxy.alerting.channels[]`). See [example 79](../examples/webhook-signing/sb.yml).
+Alert webhook channels (`proxy.alerting.channels[]`) do not accept a `secret` field; a channel entry takes only `type`, `url`, and `headers`, and anything else is rejected at config load. Alert-payload signing is not configurable yet. See [example 79](../examples/webhook-signing/sb.yml).
 
 ---
 
@@ -3528,7 +3531,7 @@ In addition to `${ENV}`, `file:`, and `secret:`, secret-bearing fields accept pr
 | `secretfile://` | Local YAML or JSON secret file | `secretfile://local/openai-prod?key=api_key` |
 | `secret://` | Local static secret map | `secret://local/openai-prod` |
 
-* `<backend-name>` is the operator-chosen backend instance name under `proxy.vault:`, `tenants[].vault:`, or `origins[].vault:`.
+* `<backend-name>` is the operator-chosen backend instance name declared under `proxy.secrets.backends:`.
 * `<provider-path>` is the backend-specific path. The parser carries it verbatim; each backend validates its own shape at resolve time.
 * `version=<n>` pins a secret version where the backend supports versioning, such as HashiCorp KV v2, AWS Secrets Manager, or GCP Secret Manager. It is ignored by versionless backends.
 * `key=<json-field>` extracts a sub-field from a JSON secret payload. When omitted the entire payload is returned.
@@ -3551,7 +3554,7 @@ authentication:
 
 #### Backward compatibility
 
-Existing `${ENV}`, `file:/path/to/secret`, and `secret:<name>` shapes keep working unchanged. Legacy umbrella references shaped as `vault://<alias>/...` are accepted with a warning during the compatibility window and are scheduled for removal in SBproxy `1.2.0`.
+Existing `${ENV}`, `file:/path/to/secret`, and `secret:<name>` shapes keep working unchanged. Legacy umbrella references shaped as `vault://<alias>/...` are still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced.
 
 Rewrite known legacy aliases with:
 
@@ -3559,43 +3562,42 @@ Rewrite known legacy aliases with:
 sbproxy config migrate sb.yml --out sb.migrated.yml
 ```
 
-#### Multi-tenant resolution
+#### Multiple backends
 
-The URI itself is tenant-agnostic. The `<backend-name>` segment names a backend block; the scheme requires that block to have the matching provider type. Resolution order at request time is origin scope, then tenant scope, then proxy scope; the first scope that declares the matching backend serves the reference.
+Backends are declared once, at proxy scope, under `proxy.secrets.backends:`. There is no per-tenant or per-origin backend list; the `<backend-name>` segment in a reference URI selects the backend by name, and the scheme requires that backend to have the matching provider type. To keep tenants on separate Vault instances, declare one named backend per instance and reference the right name from each origin.
 
 ```yaml
 proxy:
-  vault:
-    - name: primary
-      type: hashicorp
-      addr: https://vault.shared.example/v1
-      token: ${VAULT_TOKEN_SHARED}
-  tenants:
-    - id: acme-corp
-      vault:
-        - name: primary            # same name, different Vault instance
-          type: hashicorp
-          addr: https://vault.acme.example/v1
+  secrets:
+    backends:
+      - type: hashicorp
+        name: acme-vault
+        addr: https://vault.acme.example/v1
+        auth:
+          type: token
           token: ${VAULT_TOKEN_ACME}
-    - id: beta-corp
-      vault:
-        - name: primary
-          type: hashicorp
-          addr: https://vault.beta.example/v1
+      - type: hashicorp
+        name: beta-vault
+        addr: https://vault.beta.example/v1
+        auth:
+          type: token
           token: ${VAULT_TOKEN_BETA}
 origins:
   api.acme.example.com:
-    tenant_id: acme-corp
     action:
       type: ai_proxy
       providers:
         - name: openai
-          api_key: vault://primary/secret/data/openai-prod?key=api_key
+          api_key: vault://acme-vault/secret/data/openai-prod?key=api_key
+  api.beta.example.com:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: vault://beta-vault/secret/data/openai-prod?key=api_key
 ```
 
-The `vault://primary/secret/data/openai-prod` reference in the origin above resolves against acme-corp's `primary` HashiCorp backend at `vault.acme.example`. A tenant that does not redeclare a matching backend inherits the proxy default, so single-tenant configs need no changes. The request's `tenant_id` is the resolution context, not part of the URI.
-
-Tenant and origin vault scopes follow the same origin -> tenant -> proxy resolution order as credentials.
+The `vault://acme-vault/...` reference resolves against the `acme-vault` backend at `vault.acme.example`; the `beta-vault` reference resolves against the other instance. Backend types are `local`, `file`, `hashicorp`, `aws`, `gcp`, and `k8s`; see [secrets.md](secrets.md) for each backend's fields and auth methods. An unresolved reference in a secret-bearing field fails startup rather than reaching the wire verbatim.
 
 ---
 
@@ -3783,24 +3785,25 @@ origins:
       type: proxy
       url: https://backend.internal:8080
     cors:
-      enable: true
-      allow_origins: ["https://app.example.com", "https://admin.example.com"]
-      allow_methods: [GET, POST, PUT, DELETE, OPTIONS]
-      allow_headers: [Content-Type, Authorization, X-Requested-With]
+      allowed_origins: ["https://app.example.com", "https://admin.example.com"]
+      allowed_methods: [GET, POST, PUT, DELETE, OPTIONS]
+      allowed_headers: [Content-Type, Authorization, X-Requested-With]
       expose_headers: [X-Request-ID, X-RateLimit-Remaining]
       max_age: 3600
       allow_credentials: true
 ```
 
+The presence of the `cors:` block is what enables CORS header injection. A legacy `enable` flag (alias `enabled`) still parses for backward compatibility, but the runtime never checks it: `enable: false` does not turn the block off.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enable` | bool | false | Enable CORS header injection. Alias: `enabled`. |
-| `allow_origins` | list | | Allowed origins (use `["*"]` for any). Alias: `allowed_origins`. |
-| `allow_methods` | list | standard methods | Allowed HTTP methods. Alias: `allowed_methods`. |
-| `allow_headers` | list | standard headers | Allowed request headers. Alias: `allowed_headers`. |
+| `allowed_origins` | list | | Allowed origins (use `["*"]` for any). Alias: `allow_origins`. |
+| `allowed_methods` | list | standard methods | Allowed HTTP methods. Alias: `allow_methods`. |
+| `allowed_headers` | list | standard headers | Allowed request headers. Alias: `allow_headers`. |
 | `expose_headers` | list | | Headers exposed to the browser |
 | `max_age` | int | | Preflight cache duration in seconds |
 | `allow_credentials` | bool | false | Allow credentials (cookies, auth headers) |
+| `enable` | bool | unset | Legacy flag, alias `enabled`. Parsed but ignored at runtime. |
 
 ---
 

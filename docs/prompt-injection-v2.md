@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-05-23*
+*Last modified: 2026-07-09*
 
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
@@ -124,11 +124,18 @@ policies:
 
 ## Eval harness
 
-The repo ships golden corpora at `eval/prompt_injection/`:
+The repo ships golden corpora at `eval/prompt_injection/`, four files
+totalling 71 injection prompts and 93 clean prompts:
 
 - `golden_injection.txt`: 33 known-injection prompts paraphrased from
   OWASP-LLM-01, PROMPTBENCH, and similar public corpora.
+- `golden_injection_owasp.txt`: 38 further injection prompts
+  paraphrased from the OWASP LLM01 taxonomy.
 - `golden_clean.txt`: 35 known-clean prompts (typical user queries).
+- `golden_clean_v2.txt`: 58 additional known-clean prompts modelled on
+  public conversation corpora (ShareGPT, WildChat, HH-RLHF): code
+  questions, factual Q and A, debugging, brainstorming, creative
+  writing.
 - `README.md`: source attribution and usage notes.
 
 The integration test at `crates/sbproxy-modules/tests/prompt_injection_eval.rs`
@@ -148,23 +155,25 @@ classifier lands.
 
 ## In-process vs out-of-process model inference
 
-The OSS build ships only the heuristic detector in-process. Model
-inference runs out of process in the classifier sidecar, never inside
-the proxy: parsing and running a model graph on the proxy's own heap
-lets a malformed or oversized model exhaust proxy memory, so that path
-was removed. `detector: sidecar` is the supported way to run a
-learned classifier; `detector: onnx` is no longer accepted and fails at
-config load with a pointer to the sidecar.
+The OSS build ships two ways to run a learned classifier alongside the
+heuristic detector. `detector: sidecar` runs the model out of process
+behind a gRPC contract and is the preferred choice: a malformed or
+oversized model can only take down the sidecar, not the proxy.
+`detector: inprocess` runs the same tract-based ONNX classifier inside
+the proxy address space; it is opt-in, guarded by a hard
+`max_model_bytes` size cap, and you supply the model and tokenizer
+paths. The legacy `detector: onnx` name is the only thing that was
+removed; it fails at config load with a pointer to the sidecar.
 
 The trained model weights do not ship in OSS. There is no default model
 baked into the build and no model artifact in any release asset; you
-supply the ONNX file and tokenizer to the sidecar.
+supply the ONNX file and tokenizer to whichever detector you pick.
 
-The heuristic detector's quality gate (precision and recall >= 0.7
-against the bundled golden corpora) runs unconditionally in the default
-OSS test suite via
-`crates/sbproxy-modules/tests/prompt_injection_eval.rs`. That gate
-guards the OSS-shipped detector against regressions.
+The eval gate (precision and recall >= 0.7 against the bundled golden
+corpora) is opt-in: the test at
+`crates/sbproxy-modules/tests/prompt_injection_eval.rs` is marked
+`#[ignore]` and only runs when invoked with `-- --ignored`, so the
+default OSS test suite does not exercise it.
 
 ## Running detection out of process: the sidecar detector
 
@@ -336,7 +345,7 @@ supervisor passes the UDS path to the child; the proxy holds a
 lazy client at the same path; the first `classify` call races
 the child's bind exactly once.
 
-```rust
+```rust,no_run
 use std::path::PathBuf;
 use std::time::Duration;
 use sbproxy_classifier_client::{ClassifierClient, Supervisor, SupervisorConfig};

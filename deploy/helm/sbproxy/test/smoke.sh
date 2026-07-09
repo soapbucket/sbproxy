@@ -157,8 +157,9 @@ HAS_ADMIN_SECRET=$(kubectl get sbproxy demo -n "$SAMPLE_NS" \
   -o jsonpath='{.spec.adminAuthSecretRef.name}')
 
 log "patching SBProxyConfig to trigger reload"
+# Map-form origins: the proxy rejects the Go-era list form.
 kubectl patch sbproxyconfig demo-config -n "$SAMPLE_NS" --type=merge \
-  -p '{"spec":{"config":"origins:\n  - host: \"*\"\n    action:\n      type: mock\n      status: 200\n      body: \"updated\"\n"}}'
+  -p '{"spec":{"config":"origins:\n  \"demo.local\":\n    action:\n      type: mock\n      status: 200\n      body: \"updated\"\n"}}'
 
 if [[ -n "$HAS_ADMIN_SECRET" ]]; then
   log "hot-reload path: verifying pod $ORIGINAL_POD_NAME was not restarted"

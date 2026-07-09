@@ -155,13 +155,33 @@ fn warn_missing_serve_prereqs(config: &AiHandlerConfig) {
             entry.model.to_ascii_lowercase().contains("gguf") || entry.gguf_file.is_some();
         let doctor = sbproxy_model_host::EngineDoctor::for_entry(entry, is_gguf, &env);
         if !doctor.runnable {
-            tracing::warn!(
-                model = %doctor.model,
-                engine = ?doctor.resolved,
-                "serve: model cannot start on this host: {}. Run \
-                 `sbproxy doctor` to see the prerequisites and how to install them",
-                doctor.blocker.as_deref().unwrap_or("engine unavailable"),
-            );
+            // WOR-1827: the doctor's `runnable` only reflects a PATH
+            // binary, but the runtime acquires engines on demand
+            // (WOR-1801). When the acquire plan can supply the engine
+            // (a pinned prebuilt fetch, an explicit path, uvx), the
+            // honest message is "fetched on first use", not "cannot
+            // start"; the hard warning stays for a genuinely blocked
+            // engine.
+            let prov = merged.engines.get(&doctor.resolved);
+            let plan = sbproxy_model_host::plan_binary_acquire(doctor.resolved, prov, None);
+            match plan {
+                sbproxy_model_host::BinaryAcquirePlan::Blocked(reason) => {
+                    tracing::warn!(
+                        model = %doctor.model,
+                        engine = ?doctor.resolved,
+                        "serve: model cannot start on this host: {reason}. Run \
+                         `sbproxy doctor` to see the prerequisites and how to install them",
+                    );
+                }
+                _ => {
+                    tracing::info!(
+                        model = %doctor.model,
+                        engine = ?doctor.resolved,
+                        "serve: engine not on PATH; sbproxy acquires it on the first \
+                         request (a PATH install is preferred when present)",
+                    );
+                }
+            }
         }
     }
 }

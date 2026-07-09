@@ -2,7 +2,7 @@
 """Mint a sample CAP token signed with the bundled TEST private key.
 
 Usage:
-    python3 examples/25-auth-cap/mint.py [--aud HOST] [--sub AGENT_ID]
+    python3 examples/auth-cap/mint.py [--aud HOST] [--sub AGENT_ID]
                                          [--glob /blog/**] [--rps 2.0]
                                          [--bytes 10737418240] [--ttl 3600]
 

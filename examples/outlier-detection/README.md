@@ -1,10 +1,10 @@
 # Outlier detection
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Outlier detection](../../docs/assets/outlier-detection.gif)
 
-A round-robin load balancer with two targets: `test.sbproxy.dev` and `test.sbproxy.dev/status/503`. The `outlier_detection` block tracks each target's success/failure rate over a 60-second sliding window. When the failure rate crosses `threshold: 0.5` and the target has seen at least `min_requests: 5` requests in the window, the target is ejected from selection for `ejection_duration_secs: 30` before being eligible again. Failures are recorded from upstream 5xx responses and from connect-error retries. Active health checks (example 77) feed this same store when both are configured.
+A round-robin load balancer with two targets: `test.sbproxy.dev` and `test.sbproxy.dev/status/503`. Load balancer targets are addressed by scheme, host, and port only; the `/status/503` path on the second target is not applied to proxied requests, so both lanes reach the same echo upstream and stay healthy under normal traffic. The `outlier_detection` block tracks each target's success/failure rate over a 60-second sliding window. When the failure rate crosses `threshold: 0.5` and the target has seen at least `min_requests: 5` requests in the window, the target is ejected from selection for `ejection_duration_secs: 30` before being eligible again. Failures are recorded from upstream 5xx responses and from connect-error retries. Active health checks (example 77) feed this same store when both are configured.
 
 ## Run
 
@@ -15,8 +15,8 @@ sbproxy serve -f sb.yml
 ## Try it
 
 ```bash
-# Drive 20 requests through the LB. With both upstreams healthy, traffic
-# alternates and no ejection happens.
+# Drive 20 requests through the LB. Both lanes reach the same healthy
+# echo upstream, so every request returns 200 and no ejection happens.
 for i in $(seq 1 20); do
   curl -s -H 'Host: localhost' \
        http://127.0.0.1:8080/anything -o /dev/null \
@@ -24,25 +24,28 @@ for i in $(seq 1 20); do
 done
 # 200 (x20)
 
-# Force one target to fail. /status/500 on httpbin always 500s; aim traffic
-# at it to push the failure rate above 0.5.
+# Force failures. /status/500 on the echo upstream always 500s, and a
+# 5xx is recorded as a failure against whichever lane served it.
 for i in $(seq 1 10); do
   curl -s -H 'Host: localhost' http://127.0.0.1:8080/status/500 -o /dev/null -w '%{http_code}\n'
 done
-# 500 500 500 500 500 (target #1) 500 500 (target #2) 200 200 200
-# After 5+ requests with >50% failures, one target is ejected for 30s.
+# 500 (x10)
+# Each lane crosses min_requests with a failure rate above 0.5, so
+# both are ejected for 30s. With every target ejected, the load
+# balancer falls back to the unfiltered list rather than failing
+# closed, so traffic keeps flowing.
 
-# During the ejection window, every request lands on the surviving target.
+# Requests during the ejection window still succeed on paths the
+# upstream answers with 200.
 for i in $(seq 1 5); do
-  curl -s -H 'Host: localhost' http://127.0.0.1:8080/anything | jq -r '.url // .headers.Host'
+  curl -s -H 'Host: localhost' http://127.0.0.1:8080/anything -o /dev/null -w '%{http_code}\n'
 done
-# test.sbproxy.dev/status/503
-# test.sbproxy.dev/status/503
-# test.sbproxy.dev/status/503
-# test.sbproxy.dev/status/503
-# test.sbproxy.dev/status/503
+# 200 (x5)
 
-# After 30s the ejected target re-enters rotation.
+# After 30s the ejected targets re-enter rotation. To watch a single
+# lane get ejected and routed around, point one target at an upstream
+# that genuinely fails (answers 5xx or refuses connections): its
+# failures accumulate per lane and traffic shifts to the healthy peer.
 ```
 
 ## What this exercises

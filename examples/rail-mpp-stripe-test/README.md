@@ -1,5 +1,5 @@
 # Stripe MPP billing rail (test mode)
-*Last modified: 2026-05-02*
+*Last modified: 2026-07-09*
 
 Stripe MPP (Merchant Payment Protocol) paywall in front of a markdown
 feed origin, configured to talk to Stripe in test mode. Operators
@@ -221,12 +221,11 @@ the default feature set.
 
 ## Related docs
 
-- `docs/billing-rails.md` - operator-facing billing rails reference.
--  (A3.1) - wire shape of the
-  402 body.
--  (A3.2) - quote-token JWS shape and
-  JWKS publication.
--  - rail / asset mapping.
+- `docs/ai-crawl-control.md` - operator-facing crawl-control and
+  billing reference.
+- `docs/402-challenge.md` - wire shape of the 402 body, the
+  quote-token JWS shape and JWKS publication, and the per-rail
+  asset mapping in the multi-rail body.
 - `examples/rail-x402-base-sepolia/` - x402 rail counterpart.
 - `examples/multi-rail-accept-payment/` - both rails wired
   together with q-value negotiation.

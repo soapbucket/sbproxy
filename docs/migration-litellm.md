@@ -1,6 +1,6 @@
 # Migrating from LiteLLM
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 ![The importer translating a LiteLLM config, then a completion served through the migrated result](assets/migrate-litellm.gif)
 
@@ -179,7 +179,7 @@ These have no automatic translation; the importer warns and points here.
 - Python hooks given as module paths: `custom_auth`, `custom_sso`, `custom_key_generate`, and callback classes. SBproxy's analog is CEL, Lua, JavaScript, or WebAssembly scripting; rewrite the logic in one of those.
 - Open-ended `litellm_params` keyword arguments: the importer maps the known keys and warns on the rest, so review each warned key. Budget kwargs, for example, become an action-level `budget:` block ([examples/ai-budget](../examples/ai-budget/)).
 - External guardrail providers (Presidio, Lakera, Aporia, Bedrock): map each to a built-in SBproxy guardrail or an external guardrail adapter.
-- `general_settings.master_key`: set up proxy authentication explicitly. Client keys move out of LiteLLM's database and into config, as `virtual_keys` or a `credentials` block ([examples/ai-virtual-keys](../examples/ai-virtual-keys/)).
+- `general_settings.master_key`: set up proxy authentication explicitly. Client keys move out of LiteLLM's database and into config as a `credentials:` block ([examples/ai-virtual-keys](../examples/ai-virtual-keys/)). Do not write a `virtual_keys:` block; that legacy shape is a hard config error.
 
 ## What is deferred
 
@@ -189,7 +189,7 @@ Runtime parity for callback sinks, external guardrail adapters, multi-window bud
 
 - `sbproxy validate sb.yml` prints `ok: sb.yml is a valid sbproxy config`.
 - Every public model name from your `model_list` returns `200` through SBproxy with `usage.total_tokens` filled in, from the same client code that called LiteLLM.
-- Each line of the importer's warnings report is either resolved (a `budget:` block, `virtual_keys`, a rewritten hook) or deliberately parked.
+- Each line of the importer's warnings report is either resolved (a `budget:` block, a `credentials:` entry, a rewritten hook) or deliberately parked.
 
 ## Next steps
 
@@ -197,4 +197,4 @@ Runtime parity for callback sinks, external guardrail adapters, multi-window bud
 - [examples/ai-virtual-keys/](../examples/ai-virtual-keys/) - per-team client keys, the follow-up for `master_key`
 - [examples/ai-budget/](../examples/ai-budget/) - budget enforcement, the follow-up for budget kwargs
 - [docs/ai-gateway.md](ai-gateway.md) - the AI gateway and routing strategies
-- [docs/configuration.md](configuration.md) - the full config schema, including `virtual_keys` and `budget`
+- [docs/configuration.md](configuration.md) - the full config schema; see its Credentials section for per-key setup and `budget` for spend caps

@@ -1,8 +1,8 @@
 # Defense in depth
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
-Layered authentication, authorisation, and inspection on a single origin. The chain answers a different question at each layer: `ip_filter` (is this source on the allow list?), WAF (does the request body or URI look benign?), `rate_limiting` (is this IP within its RPS budget?), `concurrent_limit` (is this IP within its in-flight cap?), JWT auth (is this user authenticated?), `request_validator` (does the body match the contract?), security headers and CORS injected on the response. The layers run in policy / auth / transform order. A failure in any layer short-circuits with the configured status; the upstream only sees requests that survived everything. mTLS is intentionally not enabled here (see example 85 standalone); pair the two by setting `proxy.mtls` when the deployment requires certificate-based service identity in addition to JWT user auth.
+Layered authentication, authorisation, and inspection on a single origin. The chain answers a different question at each layer: `ip_filter` (is this source on the allow list?), WAF (does the request body or URI look benign?), `rate_limiting` (is this IP within its RPS budget?), `concurrent_limit` (is this IP within its in-flight cap?), JWT auth (is this user authenticated?), `request_validator` (does the body match the contract?), security headers and CORS injected on the response. The layers run in policy / auth / transform order. A failure in any layer short-circuits with the configured status; the upstream only sees requests that survived everything. mTLS is intentionally not enabled here (see [examples/mtls-client-auth/](../mtls-client-auth/) for the standalone demo); pair the two by setting `proxy.mtls` when the deployment requires certificate-based service identity in addition to JWT user auth.
 
 ## Run
 

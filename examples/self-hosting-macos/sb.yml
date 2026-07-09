@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Self-host on a Mac (Apple Silicon), admin surface included.
+#
+# One served model on Metal plus the embedded admin API + UI. The
+# provider has no base_url: a serve: block means the gateway spawns
+# llama.cpp itself and resolves its loopback port. The first request
+# fetches the pinned llama.cpp macos-arm64 release and the GGUF weights
+# (~5 GiB), then serves on Metal. See docs/model-host.md and
+# docs/admin.md.
+#
+# Run (from this directory):
+#   brew install soapbucket/tap/sbproxy
+#   sbproxy sb.yml
+proxy:
+  http_bind_port: 8080
+
+  # Embedded admin API + UI. Binds loopback-only by default; the UI is
+  # at http://127.0.0.1:9090/admin/ui. Rotate the password before
+  # binding beyond loopback, and add tls: + allow_ips: if you do (see
+  # docs/admin.md).
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: change-this   # demo value; rotate before real use
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        # The model runs on this box. No base_url: the gateway resolves
+        # the engine's loopback port itself. Explicit weights source
+        # (repo, quant, file) is the form certified on hardware today;
+        # Q4_K_M fits comfortably in Apple unified memory (~6 GiB).
+        - name: local
+          default_model: qwen3-8b
+          models:
+            - qwen3-8b
+          serve:
+            models:
+              - model: "hf:Qwen/Qwen3-8B-GGUF:Q4_K_M"
+                gguf_file: Qwen3-8B-Q4_K_M.gguf
+                name: qwen3-8b
+                # llama-server applies the GGUF's embedded chat template.
+                extra_args: ["--jinja"]
+                # Idle time before the engine unloads to free memory.
+                keep_alive: 30m
+
+      # Every completed call lands in a hash-chained ledger; the admin
+      # UI's usage view reads the same counters. Verify the chain with
+      # `sbproxy ai ledger verify` (see docs/ai-usage-ledger.md).
+      usage_sinks:
+        - type: ledger
+          path: /tmp/sb-macos-ledger.jsonl

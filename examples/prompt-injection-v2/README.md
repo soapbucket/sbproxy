@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-The successor to the v1 `prompt_injection` heuristic guardrail. The v2 policy splits detection from enforcement: a swappable detector returns a numeric score plus a categorical label, and the policy maps the score onto an action (`tag` (default), `block`, or `log`). The OSS build ships the heuristic detector (`detector: heuristic-v1`) which performs case-insensitive substring matching against the OWASP-LLM-01 vocabulary and a small "suspicious" cue list. Future builds register additional detectors (such as an ONNX classifier) via the inventory registry; the policy config stays the same. Scope: the OSS scaffold scans the request URI and non-auth headers at request-filter time so the tag-action path can stamp trust headers before the upstream request is built. Body-aware detection lands with the ONNX classifier follow-up (see example 100).
+The successor to the v1 `prompt_injection` heuristic guardrail. The v2 policy splits detection from enforcement: a swappable detector returns a numeric score plus a categorical label, and the policy maps the score onto an action (`tag` (default), `block`, or `log`). The OSS build ships the heuristic detector (`detector: heuristic-v1`) which performs case-insensitive substring matching against the OWASP-LLM-01 vocabulary and a small "suspicious" cue list. Future builds register additional detectors (such as an ONNX classifier) via the inventory registry; the policy config stays the same. Scope: the OSS scaffold scans the request URI and non-auth headers at request-filter time so the tag-action path can stamp trust headers before the upstream request is built. Body-aware detection lands with the ONNX classifier follow-up (see `examples/prompt-injection-sidecar/`).
 
 ## Run
 

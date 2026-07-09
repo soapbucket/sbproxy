@@ -1,6 +1,6 @@
 # Getting started: Content estate (HTML-to-markdown / content transformation for agents)
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 ## What you will build
 
@@ -30,7 +30,7 @@ sbproxy serve -f sb.yml
 Save this as `sb.yml`. It fronts the HTML page at `test.sbproxy.dev/html`, converts the body to Markdown with ATX-style headings (`#`, `##`, ...), and stamps the Markdown MIME type on the way out. Every key here exists in the config schema and matches the `transform-html-to-markdown` example.
 
 ```yaml
-# yaml-language-server: $schema=schemas/sb-config.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
 proxy:
   http_bind_port: 8080
 
@@ -65,14 +65,14 @@ curl -s https://test.sbproxy.dev/html | head -5
 ```
 
 ```text
-<!DOCTYPE html>
-<html>
-  <head>
-  </head>
-  <body>
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>test.sbproxy.dev sample</title></head>
+<body>
+  <h1>Sample HTML</h1>
 ```
 
-The proxied response is Markdown with ATX headings and the rewritten content type:
+The proxied response is Markdown with ATX headings and the rewritten content type (insignificant whitespace trimmed):
 
 ```bash
 curl -i -H 'Host: tomd.local' http://127.0.0.1:8080/html
@@ -82,9 +82,15 @@ curl -i -H 'Host: tomd.local' http://127.0.0.1:8080/html
 HTTP/1.1 200 OK
 content-type: text/markdown; charset=utf-8
 
-# Herman Melville - Moby-Dick
+# Sample HTML
 
-Availing himself of the mild, summer-cool weather that now reigned in these latitudes, ...
+This document exists so sbproxy HTML transforms have a fixed-shape upstream to point at.
+
+- One
+- Two
+- Three
+
+Visit [sbproxy.dev](https://sbproxy.dev) for docs.
 ```
 
 Confirm the headings are ATX (leading hashes, not setext underlines):
@@ -94,14 +100,14 @@ curl -s -H 'Host: tomd.local' http://127.0.0.1:8080/html | grep -E '^#'
 ```
 
 ```text
-# Herman Melville - Moby-Dick
+# Sample HTML
 ```
 
 ## You are done when
 
 - `curl -i -H 'Host: tomd.local' http://127.0.0.1:8080/html` returns `HTTP/1.1 200 OK`.
 - The response carries `content-type: text/markdown; charset=utf-8`.
-- The body starts with an ATX heading line, for example `# Herman Melville - Moby-Dick`, and `grep -E '^#'` over the body returns that heading.
+- The body starts with an ATX heading line, `# Sample HTML`, and `grep -E '^#'` over the body returns that heading.
 - The raw upstream (`curl -s https://test.sbproxy.dev/html`) is still HTML, confirming the proxy did the conversion.
 
 ## Next steps

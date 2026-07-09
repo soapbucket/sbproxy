@@ -1,6 +1,6 @@
 # Operator quickstart: first 24 hours
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 This is the minimum production bring-up path for the OSS Kubernetes operator. Use
 [`kubernetes.md`](kubernetes.md) for the full CRD and hot-reload reference after
@@ -15,15 +15,17 @@ helm install sbproxy ./deploy/helm/sbproxy \
   --namespace sbproxy-system \
   --create-namespace \
   --set image.repository=ghcr.io/soapbucket/sbproxy-k8s-operator \
-  --set image.tag=v1.1.0
+  --set image.tag=0.1.0
 ```
+
+The chart's `values.yaml` already defaults to that repository and tag, so the two `--set` flags only matter when you pin something else.
 
 For a single-node smoke check without the operator, run the data plane directly:
 
 ```bash
 docker run --rm -p 8080:8080 -p 9090:9090 \
   -v "$PWD/sb.yml:/etc/sbproxy/sb.yml:ro" \
-  ghcr.io/soapbucket/sbproxy:v1.1.0 \
+  ghcr.io/soapbucket/sbproxy:v1.5.0 \
   serve -f /etc/sbproxy/sb.yml
 ```
 
@@ -39,16 +41,16 @@ kubectl port-forward svc/demo-svc 8080:8080 9090:9090
 curl -fsS http://127.0.0.1:9090/readyz | jq .
 ```
 
-Expected result: HTTP 200 with every required component reporting `ready`.
-Optional integrations that are not configured should report `not_configured`,
-not `stale` or `error`.
+Expected result: HTTP 200 with a top-level `"status": "ok"` and every required
+component reporting `healthy`. Optional integrations that are not configured
+should report `not_configured`, not `unhealthy`.
 
-Component meanings:
+Component statuses:
 
-- `ready`: the component is configured and has reported success recently.
-- `not_configured`: the component is optional and disabled for this deployment.
-- `stale`: the component was configured but has not reported success inside its freshness window.
-- `error`: the component failed its latest readiness probe.
+- `healthy`: the component is configured and reporting nominal.
+- `degraded`: the component is reachable but impaired; readiness still passes.
+- `unhealthy`: the component is unreachable, failed its probe, or has gone stale past its freshness window; readiness fails so the load balancer drains the pod.
+- `not_configured`: the component is optional and disabled for this deployment; counts as ready.
 
 Use `/health` for the richer JSON payload with version, uptime, and readiness
 checks. Use `/healthz` only as a simple liveness probe.
@@ -80,7 +82,7 @@ as method, hostname, path, status, and duration. A denied request has a 4xx
 status plus policy/auth context, for example `auth`, `rate_limit`, `waf`, or
 `policy` fields depending on which layer made the decision.
 
-If logs contain repeated readiness `stale` messages, check the matching
+If a component sits at `unhealthy` with a staleness detail, check the matching
 integration first. If logs contain config parse errors, the operator will keep
 the last working Deployment while the bad config is corrected.
 

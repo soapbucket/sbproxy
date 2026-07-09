@@ -1,6 +1,6 @@
 # sidecar
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-09*
 
 Sidecar-tuned `sbproxy` config for the per-pod fanout case: small
 RSS, fast cold start, no required external dependencies. Run on the
@@ -35,8 +35,12 @@ make run CONFIG=examples/sidecar/sb.yml
 ## Test
 
 ```bash
-curl -H 'Host: any.host' http://127.0.0.1:15001/
+curl -H 'Host: app.local' http://127.0.0.1:15001/
 ```
+
+Origin keys are exact hostnames; wildcard origins (`"*"`) are not
+supported, so add one origin block per destination host the workload
+calls.
 
 Observe the `rate_limiting` (3000/min cap, burst 100) and
 `ip_filter` (allow `0.0.0.0/0` by default) policies in the access

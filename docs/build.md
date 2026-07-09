@@ -1,5 +1,5 @@
 # Build pipeline
-*Last modified: 2026-04-30*
+*Last modified: 2026-07-09*
 
 How the proxy container images are built, what stays warm between
 runs, and what the expected wall-clock numbers are. Companion to
@@ -16,29 +16,38 @@ cargo-chef layout:
 | `Dockerfile.cloudbuild` | Cloud Build / GCR amd64 image. | `gcloud builds submit`; bench loadtest stack. |
 | `Dockerfile.ci` | Kind-based smoke-test image. | `make k8s-operator-smoke`. |
 
-Both files have six stages:
+The two files share a five-stage Rust spine; `Dockerfile.ci` is
+exactly that spine, and `Dockerfile.cloudbuild` adds two stages of its
+own (**admin-ui** and **cert-gen**) for seven total:
 
 1. **chef-base**: `rust:1.94-bookworm` plus the apt deps (`pkg-config`,
    `libclang-dev`, `build-essential`, `cmake`, `perl`) plus a pinned
    `cargo-chef@0.1.71`. Reused by every later Rust stage.
-2. **planner**: copies the workspace, runs `cargo chef prepare`, emits
+2. **admin-ui** (cloudbuild only): `node:22-slim`, `npm ci` and
+   `npm run build` under `ui/`. `ui/dist` is gitignored, so the image
+   build must produce it; the builder stage copies it in before cargo
+   compiles with `--features embed-admin-ui`.
+3. **planner**: copies the workspace, runs `cargo chef prepare`, emits
    `recipe.json`. The recipe captures every `Cargo.toml` and
    `Cargo.lock` digest in the workspace; nothing under
    `crates/*/src/` affects it.
-3. **cacher**: `cargo chef cook --profile release-fast --bin sbproxy
-   --recipe-path recipe.json`. Compiles every dependency from
-   crates.io. This is the layer the warm-rebuild path reuses.
-4. **builder**: copies `/src/target` from cacher, then the workspace
-   source, then runs `cargo build --profile release-fast --bin sbproxy
-   --locked`.
+4. **cacher**: `cargo chef cook --profile release-fast --bin sbproxy
+   --recipe-path recipe.json` (cloudbuild adds `--features
+   embed-admin-ui`). Compiles every dependency from crates.io. This is
+   the layer the warm-rebuild path reuses.
+5. **builder**: copies `/src/target` from cacher, then the workspace
+   source (cloudbuild also copies `ui/dist` from admin-ui), then runs
+   `cargo build --profile release-fast --bin sbproxy --locked`, with
+   `--features embed-admin-ui` in the cloudbuild file.
    The dep `target/` from the cacher stage is the entire reason this
    step does not have to recompile crates like `pingora`,
    `aws-lc-sys`, or `tokio` again.
-5. **cert-gen** (cloudbuild only): self-signed loadtest cert.
+6. **cert-gen** (cloudbuild only): self-signed loadtest cert.
    Production deploys mount real certs over `/etc/sbproxy/` at
    runtime.
-6. **runtime**: `gcr.io/distroless/cc-debian12`. Carries the binary
-   and (cloudbuild) the loadtest cert pair.
+7. **runtime**: `gcr.io/distroless/cc-debian12` (the `:nonroot`
+   variant in `Dockerfile.ci`). Carries the binary and (cloudbuild)
+   the loadtest cert pair.
 
 ## Build-time numbers
 
@@ -53,7 +62,8 @@ clearing the cache.
 
 The warm path's win comes from the `cacher` layer: as long as
 `recipe.json` is byte-identical to the previous build, Docker
-short-circuits stages 1-3 and only re-runs stages 4 + 6.
+short-circuits `chef-base`, `planner`, and `cacher` (plus `admin-ui`
+when `ui/` is untouched) and only re-runs `builder` + `runtime`.
 The Dockerfiles default to `CARGO_PROFILE=release-fast`, which inherits
 the production release settings but disables fat LTO and raises
 `codegen-units` for lower link time and memory. Pass
@@ -119,8 +129,8 @@ modern amd64 worker should be under 90s.
   changed a feature flag). The recipe digest is keyed on those
   files; the cacher stage cooks fresh.
 - **`cargo build` in the builder stage refuses to use the cooked
-  artifacts.** Symptom: stage 4 takes ~12 min, ignoring the COPY
-  from cacher. Most likely cause: `--locked` and a stale
+  artifacts.** Symptom: the builder stage takes ~12 min, ignoring the
+  COPY from cacher. Most likely cause: `--locked` and a stale
   `Cargo.lock` in cacher's COPY. Re-run `cargo update` and rebuild.
 - **OOM on Cloud Build.** Set `machineType` on the build step to
   `E2_HIGHCPU_8` or higher; the chef cacher stage holds the full

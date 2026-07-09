@@ -347,6 +347,46 @@ pub(super) async fn handle_ai_proxy(
             })?;
         let provider = &config.providers[provider_idx];
 
+        // WOR-1827: a served provider has no reachable upstream until its
+        // engine is spawned, and `effective_base_url` would fall back to
+        // a localhost default, which on a stock config is this gateway's
+        // own data plane (a request loop ending in a confusing 502).
+        // Answer the models listing from the serve config, and reject
+        // any other GET with a clear not-ready error instead of dialing
+        // the fallback.
+        if provider.serve.is_some() {
+            if matches!(path.trim_end_matches('/'), "/v1/models" | "/models") {
+                let data: Vec<_> = provider
+                    .models
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "id": m.as_str(),
+                            "object": "model",
+                            "owned_by": provider.name.as_str(),
+                        })
+                    })
+                    .collect();
+                let body = serde_json::json!({ "object": "list", "data": data });
+                let bytes = serde_json::to_vec(&body).unwrap_or_default();
+                send_response(session, 200, "application/json", &bytes).await?;
+                return Ok(());
+            }
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "provider {} serves its model locally; `GET {}` has no upstream \
+                         to forward to. The engine starts on the first completion request.",
+                        provider.name, path
+                    ),
+                    "type": "engine_not_ready",
+                }
+            });
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            send_response(session, 503, "application/json", &bytes).await?;
+            return Ok(());
+        }
+
         let resp = AI_CLIENT
             .load()
             .forward_get_request(provider, &path)

@@ -1,6 +1,6 @@
 # IP filter
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![IP filter](../../docs/assets/ip-filter.gif)
 
@@ -23,13 +23,14 @@ HTTP/1.1 200 OK
 content-type: application/json
 ...
 {
-  "args": {},
+  "method": "GET",
+  "url": "/get",
   "headers": {
-    "Host": "test.sbproxy.dev",
+    "host": "test.sbproxy.dev",
     ...
   },
-  "origin": "...",
-  "url": "https://test.sbproxy.dev/get"
+  "query": {},
+  "timestamp": "2026-07-09T19:29:58.060Z"
 }
 ```
 

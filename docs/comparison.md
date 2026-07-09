@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-06-25*
+*Last modified: 2026-07-09*
 
 SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
@@ -106,7 +106,7 @@ SBproxy reaches 200+ models through 66 native providers behind one OpenAI-compat
 | Scripting | CEL + Lua + WASM + JS | No |
 | Rate limiting | Built-in, distributed | Built-in |
 | Response caching | Built-in (memory, file, memcached, redis) | 7 backends |
-| Guardrails | 7 built-in types (PII, injection, ...) | External integrations |
+| Guardrails | 9 built-in types (PII, injection, ...) | External integrations |
 | P99 proxy overhead | < 1 ms | 240-1200 ms |
 
 Choose LiteLLM if you only need an AI gateway and want the broadest provider coverage out
@@ -192,9 +192,9 @@ Caddy is a Go reverse proxy known for automatic HTTPS.
 | Circuit breaker | Built-in (3-state) | Latency-based |
 | Health checks | Active + passive | Active + passive |
 | Retries | Configurable with backoff | Configurable |
-| PROXY protocol | Yes (v1/v2) | Yes (v1/v2) |
+| PROXY protocol | Yes (v1) | Yes (v1/v2) |
 | Service discovery | DNS SRV, Consul | SRV, A/AAAA |
-| Load balancing | 12 algorithms | 12+ algorithms |
+| Load balancing | 7 algorithms | 12+ algorithms |
 | WAF | Built-in (OWASP, SQLi, XSS) | Community module |
 | DDoS protection | Built-in | No |
 | gRPC proxy | Yes | Yes |

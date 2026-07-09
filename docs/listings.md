@@ -1,6 +1,6 @@
 # Listings
 
-*Last modified: 2026-05-15*
+*Last modified: 2026-07-09*
 
 A `Listing` is a published, versioned view of an existing Resource (an
 origin, an MCP server, or a docs surface). Listings live in the same
@@ -189,10 +189,19 @@ finding the next time `sbproxy plan` runs against the Repo.
   future Catalog projection (out of scope here). The shape lands here
   so projections can read from a stable Listing surface when the
   work starts.
-- **Agent-skills**: a per-Listing extension lets a Listing publish
-  skill manifests scoped to its surface. The schema reserves space
-  for `spec.skills[]` so the follow-up can land without a breaking
-  change here.
+- **Agent-skills**: `spec.skills[]` is shipped. Each entry mirrors
+  the top-level `agent_skills:` block (`name`, `type`, `description`,
+  `url`, optional `visibility`), and the projection layer serves the
+  per-Listing manifest at
+  `/.well-known/agent-skills/<listing-name>/index.json` plus a
+  Catalog-wide union at `/.well-known/agent-skills/index.json`.
+  Plan-time validation enforces four rules:
+  `listing-skill-bad-type` (type must be `skill-md` or `archive`),
+  `listing-skill-url-out-of-tree` (url must be fully-qualified or
+  resolve under `skills/` in the Repo),
+  `duplicate-listing-skill-name` (names unique within one Listing),
+  and `unknown-listing-skill-visibility` (warns unless `public` or
+  `authenticated`).
 
 ## Example
 

@@ -7,8 +7,10 @@
 # result. The proxy emits two Prometheus counters partitioned by
 # waste class:
 #
-#   sbproxy_ai_wasted_tokens_total{kind, provider, model, project, team}
-#   sbproxy_ai_wasted_cost_dollars_total{kind, provider, model, project, team}
+#   sbproxy_ai_wasted_tokens_total{kind, provider, model, surface,
+#     project, feature, team, agent_type, environment}
+#   sbproxy_ai_wasted_cost_dollars_total{kind, provider, model, surface,
+#     project, feature, team, agent_type, environment}
 #
 # Waste classes (the `kind` label):
 #
@@ -46,8 +48,8 @@
 #   curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' \
 #     -H "Authorization: Bearer ${ANTHROPIC_API_KEY}" -d "$PAYLOAD" | head -c 80
 #
-# Read the waste counters off the metrics endpoint:
-#   curl -s http://127.0.0.1:9090/metrics | grep -E "^sbproxy_ai_wasted"
+# Read the waste counters off the data-plane metrics endpoint:
+#   curl -s http://127.0.0.1:8080/metrics | grep -E "^sbproxy_ai_wasted"
 #
 # Expected:
 #   sbproxy_ai_wasted_tokens_total{kind="duplicate_request",...} > 0

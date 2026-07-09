@@ -45,7 +45,7 @@ origins:
         mitigation:
           block_duration: 10s
           auto_block: true
-        # IPs and CIDRs that bypass the check entirely.
+        # IPs and CIDRs that bypass the check entirely. 127.0.0.1 is
+        # deliberately NOT listed: local curls must be able to trip the demo.
         whitelist:
-          - 127.0.0.1
           - 10.0.0.0/8

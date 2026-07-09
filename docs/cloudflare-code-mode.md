@@ -1,5 +1,5 @@
 # Cloudflare Code Mode
-*Last modified: 2026-05-15*
+*Last modified: 2026-07-09*
 
 SBproxy can emit a typed TypeScript module covering every tool in the
 MCP federation registry. Agents written against the [Cloudflare Code
@@ -80,20 +80,26 @@ contain non-identifier characters are emitted as string-quoted keys
 
 ## Streaming tools
 
-Streaming MCP tools are out of scope for the initial emission. The
-runtime stub posts and waits for a JSON response. A follow-up will
-emit `AsyncIterable<T>`-typed signatures and add server-sent-event
-plumbing to the stub.
+A tool the federation registry marks as streaming is emitted with an
+`AsyncIterable<Output>` signature instead of a `Promise`, backed by a
+`__codemode_call_stream` helper in the runtime stub, so the agent can
+write `for await (const chunk of codemode.tool(input))`. The helper
+consumes the upstream as server-sent events (one JSON object per
+`data:` line) or newline-delimited JSON (`application/x-ndjson`),
+yields each parsed chunk, and rejects on transport error. The
+streaming helper is only appended when the catalog actually contains
+a streaming tool, so a module with none stays as small as before.
 
 ## HTTP endpoint
 
-Serving the module over HTTP at a well-known URL is the natural next
-step. The current PR ships the emitter as a library function on the
-federation registry so any HTTP wiring layer can hand the bytes
-through to the client. A future ticket will land the
-`/.well-known/mcp/codemode.ts` route on the proxy itself, with
-caching, Etag, and workspace + RBAC filtering wired against the
-same predicates the existing agent-skills endpoint uses.
+The proxy serves the module itself: `GET
+/.well-known/mcp/codemode.ts` on an MCP gateway origin returns the
+emitted TypeScript with `content-type: text/typescript`. The response
+carries a strong `ETag` (the SHA-256 of the emitted bytes) and
+`Cache-Control: max-age=60, must-revalidate`; a request whose
+`If-None-Match` matches gets a `304 Not Modified` with no body.
+Emission and hashing are cached against the registry generation, so
+the ETag stays stable until the tool catalog changes.
 
 ## References
 

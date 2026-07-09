@@ -141,6 +141,5 @@ mock exists so:
 
 ## Related docs
 
-- `docs/ai-crawl-control.md` - feature reference for the `ai_crawl_control` policy.
--  - HTTP ledger wire shape (the mock honours its happy-path response).
+- `docs/ai-crawl-control.md` - feature reference for the `ai_crawl_control` policy, including the HTTP ledger redeem envelope (the mock honours its happy-path response).
 - `examples/ai-crawl-control/` - simpler single-tier counterpart of this bundle.

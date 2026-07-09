@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-09*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -15,13 +15,13 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 
 | Dependency | When down | Fallback | Recovery | Metrics |
 |---|---|---|---|---|
-| Upstream target (`proxy` or `load_balancer`) | Connection error / timeout | Active health checks + outlier detection + circuit breaker eject the target. Retries pick the next healthy peer. With every target ejected, the LB falls back to the unfiltered list rather than 502'ing the client. | Auto on next probe success / breaker recovery window | `sbproxy_requests_total{status}`, `sbproxy_origin_errors_total` |
+| Upstream target (`proxy` or `load_balancer`) | Connection error / timeout | Active health checks + outlier detection + circuit breaker eject the target. Retries pick the next healthy peer. With every target ejected, the LB falls back to the unfiltered list rather than 502'ing the client. | Auto on next probe success / breaker recovery window | `sbproxy_requests_total{status}`, `sbproxy_origin_requests_total{origin,method,status}` |
 | AI provider (OpenAI, Anthropic, OpenRouter, ...) | 5xx, timeout, rate-limit | Routing strategy picks the next provider in the chain (`fallback_chain` / `cost_optimized`). All-providers-failed returns 502. | Auto on next successful request | `sbproxy_ai_failovers_total`, `sbproxy_ai_provider_errors_total` |
-| Redis (`proxy.l2_cache_settings`) | Connection / command failure | Per-origin in-memory cache and per-process rate-limit counters take over. Cross-replica state is suspended until reconnect. | Auto-reconnect with exponential backoff | `sbproxy_redis_connection_errors_total` |
-| ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m → 24h) | `sbproxy_acme_errors_total` |
-| Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | `sbproxy_dns_resolver_errors_total` |
-| Vault / secrets backend (`proxy.secrets`) | Fetch fails | Secrets resolved at config-load are cached and reused. New rotation calls fail loudly. | Auto-reconnect, re-fetch on recover | `sbproxy_secrets_errors_total` |
-| Webhook receivers (`on_request` / `on_response` / alerting) | Send fails | Webhook delivery is fire-and-forget by design. A failed POST is logged at WARN; the request itself is not affected. | None needed; next event tries again | `sbproxy_webhook_failures_total` |
+| Redis (`proxy.l2_cache_settings`) | Connection / command failure | Per-origin in-memory cache and per-process rate-limit counters take over. Cross-replica state is suspended until reconnect. | Auto-reconnect with exponential backoff | None dedicated; the L2 cache path logs connection and command errors |
+| ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
+| Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None dedicated; resolver failures are logged at WARN |
+| Vault / secrets backend (`proxy.secrets`) | Fetch fails | Secrets resolved at config-load are cached and reused. New rotation calls fail loudly. | Auto-reconnect, re-fetch on recover | `sbproxy_vault_resolution_total{backend,result}` |
+| Webhook receivers (`on_request` / `on_response` / alerting) | Send fails | Webhook delivery is fire-and-forget by design. A failed POST is logged at WARN; the request itself is not affected. | None needed; next event tries again | `sbproxy_outbound_webhook_attempts_total{result}` |
 
 ## Detailed reference
 
@@ -134,7 +134,7 @@ proxy:
 
 **When down:** ACME directory or order requests fail.
 
-**Fallback:** existing certificates keep serving. If the listener has no cert at all (fresh boot, ACME never succeeded), a self-signed bootstrap cert is generated so the HTTPS listener can come up; ACME replaces it with a real cert once issuance succeeds. Renewal failures are retried with exponential backoff (1 minute → 24 hours).
+**Fallback:** existing certificates keep serving. If the listener has no cert at all (fresh boot, ACME never succeeded), a self-signed bootstrap cert is generated so the HTTPS listener can come up; ACME replaces it with a real cert once issuance succeeds. Renewal failures are retried with exponential backoff (1 minute to 24 hours). Attempts and outcomes are counted in `sbproxy_acme_renewals_total{result}`.
 
 **Log level:** `WARN` per renewal failure with time-to-expiry, `ERROR` if the active cert has expired.
 

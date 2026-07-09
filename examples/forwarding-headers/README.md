@@ -1,6 +1,6 @@
 # Forwarding headers
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Forwarding headers](../../docs/assets/forwarding-headers.gif)
 
@@ -15,21 +15,25 @@ sbproxy serve -f sb.yml
 ## Try it
 
 ```bash
-# httpbin echoes the headers it received. Note that Via and X-Forwarded-Port
-# are missing while the rest of the forwarding family is present.
+# The echo service returns the headers it received (keys are lowercase).
+# Note that via and x-forwarded-port are missing while the rest of the
+# forwarding family is present. The hosted echo runs behind a CDN that
+# rewrites x-forwarded-for and friends with its own values, so the exact
+# values differ from what the proxy injected; point the config at a
+# backend you run yourself to see the raw injected values.
 curl -s -H 'Host: localhost' http://127.0.0.1:8080/headers | jq .headers
 # {
-#   "Forwarded": "for=127.0.0.1;host=localhost;proto=http",
-#   "Host": "test.sbproxy.dev",
-#   "X-Forwarded-For": "127.0.0.1",
-#   "X-Forwarded-Host": "localhost",
-#   "X-Forwarded-Proto": "http",
-#   "X-Real-Ip": "127.0.0.1"
+#   "host": "test.sbproxy.dev",
+#   "forwarded": "...",
+#   "x-forwarded-for": "...",
+#   "x-forwarded-host": "...",
+#   "x-forwarded-proto": "https",
+#   "x-real-ip": "..."
 #   ...
 # }
 
 # Verify the absence of the disabled headers explicitly.
-curl -s -H 'Host: localhost' http://127.0.0.1:8080/headers | jq '.headers | has("Via"), has("X-Forwarded-Port")'
+curl -s -H 'Host: localhost' http://127.0.0.1:8080/headers | jq '.headers | has("via"), has("x-forwarded-port")'
 # false
 # false
 ```

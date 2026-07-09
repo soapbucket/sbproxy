@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -48,7 +48,7 @@ proxy:
 ```
 
 When `enabled` is false (the default) the block is inert and inbound auth keeps
-using the compiled `virtual_keys:` list.
+using the compiled `credentials:` blocks.
 
 ## Store backends
 
@@ -214,9 +214,10 @@ the mesh counters.
 
 - **Model and provider access:** `allowed_models`, `blocked_models`,
   `allowed_providers`. Empty allow-lists mean "all".
-- **Rate and budget:** `max_requests_per_minute`, `max_tokens_per_minute`, and a
-  `budget` with `max_tokens` and `max_cost_usd`. Budgets reconcile with the
-  multi-window budgets in the AI gateway.
+- **Rate and budget:** `max_requests_per_minute` and a `budget` with
+  `max_tokens` and `max_cost_usd`. There is no per-key tokens-per-minute field;
+  token ceilings are budget totals. Budgets reconcile with the multi-window
+  budgets in the AI gateway.
 - **Lifecycle:** `status` (active, blocked, revoked) and `expires_at`.
 - **Guardrails:** `require_pii_redaction` lists redaction rules that must be
   active before the key can dispatch; `bypass_prompt_injection` skips the
@@ -232,8 +233,12 @@ the mesh counters.
 - **Attribution:** `project`, `user`, `tenant_id`, `tags`, and `metadata` flow
   to the access log and cost reports.
 
-Set any of these at mint time, with `PATCH /admin/keys/{id}` at runtime, or in a
-seed key. For example:
+Set any of these at mint time or with `PATCH /admin/keys/{id}` at runtime. Seed
+keys accept a subset with slightly different names: the budget caps are the flat
+fields `max_budget_tokens` and `max_budget_usd` rather than a `budget` object,
+tenant attribution is `tenant`, and `tags`, `metadata`, and `status` are not
+seedable (a seeded key is always active; manage lifecycle through the API). For
+example:
 
 ```bash
 curl -s -u admin:change-me -X PATCH http://127.0.0.1:9090/admin/keys/ab12cd34 \
@@ -266,14 +271,14 @@ matching the bearer path.
 
 ## Migrating from static credentials
 
-You do not have to move everything at once. The static `credentials:` and
-`virtual_keys:` blocks keep working and lower into the same store as
-config-sourced records. To migrate a key:
+You do not have to move everything at once. The static `credentials:` blocks
+keep working and lower into the same store as config-sourced records. To
+migrate a key:
 
 1. Enable `key_management:` with a stable `pepper` and a store backend.
 2. Move the key into `key_management.seed.keys` (or mint a fresh one through the
    API and hand the new token to the client).
-3. Remove it from `virtual_keys:` once the client uses the new token.
+3. Remove it from `credentials:` once the client uses the new token.
 
 Config-seeded records are authoritative on reload: they are re-applied every time
 the config is reloaded, so the file stays the source of truth. Set
@@ -285,23 +290,27 @@ survive a reload instead.
 For a self-contained config, declare keys and credentials inline. A seed key
 takes either a `secret` (hashed at boot) or a precomputed `secret_hash`.
 
+The `key_management:` block nests under `proxy:`; a top-level `key_management:`
+key is silently dropped with a warning and the feature stays off.
+
 ```yaml
-key_management:
-  enabled: true
-  crypto:
-    pepper: env:SBPROXY_KEY_PEPPER
-    master_key: env:SBPROXY_KEY_MASTER
-  seed:
-    keys:
-      - key_id: ci0001
-        secret: rotate-me-in-production
-        name: ci-runner
-        max_requests_per_minute: 60
-        allowed_models: [gpt-4o-mini]
-    credentials:
-      - id: openai-prod
-        provider: openai
-        vault_ref: vault://openai
+proxy:
+  key_management:
+    enabled: true
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+    seed:
+      keys:
+        - key_id: ci0001
+          secret: rotate-me-in-production
+          name: ci-runner
+          max_requests_per_minute: 60
+          allowed_models: [gpt-4o-mini]
+      credentials:
+        - id: openai-prod
+          provider: openai
+          vault_ref: vault://openai
 ```
 
 See the runnable `examples/ai-dynamic-keys/` config for the full setup.
