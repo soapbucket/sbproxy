@@ -76,6 +76,55 @@ impl JailbreakGuardrail {
 
         None
     }
+
+    /// Longest pattern this guard can match, in bytes. Sizes the
+    /// streaming session's rolling tail window (WOR-1810).
+    pub(crate) fn max_pattern_len(&self) -> usize {
+        let common = if self.detect_common {
+            COMMON_JAILBREAK_PATTERNS
+                .iter()
+                .map(|p| p.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let custom = self
+            .custom_patterns
+            .iter()
+            .map(|p| p.len())
+            .max()
+            .unwrap_or(0);
+        common.max(custom)
+    }
+}
+
+/// True when the DAN standalone-word rule fires ONLY because of
+/// occurrences that touch the very end of `lower`. The word-boundary
+/// check treats end-of-input as non-alphabetic, so a text ending in
+/// "...dan" fires even though the next streamed delta may extend the
+/// word ("dan" + "iel"). The streaming session defers exactly this
+/// case to the next delta or stream close (WOR-1810).
+pub(crate) fn dan_only_at_end(lower: &str) -> bool {
+    let mut fired = false;
+    for (i, _) in lower.match_indices("dan") {
+        let before = if i > 0 { lower.as_bytes()[i - 1] } else { b' ' };
+        let after_idx = i + 3;
+        let after = if after_idx < lower.len() {
+            lower.as_bytes()[after_idx]
+        } else {
+            b' '
+        };
+        if !before.is_ascii_alphabetic() && !after.is_ascii_alphabetic() {
+            fired = true;
+            if after_idx < lower.len() {
+                // An accepting occurrence with real text after it is a
+                // settled standalone word: no deferral.
+                return false;
+            }
+        }
+    }
+    fired
 }
 
 /// Check if content contains "DAN" as a standalone reference (not part of names like "Daniel").
@@ -182,5 +231,21 @@ mod tests {
         let guard: JailbreakGuardrail = serde_json::from_value(json).unwrap();
         assert!(guard.detect_common);
         assert!(guard.custom_patterns.is_empty());
+    }
+
+    #[test]
+    fn dan_only_at_end_discriminates_boundary_cases() {
+        // Fires only at the end: deferral candidate.
+        assert!(dan_only_at_end("engage dan"));
+        assert!(dan_only_at_end("dan"));
+        // Settled mid-text occurrence: no deferral, real block.
+        assert!(!dan_only_at_end("dan mode engaged"));
+        // Fires at end AND mid-text: the mid-text one settles it.
+        assert!(!dan_only_at_end("dan says hi to dan"));
+        // Never fires at all (word continues / preceded by letter).
+        assert!(!dan_only_at_end("daniel"));
+        assert!(!dan_only_at_end("ramadan feast"));
+        // "ramadan" ends the text: before is alphabetic, so no fire.
+        assert!(!dan_only_at_end("ramadan"));
     }
 }

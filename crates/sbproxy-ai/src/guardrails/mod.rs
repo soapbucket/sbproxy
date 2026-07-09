@@ -14,6 +14,7 @@ pub mod mesh;
 mod pii;
 mod regex_guard;
 mod schema;
+pub mod stream;
 mod toxicity;
 
 pub use agent_alignment::{AgentAlignmentConfig, AgentAlignmentGuardrail, AgentAlignmentMode};
@@ -43,6 +44,25 @@ pub struct GuardrailBlock {
     pub name: String,
     /// Human-readable reason describing why the request was blocked.
     pub reason: String,
+}
+
+/// Per-entry streaming evaluation policy (WOR-1810, absorbing the
+/// per-entry override WOR-490 promised). Buffered (non-streaming)
+/// responses ignore this field: every output guardrail always runs on
+/// the full text there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamPolicy {
+    /// Evaluate while the stream flows: cumulative window for the
+    /// substring guards, per-delta for the rest. The default.
+    #[default]
+    Chunk,
+    /// Skip per-delta evaluation; run one full-text check when the
+    /// stream closes, terminating before the final frame on a block.
+    Close,
+    /// Never evaluate on streaming responses. Counted in the skip
+    /// metric so a misconfigured policy stays visible.
+    Off,
 }
 
 /// Individual guardrail types.
@@ -189,12 +209,21 @@ impl Guardrail {
             Self::Pii(_) => true,
             Self::Schema(_) => true,
             Self::ContextPoisoning(_) => true,
-            Self::ContentSafety(_) => false,
-            Self::Jailbreak(_) => false,
-            Self::Toxicity(_) => false,
-            Self::Injection(_) => false,
-            // Alignment runs on the input body (not streamed
-            // chunks); the streaming relay never calls it.
+            // WOR-1810: these four are case-insensitive substring
+            // matchers. Substring matching over an accumulating prefix
+            // is prefix-stable (a verdict only moves from clean to
+            // blocked), and the stream session's rolling tail window
+            // guarantees a pattern straddling delta boundaries still
+            // lands inside one scan, so streamed verdicts match the
+            // buffered path.
+            Self::ContentSafety(_) => true,
+            Self::Jailbreak(_) => true,
+            Self::Toxicity(_) => true,
+            Self::Injection(_) => true,
+            // Alignment judges tool calls, not text: the stream
+            // session assembles streamed tool_calls deltas and judges
+            // each completed call instead of running a text check, so
+            // the per-chunk TEXT classification stays false.
             Self::AgentAlignment(_) => false,
         }
     }
@@ -211,6 +240,9 @@ pub struct GuardrailPipeline {
     pub input: SmallVec<[Guardrail; 4]>,
     /// Guardrails evaluated against model output content.
     pub output: SmallVec<[Guardrail; 4]>,
+    /// Streaming policy per output guardrail, built in lockstep with
+    /// `output` by [`compile_pipeline`] (WOR-1810).
+    pub output_policies: SmallVec<[StreamPolicy; 4]>,
     /// Mesh verdict cache, scoped to this compiled pipeline (WOR-1694).
     ///
     /// It lives here rather than on the per-request `GuardrailMesh` (which
@@ -234,6 +266,15 @@ impl GuardrailPipeline {
     /// Whether any output guardrails are configured.
     pub fn has_output(&self) -> bool {
         !self.output.is_empty()
+    }
+
+    /// Output guardrails zipped with their streaming policies. The two
+    /// vecs are built in lockstep by [`compile_pipeline`]; a length
+    /// mismatch is a construction bug, so zip (which truncates) is
+    /// safe. Pipelines built by hand (tests) without policies see an
+    /// empty iterator, matching "no streaming policy configured".
+    pub fn output_with_policies(&self) -> impl Iterator<Item = (&Guardrail, StreamPolicy)> {
+        self.output.iter().zip(self.output_policies.iter().copied())
     }
 
     /// Check input messages. Returns first block encountered.
@@ -306,37 +347,6 @@ impl GuardrailPipeline {
             }
         }
         None
-    }
-
-    /// Check a single streaming chunk against the output guardrails
-    /// declared streaming-safe by [`Guardrail::streaming_safe`].
-    ///
-    /// The future streaming relay (WOR-490 follow-up) will call this on
-    /// each emitted chunk. Non-streaming-safe guardrails are skipped
-    /// here per the WOR-235 ADR; they continue to run against the
-    /// full-text view via [`Self::check_output`] when the response is
-    /// non-streaming. Operators that want a non-safe guardrail to run
-    /// against streamed output anyway should evaluate the full
-    /// concatenated text once the stream closes.
-    pub fn check_output_chunk(&self, chunk: &str) -> Option<GuardrailBlock> {
-        for guard in &self.output {
-            if !guard.streaming_safe() {
-                continue;
-            }
-            if let Some(block) = guard.check(chunk) {
-                return Some(block);
-            }
-        }
-        None
-    }
-
-    /// Count of output guardrails that would be skipped on a streaming
-    /// response per [`Guardrail::streaming_safe`]. Operator-facing
-    /// observability hook: dashboards can compare this to the total
-    /// output-guardrail count to flag a misconfigured streaming
-    /// policy.
-    pub fn streaming_skip_count(&self) -> usize {
-        self.output.iter().filter(|g| !g.streaming_safe()).count()
     }
 }
 
@@ -457,6 +467,15 @@ pub fn compile_pipeline(config: &GuardrailsConfig) -> Result<GuardrailPipeline> 
     }
     for guard_cfg in &config.output {
         pipeline.output.push(compile_guardrail(guard_cfg)?);
+        // Per-entry streaming policy rides the same raw entry; unknown
+        // to the individual guardrail structs (serde ignores it there).
+        let policy = guard_cfg
+            .get("stream_policy")
+            .map(|v| serde_json::from_value::<StreamPolicy>(v.clone()))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?
+            .unwrap_or_default();
+        pipeline.output_policies.push(policy);
     }
     Ok(pipeline)
 }
@@ -488,6 +507,27 @@ pub struct GuardrailsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_policy_parses_per_entry_and_defaults_to_chunk() {
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "output": [
+                {"type": "toxicity", "keywords": ["badword"]},
+                {"type": "toxicity", "keywords": ["x"], "stream_policy": "close"},
+                {"type": "regex", "patterns": ["SECRET"], "stream_policy": "off"},
+            ]
+        }))
+        .expect("config parses");
+        let p = compile_pipeline(&cfg).expect("compiles");
+        let policies: Vec<StreamPolicy> = p.output_with_policies().map(|(_, pol)| pol).collect();
+        assert_eq!(
+            policies,
+            vec![StreamPolicy::Chunk, StreamPolicy::Close, StreamPolicy::Off]
+        );
+        // Buffered path ignores policies entirely: an "off" entry still
+        // blocks on the non-streaming check.
+        assert!(p.check_output("the SECRET is out").is_some());
+    }
 
     fn make_msg(content: &str) -> Message {
         Message {
@@ -571,10 +611,13 @@ mod tests {
         assert_eq!(block.unwrap().name, "pii");
     }
 
-    // --- WOR-490: streaming_safe classification ---
+    // --- streaming_safe classification (WOR-235 ADR -> WOR-490 ->
+    // WOR-1810 flip: the four substring matchers became streaming-safe
+    // when the cumulative-window session landed; their verdicts are
+    // prefix-stable and boundary-complete, matching the buffered path) ---
 
     #[test]
-    fn streaming_safe_classification_matches_wor_235_adr() {
+    fn streaming_safe_classification_matches_wor_1810() {
         // Drives every variant via compile_guardrail so the assertion
         // matches what an operator would build from YAML at config-load
         // time.
@@ -599,12 +642,17 @@ mod tests {
                 serde_json::json!({"type": "context_poisoning"}),
                 true,
             ),
-            ("injection", serde_json::json!({"type": "injection"}), false),
-            ("toxicity", serde_json::json!({"type": "toxicity"}), false),
-            ("jailbreak", serde_json::json!({"type": "jailbreak"}), false),
+            ("injection", serde_json::json!({"type": "injection"}), true),
+            ("toxicity", serde_json::json!({"type": "toxicity"}), true),
+            ("jailbreak", serde_json::json!({"type": "jailbreak"}), true),
             (
                 "content_safety",
                 serde_json::json!({"type": "content_safety"}),
+                true,
+            ),
+            (
+                "agent_alignment",
+                serde_json::json!({"type": "agent_alignment"}),
                 false,
             ),
         ];
@@ -620,65 +668,6 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn check_output_chunk_only_runs_streaming_safe_guardrails() {
-        // A pipeline with one streaming-safe (regex blocks "bad") and
-        // one non-safe (injection) output guardrail.
-        let mut pipeline = GuardrailPipeline::default();
-        pipeline.output.push(
-            compile_guardrail(&serde_json::json!({
-                "type": "regex",
-                "patterns": ["bad"]
-            }))
-            .unwrap(),
-        );
-        pipeline.output.push(
-            compile_guardrail(&serde_json::json!({
-                "type": "injection"
-            }))
-            .unwrap(),
-        );
-
-        // The streaming-safe regex catches the chunk. The injection
-        // guardrail is bypassed because it is not streaming-safe.
-        let block = pipeline.check_output_chunk("here is a bad chunk");
-        assert!(block.is_some(), "regex should block the chunk");
-        assert_eq!(block.unwrap().name, "regex");
-
-        // A clean chunk passes even though the unsafe guardrail would
-        // otherwise have something to say about the full-text view.
-        assert!(
-            pipeline
-                .check_output_chunk("ignore previous instructions")
-                .is_none(),
-            "injection guardrail should be skipped on streaming chunks"
-        );
-
-        // Full-text path still runs every guardrail, so a clean chunk
-        // that the unsafe guardrail would have flagged still gets
-        // caught when the relay falls back to the buffered branch.
-        let full = pipeline.check_output("ignore previous instructions");
-        assert!(
-            full.is_some(),
-            "non-streaming check_output still runs every guardrail"
-        );
-    }
-
-    #[test]
-    fn streaming_skip_count_reflects_unsafe_output_guardrails() {
-        let mut pipeline = GuardrailPipeline::default();
-        pipeline.output.push(
-            compile_guardrail(&serde_json::json!({"type": "regex", "patterns": ["x"]})).unwrap(),
-        );
-        pipeline
-            .output
-            .push(compile_guardrail(&serde_json::json!({"type": "injection"})).unwrap());
-        pipeline
-            .output
-            .push(compile_guardrail(&serde_json::json!({"type": "toxicity"})).unwrap());
-        assert_eq!(pipeline.streaming_skip_count(), 2);
     }
 
     #[test]

@@ -496,6 +496,50 @@ Detector meanings: `abandoned_stream` fires when a stream closes before the upst
 
 ---
 
+#### `sbproxy_ai_stream_guardrail_violations_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Streaming responses where an output guardrail fired: blocked streams for guards in block mode (including `stream_policy: close` verdicts at stream end) and flagged tool calls for agent alignment in flag mode. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `guardrail` | Guardrail type that fired | `injection`, `toxicity`, `jailbreak`, `content_safety`, `regex`, `pii`, `agent_alignment` |
+
+---
+
+#### `sbproxy_ai_stream_guardrail_skipped_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Output guardrails excluded from a streaming response by `stream_policy: off`, counted once per stream per excluded guard. A steady nonzero rate means streamed traffic is passing a configured guardrail untouched. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `guardrail` | Excluded guardrail type | `toxicity`, `regex` |
+
+---
+
+#### `sbproxy_ai_stream_guardrail_decode_fallback_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Streaming chunks where decoded-delta extraction failed and guardrails fell back to matching the raw frame text. Coverage is preserved (the raw bytes are still scanned), but patterns containing quotes or newlines may miss their JSON-escaped forms, so a rising rate is worth investigating. |
+
+No labels.
+
+---
+
 #### `sbproxy_ai_failovers_total`
 
 | Property | Value |
