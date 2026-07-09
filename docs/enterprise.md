@@ -1,5 +1,5 @@
 # Enterprise
-*Last modified: 2026-06-25*
+*Last modified: 2026-07-09*
 
 What's in OSS, what the enterprise tier adds, and how to talk to us
 about it.
@@ -27,10 +27,11 @@ None of them are required to use SBproxy in production.
 
 The clustering substrate itself (gossip mesh, consistent-hash routing,
 leader election, federation, five service-discovery providers, and the
-distributed cache) is open source in `sbproxy-mesh`. The enterprise tier
-adds the semantic layer on top: a cluster-distributed semantic cache with
-LSH-bucketed embeddings, cluster-wide purge propagation, and per-origin
-and per-model TTL layering.
+distributed cache) is open source in `sbproxy-mesh`, and the single-node
+semantic cache ships in the OSS AI gateway. The enterprise tier adds the
+cluster-distributed layer: LSH-bucketed embeddings shared across the
+cluster, cluster-wide purge propagation, and per-origin and per-model
+TTL layering.
 
 ### Regulated-enterprise auth
 
@@ -42,9 +43,10 @@ and Postgres.
 
 ### Vendor guardrail integrations
 
-Aporia, Azure Content Safety, Bedrock Guardrails, CrowdStrike, Lakera,
-Mistral, Model Armor, Pangea, and Patronus. Plus the first-party
-guardrails that already ship in OSS.
+Azure Content Safety, Bedrock Guardrails, CrowdStrike, Mistral, Model
+Armor, Pangea, and Patronus. OSS already ships the first-party
+guardrails plus external-guardrail adapters for Lakera, Aporia, and any
+generic HTTP verdict endpoint.
 
 ### Evaluation runtime
 
@@ -79,11 +81,13 @@ in `sb.yml` is unchanged across enterprise backends; only the
 settlement code differs. See [`402-challenge.md`](402-challenge.md) for
 the wire-format contract that splits across the OSS / enterprise line.
 
-### Operations layer
+### Support
 
-Kubernetes operator with full CRDs. Classifier sidecar (gRPC embed and
-classify). GPU-aware and LoRA-aware routing. Bandit routing. Named
-support contact, SLA, security review, and onboarding.
+Named support contact, SLA, security review, and onboarding. The
+operational machinery itself is open source: the Kubernetes operator
+and CRDs (`crates/sbproxy-k8s-operator`, `deploy/crds`), the classifier
+sidecar (`crates/sbproxy-classifier-sidecar`), and the GPU-aware,
+LoRA-aware, and bandit routing strategies all ship in this repository.
 
 ## Extension points OSS exposes
 

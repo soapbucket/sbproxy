@@ -636,6 +636,23 @@ impl AiHandlerConfig {
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
+            // WOR-1818: an unresolved `${VAR}` left by env interpolation
+            // would reach the wire verbatim as a bearer token and read as
+            // a provider auth outage at request time. Fail at config load
+            // with the variable name instead.
+            if let Some(key) = &provider.api_key {
+                if let (Some(start), Some(end)) = (key.find("${"), key.find('}')) {
+                    if end > start {
+                        return Err(anyhow::anyhow!(
+                            "ai provider {:?}: api_key contains the unresolved reference \
+                             `{}`; export the environment variable before starting, or \
+                             use a secret:// / vault:// reference.",
+                            provider.name,
+                            &key[start..=end]
+                        ));
+                    }
+                }
+            }
             // WOR-1683/1684/1681: validate a serve: block (unique model
             // names, no nameless raw refs, parseable keep_alive, pinned
             // container images) at config load so a bad local-serving

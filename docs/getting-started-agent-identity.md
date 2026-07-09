@@ -1,6 +1,6 @@
 # Getting started: Agent identity issuance and enforcement
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 ## What you will build
 
@@ -33,7 +33,7 @@ The same `serve -f <config>` form works for the Docker image (`ghcr.io/soapbucke
 Save this as `sb.yml`. The `bot_auth` provider is the enforcement side: it verifies signed agents against the inline `agents` directory. The `web_bot_auth_publish` block is the issuance side: it serves SBproxy's own signing-key directory so verifiers can discover the key SBproxy signs outbound requests with.
 
 ```yaml
-# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
 proxy:
   http_bind_port: 8080
 

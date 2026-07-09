@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-09*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -172,15 +172,18 @@ processors:
     send_batch_size: 1024
 
 exporters:
-  loki:
-    endpoint: http://loki:3100/loki/api/v1/push
+  # Loki 3.x accepts native OTLP at /otlp; no Promtail or Fluent Bit needed.
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
 
 service:
   pipelines:
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [loki]
+      exporters: [otlphttp/loki]
 ```
 
 Operators that already run an OTel Collector for traces can add the `logs` pipeline above and point the proxy's OTLP-logs sink at the same endpoint. The batch processor in the sink keeps the proxy's hot path non-blocking; flushes happen on SIGHUP and on shutdown.
@@ -219,13 +222,12 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 
 | Metric family | Cardinality cap | Notes |
 |---|---|---|
-| `sbproxy_requests_total` | 50 000 | Labels: `route`, `status_class`, `agent_class`, `rail`, `tenant_id`. `agent_id` is NOT a label here. |
-| `sbproxy_request_duration_seconds_bucket` | 100 000 | Same labels plus 10 buckets. |
-| `sbproxy_policy_triggers_total` | 20 000 | Labels: `policy`, `decision`, `route`, `tenant_id`. |
-| `sbproxy_ledger_redeem_total` | 5 000 | Labels: `result`, `tenant_id`. |
-| `sbproxy_ledger_redeem_duration_seconds_bucket` | 10 000 | Plus buckets. |
-| `sbproxy_outbound_request_total` | 30 000 | Labels: `target`, `result`, `tenant_id`. `target` is enum-bounded. |
-| `sbproxy_audit_emit_total` | 5 000 | Labels: `result`, `tenant_id`. |
+| `sbproxy_requests_total` | 50 000 | Labels: `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape`. `agent_id` is the sanitized registry id, never a raw UA-derived value. |
+| `sbproxy_request_duration_seconds_bucket` | 100 000 | Labelled by `hostname`, plus buckets. |
+| `sbproxy_policy_triggers_total` | 20 000 | Labels: `origin`, `policy_type`, `action`, `agent_id`, `agent_class`. |
+| `sbproxy_ledger_redeem_duration_seconds_bucket` | 10 000 | Labels: `host`, `outcome`, plus buckets. There is no separate `_total` counter; derive counts from the histogram's `_count` series. |
+| `sbproxy_outbound_request_duration_seconds_bucket` | 30 000 | Labels: `host`, `method`, `status`, plus buckets. There is no separate `_total` counter. |
+| `sbproxy_audit_emit_duration_seconds_bucket` | 5 000 | Labels: `channel`, `outcome`, plus buckets. There is no separate `_total` counter. |
 | `sbproxy_script_compile_total` | 12 | Labels: `engine` (cel\|lua\|js\|wasm), `result` (ok\|parse_error\|sandbox_reject). |
 | `sbproxy_script_invocations_total` | 20 | Same `engine`, plus `result` (ok\|runtime_error\|timeout\|memory_cap\|instruction_cap). |
 | `sbproxy_script_duration_seconds_bucket` | 52 | `engine` label only; histogram buckets 0.1ms..10s. |
@@ -265,7 +267,7 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_agent_detect_total` | 3 000 | Labels: `agent_id` (sanitised, empty when anonymous), `provenance` (signed\|unsigned-named\|unsigned-anonymous). Per-request agent-detect scorer verdicts. |
 | `sbproxy_agent_detect_score_bucket` | 11 | Histogram buckets over the 0-100 agent-detect score. No labels. |
 | `sbproxy_agent_detect_inference_seconds_bucket` | 9 | Histogram buckets 50us..10ms for in-process scorer latency. No labels. |
-| `sbproxy_object_authz_violations_total` | 200 | Labels: `origin`, `kind` (bola\|bfla\|tenant_mismatch). Counts BOLA / BFLA / cross-tenant violations the object-authz policy refused. |
+| `sbproxy_object_authz_violations_total` | 200 | Labels: `origin`, `kind` (bola\|bfla\|enumeration). Counts BOLA / BFLA / enumeration violations the object-authz policy refused. |
 | `sbproxy_waf_persistent_blocks_total` | 600 | Labels: `origin`, `event` (rule_match\|ip_blocklisted\|anomaly_threshold), `key_kind` (ip\|jwt_sub\|api_key\|session). Counts the WAF blocks that landed on the persistent (cross-process) blocklist as opposed to the in-process rate-limit decision path. |
 | `sbproxy_bot_auth_nonce_replay_total` | 50 | Labels: `policy` (sanitised). Counts requests rejected because the Web-Bot-Auth nonce was already seen within the replay window. |
 | `sbproxy_jwks_unknown_kid_refetch_total` | 6 | Labels: `result` (ok\|backend_error\|kid_still_missing). Counts on-demand JWKS refetches triggered by an unknown `kid` in a presented JWT. |
@@ -299,7 +301,7 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_ai_shadow_timeout_total` | 1 | Counter; shadow evaluations dropped because the per-eval timeout fired. |
 | `sbproxy_ai_token_estimate_error_ratio_bucket` | 200 | Labels: `model`; histogram buckets `(estimate - actual) / actual` between -1 and +1. Drives the pre-flight estimator's accuracy alert. |
 
-Hard rule: `agent_id`, `request_id`, `session_id`, and `user_id` are never label values on Prometheus metrics. They live as span attributes (under traces) and log fields (under logs).
+Hard rule: `request_id`, `session_id`, and `user_id` are never label values on Prometheus metrics; they live as span attributes (under traces) and log fields (under logs). `agent_id` IS a label, but only in its sanitized form: values are bounded to the agent-class registry plus the reserved sentinels, and anything outside that set demotes rather than minting a new series. Raw high-cardinality identifiers (a per-request UA string, an unregistered agent name) never become label values.
 
 When a budget is exhausted the offending label demotes to `__other__` and `sbproxy_label_cardinality_overflow_total` increments. The metric update still happens; a demoted bucket is preferable to a missing one because gaps look like real traffic dips.
 
@@ -330,7 +332,7 @@ Required when the line is request-scoped:
 
 | Field | Type | Notes |
 |---|---|---|
-| `request_id` | string (ULID) | Same value as `RequestEvent.request_id` |
+| `request_id` | string (32 lowercase hex, UUIDv7) | The proxy-minted correlation id described at the top of this page. Note the `RequestEvent` envelope's own `request_id` field is a ULID, a different format minted for that stream. |
 | `trace_id` | string (32 hex) | Current OTel trace id |
 | `span_id` | string (16 hex) | Current OTel span id |
 | `tenant_id` | string | Workspace id; `default` in OSS |
@@ -400,8 +402,11 @@ proxy:
                 pattern: 'acct-\d{6,12}'
             disable: [customer_uuid]   # opt out of a proxy-level rule
 origins:
-  - hostname: api.acme.example.com
+  "api.acme.example.com":
     tenant_id: acme-corp
+    action:
+      type: proxy
+      url: https://acme-upstream.internal
     observability:
       log:
         redact:
@@ -483,6 +488,21 @@ In this example, `hipaa-tenant` inherits `email + us_ssn` from the proxy, adds `
 An origin can author its own `pii:` block under `origins[hostname].observability.log.redact.pii`. The origin-scope block composes on top of the tenant-scope block (or the proxy-scope block when the origin has no `tenant_id`). The same inherit + extend + disable rules apply, one level deeper:
 
 ```yaml
+proxy:
+  observability:
+    log:
+      redact:
+        pii:
+          enabled: true
+          rules: [email, us_ssn]
+  tenants:
+    - id: hipaa-tenant
+      observability:
+        log:
+          redact:
+            pii:
+              rules: [hipaa_mrn, hipaa_patient_id]
+              disable: [phone_us]
 origins:
   "api.acme.example.com":
     tenant_id: hipaa-tenant
@@ -504,30 +524,34 @@ origins:
 * A scope that omits `enabled:` inherits the parent scope's flag. A scope that sets `enabled: false` explicitly opts out, even when the parent enables the pass.
 * The rule set inherits + extends + subtracts at each level: parent rules carry through, the child's `rules:` are added, the child's `disable:` is removed last.
 * Unknown rule names at any scope are warn-logged at startup and skipped. The install continues with the rest of the resolved set so an operator typo does not silently disable the whole pass.
-* The field-key denylist and regex masks under `proxy.observability.log.redact.fields:` / `patterns:` remain proxy-scope only today; they touch the rendered JSON, which is tenant-agnostic at the emitter.
 
 #### Reversible PII redaction (AI origins)
 
 Customer copilots and internal assistants need the LLM to personalise its response with the same value the user typed (the customer's name, order number, or email). A destructive redactor would replace that value with `[REDACTED:EMAIL]` on the way out, the LLM would echo the marker back, and the response would no longer feel personal. The reversible pass solves this: the request body is masked with a placeholder before forwarding upstream, the LLM responds with the placeholder echoed in its reply, and the gateway restores the original value before writing the response to the client. The original lives only in memory for the request lifetime; it is never written to access log, audit log, or trace span.
 
-Opt-in per rule via `reversible: true` on an AI origin's `pii:` block:
+Opt-in per rule via `reversible: true` on the `pii:` block, which sits inside the `ai_proxy` action (the same placement as [examples/pii-redaction/sb.yml](../examples/pii-redaction/sb.yml)):
 
 ```yaml
 origins:
-  - name: customer-copilot
-    action: ai_proxy
-    pii:
-      enabled: true
-      defaults: false
-      rules:
-        - name: email
-          pattern: '\b[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,255}\.[a-z]{2,63}\b'
-          reversible: true
-          mask_template: "<placeholder:email:%d>"
-        - name: credit_card
-          pattern: '\b\d(?:[ -]?\d){12,18}\b'
-          validator: luhn
-          reversible: false   # never restored; PCI scope
+  "copilot.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+      pii:
+        enabled: true
+        defaults: false
+        redact_request: true
+        rules:
+          - name: email
+            pattern: '\b[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,255}\.[a-z]{2,63}\b'
+            reversible: true
+            mask_template: "<placeholder:email:%d>"
+          - name: credit_card
+            pattern: '\b\d(?:[ -]?\d){12,18}\b'
+            validator: luhn
+            reversible: false   # never restored; PCI scope
 ```
 
 * `reversible: false` (default) is the destructive behaviour described above.
@@ -552,27 +576,12 @@ Reversible PII redaction and semantic caching cannot safely co-exist on the same
 
 The gateway resolves this at config validation: when an AI origin declares any `pii.rules[].reversible: true` AND a `semantic_cache:` block, the semantic cache is dropped from the compiled config and a warning is logged. The cache is silently disabled rather than rejected at config load so an operator who turns reversible PII on partway through a rollout does not break their config. Re-enable semantic caching by removing reversible from every rule on that origin, or by moving the reversible workload to a separate origin without a semantic cache.
 
-Two profiles ship in Wave 1:
+Two per-sink profiles ship, selected with the `profile:` field on a sink entry (see [Sinks](#sinks)):
 
 - **`internal`** applies the denylist above. Allows `agent_id`, `tenant_id`, JA3/JA4, request paths.
-- **`external`** applies the denylist plus extra redactions: JA3/JA4 fingerprints, raw query strings (replaced with path only), full URL (replaced with `route`), and User-Agent if tenant policy demands fingerprint redaction.
+- **`external`** applies the denylist plus extra redactions: JA3/JA4 fingerprints and raw query strings.
 
-A custom profile is a list of `RedactedField` plus path globs:
-
-```yaml
-observability:
-  log:
-    profiles:
-      gov_cloud:
-        deny:
-          - authorization
-          - stripe-secret-key
-          - prompt-body
-          - ja3-fingerprint
-          - ja4-fingerprint
-        deny_paths:
-          - "$.headers.x-internal-*"
-```
+These two names are the whole vocabulary today. Operator-defined named profiles (a `profiles:` block with custom deny lists and path globs) are a design idea, not a shipped key; a `profiles:` entry under `observability.log` is rejected at config compile as an unknown key. To extend redaction beyond the two built-ins, use the `redact.fields:` / `redact.patterns:` / `redact.pii:` blocks above, which are the shipped extension surface.
 
 ### Enabling the redaction tests
 
@@ -594,20 +603,9 @@ OTLP gRPC (port 4317) is the default exporter. HTTP/protobuf (port 4318) is supp
 
 ### W3C TraceContext propagation
 
-Every inbound HTTP path extracts `traceparent` and `tracestate` from request headers; if absent, a fresh root span starts. Every outbound HTTP client owned by SBproxy injects `traceparent` and `tracestate` before send. The propagation invariant is non-negotiable for these clients (each has a unit test asserting the header injection):
+Every inbound HTTP path extracts `traceparent` and `tracestate` from request headers; if absent, a fresh root span starts. On the proxied path, the upstream request filter injects the distributed-tracing headers before the request leaves for the upstream, so proxied traffic propagates context end to end.
 
-| Client | Used for |
-|---|---|
-| `HttpLedger` | Ledger redeem |
-| Stripe adapter | Metered billing (Wave 2) |
-| MPP / x402 facilitator clients | Payment settlement (Wave 3) |
-| Web Bot Auth directory fetcher | Directory refresh |
-| KYA token verifier | Identity proof (Wave 5) |
-| Agent registry feed client | Reputation feed (Wave 2) |
-| Outbound webhook delivery | Customer notifications |
-| OAuth / token endpoints | Token exchange |
-
-Adding a new outbound integration without propagation breaks CI.
+Extending that injection to every helper HTTP client the proxy owns (the ledger redeem client, the Web Bot Auth directory fetcher, outbound webhook delivery, OAuth token exchange, and the future payment-rail clients) is a design-stage contract: those clients do not inject `traceparent` today, and there is no CI gate enforcing it yet.
 
 ### Span naming
 
@@ -696,8 +694,10 @@ Use this when SBproxy runs on the host and the reference Compose stack is runnin
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4327 \
-  sbproxy run --config sb.yml --metrics-listen 127.0.0.1:9091
+  sbproxy serve --config sb.yml
 ```
+
+There is no `--metrics-listen` flag; `/metrics` is served on the proxy listener itself (and on the admin listener when the admin API is enabled).
 
 The reference Collector fan-out is:
 
@@ -780,6 +780,9 @@ origins:
   "ai.local":
     action:
       type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
       trace_content: true
 ```
 
@@ -820,7 +823,7 @@ Wave 1 ships head-based sampling, evaluated at the root span:
 
 1. If the inbound `traceparent` has the `sampled` bit set, sample (parent-based).
 2. Else if the request errors (5xx, policy block, ledger denial), sample 100%.
-3. Else sample at `head_rate` (default 0.1).
+3. Else sample at `sample_rate` (default 0.1; see the `telemetry:` block above).
 
 Tail-based sampling (drop based on outcome at span end) is deferred to Wave 6. The reference Compose stack ships an OTel Collector recipe operators can opt into; the proxy itself does not run a tail sampler.
 
@@ -846,19 +849,18 @@ JSON files live under `deploy/dashboards/`:
 - `audit-log.json` - admin-action volume, outcome distribution, append-only verification status.
 - `traces-overview.json` - span chain length, slowest spans, sampling rate.
 
-The Helm chart provisions them via the kiwigrid sidecar:
+The Helm chart ships them as a single ConfigMap that the kiwigrid Grafana sidecar discovers by label. The chart's values are:
 
 ```yaml
 # values.yaml
 dashboards:
   enabled: true
-  configMap:
-    sbproxy-dashboards:
-      labels:
-        grafana_dashboard: "1"
+  # Label key the Grafana sidecar watches; override if your sidecar
+  # uses a different label key.
+  sidecarLabel: grafana_dashboard
 ```
 
-The sidecar mounts `deploy/dashboards/*.json` into Grafana at startup. Operators who run Grafana outside Helm can `kubectl create configmap` the JSON files directly with the `grafana_dashboard=1` label.
+Set `dashboards.enabled: false` to skip the ConfigMap when dashboards are managed out of band. Operators who run Grafana outside Helm can `kubectl create configmap` the JSON files from `deploy/dashboards/` directly with the `grafana_dashboard=1` label.
 
 ## Alerts
 
@@ -872,18 +874,23 @@ Burn-rate windows for the page tier: 5m AND 1h at 14.4x, 30m AND 6h at 6x. Ticke
 
 ## Health endpoints
 
-Two endpoints, both on the management port (default `127.0.0.1:9091`):
+The proxy listener itself serves `/health` (and `/metrics`), so a fresh install with no extra configuration is probeable. `/healthz` and `/readyz` live on the admin listener, which is disabled by default and binds `127.0.0.1:9090` when enabled:
 
 ```bash
-curl http://localhost:9091/healthz
+curl http://localhost:8080/health
+# 200 OK, {"status":"ok"}. Served on the proxy listener.
+
+curl http://localhost:9090/healthz
 # 200 OK, no body. Liveness only; the kubelet uses this to decide whether to restart the pod.
 
-curl http://localhost:9091/readyz
+curl http://localhost:9090/readyz
 # 200 OK with a JSON body listing each component status.
 # 503 with the same body when any required dependency is unhealthy.
 ```
 
-`/readyz` reports per-component status: ledger reachable, bot-auth directory fresh, agent registry loaded (Wave 2), Stripe reachable (Wave 2), facilitator quorum (Wave 3). Components not yet wired into the build report `not_wired` and pass readiness; Wave 2 onward fills them in.
+There is no separate management port 9091.
+
+`/readyz` reports per-component status. The registered components are `ledger` (redeem recency), `bot_auth_directory` (directory freshness), `agent_registry`, `mesh_quorum`, and `telemetry_sink` (a poisoned sink dispatcher fails readiness so the load balancer drains a telemetry-blind instance). A component whose feature is not configured reports `not_configured` and passes readiness.
 
 ## Reference Compose stack
 
@@ -910,7 +917,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4327 \
   sbproxy serve --config sb.yml
 ```
 
-The proxy exposes Prometheus metrics on the address configured in YAML. The reference Compose stack assumes SBproxy exposes `/metrics` on `127.0.0.1:9091`, so the Compose Prometheus job can scrape `host.docker.internal:9091`. Override the bind in YAML for your deployment.
+The proxy exposes `/metrics` on its own listener (`proxy.http_bind_port`), so with the default `8080` the Compose Prometheus job scrapes `host.docker.internal:8080`. Adjust the scrape target if your proxy binds a different port.
 
 The OTLP endpoint targets the OTel Collector (host port 4327, mapped to the container's 4317). The collector fans traces to Tempo, Phoenix, and Langfuse, mirrors OTLP metrics to Prometheus, and sends OTLP logs to Loki. The dashboards from `deploy/dashboards/` are pre-provisioned in Grafana, so you see metrics, logs, and traces flow as soon as the proxy starts handling requests.
 

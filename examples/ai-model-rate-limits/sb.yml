@@ -9,7 +9,7 @@
 # model still counts against the same window.
 #
 # Three models are governed here:
-#   - claude-haiku-4-5: 60 RPM, 200k TPM. The expensive route.
+#   - claude-sonnet-4-5: 60 RPM, 200k TPM. The expensive route.
 #   - claude-haiku-4-5: 240 RPM, 600k TPM. The cheap workhorse.
 #   - anthropic/claude-3.5-sonnet (OpenRouter passthrough): 30 RPM,
 #     100k TPM, kept low because the resale path is slower.
@@ -26,7 +26,7 @@
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "claude-haiku-4-5",
+#       "model": "claude-sonnet-4-5",
 #       "messages": [{"role": "user", "content": "Quick check."}]
 #     }'
 #
@@ -37,7 +37,7 @@
 #       -H 'Host: ai.local' \
 #       -H 'Content-Type: application/json' \
 #       -d '{
-#         "model": "claude-haiku-4-5",
+#         "model": "claude-sonnet-4-5",
 #         "messages": [{"role": "user", "content": "ping"}]
 #       }'
 #   done
@@ -62,7 +62,7 @@ origins:
           api_key: ${ANTHROPIC_API_KEY}
           default_model: claude-haiku-4-5
           models:
-            - claude-haiku-4-5
+            - claude-sonnet-4-5
             - claude-haiku-4-5
         - name: openrouter
           api_key: ${OPENROUTER_API_KEY}
@@ -72,7 +72,7 @@ origins:
             - anthropic/claude-3-haiku
 
       model_rate_limits:
-        claude-haiku-4-5:
+        claude-sonnet-4-5:
           requests_per_minute: 60
           tokens_per_minute: 200000
         claude-haiku-4-5:

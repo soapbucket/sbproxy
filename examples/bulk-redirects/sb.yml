@@ -17,12 +17,14 @@
 # Test marketing.local:
 #   curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
 #        -H 'Host: marketing.local' http://127.0.0.1:8080/old/about
-#   # => 301 https://example.com/about
+#   # => 301 http://127.0.0.1:8080/about
+#   # (the CSV target is the relative path /about; curl's %{redirect_url}
+#   #  resolves it against the request URL)
 #
 # Test shop.local:
 #   curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
 #        -H 'Host: shop.local' http://127.0.0.1:8080/category/legacy
-#   # => 308 /category/2024
+#   # => 308 http://127.0.0.1:8080/category/2024
 #
 # Hitting an unmapped path on either origin falls through to the
 # action's default `url:` (or 404 when none is configured).

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # MCP gateway with streamable HTTP sessions and a file-sink ledger.
 #
 # sessions.enabled makes the gateway issue an Mcp-Session-Id on

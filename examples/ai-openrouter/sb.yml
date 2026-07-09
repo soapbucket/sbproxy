@@ -36,3 +36,10 @@ origins:
             - openai/gpt-4o-mini
             - meta-llama/llama-3.1-70b-instruct
       routing: fallback_chain
+      # Gateway-level model allowlist: requests for any other model are
+      # rejected with 403 before an upstream call is made.
+      allowed_models:
+        - anthropic/claude-3.5-sonnet
+        - anthropic/claude-3-haiku
+        - openai/gpt-4o-mini
+        - meta-llama/llama-3.1-70b-instruct

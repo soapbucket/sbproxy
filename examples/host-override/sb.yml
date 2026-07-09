@@ -13,20 +13,25 @@
 # the public name. Suppress that with `disable_forwarded_host_header:
 # true` if needed.
 #
+# This example accepts requests for `api.local` and overrides the
+# upstream `Host` to `test.sbproxy.dev`. That is the only Host the
+# shared test upstream serves (it routes by Host), so the override is
+# what makes the demo work; in production the override is typically a
+# vanity or tenant hostname that differs from the upstream DNS name.
+#
 # Run:
 #   make run CONFIG=examples/host-override/sb.yml
 #
 # Test:
-#   curl -H 'Host: localhost' http://127.0.0.1:8080/get
-#   # Upstream sees `Host: api.upstream.example` and
-#   # `X-Forwarded-Host: localhost`.
+#   curl -s -H 'Host: api.local' http://127.0.0.1:8080/headers | jq '.headers.host'
+#   # "test.sbproxy.dev"   <- the overridden Host, as seen by the upstream
 
 proxy:
   http_bind_port: 8080
 
 origins:
-  "localhost":
+  "api.local":
     action:
       type: proxy
       url: https://test.sbproxy.dev
-      host_override: api.upstream.example
+      host_override: test.sbproxy.dev

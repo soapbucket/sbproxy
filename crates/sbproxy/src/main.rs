@@ -1160,15 +1160,32 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
     let path_str = path.to_string_lossy().into_owned();
     let json = matches!(args.format, OutputFormat::Json);
 
-    // Read + compile. The read and compile failures are the two
-    // "invalid config" outcomes; in JSON mode they are reported as
-    // `{"valid": false, ...}` with exit 2 rather than propagated.
+    // Read + compile + construct. Read and compile failures are the
+    // classic "invalid config" outcomes; in JSON mode they are reported
+    // as `{"valid": false, ...}` with exit 2 rather than propagated.
+    //
+    // WOR-1815: `compile_config` alone is not what boot runs. The
+    // per-origin module constructors (`CompiledPipeline::from_config`,
+    // the same call the server and the reload path make) hold the deep
+    // semantic checks: a provider that sets both `serve:` and
+    // `base_url:`, a policy field typo inside an opaque `policies:`
+    // blob, an unknown transform type. A config that passes only
+    // `compile_config` can still refuse to boot, so validate runs the
+    // full construction and throws the pipeline away. Outside a Tokio
+    // runtime (this subcommand) construction spawns nothing.
     let outcome = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))
         .and_then(|yaml| {
-            sbproxy_config::compile_config(&yaml)
+            let compiled = sbproxy_config::compile_config(&yaml)
+                .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
+            sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
                 .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "config '{path_str}' compiled, but a module failed to construct \
+                         (this would fail at boot):\n{e:#}"
+                    )
+                })
         });
 
     match (json, outcome) {
@@ -2267,8 +2284,18 @@ fn load_and_validate(path: &std::path::Path) -> anyhow::Result<sbproxy_config::C
     let path_str = path.to_string_lossy();
     let yaml = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))?;
-    sbproxy_config::compile_config(&yaml)
+    let compiled = sbproxy_config::compile_config(&yaml)
         .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
+    // WOR-1815: run the boot-time module constructors too, so `plan`
+    // and `apply` report semantic-validation errors (exit 3) for a
+    // config that compiles but cannot boot. See
+    // `handle_validate_subcommand` for the rationale.
+    sbproxy_core::pipeline::CompiledPipeline::from_config(compiled).map_err(|e| {
+        anyhow::anyhow!(
+            "config '{path_str}' compiled, but a module failed to construct \
+             (this would fail at boot):\n{e:#}"
+        )
+    })?;
     serde_yaml::from_str::<sbproxy_config::ConfigFile>(&yaml)
         .map_err(|e| anyhow::anyhow!("failed to parse '{path_str}' as ConfigFile: {e}"))
 }

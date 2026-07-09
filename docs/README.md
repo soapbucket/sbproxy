@@ -1,5 +1,5 @@
 # SBproxy documentation
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 Call any model. Serve your own. Govern both. SBproxy is the open-source OpenRouter alternative: one Apache-2.0 binary that routes to 66 providers or serves the weights on your GPUs, with the guardrails, keys, budgets, and spend ledger applying to every model the same way, and a real Pingora-based reverse proxy underneath for the rest of your traffic.
 
@@ -162,7 +162,7 @@ Building from source instead? See [build.md](build.md).
 - Model host: a `serve:` block that resolves weights, fits an engine and quant to your GPU, and supervises vLLM or llama.cpp as a local provider.
 - Authentication: API key, basic, bearer, JWT, digest, forward auth, noop.
 - Policies: rate limiting, IP filter, CEL expressions, WAF, DDoS, CSRF, security headers.
-- Transforms: 18 request and response transforms (JSON, HTML, Markdown, CSS, Lua, JavaScript, encoding, and more).
+- Transforms: 26 request and response transforms (JSON, HTML, Markdown, CSS, Lua, JavaScript, encoding, and more).
 - Scripting: CEL via cel-rust, Lua via mlua/Luau, JavaScript via QuickJS, WebAssembly via wasmtime.
 - Caching: response cache with pluggable backends (memory, file, Redis).
 - Load balancing: 7 algorithms with sticky sessions and health checks.

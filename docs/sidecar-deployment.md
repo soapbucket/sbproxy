@@ -1,6 +1,6 @@
 # Sidecar deployment
 
-*Last modified: 2026-06-03*
+*Last modified: 2026-07-09*
 
 SBproxy is north-south first: most operators run it as a
 top-of-rack gateway in front of an LLM provider or an internal
@@ -147,9 +147,9 @@ sidecar-tuned defaults aim for:
 
 | Metric | Target | How to verify |
 |---|---|---|
-| Cold start | under 500ms on 1 vCPU | `time sbproxy --config sb.yml --probe-ready` |
+| Cold start | under 500ms on 1 vCPU | start `sbproxy serve -f sb.yml` and time the first successful `curl http://127.0.0.1:15001/health` |
 | Resident set at idle | under 80MB | `ps -o rss= -p $(pgrep sbproxy)` |
-| Required external dependencies | none | `sbproxy validate --offline sb.yml` |
+| Required external dependencies | none | `sbproxy validate sb.yml` compiles the config; it needs no network or backing store |
 
 The sample sidecar config in
 [`examples/sidecar/sb.yml`](../examples/sidecar/sb.yml) is tuned
@@ -161,52 +161,65 @@ overhead they add on your workload mix.
 ## Sidecar-tuned config
 
 The full annotated example lives at
-[`examples/sidecar/sb.yml`](../examples/sidecar/sb.yml). The
-shape that matters for sidecar use:
+[`examples/sidecar/sb.yml`](../examples/sidecar/sb.yml). Its
+content:
 
 ```yaml
 proxy:
+  # The init container DNATs outbound TCP onto 15001. Bind here.
   http_bind_port: 15001
-  # Sidecar lives in the pod's own network namespace, so the only
-  # legitimate caller is the workload container on loopback. Bind
-  # to 127.0.0.1 so a misconfigured init container that exposed
-  # the port cluster-wide still cannot be reached.
-  http_bind_host: 127.0.0.1
-
-storage:
-  # Local-only state. The sidecar lifecycle matches the pod, so
-  # shared rate-limit or nonce stores add operational complexity
-  # without serving a real isolation need.
-  kv:
-    backend: memory
-  cache:
-    backend: memory
-    max_entries: 1024
-
-observability:
-  metrics:
-    # The pod's Prometheus annotation scrapes this directly; no
-    # control plane aggregation in the hot path.
-    bind_port: 15002
-    path: /metrics
-  audit:
-    # File-backed audit envelopes; a node-level shipper (Fluent
-    # Bit, Vector) forwards them off-pod.
-    backend: file
-    path: /var/log/sbproxy/audit.jsonl
 
 origins:
+  # Catch-all hostname. The sidecar instruments every outbound
+  # call the workload makes; layer policy on top without
+  # rewriting the destination.
   "*":
     action:
-      type: passthrough
+      type: proxy
+      url: https://test.sbproxy.dev
+
     policies:
-      - type: rate_limit
-        per_second: 100
+      # Per-pod outbound rate limit. Sized to the workload's
+      # expected steady-state; bursts above this return 429 to
+      # the workload, which is the signal an agent loop should
+      # treat as a back-pressure hint.
+      - type: rate_limiting
+        requests_per_minute: 3000
+        burst: 100
+        headers:
+          enabled: true
+          include_retry_after: true
+
+      # IP allow-list keeps the workload from reaching arbitrary
+      # destinations. The default below admits everything; in
+      # production narrow this to the LLM provider CIDRs you
+      # have authorised.
+      - type: ip_filter
+        whitelist:
+          - 0.0.0.0/0
 ```
 
-`passthrough` lets the sidecar instrument every outbound call
-without rewriting its destination; layer additional policy on
-top as needed.
+The knobs, in order:
+
+* `proxy.http_bind_port: 15001` is the port the init container's
+  redirect rules DNAT outbound TCP onto. The proxy keeps all
+  state in memory by default, so nothing else is needed at the
+  `proxy` level: no Redis, no Postgres, no separate metrics
+  listener. `/health` and `/metrics` are served on this same
+  port.
+* The `"*"` origin is a catch-all hostname, so every outbound
+  call the workload makes hits the same policy stack regardless
+  of destination. Point `action.url` at the upstream you want to
+  front; for local experiments the example uses the hosted test
+  origin.
+* `rate_limiting` is the per-pod outbound budget.
+  `requests_per_minute` sizes the steady state, `burst` absorbs
+  spikes, and the `headers` block emits rate-limit headers
+  (including `Retry-After`) so an agent loop can back off
+  instead of hammering a closed window.
+* `ip_filter` bounds where the workload can connect. The
+  shipped `0.0.0.0/0` whitelist admits everything; narrow it to
+  the provider CIDRs you have authorised before production.
 
 ## Service-mesh integration
 
@@ -218,9 +231,10 @@ Istio's sidecar injection writes its own `istio-init` and
 1. Disable Istio's outbound capture for the ports sbproxy
    handles, using
    `traffic.sidecar.istio.io/excludeOutboundPorts` on the pod.
-2. Inject sbproxy via a `MutatingWebhookConfiguration` (sample
-   webhook in `deploy/k8s/sidecar/istio/`) or by labelling the
-   namespace.
+2. Add the sbproxy containers to the pod template with the
+   kustomize patch from `deploy/k8s/sidecar/base/`. There is no
+   shipped Istio webhook manifest yet;
+   `deploy/k8s/sidecar/istio/` holds integration notes only.
 3. Order matters: the sbproxy init container must run **after**
    `istio-init` so its redirect rules take precedence on the
    ports it owns.
@@ -228,8 +242,8 @@ Istio's sidecar injection writes its own `istio-init` and
 ### Linkerd
 
 Linkerd's `linkerd-proxy` runs at L7 and does not consume the
-same iptables chain, so the two coexist without exclusion. Inject
-sbproxy via the same mutating webhook used in the bare-pod
+same iptables chain, so the two coexist without exclusion. Add
+sbproxy with the same kustomize patch used in the bare-pod
 pattern; no Linkerd-specific configuration is required.
 
 ### Bare pod (no mesh)
@@ -246,13 +260,12 @@ kubectl apply -k deploy/k8s/sidecar/base/
 The sidecar inherits the pod's Kubernetes service account by
 default. For workloads that need workload-scoped identity beyond
 the service-account boundary (per-binary attestation, signed
-audit envelopes), bind a SPIFFE SVID via the local SPIRE agent
-and reference it from sbproxy's `tls.client.cert` and the
-auth chain.
+audit envelopes), a SPIFFE SVID from the local SPIRE agent is
+the natural fit, but sbproxy has no SPIFFE integration yet.
 
-The SPIFFE binding is a separate ticket; today the sidecar
-defaults to the pod's mounted service-account token for east-west
-auth and to file-backed certs (mounted from a Secret) for mTLS.
+Today the sidecar relies on the pod's mounted service-account
+token for east-west auth and on file-backed certificates
+(mounted from a Secret) for mTLS via `proxy.mtls`.
 
 ## Telemetry shape
 
@@ -260,15 +273,16 @@ The sidecar is a per-pod data plane. The recommended scrape shape
 is:
 
 * **Metrics**: each pod exposes `/metrics` on the sbproxy
-  container; a `PodMonitor` (Prometheus Operator) or static
-  scrape config picks them up. No central aggregator on the hot
-  path.
-* **Audit**: each pod writes JSONL audit envelopes to a hostPath
-  or emptyDir volume; a DaemonSet log shipper (Fluent Bit,
-  Vector, OpenTelemetry Collector) forwards them off-pod.
-* **Traces**: each pod's sbproxy sets the
-  `OTEL_EXPORTER_OTLP_ENDPOINT` env to a node-local collector;
-  the collector batches and forwards.
+  serving port (`15001` in the shipped config); a `PodMonitor`
+  (Prometheus Operator) or static scrape config picks them up.
+  No central aggregator on the hot path.
+* **Logs**: access logs are JSON lines on the container's
+  stdout/stderr (or a rotating file via `access_log.output`); a
+  DaemonSet log shipper (Fluent Bit, Vector, OpenTelemetry
+  Collector) forwards them off-pod.
+* **Traces**: each pod's sbproxy points
+  `proxy.observability.telemetry.endpoint` at a node-local OTLP
+  collector; the collector batches and forwards.
 
 The control plane (your central Prometheus, Loki, Tempo) is
 **not** on the request path. A control-plane outage degrades
@@ -287,18 +301,18 @@ To run it against a local kind cluster:
 ```bash
 kind create cluster
 kubectl apply -k deploy/k8s/sidecar/example/
-kubectl port-forward pod/agent-pod 15002:15002
-curl -s http://127.0.0.1:15002/metrics | grep sbproxy_requests
+kubectl port-forward pod/agent-pod 15001:15001
+curl -s http://127.0.0.1:15001/metrics | grep sbproxy_requests
 ```
 
 ## Failure modes and degraded operation
 
 | Failure | Sidecar behaviour | Operator action |
 |---|---|---|
-| Workload sends traffic before sbproxy is ready | Init container blocks pod start until readyz | none; this is the intended ordering |
+| Workload sends traffic before sbproxy is ready | Connections are refused until the listener binds (subsecond); the workload should retry on startup | none; standard startup retry logic covers it |
 | sbproxy container crashes | Pod restarts; init container reinstalls redirect on fresh netns | check `kubectl logs -p` for the cause |
-| Config ConfigMap update | sbproxy SIGHUPs and hot-reloads in place | none; reload is non-disruptive |
-| Audit volume full | sbproxy logs a warning, drops audit envelopes, continues serving | rotate audit volume or shrink retention |
+| Config ConfigMap update | the file watcher sees the mounted file change and hot-reloads in place | none; reload is non-disruptive |
+| Log volume full | writes to a full file sink fail; stdout logging and serving continue | rotate the volume or shrink retention |
 | External LLM provider unreachable | sbproxy returns the upstream error to the workload | inspect provider; sidecar is not the cause |
 
 The hot path **never** depends on a control-plane component
@@ -314,6 +328,6 @@ sidecar shape safe to run in a per-pod fanout.
   uses the pod's service-account token plus file-backed mTLS
   certs; SPIRE integration is a separate workstream.
 * Automatic sidecar injection via a packaged mutating webhook.
-  The webhook template at `deploy/k8s/sidecar/webhook/` is a
-  starting point; production use requires you to host the
-  webhook and configure its TLS.
+  No webhook manifests ship yet; `deploy/k8s/sidecar/webhook/`
+  holds a README describing the intended shape. Until they
+  land, patch pods explicitly with the kustomize base.

@@ -1,6 +1,6 @@
 # Kubernetes gateway pattern
 
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-09*
 
 ![Kubernetes gateway pattern](../../docs/assets/k8s-gateway.gif)
 
@@ -12,15 +12,18 @@ Realistic config when SBproxy runs behind a Kubernetes Ingress (or any cluster-e
 sbproxy serve -f sb.yml
 ```
 
-In a real K8s deployment the Operator generates this YAML from a `Gateway` and `HTTPRoute` pair. The example uses `test.sbproxy.dev` as a stand-in for the cluster Service so it runs locally; the inline comments show the Service DNS name (`backend.namespace.svc.cluster.local:8080`) that production configs use.
+In a real K8s deployment the Operator generates this YAML from a `Gateway` and `HTTPRoute` pair. The example uses `test.sbproxy.dev` as a stand-in for the cluster Service so it runs locally; the inline comments show the Service DNS name (`backend.namespace.svc.cluster.local:8080`) that production configs use for both `url` and `host_override`. The live `host_override` is `test.sbproxy.dev` because the shared test upstream routes by Host and serves no other name.
 
 ## Try it
 
 ```bash
-# Simulate a request coming through the Ingress (10.0.0.5) for a real
-# client at 203.0.113.7. trusted_proxies recovers the client IP from
-# X-Forwarded-For; the upstream sees the recovered XFF and the new
-# X-Request-Id which is also echoed on the response.
+# Simulate a request coming through the Ingress for a real client at
+# 203.0.113.7. The curl peer (127.0.0.1) is inside trusted_proxies, so
+# the proxy honours the inbound X-Forwarded-For and treats 203.0.113.7
+# as the client IP for rate limits and logs. The response carries the
+# freshly minted X-Request-Id. (The hosted echo runs behind a CDN that
+# rewrites forwarding headers with its own values, so verify via the
+# X-Request-Id response header rather than the echoed XFF.)
 curl -i -H 'Host: api.example.com' \
      -H 'X-Forwarded-For: 203.0.113.7' \
      http://127.0.0.1:8080/headers
@@ -35,11 +38,21 @@ curl -i -H 'Host: api.example.com' \
 ```
 
 ```bash
-# A spoofed XFF from outside the trusted_proxies range gets stripped.
-# The upstream sees the proxy's IP, not the spoofed value.
+# Trust boundaries: X-Forwarded-For is only as trustworthy as the peer
+# that sends it. This config lists 127.0.0.1 in trusted_proxies (so the
+# example is testable locally), which means a local curl is a trusted
+# peer and its X-Forwarded-For value IS honoured; the call below makes
+# the proxy treat 8.8.8.8 as the client IP.
 curl -i -H 'Host: api.example.com' \
      -H 'X-Forwarded-For: 8.8.8.8' \
      http://127.0.0.1:8080/headers
+
+# Had the same request arrived from a peer outside trusted_proxies
+# (any non-listed source IP), the proxy would discard the inbound
+# header and replace it with the peer's real socket address, so a
+# spoofed XFF from the open internet never reaches rate limits, logs,
+# or the upstream. In production, keep trusted_proxies down to the
+# CIDRs your Ingress actually uses and drop the loopback entry.
 ```
 
 ## What this exercises
@@ -47,7 +60,7 @@ curl -i -H 'Host: api.example.com' \
 - `proxy.trusted_proxies` - CIDR list of allowed XFF sources (Pod CIDR, Service CIDR, loopback)
 - `proxy.correlation_id` - honour inbound `X-Request-Id`, generate when absent, echo on response
 - `service_discovery` on a Service hostname so endpoint rotation is picked up automatically
-- `host_override` so the upstream sees the Service hostname, not the public Host header
+- `host_override` so the upstream sees the hostname it routes by (the Service hostname in production; `test.sbproxy.dev` in this live demo), not the public Host header
 - `retry` on `connect_error`, `timeout`, and numeric status codes with bounded attempts and backoff
 - `concurrent_limit` keyed by IP so one client cannot exhaust upstream concurrency
 

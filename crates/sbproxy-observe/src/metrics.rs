@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use prometheus::{
     CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounterVec, IntGauge, Opts,
@@ -10,35 +9,6 @@ use prometheus::{
 
 use crate::agent_labels::AgentLabels;
 use crate::cardinality::{CardinalityConfig, CardinalityLimiter};
-
-// --- Scrape rate limiter ---
-
-static LAST_SCRAPE: AtomicU64 = AtomicU64::new(0);
-
-/// Minimum milliseconds required between two consecutive metrics scrapes.
-const MIN_SCRAPE_INTERVAL_MS: u64 = 1_000;
-
-/// Check if a metrics scrape is allowed based on a 1-second minimum interval.
-///
-/// Uses a compare-and-swap on an atomic timestamp so this function is
-/// lock-free and safe to call from multiple threads simultaneously.
-/// Returns `true` when the scrape is permitted and the timestamp is updated.
-/// Returns `false` when the last scrape was too recent.
-pub fn allow_scrape() -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let last = LAST_SCRAPE.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < MIN_SCRAPE_INTERVAL_MS {
-        return false;
-    }
-    // Best-effort CAS: if another thread wins, we still return false for this
-    // call, which is safe (the caller can retry on the next request).
-    LAST_SCRAPE
-        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
-}
 
 /// Global metrics registry.
 static METRICS: OnceLock<ProxyMetrics> = OnceLock::new();
@@ -3873,51 +3843,6 @@ mod tests {
             observed >= 1,
             "overflow counter for ({metric_name},{label}) must be >= 1, was {observed}"
         );
-    }
-
-    // --- allow_scrape rate limiter ---
-    //
-    // The three `allow_scrape_*` tests share the process-global
-    // `LAST_SCRAPE` atomic. Without serialisation, parallel `cargo test`
-    // workers race: one test stores its desired state, the scheduler
-    // preempts, another test stores a different value, then the first
-    // test's assertion runs against the second test's state and fails
-    // intermittently. Hold this mutex for the duration of each test to
-    // make them run serially with respect to one another while still
-    // running in parallel with the rest of the suite.
-    static SCRAPE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn allow_scrape_first_call_is_permitted() {
-        let _guard = SCRAPE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Reset the global atomic so this test is not order-dependent.
-        LAST_SCRAPE.store(0, Ordering::Relaxed);
-        assert!(allow_scrape(), "first scrape after reset must be allowed");
-    }
-
-    #[test]
-    fn allow_scrape_immediate_second_call_is_denied() {
-        let _guard = SCRAPE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Prime the atomic to "just now" so any immediate follow-up is blocked.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        LAST_SCRAPE.store(now, Ordering::Relaxed);
-        assert!(!allow_scrape(), "second scrape within 1 s must be denied");
-    }
-
-    #[test]
-    fn allow_scrape_after_interval_is_permitted() {
-        let _guard = SCRAPE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Simulate that the last scrape happened more than 1 second ago.
-        let past = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            - 2_000; // 2 seconds in the past
-        LAST_SCRAPE.store(past, Ordering::Relaxed);
-        assert!(allow_scrape(), "scrape after interval must be allowed");
     }
 
     // --- WOR-75: exemplar wiring on the four new histograms ---

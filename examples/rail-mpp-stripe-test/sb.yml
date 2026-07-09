@@ -24,8 +24,8 @@
 #
 # Run (offline, wiremock):
 #   docker compose --profile wiremock up -d --wait
-#   # The proxy is configured to talk to wiremock on the same network
-#   # via STRIPE_API_BASE; see README for the override.
+#   # There is no override knob yet to point the proxy at wiremock;
+#   # the container is wired but unused today. See README.
 
 proxy:
   http_bind_port: 8080
@@ -59,8 +59,8 @@ origins:
 
         # Single tier: $0.005 USD on the markdown feed. The shape
         # selector ensures only Markdown-shaped requests match (see
-        # docs/billing-rails.md for how Accept negotiation interacts
-        # with tier resolution).
+        # docs/ai-crawl-control.md for how Accept negotiation
+        # interacts with tier resolution).
         tiers:
           - route_pattern: /feed/*
             price:

@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-08*
+*Last modified: 2026-07-09*
 
 The model host lets the gateway run the model itself, not just proxy to
 a model server someone else started. You name a model in a provider's
@@ -63,32 +63,47 @@ origins:
     action:
       type: ai_proxy
       providers:
+        # No base_url: the gateway resolves the engine's loopback port
+        # itself once the engine is ready.
         - name: local
-          base_url: http://127.0.0.1:8000/v1
-          allow_private_base_url: true
           default_model: qwen3-14b
-          models: [qwen3-14b]
+          models: [qwen3-14b, qwen3-8b]
           serve:
             eviction: lru          # or `never`
             cache_budget_gib: 200
             models:
-              - model: qwen3-14b   # a catalog id
+              # Catalog id: the repo, quant list, and GGUF file come
+              # from the catalog entry.
+              - model: qwen3-14b
                 engine: vllm
                 keep_alive: 30m
-              - model: hf:Qwen/Qwen3-8B-GGUF:Q4_K_M  # explicit ref
+              # Explicit ref: names the repo, quant, and file directly,
+              # belt-and-braces when you want zero catalog indirection.
+              - model: hf:Qwen/Qwen3-8B-GGUF:Q4_K_M
+                name: qwen3-8b
+                gguf_file: Qwen3-8B-Q4_K_M.gguf
                 engine: llama_cpp
                 keep_alive: 15m
+                # llama-server applies the GGUF's embedded chat template.
+                extra_args: ["--jinja"]
 ```
 
 A model is either a catalog id (see below) or an explicit
-`hf:Org/Repo:QUANT` reference that bypasses the catalog. `engine` is an
+`hf:Org/Repo:QUANT` reference that bypasses the catalog; both forms
+serve. A raw `hf:` entry needs a `name:` (the model id every other
+plane sees; a catalog entry borrows its id), and a GGUF entry from a
+multi-file repo should pin `gguf_file:` so the runtime never guesses
+the quant. `engine` is an
 allowlisted enum (`vllm`, `llama_cpp`), never a command string: config
 picks an engine and its knobs, and the runtime owns the argument
-template. `keep_alive` is the idle time before the engine unloads to
-free VRAM; `eviction` decides what happens under VRAM pressure, `lru`
+template; `extra_args` appends engine flags one argv element at a
+time, no shell. `keep_alive` is the idle time before the engine
+unloads to free VRAM; `eviction` decides what happens under VRAM
+pressure, `lru`
 evicts the least-recently-used idle model, `never` pins residency and
 refuses a new model when full. See
-[`examples/ai-local-serving`](../examples/ai-local-serving).
+[`examples/ai-local-serving`](../examples/ai-local-serving) and
+[`examples/use-case-local-first`](../examples/use-case-local-first).
 
 ## Inference engines
 
@@ -228,8 +243,10 @@ preference order and returns the first quant that both runs and fits.
 The model host publishes `sbproxy_model_host_*` metrics: engine
 time-to-ready, launch and eviction counts, resident-model and
 load-queue-depth gauges, and per-device `gpu_vram_bytes` plus
-`gpu_utilization`. The utilization gauge is the signal the `gpu-aware`
-routing strategy already reads. See
+`gpu_utilization`. The utilization gauge is the observability view of
+that signal; the `gpu-aware` routing strategy reads a
+`gpu_utilization` entry in each target's metadata, which operators
+feed from a metrics scrape or a sidecar. See
 [`metrics-stability.md`](metrics-stability.md).
 
 ## Security

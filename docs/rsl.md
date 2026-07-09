@@ -1,55 +1,70 @@
 # RSL 1.0 licensing cookbook
 
-*Last modified: 2026-05-08*
+*Last modified: 2026-07-09*
 
 This is the cookbook for expressing a specific license stance via SBproxy YAML and seeing the result in the `/licenses.xml` document the proxy serves. The reader is a publisher author or counsel who wants the right RSL terms on the wire without writing XML by hand.
 
-If you have not yet wired `ai_crawl_control` on the origin, read [ai-crawl-control.md](ai-crawl-control.md) first. If you want the broader picture (content negotiation, JSON envelope, the four projections, transforms), read [content-for-agents.md](content-for-agents.md).
+If you have not yet wired `ai_crawl_control` on the origin, read [ai-crawl-control.md](ai-crawl-control.md) first. If you want the broader picture (content negotiation, JSON envelope, the projections, transforms), read [content-for-agents.md](content-for-agents.md).
 
 ## What RSL 1.0 expresses
 
-The Really Simple Licensing 1.0 specification (RSL Collective, https://rslstandard.org/rsl) is a machine-readable XML document that asserts the license terms a publisher offers for AI ingestion of their content. It addresses three categories of AI use:
+The Really Simple Licensing 1.0 specification (RSL Collective, https://rslstandard.org/rsl) is a machine-readable XML document that asserts the license terms a publisher offers for AI ingestion of their content. Its usage vocabulary covers three tokens:
 
-- **Training (`type="training"`).** Whether the content may be used as training data for a model. Pay-per-crawl pricing typically attaches here.
-- **Inference (`type="inference"`).** Whether the content may be used as model input at inference time, e.g. as RAG context or as a tool-use payload. Pay-per-inference pricing attaches here.
-- **Search indexing (`type="search-index"`).** Whether the content may be indexed for a non-LLM search engine. Often free or nominally priced.
+- **`ai-train`.** Whether the content may be used as training data for a model. Pay-per-crawl pricing typically attaches here.
+- **`ai-input`.** Whether the content may be used as model input at inference time, e.g. as RAG context or as a tool-use payload.
+- **`search`.** Whether the content may be indexed for a non-LLM search engine. Often free or nominally priced.
 
-Each category carries a `licensed="true"` or `licensed="false"` attribute. The default RSL stance is fail-closed: a category that is not asserted is unlicensed. SBproxy's `ai_crawl_control` policy maps to the RSL 1.0 vocabulary directly, so the operator's YAML is the source of truth for the served `/licenses.xml`.
+Permitted tokens appear inside a `<permits type="usage">` element; prohibited tokens appear inside a `<prohibits type="usage">` element. A token that is neither permitted nor prohibited is simply absent, which the spec treats as silence: the document takes no position on that use. SBproxy maps operator YAML onto this vocabulary directly, so the config is the source of truth for the served `/licenses.xml`.
 
-RSL is cooperative, not enforceable on its own. A motivated agent that ignores the document still gets a 402 challenge from the proxy if it tries to access a priced route. RSL exists so cooperative agents (the ones that pay) and licensing counterparties (News Corp, Meta, content licensing aggregators) have a stable, machine-readable artifact to reference.
+RSL is cooperative, not enforceable on its own. A motivated agent that ignores the document still gets a 402 challenge from the proxy if it tries to access a priced route. RSL exists so cooperative agents (the ones that pay) and licensing counterparties have a stable, machine-readable artifact to reference.
 
 ## The mapping
 
-The operator declares the editorial signal via `content_signal:` at the origin level or inside an individual tier. The proxy translates the signal into the matching `<ai-use>` assertion when it renders `/licenses.xml`. The mapping table is:
+The operator declares the editorial signal via `content_signal:` at the origin level, as a sibling of `action:` under `origins.<hostname>`. Do not put `content_signal:` inside the `ai_crawl_control` policy block: the policy deserializer ignores unknown keys, so a signal placed there is silently dropped. (The policy block does accept a different, plural `content_signals:` field, covered in Recipe 4.)
 
-| `content_signal` value | RSL `<ai-use>` element |
+The proxy translates the origin-level signal into the matching `<permits>` assertion when it renders `/licenses.xml`:
+
+| `content_signal` value | RSL element |
 |---|---|
-| `ai-train` | `<ai-use type="training" licensed="true" />` |
-| `ai-input` | `<ai-use type="inference" licensed="true" />` |
-| `search` | `<ai-use type="search-index" licensed="true" />` |
-| absent | `<ai-use type="training" licensed="false" />` |
+| `ai-train` | `<permits type="usage">ai-train</permits>` |
+| `ai-input` | `<permits type="usage">ai-input</permits>` |
+| `search` | `<permits type="usage">search</permits>` |
+| absent | no `<permits>` or `<prohibits>` element (the document is silent on usage) |
 
-The "absent" row is the default-deny rule. When an operator configures `ai_crawl_control` without setting `content_signal`, the proxy emits an explicit `licensed="false"` for training. Cooperative agents that read the document see that the operator has not licensed training; they should not use the content for that purpose.
+The "absent" row follows the spec: when no usage token is declared, the document simply says nothing about usage. SBproxy does not synthesize a default-deny element (RSL 1.0 has no element for that; an earlier `<ai-use licensed="false">` emission was non-conformant and has been removed). To reserve rights when no signal is declared, the proxy stamps a `TDM-Reservation: 1` response header instead, and the `/.well-known/tdmrep.json` projection serves an empty array.
 
-The set of `content_signal` values is closed. The proxy rejects any other value at config-load time with a clear error message referencing this document. Future expansion (e.g., a `derivative-allowed` axis) follows the schema-versioning rules: additive only, dual-emit window for breaking changes.
+To express an explicit prohibition in the document body (a `<prohibits>` element), use the plural `content_signals:` block on the `ai_crawl_control` policy; see Recipe 4.
+
+The set of origin-level `content_signal` values is closed. The config compiler rejects any other value at load time with an error naming the allowed set (`ai-train`, `search`, `ai-input`).
 
 ## Worked recipes
 
-Each recipe shows the operator's `ai_crawl_control` policy, the resulting `/licenses.xml` body, and a short explanation. Run `sbproxy projections render --kind licenses --config ./sb.yml` against your config to confirm the output matches before pushing to production.
+Each recipe shows the operator's config, the resulting `/licenses.xml` body, and a short explanation. Every XML body below was generated by running the config through the real renderer:
+
+```bash
+sbproxy projections render --kind licenses --config ./sb.yml
+```
+
+Run the same command against your config to confirm the output matches before pushing to production. The CLI renders with config version `0`; a running proxy substitutes its current reload counter (see "URN format" below).
 
 ### Recipe 1: Allow training, require attribution
 
-The operator licenses training but wants every downstream model output that uses the content to cite the source. Pricing is per-crawl on `/articles/*`.
+The operator licenses training but wants every downstream model output that uses the content to cite the source. Pricing is per-crawl, with a higher price on `/articles/*`.
 
 ```yaml
+proxy:
+  http_bind_port: 8080
+
 origins:
   "blog.example.com":
+    content_signal: ai-train
     action:
       type: proxy
       url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
-        content_signal: ai-train
+        price: 0.001
+        currency: USD
         tiers:
           - route_pattern: /articles/*
             citation_required: true
@@ -64,30 +79,38 @@ origins:
 <?xml version="1.0" encoding="UTF-8"?>
 <rsl xmlns="https://rslstandard.org/rsl" version="1.0">
   <content url="https://blog.example.com/*">
-    <license urn="urn:rsl:1.0:blog.example.com:0xa3f9d2c1">
+    <license urn="urn:rsl:1.0:blog.example.com:0">
       <origin hostname="blog.example.com" />
-      <ai-use type="training" licensed="true" />
+      <payment type="crawl" amount="0.001" currency="USD" />
+      <permits type="usage">ai-train</permits>
       <content-signal>ai-train</content-signal>
     </license>
   </content>
 </rsl>
 ```
 
-The `citation_required: true` flag does not appear in the RSL document directly. It propagates to the JSON envelope (`citation_required: true`) and to the citation_block transform (which prepends a `> Source: ... > License: ...` block to the Markdown body). RSL captures the licensing posture; the citation requirement rides on the response body and the per-tier `Tier::citation_required` field.
+The `<payment>` element reflects the policy-level `price:` / `currency:` (a positive price maps to `type="crawl"`; no price maps to `type="free"`). The `<content-signal>` element is an SBproxy extension that echoes the operator's declared signal verbatim for the audit trail; spec-aware consumers ignore unknown elements.
+
+The `citation_required: true` flag does not appear in the RSL document. It propagates to the JSON envelope (`citation_required: true`) and to the `citation_block` transform, which prepends a one-line `> Citation required ... Source: ... License: ...` blockquote to Markdown bodies. RSL captures the licensing posture; the citation requirement rides on the response body and the per-tier `citation_required` field.
 
 ### Recipe 2: Allow inference, block training
 
-The operator wants their reference content available to RAG pipelines but not to training jobs. Pricing is per-inference on `/api-reference/*`.
+The operator wants their reference content available to RAG pipelines but not to training jobs. Pricing attaches to `/api-reference/*`.
 
 ```yaml
+proxy:
+  http_bind_port: 8080
+
 origins:
   "docs.example.com":
+    content_signal: ai-input
     action:
       type: proxy
       url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
-        content_signal: ai-input
+        price: 0.0005
+        currency: USD
         tiers:
           - route_pattern: /api-reference/*
             price:
@@ -101,30 +124,36 @@ origins:
 <?xml version="1.0" encoding="UTF-8"?>
 <rsl xmlns="https://rslstandard.org/rsl" version="1.0">
   <content url="https://docs.example.com/*">
-    <license urn="urn:rsl:1.0:docs.example.com:0xb1c2d3e4">
+    <license urn="urn:rsl:1.0:docs.example.com:0">
       <origin hostname="docs.example.com" />
-      <ai-use type="inference" licensed="true" />
+      <payment type="crawl" amount="0.0005" currency="USD" />
+      <permits type="usage">ai-input</permits>
       <content-signal>ai-input</content-signal>
     </license>
   </content>
 </rsl>
 ```
 
-The document asserts `<ai-use type="inference" licensed="true" />`. There is no assertion about training, which under the RSL fail-closed rule means training is not licensed. Cooperative training-job operators that read the document should not include this origin's content in their training set. An inference-time RAG pipeline that pays the per-inference price and presents the content as model input is operating inside the licensed set.
+The document permits `ai-input` and says nothing about `ai-train` or `search`. Under the spec, silence is not a grant: a cooperative training-job operator that reads the document sees no permission for training and should not include this origin's content in a training set. A RAG pipeline that pays the price and presents the content as model input is operating inside the permitted set. To make the training prohibition explicit in the document body, use the `content_signals:` block from Recipe 4 instead.
 
-### Recipe 3: Block all AI use, default-deny
+### Recipe 3: No signal, default-reserve
 
 The operator does not want any AI use of the origin's content. Pricing is intentionally prohibitive on `/*`; the policy is effectively a paywall.
 
 ```yaml
+proxy:
+  http_bind_port: 8080
+
 origins:
   "private.example.com":
+    # No content_signal: declared. The document stays silent on usage.
     action:
       type: proxy
       url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
-        # No content_signal: declared. The default-deny rule applies.
+        price: 999999
+        currency: USD
         crawler_user_agents:
           - GPTBot
           - ClaudeBot
@@ -143,21 +172,24 @@ origins:
 <?xml version="1.0" encoding="UTF-8"?>
 <rsl xmlns="https://rslstandard.org/rsl" version="1.0">
   <content url="https://private.example.com/*">
-    <license urn="urn:rsl:1.0:private.example.com:0x7e8f9a0b">
+    <license urn="urn:rsl:1.0:private.example.com:0">
       <origin hostname="private.example.com" />
-      <ai-use type="training" licensed="false" />
+      <payment type="crawl" amount="999999" currency="USD" />
     </license>
   </content>
 </rsl>
 ```
 
-The absence of `content_signal` triggers the default-deny mapping: `<ai-use type="training" licensed="false" />`. This is the explicit form of "the operator has not granted permission". The policy is also defensive on the wire: the high tier price ensures that any AI-class user agent that ignores the RSL stance still hits a 402 with an unbuyable price.
+With no signal declared, the license body carries no `<permits>` or `<prohibits>` element and no `<content-signal>` echo. The rights reservation moves to two other layers: every response gets a `TDM-Reservation: 1` header, and `/.well-known/tdmrep.json` serves an empty array. The policy is also defensive on the wire: the tier price ensures that any AI-class user agent that ignores the licensing surface still hits a 402 with an unbuyable price.
 
-### Recipe 4: Per-route override
+### Recipe 4: Permit search, prohibit training
 
-The operator wants their reference content (`/api-reference/*`) freely indexable for search but their premium articles (`/premium/*`) licensed for AI training at a premium price. The origin-level default is `search`; one tier overrides to `ai-train`.
+To split the usage tier into explicit grants and explicit prohibitions, declare the plural `content_signals:` block on the `ai_crawl_control` policy. Each of the three axes (`search`, `ai_input`, `ai_train`) takes `true` (permit), `false` (prohibit), or stays absent (silent).
 
 ```yaml
+proxy:
+  http_bind_port: 8080
+
 origins:
   "blog.example.com":
     action:
@@ -165,38 +197,52 @@ origins:
       url: https://test.sbproxy.dev
     policies:
       - type: ai_crawl_control
-        content_signal: search                 # origin-level default
+        price: 0.005
+        currency: USD
+        content_signals:
+          search: true
+          ai_train: false
         tiers:
-          - route_pattern: /premium/*
-            content_signal: ai-train           # override
+          - route_pattern: /articles/*
             price:
               amount_micros: 5000
               currency: USD
-          - route_pattern: /api-reference/*
-            price:
-              amount_micros: 0                 # free under search signal
-              currency: USD
 ```
 
-The `/licenses.xml` document asserts the origin-level signal (`search`). The current schema emits a single `<content url="https://<hostname>/*">` element wrapping one `<license>` body per origin; per-route grouping (one `<content>` element per route) is a future extension. For the current schema, the policy posture per route is most accurately observed via `/.well-known/tdmrep.json`, which does emit per-route entries.
+`/licenses.xml`:
 
-A runtime request to `/premium/foo` produces `Content-Signal: ai-train` on the response. A request to `/api-reference/v1` produces `Content-Signal: search`. The `urn:rsl:1.0:blog.example.com:<hash>` is the same for both routes because the URN is per-origin per config-version, not per-route.
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<rsl xmlns="https://rslstandard.org/rsl" version="1.0">
+  <content url="https://blog.example.com/*">
+    <license urn="urn:rsl:1.0:blog.example.com:0">
+      <origin hostname="blog.example.com" />
+      <payment type="crawl" amount="0.005" currency="USD" />
+      <permits type="usage">search</permits>
+      <prohibits type="usage">ai-train</prohibits>
+      <content-signal>search=yes, ai-train=no</content-signal>
+    </license>
+  </content>
+</rsl>
+```
 
-For finer-grained per-route license expression, lean on the `/.well-known/tdmrep.json` projection or split the routes onto separate hostnames (one origin per license posture).
+`search=yes` lands in `<permits>`, `ai_train=false` lands in `<prohibits>`, and the undeclared `ai_input` axis is silent. The same set drives the managed `robots.txt` `Content-Signal:` directive, so the two surfaces can never contradict each other.
+
+Note that the license scope is per-origin: the document carries a single `<content url="https://<hostname>/*">` element wrapping one `<license>` body, and the URN is per-origin per config version, not per-route. Per-route `<content>` grouping is a future extension. For per-route rights observation today, lean on `/.well-known/tdmrep.json` (which emits one entry per priced route) or split routes onto separate hostnames, one origin per license posture.
 
 ## URN format
 
 The RSL URN format SBproxy emits is:
 
 ```
-urn:rsl:1.0:<origin_hostname>:<config_version_hash>
+urn:rsl:1.0:<origin_hostname>:<config_version>
 ```
 
 - The `1.0` segment is the RSL spec major version. The proxy re-emits the URN unchanged on every config reload until the spec major-bumps.
 - `<origin_hostname>` is the bare hostname from the origin's `origins:` key. No port, no scheme, no path.
-- `<config_version_hash>` is the same 64-bit hash the proxy uses internally to gate hot-reload (`u64`, lowercase hex with the `0x` prefix when emitted in human-readable form). The hash changes on every successful config reload, even when the config content is identical at the byte level: the hash includes the load timestamp so independent reloads produce distinct URNs.
+- `<config_version>` is a monotonically increasing in-process reload counter, rendered as a plain decimal integer (`0`, `1`, `2`, ...). It increments on every successful config reload, even when the config content is identical at the byte level, so independent reloads produce distinct URNs. The `sbproxy projections render` CLI always renders version `0` because no reload has happened in that process.
 
-The URN is the value the JSON envelope's `license` field carries on every response. It is also the value the operator references in external licensing artifacts (e.g., a News Corp licensing contract may pin a specific URN as the binding artifact for the agreement period). Counterparties can dereference the URN against the served `/licenses.xml` to prove that the operator's published terms match the contracted terms at a given point in time.
+The URN is the value the JSON envelope's `license` field carries on every response. It is also the value the operator references in external licensing artifacts (a licensing contract may pin a specific URN as the binding artifact for the agreement period). Counterparties can dereference the URN against the served `/licenses.xml` to prove that the operator's published terms match the contracted terms at a given point in time.
 
 The URN does not need to be publicly resolvable as an HTTP URL. It is a stable identifier; the proxy stamps it on response bodies and headers but does not register it with any external resolver. Counterparties resolve it indirectly by fetching `/licenses.xml` from the same hostname and reading the `<license urn="...">` attribute.
 
@@ -213,14 +259,14 @@ xmllint --noout licenses.xml
 # Expected: no output (means it parsed cleanly)
 ```
 
-The wire format follows the prose spec at https://rslstandard.org/rsl. The projection-engine snapshot tests in `crates/sbproxy-modules/src/projections/licenses.rs` pin the byte-for-byte output, so any change to the emitter that drifts from the canonical shape (root namespace, the nested `<rsl><content url="..."><license>...</license></content></rsl>` envelope, the `<ai-use>` mapping) fails the CI gate.
+The wire format follows the prose spec at https://rslstandard.org/rsl. The emitter tests in `crates/sbproxy-modules/src/projections/licenses.rs` pin the document shape: the root namespace, the nested `<rsl><content url="..."><license>...</license></content></rsl>` envelope, the `<permits type="usage">` / `<prohibits type="usage">` mapping, and a regression guard that no legacy `<ai-use>` element is ever emitted. Any emitter change that drifts from this shape fails the CI gate.
 
 If the served document does not match what is documented here, open an issue against the SBproxy repo with the served body attached.
 
 ## Companion documents
 
-- [content-for-agents.md](content-for-agents.md): the broader Wave 4 user guide. Covers content negotiation, transforms, the JSON envelope, the other three projections (robots.txt, llms.txt, tdmrep.json), and aipref signals.
-- [ai-crawl-control.md](ai-crawl-control.md): the `ai_crawl_control` policy reference. The `content_signal` field is documented inline.
+- [content-for-agents.md](content-for-agents.md): the broader user guide. Covers content negotiation, transforms, the JSON envelope, the other projections (robots.txt, llms.txt, tdmrep.json), and aipref signals.
+- [ai-crawl-control.md](ai-crawl-control.md): the `ai_crawl_control` policy reference (tiers, pricing, paywall behaviour).
 
 External references:
 

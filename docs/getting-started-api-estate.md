@@ -1,6 +1,6 @@
 # Getting started: API estate governance (reverse proxy in front of existing APIs)
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 ## What you will build
 
@@ -25,14 +25,14 @@ Homebrew, Docker, binary downloads, and source builds are in the [runtime manual
 sbproxy serve -f sb.yml
 ```
 
-The proxy binds to `127.0.0.1:8080` by default.
+The proxy binds to `0.0.0.0:8080` by default.
 
 ## Minimal config
 
 Save this as `sb.yml`. Every key here exists in `schemas/sb-config.schema.json` and is drawn from the shipped examples. It governs one origin keyed on `api.example.com`: callers present a bearer token, requests are rate limited per IP, and headers are rewritten on the way to and from the upstream. `example.com` is reserved (RFC 2606), so the client-facing hostname never collides with a real domain; replace it with your own hostname in production, and replace the upstream URL with your real backend.
 
 ```yaml
-# yaml-language-server: $schema=./schemas/sb-config.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
 proxy:
   http_bind_port: 8080
 
@@ -52,13 +52,16 @@ origins:
       - type: rate_limiting
         requests_per_second: 5
         burst: 10
-        key: ip
+        key: connection.remote_ip
+        headers:
+          enabled: true
+          include_retry_after: true
 
     request_modifiers:
       - headers:
           set:
             X-Forwarded-By: sbproxy
-            X-Trace-Id: "{{ uuid() }}"
+            X-Trace-Id: "{{ request.id }}"
           delete:
             - cookie
 
@@ -69,7 +72,7 @@ origins:
             Cache-Control: "public, max-age=60"
 ```
 
-To route different paths to different backends from the same hostname, add a `forward_rules` block; see `examples/forward-rules` for path-, header-, and query-based dispatch.
+The `key:` field is a CEL expression that names the rate-limit bucket: `connection.remote_ip` gives each client IP its own token bucket, and something like `request.headers["x-api-key"]` buckets per API key instead. Leave `key:` out and every caller shares one bucket. The `headers` block opts 429 responses into the `X-RateLimit-*` set and `Retry-After`; without it, throttled responses carry no rate-limit headers. `{{ request.id }}` in the `X-Trace-Id` value resolves to the proxy's request id, the same value the access log records as `request_id`. To route different paths to different backends from the same hostname, add a `forward_rules` block; see `examples/forward-rules` for path-, header-, and query-based dispatch.
 
 ## Run it and expected output
 
@@ -84,54 +87,48 @@ A request with no token is rejected before the upstream is contacted:
 ```console
 $ curl -i -H 'Host: api.example.com' http://127.0.0.1:8080/get
 HTTP/1.1 401 Unauthorized
-content-type: text/plain
+content-type: application/json
 
-unauthorized
+{"error":"unauthorized"}
 ```
 
-A request with a valid token is forwarded, and you can see the injected request headers reflected back by the echo upstream:
+A request with a valid token is forwarded, and you can see the injected request headers reflected back by the echo upstream. The echo lowercases header names, and the body below is trimmed: the hosted service sits behind a CDN that adds headers of its own.
 
 ```console
 $ curl -is -H 'Host: api.example.com' \
        -H 'Authorization: Bearer svc-token-alpha' \
        http://127.0.0.1:8080/get
 HTTP/1.1 200 OK
-content-type: application/json
+Cache-Control: public, max-age=60
+Content-Type: application/json; charset=utf-8
 x-served-by: sbproxy
-cache-control: public, max-age=60
+...
 
-{"args":{},"headers":{"Authorization":"Bearer svc-token-alpha","Host":"test.sbproxy.dev","X-Forwarded-By":"sbproxy","X-Trace-Id":"..."},"url":"https://test.sbproxy.dev/get"}
+{"method":"GET","url":"/get","headers":{"authorization":"Bearer svc-token-alpha","host":"test.sbproxy.dev","x-forwarded-by":"sbproxy","x-trace-id":"019f487ef3e573e38ad2f4f568b5c7c3",...},"query":{},"timestamp":"..."}
 ```
 
-Burst past the rate limit and the bucket starts returning 429 with a `Retry-After` header:
+Now trip the rate limit. The bucket refills at 5 tokens a second, so a sequential loop that waits on each round trip never empties it; the burst has to be concurrent:
 
 ```console
-$ for i in $(seq 1 20); do
-    curl -s -o /dev/null -w '%{http_code}\n' \
-      -H 'Host: api.example.com' \
-      -H 'Authorization: Bearer svc-token-alpha' \
-      http://127.0.0.1:8080/get
-  done
-200
-200
-200
-200
-200
-200
-200
-200
-200
-200
-429
-429
-429
-429
-429
-429
-429
-429
-429
-429
+$ seq 1 30 | xargs -P 15 -I{} curl -s -o /dev/null -w '%{http_code}\n' \
+    -H 'Host: api.example.com' \
+    -H 'Authorization: Bearer svc-token-alpha' \
+    http://127.0.0.1:8080/get | sort | uniq -c
+  10 200
+  20 429
+```
+
+Each 429 carries the rate-limit headers the policy's `headers` block enabled:
+
+```console
+HTTP/1.1 429 Too Many Requests
+content-type: application/json
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 2
+Retry-After: 2
+
+{"error":"rate limited"}
 ```
 
 A `Host` header that matches no configured origin is rejected by the proxy itself:
@@ -144,11 +141,11 @@ $ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ## You are done when
 
-- A request with no `Authorization` header returns `401 Unauthorized`.
+- A request with no `Authorization` header returns `401 Unauthorized` with `{"error":"unauthorized"}`.
 - A request with `Authorization: Bearer svc-token-alpha` returns `200 OK`.
-- The 200 response carries the `x-served-by: sbproxy` and `cache-control: public, max-age=60` headers added by `response_modifiers`.
-- The forwarded request body shows the injected `X-Forwarded-By: sbproxy` and `X-Trace-Id` headers and no `Cookie` header.
-- A burst of more than 10 requests per second from one IP starts returning `429 Too Many Requests` with a `Retry-After` header.
+- The 200 response carries the `x-served-by: sbproxy` and `Cache-Control: public, max-age=60` headers added by `response_modifiers`.
+- The echoed request body shows the injected `x-forwarded-by: sbproxy` header, an `x-trace-id` holding the proxy's request id, and no `cookie` header.
+- A concurrent burst from one IP drains the 10-token bucket and starts returning `429 Too Many Requests` with `X-RateLimit-*` and `Retry-After` headers.
 - A request with an unknown `Host` returns `404`.
 
 ## Next steps

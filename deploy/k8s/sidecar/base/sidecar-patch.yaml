@@ -45,11 +45,11 @@ spec:
             - "--config"
             - "/etc/sbproxy/sb.yml"
           ports:
+            # One listener: the data plane serves /health and /metrics
+            # on the same port. Nothing binds a second metrics port
+            # under the shipped config.
             - name: sbproxy
               containerPort: 15001
-              protocol: TCP
-            - name: metrics
-              containerPort: 15002
               protocol: TCP
           # Sized for the sidecar's published targets (cold start
           # under 500ms, RSS under 80MB at idle). Tune the upper
@@ -69,16 +69,19 @@ spec:
             capabilities:
               drop:
                 - ALL
+          # /healthz and /readyz live on the admin listener, which the
+          # sidecar config does not enable; the data plane serves
+          # /health on the proxy port itself.
           livenessProbe:
             httpGet:
-              path: /healthz
-              port: 15002
+              path: /health
+              port: 15001
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /readyz
-              port: 15002
+              path: /health
+              port: 15001
             initialDelaySeconds: 1
             periodSeconds: 5
           volumeMounts:

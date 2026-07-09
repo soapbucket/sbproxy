@@ -1,6 +1,6 @@
 # Multi-tenant deployment
 
-*Last modified: 2026-06-02*
+*Last modified: 2026-07-09*
 
 SBproxy serves multiple tenants from a single binary. Each tenant gets its own configuration scope under `proxy.tenants[]`; origins bind to a tenant via `origin.tenant_id`; request-time resolution walks origin → tenant → proxy with most-specific-wins by name.
 
@@ -19,13 +19,15 @@ A single-tenant deployment does not need to opt in to any of this. Every origin 
 
 ## Three scopes
 
-Every credential / policy / vault block is configurable at three layers, listed from broadest to most specific:
+Credentials are configurable at three layers, listed from broadest to most specific:
 
-* **`proxy.<block>`**: operator defaults shared across every tenant.
-* **`tenants[].<block>`**: tenant-scoped overrides + additions.
-* **`origins[].<block>`**: origin-scoped overrides + additions (the most specific scope).
+* **`proxy.credentials:`**: operator defaults shared across every tenant.
+* **`tenants[].credentials:`**: tenant-scoped overrides + additions.
+* **`origins[].credentials:`**: origin-scoped overrides + additions (the most specific scope).
 
 Resolution at request time walks origin → tenant → proxy. A block at a more specific scope shadows the broader scope when names match; otherwise the merged set is the union.
+
+A tenant entry carries exactly three fields today: `id`, `credentials`, and `observability`. Policies stay at proxy and origin scope (there is no `tenants[].policies:` block), and secret backends are declared once at proxy scope under `proxy.secrets.backends:` (a per-tenant `vault:` block is a future direction, not a shipped key).
 
 ```yaml
 proxy:
@@ -81,8 +83,8 @@ The synthetic tenant inherits proxy-scope defaults verbatim and adds nothing of 
 Every request carries a `tenant_id` on the request context, stamped by the routing layer from the matched origin. Downstream layers read it directly:
 
 * **Credentials.** The credentials resolver walks origin → tenant → proxy and picks the credential whose `principals:` selectors match the inbound principal.
-* **Policies.** The policy engine walks the same scopes and unions the policy list, with most-specific-first ordering for `match_principal` selectors.
-* **Vault.** Secret references resolve against the backend declared at the most specific scope that defines the named backend.
+* **Policies.** Policies apply at origin scope (with proxy-wide blocks like `rate_limits:` above them). There is no tenant-scoped policy list; a policy that should differ per tenant lives on that tenant's origins.
+* **Secrets.** Secret references resolve against the backends declared at proxy scope under `proxy.secrets.backends:`. Tenants do not declare their own backends; per-tenant isolation comes from per-backend path prefixes and the underlying store's ACLs.
 * **Observability.** Per-tenant sink fan-out routes structured log lines to the tenant's declared sinks; the global access-log keeps recording every line for the proxy operator.
 
 The resolution context is `(tenant_id, origin_idx, principal)`. A request that fails to match any tenant-scope or origin-scope credential falls back to the proxy default with no per-tenant attribution.
@@ -93,12 +95,12 @@ The resolution context is `(tenant_id, origin_idx, principal)`. A request that f
 * **Vault namespace + mount prefix.** Each vault backend enforces a configured path prefix; references that escape the prefix are rejected at URL composition. Pair with the underlying vault's ACL (Vault policies, AWS IAM, Kubernetes RBAC) for defence in depth.
 * **Tenant-scoped credentials.** A credential declared at tenant scope only applies to requests whose resolved `tenant_id` matches; the broader proxy scope does not see it.
 * **Access log + audit log carry `tenant_id`.** Every emitted row is filterable by tenant downstream.
-* **Per-tenant cardinality budgets.** A noisy tenant cannot exhaust the shared metric label space; the cardinality limiter rejects new label sets once the per-tenant budget is hit.
+* **Per-tenant cardinality budgets.** A noisy tenant cannot exhaust the shared metric label space; once a tenant's budget is hit, the cardinality limiter demotes that tenant's new label values to the `__other__` catch-all rather than minting new series. The metric update still happens.
 
 What is NOT guaranteed:
 
 * **Process-level isolation.** Tenants share the proxy process; a tenant whose policy triggers a panic crashes the whole proxy. Production deployments running mutually-untrusting tenants should run one proxy per trust boundary.
-* **Resource quotas.** Per-tenant CPU / memory caps require an outer orchestrator (cgroups, k8s ResourceQuota). The proxy enforces per-tenant rate limits and per-credential budgets, not raw resources.
+* **Resource quotas.** Per-tenant CPU / memory caps require an outer orchestrator (cgroups, k8s ResourceQuota). The traffic-shaping knobs that ship are per-origin rate-limit policies, per-credential rate limits and budgets, and the workspace-level `rate_limits:` escalation ladder; there is no dedicated tenant-keyed rate limiter on the serving path today, and none of these caps raw resources.
 
 ## Per-tenant cardinality budgets
 
@@ -119,9 +121,9 @@ proxy:
           max_series: 1000   # tighter cap for a tenant known to send wide cardinality
 ```
 
-Omitting the block leaves the tenant on the per-tenant default (10000 unique values per label). The synthetic `__default__` tenant continues to share the proxy-wide budget so single-tenant deployments stay bit-for-bit identical to the earlier single-budget behaviour.
+Omitting the block leaves the tenant on the proxy-wide per-label default (1000 unique values per label). The synthetic `__default__` tenant continues to share the proxy-wide budget so single-tenant deployments stay bit-for-bit identical to the earlier single-budget behaviour.
 
-Overflows fire the `sbproxy_label_cardinality_overflow_total{tenant_id, metric, label}` counter so dashboards can spot which tenant is approaching its cap.
+Overflows fire the `sbproxy_label_cardinality_overflow_per_tenant_total{metric, label, tenant_id}` counter so dashboards can spot which tenant is approaching its cap. The proxy-wide `sbproxy_label_cardinality_overflow_total{metric, label}` counter keeps counting the same demotions without the tenant dimension.
 
 ## Audit log `tenant_id`
 
@@ -139,8 +141,8 @@ The field is `#[serde(skip_serializing_if = "Option::is_none")]` so proxy-wide e
 
 The recommended sequence:
 
-1. **Start at proxy scope.** Declare every credential / policy / vault backend under `proxy.<block>:`. Confirm the deployment works end-to-end with the synthetic `__default__` tenant.
-2. **Add the first tenant.** Declare a tenant under `proxy.tenants[]` with its own `credentials:` + `vault:` blocks. Bind one origin to that tenant via `origin.tenant_id`.
+1. **Start at proxy scope.** Declare every credential under `proxy.credentials:` and every secret backend under `proxy.secrets.backends:`. Confirm the deployment works end-to-end with the synthetic `__default__` tenant.
+2. **Add the first tenant.** Declare a tenant under `proxy.tenants[]` with its own `credentials:` block. Bind one origin to that tenant via `origin.tenant_id`.
 3. **Migrate per-tenant overrides incrementally.** When a tenant needs its own copy of a credential (different key, different budget), declare it at tenant scope with the same `name:` so it shadows the proxy default for that tenant only.
 4. **Stand up per-tenant sinks.** Declare per-tenant observability sinks under `tenants[].observability.log.sinks:` once the credentials shape is stable. Tenant sinks default to the `external` redaction profile.
 5. **Wire isolation tests.** Add an e2e fixture per tenant that asserts the tenant cannot read another tenant's secrets through any reference shape.

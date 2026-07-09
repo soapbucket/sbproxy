@@ -1,14 +1,14 @@
 # Multi-rail 402 with Accept-Payment negotiation
-*Last modified: 2026-05-02*
+*Last modified: 2026-07-09*
 
 Both rails (x402 + MPP) configured at once. The example demonstrates
 the `Accept-Payment` header negotiation: q-value preference,
 first-match-wins per A3.1, the multi-rail body shape, and the 406
 fallback when no rail matches.
 
-The stack reuses the mock x402 facilitator from `examples/30-...` and
-the wiremock Stripe stand-in from `examples/31-...` so the demo runs
-end-to-end without external dependencies.
+The stack reuses the mock x402 facilitator from `examples/rail-x402-base-sepolia/`
+and the wiremock Stripe stand-in from `examples/rail-mpp-stripe-test/` so the
+demo runs end-to-end without external dependencies.
 
 ## How it composes
 
@@ -37,8 +37,8 @@ docker compose down -v
 
 ## How the negotiation works
 
-Per A3.1 () the proxy resolves
-the agent's preferred rail order from two signals:
+The proxy resolves the agent's preferred rail order from two signals
+(`docs/402-challenge.md` documents the wire contract):
 
 1. The `Accept-Payment` request header. Comma-separated list of rail
    tokens, optional q-value parameters (`x402;q=1, mpp;q=0.5`).
@@ -213,10 +213,10 @@ crate; no operator-set cargo feature is needed.
 
 ## Related docs
 
-- `docs/billing-rails.md` - operator-facing billing rails reference.
--  (A3.1) - wire shape of the
-  402 / 406 bodies and the negotiation rules.
--  (A3.2) - quote-token JWS shape.
+- `docs/ai-crawl-control.md` - operator-facing crawl-control and
+  billing reference.
+- `docs/402-challenge.md` - wire shape of the 402 / 406 bodies, the
+  negotiation rules, and the quote-token JWS shape.
 - `examples/rail-x402-base-sepolia/` - x402 rail in isolation.
 - `examples/rail-mpp-stripe-test/` - MPP rail in isolation.
 - `examples/quote-token-replay-jwks/` - JWKS endpoint and

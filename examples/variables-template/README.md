@@ -1,10 +1,10 @@
 # Variables and templates
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Variables and templates](../../docs/assets/variables-template.gif)
 
-The `variables` block declares static, per-origin key-value pairs that the template engine exposes as `{{ variables.<name> }}`. Environment variables surface as `{{ env.<NAME> }}`. This example wires both into request headers (`X-Api-Version`, `X-Region-Label`, `X-Region-Env`, `X-Beta-Api`) so `test.sbproxy.dev/headers` echoes them back, demonstrating that interpolation happens at request time. Nested variables (e.g. `feature_flags.beta_api`) are addressable with dot notation.
+The `variables` block declares static, per-origin key-value pairs that the template engine exposes as `{{ variables.<name> }}`. Environment variables surface as `{{ env.<NAME> }}`. This example wires both into request headers (`X-Api-Version`, `X-Region-Label`, `X-Region-Env`, `X-Beta-Api`) so `test.sbproxy.dev/headers` echoes them back. Both variable and environment interpolation happen once, at config load, not per request: change `DEPLOY_REGION` and restart to see a new value. Per-request values come from the separate `{{ request.* }}` template keys (see the headers-and-cors example). Nested variables (e.g. `feature_flags.beta_api`) are addressable with dot notation.
 
 ## Run
 

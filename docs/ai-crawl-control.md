@@ -1,5 +1,5 @@
 # AI Crawl Control + Pay Per Crawl
-*Last modified: 2026-07-05*
+*Last modified: 2026-07-09*
 
 ![GPTBot receiving a 402 challenge, then the article after presenting a Crawler-Payment token](assets/ai-crawl-control.gif)
 
@@ -101,14 +101,14 @@ policies:
           amount_micros: 5000          # $0.005 per crawl
           currency: USD
         free_preview_bytes: 1024       # cooperative crawlers get 1 KiB free
-        paywall_position: hard
+        paywall_position: top_of_page
       - route_pattern: /articles/*
         price:
           amount_micros: 1000          # $0.001 per crawl
           currency: USD
         content_shape: markdown        # Markdown form only
         free_preview_bytes: 4096
-        paywall_position: soft
+        paywall_position: inline
       - route_pattern: /articles/*
         price:
           amount_micros: 500           # $0.0005 per crawl
@@ -127,7 +127,7 @@ policies:
 | `price.currency` | string | ISO-4217 code. Must match the policy-level `currency` for now. |
 | `content_shape` | enum | One of `html`, `markdown`, `json`, `pdf`, `other`. Advisory; surfaced in metrics and the redeem payload but not yet used as a tier filter. |
 | `free_preview_bytes` | u64, optional | Byte budget the crawler may read without paying. Surfaced in the challenge body so cooperative crawlers can decide up front whether the preview alone meets their need. |
-| `paywall_position` | enum, optional | Hint to the crawler about where the paywall sits: `hard` (no content without payment), `soft` (preview, then paywall), `metered` (N free per period). |
+| `paywall_position` | enum, optional | Hint to the crawler about where the paywall sits in the rendered response: `top_of_page` (paywall replaces the entire body; any free preview is a separate excerpt), `inline` (free preview served inline, paywall follows in the same body), `bottom_of_page` (paywall after the full or near-full preview; discouraged for high-value content). |
 
 The first tier whose `route_pattern` matches wins. When no tier matches, the policy falls back to the top-level `price` and `currency`. An empty `tiers` list keeps the original flat-price behaviour.
 
@@ -145,22 +145,26 @@ policies:
     price: 0.001
     currency: USD
     ledger:
-      endpoint: "https://ledger.internal"
+      url: "https://ledger.internal"   # required; plain http:// is rejected
       key_id: "sb-ledger-2026-q2"
-      key_file: "${SBPROXY_LEDGER_HMAC_KEY_FILE}"
-      workspace_id: "default"
-      agent_id: "openai-gptbot"        # forwarded into the redeem payload
-      agent_vendor: "OpenAI"
-      per_attempt_timeout_ms: 5000
-      total_timeout_ms: 30000
-      max_attempts: 5                  # hard-capped at 5 by the ADR
+      secret_ref:
+        env: SBPROXY_LEDGER_HMAC_KEY   # env var holding the hex-encoded HMAC key
+      workspace_id: "default"          # default: "default"
+      idempotency_key_header: "Idempotency-Key"   # default
+      timeout_ms: 5000                 # per-attempt timeout; default 5000
+      retry:
+        max_attempts: 5                # 1..=5; hard-clamped by the client
+        initial_backoff_ms: 250        # default 250
+        max_backoff_ms: 5000           # default 5000
       breaker:
-        failure_threshold: 10
-        success_threshold: 1
-        open_duration_ms: 5000
+        failure_threshold: 10          # consecutive failures that open; default 10
+        success_threshold: 1           # half-open successes to close; default 1
+        open_duration_ms: 5000         # default 5000
 ```
 
-The client refuses to construct against a non-HTTPS endpoint at config-load time. Plain HTTP is a hard error because the request envelope carries an HMAC over the body, and TLS is the only thing keeping the body itself confidential.
+The HMAC key resolves through `secret_ref`, which takes either `env: <VAR>` (an environment variable holding the hex-encoded key) or `secret: <name>` (a logical secret resolved through the secrets layer). For dev configs and tests only, an inline `key_hex:` is honoured when `secret_ref` is absent; it should not appear in a production `sb.yml`. The agent identity fields on the redeem payload come from the request-time agent-class resolver, not from ledger config.
+
+The client refuses to construct against a non-HTTPS `url` at config-load time. Plain HTTP is a hard error because the request envelope carries an HMAC over the body, and TLS is the only thing keeping the body itself confidential.
 
 ### Request envelope
 
@@ -205,9 +209,9 @@ Exponential backoff with full jitter, max 5 attempts, per-attempt deadline 5 s, 
 
 Hard failures (`ledger.token_already_spent`, `ledger.signature_invalid`, `ledger.bad_request`) translate directly to a 402 to the crawler. There is no point retrying a token the ledger already rejected as spent.
 
-The circuit breaker opens after 10 consecutive failures over a 30 s window, half-opens after 5 s with one probe, and closes on probe success. While the breaker is open, the client returns a synthetic `ledger.unavailable` error without making the network call. The policy treats that as "ledger is down" and applies the configured `on_ledger_failure` action (default fail-closed).
+The circuit breaker opens after 10 consecutive failures, half-opens after 5 s with one probe, and closes on probe success. While the breaker is open, the client returns a synthetic `ledger.unavailable` error without making the network call. The policy treats that as "ledger is down" and fails closed: the crawler gets a 503 with a `ledger_unavailable` JSON body and a `Retry-After` header. There is no `on_ledger_failure` knob; fail-closed is the fixed behaviour, because failing open would hand out the content the paywall exists to price.
 
-A 503 response with `Retry-After` propagates straight to the crawler: the 402 response carries `Retry-After` so the crawler knows when to come back. This is the one case where the policy emits `Retry-After` on a 402.
+A ledger `Retry-After` propagates straight to the crawler on that 503 (defaulting to 5 seconds when the ledger did not send one), so the crawler knows when to come back.
 
 ### Failure modes
 
@@ -217,7 +221,7 @@ A 503 response with `Retry-After` propagates straight to the crawler: the 402 re
 | 200 success, not redeemed | 402 with the challenge body. The token was valid format but the ledger refused (out of balance, expired). |
 | 409 `token_already_spent` | 402, no retry. |
 | 4xx other | 402, no retry, log at WARN. |
-| 5xx, transient envelope, breaker open | Apply `on_ledger_failure` (default fail-closed -> 503). |
+| 5xx, transient envelope, breaker open | Fail closed: 503 with a `ledger_unavailable` body and `Retry-After`. Not configurable. |
 
 ## Agent classes and per-vendor pricing
 
@@ -303,19 +307,17 @@ Cardinality budgets are enforced by `sbproxy-observe::cardinality::CardinalityLi
 
 | Metric | Type | Notes |
 |---|---|---|
-| `sbproxy_ledger_redeem_total{result, agent_id, agent_vendor, payment_rail}` | counter | Per-redeem outcome. `result` is one of `success`, `denied`, `error`. |
-| `sbproxy_ledger_redeem_duration_seconds_bucket` | histogram | Tail-latency of the ledger round-trip. Carries trace exemplars. |
-| `sbproxy_ledger_circuit_breaker_state{endpoint}` | gauge | 0 closed, 1 half-open, 2 open. |
-| `sbproxy_ledger_circuit_breaker_transitions_total{endpoint, from, to}` | counter | Breaker flap counter. |
-| `sbproxy_requests_total{agent_id, agent_class, agent_vendor, payment_rail, content_shape}` | counter | Per-request outcome. |
+| `sbproxy_ledger_redeem_duration_seconds{host, outcome}` | histogram | Latency of the ledger round-trip, one observation per redeem. `outcome` is `success`, `transient_failure`, or `hard_failure`; count redeems from the histogram's `_count` series. Carries trace exemplars. There is no separate `sbproxy_ledger_redeem_total` counter. |
+| `sbproxy_circuit_breaker_transitions_total{origin, from_state, to_state}` | counter | Breaker flap counter, shared with every other circuit breaker in the proxy. There is no ledger-specific breaker-state gauge. |
+| `sbproxy_requests_total{hostname, method, status, agent_id, agent_class, agent_vendor, payment_rail, content_shape}` | counter | Per-request outcome. |
 
 The per-agent dashboard (`deploy/dashboards/per-agent.json`) groups every panel by `agent_class` plus `agent_vendor`, so operators see one row per vendor and one row each for the sentinels. The audit-log dashboard (`deploy/dashboards/audit-log.json`) shows admin actions on `ai_crawl_control` tier edits.
 
 ### Tracing
 
-The HTTP ledger client emits one outbound span per attempt, named `sbproxy.ledger.redeem`. The span carries `sbproxy.ledger.idempotency_key` so operators correlating across the proxy and the ledger can grep both sides for the same key. W3C TraceContext propagates on the outbound request; if the ledger emits OTel spans, the trace stitches end-to-end without manual correlation.
+Per-attempt ledger spans are design-stage: the intended shape is one outbound span per attempt named `sbproxy.ledger.redeem`, carrying `sbproxy.ledger.idempotency_key` and W3C TraceContext on the outbound request so the trace stitches end-to-end with a ledger that emits OTel spans. The HTTP ledger client does not emit those spans or inject `traceparent` today.
 
-Exemplars on `sbproxy_ledger_redeem_duration_seconds_bucket` let Grafana jump from "this latency outlier" straight to the matching trace in Tempo.
+What ships now: exemplars on `sbproxy_ledger_redeem_duration_seconds_bucket` carry the active trace id, so Grafana can jump from "this latency outlier" straight to the matching trace in Tempo.
 
 ## Limitations
 

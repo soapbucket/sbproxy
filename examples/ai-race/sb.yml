@@ -33,6 +33,9 @@ origins:
       type: ai_proxy
       routing:
         strategy: race
+      # Each non-OpenAI racer maps the requested gpt-4o-mini to a model
+      # it actually serves, so all three providers can win the race and
+      # the response's `model` field shows which one answered.
       providers:
         - name: openai
           api_key: ${OPENAI_API_KEY}
@@ -40,9 +43,13 @@ origins:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           default_model: claude-haiku-4-5
+          model_map:
+            gpt-4o-mini: claude-haiku-4-5
         - name: groq
           api_key: ${GROQ_API_KEY}
           default_model: llama-3.1-8b-instant
+          model_map:
+            gpt-4o-mini: llama-3.1-8b-instant
       resilience:
         outlier_detection:
           threshold: 0.5

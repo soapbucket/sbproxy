@@ -1,10 +1,10 @@
 # DDoS protection
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![DDoS protection](../../docs/assets/ddos-protection.gif)
 
-Demonstrates the `ddos_protection` policy. The proxy tracks a sliding 1-second window per source IP. When the rate exceeds `request_rate_threshold: 10`, the offending IP is blocked for `block_duration: 10s` and every subsequent request returns `429` with a `Retry-After` header until the block lifts. The whitelist exempts `127.0.0.1` and `10.0.0.0/8` from the check entirely (handy for health checkers and internal load testers). Distinct from `rate_limiting`: rate limiting throttles continuously and per request; DDoS protection trips a hard block once breached and keeps it for a fixed duration. Action is `echo` so each accepted request is reflected back, and the origin is reached on `127.0.0.1:8080` via the `ddos.local` Host header.
+Demonstrates the `ddos_protection` policy. The proxy tracks a sliding 1-second window per source IP. When the rate exceeds `request_rate_threshold: 10`, the offending IP is blocked for `block_duration: 10s` and every subsequent request returns `429` with a `Retry-After` header until the block lifts. The whitelist exempts `10.0.0.0/8` from the check entirely (handy for health checkers and internal load testers); `127.0.0.1` is deliberately not listed so the local curls below can trip the block. Distinct from `rate_limiting`: rate limiting throttles continuously and per request; DDoS protection trips a hard block once breached and keeps it for a fixed duration. Action is `echo` so each accepted request is reflected back, and the origin is reached on `127.0.0.1:8080` via the `ddos.local` Host header.
 
 ## Run
 

@@ -1,5 +1,5 @@
 # robots.txt + llms.txt projections
-*Last modified: 2026-05-02*
+*Last modified: 2026-07-09*
 
 Demonstrates the Wave 4 text-format policy-graph projections.
 Cooperative crawlers fetch one of three documents to discover an
@@ -141,7 +141,8 @@ the $0.005 markdown tier; the html shape stays at $0.001.
 
 ## Related docs
 
--  - A4.1 projections ADR.
+- `docs/content-for-agents.md` - the four generated projections and
+  their refresh-on-reload semantics.
 - `docs/ai-crawl-control.md` - feature reference for `ai_crawl_control`.
 - `examples/markdown-for-agents/` - companion bundle for the Markdown
   projection on the wire.

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # MCP gateway with principal-aware RBAC and per-tool quotas.
 #
 # rbac_policies are default-deny: a caller matching no rule is refused.

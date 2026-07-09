@@ -1,5 +1,5 @@
 # Web Bot Auth
-*Last modified: 2026-06-17*
+*Last modified: 2026-07-09*
 
 ![an unsigned crawler request rejected with 401 and a signature-required challenge](assets/web-bot-auth.gif)
 
@@ -40,8 +40,10 @@ authentication:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `agents` | list | required, non-empty | Directory of known agents. Each `key_id` must be unique. |
+| `agents` | list | `[]` | Inline directory of known agents. Each `key_id` must be unique. May be empty when `directory:` is set; at least one of the two is required. |
 | `clock_skew_seconds` | int | 30 | Tolerance for the `created` / `expires` parameters. |
+| `directory` | object | unset | Dynamic hosted-directory configuration: `url` (HTTPS only), `refresh_interval_secs` (default 24h, clamped to 5m-24h), `negative_cache_ttl_secs`, `stale_grace_secs`, plus self-signature verification on by default. When set, the provider resolves `Signature-Agent` headers by fetching the JWKS-shaped hosted directory. |
+| `nonce_policy` | string | `strict` | Replay policy when the verifier observes a `nonce` parameter. `strict` fails a replayed nonce; `permissive` counts it in metrics but still verifies (shadow rollouts). Inert unless a nonce store is wired. |
 | `agents[].name` | string | required | Human-readable agent name. Surfaced in logs. |
 | `agents[].key_id` | string | required | `keyid` parameter the agent advertises in `Signature-Input`. |
 | `agents[].algorithm` | string | required | `ed25519` or `hmac_sha256`. |
@@ -50,7 +52,7 @@ authentication:
 
 ## Verdicts
 
-The provider produces one of four verdicts; only the first allows the request:
+The provider produces one of five verdicts; only the first allows the request:
 
 | Verdict | Action | Cause |
 |---------|--------|-------|
@@ -58,6 +60,7 @@ The provider produces one of four verdicts; only the first allows the request:
 | `Missing` | `401` | No `Signature-Input` header. |
 | `UnknownAgent` | `401` | `keyid` claimed in `Signature-Input` is not in the directory. |
 | `Failed` | `401` | Header parse failure, signature mismatch, expired, or required component missing. |
+| `DirectoryUnavailable` | `401` | The dynamic directory could not be fetched or validated (HTTPS violation, allowlist mismatch, fetch deadline, invalid self-signature, stale grace exceeded). The underlying reason lands in the structured log. |
 
 The denial body is intentionally generic (`bot_auth: signature required` / `bot_auth: verification failed`); detailed reasons land in the structured log under the `sbproxy::auth` target so an operator can see exactly which check failed without leaking the same detail to a probing crawler.
 
@@ -153,7 +156,6 @@ The deferred check fires only when `Signature-Input` actually covers `content-di
 
 ## Limitations
 
-- The OSS directory is inline in YAML. Dynamic directory refresh from a hosted JWKS-shaped document is on the roadmap; the same `Directory` trait will back both shapes.
 - HTTP/3 / QUIC is currently disabled entirely (no QUIC listener is started) pending native HTTP/3 support in Pingora, so there is no H3 path for `bot_auth` to handle today.
 
 ## See also

@@ -1,8 +1,8 @@
 # OpenAPI schema validation
 
-*Last modified: 2026-04-26*
+*Last modified: 2026-07-09*
 
-The `openapi_validation` policy loads an OpenAPI 3.0 document at startup and validates each incoming request body against the matching operation's `requestBody` schema. Requests whose path + method are not described in the spec, or whose `Content-Type` has no schema, are passed through untouched.
+The `openapi_validation` policy loads an OpenAPI 3.0 document at startup and validates each incoming request body against the matching operation's `requestBody` schema. Requests whose path + method are not described in the spec, or whose `Content-Type` has no schema, are passed through untouched, with one exception: when the matched operation declares `requestBody.required: true`, a request whose `Content-Type` matches no schema is rejected rather than passed through.
 
 Use it to:
 
@@ -29,7 +29,7 @@ OpenAPI path templates like `/users/{id}` are compiled to anchored regexes (`^/u
 2. The corresponding operation has the request method.
 3. The request `Content-Type` (leading media type, parameters stripped) matches a key under that operation's `requestBody.content`.
 
-If any of these is missing, the policy treats the request as out of scope and forwards it without inspection.
+If any of these is missing, the policy treats the request as out of scope and forwards it without inspection, with one exception: when the operation's spec declares `requestBody.required: true`, a matched path + method whose `Content-Type` matches no schema (absent, wrong, or unsupported) fails validation instead of passing through. Otherwise a client could skip the body contract by sending an unexpected `Content-Type`.
 
 ## Schema enforcement
 

@@ -1,4 +1,4 @@
-# Convenience runner for the 24-ai-crawl-tiered example bundle.
+# Convenience runner for the ai-crawl-tiered example bundle.
 #
 # Targets:
 #   make up      - docker compose up -d --wait

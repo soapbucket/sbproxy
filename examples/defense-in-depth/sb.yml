@@ -9,18 +9,18 @@
 #   3. rate_limiting        - is this IP within its RPS budget?
 #   4. concurrent_limit     - is this IP within its in-flight cap?
 #   5. JWT auth             - is this user authenticated?
-#   6. forward_auth         - does our auth service still trust this token?
-#   7. request_validator    - does the body match the contract?
-#   8. security_headers     - injected on the response (defence for browsers)
-#   9. CORS                 - cross-origin policy for browser clients
+#   6. request_validator    - does the body match the contract?
+#   7. security_headers     - injected on the response (defence for browsers)
+#   8. CORS                 - cross-origin policy for browser clients
 #
 # The layers run in policy / auth / transform order. A failure in any
 # layer short-circuits with the configured status. The upstream only
 # sees requests that survived everything.
 #
-# This file does not enable mTLS. mTLS is shown standalone in 85; pair
-# the two by setting `proxy.mtls` here when the deployment requires
-# certificate-based service identity in addition to JWT user auth.
+# This file does not enable mTLS. mTLS is shown standalone in
+# examples/mtls-client-auth/; pair the two by setting `proxy.mtls` here
+# when the deployment requires certificate-based service identity in
+# addition to JWT user auth.
 #
 # Run:
 #   make run CONFIG=examples/defense-in-depth/sb.yml

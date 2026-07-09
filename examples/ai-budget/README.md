@@ -1,8 +1,8 @@
 # AI gateway: hierarchical budget with downgrade
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
-Two stacked budget limits with `on_exceed: downgrade`. The workspace-wide cap allows up to USD 500 of spend per month and downgrades to `claude-haiku-4-5` when exceeded. The per-API-key cap allows up to 1,000,000 tokens per day and downgrades to `anthropic/claude-3-haiku` (served by OpenRouter) when exceeded. Whichever limit fires first applies its `downgrade_to` model rewrite to subsequent requests until the period rolls over. Requests below both caps run on `claude-sonnet-4-5` (the configured default). Each downgrade fires the `sbproxy_ai_budget_utilization_ratio` gauge so dashboards can show how close each scope is to its cap.
+Two stacked budget limits with `on_exceed: downgrade`. The workspace-wide cap allows up to USD 500 of spend per month and downgrades to `claude-haiku-4-5` when exceeded. The per-API-key cap allows up to 1,000,000 tokens per day and downgrades to `anthropic/claude-3-haiku` (served by OpenRouter) when exceeded. Whichever limit fires first applies its `downgrade_to` model rewrite to subsequent requests until the period rolls over. Requests below both caps run on `claude-haiku-4-5` (the configured default). Each downgrade fires the `sbproxy_ai_budget_utilization_ratio` gauge so dashboards can show how close each scope is to its cap.
 
 ## Run
 
@@ -16,42 +16,42 @@ Both API keys are required so the downgrade path can land on a real provider.
 
 ## Try it
 
-A normal request runs on Sonnet:
+A request under both caps runs on Haiku, the configured default:
 
 ```bash
 $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
     -d '{
-      "model": "claude-sonnet-4-5",
-      "messages": [{"role": "user", "content": "Summarise the budget config."}]
-    }' \
-  | jq -r '.model'
-claude-sonnet-4-5
-```
-
-After workspace monthly spend crosses USD 500, the same request body is rewritten to Haiku before reaching the upstream:
-
-```bash
-$ curl -s http://127.0.0.1:8080/v1/chat/completions \
-    -H 'Host: ai.local' \
-    -H 'Content-Type: application/json' \
-    -d '{
-      "model": "claude-sonnet-4-5",
+      "model": "claude-haiku-4-5",
       "messages": [{"role": "user", "content": "Summarise the budget config."}]
     }' \
   | jq -r '.model'
 claude-haiku-4-5
 ```
 
-If the API-key daily token cap fires first, the rewrite lands on the OpenRouter Haiku route:
+After workspace monthly spend crosses USD 500, the workspace limit rewrites request bodies to its `downgrade_to` model, `claude-haiku-4-5`. Since that is the same model this example already runs on, the response model does not change here; the rewrite becomes visible when clients ask for a pricier model:
+
+```bash
+$ curl -s http://127.0.0.1:8080/v1/chat/completions \
+    -H 'Host: ai.local' \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "claude-haiku-4-5",
+      "messages": [{"role": "user", "content": "Summarise the budget config."}]
+    }' \
+  | jq -r '.model'
+claude-haiku-4-5
+```
+
+If the API-key daily token cap fires first, the rewrite lands on the OpenRouter Haiku route and the response model changes:
 
 ```bash
 $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Authorization: Bearer some-virtual-key' \
     -H 'Content-Type: application/json' \
-    -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}' \
+    -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}' \
   | jq -r '.model'
 anthropic/claude-3-haiku
 ```

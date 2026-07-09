@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-06-08*
+*Last modified: 2026-07-09*
 
 Stability guarantees for every field in `sb.yml`. Check a field's tier before relying on it in production.
 
@@ -46,7 +46,7 @@ A `disabled` field still parses but has no runtime effect today.
 
 1. A field moves from `alpha` to `beta` once its interface is reviewed, it has integration tests, and it has been in at least one release.
 2. A field moves from `beta` to `stable` once it has been in production use by at least one internal deployment for one full release cycle without interface changes.
-3. Stable fields are never silently removed. The process is: deprecate (add `x-deprecated` annotation in schema), warn in logs, remove in the next major version.
+3. Stable fields are never silently removed. The process is: deprecate (the config compiler logs a structured deprecation warning at load time naming the legacy and canonical field), then remove in the next major version. A schema-level `x-deprecated` annotation is planned but not shipped.
 
 ---
 
@@ -77,7 +77,7 @@ A `disabled` field still parses but has no runtime effect today.
 | `enabled` | boolean | false | **beta** | Activates ACME. |
 | `email` | string | "" | **beta** | Contact email for the ACME account. |
 | `directory_url` | string | Let's Encrypt prod | **beta** | ACME directory endpoint URL. |
-| `challenge_types` | array | `[tls-alpn-01, http-01]` | **beta** | Challenge method preference list. |
+| `challenge_types` | array | `[http-01]` | **beta** | Challenge method preference list. `tls-alpn-01` is accepted in the list but not yet served. |
 | `storage_backend` | string | `redb` | **beta** | Cert persistence backend. |
 | `storage_path` | string | `/var/lib/sbproxy/certs` | **beta** | Filesystem path for cert storage. |
 | `renew_before_days` | integer | 30 | **beta** | Days before expiry to renew. |
@@ -105,7 +105,7 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. These
 | `cors` | - | object | - | **stable** | CORS policy. |
 | `hsts` | - | object | - | **stable** | HSTS policy. |
 | `compression` | - | object | - | **stable** | Response compression. |
-| `session_config` | - | object | - | **beta** | Session cookie management. |
+| `session` | `session_config` | object | - | **beta** | Session cookie management. |
 | `force_ssl` | - | boolean | false | **stable** | Redirect HTTP to HTTPS. |
 | `allowed_methods` | - | array | `[]` (all) | **stable** | HTTP method allowlist. |
 | `forward_rules` | - | array | `[]` | **beta** | Conditional routing rules. |
@@ -150,7 +150,10 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. These
 | `min_size` | - | integer | 0 | **stable** |
 | `level` | - | integer | - | **beta** |
 
-### Session Config (`session_config:`)
+`level` is parsed but not applied: the encoders use their library
+default levels (gzip and zstd defaults, brotli quality 4).
+
+### Session Config (`session:`, alias `session_config:`)
 
 | Field | Alias | Type | Default | Stability |
 |---|---|---|---|---|

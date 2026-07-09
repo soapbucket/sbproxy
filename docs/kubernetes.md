@@ -1,6 +1,6 @@
 # Running sbproxy on Kubernetes
 
-*Last modified: 2026-05-20*
+*Last modified: 2026-07-09*
 
 The OSS Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`.
 
@@ -47,12 +47,14 @@ metadata:
 spec:
   config: |
     origins:
-      - host: "*"
+      "demo.example.com":
         action:
           type: mock
           status: 200
           body: "hello from sbproxy\n"
 ```
+
+`origins` is a map keyed by hostname, not a list. Check the embedded document with `sbproxy validate` before applying it; the operator does not deeply validate it.
 
 ## Define an `SBProxy`
 
@@ -63,7 +65,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: ghcr.io/soapbucket/sbproxy:0.1.0
+  image: ghcr.io/soapbucket/sbproxy:1.5.0
   configRef: demo-config
   replicas: 2
   port: 8080
@@ -92,7 +94,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: ghcr.io/soapbucket/sbproxy:0.1.0
+  image: ghcr.io/soapbucket/sbproxy:1.5.0
   configRef: demo-config
   replicas: 2
   port: 8080
@@ -212,14 +214,13 @@ expired.
 
 ## Local smoke test
 
-`make k8s-operator-smoke` runs the full install / hot-reload / leader-election flow against a local kind cluster. This is intentionally local-only because it builds release binaries, creates Docker images, and boots a kind cluster.
+`make k8s-operator-smoke` runs the full install / hot-reload / leader-election flow against a local kind cluster. This is intentionally local-only because it builds release binaries, creates Docker images, and boots a kind cluster; there is no CI workflow that runs it.
 
-The job:
+The target:
 
-1. Frees disk space on the runner.
-2. Builds the proxy and operator CI binaries with `cargo build --profile release-fast -p sbproxy -p sbproxy-k8s-operator --locked`.
-3. Wraps each binary in a tiny distroless image (`Dockerfile.ci` and `crates/sbproxy-k8s-operator/Dockerfile.ci`).
-4. Brings up a kind cluster via `helm/kind-action@v1`, loads both images with `kind load docker-image`, helm-installs the chart, and runs `deploy/helm/sbproxy/test/smoke.sh`.
+1. Builds the proxy and operator binaries with `cargo build --profile release-fast -p sbproxy -p sbproxy-k8s-operator --locked`.
+2. Wraps each binary in a small image (`Dockerfile.ci` and `crates/sbproxy-k8s-operator/Dockerfile.ci`).
+3. Creates a kind cluster (`kindest/node:v1.30.0`), loads both images with `kind load docker-image`, helm-installs the chart, and runs `deploy/helm/sbproxy/test/smoke.sh`.
 
 The Make target wraps the manual sequence below:
 
@@ -228,7 +229,7 @@ The Make target wraps the manual sequence below:
 cargo build --profile release-fast -p sbproxy -p sbproxy-k8s-operator
 docker build -t sbproxy:ci -f Dockerfile.ci .
 docker build -t sbproxy-operator:ci -f crates/sbproxy-k8s-operator/Dockerfile.ci .
-kind create cluster --name sbproxy-smoke
+kind create cluster --name sbproxy-smoke --image kindest/node:v1.30.0
 kind load docker-image sbproxy:ci sbproxy-operator:ci --name sbproxy-smoke
 SKIP_KIND_CREATE=1 NO_CLEANUP=1 \
   PROXY_IMAGE=sbproxy:ci OPERATOR_IMAGE=sbproxy-operator:ci \
@@ -248,4 +249,4 @@ The script verifies, in order:
 3. Updating the `SBProxyConfig` either hot-reloads the pod (when `adminAuthSecretRef` is set) without bumping its restart count, or rolls the Deployment via the config-hash annotation (the default).
 4. Killing the leader operator pod hands the Lease off to the standby replica within 30s.
 
-The workflow is currently marked `continue-on-error: true` so a flaky kind run cannot block PRs while the workflow stabilises. That is temporary; once a green streak shows the run is reliable, the flag is removed.
+A failed run leaves the kind cluster in place (the manual sequence sets `NO_CLEANUP=1`), so you can inspect pods and operator logs before deleting the cluster with `kind delete cluster --name sbproxy-smoke`.

@@ -4,6 +4,7 @@
 # same fallback array. See docs/self-hosting.md for the full narrative.
 #
 # Run:
+#   export OPENAI_API_KEY=sk-...
 #   make run CONFIG=examples/self-hosting/sb.yml
 proxy:
   http_bind_port: 8080
@@ -15,11 +16,12 @@ origins:
       routing:
         strategy: fallback_chain
       providers:
-        # Provider zero: the model runs on this box. engine defaults to
-        # auto; the fit planner picks the quant the GPU can run.
+        # Provider zero: the model runs on this box. No base_url: a
+        # served provider is hosted locally, so the gateway spawns the
+        # engine and resolves its loopback port itself (writing
+        # base_url here is a config error). engine defaults to auto;
+        # the fit planner picks the quant the GPU can run.
         - name: local
-          base_url: http://127.0.0.1:8000/v1
-          allow_private_base_url: true
           default_model: qwen3-14b
           models:
             - qwen3-14b

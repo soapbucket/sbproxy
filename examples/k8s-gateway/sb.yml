@@ -42,12 +42,15 @@
 # Run:
 #   make run CONFIG=examples/k8s-gateway/sb.yml
 #
-# Test (simulating the Ingress in front, IP 10.0.0.5):
-#   curl -H 'Host: api.example.com' \
+# Test (simulating the Ingress in front; 127.0.0.1 is in trusted_proxies):
+#   curl -i -H 'Host: api.example.com' \
 #        -H 'X-Forwarded-For: 203.0.113.7' \
 #        http://127.0.0.1:8080/headers
-#   # Upstream sees X-Forwarded-For: 203.0.113.7 (recovered) and
-#   # X-Request-Id: <uuid>. Echoed in the response.
+#   # The response carries X-Request-Id: <uuid>. Because the curl peer
+#   # (127.0.0.1) is a trusted proxy, 203.0.113.7 is honoured as the
+#   # client IP for rate limits and logs. The hosted echo sits behind a
+#   # CDN that rewrites forwarding headers with its own values, so
+#   # verify via X-Request-Id rather than the echoed XFF.
 
 proxy:
   http_bind_port: 8080
@@ -71,7 +74,11 @@ origins:
       # In production this is the K8s Service DNS name:
       # url: http://backend.namespace.svc.cluster.local:8080
       url: https://test.sbproxy.dev
-      host_override: backend.namespace.svc.cluster.local
+      # Production value: the Service hostname the Pods route by.
+      # host_override: backend.namespace.svc.cluster.local
+      # Live default: the shared test upstream routes by Host and only
+      # serves test.sbproxy.dev, so override to that.
+      host_override: test.sbproxy.dev
       service_discovery:
         enabled: true
         refresh_secs: 30

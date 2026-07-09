@@ -1,6 +1,6 @@
 # AI crawl control with Pay Per Crawl
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![AI crawl control with Pay Per Crawl](../../docs/assets/ai-crawl-control.gif)
 
@@ -27,9 +27,12 @@ curl -i -H 'Host: blog.local' \
 ```
 
 ```bash
-# Redeem a valid token - 200, the request reaches the upstream. The
-# token is single-use; the next call without a fresh token gets 402 again.
-curl -s -H 'Host: blog.local' \
+# Redeem a valid token - the request passes the paywall and returns
+# whatever the upstream answers. The public echo service only
+# implements /get, so /article comes back 404 from upstream; the
+# absence of a 402 is what shows the paywall opened. The token is
+# single-use; the next call without a fresh token gets 402 again.
+curl -i -H 'Host: blog.local' \
      -H 'User-Agent: GPTBot/1.0' \
      -H 'crawler-payment: token-aaa-001' \
      http://127.0.0.1:8080/article

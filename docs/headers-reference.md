@@ -1,52 +1,86 @@
-# Response headers reference
-*Last modified: 2026-05-04*
+# Headers reference
+*Last modified: 2026-07-09*
 
-Every response header SBproxy can stamp on a client-facing response,
-with the config that triggers it. This is the single source of truth;
-`docs/manual.md` and the marketing pages link here rather than
-duplicating the table inline.
+Every header SBproxy reads or stamps, with the config that triggers it.
+This is the single source of truth; `docs/manual.md` and the marketing
+pages link here rather than duplicating the table inline.
 
-## Always present
+The proxy touches headers in three places: request headers it reads
+from the client, response headers it emits back to the client, and
+headers it stamps on outbound requests it makes itself (webhooks,
+mirrors, shadow traffic, ledger calls). Each gets its own section
+below.
 
-These headers fire on every response from the data plane, regardless
-of config. Use them to anchor SIEM rules and incident-response
-runbooks.
+## Request headers the proxy reads
+
+These arrive on the inbound request. The proxy consumes them; most are
+also forwarded or stripped depending on trust.
 
 | Header | Description | Source |
 |---|---|---|
-| `x-sb-session-id` | ULID identifying the client session. Stable across requests on the same connection. | `crates/sbproxy-observe/src/capture.rs` |
-| `x-sb-request-id` | Per-request UUID. Use to correlate proxy logs with upstream logs. | `crates/sbproxy-config/src/types.rs` (default) |
-| `traceparent` | W3C Trace Context. Generated when no inbound `traceparent` is present, otherwise propagated. | `crates/sbproxy-core/src/server.rs` |
+| `X-Request-Id` | Correlation ID. If present (and `proxy.correlation_id.enabled`, the default), its value is adopted as the request's correlation ID; otherwise the proxy mints a UUID v4. The header name is configurable via `proxy.correlation_id.header`. | `crates/sbproxy-core/src/server/request_phase.rs` |
+| `x-sb-session-id` | Caller-supplied session ULID. Captured when it parses; invalid values are dropped and counted. | `crates/sbproxy-observe/src/capture.rs` |
+| `x-sb-parent-session-id` | Caller-supplied parent session ULID for chaining agent sessions. Never auto-generated. | `crates/sbproxy-observe/src/capture.rs` |
+| `x-sb-user-id` | Caller-supplied user identifier. First in the user-ID resolution order, ahead of the JWT `sub` claim and forward-auth headers. | `crates/sbproxy-observe/src/capture.rs` |
+| `x-sb-property-*` | Per-request session properties captured onto the request event. Length-capped, allowlist-checked, and redacted per `properties.redact`. | `crates/sbproxy-observe/src/capture.rs` |
+| `x-sb-flags` | Per-request feature flags. `x-sb-flags: debug` turns on the debug response headers listed below and a DEBUG-level log line. Kill switch: `--disable-sb-flags` / `SB_DISABLE_SB_FLAGS=1`. | `crates/sbproxy-core/src/sb_flags.rs` |
+| `x-sbproxy-tag` | Caller-supplied attribution tag read by the AI dispatch path. | `crates/sbproxy-core/src/server/ai_dispatch.rs` |
+| `traceparent` / `tracestate` / `b3` / `x-b3-*` | W3C Trace Context or B3 propagation. Parsed when present; a random trace context is generated otherwise. | `crates/sbproxy-core/src/server/request_phase.rs` |
 
-The `x-sb-request-id` header name is configurable via
-`proxy.request_id_header`; the default is `x-sb-request-id`.
+### TLS fingerprint sidecar headers
 
-## Conditional
+The `x-sbproxy-tls-*` family carries TLS fingerprints computed by a
+trusted TLS-terminating sidecar in front of the proxy. They are
+request headers, read only when the immediate TCP peer is in
+`proxy.trusted_proxies`, and stripped from untrusted peers so a
+client cannot forge its own fingerprint. They are never emitted on
+responses. Configuration lives under
+`proxy.extensions.tls_fingerprint` (the older `features.tls_fingerprint`
+block is migrated there by the config compiler), which also carries a
+`sidecar_header_allowlist` for alternate names such as
+`x-forwarded-ja4`.
 
-These headers only fire when the relevant config is enabled. They are
-NOT promises of the v1.x stability surface unless the corresponding
-config knob is documented as stable.
+| Header | Description |
+|---|---|
+| `x-sbproxy-tls-ja3` | JA3 client TLS fingerprint hash from the sidecar. |
+| `x-sbproxy-tls-ja4` | JA4 client TLS fingerprint hash from the sidecar. |
+| `x-sbproxy-tls-ja4h` | JA4H HTTP fingerprint. Sidecar-supplied, or computed by the proxy from the request when absent. |
+| `x-sbproxy-tls-ja4s` | JA4S server-side TLS fingerprint hash from the sidecar. |
+| `x-sbproxy-tls-trustworthy` | Sidecar's trust assertion. Overrides the proxy's own CIDR-based classification when present. |
+
+## Response headers the proxy emits
+
+### Present by default
+
+| Header | Description | Source |
+|---|---|---|
+| `X-Request-Id` | The correlation ID (adopted or minted) echoed to the client. On by default; disable with `proxy.correlation_id.echo_response: false`. The header name follows `proxy.correlation_id.header`. | `crates/sbproxy-core/src/server/proxy_http.rs` |
+| `traceparent` | W3C Trace Context, echoed on the response. Generated when no inbound trace headers were present, otherwise derived from them. `tracestate` accompanies it when one exists. | `crates/sbproxy-core/src/server/proxy_http.rs` |
+
+### Conditional
+
+These fire only when the relevant config or request state applies.
 
 | Header | Trigger | Description |
 |---|---|---|
-| `x-sbproxy-cache` | `response_cache.enabled: true` on the origin | Values: `HIT`, `MISS`, `STALE`, `HIT-RESERVE`. Indicates the response cache outcome. |
-| `x-sbproxy-mirror` | `mirror.enabled: true` on the origin | `1` if the request was mirrored to a shadow upstream. Mirror responses are silently discarded; this header lets test traffic confirm mirroring. |
-| `x-sbproxy-tls-ja3` | `tls.fingerprint: ja3` | JA3 client TLS fingerprint hash. |
-| `x-sbproxy-tls-ja4` | `tls.fingerprint: ja4` | JA4 client TLS fingerprint hash. |
-| `x-sbproxy-tls-ja4h` | `tls.fingerprint: ja4h` | JA4H HTTP/TLS fingerprint hash. |
-| `x-sbproxy-tls-ja4s` | `tls.fingerprint: ja4s` | JA4S server-side TLS fingerprint hash. |
-| `x-sbproxy-tls-trustworthy` | `tls.fingerprint: *` and the client's fingerprint is on the trust list | `true` if the JA4 family matches a known-good entry; absent otherwise. |
-| `x-sb-parent-session-id` | A2A request envelope present | Set on agent-to-agent traffic to chain sessions across hops. |
-| `x-sb-user-id` | Auth provider populated `request.user_id` | The authenticated user identifier; safe to log. |
-| `x-sb-ledger-key-id` | `policies: [ai_crawl_control]` issued a quote token | Identifies the signing key for the issued quote token. |
-| `x-sb-ledger-signature` | `policies: [ai_crawl_control]` issued a quote token | The detached signature over the quote token. |
-| `Retry-After` | 429 from rate-limit, ddos, or a2a chain-depth-exceeded | Seconds until retry, or `0` for a2a depth denial. |
+| `X-Sb-Session-Id` | A session ID was captured | Echoed when the caller supplied a valid ULID, or when the proxy auto-generated one. Auto-generation follows `sessions.auto_generate`: the default `anonymous` mints an ID only for requests with no resolved user identity; `always` and `never` do what they say. No session captured means no header. |
+| `x-sbproxy-cache` | `response_cache.enabled: true` on the origin | Values: `HIT`, `STALE`, `HIT-RESERVE`. There is no `MISS` value; a cache miss simply omits the header. |
+| `x-sbproxy-debug-request-id` | Request carried `x-sb-flags: debug` | The request's correlation ID, stamped for quick copy-paste debugging. |
+| `x-sbproxy-debug-config-rev` | Request carried `x-sb-flags: debug` | The compiled-config revision that served the request. |
+| `X-Sb-Property-<key>` | `properties.echo: true` on the origin | Each captured `x-sb-property-*` request property echoed back. Off by default. |
+| `x-sbproxy-idempotency` | Idempotency middleware disengaged mid-request | Skip reason (oversize body, pool exhausted). Informational only. |
+| `x-sbproxy-retry-skip-reason` | Status-retry middleware skipped a retry | Skip reason for dashboards. |
+| `Retry-After` | 429 or a2a chain-depth denial | On rate-limit 429s this is opt-in via the policy's `headers.include_retry_after` (the built-in ddos and ai-crawl enforcers turn it on themselves). The a2a chain-depth-exceeded denial always sends `Retry-After: 0`, unconditionally. |
 
-## Webhook / callback delivery only
+## Headers on outbound requests the proxy makes
 
-These headers fire on outbound webhook deliveries (event sinks,
-audit-log sinks, callback hooks), NOT on inbound client responses. A
-client `curl` will not see them.
+These never appear on the client-facing response. A client `curl`
+will not see them.
+
+### Webhook and callback delivery
+
+Stamped on event-sink, audit-log-sink, and callback deliveries
+(`crates/sbproxy-core/src/server/callbacks.rs`).
 
 | Header | Description |
 |---|---|
@@ -54,30 +88,36 @@ client `curl` will not see them.
 | `x-sbproxy-config-revision` | The compiled-config revision that produced the event. |
 | `x-sbproxy-timestamp` | Unix ms when the webhook was dispatched. |
 | `x-sbproxy-event` | The event type (e.g. `ai.request.completed`, `policy.violation`, `audit.session_close`). |
-| `x-sbproxy-signature` | HMAC-SHA256 over the body, prefixed by the algorithm tag. |
-| `x-sbproxy-request-id` | The originating request's `x-sb-request-id`, propagated to the sink. |
+| `x-sbproxy-signature` | HMAC-SHA256 over the body, prefixed by the algorithm tag. Present when a signing secret is configured. |
+| `x-sbproxy-request-id` | The originating request's correlation ID, propagated to the sink. |
 
-## Internal-only (not on the wire)
+### Mirror, shadow, and ledger traffic
 
-These header names appear in the source but are stripped before the
-response leaves the proxy, or are used inside the request pipeline
-for inter-stage signalling.
+| Header | Where it goes | Description |
+|---|---|---|
+| `x-sbproxy-mirror: 1` | The mirrored copy of the request sent to the mirror upstream (`mirror.enabled: true`) | Lets the mirror target distinguish mirrored traffic from live traffic. Mirror responses are discarded; the client response carries nothing. |
+| `x-sbproxy-shadow: 1` | The shadow request sent by AI shadow traffic | Same idea for the AI shadow path (`crates/sbproxy-ai/src/client.rs`). |
+| `x-sb-ledger-key-id` | The outbound ledger POST | Identifies the signing key for the usage-ledger submission (`crates/sbproxy-modules/src/policy/ai_crawl/http_ledger.rs`). |
+| `x-sb-ledger-signature` | The outbound ledger POST | Detached signature over the ledger submission body. |
 
-| Header | Use |
-|---|---|
-| `x-sb-property-*` | Per-request session properties stored on the context; never emitted. |
-| `x-sbproxy-auth-type` | Inserted by the auth phase for downstream policies; stripped before egress. |
-| `x-sbproxy-prefix-match` / `x-sbproxy-regex-path` / `x-sbproxy-shadow` / `x-sbproxy-tag` | Internal routing breadcrumbs; stripped before egress. |
+## Not headers: OpenAPI vendor-extension keys
+
+`x-sbproxy-prefix-match`, `x-sbproxy-regex-path`, and
+`x-sbproxy-auth-type` look like header names but are JSON keys in the
+OpenAPI document the proxy emits for an origin with
+`expose_openapi: true`. They annotate path items and security schemes
+in the spec (`crates/sbproxy-openapi/src/lib.rs`). They are never on
+the wire as HTTP headers.
 
 ## Middleware helpers (RFC-shaped responses)
 
-Two helpers in `crates/sbproxy-middleware` produce response shapes
-that follow published RFCs. Both are opt-in per origin and fire on
-two error paths: proxy-generated errors (auth deny, policy deny,
-default 404) and upstream failures routed through Pingora's
-`fail_to_proxy` path (connect refused, connect timeout, TLS
-handshake error, mid-stream connection loss). See
-[configuration.md](configuration.md) for the per-origin config block.
+Two helpers produce response shapes that follow published RFCs. Both
+are opt-in per origin and fire on two error paths: proxy-generated
+errors (auth deny, policy deny, default 404) and upstream failures
+routed through Pingora's `fail_to_proxy` path (connect refused,
+connect timeout, TLS handshake error, mid-stream connection loss).
+See [configuration.md](configuration.md) for the per-origin config
+block.
 
 ### `Proxy-Status` (RFC 9209)
 
@@ -101,8 +141,9 @@ The error token catalogue mirrors RFC 9209 section 2.3.4
 
 ### `application/problem+json` (RFC 9457)
 
-Source: `crates/sbproxy-middleware/src/problem_details.rs`. Renders
-the response body as `application/problem+json` when the origin has
+Source: the `render_problem_details` function in
+`crates/sbproxy-core/src/server.rs`. Renders the response body as
+`application/problem+json` when the origin has
 `problem_details.enabled: true` and no custom `error_pages` entry
 matches the status. The body shape is the RFC 9457 problem details
 format with `type`, `title`, `status`, `detail`, `instance` fields.
@@ -125,16 +166,13 @@ On upstream failures the `detail` field carries the same RFC 9209
 error token that lands in the `Proxy-Status` header so downstream
 tooling reading either signal sees the same vocabulary.
 
-## What you will NOT see
+## Debugging a live request
 
-The following names sometimes appear in older docs or marketing
-copy. They are not implemented and not on the v1.0 surface:
-
-- `x-sb-flags`: per-request feature-flag system documented in
-  `docs/manual.md` §10. Not implemented in v1.0.
-- `x-sbproxy-debug`: there is no debug header. Set `RUST_LOG=debug`
-  on the proxy process for verbose logs.
-- Any header beginning with `x-sb-debug-*`: same.
+Send `x-sb-flags: debug` on the request and the proxy stamps
+`x-sbproxy-debug-request-id` and `x-sbproxy-debug-config-rev` on the
+response, plus a DEBUG-level log line keyed by the same request ID.
+For verbose process-wide logs, set `RUST_LOG=debug` on the proxy
+process.
 
 ## Verifying live
 
@@ -142,11 +180,12 @@ Run any request through a configured proxy and inspect with curl:
 
 ```bash
 curl -i -H "Host: myapp.example.com" http://127.0.0.1:8080/
-# x-sb-session-id: 01KQRPPS5FZ8MDQR0H01D0V52E
-# x-sb-request-id: ee1f1806769b467bbaf5ca3550f17780
+# X-Request-Id: ee1f1806769b467bbaf5ca3550f17780
 # traceparent: 00-dc5a693f...-dc3096404c44485a-01
+# X-Sb-Session-Id: 01KQRPPS5FZ8MDQR0H01D0V52E   (when a session was captured)
 ```
 
-The three "always present" headers above will appear on every response
-the proxy emits. Anything else you see is configured by the active
-`sb.yml`.
+`X-Request-Id` and `traceparent` appear on every response the proxy
+emits with default config. `X-Sb-Session-Id` appears when a session
+was captured for the request. Anything else you see is configured by
+the active `sb.yml`.

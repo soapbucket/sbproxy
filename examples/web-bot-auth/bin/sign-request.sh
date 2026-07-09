@@ -9,7 +9,7 @@
 #     --key      <private-key.pem> \
 #     --keyid    <directory-key-id> \
 #     --method   GET \
-#     --target-uri http://127.0.0.1:8080/article \
+#     --target-uri /article \
 #     [--authority blog.local]
 #
 # Generate a keypair (one-time, paired to the directory entry in sb.yml):
@@ -17,10 +17,10 @@
 #   openssl pkey -in openai-bot.pem -pubout -outform DER | tail -c 32 | xxd -p -c 64
 #   # ^ paste that hex into the matching `public_key:` field in sb.yml
 #
-# End-to-end smoke:
+# End-to-end smoke (sign the path + query only, and name the authority):
 #   eval $(./bin/sign-request.sh --key openai-bot.pem --keyid openai-2026-01 \
-#           --method GET --target-uri http://127.0.0.1:8080/article)
-#   curl -i -H "Signature-Input: $SIG_INPUT" -H "Signature: $SIG" \
+#           --method GET --target-uri /article --authority blog.local)
+#   curl -i -H 'Host: blog.local' -H "Signature-Input: $SIG_INPUT" -H "Signature: $SIG" \
 #        http://127.0.0.1:8080/article
 #
 # The script prints the headers as `SIG_INPUT=...` and `SIG=...` shell

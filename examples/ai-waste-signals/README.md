@@ -1,6 +1,6 @@
 # ai-waste-signals
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-09*
 
 Tokenomics layer: surface tokens spent with no outcome. The proxy
 emits two Prometheus counters per waste class so a FinOps dashboard
@@ -16,8 +16,10 @@ grouping.
 
 | Counter | Description |
 |---|---|
-| `sbproxy_ai_wasted_tokens_total{kind, provider, model, project, team}` | Token count tagged as wasted, partitioned by waste class + attribution |
-| `sbproxy_ai_wasted_cost_dollars_total{kind, provider, model, project, team}` | Estimated USD cost of the wasted spend |
+| `sbproxy_ai_wasted_tokens_total{kind, provider, model, surface, project, feature, team, agent_type, environment}` | Token count tagged as wasted, partitioned by waste class + attribution |
+| `sbproxy_ai_wasted_cost_dollars_total{kind, provider, model, surface, project, feature, team, agent_type, environment}` | Estimated USD cost of the wasted spend |
+
+Attribution labels without a value (here `feature`, `agent_type`, and `environment`) are emitted as empty strings so `sum without (...)` queries keep working.
 
 ## Waste classes (the `kind` label)
 
@@ -63,14 +65,14 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ## Read the counters
 
 ```bash
-curl -s http://127.0.0.1:9090/metrics | grep -E "^sbproxy_ai_wasted"
+curl -s http://127.0.0.1:8080/metrics | grep -E "^sbproxy_ai_wasted"
 ```
 
 Expected (counter samples; values depend on the actual prompt):
 
 ```
-sbproxy_ai_wasted_tokens_total{kind="duplicate_request",provider="anthropic",model="claude-haiku-4-5",surface="chat_completions",project="demo",team="demo-team"} 5
-sbproxy_ai_wasted_cost_dollars_total{kind="duplicate_request",provider="anthropic",model="claude-haiku-4-5",surface="chat_completions",project="demo",team="demo-team"} 0.000005
+sbproxy_ai_wasted_tokens_total{agent_type="",environment="",feature="",kind="duplicate_request",model="claude-haiku-4-5",project="demo",provider="anthropic",surface="chat_completions",team="demo-team"} 5
+sbproxy_ai_wasted_cost_dollars_total{agent_type="",environment="",feature="",kind="duplicate_request",model="claude-haiku-4-5",project="demo",provider="anthropic",surface="chat_completions",team="demo-team"} 0.000005
 ```
 
 ## Dashboarding pattern

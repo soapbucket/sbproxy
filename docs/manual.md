@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -68,7 +68,7 @@ sbproxy --version
 
 ### Docker
 
-The official image is built from `alpine:3.21` with no external runtime dependencies.
+The official image runs the statically-linked binary on a distroless base (`gcr.io/distroless/cc-debian12`); there is no shell or package manager in the runtime layer.
 
 ```bash
 # Pull the image
@@ -125,12 +125,36 @@ sbproxy --config <path> --check
 sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
 sbproxy apply -f <yaml>
 sbproxy apply -p <plan-file>
+sbproxy config {migrate|import-litellm|print}
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
+sbproxy run <model> [--name <alias>]
+sbproxy models [list|show <id>]
+sbproxy update [--self]
+sbproxy ai ledger <subcommand>
 sbproxy doctor [--format text|json]
 sbproxy completions {bash|zsh|fish|powershell|elvish}
+sbproxy version
 sbproxy --version
 sbproxy --help
 ```
+
+The full subcommand set, one line each:
+
+| Subcommand | What it does |
+|------------|--------------|
+| `serve` | Run the proxy. Synonym for the no-subcommand run form. |
+| `validate` | Validate an `sb.yml` without starting the proxy. |
+| `plan` | Diff a proposed config against a baseline. |
+| `apply` | Validate and reload a config in place; the same primitive the SIGHUP handler and file watcher use. |
+| `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked. |
+| `projections` | Render projection documents (robots.txt, llms.txt, ...) for an origin without starting the proxy. |
+| `run` | Serve a model in one command, with no YAML: synthesizes a minimal serving config and boots an OpenAI-compatible endpoint on loopback. |
+| `models` | Discover models: one row per catalog model with a per-GPU fit verdict and cache status; `models show <id>` prints the full entry. |
+| `update` | Check the engine release feed and cached models for freshness; `--self` also checks the sbproxy binary. Report-only. |
+| `ai` | AI gateway tools; `ai ledger` verifies the usage ledger. |
+| `doctor` | Diagnose what this binary can do on the current host. |
+| `completions` | Print a shell-completion script for the requested shell. |
+| `version` | Print the version line. Synonym for `--version`. |
 
 Argv parsing is `clap` derive, so every subcommand also accepts
 `--help` for a focused usage block (`sbproxy plan --help`,
@@ -164,8 +188,8 @@ sbproxy --config /etc/sbproxy/sb.yml --check
 
 Add `--format json` to emit a single JSON object instead of the human
 line, so CI can parse the result. A valid config prints
-`{"valid":true,"path":"..."}`; an invalid one prints
-`{"valid":false,"path":"...","error":"..."}` and still exits 2. The
+`{"path":"...","valid":true}`; an invalid one prints
+`{"error":"...","path":"...","valid":false}` and still exits 2. The
 default is `--format text`.
 
 ```bash
@@ -287,24 +311,31 @@ gracefully (admission rejects, the attempt fails over to the next
 provider), but the gap surfaces when the config lands instead of on
 the first request.
 
-#### Installing a missing engine
+#### Engine acquisition
 
-sbproxy diagnoses; it does not install engines. When `doctor` reports a
-missing engine it prints the prerequisites and the manual steps. Install
-one, then re-run `sbproxy doctor` to confirm it is detected on `PATH`:
+sbproxy acquires inference engines itself; a bare box serves without a
+manual install. When a `serve:` entry needs an engine, the runtime
+resolves it in this order:
 
-- **llama.cpp** (GGUF models): download a prebuilt release from
-  <https://github.com/ggml-org/llama.cpp/releases> and put `llama-server`
-  on `PATH`. On Linux x64 that is the `llama-<tag>-bin-ubuntu-x64.tar.gz`
-  asset (CPU); for NVIDIA GPU without a CUDA build use the
-  `ubuntu-vulkan-x64` asset; for maximum GPU throughput build from source
-  with `cmake -B build -DGGML_CUDA=ON` and install `build/bin/llama-server`.
-- **vLLM** (safetensors / FP8): `uv tool install vllm` or `pipx install
-  vllm`, or run the pinned vLLM container via the `serve:` block's
-  `engines.launch: container`.
+- **A binary already on `PATH` wins.** If `llama-server` (or `vllm`)
+  resolves on `PATH`, sbproxy uses it. This is also the escape hatch
+  for custom builds: put a CUDA-built `llama-server` on `PATH` and it
+  takes over with no config change.
+- **llama.cpp** (GGUF models): sbproxy fetches a pinned ggml-org
+  prebuilt release for the host platform (a fixed tag, never `latest`,
+  with an optional sha256 to verify). No compiler or build step on the
+  box. An explicit `acquire.source: path` pins an operator-provided
+  binary instead.
+- **vLLM** (safetensors): vLLM is a Python package, not a binary, so
+  sbproxy fetches `uv` (Astral's single static binary, also a pinned
+  release) and runs vLLM through `uv tool run`, a.k.a. `uvx`. uv
+  provisions and caches the environment, including its own Python, on
+  first use. Opt in with `engines.vllm.acquire.source: uvx`; `sbproxy
+  run <model>` sets it for you.
 
-GPU drivers are never installed by sbproxy; a missing driver is reported
-with guidance only.
+GPU drivers are never installed by sbproxy; a missing driver is
+reported with guidance only. See [model-host.md](model-host.md) for
+the `serve:` block, per-engine details, and host prerequisites.
 
 ### `completions` - shell tab-completion scripts
 
@@ -471,7 +502,7 @@ sbproxy --config sb.yml --check
 ### Planned, not yet wired
 
 The following flag appears in older release notes but is not honoured
-by the v1.0 binary:
+by the current binary:
 
 - `--config-dir` / `SB_CONFIG_DIR`. Pass an absolute or relative path
   to `--config`; the loader does not search a directory for known
@@ -495,30 +526,52 @@ In environments without cgroup CPU quotas (bare metal, macOS), the proxy falls b
 
 ### Startup sequence
 
-SBproxy initializes subsystems in a fixed order. Each step must succeed before the next begins. The process is marked ready only after all steps complete.
+SBproxy initializes subsystems in a fixed order. A config or pipeline
+compile error aborts startup; most optional subsystems (telemetry, key
+plane, enterprise hooks) log and degrade instead of blocking.
 
-1. **Config load**: reads `sb.yaml` (or equivalent) from the config directory and validates all fields.
-2. **Logger init**: initializes the structured application logger, request logger, and security logger. All subsequent log output uses the configured level and format.
-3. **Embedded data**: loads embedded static assets and data files compiled into the binary. Logs the generated-at timestamp and file count.
-4. **Buffer pools**: initializes adaptive buffer pools used across the request path to minimize allocations.
-5. **Server variables**: populates the server context singleton with version, hostname, PID, and any operator-defined custom variables from the `var` config section.
-6. **DNS resolver**: initializes the caching DNS resolver with a 10-second timeout. If DNS initialization times out, the proxy falls back to the system resolver.
-7. **Telemetry**: sets up the OpenTelemetry tracing provider (OTLP gRPC or HTTP). Errors are logged but do not prevent startup.
-8. **AI providers**: loads AI provider configurations from the config directory.
-9. **Manager**: creates the core manager with storage, messenger, GeoIP, UA parser, and crypto settings. Loads workspace configurations and registers callbacks.
-10. **Vaults**: initializes configured secret vault backends (AWS Secrets Manager, GCP Secret Manager, HashiCorp Vault, and so on).
-11. **Feature flags**: loads and caches workspace-level feature flags from the messenger.
-12. **Host filter**: builds the bloom filter from all known hostnames. Short-circuits requests for unknown hostnames before full origin lookup.
-13. **Build router**: assembles the HTTP router with all middleware, auth handlers, and proxy engine endpoints.
-14. **Start servers**: binds and listens on configured HTTP and HTTPS ports. (The HTTP/3 (QUIC) listener is currently disabled pending native Pingora HTTP/3, so no QUIC port is bound even when `http3` is configured.)
-15. **Start subscribers**: starts background workers that subscribe to messenger topics for real-time config updates, cache invalidation, and feature flag changes.
-16. **Mark ready**: sets the health manager's ready flag to `true`. The `/ready` and `/readyz` endpoints begin returning `200`.
-17. **Hot reload watcher**: starts the file watcher on the config file.
+1. **Config load and compile**: reads the single YAML file named by
+   `--config` / `SB_CONFIG_FILE`, interpolates `${ENV}` references, and
+   compiles it. A compile error is fatal.
+2. **Observability wiring**: applies the metrics cardinality limiter
+   (`proxy.metrics`), the log redaction state
+   (`proxy.observability.log.redact`), per-tenant cardinality caps, and
+   the declared log sinks.
+3. **Scripting limits**: installs the Lua sandbox budgets from
+   `proxy.scripting.lua.sandbox`.
+4. **AI provider catalog**: loads the embedded provider catalog, or the
+   override file named by `proxy.ai_providers_file` when readable.
+5. **Rate-limit budgets, key plane, session ledger**: installs the
+   workspace rate-limit budget registry, the dynamic key plane
+   (`proxy.key_management`), and the session-ledger sink when enabled.
+   These keep accumulated state across reloads.
+6. **Detection singletons**: installs the agent-class resolver, the
+   TLS-fingerprint catalogue, and the agent-detect scorer.
+7. **Pipeline compile**: builds the routing pipeline (origins, actions,
+   auth, policies) and loads `listings/*.yaml` from the config file's
+   directory. A pipeline compile error is fatal.
+8. **Hot reload**: stores the pipeline in the hot-reload slot, starts
+   the config file watcher, and installs the SIGHUP handler.
+9. **TLS**: initializes TLS state when `https_bind_port`,
+   `tls_cert_file`, or an enabled `proxy.acme` block is present.
+10. **Listeners**: creates the Pingora server (worker count from
+    `SB_WORKER_THREADS` or auto-detection), binds the plain HTTP
+    listener on `http_bind_port`, and adds the HTTPS listener (manual
+    certs or the ACME dynamic-certificate resolver, with optional
+    mTLS). No QUIC port is bound even when `proxy.http3` is
+    configured; an enabled `http3` block only logs a warning.
+11. **Admin server**: when `proxy.admin.enabled: true`, spawns the
+    embedded admin listener (default `127.0.0.1:9090`) and registers
+    the component health probes that `/readyz` and `/health` report.
+12. **Background tasks**: starts the ACME renewal and OCSP-stapling
+    refresh tasks when TLS is active, then hands control to Pingora's
+    run loop.
 
-On successful startup, the log includes:
+Startup progress is visible in the log; the listener bind is announced
+with a line like:
 
-```json
-{"level":"info","msg":"service started","startup_time":"342ms"}
+```
+INFO starting sbproxy on 0.0.0.0:8080
 ```
 
 ### Signal handling
@@ -527,25 +580,30 @@ On successful startup, the log includes:
 |--------|--------|
 | `SIGTERM` | Graceful shutdown (drain in-flight requests up to the grace budget) |
 | `SIGINT` (Ctrl+C) | Fast shutdown (drop in-flight requests immediately) |
-| `SIGQUIT` | Graceful upgrade (zero-downtime binary swap, when configured) |
-| `SIGHUP` | Config reload (log level changes take effect immediately) |
+| `SIGHUP` | Full config reload: recompile the YAML and hot-swap the pipeline |
 
-Both the `sbproxy` binary and the `sbproxy-k8s-operator` install
-handlers for SIGTERM and SIGINT. Each receipt emits a structured
-`shutdown_signal_received` tracing event with the signal name and the
-resolved grace budget so operators can confirm the drain started.
+Pingora handles SIGTERM and SIGINT itself; SBproxy subscribes to the
+server's execution-phase broadcast and mirrors each phase into
+structured tracing events (`shutdown_signal_received` on a graceful
+SIGTERM, then `shutdown_started`, `shutdown_grace_period`,
+`shutdown_runtimes`, and finally `shutdown_complete`) so operators can
+confirm the drain started and finished.
 
 ### Graceful shutdown
 
 On `SIGTERM`, SBproxy proceeds as follows:
 
-1. The health manager is marked as shutting down. `/ready` and `/readyz` immediately return `503`. Load balancers should stop routing new traffic within one health check interval.
-2. SBproxy emits the `shutdown_signal_received` event with `signal=SIGTERM` and the resolved `grace_seconds`.
-3. SBproxy waits up to `--shutdown-grace-ms` milliseconds for in-flight requests to complete, polling every 100ms.
-4. After all in-flight requests drain (or grace time expires), background subscribers and the reload watcher are stopped.
-5. The HTTP and HTTPS listeners shut down with a 10-second deadline.
-6. Flush operations on logging backends and AI cost tracking complete.
-7. The process exits with code `0` on clean shutdown. The Kubernetes operator exits with code `1` when the grace window is exceeded so the orchestrator surfaces an alert.
+1. The `shutdown_signal_received` event is logged with
+   `signal=SIGTERM` and the resolved `grace_seconds` budget.
+2. Pingora stops accepting new connections and waits up to the
+   resolved grace budget (`--shutdown-grace-ms`, default 30 seconds)
+   for in-flight requests to complete. The budget is applied to both
+   Pingora's `grace_period_seconds` and
+   `graceful_shutdown_timeout_seconds`.
+3. The remaining shutdown phases are logged as they occur; the final
+   `shutdown_complete` event marks the point where every listener and
+   service runtime has exited.
+4. The process exits with code `0` on clean shutdown.
 
 On `SIGINT`, Pingora skips the grace window and tears down listeners immediately; in-flight requests see a connection close. Use this only for fast local-dev shutdowns.
 
@@ -553,98 +611,58 @@ On `SIGINT`, Pingora skips the grace window and tears down listeners immediately
 
 ## 4. Logging
 
-### Log streams
+### One subscriber, two targets
 
-SBproxy produces three independent log streams, each independently configurable:
+SBproxy logs through a single `tracing` subscriber. Application events
+(lifecycle, config, errors) go to the default targets; per-request
+access-log lines go to the dedicated `access_log` target so log
+routers can split the two without extra plumbing.
 
-| Stream | Purpose | Default Level |
-|--------|---------|---------------|
-| Application | Service lifecycle, config events, errors | `info` |
-| Request | Per-request access log | `info` |
-| Security | Auth failures, policy triggers, IP blocks | `info` |
+The output format is `compact` by default (one short line per event).
+Switch with `--log-format pretty` for local debugging or
+`--log-format json` for a log aggregator; the env fallback is
+`SB_LOG_FORMAT`.
 
-All streams produce structured JSON output by default. For local development, set `proxy.logging.format: dev` in `sb.yaml` for a human-readable format.
+### Log levels and filters
 
-### Log levels
+The filter is a standard `tracing-subscriber` directive: a bare level
+(`info`, `debug`, `trace`, `warn`, `error`) or a per-target filter
+string (`sbproxy=debug,h2=warn`).
 
-- **debug**: high-volume diagnostic output. Health check calls, cache lookups, DNS resolutions, worker activity. Reserve for troubleshooting.
-- **info**: normal operational events. Startup, shutdown, config changes, connection established or closed.
-- **warn**: recoverable issues. Degraded dependency, DNS timeout, config reload with partial errors.
-- **error**: failures requiring attention. Failed to bind port, upstream unreachable, cert rotation error.
-
-Change the log level at runtime by sending `SIGHUP`, or by updating `SB_LOG_LEVEL` and then sending `SIGHUP`. The change takes effect within the 500ms debounce window.
-
-### Two-level log configuration
-
-Set the application and request log levels independently to avoid burying access logs in debug noise:
+- `--log-level` / `SB_LOG_LEVEL` sets the global filter (wins over
+  `RUST_LOG`; default `info`).
+- `--request-log-level` / `SB_REQUEST_LOG_LEVEL` appends an
+  `access_log=<level>` directive so access logs can be tuned
+  independently of the application log:
 
 ```bash
 # Quiet application log, verbose request log
-sbproxy serve --log-level warn --request-log-level debug
+sbproxy serve -f sb.yml --log-level warn --request-log-level debug
 ```
 
-Or in `sb.yaml`:
+The same knobs exist in YAML under `proxy.observability.log`, which
+also carries per-level sampling, redaction, sink fan-out, and custom
+access-log fields. CLI and env win over the YAML values.
 
 ```yaml
 proxy:
-  logging:
-    application:
-      level: warn
-    request:
-      level: info
-      fields:
-        headers: true
-        query_string: true
-        cookies: false
-        cache_info: true
-        auth_info: true
-        location: true
+  observability:
+    log:
+      level: info        # debug | info | warn | error
+      format: compact    # compact | pretty | json
 ```
 
-### Request log fields
+At runtime, the filter can be changed without a restart through the
+admin API: `PUT /admin/log-level` with `{"level": "debug"}` (see
+[admin-api-reference.md](admin-api-reference.md)).
 
-The request logger supports opt-in field groups. Defaults are below unless overridden:
+### Access logs
 
-| Field Group | Default | Description |
-|-------------|---------|-------------|
-| `timestamps` | `true` | Request start time, end time, duration |
-| `headers` | `false` | All incoming request headers |
-| `forwarded_headers` | `true` | `X-Forwarded-For`, `X-Real-IP`, `Via` |
-| `query_string` | `true` | Raw URL query string |
-| `cookies` | `false` | Cookie names and values |
-| `original_request` | `false` | Original request before any modifications |
-| `cache_info` | `true` | Cache hit/miss, cache key, TTL |
-| `auth_info` | `true` | Auth method, user ID, token metadata |
-| `app_version` | `false` | Proxy version in each log line |
-| `location` | `false` | GeoIP country, city, ASN |
-
-Example request log entry (JSON):
-
-```json
-{
-  "level": "info",
-  "ts": "2026-04-08T12:00:00.123Z",
-  "msg": "request",
-  "method": "GET",
-  "path": "/api/users",
-  "status": 200,
-  "duration_ms": 42,
-  "bytes": 1284,
-  "remote_addr": "203.0.113.5:51234",
-  "host": "api.example.com",
-  "request_id": "01HWQMB5GBMR3X4ZF9KVFD7R8P",
-  "origin_id": "abc123",
-  "cache_status": "HIT",
-  "cache_key": "GET:api.example.com:/api/users:"
-}
-```
-
-### Sampling
-
-Access logging supports probabilistic sampling to reduce log volume on
-high-traffic origins. `always_log_errors` and
-`slow_request_threshold_ms` force matching requests through before the
-sampler runs.
+Structured JSON access logging is opt-in via the top-level
+`access_log` block. The full record schema (phase timings, AI token
+fields, header capture) and the filter semantics live in
+[access-log.md](access-log.md); the two knobs most deployments touch
+are sampling and the output sink:
 
 ```yaml
 access_log:
@@ -654,10 +672,11 @@ access_log:
   slow_request_threshold_ms: 1000
 ```
 
-### Log outputs
+`always_log_errors` and `slow_request_threshold_ms` force matching
+requests through before the sampler runs.
 
 By default, access-log lines are emitted via the `access_log` tracing
-target. To write access logs directly to disk:
+target. To write them directly to a rotating file instead:
 
 ```yaml
 access_log:
@@ -676,7 +695,7 @@ access_log:
 
 ### Prometheus metrics
 
-The proxy serves `/metrics` on its main HTTP port (`http_bind_port`, default `8080`). There is no separate telemetry listener. Scrapes are rate-limited to one per second; back-to-back requests get an empty body.
+The proxy serves `/metrics` on its main HTTP port (`http_bind_port`, default `8080`). When the embedded admin server is enabled, the same series are mirrored on the admin listener so operators can scrape through the access-controlled port instead. Scrapes are not throttled.
 
 ```
 GET http://localhost:8080/metrics
@@ -688,7 +707,7 @@ Label cardinality is capped by `metrics.max_cardinality_per_label` (default `100
 
 | Metric | Type | Labels |
 |--------|------|--------|
-| `sbproxy_requests_total` | Counter | `hostname`, `method`, `status` |
+| `sbproxy_requests_total` | Counter | `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape` |
 | `sbproxy_request_duration_seconds` | Histogram | `hostname` |
 | `sbproxy_errors_total` | Counter | `hostname`, `error_type` |
 | `sbproxy_active_connections` | Gauge | (none) |
@@ -712,7 +731,7 @@ Label cardinality is capped by `metrics.max_cardinality_per_label` (default `100
 | `sbproxy_origin_active_connections` | Gauge | `origin` |
 | `sbproxy_bytes_total` | Counter | `origin`, `direction` (`in`, `out`) |
 | `sbproxy_auth_results_total` | Counter | `origin`, `auth_type`, `result` (`allow`, `deny`) |
-| `sbproxy_policy_triggers_total` | Counter | `origin`, `policy_type`, `action` |
+| `sbproxy_policy_triggers_total` | Counter | `origin`, `policy_type`, `action`, `agent_id`, `agent_class` |
 | `sbproxy_cache_results_total` | Counter | `origin`, `result` |
 | `sbproxy_circuit_breaker_transitions_total` | Counter | `origin`, `from_state`, `to_state` |
 
@@ -728,7 +747,7 @@ scrape_configs:
 
 ### OpenTelemetry tracing
 
-SBproxy exports distributed traces via OTLP. Configure in `sb.yaml`:
+SBproxy exports distributed traces via OTLP. Configure in `sb.yml`:
 
 ```yaml
 proxy:
@@ -770,23 +789,31 @@ hot-reload workflow.
 
 ## 6. Health checks
 
-SBproxy exposes three probe endpoints, each with a bare alias. All
-responses are `application/json` and unauthenticated. Endpoints are
-served from the embedded admin listener, alongside `/metrics`.
+SBproxy serves probe endpoints on two listeners. The main data plane
+(`http_bind_port`, default `8080`) always serves a minimal `/health`
+plus `/metrics`. The embedded admin listener (`proxy.admin`, default
+`127.0.0.1:9090`) serves the full probe set unauthenticated, alongside
+its authenticated operator routes. All responses are
+`application/json`.
 
 ### Endpoints
 
-| Endpoint        | Aliases    | Purpose                | Success | Failure |
-|-----------------|-----------|-------------------------|---------|---------|
-| `/livez`        | `/live`   | Liveness; process is up  | `200`   | never   |
-| `/readyz`       | `/ready`  | Readiness; ready to serve | `200`   | `503`   |
-| `/healthz`      | (none)    | Liveness; trivial body   | `200`   | never   |
-| `/health`       | (none)    | Rich operator health     | `200`   | `503`   |
+| Endpoint        | Listener | Aliases    | Purpose                | Success | Failure |
+|-----------------|----------|-----------|-------------------------|---------|---------|
+| `/health`       | data plane | (none)  | Liveness; fixed body     | `200`   | never   |
+| `/livez`        | admin    | `/live`   | Liveness; process is up  | `200`   | never   |
+| `/readyz`       | admin    | `/ready`  | Readiness; ready to serve | `200`   | `503`   |
+| `/healthz`      | admin    | (none)    | Liveness; trivial body   | `200`   | never   |
+| `/health`       | admin    | (none)    | Rich operator health     | `200`   | `503`   |
 
 The bare `/live` and `/ready` aliases return identical bodies to
-`/livez` and `/readyz`. `/health` is intentionally different: it is the
-rich operator/SIEM endpoint. K8s readiness probes should hit `/readyz`;
-K8s liveness probes should hit `/livez`.
+`/livez` and `/readyz`. On the admin listener, `/health` is the rich
+operator/SIEM endpoint; on the data plane it is a fixed liveness body
+(`{"status":"ok"}`) suitable for load balancers that can only probe
+the serving port. K8s readiness probes should hit `/readyz` and
+liveness probes `/livez` when the admin listener is reachable from
+the kubelet; otherwise use the data plane's `/health` for both (see
+[section 12](#12-kubernetes-deployment)).
 
 ### `/livez`
 
@@ -807,7 +834,7 @@ binary is running.
 {"status": "ok"}
 ```
 
-### `/health`
+### `/health` (admin listener)
 
 Rich health report for humans, dashboards, and SIEM ingestion. It
 includes the binary version, embedded git revision, current timestamp,
@@ -816,13 +843,13 @@ process uptime, and the same component checks used by readiness:
 ```json
 {
   "status": "ok",
-  "version": "1.1.0",
+  "version": "1.5.0",
   "build_hash": "5e8cfa8",
   "timestamp": "2026-05-04T18:30:00Z",
   "uptime_seconds": 12345,
   "checks": [
     {"name": "ledger", "status": "healthy"},
-    {"name": "stripe", "status": "not_configured", "detail": "not yet wired in this wave"}
+    {"name": "mesh_quorum", "status": "not_configured", "detail": "mesh not enabled"}
   ]
 }
 ```
@@ -833,38 +860,39 @@ liveness response for load balancers.
 
 ### `/readyz`
 
-Walks the registered component readiness probes (TLS, ACME, AI
-provider catalog, ML classifier, ledger client, etc.) and returns
-`200` only when every probe reports ready. The body carries a
-per-component breakdown so a dashboard can surface which component
-failed:
+Walks the registered component readiness probes (agent registry,
+bot-auth key directory, usage ledger, mesh quorum, synthetic pipeline
+probe, etc.) and returns `200` only when every probe reports ready
+(`healthy`, `degraded`, and `not_configured` all count as ready). The
+body's `components` field is an array, sorted by component name, so a
+dashboard can surface which component failed:
 
 ```json
 {
   "status": "ok",
-  "components": {
-    "tls": {"status": "ready"},
-    "acme": {"status": "ready"}
-  }
+  "components": [
+    {"name": "agent_registry", "status": "healthy"},
+    {"name": "ledger", "status": "not_configured", "detail": "no ledger append yet"}
+  ]
 }
 ```
 
-When a component is not ready, the envelope's `status` flips to
+When a component is `unhealthy`, the envelope's `status` flips to
 `"unready"` and the response is `503`:
 
 ```json
 {
   "status": "unready",
-  "components": {
-    "tls": {"status": "ready"},
-    "acme": {"status": "unready", "detail": "cert renewal pending"}
-  }
+  "components": [
+    {"name": "agent_registry", "status": "healthy"},
+    {"name": "mesh_quorum", "status": "unhealthy", "detail": "isolated: 0 of 1 min peers alive"}
+  ]
 }
 ```
 
 The set of components depends on which features the live config
-enabled; an OSS deployment with no ACME has only the always-on probes
-in the registry.
+enabled; a deployment with no mesh or ledger reports those probes as
+`not_configured` rather than dropping them.
 
 ### Load balancer target health checks
 
@@ -887,11 +915,11 @@ origins:
         expected_status: 200
 ```
 
-Unhealthy targets drop out of rotation. The `sb_lb_target_healthy` metric tracks health state per target.
+Unhealthy targets drop out of rotation. Per-target health state is exposed through the admin API's `GET /api/health/targets` route (see [admin-api-reference.md](admin-api-reference.md)); there is no per-target Prometheus metric.
 
 ### Component registration
 
-Subsystems register named health checkers with the health manager. The registered names appear in `/readyz`'s `components` array and `/health`'s `checks` array. Components report `"healthy"`, `"degraded"`, `"unhealthy"`, or `"not_configured"` status strings.
+Subsystems register named health probes with the health registry. The registered names appear in `/readyz`'s `components` array and `/health`'s `checks` array. Components report `"healthy"`, `"degraded"`, `"unhealthy"`, or `"not_configured"` status strings; only `"unhealthy"` fails readiness.
 
 ---
 
@@ -899,246 +927,167 @@ Subsystems register named health checkers with the health manager. The registere
 
 ### Manual TLS
 
-Provide a certificate and key as file paths relative to the config directory:
+Provide a PEM certificate chain and key as file paths under `proxy`.
+Setting `https_bind_port` requires either the manual pair or an
+enabled `acme` block:
 
 ```yaml
 proxy:
   https_bind_port: 8443
-  tls_cert: certs/server.crt
-  tls_key: certs/server.key
+  tls_cert_file: certs/server-cert.pem
+  tls_key_file: certs/server-key.pem
 ```
 
-Or use the `certificate_settings` block for finer control:
-
-```yaml
-proxy:
-  https_bind_port: 8443
-  certificate_settings:
-    certificate_dir: certs
-    certificate_key_dir: certs
-    min_tls_version: 13     # 12 = TLS 1.2, 13 = TLS 1.3 (default)
-    tls_cipher_suites:
-      - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-      - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-```
-
-The default minimum TLS version is 1.3. To allow TLS 1.2 connections (not recommended in production), set `min_tls_version: 12`.
+The HTTPS listener negotiates HTTP/2 and HTTP/1.1 via ALPN. There are
+no YAML knobs for minimum TLS version or cipher suites; the rustls
+defaults apply.
 
 ### ACME auto-TLS
 
-SBproxy works with any ACME-compatible certificate authority. The default is Let's Encrypt production. Certificates are obtained on first request for each domain and renewed automatically.
+SBproxy works with any ACME-compatible certificate authority; the
+default directory is Let's Encrypt production. Certificates are issued
+per hostname in the config, stored in the configured backing store,
+and renewed automatically. Until the first issuance completes, the
+listener serves a self-signed fallback certificate so handshakes do
+not fail outright. Issued and renewed certificates are swapped in live
+via SNI, with no restart.
+
+```yaml
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+  acme:
+    enabled: true
+    email: ops@example.com
+    # directory_url: https://acme-v02.api.letsencrypt.org/directory
+    # challenge_types: ["http-01"]
+    # storage_backend: redb
+    # storage_path: /var/lib/sbproxy/certs
+    # renew_before_days: 30
+```
+
+Field reference:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Master switch for ACME-managed certificates |
+| `email` | (empty) | Account contact registered with the ACME directory |
+| `directory_url` | Let's Encrypt production | ACME directory URL |
+| `challenge_types` | `["http-01"]` | Allowed challenge types in priority order. `http-01` is the only type the proxy drives today; `tls-alpn-01` parses but is not served |
+| `storage_backend` | `redb` | Backing store for issued certificates |
+| `storage_path` | `/var/lib/sbproxy/certs` | Filesystem path for the certificate store |
+| `renew_before_days` | `30` | Days before expiry to attempt renewal |
+
+The `http-01` challenge is answered on the plain HTTP listener, so
+keep `http_bind_port` reachable from the CA. For Let's Encrypt
+staging, point `directory_url` at
+`https://acme-staging-v02.api.letsencrypt.org/directory`. The Docker
+Compose stack ships a Pebble test CA for local development
+(`https://pebble:14000/dir`).
+
+### Mutual TLS (mTLS) for inbound connections
+
+To require clients to present certificates when connecting to SBproxy,
+add a `proxy.mtls` block. It applies to the HTTPS listener (manual
+certs or ACME) and requires `https_bind_port`:
 
 ```yaml
 proxy:
   https_bind_port: 8443
-  certificate_settings:
-    use_acme: true
-    acme_email: ops@example.com
-    acme_domains:
-      - api.example.com
-      - proxy.example.com
-    acme_cache_dir: /var/lib/sbproxy/acme-cache
-    # acme_directory_url: ""  # empty = Let's Encrypt production
+  tls_cert_file: certs/server-cert.pem
+  tls_key_file: certs/server-key.pem
+  mtls:
+    client_ca_file: certs/ca-cert.pem
+    require: true
+    allowed_cn_patterns:
+      - "^service-[a-z]+$"
 ```
 
-For Let's Encrypt staging (testing):
+Field reference:
 
-```yaml
-certificate_settings:
-  use_acme: true
-  acme_email: test@example.com
-  acme_directory_url: https://acme-staging-v02.api.letsencrypt.org/directory
-  acme_cache_dir: /tmp/acme-cache
-```
+| Field | Default | Description |
+|-------|---------|-------------|
+| `client_ca_file` | (required) | PEM CA bundle used to verify client certificates |
+| `require` | `true` | When `true`, the handshake fails without a valid client cert. When `false`, certless clients connect and the upstream sees `X-Client-Cert-Verified: 0` so it can decide |
+| `allowed_cn_patterns` | `[]` | Regex allowlist for the client certificate CN. Empty accepts any CN signed by the CA |
 
-For the Pebble test ACME server (local development, used by the Docker Compose stack):
-
-```yaml
-certificate_settings:
-  use_acme: true
-  acme_email: test@example.com
-  acme_directory_url: https://pebble:14000/dir
-  acme_insecure_skip_verify: true   # only for self-signed ACME test servers
-  acme_ca_cert_file: pebble-ca.pem  # optional: trust Pebble's CA
-  acme_cache_dir: /etc/sbproxy/certs
-```
-
-### Mutual TLS (mTLS) for inbound connections
-
-To require clients to present certificates when connecting to SBproxy, configure `client_auth` under `certificate_settings`:
-
-```yaml
-proxy:
-  certificate_settings:
-    use_acme: true
-    acme_email: ops@example.com
-    client_auth: require_and_verify
-    client_ca_cert_file: certs/ca.crt
-```
-
-Available `client_auth` values:
-
-| Value | Behavior |
-|-------|----------|
-| `none` | No client certificate required (default) |
-| `request` | Request a certificate but do not require it |
-| `require` | Require a certificate but do not verify it against a CA |
-| `verify_if_given` | Verify the certificate if one is presented |
-| `require_and_verify` | Require a certificate and verify it against the configured CA |
-
-The CA can also be provided as base64-encoded PEM data instead of a file path:
-
-```yaml
-certificate_settings:
-  client_auth: require_and_verify
-  client_ca_cert_data: "LS0tLS1CRUdJTi..."  # base64-encoded PEM
-```
+Verified client-certificate metadata is forwarded to the upstream as
+`X-Client-Cert-*` headers.
 
 ### Generating development certificates
 
-The project includes a script to generate a local CA, server certificate, and client certificate for development and testing:
+The repository includes a script that generates a local CA, a server
+certificate, and a client certificate for development and mTLS
+testing:
 
 ```bash
-make certs
+./scripts/generate-certs.sh
 # Generates in ./certs/:
-#   ca.crt, ca.key
-#   server.crt, server.key
-#   client.crt, client.key
+#   ca-cert.pem, ca-key.pem
+#   server-cert.pem, server-key.pem
+#   client-cert.pem, client-key.pem
 ```
 
 ---
 
 ## 8. Connection tuning
 
-Connection pool behavior and timeouts are configurable per origin. Place these settings at the origin level alongside the `action` block.
+Upstream connection behavior is tuned per origin with a single
+`connection_pool` block, placed at the origin level alongside the
+`action` block.
 
 ![ten concurrent requests completing over a bounded upstream pool, per-request timing shown](assets/connection-pool.gif)
 
 A 32-connection pool with idle and lifetime caps absorbs the burst ([config](../examples/connection-pool/)).
 
-### Per-origin transport fields
+### Per-origin connection pool
 
-| Field | Default | Max | Description |
-|-------|---------|-----|-------------|
-| `dial_timeout` | `10s` | `1m` | Maximum time to establish a TCP connection to the upstream |
-| `tls_handshake_timeout` | `10s` | `1m` | Maximum time to complete TLS handshake with upstream |
-| `idle_conn_timeout` | `60s` | `1m` | Time an idle keep-alive connection stays in the pool |
-| `keep_alive` | `30s` | `1m` | TCP keep-alive interval on upstream connections |
-| `timeout` | `30s` | `1m` | End-to-end request timeout (dial + headers + body) |
-| `response_header_timeout` | `30s` | `1m` | Time to wait for upstream to send response headers after request is sent |
-| `expect_continue_timeout` | `1s` | `1m` | Time to wait for upstream `100 Continue` before sending body |
-| `max_idle_conns` | unlimited | `5000` | Maximum idle connections across all upstream hosts |
-| `max_idle_conns_per_host` | unlimited | `500` | Maximum idle connections per upstream host |
-| `max_conns_per_host` | unlimited | `5000` | Maximum total connections per upstream host |
-| `max_connections` | unlimited | `10000` | Maximum concurrent connections from clients for this origin |
-| `write_buffer_size` | `64KB` | `10MB` | Write buffer size per upstream connection |
-| `read_buffer_size` | `64KB` | `10MB` | Read buffer size per upstream connection |
-| `max_redirects` | `0` | `20` | Number of redirects to follow automatically |
-| `http11_only` | `false` | - | Force HTTP/1.1 (disable HTTP/2 and HTTP/3) |
-| `skip_tls_verify_host` | `false` | - | Skip TLS certificate verification for upstream (use only in dev) |
-| `min_tls_version` | (global) | - | Minimum TLS version for outbound: `"1.2"` or `"1.3"` |
-| `enable_http3` | `false` | - | Enable HTTP/3 (QUIC) for upstream connections. Currently inert; HTTP/3 is disabled pending native Pingora HTTP/3. |
-
-Example: aggressive tuning for a low-latency internal API:
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_connections` | `128` | Maximum concurrent connections to the upstream. Additional requests queue until a connection frees up |
+| `idle_timeout_secs` | `90` | Idle keep-alive connections unused for longer than this are dropped from the pool |
+| `max_lifetime_secs` | `300` | Hard ceiling on any single connection's lifetime; older connections are replaced even when healthy |
 
 ```yaml
 origins:
   "api.example.com":
+    connection_pool:
+      max_connections: 32
+      idle_timeout_secs: 60
+      max_lifetime_secs: 300
     action:
       type: proxy
       url: https://backend.internal
-    dial_timeout: 2s
-    tls_handshake_timeout: 3s
-    timeout: 10s
-    response_header_timeout: 8s
-    max_idle_conns_per_host: 100
-    max_conns_per_host: 500
-    idle_conn_timeout: 30s
 ```
 
-Example: conservative tuning for a slow third-party API:
-
-```yaml
-origins:
-  "slow-api.example.com":
-    action:
-      type: proxy
-      url: https://slow-vendor.com
-    timeout: 60s
-    response_header_timeout: 55s
-    dial_timeout: 10s
-    max_idle_conns_per_host: 10
-```
-
-### HTTP/2 connection coalescing
-
-HTTP/2 coalescing lets multiple hostnames that resolve to the same IP and share a TLS certificate share a single TCP connection. Enabled globally by default.
-
-Global settings in `sb.yaml`:
-
-```yaml
-proxy:
-  http2_coalescing:
-    disabled: false
-    max_idle_conns_per_host: 20
-    idle_conn_timeout: 90s
-    max_conn_lifetime: 1h
-    allow_ip_based_coalescing: true
-    allow_cert_based_coalescing: true
-    strict_cert_validation: false
-```
-
-Per-origin override:
-
-```yaml
-origins:
-  "api.example.com":
-    action:
-      type: proxy
-      url: https://backend.example.com
-    http2_coalescing:
-      disabled: true  # disable coalescing for this origin only
-```
-
-### Request coalescing
-
-Request coalescing deduplicates simultaneous identical upstream requests: one task makes the upstream call, the others wait for the result. Disabled by default.
-
-```yaml
-proxy:
-  request_coalescing:
-    enabled: true
-    max_inflight: 1000
-    coalesce_window: 100ms
-    max_waiters: 100
-    cleanup_interval: 30s
-    key_strategy: default  # or "method_url"
-```
+Tune these when an upstream is sensitive to concurrent connection
+count, or when a load balancer aggressively terminates long-lived TCP
+sessions. Origins without a `connection_pool` block get the defaults
+above. There are no other per-origin transport knobs; buffer sizes and
+handshake timeouts follow Pingora's defaults.
 
 ### HTTP/3 (QUIC)
 
-HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `http3` config and the `enable_http3` flags below still parse, but they are currently ignored: no QUIC listener is started, no `Alt-Svc` header is advertised, and setting `enable_http3: true` only logs a warning. HTTP/2 is the highest version served. The configuration and the UDP, port, and firewall mechanics below are documented for when HTTP/3 returns.
-
-Enable inbound HTTP/3 on the proxy server (currently has no effect):
+HTTP/3 is temporarily disabled until native QUIC support lands in
+Pingora. The `proxy.http3` block still parses, but it is ignored: no
+QUIC listener is started, no `Alt-Svc` header is advertised, and
+setting `enabled: true` only logs a warning at startup. HTTP/2 is the
+highest version served. The fields are documented for when HTTP/3
+returns:
 
 ```yaml
 proxy:
-  http3_bind_port: 8443   # typically same port as HTTPS, uses UDP
-  enable_http3: true
+  http3:
+    enabled: true          # currently ignored; logs a warning
+    idle_timeout_secs: 30
+    max_streams: 100
 ```
 
-Enable HTTP/3 for upstream connections on a specific origin:
-
-```yaml
-origins:
-  "fast.example.com":
-    action:
-      type: proxy
-      url: https://backend.example.com
-    enable_http3: true
-```
-
-When HTTP/3 returns, it will require the HTTPS port to also be bound: the `Alt-Svc` header is sent on the HTTPS response to signal QUIC availability to clients. Today no `Alt-Svc` header is emitted.
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Whether to start the HTTP/3 (QUIC) listener. Currently inert |
+| `idle_timeout_secs` | `30` | Idle timeout for QUIC connections |
+| `max_streams` | `100` | Maximum concurrent QUIC streams per connection |
 
 ---
 
@@ -1146,9 +1095,7 @@ When HTTP/3 returns, it will require the HTTPS port to also be bound: the `Alt-S
 
 ### File watcher
 
-SBproxy watches the configuration file for changes via `notify`. When a write or create event arrives, a 500ms debounce timer starts. If no further events arrive within the debounce window, the reload fires. This prevents redundant reloads when editors write files in multiple stages.
-
-The watcher monitors the resolved path of the config file. If no config file can be resolved (for example, when using a config directory without a named file), the watcher logs a warning and hot reload is disabled.
+SBproxy watches the directory containing the configuration file via `notify`. Every modify, create, or remove event in that directory triggers a reload of the config file; there is no debounce window. Back-to-back editor writes produce back-to-back reloads, which is harmless: each reload atomically swaps the compiled pipeline, and a failed compile leaves the previous pipeline serving.
 
 ### SIGHUP trigger
 
@@ -1156,8 +1103,6 @@ Send `SIGHUP` to manually trigger a configuration reload without modifying any f
 
 ```bash
 kill -HUP $(pgrep sbproxy)
-# or
-kill -HUP $(cat /var/run/sbproxy.pid)
 ```
 
 ### Admin endpoint trigger
@@ -1194,33 +1139,34 @@ For the complete per-route schema of every admin endpoint (`/api/requests`, `/ap
 
 ### What reloads
 
+Every reload path (SIGHUP, file watcher, `sbproxy apply`,
+`POST /admin/reload`) runs the same primitive: recompile the YAML and
+atomically swap the live pipeline. That covers most of the config
+surface:
+
 | Change Type | Reload Behavior |
 |-------------|-----------------|
-| Log level (`SB_LOG_LEVEL` or config `level`) | Applied immediately |
-| Request log level | Applied immediately |
-| Any other config change | Requires process restart |
+| Origins: routing, upstream URLs, actions, auth, policies | Hot-reloaded; the new pipeline serves the next request |
+| AI provider catalog (`proxy.ai_providers_file`) | Hot-reloaded |
+| Agent classes, detection settings, key management, log redaction, sinks, Lua sandbox limits | Hot-reloaded |
+| Listener and server-level settings: `http_bind_port`, `https_bind_port`, TLS listener shape, `proxy.admin`, worker threads | Requires process restart |
+| Rate-limit budget accumulators, session-ledger sink registration | Registered at startup; state survives reloads, registration changes need a restart |
 
-When a reload completes, the log includes:
+The runtime log filter is not part of config reload; change it with
+`--log-level` at start or `PUT /admin/log-level` at runtime.
 
-```json
-{"level":"info","msg":"configuration reloaded successfully","reload_count":3,"duration":"12ms"}
-```
-
-If the reload fails (for example, malformed YAML), an error is logged and the previous configuration stays active:
-
-```json
-{"level":"error","msg":"configuration reload failed","error":"yaml: line 42: mapping values are not allowed in this context"}
-```
-
-### Why full restarts are required for origin changes
-
-Origin configurations are parsed and compiled at startup into in-memory routing structures. Changing origin routing, upstream URLs, TLS settings, or authentication requires safely rebuilding those structures. The recommended pattern for zero-downtime config changes is a restart behind a load balancer with health-check-driven rollout.
+When a reload completes, the log includes the line `config reloaded
+successfully`, and the `sbproxy_config_reload_total{result="success"}`
+counter increments. If the reload fails (for example, malformed YAML),
+the watcher logs `reload failed; serving prior pipeline` with the
+error, `sbproxy_config_reload_total{result="failure"}` increments, and
+the previous configuration stays active.
 
 ---
 
 ## 10. Feature flags
 
-Feature flags are per-request hints that alter proxy behavior. Clients can inject them via headers, operators can set them in config, and CEL expressions and Lua scripts read them through the `features` namespace.
+Feature flags are per-request hints that alter proxy behavior. Clients inject them via a request header or query parameters, and CEL expressions and Lua scripts read them through the `features` namespace.
 
 ### Built-in flags
 
@@ -1292,7 +1238,7 @@ header / query parsing is wired today.
 
 ### Single container
 
-Mount a config directory and map ports. The container exposes `8080/tcp`, `8443/tcp`, and `8443/udp` (UDP will be required for HTTP/3 QUIC when HTTP/3 returns; HTTP/3 is currently disabled, so the UDP mapping is presently unused).
+Mount a config directory containing `sb.yml` and map ports; the image's default command is `serve -f /etc/sbproxy/sb.yml`. The container exposes `8080/tcp`, `8443/tcp`, and `8443/udp` (UDP will be required for HTTP/3 QUIC when HTTP/3 returns; HTTP/3 is currently disabled, so the UDP mapping is presently unused).
 
 ```bash
 docker run -d \
@@ -1306,7 +1252,7 @@ docker run -d \
   ghcr.io/soapbucket/sbproxy:latest
 ```
 
-For a read-only config with a writable ACME cache directory:
+For a read-only config with a writable ACME certificate store (the default `proxy.acme.storage_path` is `/var/lib/sbproxy/certs`):
 
 ```bash
 docker run -d \
@@ -1314,71 +1260,36 @@ docker run -d \
   -p 8080:8080 \
   -p 8443:8443 \
   -p 8443:8443/udp \
-  -v /etc/sbproxy/sb.yaml:/etc/sbproxy/sb.yaml:ro \
-  -v sbproxy-acme-cache:/etc/sbproxy/certs \
+  -v /etc/sbproxy/sb.yml:/etc/sbproxy/sb.yml:ro \
+  -v sbproxy-acme-certs:/var/lib/sbproxy/certs \
   -e SB_LOG_LEVEL=info \
   ghcr.io/soapbucket/sbproxy:latest
 ```
 
 ### Docker Compose stack
 
-The repository ships a Docker Compose stack for local development with SBproxy, a Pebble ACME test server, and Redis.
+The repository ships a Docker Compose stack for local development at
+[`docker/docker-compose.yml`](../docker/docker-compose.yml). It runs
+six services on a shared bridge network:
 
-Start the stack:
+- **sbproxy**: the proxy itself, built from the repository and started
+  with the stack's `docker/sb.yml`, ports `8080` and `8443` mapped.
+- **pebble**: a Let's Encrypt Pebble test ACME server for exercising
+  the ACME issuance path locally (directory on port `14000`).
+- **redis**: shared-state backend for the L2 cache and distributed
+  rate limiting.
+- **prometheus**: scrapes the proxy using `docker/prometheus.yml`
+  (port `9090`).
+- **grafana**: dashboards with anonymous admin access for local use,
+  pre-provisioned with the Prometheus datasource (port `3000`).
+- **jaeger**: all-in-one trace backend with OTLP intake on `4317` and
+  the UI on `16686`.
+
+Start and stop the stack:
 
 ```bash
-make docker-up
-# Equivalent to: docker compose -f docker/docker-compose.yml up --build -d
-```
-
-Stop the stack:
-
-```bash
-make docker-down
-# Equivalent to: docker compose -f docker/docker-compose.yml down
-```
-
-The compose file (`docker/docker-compose.yml`):
-
-```yaml
-services:
-  sbproxy:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    ports:
-      - "8080:8080"
-      - "8443:8443"
-      - "8443:8443/udp"
-    volumes:
-      - ./sb.yml:/etc/sbproxy/sb.yml:ro
-      - pebble-certs:/etc/sbproxy/certs
-    environment:
-      - SB_LOG_LEVEL=info
-    depends_on:
-      redis:
-        condition: service_healthy
-      pebble:
-        condition: service_started
-
-  pebble:
-    image: letsencrypt/pebble:latest
-    command: pebble -config /test/config/pebble-config.json
-    ports:
-      - "14000:14000"
-    environment:
-      - PEBBLE_VA_NOSLEEP=1
-      - PEBBLE_VA_ALWAYS_VALID=1
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
+docker compose -f docker/docker-compose.yml up -d
+docker compose -f docker/docker-compose.yml down
 ```
 
 ### Building the Docker image
@@ -1386,20 +1297,14 @@ services:
 ```bash
 make docker
 # Equivalent to:
-docker build \
-  --build-arg VERSION=$(cat VERSION) \
-  --build-arg GIT_HASH=$(git rev-parse --short HEAD) \
-  -t sbproxy:latest .
+docker build -f Dockerfile.cloudbuild -t sbproxy:dev .
 ```
 
-Build arguments:
-
-| Argument | Description |
-|----------|-------------|
-| `VERSION` | Version string injected at compile time (default: `dev`) |
-| `GIT_HASH` | Git commit hash injected at compile time (default: `unknown`) |
-
-The image uses a multi-stage build: the builder stage compiles a fully static binary, and the final image is a small distroless or `alpine:3.21` runtime with `ca-certificates` and `tzdata` added.
+The image uses a multi-stage build: the builder stages compile the
+binary and the embedded admin UI, and the final image is
+`gcr.io/distroless/cc-debian12`, with no shell or package manager. The
+default command is `serve -f /etc/sbproxy/sb.yml`, so mounting a
+config at that path is all a derived deployment needs.
 
 ---
 
@@ -1432,13 +1337,13 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: sbproxy
-          image: ghcr.io/soapbucket/sbproxy:0.1.0
-          args: ["serve", "-c", "/etc/sbproxy"]
+          image: ghcr.io/soapbucket/sbproxy:1.5.0
+          args: ["serve", "-f", "/etc/sbproxy/sb.yaml"]
           env:
             - name: SB_LOG_LEVEL
               value: info
-            - name: SB_GRACE_TIME
-              value: "30"
+            - name: SBPROXY_SHUTDOWN_GRACE_MS
+              value: "30000"
             - name: SB_WORKER_THREADS
               valueFrom:
                 resourceFieldRef:
@@ -1450,16 +1355,13 @@ spec:
             - name: https
               containerPort: 8443
               protocol: TCP
-            - name: https-udp
-              containerPort: 8443
-              protocol: UDP
           volumeMounts:
             - name: config
               mountPath: /etc/sbproxy
               readOnly: true
           livenessProbe:
             httpGet:
-              path: /livez
+              path: /health
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
@@ -1467,7 +1369,7 @@ spec:
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /health
               port: http
             initialDelaySeconds: 5
             periodSeconds: 5
@@ -1504,6 +1406,36 @@ spec:
       targetPort: https
       protocol: TCP
 ```
+
+### Probes
+
+The example above probes `/health` on the serving port (`8080`), which
+returns a fixed `200` whenever the process is up. That is the simplest
+working configuration and needs nothing beyond the default config.
+
+The richer `/livez` and `/readyz` endpoints live on the embedded admin
+listener, not the serving port. To use them as probes, enable the
+admin server and make it reachable from the kubelet: set
+`proxy.admin.enabled: true`, `bind: "0.0.0.0"`, and an `allow_ips`
+list covering the node network (the probe endpoints themselves are
+unauthenticated, but the admin listener's IP allowlist applies to
+every connection). Then point the probes at port `9090`:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: 9090
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 9090
+```
+
+`/readyz` folds in the registered component probes (ledger, mesh
+quorum, synthetic pipeline), so it can take a pod out of rotation on a
+component failure instead of only on process death. See
+[section 6](#6-health-checks).
 
 ### UDP support for HTTP/3
 
@@ -1566,10 +1498,13 @@ data:
     proxy:
       http_bind_port: 8080
       https_bind_port: 8443
-      certificate_settings:
-        use_acme: true
-        acme_email: ops@example.com
-        acme_cache_dir: /tmp/acme-cache
+      acme:
+        enabled: true
+        email: ops@example.com
+        # The config mount is read-only; point the certificate
+        # store at a writable volume (an emptyDir loses certs on
+        # pod restart, a PVC keeps them).
+        storage_path: /var/lib/sbproxy/certs
 
     origins:
       "api.example.com":
@@ -1599,13 +1534,15 @@ spec:
 
 ## 13. Environment variables reference
 
-The binary reads three `SB_*` variables, each a fallback for a CLI flag.
-Variables are applied at process start; changes require a restart.
+The binary reads ten environment variables, most of them fallbacks for
+CLI flags. Variables are applied at process start; changes require a
+restart.
 
 | Variable | CLI Flag | Default | Description |
 |----------|----------|---------|-------------|
 | `SB_CONFIG_FILE` | `-f`, `--config` | (empty) | Path to `sb.yml`. Required if no flag and no positional arg. |
 | `SB_LOG_LEVEL` | `--log-level` | `info` | Filter for `tracing-subscriber`. Wins over `RUST_LOG`. |
+| `SB_LOG_FORMAT` | `--log-format` | `compact` | Output format for the tracing subscriber: `compact`, `pretty`, or `json`. |
 | `SB_REQUEST_LOG_LEVEL` | `--request-log-level` | (unset) | Appends an `access_log=<level>` target filter for request/access logs. |
 | `SBPROXY_SHUTDOWN_GRACE_MS` | `--shutdown-grace-ms` | `30000` | SIGINT/SIGTERM drain budget in milliseconds. Wins over `SB_GRACE_TIME`. |
 | `SB_GRACE_TIME` | `--grace-time` | (unset) | Legacy Pingora grace period and shutdown timeout in seconds. Superseded by `SBPROXY_SHUTDOWN_GRACE_MS`. |
@@ -1617,16 +1554,13 @@ Variables are applied at process start; changes require a restart.
 In addition, the standard `RUST_LOG` env var is honoured when neither
 `--log-level` nor `SB_LOG_LEVEL` is set.
 
-### OpenTelemetry standard variables
+### OpenTelemetry configuration
 
-When the OTel provider is enabled, SBproxy also respects the standard OpenTelemetry SDK environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Override OTLP endpoint |
-| `OTEL_EXPORTER_OTLP_HEADERS` | Additional OTLP headers (e.g., auth tokens) |
-| `OTEL_SERVICE_NAME` | Override service name |
-| `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes as `key=value,key=value` |
+SBproxy does not read the standard `OTEL_*` SDK environment variables.
+The OTLP exporter (endpoint, transport, service name, sampling,
+resource attributes) is configured entirely in YAML under
+`proxy.observability.telemetry`; see
+[section 5](#5-metrics-and-observability).
 
 ### Quick reference - common configurations
 
@@ -1635,7 +1569,7 @@ Minimal production startup:
 ```bash
 SB_CONFIG_FILE=/etc/sbproxy/sb.yml \
 SB_LOG_LEVEL=info \
-SB_GRACE_TIME=30 \
+SBPROXY_SHUTDOWN_GRACE_MS=30000 \
 sbproxy
 ```
 
@@ -1660,7 +1594,7 @@ Container with the canonical environment:
 docker run --rm \
   -e SB_CONFIG_FILE=/etc/sbproxy/sb.yml \
   -e SB_LOG_LEVEL=info \
-  -e SB_GRACE_TIME=30 \
+  -e SBPROXY_SHUTDOWN_GRACE_MS=30000 \
   -p 8080:8080 \
   -p 8443:8443 \
   -p 8443:8443/udp \

@@ -1,5 +1,5 @@
 # Troubleshooting
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -30,14 +30,18 @@ Jump by symptom:
 
 ## A config setting seems to be ignored
 
-You set a config key and nothing changes, with no error at boot.
+You set a config key and nothing changes.
 
-The most common cause is a misspelled key or one at the wrong nesting level. The config loader keeps an unrecognized key out of the compiled config and the field falls back to its default, which for a protection usually means off.
+Where the key sits decides what happens:
+
+- A misspelled or misplaced key nested inside `proxy:`, an origin, or a security block is a hard failure: boot and `sbproxy validate` both reject the config and print the full key path, for example `unknown or misspelled config key(s): origins.api.example.com.forward_rules.0.rules.0.user_agent`. If the proxy is running at all, no nested key in the loaded file is being silently ignored.
+- A misspelled top-level key (a sibling of `proxy:` and `origins:`) is dropped with a boot-time warning, and everything under it takes defaults. This is the usual way a whole feature block "does nothing": `key_management:` at the top level instead of nested under `proxy:` leaves the feature off.
 
 Check:
-- Compare the key against `schemas/sb-config.schema.json`, which is the generated source of truth for every valid key and its nesting.
-- Run `sbproxy validate --config sb.yml` to parse the file offline before serving.
-- As a quick test, rename the suspect key to something obviously wrong and confirm the behavior is identical. If it is, the key was never taking effect.
+- Run `sbproxy validate sb.yml`. Nested unknown keys fail the run; dropped top-level keys print the same `ignored unknown/misspelled top-level key(s)` warning the server logs.
+- Grep the boot log for `ignored unknown/misspelled top-level key(s)`.
+- Compare the key against `schemas/sb-config.schema.json`, the generated source of truth for every valid key and its nesting.
+- Out-of-tree blocks belong under `proxy.extensions:` (or an origin's `extensions:`); that is the one place unrecognized keys are expected and passed through.
 
 ## 404, origin not found
 
@@ -76,7 +80,7 @@ Usually one of: file watcher debounce, ConfigMap symlink swap, or a validation f
 Check:
 - A config with a validation error gets logged and rejected. The old config keeps running. Run `sbproxy validate --config sb.yml` to see the error.
 - The file watcher reacts to in-place writes. Saves that replace the file by atomic rename (many editors, `sed -i`, and Kubernetes ConfigMap symlink swaps) may not be detected. After a ConfigMap update, send `SIGHUP` or restart the pod to force the reload.
-- The `agent_classes`, `agent_detect`, and `tls_fingerprint` installers are applied at startup and are not currently re-applied on reload. Restart the process to pick up changes to those blocks.
+- The `agent_classes`, `agent_detect`, and `tls_fingerprint` installers are applied at startup and re-applied on every hot reload; each swaps its live state atomically, so changes to those blocks take effect without a restart.
 - Watch `sbproxy_config_reload_total{result}`: a rising `failure` count or a stalled `success` cadence is the reload path telling you it is stuck.
 
 ## Rolling back a bad config change
@@ -86,7 +90,7 @@ Traffic degraded right after a config rollout and you need the old behavior back
 Check:
 - Revert `sb.yml` to the last-good revision, then send `SIGHUP` or `POST /admin/reload`. Validation runs first and a config that fails validation is rejected while the old pipeline keeps serving, so a rushed rollback cannot take the proxy down.
 - Before re-applying, `sbproxy plan -f sb.yml --against last-good.yml` prints the added, changed, and removed origins with a max-blast-radius line. Exit code 0 means no-op, 2 means changes present, 3 means semantic errors. Wire it into CI so oversized diffs stop before they ship.
-- One thing hot reload deliberately does not reset: the AI budget accumulators. Budget windows are wall-clock-relative, so a reload (or rollback) does not zero already-spent budget. To zero a budget intentionally, restart the process or use the per-scope reset on the admin surface.
+- One thing hot reload deliberately does not reset: the AI budget accumulators. Budget windows are wall-clock-relative, so a reload (or rollback) does not zero already-spent budget. There is no admin endpoint for resetting a budget; to zero one intentionally, restart the process.
 - On Kubernetes, `helm history sbproxy` and `helm rollback` walk the same ladder at the deployment layer; [operator-runbook.md](operator-runbook.md) has the exact commands.
 
 ## AI requests fail with provider error
@@ -111,10 +115,10 @@ Check:
 
 SBproxy adds well under 1 ms of overhead under normal load. If you see more, the cause is almost always upstream or DNS.
 
-1. Check `upstream_latency_ms` in the structured log. If it's high, the upstream is slow, not SBproxy.
-2. If `upstream_latency_ms` is low but total latency is high, suspect DNS. SBproxy caches DNS with a 30-second TTL; the first request after a cache miss pays the resolver round trip.
+1. Check `upstream_ttfb_ms` in the structured log. If it's high, the upstream is slow, not SBproxy.
+2. If `upstream_ttfb_ms` is low but total latency is high, suspect DNS. Resolved addresses are cached and refreshed in the background by a refreshing resolver, so a request that lands right after a hostname goes stale pays the resolver round trip.
 3. Turn on OpenTelemetry tracing (`telemetry` block) to get a per-span breakdown across the phase pipeline.
-4. If you have Lua, JavaScript, or CEL configured, set `scripting.timeout_ms` to cap runaway scripts.
+4. If you have Lua or JavaScript configured, cap runaway scripts with the per-engine sandbox budgets: `proxy.scripting.lua.sandbox.max_execution_ms` and `proxy.scripting.javascript.sandbox.budget_ms`.
 5. The `sbproxy_phase_duration_seconds{phase}` histogram (and the matching `auth_ms` / `upstream_ttfb_ms` / `response_filter_ms` access-log fields) splits end-to-end latency into auth, upstream wait, and response transforms, so you can see which phase grew without tracing.
 
 ## No access-log lines appear
@@ -176,8 +180,8 @@ With `proxy.l2_cache_settings` on Redis, an outage does not stop traffic, but sh
 
 Check:
 - Expected during the outage: rate-limit counters go node-local (a multi-replica fleet lets slightly more traffic through a global limit), and response-cache entries written meanwhile stay local. This is the designed fallback behavior; see [degradation.md](degradation.md).
-- `sbproxy_redis_connection_errors_total` confirms the proxy sees the outage; the log shows `ERROR` on disconnect and `INFO` on recovery.
-- Reconnection is automatic with exponential backoff behind a circuit breaker. There is nothing to restart; fix Redis and the proxy re-attaches.
+- There is no dedicated Redis metric family; confirm the outage in the logs, where failed Redis operations surface as errors on the rate-limit and cache paths.
+- Reconnection is automatic: the client connects lazily and re-establishes the connection on the next operation once Redis is back. There is nothing to restart; fix Redis and the proxy re-attaches.
 - Alert on this when running clustered, since the visible symptom (limits slightly leaky, cache hit rate down) is easy to miss.
 
 ## TLS handshake fails
@@ -193,10 +197,10 @@ Check:
 Renewal failures are quiet at first because the existing certificate keeps serving until expiry.
 
 Check:
-- The log: each failed renewal logs `WARN` with time-to-expiry, escalating to `ERROR` once the active cert has expired. `sbproxy_acme_errors_total` counts the failures.
-- Renewals retry on exponential backoff from 1 minute up to 24 hours, so a transient CA outage heals itself. A renewal that has been failing for days is usually a changed DNS record, a firewall now blocking the challenge port, or an account/rate-limit problem at the CA.
+- The log: every failed issuance or renewal logs an error naming the hostname (`ACME issuance failed`, directory fetch and account-key errors likewise). `sbproxy_acme_renewals_total{result}` counts attempts by outcome.
+- The renewal loop re-checks every hostname on a 12 hour cadence (with an immediate first pass at startup), so a transient CA outage heals on a later pass. A renewal that has been failing for days is usually a changed DNS record, a firewall now blocking the challenge port, or an account/rate-limit problem at the CA.
+- `sbproxy_cert_expiry_seconds{host}` gauges seconds until each served certificate expires; graph it or alert on it dropping below your comfort window. No bundled alert rule covers cert expiry, so add one to your own rules if you rely on ACME.
 - If a listener has no usable cert at all (fresh boot, ACME never succeeded), the proxy serves a self-signed bootstrap cert and logs loudly rather than refusing to start. Clients will see trust errors until the first real issuance lands; that is the visible symptom to chase.
-- The bundled alerting fires when expiry is within 14 days and renewal keeps failing. Do not wait for the expiry page.
 
 ## HTTP/3 requests fall back to HTTP/2
 
@@ -211,19 +215,20 @@ Check:
 A `serve:` block parses and validates on any host, but an engine only launches where the hardware and runtime support it.
 
 Check:
-- Run `sbproxy doctor`. It reports the host-wide verdict with no config needed: build capabilities, visible GPUs, inference engines on PATH, container runtime, the model cache, and a serve-readiness verdict listing every blocker. For a missing engine it prints the prerequisites and the manual install steps; it diagnoses, it does not install engines for you.
+- Run `sbproxy doctor`. It reports the host-wide verdict with no config needed: build capabilities, visible GPUs, inference engines, container runtime, the model cache, and a serve-readiness verdict listing every blocker. Engine acquisition comes first in that verdict: a binary engine that is not on PATH still counts as runnable when a viable acquisition method exists, because sbproxy fetches it itself (a pinned llama.cpp release download, an operator-supplied path, or vLLM via `uv tool run`). A model is only blocked when no acquisition path works on this host, and doctor names the reason.
 - The proxy re-checks the same prerequisites whenever a config with `serve:` loads and logs a warning per missing piece, naming the model and the blocker. Read boot logs before chasing anything else.
 - `sbproxy_model_host_ensure_failures_total{reason}` separates a model that cannot fit the GPU (`fit`) from an engine that crash-loops (`launch`) from a bad reference (`unknown_model`, `resolve`). The bundled `SBProxyModelHostEngineLaunchFailing` alert points at GPU VRAM, the engine binary on PATH, and weight integrity as the first three suspects.
 - Weight downloads are governed by the manifest entry's pull policy (`on_boot`, `on_demand`, `manual`). With `manual`, the weights must already be in the cache directory; with `on_demand`, the first request pays the download, which can look like a hang on a multi-GB pull. `sbproxy_model_host_weight_download_seconds` makes the slow pull visible. See [model-host.md](model-host.md).
 
 ## An example docker compose stack will not start
 
-The compose-based examples build the `sbproxy` image from source in the container (`build: ../..`, `Dockerfile.cloudbuild`) and pull base images such as `wiremock/wiremock` from Docker Hub.
+The `use-case-*` stacks (and other recent examples) pull the published `ghcr.io/soapbucket/sbproxy` image; some older examples instead build the image from source in the container (`build: ../..`, `Dockerfile.cloudbuild`). Both kinds pull supporting images such as `wiremock/wiremock` from Docker Hub.
 
 Check:
-- Look for `pull access denied` or `auth.docker.io ... unexpected EOF` in the compose output. That is a registry-connectivity problem, not an example defect.
-- Confirm the daemon is up with `docker info`, and that the host can reach Docker Hub.
-- Pre-pull the base images (or build the `sbproxy` image once) so a later `docker compose up` works from cache.
+- Look for `pull access denied` or `auth.docker.io ... unexpected EOF` in the compose output. That is a registry-connectivity problem (ghcr.io or Docker Hub), not an example defect.
+- Confirm the daemon is up with `docker info`, and that the host can reach ghcr.io and Docker Hub.
+- Pre-pull the images (or, for the build-from-source examples, build the `sbproxy` image once) so a later `docker compose up` works from cache.
+- The build-from-source examples compile the whole workspace inside the container on first run; a long silent period during `docker compose up` is the Rust build, not a hang.
 
 ## Build and run quick reference
 

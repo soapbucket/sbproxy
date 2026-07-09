@@ -1,5 +1,5 @@
 # Routing Strategies
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 The `RoutingStrategy` trait is an opt-in extension point for plugging custom upstream selection logic into a `load_balancer` action. It lives in `sbproxy-modules::action::routing`. The trait runs on the request hot path, so it is synchronous, takes a borrowed slice of already-projected target state, and returns the index of the chosen target or `None` to fall through to the configured load-balancing algorithm. The production strategies this scaffold was built for (LoRA affinity, GPU-utilisation routing, bandit routing) have since shipped against it; the full list is below.
 
@@ -21,14 +21,14 @@ pub trait RoutingStrategy: Send + Sync {
 
 `RoutingRequest` carries the request projection a strategy is allowed to see: `method`, `path`, `headers`, `client_ip`, `hostname`, optional `model` and `adapter` (set on the AI-proxy code path), and a free-form `metadata` map for additional signals.
 
-`TargetState` is the projected upstream view: `index` into the load balancer's target slice, `url`, a single `healthy` boolean (collapsing health checks, circuit breakers, and outlier detection), `active_connections`, `weight`, and a `metadata` map sourced from the target config (loaded LoRA adapters, GPU model, region, ...).
+`TargetState` is the projected upstream view: `index` into the load balancer's target slice, `url`, a single `healthy` boolean (collapsing health checks, circuit breakers, and outlier detection), `active_connections`, `weight`, and a `metadata` map for per-target signals (loaded LoRA adapters, GPU utilization, region, ...). One honesty note: the `load_balancer` config's `Target` struct has no `metadata` field today, so a `metadata:` key written under a target in `sb.yml` is silently dropped and the map arrives empty; populating it is embedder or control-plane work until the config field lands.
 
 The four core methods on the public surface:
 
 - `RoutingStrategy::select` - pick an index into `targets`, or return `None` to defer.
 - `RoutingStrategy::name` - stable identifier used for logging and metrics labels.
 - `build_routing_strategy(name, config)` - look up a strategy by registered name and instantiate it from a JSON config blob.
-- `list_routing_strategies()` - enumerate every registered strategy name (used by `clictl` config validation).
+- `list_routing_strategies()` - enumerate every registered strategy name, for diagnostics and config validation.
 
 ## Registering a strategy from a third-party crate
 
@@ -94,9 +94,11 @@ The `gpu-aware` strategy is a pure consumer of telemetry; it never polls a devic
 
 ### Metadata contract
 
-Each target advertises its adapter inventory in the `metadata` map under the key `loaded_adapters`. The shape is a JSON array of adapter identifiers:
+Each target advertises its adapter inventory in the `TargetState.metadata` map under the key `loaded_adapters`. The shape is a JSON array of adapter identifiers:
 
 ```yaml
+# Forward-looking: the config Target struct has no metadata field yet,
+# so this YAML parses but the metadata block is silently dropped.
 targets:
   - url: https://upstream-0.ai.internal
     metadata:
@@ -107,7 +109,7 @@ targets:
 
 A missing key, a non-array value, or non-string elements are all treated as "no adapters loaded" rather than producing an error: the strategy is intentionally lenient so a single misconfigured target cannot poison routing for the rest of the pool.
 
-Populating this metadata is operator work. Today the supported path is hand-pinned YAML (per the example above) or a control-plane hook that rewrites target metadata on config reload. There is no built-in live feed where each upstream reports its adapter inventory back to the proxy; the same is true of the `gpu-aware` strategy's utilisation signal, which operators feed from a metrics scrape or a sidecar.
+Populating this metadata is embedder or control-plane work. The YAML shape above is forward-looking: the `load_balancer` config's `Target` struct has no `metadata` field today, so writing it in `sb.yml` has no effect. Until that field lands, the map is populated by whatever builds the per-request `TargetState` slice, typically a control-plane hook that rewrites target metadata on config reload. There is no built-in live feed where each upstream reports its adapter inventory back to the proxy; the same is true of the `gpu-aware` strategy's utilisation signal, which operators feed from a metrics scrape or a sidecar.
 
 ### Fall-back semantics
 

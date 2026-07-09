@@ -435,7 +435,10 @@ mod tests {
                 ..Default::default()
             },
             spec: SBProxyConfigSpec {
-                config: "origins:\n  - host: example.com\n    upstream:\n      url: https://example.org\n"
+                // Map-form origins: the schema `origins` is a
+                // hostname-keyed map, and the proxy rejects the
+                // Go-era list form this fixture used to carry.
+                config: "origins:\n  \"example.com\":\n    action:\n      type: proxy\n      url: https://example.org\n"
                     .to_string(),
             },
         }

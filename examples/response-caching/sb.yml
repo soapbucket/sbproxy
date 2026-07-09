@@ -3,14 +3,14 @@
 #
 # Caches upstream responses for 60 seconds. The second request for the same
 # path is served from the in-memory store without contacting the upstream.
-# The x-sbproxy-cache response header reports MISS on the first request and
-# HIT on the second.
+# The x-sbproxy-cache response header reports HIT on a cached serve; it is
+# absent on a miss.
 #
 # Run:
 #   make run CONFIG=examples/response-caching/sb.yml
 #
 # Test:
-#   # First request: MISS (fetched from upstream and stored).
+#   # First request: miss (fetched from upstream and stored; no header).
 #   curl -s -D - -o /dev/null -H 'Host: cached.local' http://127.0.0.1:8080/get | grep -i x-sbproxy-cache
 #   # Second request: HIT (served from cache, upstream not contacted).
 #   curl -s -D - -o /dev/null -H 'Host: cached.local' http://127.0.0.1:8080/get | grep -i x-sbproxy-cache

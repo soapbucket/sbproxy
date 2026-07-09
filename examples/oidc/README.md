@@ -1,6 +1,6 @@
 # oidc
 
-*Last modified: 2026-06-04*
+*Last modified: 2026-07-09*
 
 OpenID Connect Relying-Party login flow. Puts SSO in front of an
 upstream that has no auth of its own: an unauthenticated browser is
@@ -34,10 +34,17 @@ make run CONFIG=examples/oidc/sb.yml
 
 ## Walk through the flow (interactive)
 
+The config keys the origin on `app.example.com`, so the browser has to
+reach the proxy under that name. Map it to loopback first:
+
+```bash
+echo '127.0.0.1 app.example.com' | sudo tee -a /etc/hosts
+```
+
 The auth-redirect dance is browser-driven:
 
 ```bash
-open http://127.0.0.1:8080/        # 302 to IdP authorize endpoint
+open http://app.example.com:8080/  # 302 to IdP authorize endpoint
 # ... complete login at the IdP ...
 # IdP 302s back to /oidc/callback?code=...&state=...
 # the proxy validates the ID token, mints a session cookie, 302s to "/"

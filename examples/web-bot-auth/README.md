@@ -1,6 +1,6 @@
 # Web Bot Auth
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Web Bot Auth](../../docs/assets/web-bot-auth.gif)
 
@@ -9,13 +9,10 @@ Cryptographic agent verification under RFC 9421 HTTP Message Signatures and the 
 ## Run
 
 ```bash
-export OPENAI_BOT_PUBKEY=...        # 32-byte ed25519 pubkey, hex or base64
-export ANTHROPIC_BOT_PUBKEY=...
-export PERPLEXITY_BOT_PUBKEY=...
 sbproxy serve -f sb.yml
 ```
 
-The directory is populated from environment variables here. Production deployments typically materialise these from a vault or a hosted directory.
+The agent public keys are inline hex placeholders in `sb.yml`. Production deployments typically materialise these from a vault or a hosted directory.
 
 ## Try it
 

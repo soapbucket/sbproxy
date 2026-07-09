@@ -1,6 +1,6 @@
 # Bearer token authentication
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Bearer token authentication](../../docs/assets/auth-bearer.gif)
 
@@ -35,7 +35,7 @@ $ curl -i -H 'Host: bearer.local' \
 HTTP/1.1 200 OK
 content-type: application/json
 
-{"args":{},"headers":{"Authorization":"Bearer svc-token-alpha","Host":"test.sbproxy.dev",...},"url":"https://test.sbproxy.dev/get"}
+{"method":"GET","url":"/get","headers":{"authorization":"Bearer svc-token-alpha","host":"test.sbproxy.dev",...},"query":{},"timestamp":"2026-07-09T19:29:58.060Z"}
 ```
 
 The second token works the same way:

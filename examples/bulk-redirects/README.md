@@ -1,6 +1,6 @@
 # Bulk redirects
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Bulk redirects](../../docs/assets/bulk-redirects.gif)
 
@@ -9,7 +9,10 @@ Each origin owns its own redirect list, compiled at config-load into an O(1) loo
 ## Run
 
 ```bash
-sbproxy serve -f sb.yml
+# From the repo root. The file-backed list resolves
+# examples/bulk-redirects/redirects.csv relative to the working directory,
+# so the proxy must start from the repo root.
+make run CONFIG=examples/bulk-redirects/sb.yml
 ```
 
 The `redirects.csv` file lives next to `sb.yml`. Lines starting with `#` and blank lines are skipped.
@@ -20,16 +23,18 @@ The `redirects.csv` file lives next to `sb.yml`. Lines starting with `#` and bla
 # marketing.local: file-backed list, default 301.
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
      -H 'Host: marketing.local' http://127.0.0.1:8080/old/about
-# 301 https://example.com/about... (well, /about; relative target)
+# 301 http://127.0.0.1:8080/about
+# The CSV target is the relative path /about; curl's %{redirect_url}
+# resolves it against the request URL.
 
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
      -H 'Host: marketing.local' http://127.0.0.1:8080/old/team
-# 301 /about/team
+# 301 http://127.0.0.1:8080/about/team
 
 # Press archive: status falls back to action's default (301).
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
      -H 'Host: marketing.local' http://127.0.0.1:8080/press/2022/october-launch
-# 301 /press/archive/2022-10
+# 301 http://127.0.0.1:8080/press/archive/2022-10
 
 # Cross-host moves: row carries its own status.
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
@@ -39,7 +44,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
 # shop.local inline list with 308 override.
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
      -H 'Host: shop.local' http://127.0.0.1:8080/category/legacy
-# 308 /category/2024
+# 308 http://127.0.0.1:8080/category/2024
 
 # Unmapped path on shop.local -> 302 fallback to https://shop.example.com/.
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
@@ -49,7 +54,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
 # Query strings preserved by default (preserve_query: true).
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
      -H 'Host: marketing.local' 'http://127.0.0.1:8080/old/about?utm=launch'
-# 301 /about?utm=launch
+# 301 http://127.0.0.1:8080/about?utm=launch
 ```
 
 ## What this exercises

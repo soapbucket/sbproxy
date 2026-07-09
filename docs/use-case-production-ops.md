@@ -1,6 +1,6 @@
 # Taking SBproxy on-call: metrics, logs, and your first incident
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-09*
 
 ![Terminal recording: traffic flows through three origins, a dead upstream returns 502, the fallback origin serves a degraded 200, and the failure shows up in /metrics and the JSON access log](assets/use-case-production-ops.gif)
 
@@ -159,7 +159,7 @@ $ curl -s http://127.0.0.1:9091/readyz
 {"status":"ok","components":[{"name":"agent_registry","status":"healthy"},...]}
 
 $ curl -s http://127.0.0.1:9091/health
-{"status":"ok","version":"1.2.0","build_hash":"5e8cfa8","uptime_seconds":312,"checks":[...]}
+{"status":"ok","version":"1.5.0","build_hash":"5e8cfa8","uptime_seconds":312,"checks":[...]}
 ```
 
 Point Kubernetes readiness at `/readyz` and liveness at `/livez`. `/health` is the rich one, for humans and SIEMs: version, build hash, uptime, and per-component checks, returning 503 with the failing component named when something required is down. The admin UI renders the same data as a health view:

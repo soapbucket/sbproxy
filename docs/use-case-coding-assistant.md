@@ -1,14 +1,14 @@
 # Point your coding assistant at your own GPU
 
-*Last modified: 2026-07-07*
+*Last modified: 2026-07-09*
 
 ![The Anthropic wire answered by local Qwen3 weights behind the claude-sonnet-4-5 alias, the OpenAI wire answering the same, then the one-line base-URL change](assets/use-case-coding-assistant.gif)
 
-*The recording shows the gateway's Anthropic format bridge against a hosted Claude upstream. A recording of this page's config, with the model running on a local GPU, lands with model-host GPU certification.*
+*The recording shows the gateway's Anthropic format bridge against a hosted Claude upstream. A recording of this page's config, with the model running on a local GPU, is still to come.*
 
 Your coding assistant streams your source code to somebody else's cloud, and the meter runs the whole session. Meanwhile the GPU in your workstation sits idle. SBproxy closes that gap with one Apache-2.0 binary that routes to 66 providers or serves the weights on your own hardware: "Call any model. Serve your own. Govern both." This page sets up the serving half and points Claude Code, Cline, and Continue at it.
 
-One honest note up front. The model host is landing in phases. The released binary ships GPU discovery and Hugging Face weight download, and the process launcher is tested against a fake engine, but real vLLM and llama.cpp bring-up is certified against actual GPUs in later phases of the work. `sbproxy doctor` reports what your host can do today; trust its verdict over any doc, this one included. See [model-host.md](model-host.md) for the current status.
+One honest note up front. The released binary ships GPU discovery and Hugging Face weight download, acquires a missing inference engine on first use (a pinned llama.cpp release binary, or vLLM run through `uv tool run`), and the real engine bring-up is certified on hardware: a GGUF model serves on Metal on an Apple Silicon Mac, and a safetensors model serves on an NVIDIA L4 through vLLM. Hosts still differ. `sbproxy doctor` reports what your box can do; trust its verdict over any doc, this one included. See [model-host.md](model-host.md) for the details.
 
 ## What you will build
 
@@ -17,7 +17,7 @@ A gateway on port 8080 that hosts Qwen3 14B on your GPU and answers to the name 
 ## Prerequisites
 
 - A host with an NVIDIA GPU and driver. `sbproxy doctor` tells you whether the box qualifies and lists every blocker when it does not.
-- An inference engine on `PATH`: a prebuilt `llama-server` release, or vLLM via `uv tool install vllm` or `pipx install vllm`. SBproxy diagnoses missing engines and prints install steps; it never installs them for you.
+- An inference engine, which SBproxy acquires for you on first use: it fetches a pinned `llama-server` prebuilt for GGUF weights, or fetches `uv` and runs vLLM through `uv tool run` for safetensors. A binary already on `PATH` is preferred over any fetch, so installing your own build also works.
 - `curl` for testing and `jq` for readable output.
 - Claude Code, Cline, or Continue on the machine you code from.
 
@@ -41,7 +41,7 @@ The full install matrix, including packages and Kubernetes, is in the [manual](m
 Save this as `sb.yml`. It ships as [`examples/use-case-coding-assistant`](../examples/use-case-coding-assistant), which also carries a compose file.
 
 ```yaml
-# yaml-language-server: $schema=./schemas/sb-config.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
 proxy:
   http_bind_port: 8080
 
@@ -63,7 +63,7 @@ origins:
                 keep_alive: 30m
 ```
 
-The `serve:` block is the whole trick. The model line names the weights explicitly: the Hugging Face repo, the quant, and the file. The gateway fetches them into its cache, spawns the engine as a supervised subprocess, and routes to it over loopback, which is why the provider carries no `base_url`. (Bare catalog ids like `qwen3-14b`, with the fit planner choosing the quant for your card, resolve here once catalog-driven serving lands; the explicit form is the one certified on hardware today.) The `name:` field is the alias every plane sees. A request for `claude-sonnet-4-5` lands on the local Qwen, and since that is the model id Claude Code asks for by default, the client side shrinks to a base-URL change. `extra_args: ["--jinja"]` has llama-server apply the chat template embedded in the GGUF, and `keep_alive: 30m` unloads the engine after thirty idle minutes so the VRAM comes back.
+The `serve:` block is the whole trick. The model line names the weights explicitly: the Hugging Face repo, the quant, and the file. The gateway fetches them into its cache, spawns the engine as a supervised subprocess, and routes to it over loopback, which is why the provider carries no `base_url`. (A bare catalog id like `qwen3-14b` also resolves, with the fit planner choosing the quant for your card; the explicit form pins the exact weights file.) The `name:` field is the alias every plane sees. A request for `claude-sonnet-4-5` lands on the local Qwen, and since that is the model id Claude Code asks for by default, the client side shrinks to a base-URL change. `extra_args: ["--jinja"]` has llama-server apply the chat template embedded in the GGUF, and `keep_alive: 30m` unloads the engine after thirty idle minutes so the VRAM comes back.
 
 The origin key matters more than it looks. Hostname matching strips the port, so `"localhost"` matches a client whose base URL is `http://localhost:8080`. Running the gateway on a shared GPU box, key the origin with the hostname your clients will use instead.
 
@@ -88,7 +88,7 @@ Check the config and the host before starting anything:
 
 ```console
 $ sbproxy validate sb.yml --format json
-{"valid":true,"path":"sb.yml"}
+{"path":"sb.yml","valid":true}
 $ sbproxy doctor
 ```
 
@@ -119,7 +119,7 @@ $ curl -s http://localhost:8080/v1/messages \
 }
 ```
 
-That is a captured response, not a mock, and two things in it are worth knowing about. The `model` field currently names the served weights file rather than echoing the alias, which is unambiguous proof the tokens came from your disk. And Qwen3 is a reasoning model: it spends tokens thinking before it answers (the bridge strips the thinking from `content`), so give `max_tokens` room; at 100 the whole budget can go to thought and the text comes back empty. The text itself was written by the Qwen on your GPU. No API key changed hands; this config defines no virtual keys, so the gateway accepts the request as-is. Add `virtual_keys` from [configuration.md](configuration.md#virtual-keys-virtual_keys) when you want per-client keys and quotas in front of the box.
+That is a captured response, not a mock, and two things in it are worth knowing about. The `model` field currently names the served weights file rather than echoing the alias, which is unambiguous proof the tokens came from your disk. And Qwen3 is a reasoning model: it spends tokens thinking before it answers (the bridge strips the thinking from `content`), so give `max_tokens` room; at 100 the whole budget can go to thought and the text comes back empty. The text itself was written by the Qwen on your GPU. No API key changed hands; this config defines no client credentials, so the gateway accepts the request as-is. Add a `credentials:` block from [configuration.md](configuration.md#credentials) when you want per-client keys and quotas in front of the box.
 
 ### Claude Code
 

@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# RFC 8594 idempotency middleware.
+# Idempotency middleware (IETF draft draft-ietf-httpapi-idempotency-key-header).
 #
 # Authoring `idempotency:` on an origin tells the proxy to short-circuit
 # retries that carry the same `Idempotency-Key` header and the same
@@ -17,7 +17,7 @@
 #     operators can tell it apart in logs.
 #
 #   * Retry with key X but a different body: the proxy returns 409 with
-#     the `ledger.idempotency_conflict` body per the RFC.
+#     the `ledger.idempotency_conflict` body per the draft.
 #
 # Only POST, PUT, and PATCH engage by default; other methods (which the
 # HTTP spec defines as idempotent) pass through unaffected.

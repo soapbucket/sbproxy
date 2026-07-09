@@ -40,8 +40,13 @@ a separate `mock-origin` to demonstrate the proxy mode.
 
 ```bash
 cd examples/markdown-for-agents
-docker compose up -d --wait
+make up
 ```
+
+`make up` runs `docker compose up -d` and then polls
+`http://127.0.0.1:8080/health` until the proxy answers. The image is
+distroless (no shell, no wget), so the compose file has no container
+healthcheck and `docker compose up -d --wait` cannot be used here.
 
 Tear down:
 
@@ -49,8 +54,8 @@ Tear down:
 docker compose down -v
 ```
 
-The `Makefile` wraps the same calls (`make up`, `make down`,
-`make logs`, `make test`).
+The `Makefile` also provides `make down`, `make logs`, and
+`make test`.
 
 ## What to expect
 
@@ -153,8 +158,7 @@ denser (technical docs, source code) or sparser (CJK languages).
 
 ## Related docs
 
--  - G4.1 content-negotiate ADR.
--  - A4.2 JSON envelope (Markdown carriage in API responses).
+- `docs/content-for-agents.md` - content negotiation and the JSON envelope (Markdown carriage in API responses).
 - `docs/ai-crawl-control.md` - feature reference for the `ai_crawl_control` policy.
 - `examples/rsl-licensing/` - companion bundle for the RSL `/licenses.xml` projection.
 - `examples/robots-llms-txt/` - companion bundle for `robots.txt` + `llms.txt`.

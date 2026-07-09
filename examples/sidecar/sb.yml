@@ -11,7 +11,7 @@
 #   make run CONFIG=examples/sidecar/sb.yml
 #
 # Test:
-#   curl -H 'Host: any.host' http://127.0.0.1:15001/
+#   curl -H 'Host: app.local' http://127.0.0.1:15001/
 #   # observe the rate_limiting and ip_filter policies in action
 #
 # In a pod the workload talks to 127.0.0.1:15001 directly (no
@@ -23,10 +23,11 @@ proxy:
   http_bind_port: 15001
 
 origins:
-  # Catch-all hostname. The sidecar instruments every outbound
-  # call the workload makes; layer policy on top without
-  # rewriting the destination.
-  "*":
+  # Origin keys are exact hostnames; wildcard origins are not
+  # supported. app.local stands in for one destination the
+  # workload calls; add one origin block per destination host
+  # you authorise.
+  "app.local":
     action:
       type: proxy
       url: https://test.sbproxy.dev

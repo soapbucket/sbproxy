@@ -1,5 +1,5 @@
 # Bulk redirects
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![/old/about answered with a 301 from a CSV row and a shop path answered 308 from an inline row](assets/bulk-redirects.gif)
 
@@ -40,9 +40,14 @@ lines are ignored. A leading row whose first column is the literal
 ```csv
 from,to,status
 /old/about,/about,301
-/old/help,/help          # status defaults to the action's status_code
+# status defaults to the action's status_code:
+/old/help,/help
 /blog/2023,https://blog.example.com/2023,308
 ```
+
+Comments must sit on their own line; only lines starting with `#`
+are ignored, so a trailing comment after a row would be parsed as
+part of the destination.
 
 YAML or inline:
 
