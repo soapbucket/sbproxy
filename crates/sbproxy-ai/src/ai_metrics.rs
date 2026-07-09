@@ -1264,9 +1264,106 @@ pub fn record_audio_seconds_attributed(
         .inc_by(seconds);
 }
 
+// --- WOR-1810: streaming guardrail observability ---
+
+/// Streamed responses terminated (or flagged) by an output guardrail,
+/// by guardrail type name. The WOR-490 metric that never landed.
+static STREAM_GUARDRAIL_VIOLATIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_stream_guardrail_violations_total",
+            "Streaming output guardrail violations, by guardrail type (WOR-1810)"
+        ),
+        &["guardrail"] // bounded: the built-in guardrail type names
+    )
+    .unwrap()
+});
+
+/// Output guardrails excluded from a streaming response by
+/// `stream_policy: off`, counted per stream so a policy that silently
+/// disables coverage stays visible on dashboards.
+static STREAM_GUARDRAIL_SKIPPED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_stream_guardrail_skipped_total",
+            "Output guardrails skipped on streaming responses via stream_policy: off (WOR-1810)"
+        ),
+        &["guardrail"]
+    )
+    .unwrap()
+});
+
+/// Chunks where decoded-delta extraction failed and guardrails fell
+/// back to matching the raw frame text. A rising rate means a provider
+/// is emitting frames the OpenAI delta parser cannot read.
+static STREAM_GUARDRAIL_DECODE_FALLBACK: LazyLock<prometheus::Counter> = LazyLock::new(|| {
+    prometheus::register_counter!(
+        "sbproxy_ai_stream_guardrail_decode_fallback_total",
+        "Streaming chunks where guardrails fell back to raw-frame matching (WOR-1810)"
+    )
+    .unwrap()
+});
+
+/// Record a streaming guardrail violation (block or flag).
+pub fn record_stream_guardrail_violation(guardrail: &str) {
+    STREAM_GUARDRAIL_VIOLATIONS
+        .with_label_values(&[guardrail])
+        .inc();
+}
+
+/// Record guardrails excluded from a stream by `stream_policy: off`.
+pub fn record_stream_guardrail_skipped(guardrail: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    STREAM_GUARDRAIL_SKIPPED
+        .with_label_values(&[guardrail])
+        .inc_by(n as f64);
+}
+
+/// Record a raw-frame guardrail fallback on an undecodable chunk.
+pub fn record_stream_guardrail_decode_fallback() {
+    STREAM_GUARDRAIL_DECODE_FALLBACK.inc();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_guardrail_counters_register_and_increment() {
+        record_stream_guardrail_violation("toxicity");
+        record_stream_guardrail_skipped("injection", 2);
+        record_stream_guardrail_skipped("injection", 0); // no-op
+        record_stream_guardrail_decode_fallback();
+        let families = prometheus::gather();
+        let violations = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_stream_guardrail_violations_total")
+            .expect("violations counter registered");
+        assert!(violations.get_metric().iter().any(|m| {
+            m.get_label()
+                .iter()
+                .any(|l| l.name() == "guardrail" && l.value() == "toxicity")
+        }));
+        let skipped = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_stream_guardrail_skipped_total")
+            .expect("skipped counter registered");
+        let inj = skipped
+            .get_metric()
+            .iter()
+            .find(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "guardrail" && l.value() == "injection")
+            })
+            .expect("injection row");
+        assert_eq!(inj.get_counter().value(), 2.0);
+        assert!(families
+            .iter()
+            .any(|f| f.name() == "sbproxy_ai_stream_guardrail_decode_fallback_total"));
+    }
 
     #[test]
     fn test_record_ai_request() {
