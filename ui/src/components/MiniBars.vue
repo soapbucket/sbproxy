@@ -4,6 +4,8 @@ import { computed } from "vue";
 const props = defineProps<{
   items: { key: string; value: number }[];
   unit?: string;
+  /** Custom value formatter; wins over the default fmt + unit pair. */
+  format?: (v: number) => string;
 }>();
 
 const max = computed(() =>
@@ -20,7 +22,9 @@ function fmt(v: number): string {
     <div class="bar" v-for="item in items" :key="item.key">
       <div class="bar__head">
         <span class="bar__key sb-mono">{{ item.key }}</span>
-        <span class="bar__val">{{ fmt(item.value) }}{{ unit || "" }}</span>
+        <span class="bar__val">{{
+          format ? format(item.value) : fmt(item.value) + (unit || "")
+        }}</span>
       </div>
       <div class="bar__track">
         <div
