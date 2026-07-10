@@ -90,9 +90,9 @@ fn load_catalog_from_dir(
 fn artifact_transport() -> Result<Arc<dyn ArtifactTransport>, String> {
     #[cfg(feature = "model-weights")]
     {
-        return sbproxy_model_host::HttpArtifactTransport::new()
+        sbproxy_model_host::HttpArtifactTransport::new()
             .map(|transport| Arc::new(transport) as Arc<dyn ArtifactTransport>)
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string())
     }
     #[cfg(not(feature = "model-weights"))]
     {

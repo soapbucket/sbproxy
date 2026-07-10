@@ -1601,12 +1601,12 @@ fn models_pull_transport(
 ) -> anyhow::Result<std::sync::Arc<dyn sbproxy_model_host::ArtifactTransport>> {
     #[cfg(feature = "model-weights")]
     {
-        return sbproxy_model_host::HttpArtifactTransport::new()
+        sbproxy_model_host::HttpArtifactTransport::new()
             .map(|transport| {
                 std::sync::Arc::new(transport)
                     as std::sync::Arc<dyn sbproxy_model_host::ArtifactTransport>
             })
-            .map_err(|error| anyhow::anyhow!(error.to_string()));
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
     #[cfg(not(feature = "model-weights"))]
     {
@@ -1655,14 +1655,18 @@ struct ModelsPullProgress;
 impl sbproxy_model_host::ArtifactObserver for ModelsPullProgress {
     fn on_job(&self, job: &sbproxy_model_host::OperationJob) {
         let total = job.progress.total_bytes;
-        if total == 0 {
-            eprintln!("{}: {:?}", job.subject, job.state);
-        } else {
-            let percent = job.progress.completed_bytes.saturating_mul(100) / total;
+        if let Some(percent) = job
+            .progress
+            .completed_bytes
+            .saturating_mul(100)
+            .checked_div(total)
+        {
             eprintln!(
                 "{}: {:?} {} / {} bytes ({}%)",
                 job.subject, job.state, job.progress.completed_bytes, total, percent
             );
+        } else {
+            eprintln!("{}: {:?}", job.subject, job.state);
         }
     }
 }
