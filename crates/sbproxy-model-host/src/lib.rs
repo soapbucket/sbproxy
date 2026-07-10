@@ -40,6 +40,7 @@ pub mod deployment_store;
 pub mod embedded;
 pub mod fit;
 pub mod hybrid;
+pub mod jobs;
 pub mod kv_tiering;
 pub mod launch;
 pub mod llama_release;
@@ -91,6 +92,9 @@ pub use fit::{
     ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
 };
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
+pub use jobs::{
+    FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
+};
 pub use kv_tiering::{KvTier, KvTieringPolicy, TierDecision};
 pub use launch::{
     build_launch_spec, chunk_size_for_ttft, serving_flags, should_speculate, ProcessEngineLauncher,
