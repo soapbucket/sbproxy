@@ -406,6 +406,56 @@ enum ModelsSub {
     List(ModelsListArgs),
     /// Show the full catalog entry for a model id.
     Show(ModelsShowArgs),
+    /// Resolve, download, verify, and atomically cache exact artifacts.
+    Pull(ModelsPullArgs),
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
+enum ModelEngineArg {
+    #[default]
+    Auto,
+    Vllm,
+    LlamaCpp,
+    Embedded,
+}
+
+impl From<ModelEngineArg> for sbproxy_model_host::EngineChoice {
+    fn from(value: ModelEngineArg) -> Self {
+        match value {
+            ModelEngineArg::Auto => Self::Auto,
+            ModelEngineArg::Vllm => Self::Vllm,
+            ModelEngineArg::LlamaCpp => Self::LlamaCpp,
+            ModelEngineArg::Embedded => Self::Embedded,
+        }
+    }
+}
+
+#[derive(clap::Args, Debug)]
+struct ModelsPullArgs {
+    /// Catalog model IDs to pull. With no IDs, pulls the `on_boot` set.
+    #[arg(value_name = "MODEL")]
+    models: Vec<String>,
+    /// Pull every catalog model compatible with this worker.
+    #[arg(long = "all")]
+    all: bool,
+    /// Pin one exact variant. Valid only with one positional model.
+    #[arg(long = "variant")]
+    variant: Option<String>,
+    /// Restrict resolution to one managed engine.
+    #[arg(long = "engine", value_enum, default_value_t = ModelEngineArg::Auto)]
+    engine: ModelEngineArg,
+    /// Operator catalog file, replacing the built-in catalog.
+    #[arg(long = "catalog-file")]
+    catalog_file: Option<PathBuf>,
+    /// Content-addressed artifact cache directory.
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
+    /// Forbid network access. Verified hits and `file:` sources still work.
+    #[arg(long = "offline")]
+    offline: bool,
+    /// Output format. Progress is always written to stderr.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[derive(clap::Args, Debug, Default)]
@@ -1500,6 +1550,7 @@ fn handle_models_subcommand(cmd: &ModelsCmd) -> anyhow::Result<i32> {
         None => handle_models_list(&ModelsListArgs::default()),
         Some(ModelsSub::List(a)) => handle_models_list(a),
         Some(ModelsSub::Show(a)) => handle_models_show(a),
+        Some(ModelsSub::Pull(a)) => handle_models_pull(a),
     }
 }
 
@@ -1517,13 +1568,225 @@ fn load_models_catalog(
     }
 }
 
+fn models_pull_transport(
+) -> anyhow::Result<std::sync::Arc<dyn sbproxy_model_host::ArtifactTransport>> {
+    #[cfg(feature = "model-weights")]
+    {
+        return sbproxy_model_host::HttpArtifactTransport::new()
+            .map(|transport| {
+                std::sync::Arc::new(transport)
+                    as std::sync::Arc<dyn sbproxy_model_host::ArtifactTransport>
+            })
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
+    #[cfg(not(feature = "model-weights"))]
+    {
+        Ok(std::sync::Arc::new(
+            sbproxy_model_host::UnavailableArtifactTransport,
+        ))
+    }
+}
+
+fn models_pull_credential() -> anyhow::Result<Option<sbproxy_model_host::SourceCredential>> {
+    use zeroize::Zeroize;
+
+    let Some(mut secret) = std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
+    else {
+        return Ok(None);
+    };
+    let credential = sbproxy_model_host::SourceCredential::new(secret.as_bytes())
+        .map_err(|error| anyhow::anyhow!(error.to_string()));
+    secret.zeroize();
+    credential.map(Some)
+}
+
+#[derive(Default)]
+struct ModelsPullProgress;
+
+impl sbproxy_model_host::ArtifactObserver for ModelsPullProgress {
+    fn on_job(&self, job: &sbproxy_model_host::OperationJob) {
+        let total = job.progress.total_bytes;
+        if total == 0 {
+            eprintln!("{}: {:?}", job.subject, job.state);
+        } else {
+            let percent = job.progress.completed_bytes.saturating_mul(100) / total;
+            eprintln!(
+                "{}: {:?} {} / {} bytes ({}%)",
+                job.subject, job.state, job.progress.completed_bytes, total, percent
+            );
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ModelsPullResult {
+    model: String,
+    variant: String,
+    engine: String,
+    artifact_digest: String,
+    snapshot_path: PathBuf,
+    verified_bytes: u64,
+    job_id: String,
+}
+
+fn selected_pull_models(
+    args: &ModelsPullArgs,
+    catalog: &sbproxy_model_host::Catalog,
+) -> anyhow::Result<Vec<String>> {
+    if args.all && !args.models.is_empty() {
+        anyhow::bail!("--all cannot be combined with positional model IDs");
+    }
+    if args.variant.is_some() && (args.all || args.models.len() != 1) {
+        anyhow::bail!("--variant requires exactly one positional model ID");
+    }
+    if args.all {
+        return Ok(catalog
+            .models
+            .iter()
+            .filter(|(_, entry)| !entry.variants.is_empty())
+            .map(|(model, _)| model.clone())
+            .collect());
+    }
+    if !args.models.is_empty() {
+        return Ok(args.models.clone());
+    }
+    Ok(catalog
+        .models
+        .iter()
+        .filter(|(_, entry)| {
+            !entry.variants.is_empty() && entry.pull == sbproxy_model_host::PullPolicy::OnBoot
+        })
+        .map(|(model, _)| model.clone())
+        .collect())
+}
+
+fn handle_models_pull(args: &ModelsPullArgs) -> anyhow::Result<i32> {
+    let catalog = load_models_catalog(args.catalog_file.as_deref())?;
+    let models = selected_pull_models(args, &catalog)?;
+    if models.is_empty() {
+        eprintln!("sbproxy models pull: no catalog v2 artifacts selected");
+        return Ok(0);
+    }
+
+    let report = sbproxy_core::doctor::DoctorReport::collect();
+    let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&report.gpus)
+        .map_err(|error| anyhow::anyhow!("resolve pull worker: {error}"))?;
+    let root = model_cache_root(args.cache_dir.as_deref());
+    let manager = sbproxy_model_host::ArtifactManager::new(root, models_pull_transport()?)?
+        .with_observer(std::sync::Arc::new(ModelsPullProgress));
+    let credential = models_pull_credential()?;
+    let network = if args.offline {
+        sbproxy_model_host::NetworkPolicy::Denied
+    } else {
+        sbproxy_model_host::NetworkPolicy::Allowed
+    };
+    let engine = args.engine.into();
+
+    let mut requests = Vec::with_capacity(models.len());
+    for model in models {
+        let entry = catalog
+            .get(&model)
+            .ok_or_else(|| anyhow::anyhow!("model '{model}' is not in the catalog"))?;
+        if entry.variants.is_empty() {
+            anyhow::bail!(
+                "model '{model}' has no exact catalog v2 variant; migrate its files, sizes, digests, and revision before pulling"
+            );
+        }
+        let request = sbproxy_model_host::ResolveArtifactRequest {
+            model: model.clone(),
+            variant: args.variant.clone(),
+            engine,
+            replicas: 1,
+            heterogeneous_variants: false,
+        };
+        match catalog.resolve_artifact(&request, &worker) {
+            Ok(artifact) => requests.push((artifact, entry.pull)),
+            Err(error) if args.all => {
+                eprintln!("sbproxy models pull: skip {model}: {error}");
+            }
+            Err(error) => return Err(anyhow::anyhow!(error.to_string())),
+        }
+    }
+
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("build models pull runtime: {error}"))?;
+    let results = executor.block_on(async {
+        let mut results = Vec::with_capacity(requests.len());
+        for (artifact, pull_policy) in requests {
+            let ready = manager
+                .ensure(
+                    &artifact,
+                    sbproxy_model_host::AcquisitionContext {
+                        intent: sbproxy_model_host::PullIntent::Explicit,
+                        network,
+                        pull_policy,
+                        credential: credential.clone(),
+                    },
+                )
+                .await?;
+            results.push(ModelsPullResult {
+                model: artifact.logical_model,
+                variant: artifact.variant_id,
+                engine: format!("{:?}", artifact.engine).to_lowercase(),
+                artifact_digest: ready.artifact_digest,
+                snapshot_path: ready.snapshot_path,
+                verified_bytes: ready.metadata.total_size_bytes,
+                job_id: ready.job.id,
+            });
+        }
+        Ok::<_, sbproxy_model_host::ArtifactError>(results)
+    })?;
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&results)?),
+        OutputFormat::Text => {
+            for result in results {
+                println!(
+                    "{}:{} verified {} bytes at {} (sha256:{})",
+                    result.model,
+                    result.variant,
+                    result.verified_bytes,
+                    result.snapshot_path.display(),
+                    result.artifact_digest
+                );
+            }
+        }
+    }
+    Ok(0)
+}
+
 fn model_cache_root(cache_dir: Option<&std::path::Path>) -> PathBuf {
     let configured = cache_dir.map(|p| p.to_string_lossy().into_owned());
     sbproxy_model_host::resolve_cache_dir_default(configured.as_deref())
 }
 
 /// Whether any weights for `entry` are present in the cache dir.
-fn model_is_cached(root: &std::path::Path, entry: &sbproxy_model_host::CatalogEntry) -> bool {
+fn model_is_cached(
+    root: &std::path::Path,
+    model: &str,
+    entry: &sbproxy_model_host::CatalogEntry,
+) -> bool {
+    if !entry.variants.is_empty() {
+        return std::fs::read_dir(root.join("metadata"))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read(entry.path()).ok())
+            .filter_map(|bytes| {
+                serde_json::from_slice::<sbproxy_model_host::ArtifactCacheMetadata>(&bytes).ok()
+            })
+            .any(|metadata| {
+                metadata.logical_model == model
+                    && root
+                        .join("snapshots")
+                        .join(metadata.artifact_digest)
+                        .is_dir()
+            });
+    }
     let revision = entry.revision.as_deref().unwrap_or("main");
     let dir = sbproxy_model_host::weights::cache_dir(root, &entry.hf_repo, revision);
     std::fs::read_dir(&dir)
@@ -1584,7 +1847,7 @@ fn build_model_rows(
                 engine: e.map(|e| e.engine.clone()).unwrap_or_default(),
                 fit: e.map(|e| e.fit.verdict.to_string()).unwrap_or_default(),
                 estimated_vram_gib: e.and_then(|e| e.fit.estimated_vram_gib),
-                status: if model_is_cached(cache_root, entry) {
+                status: if model_is_cached(cache_root, id, entry) {
                     "cached".to_string()
                 } else {
                     "not-pulled".to_string()
@@ -1667,7 +1930,7 @@ fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
         license: entry.license.clone(),
         family: entry.family.clone(),
         min_vram_hint_gib: entry.min_vram_hint_gib,
-        cached: model_is_cached(&root, entry),
+        cached: model_is_cached(&root, &args.id, entry),
     };
     match args.format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&detail)?),
@@ -1816,7 +2079,7 @@ fn check_models_freshness(
     let root = model_cache_root(cache_dir);
     let mut out = Vec::new();
     for (id, entry) in &catalog.models {
-        if !model_is_cached(&root, entry) {
+        if !model_is_cached(&root, id, entry) {
             continue; // only report models that are actually pulled
         }
         let revision = entry.revision.clone().unwrap_or_else(|| "main".to_string());
@@ -2613,6 +2876,86 @@ fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i3
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    fn pull_catalog() -> sbproxy_model_host::Catalog {
+        sbproxy_model_host::Catalog::from_yaml(
+            "schema_version: 2\ncatalog_revision: cli-pull-fixture\nmodels:\n  boot:\n    params: 1B\n    license: apache-2.0\n    family: fixture\n    context_length: 1024\n    pull: on_boot\n    variants:\n      - id: cpu\n        format: gguf\n        quant: Q4\n        engines: [llama_cpp]\n        source: file:/tmp/boot.gguf\n        revision: fixture\n        files:\n          - path: boot.gguf\n            sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n            size_bytes: 1\n        requirements:\n          accelerators: [cpu]\n        stability: preview\n        certification: cli-fixture\n  demand:\n    params: 1B\n    license: apache-2.0\n    family: fixture\n    context_length: 1024\n    pull: on_demand\n    variants:\n      - id: cpu\n        format: gguf\n        quant: Q4\n        engines: [llama_cpp]\n        source: file:/tmp/demand.gguf\n        revision: fixture\n        files:\n          - path: demand.gguf\n            sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n            size_bytes: 1\n        requirements:\n          accelerators: [cpu]\n        stability: preview\n        certification: cli-fixture\n",
+        )
+        .unwrap()
+    }
+
+    fn pull_args() -> ModelsPullArgs {
+        ModelsPullArgs {
+            models: Vec::new(),
+            all: false,
+            variant: None,
+            engine: ModelEngineArg::Auto,
+            catalog_file: None,
+            cache_dir: None,
+            offline: false,
+            format: OutputFormat::Text,
+        }
+    }
+
+    #[test]
+    fn models_pull_defaults_to_boot_and_supports_explicit_or_all_selection() {
+        let catalog = pull_catalog();
+        assert_eq!(
+            selected_pull_models(&pull_args(), &catalog).unwrap(),
+            ["boot"]
+        );
+
+        let mut explicit = pull_args();
+        explicit.models = vec!["demand".to_string()];
+        assert_eq!(
+            selected_pull_models(&explicit, &catalog).unwrap(),
+            ["demand"]
+        );
+
+        let mut all = pull_args();
+        all.all = true;
+        assert_eq!(
+            selected_pull_models(&all, &catalog).unwrap(),
+            ["boot", "demand"]
+        );
+    }
+
+    #[test]
+    fn models_pull_variant_requires_one_explicit_model() {
+        let catalog = pull_catalog();
+        let mut args = pull_args();
+        args.variant = Some("cpu".to_string());
+        assert!(selected_pull_models(&args, &catalog)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+    }
+
+    #[test]
+    fn models_pull_cli_surface_parses_exact_variant_and_offline_mode() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "models",
+            "pull",
+            "boot",
+            "--variant",
+            "cpu",
+            "--engine",
+            "llama-cpp",
+            "--offline",
+        ])
+        .unwrap();
+        let Some(Cmd::Models(ModelsCmd {
+            sub: Some(ModelsSub::Pull(args)),
+        })) = cli.cmd
+        else {
+            panic!("models pull parsed to the wrong command");
+        };
+        assert_eq!(args.models, ["boot"]);
+        assert_eq!(args.variant.as_deref(), Some("cpu"));
+        assert!(matches!(args.engine, ModelEngineArg::LlamaCpp));
+        assert!(args.offline);
+    }
 
     #[test]
     fn run_name_defaults_to_catalog_id_and_hf_ref_needs_name() {

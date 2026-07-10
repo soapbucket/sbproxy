@@ -8229,9 +8229,11 @@ dependencies = [
  "sbproxy-vault",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
