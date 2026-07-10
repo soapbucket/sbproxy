@@ -27,7 +27,13 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::catalog::{Catalog, ModelRef};
+use crate::artifact::{
+    AcquisitionContext, ArtifactManager, NetworkPolicy, PullIntent, ReadyArtifact,
+};
+use crate::artifact_spec::{
+    ArtifactFormat, ResolveArtifactRequest, ResolvedArtifact, WorkerProfile,
+};
+use crate::catalog::{Catalog, ModelRef, PullPolicy};
 use crate::config::ModelHostConfig;
 use crate::fit::{plan_fit_auto_kv, GpuProbe, ModelMetadata, DEFAULT_OVERHEAD};
 use crate::launch::{build_launch_spec, serving_flags};
@@ -40,6 +46,18 @@ use crate::supervisor::{BackoffPolicy, EngineLauncher, Supervisor};
 pub trait ModelMetadataProvider: Send + Sync {
     /// Metadata for a resolved model, or `None` when it cannot be read.
     fn metadata(&self, model: &ModelRef) -> Option<ModelMetadata>;
+
+    /// Metadata read from one verified catalog v2 artifact. Providers
+    /// that only understand the legacy cache may rely on this default
+    /// projection; production providers should read declared files from
+    /// `ready` so admission and launch consume the same immutable bytes.
+    fn metadata_for_artifact(
+        &self,
+        artifact: &ResolvedArtifact,
+        _ready: &ReadyArtifact,
+    ) -> Option<ModelMetadata> {
+        self.metadata(&model_ref_for_artifact(artifact))
+    }
 }
 
 /// Observes model-host lifecycle events so a host can emit metrics
@@ -186,6 +204,19 @@ pub fn parse_params(s: &str) -> u64 {
     (value * mult) as u64
 }
 
+fn model_ref_for_artifact(artifact: &ResolvedArtifact) -> ModelRef {
+    let source = artifact
+        .source
+        .strip_prefix("hf:")
+        .or_else(|| artifact.source.strip_prefix("file:"))
+        .unwrap_or(&artifact.source);
+    ModelRef {
+        hf_repo: source.to_string(),
+        quant: artifact.quant.clone(),
+        catalog_id: Some(artifact.logical_model.clone()),
+    }
+}
+
 /// A [`ModelMetadataProvider`] that reads the model's `config.json`
 /// from the content-addressed weight cache and parses its shape. The
 /// total parameter count comes from the catalog entry's `params`
@@ -198,7 +229,7 @@ pub struct ConfigDirMetadataProvider {
     /// Revision the weights were fetched at.
     pub revision: String,
     /// Catalog, for the parameter-count lookup.
-    pub catalog: Catalog,
+    pub catalog: Arc<Catalog>,
 }
 
 impl ModelMetadataProvider for ConfigDirMetadataProvider {
@@ -221,6 +252,34 @@ impl ModelMetadataProvider for ConfigDirMetadataProvider {
             .unwrap_or(0);
         ModelMetadata::from_hf_config(&v, params)
     }
+
+    fn metadata_for_artifact(
+        &self,
+        artifact: &ResolvedArtifact,
+        ready: &ReadyArtifact,
+    ) -> Option<ModelMetadata> {
+        let config_path = ready.file("config.json").or_else(|| {
+            artifact
+                .files
+                .iter()
+                .find(|file| file.path.ends_with("/config.json"))
+                .and_then(|file| ready.file(&file.path))
+        })?;
+        let text = std::fs::read_to_string(config_path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let params = self
+            .catalog
+            .get(&artifact.logical_model)
+            .map(|entry| parse_params(&entry.params))
+            .filter(|params| *params > 0)
+            .or_else(|| {
+                value
+                    .get("num_parameters")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or(0);
+        ModelMetadata::from_hf_config(&value, params)
+    }
 }
 
 /// Why bringing a model to ready failed.
@@ -237,6 +296,9 @@ pub enum RuntimeError {
         /// Why.
         reason: String,
     },
+    /// Exact artifact resolution or verified acquisition failed.
+    #[error("artifact: {0}")]
+    Artifact(String),
     /// No metadata for the resolved model.
     #[error("no model metadata for '{name}' (weights source '{model}' not fetched? Bare catalog ids resolve once catalog-driven serving lands; name the weights explicitly, e.g. \"hf:<repo>:<quant>\" with gguf_file)")]
     NoMetadata {
@@ -266,6 +328,7 @@ impl RuntimeError {
         match self {
             RuntimeError::UnknownModel(_) => "unknown_model",
             RuntimeError::Resolve { .. } => "resolve",
+            RuntimeError::Artifact(_) => "artifact",
             RuntimeError::NoMetadata { .. } => "no_metadata",
             RuntimeError::Fit(_) => "fit",
             RuntimeError::Residency(_) => "residency",
@@ -285,7 +348,9 @@ struct EngineHandle<L: EngineLauncher> {
 /// residency for one node.
 pub struct ModelHostRuntime<L: EngineLauncher> {
     config: ModelHostConfig,
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
+    artifact_manager: Option<Arc<ArtifactManager>>,
+    artifact_network_policy: NetworkPolicy,
     probe: Arc<dyn GpuProbe>,
     metadata: Arc<dyn ModelMetadataProvider>,
     make_launcher: Box<dyn Fn() -> L + Send + Sync>,
@@ -323,7 +388,7 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     /// `engine: auto` resolution.
     pub fn new(
         config: ModelHostConfig,
-        catalog: Catalog,
+        catalog: impl Into<Arc<Catalog>>,
         probe: Arc<dyn GpuProbe>,
         metadata: Arc<dyn ModelMetadataProvider>,
         make_launcher: Box<dyn Fn() -> L + Send + Sync>,
@@ -338,7 +403,9 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         let residency = ResidencyManager::new(budget, config.eviction);
         Self {
             config,
-            catalog,
+            catalog: catalog.into(),
+            artifact_manager: None,
+            artifact_network_policy: NetworkPolicy::Allowed,
             probe,
             metadata,
             make_launcher,
@@ -370,6 +437,18 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         self
     }
 
+    /// Attach the verified artifact service used by catalog v2 models.
+    pub fn with_artifact_manager(mut self, manager: Arc<ArtifactManager>) -> Self {
+        self.artifact_manager = Some(manager);
+        self
+    }
+
+    /// Set whether runtime artifact misses may contact network sources.
+    pub fn with_artifact_network_policy(mut self, policy: NetworkPolicy) -> Self {
+        self.artifact_network_policy = policy;
+        self
+    }
+
     /// Emit the current GPU residency view (per device) to the observer.
     fn report_gpu_stats(&self) {
         for g in self.probe.probe() {
@@ -390,6 +469,87 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
 
     fn next_tick(&self) -> u64 {
         self.tick.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Pull every catalog v2 artifact configured with `pull: on_boot`.
+    /// Warming performs only resolution, acquisition, and verification;
+    /// it never admits VRAM, allocates a port, or starts an engine.
+    pub async fn warm_on_boot(&self) -> Result<Vec<ReadyArtifact>, RuntimeError> {
+        let entries = self.config.models.clone();
+        let mut ready = Vec::new();
+        for entry in entries {
+            let Some(catalog_entry) = self.catalog.get(&entry.model) else {
+                continue;
+            };
+            if catalog_entry.variants.is_empty() || catalog_entry.pull != PullPolicy::OnBoot {
+                continue;
+            }
+            if let Some((_, artifact)) = self
+                .acquire_managed_artifact(&entry, PullIntent::Startup)
+                .await?
+            {
+                ready.push(artifact);
+            }
+        }
+        Ok(ready)
+    }
+
+    fn worker_profile(&self) -> Result<WorkerProfile, RuntimeError> {
+        WorkerProfile::from_descriptors(&self.probe.probe()).map_err(RuntimeError::Artifact)
+    }
+
+    async fn acquire_managed_artifact(
+        &self,
+        entry: &crate::config::ServeEntry,
+        intent: PullIntent,
+    ) -> Result<Option<(ResolvedArtifact, ReadyArtifact)>, RuntimeError> {
+        let Some(catalog_entry) = self.catalog.get(&entry.model) else {
+            return Ok(None);
+        };
+        if catalog_entry.variants.is_empty() {
+            return Ok(None);
+        }
+        let worker = self.worker_profile()?;
+        let resolved = self
+            .catalog
+            .resolve_artifact(
+                &ResolveArtifactRequest {
+                    model: entry.model.clone(),
+                    variant: entry.variant.clone(),
+                    engine: entry.engine,
+                    replicas: 1,
+                    heterogeneous_variants: false,
+                },
+                &worker,
+            )
+            .map_err(|error| RuntimeError::Artifact(error.to_string()))?;
+        if resolved.engine == crate::config::EngineKind::LlamaCpp
+            && resolved.format != ArtifactFormat::Gguf
+        {
+            return Err(RuntimeError::Artifact(format!(
+                "llama.cpp variant '{}' must declare GGUF weights",
+                resolved.variant_id
+            )));
+        }
+        let manager = self.artifact_manager.as_ref().ok_or_else(|| {
+            RuntimeError::Artifact(format!(
+                "managed artifact service is not configured for catalog v2 model '{}'",
+                entry.model
+            ))
+        })?;
+        let ready = manager
+            .ensure(
+                &resolved,
+                AcquisitionContext {
+                    intent,
+                    network: self.artifact_network_policy,
+                    pull_policy: catalog_entry.pull,
+                    credential: None,
+                },
+            )
+            .await
+            .map_err(|error| RuntimeError::Artifact(error.to_string()))?;
+        Ok(Some((resolved, ready)))
     }
 
     /// The serve entry that serves `name` (its base name or a LoRA
@@ -838,52 +998,92 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             .ok_or_else(|| RuntimeError::UnknownModel(name.to_string()))?
             .clone();
 
-        let model_ref = self
-            .catalog
-            .resolve(&entry.model)
-            .map_err(|e| RuntimeError::Resolve {
-                model: entry.model.clone(),
-                reason: e.to_string(),
-            })?;
+        // Catalog v2 resolution and complete byte verification happen
+        // before metadata planning, residency, port allocation, or any
+        // launcher call. Legacy v1 entries keep the preview path below.
+        let managed = self
+            .acquire_managed_artifact(&entry, PullIntent::Runtime)
+            .await?;
+        let model_ref = match &managed {
+            Some((artifact, _)) => model_ref_for_artifact(artifact),
+            None => self
+                .catalog
+                .resolve(&entry.model)
+                .map_err(|e| RuntimeError::Resolve {
+                    model: entry.model.clone(),
+                    reason: e.to_string(),
+                })?,
+        };
 
         // WOR-1769: for a GGUF model (gguf_file set), pre-fetch the GGUF
         // now and read its header for the fit metadata a GGUF-only repo
         // cannot supply via config.json. The fetched path is reused at
         // launch below so we do not download twice. Falls back to the
         // config.json metadata provider (safetensors / vLLM path).
-        let prefetched_gguf = if entry.gguf_file.is_some() {
+        let managed_gguf = match &managed {
+            Some((artifact, ready)) if artifact.format == ArtifactFormat::Gguf => {
+                let file = artifact
+                    .files
+                    .iter()
+                    .find(|file| file.path.ends_with(".gguf"))
+                    .and_then(|file| ready.file(&file.path))
+                    .ok_or_else(|| {
+                        RuntimeError::Artifact(format!(
+                            "verified GGUF artifact '{}' has no declared GGUF file",
+                            artifact.artifact_digest
+                        ))
+                    })?;
+                Some(file.to_path_buf())
+            }
+            _ => None,
+        };
+        let prefetched_gguf = if managed.is_some() {
+            managed_gguf.clone()
+        } else if entry.gguf_file.is_some() {
             self.prefetch_gguf(&entry, &model_ref).await
         } else {
             None
         };
-        let params_fallback = model_ref
-            .catalog_id
+        let params_fallback = managed
             .as_ref()
+            .map(|(artifact, _)| artifact.logical_model.as_str())
+            .or(model_ref.catalog_id.as_deref())
             .and_then(|id| self.catalog.get(id))
             .map(|e| parse_params(&e.params))
             .filter(|p| *p > 0)
             .unwrap_or(0);
-        let meta = match prefetched_gguf.as_deref() {
-            Some(path) => Self::gguf_header_metadata(path, params_fallback)
-                .await
-                .or_else(|| self.metadata.metadata(&model_ref)),
-            // Safetensors / vLLM path: prefer an already-cached config.json
-            // (the provider), else prefetch it (WOR-1807) so a fresh box
-            // admits instead of failing NoMetadata.
-            None => match self.metadata.metadata(&model_ref) {
-                Some(m) => Some(m),
-                None => {
-                    self.prefetch_config_metadata(&model_ref, params_fallback)
-                        .await
-                }
-            },
+        let meta = if let Some((artifact, ready)) = &managed {
+            match managed_gguf.as_deref() {
+                Some(path) => Self::gguf_header_metadata(path, params_fallback)
+                    .await
+                    .or_else(|| self.metadata.metadata_for_artifact(artifact, ready)),
+                None => self.metadata.metadata_for_artifact(artifact, ready),
+            }
+        } else {
+            match prefetched_gguf.as_deref() {
+                Some(path) => Self::gguf_header_metadata(path, params_fallback)
+                    .await
+                    .or_else(|| self.metadata.metadata(&model_ref)),
+                // Safetensors / vLLM path: prefer an already-cached
+                // config.json, else prefetch it for the legacy path.
+                None => match self.metadata.metadata(&model_ref) {
+                    Some(metadata) => Some(metadata),
+                    None => {
+                        self.prefetch_config_metadata(&model_ref, params_fallback)
+                            .await
+                    }
+                },
+            }
         }
         .ok_or_else(|| RuntimeError::NoMetadata {
             name: name.to_string(),
             model: entry.model.clone(),
         })?;
 
-        let candidates = self.candidate_quants(&model_ref);
+        let candidates = managed
+            .as_ref()
+            .map(|(artifact, _)| vec![artifact.quant.clone()])
+            .unwrap_or_else(|| self.candidate_quants(&model_ref));
         let seq_len = entry.max_context.unwrap_or(meta.max_context);
         // WOR-1676: if the entry quantizes the KV cache, the planner
         // spends the smaller KV term on the fit (so a card can hold a
@@ -907,10 +1107,15 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         // a raw safetensors ref can be assigned a GGUF-style default
         // quant, and routing it to llama.cpp then fails with no file to
         // load (there is no GGUF in a safetensors repo).
-        let is_gguf = entry.gguf_file.is_some()
-            || entry.model.to_ascii_lowercase().contains("gguf")
-            || model_ref.hf_repo.to_ascii_lowercase().contains("gguf");
-        let engine_kind = entry.engine.resolve(is_gguf, self.container_runtime);
+        let engine_kind = managed
+            .as_ref()
+            .map(|(artifact, _)| artifact.engine)
+            .unwrap_or_else(|| {
+                let is_gguf = entry.gguf_file.is_some()
+                    || entry.model.to_ascii_lowercase().contains("gguf")
+                    || model_ref.hf_repo.to_ascii_lowercase().contains("gguf");
+                entry.engine.resolve(is_gguf, self.container_runtime)
+            });
 
         // Admit against the VRAM budget, evicting the models the
         // residency manager chooses. WOR-1672: use the cost-minimizing
@@ -958,14 +1163,36 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                 "1".to_string(),
             ));
         }
-        // WOR-1656: for llama.cpp, prefer a locally pre-fetched GGUF over
+        // Managed launches are retargeted only to the verified immutable
+        // snapshot. No engine receives a repository fallback after the
+        // catalog selected exact bytes.
+        if let Some((_, ready)) = &managed {
+            match engine_kind {
+                crate::config::EngineKind::Vllm => {
+                    crate::launch::vllm_use_local_snapshot(&mut spec.args, &ready.snapshot_path);
+                }
+                crate::config::EngineKind::LlamaCpp => {
+                    let local = managed_gguf.as_ref().ok_or_else(|| {
+                        RuntimeError::Artifact(
+                            "verified llama.cpp artifact has no GGUF launch file".to_string(),
+                        )
+                    })?;
+                    crate::launch::llama_use_local_model(&mut spec.args, local);
+                }
+                crate::config::EngineKind::Embedded => {
+                    if let Some(model) = spec.args.first_mut() {
+                        *model = ready.snapshot_path.display().to_string();
+                    }
+                }
+            }
+        // WOR-1656: for legacy llama.cpp, prefer a locally pre-fetched GGUF over
         // letting the engine download via `--hf-repo`. That needs a
         // curl-enabled llama.cpp and, for a multi-file repo, picks the
         // wrong file. Pre-fetching with our own weight manager and
         // passing `--model` removes both problems; if we cannot fetch
         // (the `weights` feature is off), fall back to `--hf-file` so a
         // curl build at least gets the right file.
-        if engine_kind == crate::config::EngineKind::LlamaCpp {
+        } else if engine_kind == crate::config::EngineKind::LlamaCpp {
             // Reuse the GGUF already pre-fetched for metadata above; only
             // fetch here if we did not (e.g. gguf_file unset but the fit
             // resolved to a GGUF quant).
@@ -1600,7 +1827,7 @@ mod tests {
         let provider = ConfigDirMetadataProvider {
             cache_root: dir.path().to_path_buf(),
             revision: "main".to_string(),
-            catalog: Catalog::builtin(),
+            catalog: Arc::new(Catalog::builtin()),
         };
         let model = ModelRef {
             hf_repo: "Qwen/Qwen3-14B".to_string(),

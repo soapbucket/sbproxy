@@ -110,6 +110,36 @@ pub struct WorkerProfile {
     pub engines: BTreeSet<EngineKind>,
 }
 
+impl WorkerProfile {
+    /// Project discovered host devices into the catalog v2 worker
+    /// contract, selecting the device with the most free serving
+    /// memory. All allowlisted engines remain candidates; catalog and
+    /// explicit engine selection narrow them deterministically.
+    pub fn from_descriptors(descriptors: &[crate::GpuDescriptor]) -> Result<Self, String> {
+        let descriptor = descriptors
+            .iter()
+            .max_by_key(|descriptor| descriptor.free_vram_bytes)
+            .ok_or_else(|| "no model-serving worker is available".to_string())?;
+        let accelerator = match descriptor.vendor {
+            crate::GpuVendor::Nvidia => AcceleratorKind::Cuda,
+            crate::GpuVendor::Apple => AcceleratorKind::Metal,
+            crate::GpuVendor::Cpu => AcceleratorKind::Cpu,
+            crate::GpuVendor::Amd => {
+                return Err("catalog v2 does not yet define a ROCm accelerator contract".to_string())
+            }
+        };
+        let compute_capability = descriptor
+            .compute_capability
+            .map(|(major, minor)| ComputeCapability { major, minor });
+        Ok(Self {
+            accelerator,
+            compute_capability,
+            memory_bytes: descriptor.free_vram_bytes,
+            engines: BTreeSet::from([EngineKind::Vllm, EngineKind::LlamaCpp, EngineKind::Embedded]),
+        })
+    }
+}
+
 /// Requested logical model and variant-selection policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveArtifactRequest {

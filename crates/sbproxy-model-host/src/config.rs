@@ -384,6 +384,11 @@ pub struct ServeEntry {
     /// Catalog id (`qwen3-32b`) or an explicit `hf:Org/Repo:QUANT`
     /// reference. Resolved by [`crate::catalog`].
     pub model: String,
+    /// Exact catalog v2 artifact variant to run. When omitted, the
+    /// runtime deterministically selects a compatible variant for the
+    /// current worker. Pin this for reproducible deployments.
+    #[serde(default)]
+    pub variant: Option<String>,
     /// The model id every other plane sees (WOR-1683): routing,
     /// `allowed_models`, rate limits, budgets, aliases. Defaults to the
     /// catalog id in `model`; **required** when `model` is a raw `hf:`
@@ -649,6 +654,14 @@ impl ModelHostConfig {
         self.model_names()?;
         // keep_alive durations parse.
         for e in &self.models {
+            if let Some(variant) = &e.variant {
+                if !crate::artifact_spec::valid_identifier(variant) {
+                    return Err(format!(
+                        "serve model '{}' has an invalid variant '{variant}'",
+                        e.model
+                    ));
+                }
+            }
             if let Some(ka) = &e.keep_alive {
                 if sbproxy_util::parse_duration(ka).is_err() {
                     return Err(format!(
@@ -983,6 +996,7 @@ models:
         // carries only the known keys.
         let e = ServeEntry {
             model: "qwen3-8b".into(),
+            variant: None,
             name: None,
             engine: EngineChoice::Vllm,
             keep_alive: None,

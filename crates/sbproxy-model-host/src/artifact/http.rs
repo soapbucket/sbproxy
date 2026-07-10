@@ -107,6 +107,21 @@ pub trait ArtifactTransport: Send + Sync {
     async fn get(&self, request: TransportRequest) -> Result<TransportResponse, ArtifactError>;
 }
 
+/// Transport used by builds that intentionally omit network weight
+/// support. Local `file:` artifacts and verified cache hits still work;
+/// an HTTP miss fails with an actionable feature message.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnavailableArtifactTransport;
+
+#[async_trait]
+impl ArtifactTransport for UnavailableArtifactTransport {
+    async fn get(&self, _request: TransportRequest) -> Result<TransportResponse, ArtifactError> {
+        Err(ArtifactError::Transport(
+            "network artifact acquisition requires the model-weights feature".to_string(),
+        ))
+    }
+}
+
 /// Redirect-following HTTP artifact transport.
 #[cfg(feature = "weights")]
 #[derive(Debug, Clone)]

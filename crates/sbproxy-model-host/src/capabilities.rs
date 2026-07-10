@@ -619,6 +619,7 @@ fn field_is_active(path: &str, config: &ModelHostConfig) -> bool {
             .models
             .iter()
             .any(|entry| entry.engine != EngineChoice::Auto),
+        "serve.models[].variant" => config.models.iter().any(|entry| entry.variant.is_some()),
         "serve.models[].keep_alive" => config.models.iter().any(|entry| entry.keep_alive.is_some()),
         "serve.models[].max_context" => config
             .models
@@ -872,6 +873,12 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         status: SupportLevel::Stable,
         capability_id: "manifest.serve_model_declarations",
         consumer: Some(ConsumerContract::ServeModelsChangeDesiredDeployments),
+    },
+    ConfigFieldCapability {
+        path: "serve.models[].variant",
+        status: SupportLevel::Stable,
+        capability_id: "manifest.catalog_v2",
+        consumer: Some(ConsumerContract::CatalogV2SelectsExactArtifact),
     },
     ConfigFieldCapability {
         path: "serve.models[].engine",

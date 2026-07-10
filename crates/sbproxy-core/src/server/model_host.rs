@@ -23,19 +23,75 @@
 //! `serve:` provider fails admission with a clear residency error
 //! rather than pretending to serve.
 
-use std::sync::{Arc, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use sbproxy_ai::local_host::{resolve_served_base_url, LocalModelHost};
 use sbproxy_ai::AiHandlerConfig;
 use sbproxy_model_host::{
-    Catalog, ConfigDirMetadataProvider, GpuProbe, ModelHostConfig, ModelHostRuntime,
-    ProcessEngineLauncher,
+    ArtifactManager, ArtifactTransport, Catalog, ConfigDirMetadataProvider, GpuProbe,
+    ModelHostConfig, ModelHostRuntime, ProcessEngineLauncher,
 };
 
 /// Built once from the first config that declares any `serve:` block;
 /// `None` when no provider serves locally. Survives hot reload so a
 /// resident engine is not killed on an unrelated config change.
 static MODEL_HOST: OnceLock<Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>>> = OnceLock::new();
+
+/// Directory containing the active `sb.yml`, used to resolve a relative
+/// `serve.catalog_file`. Reload updates this before a runtime is first
+/// constructed; the process-global runtime keeps its original immutable
+/// catalog for the lifetime of its resident engines.
+static MODEL_HOST_CONFIG_DIR: OnceLock<RwLock<PathBuf>> = OnceLock::new();
+
+pub(crate) fn set_model_host_config_path(config_path: &Path) {
+    let directory = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let lock = MODEL_HOST_CONFIG_DIR.get_or_init(|| RwLock::new(directory.clone()));
+    *lock.write().expect("model-host config directory lock") = directory;
+}
+
+fn model_host_config_dir() -> PathBuf {
+    MODEL_HOST_CONFIG_DIR
+        .get()
+        .and_then(|lock| lock.read().ok().map(|directory| directory.clone()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn load_catalog(config: &ModelHostConfig) -> Result<Arc<Catalog>, String> {
+    let Some(configured) = config.catalog_file.as_deref() else {
+        return Ok(Arc::new(Catalog::builtin()));
+    };
+    let configured = PathBuf::from(configured);
+    let path = if configured.is_absolute() {
+        configured
+    } else {
+        model_host_config_dir().join(configured)
+    };
+    let yaml = std::fs::read_to_string(&path)
+        .map_err(|error| format!("read model catalog '{}': {error}", path.display()))?;
+    let loaded = Catalog::from_yaml_with_diagnostics(&yaml)
+        .map_err(|error| format!("load model catalog '{}': {error}", path.display()))?;
+    for diagnostic in loaded.diagnostics {
+        tracing::warn!(catalog = %path.display(), %diagnostic, "model catalog migration finding");
+    }
+    Ok(Arc::new(loaded.catalog))
+}
+
+fn artifact_transport() -> Result<Arc<dyn ArtifactTransport>, String> {
+    #[cfg(feature = "model-weights")]
+    {
+        return sbproxy_model_host::HttpArtifactTransport::new()
+            .map(|transport| Arc::new(transport) as Arc<dyn ArtifactTransport>)
+            .map_err(|error| error.to_string());
+    }
+    #[cfg(not(feature = "model-weights"))]
+    {
+        Ok(Arc::new(sbproxy_model_host::UnavailableArtifactTransport))
+    }
+}
 
 /// Records the model-host lifecycle into the `sbproxy_model_host_*`
 /// metrics (WOR-1659). The model-host crate stays observe-free and
@@ -221,15 +277,36 @@ fn build_runtime(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<Proces
         tracing::error!("model host: merged serve config is invalid: {e}");
         return None;
     }
+    let catalog = match load_catalog(&merged) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            tracing::error!("model host: {error}");
+            return None;
+        }
+    };
     let cache_root = sbproxy_model_host::resolve_cache_dir_default(merged.cache_dir.as_deref());
     let metadata = Arc::new(ConfigDirMetadataProvider {
-        cache_root,
+        cache_root: cache_root.clone(),
         revision: "main".to_string(),
-        catalog: Catalog::builtin(),
+        catalog: Arc::clone(&catalog),
     });
+    let transport = match artifact_transport() {
+        Ok(transport) => transport,
+        Err(error) => {
+            tracing::error!("model host: build artifact transport: {error}");
+            return None;
+        }
+    };
+    let artifact_manager = match ArtifactManager::new(cache_root, transport) {
+        Ok(manager) => Arc::new(manager),
+        Err(error) => {
+            tracing::error!("model host: open artifact cache: {error}");
+            return None;
+        }
+    };
     let runtime = ModelHostRuntime::new(
         merged,
-        Catalog::builtin(),
+        catalog,
         make_probe(),
         metadata,
         // A cold weight-load + engine warm-up can take minutes; give the
@@ -243,6 +320,7 @@ fn build_runtime(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<Proces
         sbproxy_model_host::resolve_on_path("docker").is_some()
             || sbproxy_model_host::resolve_on_path("podman").is_some(),
     )
+    .with_artifact_manager(artifact_manager)
     .with_health_recheck(true)
     .with_observer(Arc::new(MetricsObserver));
     Some(Arc::new(runtime))
@@ -252,6 +330,49 @@ fn build_runtime(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<Proces
 /// use and cached for the process lifetime.
 fn model_host(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>> {
     MODEL_HOST.get_or_init(|| build_runtime(config)).clone()
+}
+
+/// Construct the process-global host from a compiled pipeline during
+/// startup, before request dispatch begins. Returns `None` when the
+/// pipeline declares no local models.
+pub(crate) fn initialize_model_host(
+    actions: &[sbproxy_modules::Action],
+) -> Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>> {
+    actions.iter().find_map(|action| match action {
+        sbproxy_modules::Action::AiProxy(ai)
+            if ai
+                .config
+                .providers
+                .iter()
+                .any(|provider| provider.serve.is_some()) =>
+        {
+            model_host(&ai.config)
+        }
+        _ => None,
+    })
+}
+
+/// Complete `pull: on_boot` acquisition on an isolated Tokio runtime.
+/// The dedicated thread makes this safe from both synchronous startup
+/// and reload callbacks that may already run inside another runtime.
+pub(crate) fn warm_on_boot_blocking(
+    runtime: Arc<ModelHostRuntime<ProcessEngineLauncher>>,
+) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("sbproxy-model-warm".to_string())
+        .spawn(move || {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("build model warm runtime: {error}"))?;
+            executor
+                .block_on(runtime.warm_on_boot())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|error| format!("spawn model warm thread: {error}"))?
+        .join()
+        .map_err(|_| "model warm thread panicked".to_string())?
 }
 
 /// The current model host, resolved from the live compiled pipeline's

@@ -23,6 +23,7 @@ pub use gc::{CacheProtection, GcReport};
 pub use http::HttpArtifactTransport;
 pub use http::{
     ArtifactTransport, ResponseDisposition, SourceCredential, TransportRequest, TransportResponse,
+    UnavailableArtifactTransport,
 };
 
 use crate::{
@@ -240,6 +241,14 @@ impl ArtifactManager {
     /// Inspect and fully verify one cache digest.
     pub fn inspect(&self, artifact_digest: &str) -> Result<ArtifactCacheState, ArtifactError> {
         self.cache.inspect(artifact_digest)
+    }
+
+    /// List durable ready metadata in deterministic digest order. This
+    /// is a lightweight inventory for CLI and admin surfaces; callers
+    /// that need byte-for-byte validation should call [`Self::inspect`]
+    /// for the selected digest.
+    pub fn cached_artifacts(&self) -> Result<Vec<ArtifactCacheMetadata>, ArtifactError> {
+        self.cache.metadata_entries()
     }
 
     /// Return verified local bytes, downloading and finalizing atomically on a miss.
