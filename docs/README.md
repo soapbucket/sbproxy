@@ -1,5 +1,5 @@
 # SBproxy documentation
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-10*
 
 Call any model. Serve your own. Govern both. SBproxy is the open-source OpenRouter alternative: one Apache-2.0 binary that routes to 66 providers or serves the weights on your GPUs, with the guardrails, keys, budgets, and spend ledger applying to every model the same way, and a real Pingora-based reverse proxy underneath for the rest of your traffic.
 
@@ -137,6 +137,7 @@ Point a framework you already run at the gateway: chat completions through the O
 
 ### Contributing
 - [architecture.md](architecture.md) - internals: pipeline, hot reload, plugin system.
+- [self-hosted-openrouter-delivery-design.md](self-hosted-openrouter-delivery-design.md) - approved architecture, PR boundaries, and certification contract for managed multi-node model serving.
 - [build.md](build.md) - building from source, supported platforms, optional features.
 - [CONTRIBUTING.md](../CONTRIBUTING.md) - how to set up a dev environment and submit changes.
 
