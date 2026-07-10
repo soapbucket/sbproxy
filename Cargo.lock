@@ -8686,6 +8686,7 @@ name = "sbproxy-model-host"
 version = "0.1.0"
 dependencies = [
  "axum 0.8.9",
+ "fs2",
  "hex",
  "libc",
  "minijinja",

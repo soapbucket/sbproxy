@@ -34,6 +34,8 @@ pub mod artifact_spec;
 pub mod capabilities;
 pub mod catalog;
 pub mod config;
+pub mod deployment;
+pub mod deployment_store;
 #[cfg(feature = "embedded")]
 pub mod embedded;
 pub mod fit;
@@ -79,6 +81,11 @@ pub use config::{
     EngineEnv, EngineKind, EngineLaunchMethod, EngineProvisioning, EvictionPolicy, KvCacheQuant,
     LoraAdapter, ModelHostConfig, ServeEntry, SpecMethod, SpeculativeConfig,
 };
+pub use deployment::{
+    DeploymentError, DeploymentRevision, DeploymentRevisionDraft, DeploymentSourceMode,
+    ModelDeployment, RolloutPolicy, DEPLOYMENT_SCHEMA_VERSION,
+};
+pub use deployment_store::{DeploymentStoreError, FileDeploymentRevisionStore};
 pub use fit::{
     estimate_throughput, fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
     ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
