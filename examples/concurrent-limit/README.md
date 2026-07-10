@@ -1,6 +1,6 @@
 # Concurrent request limit
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-09*
 
 ![Concurrent request limit](../../docs/assets/concurrent-limit.gif)
 
@@ -17,17 +17,15 @@ No setup required. The example caps in-flight requests at 3 per client IP and ro
 ## Try it
 
 ```bash
-# Open 5 slow requests in parallel; the 4th and 5th get 503.
-for i in 1 2 3 4 5; do
-  curl -s -o /dev/null -w "%{http_code}\n" \
-    -H 'Host: localhost' http://127.0.0.1:8080/delay/3 &
-done
-wait
-# 200
-# 200
-# 200
-# 503
-# 503
+# Open 5 slow requests in parallel: 3 permits are taken, 2 overflow.
+# The upstream's /delay/3 holds each admitted request for 3 seconds,
+# so the two 503s print first (they are rejected immediately).
+( for i in 1 2 3 4 5; do
+    curl -s -o /dev/null -w "%{http_code}\n" \
+      -H 'Host: localhost' http://127.0.0.1:8080/delay/3 &
+  done; wait ) | sort | uniq -c
+#    3 200
+#    2 503
 ```
 
 ```bash
@@ -40,6 +38,7 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 ```bash
 # Once the in-flight requests drain, new requests are admitted again.
 curl -s -H 'Host: localhost' http://127.0.0.1:8080/get | jq .url
+# "/get"
 ```
 
 ## What this exercises

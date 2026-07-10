@@ -27,15 +27,15 @@ curl -i -H 'Host: blog.local' \
 ```
 
 ```bash
-# Redeem a valid token - the request passes the paywall and returns
-# whatever the upstream answers. The public echo service only
-# implements /get, so /article comes back 404 from upstream; the
-# absence of a 402 is what shows the paywall opened. The token is
-# single-use; the next call without a fresh token gets 402 again.
+# Redeem a valid token - the paywall opens and the upstream's real
+# article comes back. The token is single-use; the next call without
+# a fresh token gets 402 again.
 curl -i -H 'Host: blog.local' \
      -H 'User-Agent: GPTBot/1.0' \
      -H 'crawler-payment: token-aaa-001' \
      http://127.0.0.1:8080/article
+# HTTP/1.1 200 OK
+# <!doctype html> ... <h1>The Gateway Pattern for AI Traffic</h1> ...
 ```
 
 ```bash
@@ -48,12 +48,10 @@ curl -i -H 'Host: blog.local' \
 ```
 
 ```bash
-# Normal browser UA - passes through without paying. We hit /get
-# rather than /article because the upstream (test.sbproxy.dev) only
-# implements the former; this confirms the proxy is forwarding
-# correctly when no payment challenge fires.
+# Normal browser UA - passes through to the same article without
+# paying; the challenge only fires for the configured crawler agents.
 curl -s -o /dev/null -w "%{http_code}\n" \
-     -H 'Host: blog.local' http://127.0.0.1:8080/get
+     -H 'Host: blog.local' http://127.0.0.1:8080/article
 # 200
 ```
 

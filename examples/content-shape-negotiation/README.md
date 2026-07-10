@@ -1,6 +1,6 @@
 # Content-shape negotiation
 
-*Last modified: 2026-05-08*
+*Last modified: 2026-07-09*
 
 ![Content-shape negotiation](../../docs/assets/content-shape-negotiation.gif)
 
@@ -19,18 +19,20 @@ sbproxy serve -f sb.yml
 ```bash
 # Markdown shape. The HTML body is projected into Markdown and the
 # proxy stamps `Content-Type: text/markdown` plus an
-# `x-markdown-tokens` header carrying the projected body's token
-# estimate.
+# `x-markdown-tokens` header carrying a token estimate. (Against an
+# upstream that streams without a Content-Length, like this test
+# service, the header's fallback estimate can read 0; the JSON
+# envelope's `token_estimate` below is computed at projection time
+# and is exact.)
 $ curl -i -H 'Host: shape.local' \
        -H 'Accept: text/markdown' \
        http://127.0.0.1:8080/article
 HTTP/1.1 200 OK
 content-type: text/markdown; charset=utf-8
-x-markdown-tokens: 27
 
-# The Article
+# The Gateway Pattern for AI Traffic
 
-The first paragraph carries the lede ...
+By the test.sbproxy.dev echo service ...
 ```
 
 ```bash
@@ -42,16 +44,15 @@ $ curl -i -H 'Host: shape.local' \
        http://127.0.0.1:8080/article
 HTTP/1.1 200 OK
 content-type: application/json; profile="https://sbproxy.dev/schema/json-envelope/v1"
-x-markdown-tokens: 27
 
 {
   "schema_version": "1",
-  "title": "The Article",
-  "content_md": "# The Article\n\nThe first paragraph ...",
-  "token_estimate": 27,
+  "title": "The Gateway Pattern for AI Traffic",
+  "url": "http://shape.local/article",
   "license": "all-rights-reserved",
-  "url": "https://test.sbproxy.dev/article",
-  "fetched_at": "2026-05-08T12:00:00Z",
+  "content_md": "# The Gateway Pattern for AI Traffic\n\nBy the test.sbproxy.dev echo service ...",
+  "token_estimate": 311,
+  "fetched_at": "2026-07-09T12:00:00Z",
   "citation_required": false
 }
 ```
@@ -81,7 +82,7 @@ The four transforms run in declared order. The negotiated transform shape gates 
 3. `citation_block` prepends a citation footer naming the upstream URL so cited Markdown is traceable back to its source. Honours `force_citation: true` when the policy needs to demand a citation regardless of negotiated shape.
 4. `json_envelope` wraps the projected Markdown in the v1 JSON envelope schema when the negotiated shape is `json`. No-op for the Markdown and HTML shapes.
 
-The single Wave 4 transform on the origin (here `json_envelope`) is the trigger that tells the compiler to synthesise an `auto_content_negotiate` config and mount the resolver. Origins that pair the chain with `ai_crawl_control` can leave `transforms:` empty, and the compiler auto-prepends the same four entries; example `17-markdown-for-agents` shows that path with a paywall in front.
+The single Wave 4 transform on the origin (here `json_envelope`) is the trigger that tells the compiler to synthesise an `auto_content_negotiate` config and mount the resolver. Origins that pair the chain with `ai_crawl_control` can leave `transforms:` empty, and the compiler auto-prepends the same four entries; the `markdown-for-agents` example shows that path with a paywall in front.
 
 ## Wildcard fallback rules
 
@@ -97,6 +98,6 @@ The single Wave 4 transform on the origin (here `json_envelope`) is the trigger 
 ## See also
 
 - [docs/configuration.md](../../docs/configuration.md) for the full origin schema
-- [examples/markdown-for-agents](../17-markdown-for-agents/) for the same chain wired in front of an `ai_crawl_control` paywall
-- [examples/transform-html-to-markdown](../45-transform-html-to-markdown/) for the standalone HTML to Markdown transform without negotiation
+- [examples/markdown-for-agents](../markdown-for-agents/) for the same chain wired in front of an `ai_crawl_control` paywall
+- [examples/transform-html-to-markdown](../transform-html-to-markdown/) for the standalone HTML to Markdown transform without negotiation
 - The e2e contract at `e2e/tests/content_negotiation_e2e.rs` and `e2e/tests/x_markdown_tokens_e2e.rs`

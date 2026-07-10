@@ -27,10 +27,12 @@ $ curl -i -H 'Host: a2a.local' \
        -H 'X-A2A-Task-Id: task-1' \
        -H 'X-A2A-Chain-Depth: 1' \
        http://127.0.0.1:8080/agents/invoke
-HTTP/1.1 404 Not Found
+HTTP/1.1 200 OK
+
+{"status":"ok","action":"invoke","received":null,"timestamp":"..."}
 ```
 
-The 404 comes from the upstream: the echo service at test.sbproxy.dev only implements `/get`, so any `/agents/*` path answers 404, and getting an upstream response at all (instead of a 4xx JSON error from the policy) demonstrates the policy allowed the request.
+The 200 comes from the upstream: test.sbproxy.dev implements `/agents/invoke` as a permissive test agent, so a policy-allowed request gets a real answer while a policy rejection is one of the 4xx JSON errors below.
 
 ```bash
 # 429 - chain depth 7 exceeds the configured limit of 3.
@@ -76,11 +78,12 @@ HTTP/1.1 403 Forbidden
 ```bash
 # Pass-through via the operator escape hatch. No A2A protocol
 # headers, but the path matches the configured route_glob, so
-# detection still fires and the policy applies. The 404 is again the
-# upstream answering for a path it does not implement; the policy
-# let the request through.
+# detection still fires and the policy applies. The upstream's
+# /agents/ping answers, proving the policy let the request through.
 $ curl -i -H 'Host: a2a.local' http://127.0.0.1:8080/agents/ping
-HTTP/1.1 404 Not Found
+HTTP/1.1 200 OK
+
+{"status":"ok","action":"ping","timestamp":"..."}
 ```
 
 ## When to enable the parser features
