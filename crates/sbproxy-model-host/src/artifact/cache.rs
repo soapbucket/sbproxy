@@ -51,6 +51,8 @@ pub struct ArtifactCacheMetadata {
     pub license: String,
     /// Catalog support level.
     pub stability: SupportLevel,
+    /// Logical-model pickle opt-in captured at resolution.
+    pub pickle_allowed: bool,
     /// Trust classification for managed v2 artifacts.
     pub trust: String,
     /// Initial finalization timestamp as Unix milliseconds.
@@ -69,6 +71,22 @@ pub(crate) struct LegacyArtifactMetadata<'a> {
     pub(crate) sha256: Option<&'a str>,
     pub(crate) size_bytes: u64,
     pub(crate) trust: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResumeMetadata {
+    schema_version: u32,
+    url: String,
+    etag: Option<String>,
+    expected_sha256: String,
+    expected_size: u64,
+    completed_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResumeState {
+    pub(crate) offset: u64,
+    pub(crate) etag: Option<String>,
 }
 
 impl ArtifactCacheMetadata {
@@ -91,6 +109,7 @@ impl ArtifactCacheMetadata {
             context_length: artifact.context_length,
             license: artifact.license.clone(),
             stability: artifact.stability,
+            pickle_allowed: artifact.pickle_allowed,
             trust: "verified".to_string(),
             created_at_ms,
             last_accessed_ms: created_at_ms,
@@ -141,6 +160,7 @@ impl ArtifactCacheMetadata {
             && self.context_length == artifact.context_length
             && self.license == artifact.license
             && self.stability == artifact.stability
+            && self.pickle_allowed == artifact.pickle_allowed
     }
 
     fn same_immutable_identity(&self, other: &Self) -> bool {
@@ -158,6 +178,7 @@ impl ArtifactCacheMetadata {
             && self.context_length == other.context_length
             && self.license == other.license
             && self.stability == other.stability
+            && self.pickle_allowed == other.pickle_allowed
             && self.trust == other.trust
             && self.created_at_ms == other.created_at_ms
     }
@@ -338,9 +359,18 @@ impl ArtifactCache {
                 "metadata digest differs from its filename".to_string(),
             ));
         }
-        if !snapshot_path.is_dir() {
+        let snapshot_metadata = match fs::symlink_metadata(&snapshot_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Ok(CacheLookup::Corrupt(format!(
+                    "read snapshot directory metadata: {error}"
+                )))
+            }
+        };
+        if snapshot_metadata.file_type().is_symlink() || !snapshot_metadata.is_dir() {
             return Ok(CacheLookup::Corrupt(
-                "ready metadata exists without a snapshot directory".to_string(),
+                "ready metadata snapshot is missing, not a directory, or a symbolic link"
+                    .to_string(),
             ));
         }
         let snapshot_manifest_path = snapshot_path.join("artifact.json");
@@ -354,8 +384,7 @@ impl ArtifactCache {
             ));
         }
         for file in &metadata.files {
-            let path = snapshot_path.join(&file.path);
-            if let Err(error) = verify_file(&path, file) {
+            if let Err(error) = verify_snapshot_file(&snapshot_path, file) {
                 return Ok(CacheLookup::Corrupt(error.to_string()));
             }
         }
@@ -365,6 +394,129 @@ impl ArtifactCache {
     pub(crate) fn partial_path(&self, digest: &str, relative: &str) -> PathBuf {
         let base = self.partial_root(digest).join(relative);
         append_suffix(&base, ".part")
+    }
+
+    pub(crate) fn resume_state(
+        &self,
+        digest: &str,
+        file: &ArtifactFile,
+        url: &str,
+    ) -> Result<ResumeState, ArtifactError> {
+        let partial = self.partial_path(digest, &file.path);
+        let resume = self.resume_path(digest, &file.path);
+        let partial_exists = partial.exists();
+        let resume_exists = resume.exists();
+        if !partial_exists && !resume_exists {
+            return Ok(ResumeState {
+                offset: 0,
+                etag: None,
+            });
+        }
+        if !partial_exists || !resume_exists {
+            self.discard_partial_file(digest, &file.path)?;
+            return Ok(ResumeState {
+                offset: 0,
+                etag: None,
+            });
+        }
+        let metadata = match read_json::<ResumeMetadata>(&resume) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                self.discard_partial_file(digest, &file.path)?;
+                return Ok(ResumeState {
+                    offset: 0,
+                    etag: None,
+                });
+            }
+        };
+        let partial_metadata = fs::symlink_metadata(&partial)
+            .map_err(|source| io_error("read artifact partial metadata", &partial, source))?;
+        if partial_metadata.file_type().is_symlink() || !partial_metadata.is_file() {
+            return Err(ArtifactError::CacheCorrupt {
+                digest: digest.to_string(),
+                reason: format!("artifact partial '{}' is not a regular file", file.path),
+            });
+        }
+        let actual_size = partial_metadata.len();
+        let valid = metadata.schema_version == 1
+            && metadata.url == url
+            && metadata.expected_sha256 == file.sha256
+            && metadata.expected_size == file.size_bytes
+            && metadata.completed_bytes == actual_size
+            && metadata.completed_bytes <= file.size_bytes
+            && metadata
+                .etag
+                .as_deref()
+                .is_some_and(|etag| !etag.is_empty());
+        if !valid {
+            self.discard_partial_file(digest, &file.path)?;
+            return Ok(ResumeState {
+                offset: 0,
+                etag: None,
+            });
+        }
+        Ok(ResumeState {
+            offset: metadata.completed_bytes,
+            etag: metadata.etag,
+        })
+    }
+
+    pub(crate) fn write_resume(
+        &self,
+        digest: &str,
+        file: &ArtifactFile,
+        url: &str,
+        etag: Option<&str>,
+        completed_bytes: u64,
+    ) -> Result<(), ArtifactError> {
+        let destination = self.resume_path(digest, &file.path);
+        let parent = destination.parent().expect("resume metadata has parent");
+        fs::create_dir_all(parent)
+            .map_err(|source| io_error("create artifact resume directory", parent, source))?;
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = append_suffix(
+            &destination,
+            &format!(".tmp.{}.{}", std::process::id(), sequence),
+        );
+        let metadata = ResumeMetadata {
+            schema_version: 1,
+            url: url.to_string(),
+            etag: etag.map(str::to_string),
+            expected_sha256: file.sha256.clone(),
+            expected_size: file.size_bytes,
+            completed_bytes,
+        };
+        let result = (|| {
+            write_json_synced(&temporary, &metadata)?;
+            fs::rename(&temporary, &destination).map_err(|source| {
+                io_error("replace artifact resume metadata", &destination, source)
+            })?;
+            sync_directory(parent)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    pub(crate) fn discard_partial_file(
+        &self,
+        digest: &str,
+        relative: &str,
+    ) -> Result<(), ArtifactError> {
+        for path in [
+            self.partial_path(digest, relative),
+            self.resume_path(digest, relative),
+        ] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(io_error("discard artifact partial", &path, source));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_partial(
@@ -377,6 +529,16 @@ impl ArtifactCache {
         let parent = path.parent().expect("partial file always has a parent");
         fs::create_dir_all(parent)
             .map_err(|source| io_error("create artifact partial directory", parent, source))?;
+        if path.exists() {
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| io_error("inspect artifact partial", &path, source))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(ArtifactError::InvalidArtifact(format!(
+                    "artifact partial '{}' is not a regular file",
+                    path.display()
+                )));
+            }
+        }
         Ok(path)
     }
 
@@ -388,6 +550,14 @@ impl ArtifactCache {
             let partial = self.partial_path(&artifact.artifact_digest, &file.path);
             verify_file(&partial, file)?;
             self.promote_blob(&partial, file)?;
+            let resume = self.resume_path(&artifact.artifact_digest, &file.path);
+            match fs::remove_file(&resume) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(io_error("remove artifact resume metadata", &resume, source));
+                }
+            }
         }
         Ok(())
     }
@@ -553,6 +723,11 @@ impl ArtifactCache {
         self.root.join("partials").join(digest)
     }
 
+    fn resume_path(&self, digest: &str, relative: &str) -> PathBuf {
+        let base = self.partial_root(digest).join(relative);
+        append_suffix(&base, ".resume.json")
+    }
+
     fn metadata_path(&self, digest: &str) -> PathBuf {
         self.root.join("metadata").join(format!("{digest}.json"))
     }
@@ -593,6 +768,11 @@ pub(crate) fn validate_resolved_artifact(artifact: &ResolvedArtifact) -> Result<
     }
     validate_files(&artifact.files)?;
     total_size(&artifact.files)?;
+    if artifact.format == ArtifactFormat::Pickle && !artifact.pickle_allowed {
+        return Err(ArtifactError::PickleRefused {
+            model: artifact.logical_model.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -658,8 +838,14 @@ fn total_size(files: &[ArtifactFile]) -> Result<u64, ArtifactError> {
 }
 
 fn verify_file(path: &Path, expected: &ArtifactFile) -> Result<(), ArtifactError> {
-    let metadata = fs::metadata(path)
+    let metadata = fs::symlink_metadata(path)
         .map_err(|source| io_error("read artifact file metadata", path, source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ArtifactError::InvalidArtifact(format!(
+            "artifact file '{}' is not a regular file",
+            path.display()
+        )));
+    }
     if metadata.len() != expected.size_bytes {
         return Err(ArtifactError::SizeMismatch {
             file: expected.path.clone(),
@@ -676,6 +862,29 @@ fn verify_file(path: &Path, expected: &ArtifactFile) -> Result<(), ArtifactError
         });
     }
     Ok(())
+}
+
+fn verify_snapshot_file(root: &Path, expected: &ArtifactFile) -> Result<(), ArtifactError> {
+    let mut current = root.to_path_buf();
+    let components: Vec<_> = Path::new(&expected.path).components().collect();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|source| io_error("inspect artifact snapshot path", &current, source))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ArtifactError::InvalidArtifact(format!(
+                "artifact snapshot path '{}' contains a symbolic link",
+                current.display()
+            )));
+        }
+        if index + 1 < components.len() && !metadata.is_dir() {
+            return Err(ArtifactError::InvalidArtifact(format!(
+                "artifact snapshot parent '{}' is not a directory",
+                current.display()
+            )));
+        }
+    }
+    verify_file(&current, expected)
 }
 
 pub(crate) fn hash_file(path: &Path) -> Result<String, ArtifactError> {
@@ -741,6 +950,14 @@ fn write_json_synced<T: Serialize>(path: &Path, value: &T) -> Result<(), Artifac
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ArtifactError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| io_error("inspect artifact JSON", path, source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ArtifactError::CacheCorrupt {
+            digest: path.display().to_string(),
+            reason: "artifact JSON is not a regular file".to_string(),
+        });
+    }
     let bytes = fs::read(path).map_err(|source| io_error("read artifact JSON", path, source))?;
     serde_json::from_slice(&bytes).map_err(|error| ArtifactError::CacheCorrupt {
         digest: path.display().to_string(),

@@ -396,6 +396,7 @@ impl Catalog {
                 engine,
                 entry.context_length,
                 &entry.license,
+                entry.allow_pickle,
             )
             .map_err(|reason| ArtifactResolveError::Digest {
                 model: request.model.clone(),

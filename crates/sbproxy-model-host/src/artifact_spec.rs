@@ -154,6 +154,8 @@ pub struct ResolvedArtifact {
     pub license: String,
     /// Variant support level.
     pub stability: SupportLevel,
+    /// Logical-model policy explicitly permits pickle execution risk.
+    pub pickle_allowed: bool,
 }
 
 #[derive(Serialize)]
@@ -177,6 +179,7 @@ impl ResolvedArtifact {
         engine: EngineKind,
         context_length: u64,
         license: &str,
+        pickle_allowed: bool,
     ) -> Result<Self, String> {
         let material = ArtifactDigestMaterial {
             catalog_revision,
@@ -205,6 +208,7 @@ impl ResolvedArtifact {
             context_length,
             license: license.to_string(),
             stability: variant.stability,
+            pickle_allowed,
         })
     }
 }

@@ -9,6 +9,7 @@ mod http;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use sha2::Digest as _;
@@ -22,8 +23,8 @@ pub use http::{
 };
 
 use crate::{
-    FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
-    PullPolicy, ResolvedArtifact,
+    ArtifactFile, ArtifactFormat, FileJobStore, JobError, OperationJob, OperationKind,
+    OperationProgress, OperationState, PullPolicy, ResolvedArtifact, WeightFormat,
 };
 use cache::{
     hash_file, validate_digest, validate_relative_path, validate_resolved_artifact, ArtifactCache,
@@ -94,6 +95,40 @@ pub enum ArtifactError {
         /// Safe verification failure.
         reason: String,
     },
+    /// Runtime acquisition was blocked by manual pull policy.
+    #[error("manual artifact '{digest}' is not in the verified cache; run sbproxy models pull")]
+    ManualArtifactMissing {
+        /// Artifact digest.
+        digest: String,
+    },
+    /// Network-denied acquisition encountered an HTTP cache miss.
+    #[error("offline artifact '{digest}' is not in the verified cache")]
+    OfflineArtifactMissing {
+        /// Artifact digest.
+        digest: String,
+    },
+    /// Startup warming was requested for a non-on-boot artifact.
+    #[error("startup warming skipped artifact '{digest}' with pull policy {pull_policy:?}")]
+    StartupArtifactNotSelected {
+        /// Artifact digest.
+        digest: String,
+        /// Declared pull policy.
+        pull_policy: PullPolicy,
+    },
+    /// Pickle artifact did not carry explicit logical-model opt-in.
+    #[error("pickle artifact '{model}' is refused without allow_pickle: true")]
+    PickleRefused {
+        /// Logical model ID.
+        model: String,
+    },
+    /// Opted-in pickle bytes failed opcode scanning.
+    #[error("pickle artifact file '{file}' is unsafe: {reason}")]
+    PickleUnsafe {
+        /// Relative pickle file.
+        file: String,
+        /// Scanner failure.
+        reason: String,
+    },
     /// Durable operation job failed.
     #[error(transparent)]
     Job(#[from] JobError),
@@ -112,7 +147,7 @@ impl ArtifactError {
     fn invalid_bytes(&self) -> bool {
         matches!(
             self,
-            Self::SizeMismatch { .. } | Self::DigestMismatch { .. }
+            Self::SizeMismatch { .. } | Self::DigestMismatch { .. } | Self::PickleUnsafe { .. }
         )
     }
 }
@@ -354,68 +389,340 @@ impl ArtifactManager {
             CacheLookup::Missing | CacheLookup::Partial(_) => {}
         }
 
-        let first_file = artifact.files.first().map(|file| file.path.clone());
+        let local_source = artifact.source.strip_prefix("file:");
+        enforce_cache_miss_policy(
+            &artifact.artifact_digest,
+            context.intent,
+            context.network,
+            context.pull_policy,
+            local_source.is_some(),
+        )?;
+
+        if let Some(local_source) = local_source {
+            self.stage_local_files(artifact, local_source, total_bytes, job)
+                .await?;
+        } else {
+            *job = self.transition_job(
+                job,
+                OperationState::Downloading,
+                OperationProgress {
+                    completed_bytes: 0,
+                    total_bytes,
+                    current_file: artifact.files.first().map(|file| file.path.clone()),
+                },
+            )?;
+            let mut completed_bytes = 0u64;
+            for file in &artifact.files {
+                let file_bytes = self
+                    .download_http_file(
+                        artifact,
+                        file,
+                        completed_bytes,
+                        total_bytes,
+                        context.credential.clone(),
+                        job,
+                    )
+                    .await?;
+                completed_bytes = completed_bytes.checked_add(file_bytes).ok_or_else(|| {
+                    ArtifactError::InvalidArtifact("artifact progress overflows u64".to_string())
+                })?;
+            }
+            *job = self.transition_job(
+                job,
+                OperationState::Verifying,
+                OperationProgress {
+                    completed_bytes: total_bytes,
+                    total_bytes,
+                    current_file: None,
+                },
+            )?;
+        }
+
+        let cache = self.cache.clone();
+        let requested = artifact.clone();
+        tokio::task::spawn_blocking(move || scan_pickle_partials(&cache, &requested))
+            .await
+            .map_err(|error| ArtifactError::Join(error.to_string()))??;
+        let cache = self.cache.clone();
+        let requested = artifact.clone();
+        tokio::task::spawn_blocking(move || cache.verify_and_promote(&requested))
+            .await
+            .map_err(|error| ArtifactError::Join(error.to_string()))??;
+        let cache = self.cache.clone();
+        let requested = artifact.clone();
+        let metadata = tokio::task::spawn_blocking(move || cache.finalize_snapshot(&requested))
+            .await
+            .map_err(|error| ArtifactError::Join(error.to_string()))??;
         *job = self.transition_job(
             job,
-            OperationState::Downloading,
+            OperationState::Ready,
+            OperationProgress {
+                completed_bytes: total_bytes,
+                total_bytes,
+                current_file: None,
+            },
+        )?;
+        Ok(ReadyArtifact::new(self.cache.root(), metadata, job.clone()))
+    }
+
+    async fn stage_local_files(
+        &self,
+        artifact: &ResolvedArtifact,
+        local_source: &str,
+        total_bytes: u64,
+        job: &mut OperationJob,
+    ) -> Result<(), ArtifactError> {
+        if local_source.trim().is_empty() {
+            return Err(ArtifactError::InvalidArtifact(
+                "file: source path must not be empty".to_string(),
+            ));
+        }
+        let source_root = PathBuf::from(local_source);
+        let source_metadata = std::fs::symlink_metadata(&source_root)
+            .map_err(|source| io_error("read local artifact source", &source_root, source))?;
+        if source_metadata.file_type().is_symlink() {
+            return Err(ArtifactError::InvalidArtifact(
+                "file: source must not be a symbolic link".to_string(),
+            ));
+        }
+        if source_metadata.is_file() && artifact.files.len() != 1 {
+            return Err(ArtifactError::InvalidArtifact(
+                "a file: source file can satisfy only one declared artifact file".to_string(),
+            ));
+        }
+        if !source_metadata.is_file() && !source_metadata.is_dir() {
+            return Err(ArtifactError::InvalidArtifact(
+                "file: source must be a regular file or directory".to_string(),
+            ));
+        }
+
+        *job = self.transition_job(
+            job,
+            OperationState::Verifying,
             OperationProgress {
                 completed_bytes: 0,
                 total_bytes,
-                current_file: first_file,
+                current_file: artifact.files.first().map(|file| file.path.clone()),
             },
         )?;
-
         let mut completed_bytes = 0u64;
         for file in &artifact.files {
-            if job.progress.current_file.as_deref() != Some(file.path.as_str()) {
-                *job = self.transition_job(
-                    job,
-                    OperationState::Downloading,
-                    OperationProgress {
-                        completed_bytes,
-                        total_bytes,
-                        current_file: Some(file.path.clone()),
-                    },
-                )?;
+            let source = if source_metadata.is_file() {
+                source_root.clone()
+            } else {
+                source_root.join(&file.path)
+            };
+            reject_symlink_path(&source_root, &source)?;
+            let metadata = std::fs::metadata(&source)
+                .map_err(|error| io_error("read local artifact file", &source, error))?;
+            if !metadata.is_file() {
+                return Err(ArtifactError::InvalidArtifact(format!(
+                    "local artifact '{}' is not a regular file",
+                    source.display()
+                )));
             }
-            let url = source_url(artifact, &file.path)?;
-            let response = self
-                .transport
-                .get(TransportRequest {
-                    url,
-                    offset: 0,
-                    if_range: None,
-                    credential: context.credential.clone(),
-                })
-                .await?;
-            if response.disposition != ResponseDisposition::Replacement {
-                return Err(ArtifactError::UnexpectedResponse {
+            if metadata.len() != file.size_bytes {
+                return Err(ArtifactError::SizeMismatch {
                     file: file.path.clone(),
-                    reason: format!("byte-zero request returned {:?}", response.disposition),
+                    expected: file.size_bytes,
+                    actual: metadata.len(),
                 });
             }
-            if let Some(actual) = response.total_size {
-                if actual != file.size_bytes {
-                    return Err(ArtifactError::SizeMismatch {
-                        file: file.path.clone(),
-                        expected: file.size_bytes,
-                        actual,
-                    });
-                }
-            }
-
             let partial = self
                 .cache
                 .prepare_partial(&artifact.artifact_digest, &file.path)?;
-            let mut destination = tokio::fs::OpenOptions::new()
+            let mut reader = tokio::fs::File::open(&source)
+                .await
+                .map_err(|error| io_error("open local artifact file", &source, error))?;
+            let mut writer = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(&partial)
                 .await
+                .map_err(|error| io_error("open local artifact partial", &partial, error))?;
+            let copied = tokio::io::copy(&mut reader, &mut writer)
+                .await
+                .map_err(|error| io_error("stage local artifact file", &partial, error))?;
+            writer
+                .sync_all()
+                .await
+                .map_err(|error| io_error("sync local artifact partial", &partial, error))?;
+            if copied != file.size_bytes {
+                return Err(ArtifactError::SizeMismatch {
+                    file: file.path.clone(),
+                    expected: file.size_bytes,
+                    actual: copied,
+                });
+            }
+            completed_bytes = completed_bytes.checked_add(copied).ok_or_else(|| {
+                ArtifactError::InvalidArtifact("artifact progress overflows u64".to_string())
+            })?;
+            *job = self.transition_job(
+                job,
+                OperationState::Verifying,
+                OperationProgress {
+                    completed_bytes,
+                    total_bytes,
+                    current_file: Some(file.path.clone()),
+                },
+            )?;
+        }
+        *job = self.transition_job(
+            job,
+            OperationState::Verifying,
+            OperationProgress {
+                completed_bytes: total_bytes,
+                total_bytes,
+                current_file: None,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn download_http_file(
+        &self,
+        artifact: &ResolvedArtifact,
+        file: &ArtifactFile,
+        completed_before: u64,
+        total_bytes: u64,
+        credential: Option<SourceCredential>,
+        job: &mut OperationJob,
+    ) -> Result<u64, ArtifactError> {
+        let url = source_url(artifact, &file.path)?;
+        let mut resume = self
+            .cache
+            .resume_state(&artifact.artifact_digest, file, &url)?;
+        *job = self.transition_job(
+            job,
+            OperationState::Downloading,
+            OperationProgress {
+                completed_bytes: completed_before.checked_add(resume.offset).ok_or_else(|| {
+                    ArtifactError::InvalidArtifact("artifact progress overflows u64".to_string())
+                })?,
+                total_bytes,
+                current_file: Some(file.path.clone()),
+            },
+        )?;
+
+        let mut restarted = false;
+        let mut checkpointed_bytes = resume.offset;
+        let mut last_checkpoint = Instant::now();
+        let mut body_checkpointed = false;
+        loop {
+            let response = self
+                .transport
+                .get(TransportRequest {
+                    url: url.clone(),
+                    offset: resume.offset,
+                    if_range: resume.etag.clone(),
+                    credential: credential.clone(),
+                })
+                .await?;
+
+            let append = match response.disposition {
+                ResponseDisposition::Replacement => {
+                    if let Some(actual) = response.total_size {
+                        if actual != file.size_bytes {
+                            return Err(ArtifactError::SizeMismatch {
+                                file: file.path.clone(),
+                                expected: file.size_bytes,
+                                actual,
+                            });
+                        }
+                    }
+                    if resume.offset > 0 {
+                        self.cache
+                            .discard_partial_file(&artifact.artifact_digest, &file.path)?;
+                    }
+                    resume.offset = 0;
+                    resume.etag = response.etag.clone();
+                    checkpointed_bytes = 0;
+                    last_checkpoint = Instant::now();
+                    body_checkpointed = false;
+                    false
+                }
+                ResponseDisposition::Append
+                    if resume.offset > 0
+                        && response.etag == resume.etag
+                        && response.total_size == Some(file.size_bytes) =>
+                {
+                    true
+                }
+                ResponseDisposition::RangeComplete
+                    if resume.offset == file.size_bytes
+                        && response.total_size == Some(file.size_bytes)
+                        && response
+                            .etag
+                            .as_ref()
+                            .is_none_or(|etag| Some(etag) == resume.etag.as_ref()) =>
+                {
+                    *job = self.transition_job(
+                        job,
+                        OperationState::Downloading,
+                        OperationProgress {
+                            completed_bytes: completed_before
+                                .checked_add(resume.offset)
+                                .ok_or_else(|| {
+                                    ArtifactError::InvalidArtifact(
+                                        "artifact progress overflows u64".to_string(),
+                                    )
+                                })?,
+                            total_bytes,
+                            current_file: Some(file.path.clone()),
+                        },
+                    )?;
+                    return Ok(resume.offset);
+                }
+                ResponseDisposition::Append | ResponseDisposition::RangeComplete
+                    if resume.offset > 0 && !restarted =>
+                {
+                    self.cache
+                        .discard_partial_file(&artifact.artifact_digest, &file.path)?;
+                    resume.offset = 0;
+                    resume.etag = None;
+                    checkpointed_bytes = 0;
+                    last_checkpoint = Instant::now();
+                    body_checkpointed = false;
+                    restarted = true;
+                    continue;
+                }
+                disposition => {
+                    return Err(ArtifactError::UnexpectedResponse {
+                        file: file.path.clone(),
+                        reason: format!(
+                            "response {disposition:?} is incompatible with offset {}",
+                            resume.offset
+                        ),
+                    })
+                }
+            };
+
+            let partial = self
+                .cache
+                .prepare_partial(&artifact.artifact_digest, &file.path)?;
+            self.cache.write_resume(
+                &artifact.artifact_digest,
+                file,
+                &url,
+                response.etag.as_deref(),
+                resume.offset,
+            )?;
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).create(true);
+            if append {
+                options.append(true);
+            } else {
+                options.truncate(true);
+            }
+            let mut destination = options
+                .open(&partial)
+                .await
                 .map_err(|source| io_error("open artifact partial", &partial, source))?;
+            let response_etag = response.etag;
             let mut body = response.body;
-            let mut file_bytes = 0u64;
+            let mut file_bytes = resume.offset;
             while let Some(chunk) = body.next().await {
                 let chunk = chunk?;
                 let chunk_len = u64::try_from(chunk.len()).map_err(|_| {
@@ -437,18 +744,42 @@ impl ArtifactManager {
                     .write_all(&chunk)
                     .await
                     .map_err(|source| io_error("write artifact partial", &partial, source))?;
-                let progress_bytes = completed_bytes.checked_add(file_bytes).ok_or_else(|| {
-                    ArtifactError::InvalidArtifact("artifact progress overflows u64".to_string())
-                })?;
-                *job = self.transition_job(
-                    job,
-                    OperationState::Downloading,
-                    OperationProgress {
-                        completed_bytes: progress_bytes,
-                        total_bytes,
-                        current_file: Some(file.path.clone()),
-                    },
-                )?;
+                let checkpoint_due = !body_checkpointed
+                    || file_bytes == file.size_bytes
+                    || file_bytes.saturating_sub(checkpointed_bytes) >= 8 * 1024 * 1024
+                    || last_checkpoint.elapsed() >= Duration::from_secs(2);
+                if checkpoint_due {
+                    destination.sync_data().await.map_err(|source| {
+                        io_error("checkpoint artifact partial", &partial, source)
+                    })?;
+                    self.cache.write_resume(
+                        &artifact.artifact_digest,
+                        file,
+                        &url,
+                        response_etag.as_deref(),
+                        file_bytes,
+                    )?;
+                    let completed_bytes = completed_before
+                        .checked_add(file_bytes)
+                        .ok_or_else(|| {
+                            ArtifactError::InvalidArtifact(
+                                "artifact progress overflows u64".to_string(),
+                            )
+                        })?
+                        .max(job.progress.completed_bytes);
+                    *job = self.transition_job(
+                        job,
+                        OperationState::Downloading,
+                        OperationProgress {
+                            completed_bytes,
+                            total_bytes,
+                            current_file: Some(file.path.clone()),
+                        },
+                    )?;
+                    checkpointed_bytes = file_bytes;
+                    last_checkpoint = Instant::now();
+                    body_checkpointed = true;
+                }
             }
             destination
                 .sync_all()
@@ -461,40 +792,8 @@ impl ArtifactManager {
                     actual: file_bytes,
                 });
             }
-            completed_bytes = completed_bytes.checked_add(file_bytes).ok_or_else(|| {
-                ArtifactError::InvalidArtifact("artifact progress overflows u64".to_string())
-            })?;
+            return Ok(file_bytes);
         }
-
-        *job = self.transition_job(
-            job,
-            OperationState::Verifying,
-            OperationProgress {
-                completed_bytes: total_bytes,
-                total_bytes,
-                current_file: None,
-            },
-        )?;
-        let cache = self.cache.clone();
-        let requested = artifact.clone();
-        tokio::task::spawn_blocking(move || cache.verify_and_promote(&requested))
-            .await
-            .map_err(|error| ArtifactError::Join(error.to_string()))??;
-        let cache = self.cache.clone();
-        let requested = artifact.clone();
-        let metadata = tokio::task::spawn_blocking(move || cache.finalize_snapshot(&requested))
-            .await
-            .map_err(|error| ArtifactError::Join(error.to_string()))??;
-        *job = self.transition_job(
-            job,
-            OperationState::Ready,
-            OperationProgress {
-                completed_bytes: total_bytes,
-                total_bytes,
-                current_file: None,
-            },
-        )?;
-        Ok(ReadyArtifact::new(self.cache.root(), metadata, job.clone()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -721,6 +1020,32 @@ impl ArtifactManager {
     }
 }
 
+pub(crate) fn enforce_cache_miss_policy(
+    digest: &str,
+    intent: PullIntent,
+    network: NetworkPolicy,
+    pull_policy: PullPolicy,
+    local_source: bool,
+) -> Result<(), ArtifactError> {
+    if intent == PullIntent::Runtime && pull_policy == PullPolicy::Manual {
+        return Err(ArtifactError::ManualArtifactMissing {
+            digest: digest.to_string(),
+        });
+    }
+    if intent == PullIntent::Startup && pull_policy != PullPolicy::OnBoot {
+        return Err(ArtifactError::StartupArtifactNotSelected {
+            digest: digest.to_string(),
+            pull_policy,
+        });
+    }
+    if network == NetworkPolicy::Denied && !local_source {
+        return Err(ArtifactError::OfflineArtifactMissing {
+            digest: digest.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn source_url(artifact: &ResolvedArtifact, relative_path: &str) -> Result<String, ArtifactError> {
     let repo = artifact.source.strip_prefix("hf:").ok_or_else(|| {
         ArtifactError::InvalidArtifact(format!(
@@ -729,6 +1054,61 @@ fn source_url(artifact: &ResolvedArtifact, relative_path: &str) -> Result<String
         ))
     })?;
     Ok(hf_url(repo, &artifact.revision, relative_path))
+}
+
+fn scan_pickle_partials(
+    cache: &ArtifactCache,
+    artifact: &ResolvedArtifact,
+) -> Result<(), ArtifactError> {
+    if artifact.format != ArtifactFormat::Pickle {
+        return Ok(());
+    }
+    let mut scanned = false;
+    for file in &artifact.files {
+        if WeightFormat::from_filename(&file.path) != WeightFormat::Pickle {
+            continue;
+        }
+        scanned = true;
+        let path = cache.partial_path(&artifact.artifact_digest, &file.path);
+        let bytes = std::fs::read(&path)
+            .map_err(|source| io_error("read pickle artifact for scanning", &path, source))?;
+        crate::scan_pickle(&file.path, &bytes).map_err(|error| ArtifactError::PickleUnsafe {
+            file: file.path.clone(),
+            reason: error.to_string(),
+        })?;
+    }
+    if !scanned {
+        return Err(ArtifactError::InvalidArtifact(
+            "pickle artifact has no declared pickle file".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_symlink_path(root: &Path, target: &Path) -> Result<(), ArtifactError> {
+    if root == target {
+        return Ok(());
+    }
+    let relative = target.strip_prefix(root).map_err(|_| {
+        ArtifactError::InvalidArtifact(format!(
+            "local artifact path '{}' escapes source root '{}'",
+            target.display(),
+            root.display()
+        ))
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|source| io_error("inspect local artifact path", &current, source))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ArtifactError::InvalidArtifact(format!(
+                "local artifact path '{}' contains a symbolic link",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn hf_url(repo: &str, revision: &str, relative_path: &str) -> String {

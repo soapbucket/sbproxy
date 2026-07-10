@@ -13,6 +13,7 @@ Registry version: `1`
 | `manifest.legacy_catalog_resolution` | `manifest` | `stable` | contract.catalog_id_resolves_exact_repo | Legacy catalog IDs resolve during the migration window. |
 | `manifest.catalog_v2` | `manifest` | `stable` | contract.catalog_v2_selects_exact_artifact<br>test.catalog_v2 | Catalog v2 resolves pinned logical models to exact immutable artifacts. |
 | `artifact.legacy_download` | `artifact` | `preview` | none | Legacy file downloads lack the complete atomic artifact contract. |
+| `artifact.verified_acquisition` | `artifact` | `stable` | contract.verified_artifact_policy_blocks_unauthorized_network<br>test.artifact_manager<br>test.artifact_policy | Managed artifacts are exact, atomic, resumable, and policy enforced. |
 | `artifact.cache_addressing` | `artifact` | `stable` | contract.cache_directory_changes_artifact_path | Explicit cache directories deterministically change artifact paths. |
 | `artifact.cache_budget` | `artifact` | `config_only` | none | Cache budget is parsed but safe protected collection is not yet active. |
 | `engine.managed_launch` | `engine` | `preview` | none | llama.cpp and vLLM launch paths require managed-artifact hardening. |

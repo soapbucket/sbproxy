@@ -8709,6 +8709,7 @@ dependencies = [
  "tracing",
  "ulid",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]

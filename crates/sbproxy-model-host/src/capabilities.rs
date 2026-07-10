@@ -94,6 +94,8 @@ pub enum ConsumerContract {
     CatalogIdResolvesExactRepo,
     /// Catalog v2 resolves a pinned logical model to exact immutable bytes.
     CatalogV2SelectsExactArtifact,
+    /// Managed cache misses enforce intent, pull policy, and network policy.
+    VerifiedArtifactPolicyBlocksUnauthorizedNetwork,
     /// An explicit cache directory changes artifact addressing.
     CacheDirectoryChangesArtifactPath,
     /// The eviction field changes admission under a full budget.
@@ -111,6 +113,9 @@ impl ConsumerContract {
             }
             Self::CatalogIdResolvesExactRepo => "contract.catalog_id_resolves_exact_repo",
             Self::CatalogV2SelectsExactArtifact => "contract.catalog_v2_selects_exact_artifact",
+            Self::VerifiedArtifactPolicyBlocksUnauthorizedNetwork => {
+                "contract.verified_artifact_policy_blocks_unauthorized_network"
+            }
             Self::CacheDirectoryChangesArtifactPath => {
                 "contract.cache_directory_changes_artifact_path"
             }
@@ -178,6 +183,45 @@ impl ConsumerContract {
                     ));
                 }
                 Ok(())
+            }
+            Self::VerifiedArtifactPolicyBlocksUnauthorizedNetwork => {
+                use crate::{NetworkPolicy, PullIntent, PullPolicy};
+
+                let digest = &"a".repeat(64);
+                let manual = crate::artifact::enforce_cache_miss_policy(
+                    digest,
+                    PullIntent::Runtime,
+                    NetworkPolicy::Allowed,
+                    PullPolicy::Manual,
+                    false,
+                );
+                if !matches!(
+                    manual,
+                    Err(crate::ArtifactError::ManualArtifactMissing { .. })
+                ) {
+                    return Err(format!("runtime manual policy returned {manual:?}"));
+                }
+                let offline = crate::artifact::enforce_cache_miss_policy(
+                    digest,
+                    PullIntent::Explicit,
+                    NetworkPolicy::Denied,
+                    PullPolicy::Manual,
+                    false,
+                );
+                if !matches!(
+                    offline,
+                    Err(crate::ArtifactError::OfflineArtifactMissing { .. })
+                ) {
+                    return Err(format!("offline HTTP policy returned {offline:?}"));
+                }
+                crate::artifact::enforce_cache_miss_policy(
+                    digest,
+                    PullIntent::Explicit,
+                    NetworkPolicy::Denied,
+                    PullPolicy::Manual,
+                    true,
+                )
+                .map_err(|error| format!("offline file source was rejected: {error}"))
             }
             Self::CacheDirectoryChangesArtifactPath => {
                 let config: ModelHostConfig = serde_yaml::from_str(
@@ -626,6 +670,18 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         summary: "Legacy file downloads lack the complete atomic artifact contract.",
         evidence: &[],
         consumer: None,
+    },
+    CapabilityEntry {
+        id: "artifact.verified_acquisition",
+        domain: CapabilityDomain::Artifact,
+        status: SupportLevel::Stable,
+        summary: "Managed artifacts are exact, atomic, resumable, and policy enforced.",
+        evidence: &[
+            "contract.verified_artifact_policy_blocks_unauthorized_network",
+            "test.artifact_manager",
+            "test.artifact_policy",
+        ],
+        consumer: Some(ConsumerContract::VerifiedArtifactPolicyBlocksUnauthorizedNetwork),
     },
     CapabilityEntry {
         id: "artifact.cache_addressing",

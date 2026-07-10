@@ -9,6 +9,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
+use zeroize::Zeroize;
 
 use super::ArtifactError;
 
@@ -47,7 +48,7 @@ impl Clone for SourceCredential {
 
 impl Drop for SourceCredential {
     fn drop(&mut self) {
-        self.secret.fill(0);
+        self.secret.zeroize();
     }
 }
 
@@ -198,4 +199,20 @@ impl ArtifactTransport for HttpArtifactTransport {
 #[cfg(feature = "weights")]
 fn parse_content_range_total(value: &str) -> Option<u64> {
     value.rsplit_once('/')?.1.parse().ok()
+}
+
+#[cfg(all(test, feature = "weights"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_credentials_are_usable_only_through_the_private_transport_accessor() {
+        let secret = b"hf_fixture_secret";
+        let credential = SourceCredential::new(secret).expect("credential");
+
+        assert_eq!(credential.bearer(), secret);
+        assert_eq!(format!("{credential:?}"), "SourceCredential([REDACTED])");
+        assert_eq!(credential.to_string(), "[REDACTED]");
+        assert!(!format!("{credential:?}").contains("hf_fixture_secret"));
+    }
 }

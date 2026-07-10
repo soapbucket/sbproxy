@@ -50,6 +50,7 @@ hex = { workspace = true }
 fs2 = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+zeroize = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
