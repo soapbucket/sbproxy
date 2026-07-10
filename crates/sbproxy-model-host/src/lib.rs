@@ -30,6 +30,7 @@
 //! - [`config`] - the `serve:` config block an operator writes.
 
 pub mod acquire;
+pub mod artifact_spec;
 pub mod capabilities;
 pub mod catalog;
 pub mod config;
@@ -61,11 +62,18 @@ pub mod uv_release;
 pub mod weights;
 
 pub use acquire::{plan_binary_acquire, BinaryAcquirePlan};
+pub use artifact_spec::{
+    AcceleratorKind, ArtifactFile, ArtifactFormat, ArtifactVariant, ComputeCapability,
+    ResolveArtifactRequest, ResolvedArtifact, VariantRequirements, WorkerProfile,
+};
 pub use capabilities::{
     capability_registry, CapabilityDomain, CapabilityEntry, CapabilityFinding, CapabilityRegistry,
     ConfigFieldCapability, ConsumerContract, SupportLevel, CAPABILITY_REGISTRY_VERSION,
 };
-pub use catalog::{Catalog, CatalogEntry, ModelRef, PullPolicy, ResolveError};
+pub use catalog::{
+    ArtifactResolveError, Catalog, CatalogDiagnostic, CatalogEntry, CatalogError, CatalogLoad,
+    ModelRef, PullPolicy, ResolveError,
+};
 pub use config::{
     AcquireSource, ChunkedPrefill, EngineAccel, EngineAcquire, EngineChoice, EngineDoctor,
     EngineEnv, EngineKind, EngineLaunchMethod, EngineProvisioning, EvictionPolicy, KvCacheQuant,

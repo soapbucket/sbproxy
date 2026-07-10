@@ -92,6 +92,8 @@ pub enum ConsumerContract {
     ServeModelsChangeDesiredDeployments,
     /// A legacy catalog ID resolves to the declared repository and quant.
     CatalogIdResolvesExactRepo,
+    /// Catalog v2 resolves a pinned logical model to exact immutable bytes.
+    CatalogV2SelectsExactArtifact,
     /// An explicit cache directory changes artifact addressing.
     CacheDirectoryChangesArtifactPath,
     /// The eviction field changes admission under a full budget.
@@ -108,6 +110,7 @@ impl ConsumerContract {
                 "contract.serve_models_change_desired_deployments"
             }
             Self::CatalogIdResolvesExactRepo => "contract.catalog_id_resolves_exact_repo",
+            Self::CatalogV2SelectsExactArtifact => "contract.catalog_v2_selects_exact_artifact",
             Self::CacheDirectoryChangesArtifactPath => {
                 "contract.cache_directory_changes_artifact_path"
             }
@@ -140,6 +143,39 @@ impl ConsumerContract {
                     .map_err(|error| error.to_string())?;
                 if resolved.hf_repo != "Org/Exact" || resolved.quant != "Q4_K_M" {
                     return Err(format!("legacy resolution returned {resolved:?}"));
+                }
+                Ok(())
+            }
+            Self::CatalogV2SelectsExactArtifact => {
+                use crate::{AcceleratorKind, EngineKind, ResolveArtifactRequest, WorkerProfile};
+
+                let catalog = crate::Catalog::builtin();
+                let resolved = catalog
+                    .resolve_artifact(
+                        &ResolveArtifactRequest {
+                            model: "qwen2.5-0.5b-instruct".to_string(),
+                            variant: Some("q4_k_m".to_string()),
+                            engine: EngineChoice::Auto,
+                            replicas: 1,
+                            heterogeneous_variants: false,
+                        },
+                        &WorkerProfile {
+                            accelerator: AcceleratorKind::Metal,
+                            compute_capability: None,
+                            memory_bytes: 24 * 1024 * 1024 * 1024,
+                            engines: BTreeSet::from([EngineKind::LlamaCpp]),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                if resolved.variant_id != "q4_k_m"
+                    || resolved.revision != "9217f5db79a29953eb74d5343926648285ec7e67"
+                    || resolved.files.len() != 1
+                    || resolved.files[0].sha256
+                        != "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+                {
+                    return Err(format!(
+                        "catalog v2 resolved unexpected artifact {resolved:?}"
+                    ));
                 }
                 Ok(())
             }
@@ -575,10 +611,13 @@ const CAPABILITIES: &[CapabilityEntry] = &[
     CapabilityEntry {
         id: "manifest.catalog_v2",
         domain: CapabilityDomain::Manifest,
-        status: SupportLevel::Preview,
-        summary: "Typed immutable artifact variants land in the foundations PR.",
-        evidence: &[],
-        consumer: None,
+        status: SupportLevel::Stable,
+        summary: "Catalog v2 resolves pinned logical models to exact immutable artifacts.",
+        evidence: &[
+            "contract.catalog_v2_selects_exact_artifact",
+            "test.catalog_v2",
+        ],
+        consumer: Some(ConsumerContract::CatalogV2SelectsExactArtifact),
     },
     CapabilityEntry {
         id: "artifact.legacy_download",

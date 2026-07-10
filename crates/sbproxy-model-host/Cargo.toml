@@ -41,6 +41,7 @@ embedded = ["dep:mistralrs", "dep:axum"]
 sbproxy-util.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
 serde_yaml = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
