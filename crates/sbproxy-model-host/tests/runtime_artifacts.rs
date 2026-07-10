@@ -101,6 +101,7 @@ impl ModelMetadataProvider for FixtureMetadata {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn variant_yaml(
     model: &str,
     repo: &str,
