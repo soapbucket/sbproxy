@@ -181,8 +181,13 @@ export interface DeviceVram {
   total_bytes?: number;
   free_bytes?: number;
 }
+export interface LocalServing {
+  ready?: boolean;
+  blockers?: string[];
+  recommendation?: string;
+}
 export interface ModelHostStatus {
-  // Real shape: {serving, models, vram} or {serving:false, reason}.
+  // Real shape: {serving, models, vram, local_serving} or {serving:false, reason}.
   serving?: boolean;
   reason?: string;
   models?: ResidentModel[];
@@ -192,6 +197,8 @@ export interface ModelHostStatus {
     free_bytes?: number;
     devices?: DeviceVram[];
   };
+  // Doctor's admission verdict: why a serve: block would reject here.
+  local_serving?: LocalServing;
   // Tolerated loose/legacy fields.
   status?: string;
   resident?: ResidentModel[];
@@ -226,6 +233,10 @@ export interface KeyPolicy {
   max_budget_tokens?: number;
   max_budget_usd?: number;
   max_requests_per_minute?: number;
+  max_tokens_per_minute?: number;
+  priority?: string;
+  inject_mcp?: unknown;
+  metadata?: Record<string, string>;
   project?: string;
   user?: string;
   tenant_id?: string;
@@ -257,6 +268,10 @@ export interface AdminKey {
   principal_selectors?: unknown[];
   bypass_prompt_injection?: boolean;
   max_requests_per_minute?: number;
+  max_tokens_per_minute?: number;
+  priority?: string;
+  inject_mcp?: unknown;
+  metadata?: Record<string, string>;
   budget?: unknown;
   project?: string;
   user?: string;

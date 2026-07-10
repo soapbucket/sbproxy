@@ -4165,6 +4165,17 @@ impl ProxyHttp for SbProxy {
             // The `ai_tokens_in.is_none()` guard prevents double counting
             // against the measured spend recorded by the billing choke
             // point on the success path.
+            // WOR-1833: charge this response's measured token usage into
+            // the key's tokens-per-minute window. Done once at request
+            // completion (covers unary and streaming alike, both of which
+            // stamp `ai_tokens_*` when usage is extracted) so the next
+            // request on the key sees the spent window.
+            if let Some(bucket) = ctx.ai_key_tpm_bucket.as_deref() {
+                let used = ctx.ai_tokens_in.unwrap_or(0) + ctx.ai_tokens_out.unwrap_or(0);
+                if used > 0 {
+                    super::ai_dispatch::key_rate_limiter().record_tokens(bucket, used);
+                }
+            }
             if ctx.ai_tokens_in.is_none() {
                 if let Some(est) = ctx.ai_prompt_tokens_est {
                     if est > 0 {

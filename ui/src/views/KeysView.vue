@@ -62,6 +62,40 @@ function parseJsonArray(s: string): unknown[] | undefined {
   if (!Array.isArray(parsed)) throw new Error("Expected a JSON array.");
   return parsed;
 }
+function jsonObjectText(v: unknown): string {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return "";
+  return JSON.stringify(v, null, 2);
+}
+function parseJsonObject(s: string): Record<string, unknown> | undefined {
+  if (!s.trim()) return undefined;
+  const parsed = JSON.parse(s);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Expected a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+// Metadata is edited as one `key = value` pair per line.
+function metadataText(v: unknown): string {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return "";
+  return Object.entries(v as Record<string, string>)
+    .map(([k, val]) => `${k} = ${val}`)
+    .join("\n");
+}
+function parseMetadata(s: string): Record<string, string> | undefined {
+  const lines = s
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!lines.length) return undefined;
+  const out: Record<string, string> = {};
+  for (const line of lines) {
+    const eq = line.indexOf("=");
+    if (eq < 1) throw new Error(`Metadata line "${line}" is not "key = value".`);
+    out[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+  }
+  return out;
+}
+const PRIORITY_LANES = ["interactive", "standard", "batch"] as const;
 
 // ---- create ----
 const showCreate = ref(false);
@@ -74,6 +108,8 @@ const createForm = reactive({
   require_pii_redaction: "",
   route_to_model: "",
   max_requests_per_minute: "",
+  max_tokens_per_minute: "",
+  priority: "",
   max_budget_tokens: "",
   budget_usd: "",
   project: "",
@@ -82,6 +118,8 @@ const createForm = reactive({
   bypass_prompt_injection: false,
   principal_selectors: "",
   inject_tools: "",
+  inject_mcp: "",
+  metadata: "",
   tags: "",
   expires_at: "",
 });
@@ -100,6 +138,8 @@ function resetCreate() {
     require_pii_redaction: "",
     route_to_model: "",
     max_requests_per_minute: "",
+    max_tokens_per_minute: "",
+    priority: "",
     max_budget_tokens: "",
     budget_usd: "",
     project: "",
@@ -108,6 +148,8 @@ function resetCreate() {
     bypass_prompt_injection: false,
     principal_selectors: "",
     inject_tools: "",
+    inject_mcp: "",
+    metadata: "",
     tags: "",
     expires_at: "",
   });
@@ -125,6 +167,10 @@ function buildPolicy(f: typeof createForm) {
   if (f.max_requests_per_minute && !Number.isNaN(Number(f.max_requests_per_minute))) {
     policy.max_requests_per_minute = Number(f.max_requests_per_minute);
   }
+  if (f.max_tokens_per_minute && !Number.isNaN(Number(f.max_tokens_per_minute))) {
+    policy.max_tokens_per_minute = Number(f.max_tokens_per_minute);
+  }
+  if (f.priority) policy.priority = f.priority;
   if (f.max_budget_tokens && !Number.isNaN(Number(f.max_budget_tokens))) {
     policy.max_budget_tokens = Number(f.max_budget_tokens);
   }
@@ -139,6 +185,10 @@ function buildPolicy(f: typeof createForm) {
   if (principalSelectors) policy.principal_selectors = principalSelectors;
   const injectTools = parseJsonArray(f.inject_tools);
   if (injectTools) policy.inject_tools = injectTools;
+  const injectMcp = parseJsonObject(f.inject_mcp);
+  if (injectMcp) policy.inject_mcp = injectMcp;
+  const metadata = parseMetadata(f.metadata);
+  if (metadata) policy.metadata = metadata;
   if (f.tags) policy.tags = toList(f.tags);
   return policy;
 }
@@ -178,6 +228,8 @@ const editForm = reactive({
   require_pii_redaction: "",
   route_to_model: "",
   max_requests_per_minute: "",
+  max_tokens_per_minute: "",
+  priority: "",
   max_budget_tokens: "",
   budget_usd: "",
   project: "",
@@ -186,6 +238,8 @@ const editForm = reactive({
   bypass_prompt_injection: false,
   principal_selectors: "",
   inject_tools: "",
+  inject_mcp: "",
+  metadata: "",
   tags: "",
 });
 const editBusy = ref(false);
@@ -203,6 +257,9 @@ function openEdit(k: AdminKey) {
     route_to_model: stringOf(k, "route_to_model"),
     max_requests_per_minute:
       typeof k.max_requests_per_minute === "number" ? String(k.max_requests_per_minute) : "",
+    max_tokens_per_minute:
+      typeof k.max_tokens_per_minute === "number" ? String(k.max_tokens_per_minute) : "",
+    priority: stringOf(k, "priority"),
     max_budget_tokens: tokenBudgetOf(k) !== undefined ? String(tokenBudgetOf(k)) : "",
     budget_usd: budgetOf(k) !== undefined ? String(budgetOf(k)) : "",
     project: stringOf(k, "project"),
@@ -211,6 +268,8 @@ function openEdit(k: AdminKey) {
     bypass_prompt_injection: boolOf(k, "bypass_prompt_injection"),
     principal_selectors: jsonText(k.principal_selectors ?? k.policy?.principal_selectors),
     inject_tools: jsonText(k.inject_tools ?? k.policy?.inject_tools),
+    inject_mcp: jsonObjectText(k.inject_mcp ?? k.policy?.inject_mcp),
+    metadata: metadataText(k.metadata ?? k.policy?.metadata),
     tags: fromList(k.tags ?? k.policy?.tags),
   });
 }
@@ -220,7 +279,18 @@ async function submitEdit() {
   editBusy.value = true;
   editError.value = null;
   try {
-    await api.patchKey(keyId(editing.value), buildPolicy(editForm as any));
+    const k = editing.value;
+    const body = buildPolicy(editForm as any);
+    // Emptied fields that the key currently carries are explicit clears:
+    // priority clears with "", inject_mcp with JSON null, metadata with {}.
+    if (!editForm.priority && stringOf(k, "priority")) body.priority = "";
+    if (!editForm.inject_mcp.trim() && (k.inject_mcp ?? k.policy?.inject_mcp)) {
+      body.inject_mcp = null;
+    }
+    if (!editForm.metadata.trim() && metadataText(k.metadata ?? k.policy?.metadata)) {
+      body.metadata = {};
+    }
+    await api.patchKey(keyId(k), body);
     editing.value = null;
     keysReq.run();
   } catch (e) {
@@ -348,6 +418,18 @@ function statusOf(k: AdminKey): string {
               <span class="pol__k">rpm</span>
               <span class="sb-mono">{{ k.max_requests_per_minute }}</span>
             </div>
+            <div v-if="k.max_tokens_per_minute" class="pol">
+              <span class="pol__k">tpm</span>
+              <span class="sb-mono">{{ k.max_tokens_per_minute }}</span>
+            </div>
+            <div v-if="k.priority ?? k.policy?.priority" class="pol">
+              <span class="pol__k">priority</span>
+              <span class="sb-mono">{{ k.priority ?? k.policy?.priority }}</span>
+            </div>
+            <div v-if="k.inject_mcp ?? k.policy?.inject_mcp" class="pol">
+              <span class="pol__k">mcp tools</span>
+              <span class="sb-mono">{{ (k.inject_mcp as any)?.ref ?? "injected" }}</span>
+            </div>
             <div v-if="k.bypass_prompt_injection ?? k.policy?.bypass_prompt_injection" class="pol">
               <span class="pol__k pol__k--block">prompt scan</span>
               <span class="sb-mono">bypassed</span>
@@ -362,6 +444,9 @@ function statusOf(k: AdminKey): string {
                 !(k.route_to_model ?? k.policy?.route_to_model) &&
                 !(k.require_pii_redaction ?? k.policy?.require_pii_redaction)?.length &&
                 !k.max_requests_per_minute &&
+                !k.max_tokens_per_minute &&
+                !(k.priority ?? k.policy?.priority) &&
+                !(k.inject_mcp ?? k.policy?.inject_mcp) &&
                 !(k.bypass_prompt_injection ?? k.policy?.bypass_prompt_injection)
               "
             >
@@ -459,6 +544,19 @@ function statusOf(k: AdminKey): string {
           <input class="sb-input" v-model="createForm.max_requests_per_minute" inputmode="numeric" placeholder="60" />
         </div>
         <div class="sb-field">
+          <label class="sb-label">Tokens per minute</label>
+          <input class="sb-input" v-model="createForm.max_tokens_per_minute" inputmode="numeric" placeholder="100000" />
+        </div>
+      </div>
+      <div class="two">
+        <div class="sb-field">
+          <label class="sb-label">Priority lane</label>
+          <select class="sb-input" v-model="createForm.priority">
+            <option value="">standard (default)</option>
+            <option v-for="p in PRIORITY_LANES" :key="p" :value="p">{{ p }}</option>
+          </select>
+        </div>
+        <div class="sb-field">
           <label class="sb-label">Route to model</label>
           <input class="sb-input" v-model="createForm.route_to_model" placeholder="qwen2.5-coder:1.5b" />
         </div>
@@ -507,6 +605,14 @@ function statusOf(k: AdminKey): string {
       <div class="sb-field">
         <label class="sb-label">Inject tools (JSON array)</label>
         <textarea class="sb-input textarea" v-model="createForm.inject_tools" placeholder='[{"type":"function","function":{"name":"search"}}]'></textarea>
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Inject MCP gateway (JSON object)</label>
+        <textarea class="sb-input textarea" v-model="createForm.inject_mcp" placeholder='{"ref": "toolhub"}'></textarea>
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Metadata (key = value per line)</label>
+        <textarea class="sb-input textarea" v-model="createForm.metadata" placeholder="owner = platform-team&#10;cost-center = 1234"></textarea>
       </div>
     </form>
     <template #footer>
@@ -574,6 +680,19 @@ function statusOf(k: AdminKey): string {
         <input class="sb-input" v-model="editForm.max_requests_per_minute" inputmode="numeric" />
       </div>
       <div class="sb-field">
+        <label class="sb-label">Tokens per minute</label>
+        <input class="sb-input" v-model="editForm.max_tokens_per_minute" inputmode="numeric" />
+      </div>
+    </div>
+    <div class="two">
+      <div class="sb-field">
+        <label class="sb-label">Priority lane</label>
+        <select class="sb-input" v-model="editForm.priority">
+          <option value="">standard (default)</option>
+          <option v-for="p in PRIORITY_LANES" :key="p" :value="p">{{ p }}</option>
+        </select>
+      </div>
+      <div class="sb-field">
         <label class="sb-label">Route to model</label>
         <input class="sb-input" v-model="editForm.route_to_model" />
       </div>
@@ -618,6 +737,14 @@ function statusOf(k: AdminKey): string {
     <div class="sb-field">
       <label class="sb-label">Inject tools (JSON array)</label>
       <textarea class="sb-input textarea" v-model="editForm.inject_tools"></textarea>
+    </div>
+    <div class="sb-field">
+      <label class="sb-label">Inject MCP gateway (JSON object)</label>
+      <textarea class="sb-input textarea" v-model="editForm.inject_mcp" placeholder='{"ref": "toolhub"}'></textarea>
+    </div>
+    <div class="sb-field">
+      <label class="sb-label">Metadata (key = value per line)</label>
+      <textarea class="sb-input textarea" v-model="editForm.metadata"></textarea>
     </div>
     <template #footer>
       <button class="sb-btn" @click="editing = null">Cancel</button>

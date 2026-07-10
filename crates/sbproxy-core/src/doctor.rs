@@ -930,10 +930,12 @@ fn serving_verdict(
     if gpus.is_empty() {
         if drivers.metal {
             blockers.push(
-                "Apple Metal is available, but the model-host admission path did not publish \
-                 an Apple unified-memory budget yet; use an external OpenAI-compatible local \
-                 server such as Ollama today, or install llama.cpp and use serve: once the \
-                 unified-memory probe reports a budget"
+                "Apple Metal is available, but the unified-memory probe reported no budget. \
+                 The probe reads hw.memsize via the sysctlbyname syscall (with a sysctl CLI \
+                 fallback), so this usually means the binary was built without the default \
+                 gpu-apple feature, or SBPROXY_CPU_MEMORY_FRACTION=0 disabled the RAM \
+                 fallback. Rebuild with default features, unset that variable, or tune the \
+                 budget with SBPROXY_METAL_WORKING_SET_FRACTION (0.1-0.95, default 0.75)"
                     .to_string(),
             );
         } else {

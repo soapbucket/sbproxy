@@ -11,17 +11,17 @@
 //! GGUF models that fit unified memory and rejects ones that do not, and
 //! llama.cpp (Metal) or the embedded engine serve them.
 //!
-//! Detection is dependency-free (`sysctl`), mirroring the `nvidia-smi`
-//! CLI fallback: `hw.memsize` for unified memory and
-//! `machdep.cpu.brand_string` for the chip name. Querying Metal's exact
-//! `recommendedMaxWorkingSetSize` through `objc2-metal` is a later
-//! refinement; the memory budget is the number that gates admission and
-//! `sysctl` reports it directly with no extra dependency.
-
-use std::process::Command;
+//! Detection reads `hw.memsize` for unified memory and
+//! `machdep.cpu.brand_string` for the chip name, via the
+//! `sysctlbyname(3)` syscall with a `sysctl` CLI fallback (WOR-1829:
+//! sandboxed contexts block process spawn but not the syscall).
+//! Querying Metal's exact `recommendedMaxWorkingSetSize` through
+//! `objc2-metal` is a later refinement; the memory budget is the number
+//! that gates admission and `sysctl` reports it directly with no extra
+//! dependency.
 
 use crate::fit::{GpuDescriptor, GpuProbe, GpuVendor};
-use crate::probe_cpu::sysctl_u64;
+use crate::probe_cpu::{sysctl_string, sysctl_u64};
 
 /// Default fraction of unified memory offered as the Metal working-set
 /// budget, matching Metal's `recommendedMaxWorkingSetSize` heuristic.
@@ -83,14 +83,6 @@ fn resolve_fraction() -> f64 {
             .unwrap_or(DEFAULT_METAL_WORKING_SET_FRACTION),
         Err(_) => DEFAULT_METAL_WORKING_SET_FRACTION,
     }
-}
-
-fn sysctl_string(key: &str) -> Option<String> {
-    let out = Command::new("sysctl").arg("-n").arg(key).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 #[cfg(test)]

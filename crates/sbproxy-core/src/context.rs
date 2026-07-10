@@ -715,6 +715,22 @@ pub struct RequestContext {
     pub ai_prompt_fingerprint: Option<String>,
     /// Completion / output tokens reported by the provider response.
     pub ai_tokens_out: Option<u64>,
+    /// Rate-limiter bucket for the authenticated virtual key, set only
+    /// when the key carries a tokens-per-minute cap (WOR-1833). The
+    /// request-completion path uses it to charge the response's token
+    /// usage into the key's one-minute window; the identifier is the
+    /// limiter's bucket key (the stable key id, never the display name).
+    pub ai_key_tpm_bucket: Option<String>,
+    /// Scheduling lane of the authenticated virtual key (WOR-1679),
+    /// stamped at auth when the key declares a `priority`. The served-
+    /// model admission gate reads it to decide queue ordering and
+    /// spill behavior; `None` means the standard lane.
+    pub ai_lane_priority: Option<sbproxy_ai::identity::KeyPriority>,
+    /// Held admission slot on the served-model concurrency gate
+    /// (WOR-1679). Present only while a request occupies a served
+    /// lane; dropping the context releases the slot to the next
+    /// queued request.
+    pub serve_lane_permit: Option<crate::server::model_host::ServeLanePermit>,
     /// Derived AI request cost in micro-USD (`1e-6` USD), computed
     /// from the same pricing catalog used by AI billing metrics.
     pub ai_cost_usd_micros: Option<u64>,
@@ -1101,6 +1117,9 @@ impl RequestContext {
             ai_prompt_tokens_est: None,
             ai_prompt_fingerprint: None,
             ai_tokens_out: None,
+            ai_key_tpm_bucket: None,
+            ai_lane_priority: None,
+            serve_lane_permit: None,
             ai_cost_usd_micros: None,
             ai_surface: None,
             ai_outcome: None,

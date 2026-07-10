@@ -54,6 +54,12 @@ pub struct LlmUsageEvent {
     /// record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// Scheduling lane of the key that made the request (WOR-1679):
+    /// `interactive`, `standard`, or `batch`. Present only when the key
+    /// declares a priority, so ledger queries can attribute spend and
+    /// latency per lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
 }
 
 /// A destination for completed-call usage events.
@@ -453,6 +459,7 @@ mod tests {
             team: None,
             request_id: None,
             tag: None,
+            priority: None,
         }
     }
 

@@ -42,6 +42,14 @@ fn key_record_to_virtual_key(
             .collect(),
         require_pii_redaction: rec.require_pii_redaction.clone(),
         max_requests_per_minute: rec.max_requests_per_minute,
+        max_tokens_per_minute: rec.max_tokens_per_minute,
+        // Stored as a validated lowercase string (the admin boundary
+        // rejects unknown lanes); a value that predates a lane rename
+        // parses to None and behaves as standard.
+        priority: rec
+            .priority
+            .as_deref()
+            .and_then(sbproxy_ai::identity::KeyPriority::parse),
         budget: rec
             .budget
             .as_ref()
@@ -59,9 +67,13 @@ fn key_record_to_virtual_key(
             .collect(),
         route_to_model: rec.route_to_model.clone(),
         inject_tools: rec.inject_tools.clone(),
-        // WOR-1646: keystore-sourced keys do not carry a federation
-        // injection ref today; it is a static-config surface.
-        inject_mcp: None,
+        // Stored opaque on the record (like the selectors above);
+        // deserialize here, dropping a malformed ref rather than
+        // failing the resolve (WOR-1833).
+        inject_mcp: rec
+            .inject_mcp
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
         enabled: true,
         bypass_prompt_injection: rec.bypass_prompt_injection,
     }
@@ -70,7 +82,7 @@ fn key_record_to_virtual_key(
 /// Process-global per-key rate limiter (WOR-1558). Accumulates request counts
 /// per virtual key across requests; the limit itself is read per-request from
 /// the resolved record, so a live PATCH changes enforcement without a reload.
-fn key_rate_limiter() -> &'static sbproxy_ai::identity::KeyRateLimiter {
+pub(super) fn key_rate_limiter() -> &'static sbproxy_ai::identity::KeyRateLimiter {
     static LIMITER: std::sync::OnceLock<sbproxy_ai::identity::KeyRateLimiter> =
         std::sync::OnceLock::new();
     LIMITER.get_or_init(sbproxy_ai::identity::KeyRateLimiter::new)
@@ -1098,21 +1110,33 @@ pub(super) async fn handle_ai_proxy(
                 // / customer / environment / agent_type / risk_tier.
                 ctx.attribution_tags =
                     crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
-                // WOR-1558: enforce the key's live requests-per-minute limit.
-                // The limit is read from the resolved record (via the cache),
-                // so a PATCH to a dynamic key's rate takes effect on the next
-                // request without a reload. The bucket is keyed by the stable
-                // key id, never the secret.
-                if vk.max_requests_per_minute.is_some()
+                // WOR-1558: enforce the key's live requests-per-minute limit,
+                // and (WOR-1833) its tokens-per-minute window. The limits are
+                // read from the resolved record (via the cache), so a PATCH to
+                // a dynamic key's caps takes effect on the next request
+                // without a reload. The bucket is keyed by the stable key id,
+                // never the secret.
+                if (vk.max_requests_per_minute.is_some() || vk.max_tokens_per_minute.is_some())
                     && !key_rate_limiter().check_rate(&vk.key, &vk)
                 {
                     warn!(
                         key = %vk.name.as_deref().unwrap_or(&vk.key),
-                        "AI proxy: per-key requests-per-minute limit exceeded"
+                        "AI proxy: per-key rate limit exceeded (requests or tokens per minute)"
                     );
                     send_error(session, 429, "rate limit exceeded for this key").await?;
                     return Ok(());
                 }
+                // Remember the limiter bucket so the completion path can
+                // charge this response's token usage into the key's
+                // one-minute window (WOR-1833).
+                if vk.max_tokens_per_minute.is_some() {
+                    ctx.ai_key_tpm_bucket = Some(vk.key.clone());
+                }
+                // WOR-1679: remember the key's scheduling lane so the
+                // served-model admission gate can order the queue and
+                // decide spill behavior. Lane comes from the key record
+                // only, never from a client header.
+                ctx.ai_lane_priority = vk.priority;
                 // WOR-1563: record the request into the cross-replica rate
                 // counter (mesh CRDT) so a key's fleet-wide rate is visible to
                 // every replica. No-op unless the mesh tier is enabled.
@@ -2569,8 +2593,52 @@ pub(super) async fn handle_ai_proxy(
         // brought up, treat this like a failed attempt and fail over to
         // the next provider (a lone served provider that fails then
         // yields the "no provider succeeded" 502 after the loop).
+        // A failed prior served attempt may still hold a lane slot;
+        // release it before this attempt queues or dispatches.
+        ctx.serve_lane_permit = None;
         let mut resolved_provider = config.providers[provider_idx].clone();
         if resolved_provider.serve.is_some() {
+            // WOR-1679: served-lane admission. When the serve block caps
+            // concurrency, take a slot before touching the engine. The
+            // queue is priority-ordered by the key's lane; an interactive
+            // request that would have to queue spills to a later hosted
+            // provider in the same array instead (if one exists), and a
+            // queue-timeout fails over like any other failed attempt.
+            if let Some(gate) = crate::server::model_host::serve_lane_gate(config) {
+                let class = crate::server::model_host::lane_class_for(ctx.ai_lane_priority);
+                let has_fallback = provider_order
+                    .iter()
+                    .enumerate()
+                    .skip(attempt + 1)
+                    .take_while(|(j, _)| *j < max_attempts)
+                    .any(|(_, &idx)| config.providers[idx].serve.is_none());
+                match gate.acquire(class, has_fallback).await {
+                    crate::server::model_host::LaneAdmission::Admitted(permit) => {
+                        ctx.serve_lane_permit = Some(permit);
+                    }
+                    crate::server::model_host::LaneAdmission::Spill => {
+                        warn!(
+                            provider = %resolved_provider.name,
+                            attempt = %attempt,
+                            "AI proxy: served lane saturated, spilling interactive \
+                             request to the next provider"
+                        );
+                        continue;
+                    }
+                    crate::server::model_host::LaneAdmission::TimedOut => {
+                        sbproxy_observe::metrics::record_provider_attempt(
+                            &resolved_provider.name,
+                            "error",
+                        );
+                        warn!(
+                            provider = %resolved_provider.name,
+                            attempt = %attempt,
+                            "AI proxy: served lane queue timeout, failing over"
+                        );
+                        continue;
+                    }
+                }
+            }
             let requested = (!model.is_empty()).then_some(model.as_str());
             match crate::server::model_host::served_upstream(config, &resolved_provider, requested)
                 .await
@@ -2582,6 +2650,8 @@ pub(super) async fn handle_ai_proxy(
                         &resolved_provider.name,
                         "error",
                     );
+                    // Give the slot back before failing over.
+                    ctx.serve_lane_permit = None;
                     warn!(
                         provider = %resolved_provider.name,
                         attempt = %attempt,

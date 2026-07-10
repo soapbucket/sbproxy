@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-10*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -214,10 +214,15 @@ the mesh counters.
 
 - **Model and provider access:** `allowed_models`, `blocked_models`,
   `allowed_providers`. Empty allow-lists mean "all".
-- **Rate and budget:** `max_requests_per_minute` and a `budget` with
-  `max_tokens` and `max_cost_usd`. There is no per-key tokens-per-minute field;
-  token ceilings are budget totals. Budgets reconcile with the multi-window
-  budgets in the AI gateway.
+- **Rate and budget:** `max_requests_per_minute` and `max_tokens_per_minute`
+  cap the key's one-minute windows (requests admitted, then tokens actually
+  consumed by responses), and a `budget` with `max_tokens` and `max_cost_usd`
+  caps lifetime totals. Budgets reconcile with the multi-window budgets in the
+  AI gateway.
+- **Scheduling lane:** `priority` (`interactive`, `standard`, or `batch`)
+  places the key's requests in a lane on the locally served model's admission
+  queue. Unset means standard. See the model host doc for how lanes queue and
+  spill.
 - **Lifecycle:** `status` (active, blocked, revoked) and `expires_at`.
 - **Guardrails:** `require_pii_redaction` lists redaction rules that must be
   active before the key can dispatch; `bypass_prompt_injection` skips the
@@ -225,7 +230,9 @@ the mesh counters.
   tooling). Default off, so every key is scanned.
 - **Model pinning and tools:** `route_to_model` overwrites the request's `model`
   before routing, so the caller cannot pick another; `inject_tools` replaces the
-  client's tool list with a set the key owns. Together these make a key a fixed
+  client's tool list with a set the key owns; `inject_mcp` (an object naming a
+  federated MCP gateway, for example `{"ref": "toolhub"}`) attaches that
+  gateway's tools to the key's requests. Together these make a key a fixed
   "model plus tools" surface.
 - **Principal gate:** `principal_selectors` restricts which inbound identities
   may present the key, matched by `virtual_key`, `team`, `project`, `user`,

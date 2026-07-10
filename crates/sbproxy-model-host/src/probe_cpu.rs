@@ -116,9 +116,19 @@ pub fn detect_total_memory_bytes() -> Option<u64> {
     sysctl_u64("hw.memsize")
 }
 
-/// Read a `u64`-valued `sysctl` key (`sysctl -n <key>`). `None` when the
-/// tool is absent, the key is unknown, or the value does not parse.
+/// Read a `u64`-valued `sysctl` key. On macOS the `sysctlbyname(3)`
+/// syscall is tried first: sandboxed contexts (Seatbelt profiles, some
+/// launchd services) block spawning the `sysctl` binary while the
+/// syscall itself still works, and without it the probe reported no
+/// device and every `serve:` block rejected admission (WOR-1829). The
+/// CLI (`sysctl -n <key>`) remains as the fallback and the only path
+/// on other BSDs. `None` when the key is unknown or the value does not
+/// parse.
 pub(crate) fn sysctl_u64(key: &str) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    if let Some(v) = sysctlbyname_u64(key) {
+        return Some(v);
+    }
     let out = Command::new("sysctl").arg("-n").arg(key).output().ok()?;
     if !out.status.success() {
         return None;
@@ -127,6 +137,87 @@ pub(crate) fn sysctl_u64(key: &str) -> Option<u64> {
         .trim()
         .parse::<u64>()
         .ok()
+}
+
+/// Read a string-valued `sysctl` key, syscall first on macOS then the
+/// CLI, mirroring [`sysctl_u64`]. Only the Metal probe needs strings
+/// (the chip name), hence the feature gate.
+#[cfg(all(target_os = "macos", feature = "gpu-apple"))]
+pub(crate) fn sysctl_string(key: &str) -> Option<String> {
+    if let Some(s) = sysctlbyname_string(key) {
+        return Some(s);
+    }
+    let out = Command::new("sysctl").arg("-n").arg(key).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `sysctlbyname(3)` for an integer key. Handles both 8- and 4-byte
+/// kernel values (`hw.memsize` is 64-bit, keys like `hw.ncpu` are
+/// 32-bit) by writing into a zeroed u64.
+#[cfg(target_os = "macos")]
+fn sysctlbyname_u64(key: &str) -> Option<u64> {
+    let name = std::ffi::CString::new(key).ok()?;
+    let mut value: u64 = 0;
+    let mut len: libc::size_t = std::mem::size_of::<u64>();
+    // SAFETY: `name` is NUL-terminated, `value` is an aligned u64 the
+    // kernel writes at most `len` (= 8) bytes into, and `len` is the
+    // in/out size parameter per sysctlbyname(3).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut u64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // A 4-byte value lands in the low bytes of the zeroed little-endian
+    // u64, so no shift is needed.
+    (rc == 0 && (len == 8 || len == 4)).then_some(value)
+}
+
+/// `sysctlbyname(3)` for a string key: query the length, then read.
+#[cfg(all(target_os = "macos", any(feature = "gpu-apple", test)))]
+fn sysctlbyname_string(key: &str) -> Option<String> {
+    let name = std::ffi::CString::new(key).ok()?;
+    let mut len: libc::size_t = 0;
+    // SAFETY: a null buffer with a zeroed length asks the kernel for
+    // the required size, per sysctlbyname(3).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    // SAFETY: `buf` owns `len` writable bytes and the kernel writes at
+    // most `len` bytes into it.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    Some(String::from_utf8_lossy(&buf).trim().to_string())
 }
 
 /// Parse the `MemTotal:` line of `/proc/meminfo` into kibibytes.
@@ -183,5 +274,21 @@ mod tests {
         let probe = CpuProbe::from_system();
         let _ = probe.budget_bytes();
         let _ = probe.probe();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sysctlbyname_reads_memsize_without_spawning() {
+        // The syscall path must work on its own (WOR-1829: sandboxes
+        // that block process spawn still allow the syscall), so call it
+        // directly rather than through the CLI-fallback wrapper.
+        let mem = sysctlbyname_u64("hw.memsize").expect("hw.memsize via syscall");
+        assert!(mem > 1 << 30, "unified memory is at least 1 GiB");
+        let brand =
+            sysctlbyname_string("machdep.cpu.brand_string").expect("brand string via syscall");
+        assert!(!brand.is_empty());
+        // Unknown keys report None, never an error or panic.
+        assert_eq!(sysctlbyname_u64("sbproxy.not.a.key"), None);
+        assert_eq!(sysctlbyname_string("sbproxy.not.a.key"), None);
     }
 }
