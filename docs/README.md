@@ -138,6 +138,7 @@ Point a framework you already run at the gateway: chat completions through the O
 ### Contributing
 - [architecture.md](architecture.md) - internals: pipeline, hot reload, plugin system.
 - [self-hosted-openrouter-delivery-design.md](self-hosted-openrouter-delivery-design.md) - approved architecture, PR boundaries, and certification contract for managed multi-node model serving.
+- [self-hosted-openrouter-foundations-implementation-plan.md](self-hosted-openrouter-foundations-implementation-plan.md) - test-first task plan and review checkpoints for the catalog, artifact, and pull foundations PR.
 - [build.md](build.md) - building from source, supported platforms, optional features.
 - [CONTRIBUTING.md](../CONTRIBUTING.md) - how to set up a dev environment and submit changes.
 
