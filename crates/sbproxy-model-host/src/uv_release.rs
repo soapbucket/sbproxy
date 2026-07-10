@@ -19,6 +19,7 @@
 #[cfg(feature = "weights")]
 use std::path::PathBuf;
 
+#[cfg(feature = "weights")]
 use crate::llama_release::resolve_on_path;
 
 /// The default pinned `uv` release used when the acquire block does not

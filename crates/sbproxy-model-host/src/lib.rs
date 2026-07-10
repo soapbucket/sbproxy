@@ -30,6 +30,7 @@
 //! - [`config`] - the `serve:` config block an operator writes.
 
 pub mod acquire;
+pub mod capabilities;
 pub mod catalog;
 pub mod config;
 #[cfg(feature = "embedded")]
@@ -60,6 +61,10 @@ pub mod uv_release;
 pub mod weights;
 
 pub use acquire::{plan_binary_acquire, BinaryAcquirePlan};
+pub use capabilities::{
+    capability_registry, CapabilityDomain, CapabilityEntry, CapabilityFinding, CapabilityRegistry,
+    ConfigFieldCapability, ConsumerContract, SupportLevel, CAPABILITY_REGISTRY_VERSION,
+};
 pub use catalog::{Catalog, CatalogEntry, ModelRef, PullPolicy, ResolveError};
 pub use config::{
     AcquireSource, ChunkedPrefill, EngineAccel, EngineAcquire, EngineChoice, EngineDoctor,

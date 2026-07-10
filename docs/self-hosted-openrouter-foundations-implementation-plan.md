@@ -164,6 +164,8 @@ pub struct CapabilityEntry {
     pub status: SupportLevel,
     pub summary: &'static str,
     pub evidence: &'static [&'static str],
+    #[serde(skip)]
+    pub consumer: Option<ConsumerContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -174,7 +176,7 @@ pub struct CapabilityFinding {
 }
 ```
 
-`CapabilityRegistry::validate` must reject duplicate IDs, missing domains, stable entries without evidence, stable fields without consumers, fields pointing at unknown capabilities, and any schema property absent from the field registry. `validate_config` returns findings for every configured preview, config-only, or unsupported field; `ModelHostConfig::validate` rejects unsupported fields and returns preview findings to CLI planning and startup logging. Prefix preview/config-only schema descriptions with their support label so generated JSON schema is truthful without consulting a separate document. Mark keep-alive enforcement and container launch `preview`, arbitrary admin model load and multi-node behavior `unsupported`, and the PR 1 catalog/artifact/pull contracts `stable` only after their tests land.
+`CapabilityRegistry::validate` must reject duplicate IDs, missing domains, stable entries without an executable consumer and matching evidence, stable fields without consumers, stable fields owned by non-stable capabilities, fields pointing at unknown capabilities, and any schema property absent from the field registry. `validate_config` returns findings for every configured preview, config-only, or unsupported field; `ModelHostConfig::validate` rejects unsupported fields and returns preview findings to CLI planning and startup logging. Prefix preview/config-only schema descriptions with their support label so generated JSON schema is truthful without consulting a separate document. Mark keep-alive enforcement and container launch `preview`, arbitrary admin model load and multi-node behavior `unsupported`, and the PR 1 catalog/artifact/pull contracts `stable` only after their tests land.
 
 - [ ] **Step 4: Generate and gate the Markdown matrix**
 
