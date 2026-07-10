@@ -116,7 +116,7 @@ impl ArtifactCacheMetadata {
         })
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.schema_version != METADATA_SCHEMA_VERSION {
             return Err(format!(
                 "unsupported artifact metadata schema {}",
@@ -261,6 +261,11 @@ pub(crate) struct ArtifactLockGuard {
     _file: File,
 }
 
+/// Serializes blob and ready-metadata mutation against collection.
+pub(crate) struct CacheMutationGuard {
+    _file: File,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ArtifactCache {
     root: PathBuf,
@@ -293,6 +298,180 @@ impl ArtifactCache {
         FileExt::lock_exclusive(&file)
             .map_err(|source| io_error("lock artifact", &path, source))?;
         Ok(ArtifactLockGuard { _file: file })
+    }
+
+    pub(crate) fn lock_shared_mutation(&self) -> Result<CacheMutationGuard, ArtifactError> {
+        let path = self.root.join("locks/cache-mutation.lock");
+        let file = open_lock(&path)?;
+        FileExt::lock_shared(&file)
+            .map_err(|source| io_error("lock artifact cache mutation", &path, source))?;
+        Ok(CacheMutationGuard { _file: file })
+    }
+
+    pub(crate) fn lock_exclusive_mutation(&self) -> Result<CacheMutationGuard, ArtifactError> {
+        let path = self.root.join("locks/cache-mutation.lock");
+        let file = open_lock(&path)?;
+        FileExt::lock_exclusive(&file)
+            .map_err(|source| io_error("lock artifact cache collection", &path, source))?;
+        Ok(CacheMutationGuard { _file: file })
+    }
+
+    pub(crate) fn try_lock_artifact(
+        &self,
+        digest: &str,
+    ) -> Result<Option<ArtifactLockGuard>, ArtifactError> {
+        validate_digest(digest)?;
+        let path = self.root.join("locks").join(format!("{digest}.lock"));
+        let file = open_lock(&path)?;
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(ArtifactLockGuard { _file: file })),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(source) => Err(io_error("try lock artifact", &path, source)),
+        }
+    }
+
+    pub(crate) fn metadata_entries(&self) -> Result<Vec<ArtifactCacheMetadata>, ArtifactError> {
+        let directory = self.root.join("metadata");
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&directory)
+            .map_err(|source| io_error("list artifact metadata", &directory, source))?
+        {
+            let entry = entry
+                .map_err(|source| io_error("read artifact metadata entry", &directory, source))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(digest) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if validate_digest(digest).is_err() {
+                continue;
+            }
+            let metadata = read_json::<ArtifactCacheMetadata>(&path)?;
+            metadata
+                .validate()
+                .map_err(|reason| ArtifactError::CacheCorrupt {
+                    digest: digest.to_string(),
+                    reason,
+                })?;
+            entries.push(metadata);
+        }
+        entries.sort_by(|left, right| left.artifact_digest.cmp(&right.artifact_digest));
+        Ok(entries)
+    }
+
+    pub(crate) fn verified_metadata(
+        &self,
+        digest: &str,
+    ) -> Result<Option<ArtifactCacheMetadata>, ArtifactError> {
+        match self.lookup(digest)? {
+            CacheLookup::Ready(metadata) => Ok(Some(*metadata)),
+            CacheLookup::Missing | CacheLookup::Partial(_) => Ok(None),
+            CacheLookup::Corrupt(reason) => Err(ArtifactError::CacheCorrupt {
+                digest: digest.to_string(),
+                reason,
+            }),
+        }
+    }
+
+    pub(crate) fn blob_bytes(&self) -> Result<u64, ArtifactError> {
+        let directory = self.root.join("blobs/sha256");
+        let mut total = 0u64;
+        for entry in fs::read_dir(&directory)
+            .map_err(|source| io_error("list artifact blobs", &directory, source))?
+        {
+            let entry =
+                entry.map_err(|source| io_error("read artifact blob entry", &directory, source))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_digest(name).is_err() {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| io_error("read artifact blob metadata", &path, source))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(ArtifactError::CacheCorrupt {
+                    digest: name.to_string(),
+                    reason: "blob is not a regular file".to_string(),
+                });
+            }
+            total = total.checked_add(metadata.len()).ok_or_else(|| {
+                ArtifactError::InvalidArtifact("artifact blob bytes overflow u64".to_string())
+            })?;
+        }
+        Ok(total)
+    }
+
+    pub(crate) fn delete_ready_artifact(&self, digest: &str) -> Result<(), ArtifactError> {
+        validate_digest(digest)?;
+        let snapshots = self.root.join("snapshots");
+        let snapshot = snapshots.join(digest);
+        let deleting = snapshots.join(format!(".deleting-{digest}-{}", std::process::id()));
+        if deleting.exists() {
+            fs::remove_dir_all(&deleting)
+                .map_err(|source| io_error("remove stale artifact deletion", &deleting, source))?;
+        }
+        fs::rename(&snapshot, &deleting)
+            .map_err(|source| io_error("detach artifact snapshot", &snapshot, source))?;
+        sync_directory(&snapshots)?;
+        let metadata = self.metadata_path(digest);
+        fs::remove_file(&metadata)
+            .map_err(|source| io_error("remove artifact metadata", &metadata, source))?;
+        sync_directory(metadata.parent().expect("metadata has parent"))?;
+        fs::remove_dir_all(&deleting)
+            .map_err(|source| io_error("delete artifact snapshot", &deleting, source))?;
+        sync_directory(&snapshots)
+    }
+
+    pub(crate) fn remove_unreferenced_blobs(&self) -> Result<u64, ArtifactError> {
+        let referenced: BTreeSet<_> = self
+            .metadata_entries()?
+            .into_iter()
+            .flat_map(|metadata| {
+                metadata
+                    .files
+                    .into_iter()
+                    .map(|file| file.sha256)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let directory = self.root.join("blobs/sha256");
+        let mut reclaimed = 0u64;
+        let mut removed = false;
+        for entry in fs::read_dir(&directory)
+            .map_err(|source| io_error("list artifact blobs", &directory, source))?
+        {
+            let entry =
+                entry.map_err(|source| io_error("read artifact blob entry", &directory, source))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_digest(name).is_err() || referenced.contains(name) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| io_error("read artifact blob metadata", &path, source))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(ArtifactError::CacheCorrupt {
+                    digest: name.to_string(),
+                    reason: "unreferenced blob is not a regular file".to_string(),
+                });
+            }
+            fs::remove_file(&path)
+                .map_err(|source| io_error("remove unreferenced artifact blob", &path, source))?;
+            reclaimed = reclaimed.checked_add(metadata.len()).ok_or_else(|| {
+                ArtifactError::InvalidArtifact("reclaimed artifact bytes overflow u64".to_string())
+            })?;
+            removed = true;
+        }
+        if removed {
+            sync_directory(&directory)?;
+        }
+        Ok(reclaimed)
     }
 
     pub(crate) fn inspect(&self, digest: &str) -> Result<ArtifactCacheState, ArtifactError> {

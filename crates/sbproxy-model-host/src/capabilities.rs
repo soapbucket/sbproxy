@@ -96,6 +96,8 @@ pub enum ConsumerContract {
     CatalogV2SelectsExactArtifact,
     /// Managed cache misses enforce intent, pull policy, and network policy.
     VerifiedArtifactPolicyBlocksUnauthorizedNetwork,
+    /// Cache collection preserves resident and pinned artifacts.
+    CacheBudgetProtectsActiveArtifacts,
     /// An explicit cache directory changes artifact addressing.
     CacheDirectoryChangesArtifactPath,
     /// The eviction field changes admission under a full budget.
@@ -115,6 +117,9 @@ impl ConsumerContract {
             Self::CatalogV2SelectsExactArtifact => "contract.catalog_v2_selects_exact_artifact",
             Self::VerifiedArtifactPolicyBlocksUnauthorizedNetwork => {
                 "contract.verified_artifact_policy_blocks_unauthorized_network"
+            }
+            Self::CacheBudgetProtectsActiveArtifacts => {
+                "contract.cache_budget_protects_active_artifacts"
             }
             Self::CacheDirectoryChangesArtifactPath => {
                 "contract.cache_directory_changes_artifact_path"
@@ -222,6 +227,29 @@ impl ConsumerContract {
                     true,
                 )
                 .map_err(|error| format!("offline file source was rejected: {error}"))
+            }
+            Self::CacheBudgetProtectsActiveArtifacts => {
+                let resident = "a".repeat(64);
+                let pinned = "b".repeat(64);
+                let protection = crate::CacheProtection {
+                    resident: BTreeSet::from([resident.clone()]),
+                    pinned: BTreeSet::from([pinned.clone()]),
+                };
+                let resident_reason =
+                    crate::artifact::explicit_protection_reason(&protection, &resident);
+                let pinned_reason =
+                    crate::artifact::explicit_protection_reason(&protection, &pinned);
+                let other_reason =
+                    crate::artifact::explicit_protection_reason(&protection, &"c".repeat(64));
+                if resident_reason != Some("resident")
+                    || pinned_reason != Some("pinned")
+                    || other_reason.is_some()
+                {
+                    return Err(format!(
+                        "protection reasons were {resident_reason:?}, {pinned_reason:?}, and {other_reason:?}"
+                    ));
+                }
+                Ok(())
             }
             Self::CacheDirectoryChangesArtifactPath => {
                 let config: ModelHostConfig = serde_yaml::from_str(
@@ -694,10 +722,13 @@ const CAPABILITIES: &[CapabilityEntry] = &[
     CapabilityEntry {
         id: "artifact.cache_budget",
         domain: CapabilityDomain::Artifact,
-        status: SupportLevel::ConfigOnly,
-        summary: "Cache budget is parsed but safe protected collection is not yet active.",
-        evidence: &[],
-        consumer: None,
+        status: SupportLevel::Stable,
+        summary: "Cache collection enforces LRU budgets without deleting protected artifacts.",
+        evidence: &[
+            "contract.cache_budget_protects_active_artifacts",
+            "test.artifact_gc",
+        ],
+        consumer: Some(ConsumerContract::CacheBudgetProtectsActiveArtifacts),
     },
     CapabilityEntry {
         id: "engine.managed_launch",

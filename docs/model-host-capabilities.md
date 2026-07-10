@@ -15,7 +15,7 @@ Registry version: `1`
 | `artifact.legacy_download` | `artifact` | `preview` | none | Legacy file downloads lack the complete atomic artifact contract. |
 | `artifact.verified_acquisition` | `artifact` | `stable` | contract.verified_artifact_policy_blocks_unauthorized_network<br>test.artifact_manager<br>test.artifact_policy | Managed artifacts are exact, atomic, resumable, and policy enforced. |
 | `artifact.cache_addressing` | `artifact` | `stable` | contract.cache_directory_changes_artifact_path | Explicit cache directories deterministically change artifact paths. |
-| `artifact.cache_budget` | `artifact` | `config_only` | none | Cache budget is parsed but safe protected collection is not yet active. |
+| `artifact.cache_budget` | `artifact` | `stable` | contract.cache_budget_protects_active_artifacts<br>test.artifact_gc | Cache collection enforces LRU budgets without deleting protected artifacts. |
 | `engine.managed_launch` | `engine` | `preview` | none | llama.cpp and vLLM launch paths require managed-artifact hardening. |
 | `engine.container_launch` | `engine` | `config_only` | none | Container launch configuration is not an executable stable path. |
 | `lifecycle.single_node_residency` | `lifecycle` | `stable` | contract.eviction_changes_admission | Single-node residency honors the configured eviction policy. |

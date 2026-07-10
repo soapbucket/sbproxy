@@ -70,8 +70,8 @@ pub use acquire::{plan_binary_acquire, BinaryAcquirePlan};
 pub use artifact::HttpArtifactTransport;
 pub use artifact::{
     AcquisitionContext, ArtifactCacheMetadata, ArtifactCacheState, ArtifactError, ArtifactManager,
-    ArtifactObserver, ArtifactTransport, NetworkPolicy, PullIntent, ReadyArtifact,
-    ResponseDisposition, SourceCredential, TransportRequest, TransportResponse,
+    ArtifactObserver, ArtifactTransport, CacheProtection, GcReport, NetworkPolicy, PullIntent,
+    ReadyArtifact, ResponseDisposition, SourceCredential, TransportRequest, TransportResponse,
 };
 pub use artifact_spec::{
     AcceleratorKind, ArtifactFile, ArtifactFormat, ArtifactVariant, ComputeCapability,

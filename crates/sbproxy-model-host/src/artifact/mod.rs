@@ -4,6 +4,7 @@
 //! Atomic verified artifact acquisition and cache inspection.
 
 mod cache;
+mod gc;
 mod http;
 
 use std::io;
@@ -16,6 +17,8 @@ use sha2::Digest as _;
 use tokio::io::AsyncWriteExt;
 
 pub use cache::{ArtifactCacheMetadata, ArtifactCacheState, ReadyArtifact};
+pub(crate) use gc::explicit_protection_reason;
+pub use gc::{CacheProtection, GcReport};
 #[cfg(feature = "weights")]
 pub use http::HttpArtifactTransport;
 pub use http::{
@@ -439,6 +442,10 @@ impl ArtifactManager {
         }
 
         let cache = self.cache.clone();
+        let mutation_guard = tokio::task::spawn_blocking(move || cache.lock_shared_mutation())
+            .await
+            .map_err(|error| ArtifactError::Join(error.to_string()))??;
+        let cache = self.cache.clone();
         let requested = artifact.clone();
         tokio::task::spawn_blocking(move || scan_pickle_partials(&cache, &requested))
             .await
@@ -453,6 +460,7 @@ impl ArtifactManager {
         let metadata = tokio::task::spawn_blocking(move || cache.finalize_snapshot(&requested))
             .await
             .map_err(|error| ArtifactError::Join(error.to_string()))??;
+        drop(mutation_guard);
         *job = self.transition_job(
             job,
             OperationState::Ready,
