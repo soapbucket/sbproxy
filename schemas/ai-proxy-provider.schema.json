@@ -165,7 +165,7 @@
           }
         },
         "catalog_file": {
-          "description": "Support: preview. Optional path to an operator catalog file, replacing the built-in certified catalog for id resolution.",
+          "description": "Support: preview. Optional path to an operator catalog file, replacing the built-in certified catalog for id resolution. Relative paths resolve from the directory containing the active `sb.yml`.",
           "default": null,
           "type": [
             "string",
@@ -238,6 +238,14 @@
         "model": {
           "description": "Catalog id (`qwen3-32b`) or an explicit `hf:Org/Repo:QUANT` reference. Resolved by [`crate::catalog`].",
           "type": "string"
+        },
+        "variant": {
+          "description": "Exact catalog v2 artifact variant to run. When omitted, the runtime deterministically selects a compatible variant for the current worker. Pin this for reproducible deployments.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "name": {
           "description": "The model id every other plane sees (WOR-1683): routing, `allowed_models`, rate limits, budgets, aliases. Defaults to the catalog id in `model`; **required** when `model` is a raw `hf:` reference (there is no catalog id to borrow). See [`Self::effective_name`].",

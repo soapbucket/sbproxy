@@ -494,7 +494,8 @@ pub struct ModelHostConfig {
     pub models: Vec<ServeEntry>,
     /// Support: preview.
     /// Optional path to an operator catalog file, replacing the
-    /// built-in certified catalog for id resolution.
+    /// built-in certified catalog for id resolution. Relative paths
+    /// resolve from the directory containing the active `sb.yml`.
     #[serde(default)]
     pub catalog_file: Option<String>,
     /// Directory for the content-addressed weight cache. `None` uses
@@ -1188,6 +1189,7 @@ engines:
     image: vllm/vllm-openai:v0.24.0
 models:
   - model: qwen3-14b
+    variant: q4_k_m
     keep_alive: 30m
   - model: hf:Org/Coder:Q4
     name: coder
@@ -1212,6 +1214,11 @@ models:
         let bad_ka: ModelHostConfig =
             serde_yaml::from_str("models:\n  - model: qwen3-14b\n    keep_alive: soon\n").unwrap();
         assert!(bad_ka.validate().unwrap_err().contains("keep_alive"));
+
+        let bad_variant: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: qwen3-14b\n    variant: ../unsafe\n")
+                .unwrap();
+        assert!(bad_variant.validate().unwrap_err().contains("variant"));
 
         // Container engine with an unpinned image.
         let latest: ModelHostConfig = serde_yaml::from_str(

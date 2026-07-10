@@ -735,7 +735,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "engine.managed_launch",
         domain: CapabilityDomain::Engine,
         status: SupportLevel::Preview,
-        summary: "llama.cpp and vLLM launch paths require managed-artifact hardening.",
+        summary: "Managed v2 launches consume only verified local artifacts; final platform validation remains.",
         evidence: &[],
         consumer: None,
     },

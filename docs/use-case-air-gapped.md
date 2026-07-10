@@ -10,7 +10,7 @@ Some networks end at a wall. Classified enclaves, medical records systems, indus
 
 An AI gateway with nothing to say to the outside world, and a way to check that claim rather than take it. The model manifest lists one model whose `source` is a `file:` path, weights that were vetted on the connected side of the transfer and carried across by whatever your enclave uses (a data diode, a burned disk, a courier). The manifest pins a sha256 digest for each weight file, which turns it into a supply-chain allowlist: a reviewable document that says exactly which bytes are allowed to reach an inference engine. The pull policy is `manual`, so the gateway never decides on its own to fetch weights. Weights are not the only artifact with a fetch path, though: on a connected box the runtime acquires a missing inference engine on first use, so in the enclave you stage `llama-server` on `PATH` the same way you stage the weights. SBproxy prefers a `PATH` binary over any fetch, so no engine acquisition is ever attempted. Prompt injection and PII checks run in process, and the semantic cache's embedding model is an ONNX file on the box, reached over loopback. A Docker Compose file finishes the job by putting the gateway on an internal-only network, so the no-egress claim is enforced by the kernel instead of by everyone's good behavior.
 
-Two honesty notes before you start, both from [model-host.md](model-host.md). The model host is landing in phases: the manifest's config surface (sources, digests, pull policy) parses and validates everywhere, and the runtime half that acts on it runs end to end on a GPU host. Digest verification happens inside the serve lifecycle, when weights are pulled or an engine is about to be spawned, and a mismatch aborts the launch; there is no standalone CLI command that verifies a manifest against the disk. On a host with no GPU, a `serve:` block parses and validates but starts no engine, so every governance surface on this page works on your laptop while actual tokens need the GPU box.
+Two honesty notes before you start, both from [model-host.md](model-host.md). Catalog v2 acquisition and the standalone `sbproxy models pull` command work without a GPU: exact sizes and digests are checked before an immutable snapshot becomes visible. Token generation still needs a real GGUF, a compatible worker, and llama.cpp. The tiny file in this example proves the offline acquisition and policy chain, not inference. Replace it with vetted weights and matching metadata for production.
 
 ## Prerequisites
 
@@ -43,22 +43,34 @@ Two files, from [`examples/use-case-air-gapped`](../examples/use-case-air-gapped
 The manifest first:
 
 ```yaml
+schema_version: 2
+catalog_revision: air-gap-demo-2026-07-10
 models:
   offline-coder:
-    hf_repo: local/offline-coder          # label only; nothing is fetched
-    source: file:/var/lib/sbproxy/weights/qwen3-coder-gguf
-    quants: [Q4_K_M]
-    params: 30B-A3B
+    params: 0.000000013B
     license: apache-2.0
-    family: qwen
-    min_vram_hint_gib: 18.0
-    engine: llama_cpp
+    family: demo
+    context_length: 1024
     pull: manual
-    sha256:
-      model.gguf: "729590a45b549db7a1631f3d220b794a8cd7c9042a43064dd0dcc80c7cb98b5e"
+    variants:
+      - id: demo_q4
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: file:/var/lib/sbproxy/weights/qwen3-coder-gguf
+        revision: local-demo-v1
+        files:
+          - path: model.gguf
+            sha256: 729590a45b549db7a1631f3d220b794a8cd7c9042a43064dd0dcc80c7cb98b5e
+            size_bytes: 13
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 1
+        stability: preview
+        certification: air-gap-demo-bytes
 ```
 
-Three lines carry the security story. `source: file:` means the weights are read in place from a path inside the network; there is no download, and no `hf_token` because there is no hub. `pull: manual` closes the remaining fetch path: `on_boot` and `on_demand` exist for connected deployments, and `manual` says a human moves bytes here, never the gateway. The `sha256` map is the allowlist. When the serve lifecycle resolves a `file:` source it verifies each file against its digest before an engine reads it, and a mismatch aborts the launch, so a swapped or corrupted weight file is a refusal with a named file rather than a model that behaves strangely. The digest shown is real: it is the sha256 of the placeholder file the example README stages, so the `file:` path and its digest agree out of the box, and you replace it with the digests you computed when you vetted the production weights. Compute them on the connected side and carry them across with the files, the same procedure [local-inference.md](local-inference.md) prescribes for its ONNX models and [model-pinning.md](model-pinning.md) applies to the classifier registry.
+Three fields carry the security story. `source: file:` names bytes already inside the network. `pull: manual` refuses an automatic cache miss. Each file has an exact byte length and SHA-256, so a swapped, truncated, or corrupted file fails before an engine can see it. The digest shown is the real digest of the 13-byte demo file. An explicit offline pull copies and verifies it into the content-addressed cache; production weights follow the same flow with real sizes and digests computed on the connected side.
 
 Now `sb.yml`, walked in chunks. The provider:
 
@@ -72,14 +84,15 @@ origins:
           default_model: offline-coder
           models: [offline-coder]
           serve:
-            catalog_file: examples/use-case-air-gapped/models.yaml
+            catalog_file: models.yaml
             cache_dir: /var/lib/sbproxy/models
             eviction: lru
             models:
               - model: offline-coder
+                variant: demo_q4
 ```
 
-The provider list has exactly one entry and it is the box itself. A served provider carries no `api_key` and no `base_url`; the gateway spawns the engine and resolves the loopback endpoint internally, and [security-model-host.md](security-model-host.md) explains why a served provider that also names a `base_url` is rejected. `engine` values are an allowlisted enum, never a command string, so this config cannot be edited into running an arbitrary executable. `cache_dir` is pinned even though a `file:` source never populates it, because an explicit path beats a convention (`$HF_HOME`) in an environment where an auditor reads this file.
+The provider list has exactly one entry and it is the box itself. A served provider carries no `api_key` and no `base_url`; the gateway spawns the engine and resolves the loopback endpoint internally, and [security-model-host.md](security-model-host.md) explains why a served provider that also names a `base_url` is rejected. `engine` values are an allowlisted enum, never a command string, so this config cannot be edited into running an arbitrary executable. Relative `catalog_file` paths resolve from the directory holding `sb.yml`. The `file:` source stays read-only while the explicit pull publishes verified content-addressed bytes under `cache_dir`.
 
 The guardrails:
 
@@ -124,7 +137,7 @@ So, the accounting the auditor asked for. What leaves the box: nothing. One chan
 | Potential egress | Why it is closed here |
 |---|---|
 | Provider API calls | No cloud provider in the config. The one provider is a `serve:` block with no `base_url` and no key. |
-| Weight downloads | `source: file:` reads staged weights in place; `pull: manual` forbids fetching; no `hf_token` exists to use. |
+| Weight downloads | `source: file:` supplies staged weights; `pull: manual` forbids automatic acquisition; `models pull --offline` allows only that local source or a verified cache hit. |
 | Engine acquisition | `llama-server` is staged on `PATH`, and a `PATH` binary is preferred over the pinned-release fetch, so no download is attempted. |
 | Guardrail verdicts | Injection, PII, and `heuristic-v1` are in-process pattern checks. No moderation API. |
 | Embeddings | `source: sidecar` is loopback to an on-box ONNX model, replacing the default provider-API path. |
@@ -149,6 +162,21 @@ Plan: 1 added, 0 changed, 0 removed. max-blast-radius: reload
 ```
 
 `plan` exits 2 for "changes present, no errors" (against an empty baseline the whole origin is an add), 3 if semantic validation fails, 0 for a no-op. Then ask the host what it can do. The report below is abbreviated; run `sbproxy doctor` on your box for the live report:
+
+Stage and verify the artifact before starting the gateway. This command
+must complete with the network physically absent:
+
+```bash
+sbproxy models pull offline-coder \
+  --variant demo_q4 \
+  --catalog-file examples/use-case-air-gapped/models.yaml \
+  --cache-dir /var/lib/sbproxy/models \
+  --offline
+```
+
+A size or digest mismatch deletes invalid partial bytes and returns
+nonzero. The durable job and cache metadata contain no source
+credentials.
 
 ```console
 $ sbproxy doctor

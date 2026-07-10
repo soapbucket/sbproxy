@@ -61,6 +61,13 @@ fn model_host_config_dir() -> PathBuf {
 }
 
 fn load_catalog(config: &ModelHostConfig) -> Result<Arc<Catalog>, String> {
+    load_catalog_from_dir(config, &model_host_config_dir())
+}
+
+fn load_catalog_from_dir(
+    config: &ModelHostConfig,
+    config_dir: &Path,
+) -> Result<Arc<Catalog>, String> {
     let Some(configured) = config.catalog_file.as_deref() else {
         return Ok(Arc::new(Catalog::builtin()));
     };
@@ -68,7 +75,7 @@ fn load_catalog(config: &ModelHostConfig) -> Result<Arc<Catalog>, String> {
     let path = if configured.is_absolute() {
         configured
     } else {
-        model_host_config_dir().join(configured)
+        config_dir.join(configured)
     };
     let yaml = std::fs::read_to_string(&path)
         .map_err(|error| format!("read model catalog '{}': {error}", path.display()))?;
@@ -337,8 +344,8 @@ fn model_host(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<ProcessEn
 /// pipeline declares no local models.
 pub(crate) fn initialize_model_host(
     actions: &[sbproxy_modules::Action],
-) -> Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>> {
-    actions.iter().find_map(|action| match action {
+) -> Result<Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>>, String> {
+    let config = actions.iter().find_map(|action| match action {
         sbproxy_modules::Action::AiProxy(ai)
             if ai
                 .config
@@ -346,10 +353,29 @@ pub(crate) fn initialize_model_host(
                 .iter()
                 .any(|provider| provider.serve.is_some()) =>
         {
-            model_host(&ai.config)
+            Some(&ai.config)
         }
         _ => None,
-    })
+    });
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    if let Some(existing) = MODEL_HOST.get() {
+        return existing
+            .clone()
+            .map(Some)
+            .ok_or_else(|| "model host was previously initialized without a runtime".to_string());
+    }
+    let runtime = build_runtime(config)
+        .ok_or_else(|| "model-host construction failed; inspect the preceding error".to_string())?;
+    if MODEL_HOST.set(Some(Arc::clone(&runtime))).is_err() {
+        return MODEL_HOST
+            .get()
+            .and_then(Clone::clone)
+            .map(Some)
+            .ok_or_else(|| "model host initialization raced with an invalid runtime".to_string());
+    }
+    Ok(Some(runtime))
 }
 
 /// Complete `pull: on_boot` acquisition on an isolated Tokio runtime.
@@ -621,6 +647,22 @@ mod tests {
         let merged = merged_serve_config(&cfg).expect("one serve block");
         assert_eq!(merged.models.len(), 1);
         assert!(merged.validate().is_ok());
+    }
+
+    #[test]
+    fn custom_catalog_resolves_relative_to_sb_yml_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("models.yaml"),
+            "models:\n  exact:\n    hf_repo: Org/Exact\n    quants: [Q4_K_M]\n    params: 1B\n    license: apache-2.0\n    family: fixture\n    min_vram_hint_gib: 1.0\n",
+        )
+        .unwrap();
+        let config: ModelHostConfig =
+            serde_yaml::from_str("catalog_file: models.yaml\nmodels:\n  - model: exact\n").unwrap();
+
+        let catalog = load_catalog_from_dir(&config, directory.path()).unwrap();
+
+        assert!(catalog.get("exact").is_some());
     }
 
     #[tokio::test]

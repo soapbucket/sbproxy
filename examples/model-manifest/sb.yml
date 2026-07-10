@@ -3,8 +3,8 @@
 #
 # The provider's serve.catalog_file points at models.yaml (the fleet
 # fact sheet). sb.yml stays the box fact sheet: what this box serves and
-# where its cache lives. See models.yaml for the per-model source,
-# revision pin, digests, token, engine, and pull policy.
+# where its cache lives. See models.yaml for exact sources, revisions,
+# files, digests, requirements, engines, and pull policy.
 #
 # Run:
 #   make run CONFIG=examples/model-manifest/sb.yml
@@ -20,22 +20,21 @@ origins:
           # No base_url: a served provider is hosted on this box, so the
           # gateway resolves the engine's loopback port itself. Pairing
           # base_url with serve: is rejected fatally at gateway boot.
-          default_model: qwen3-14b
+          default_model: qwen2.5-0.5b-instruct
           models:
-            - qwen3-14b
-            - llama-3.1-8b
+            - qwen2.5-0.5b-instruct
             - offline-coder
           serve:
             # The manifest: which models exist and how to fetch them.
-            catalog_file: examples/model-manifest/models.yaml
+            catalog_file: models.yaml
             # Where this box caches weights. Defaults to
             # /var/lib/sbproxy/models for a service; overridable here.
             cache_dir: /var/lib/sbproxy/models
-            cache_budget_gib: 400
             eviction: lru
             models:
               # Each names a manifest id; engine and pull come from the
               # manifest entry unless overridden here.
-              - model: qwen3-14b
-              - model: llama-3.1-8b
+              - model: qwen2.5-0.5b-instruct
+                variant: q4_k_m
               - model: offline-coder
+                variant: q4_k_m

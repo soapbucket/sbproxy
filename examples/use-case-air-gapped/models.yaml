@@ -1,33 +1,28 @@
-# Model manifest for an air-gapped box. Every entry resolves to weights
-# that are already inside the network: a `file:` source fetches nothing,
-# and `pull: manual` means the gateway never decides on its own to go
-# looking. The per-file sha256 digests are the supply-chain allowlist;
-# a file that does not match its digest never reaches an engine.
-#
-# This file is the fleet fact sheet (which models exist, how to verify
-# them). sb.yml is the box fact sheet (what this box serves). See
-# ../../docs/model-host.md for the full manifest schema.
+# Catalog v2 manifest for an air-gapped box. The demo file is staged
+# out of band, then copied into the verified cache by `models pull
+# --offline`. No network transport is called.
+schema_version: 2
+catalog_revision: air-gap-demo-2026-07-10
 models:
   offline-coder:
-    # Label for humans and dashboards. Nothing is fetched from it.
-    hf_repo: local/offline-coder
-    # Weights staged out of band (data diode, burned disk, sneakernet).
-    # The gateway reads them in place; there is no copy and no download.
-    source: file:/var/lib/sbproxy/weights/qwen3-coder-gguf
-    quants: [Q4_K_M]
-    params: 30B-A3B
+    params: 0.000000013B
     license: apache-2.0
-    family: qwen
-    min_vram_hint_gib: 18.0
-    # GGUF weights run on llama.cpp. The engine is an allowlisted enum,
-    # never a command string, so config cannot name an arbitrary binary.
-    engine: llama_cpp
-    # `manual` closes the last fetch path: even a model named in a
-    # request will not trigger a download.
+    family: demo
+    context_length: 1024
     pull: manual
-    sha256:
-      # Digest of the demo placeholder the README stages with
-      # `printf 'demo weights\n'`. When you vet real weights on the
-      # connected side of the transfer, compute their digests there
-      # and carry the digests across with the files.
-      model.gguf: "729590a45b549db7a1631f3d220b794a8cd7c9042a43064dd0dcc80c7cb98b5e"
+    variants:
+      - id: demo_q4
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: file:/var/lib/sbproxy/weights/qwen3-coder-gguf
+        revision: local-demo-v1
+        files:
+          - path: model.gguf
+            sha256: 729590a45b549db7a1631f3d220b794a8cd7c9042a43064dd0dcc80c7cb98b5e
+            size_bytes: 13
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 1
+        stability: preview
+        certification: air-gap-demo-bytes

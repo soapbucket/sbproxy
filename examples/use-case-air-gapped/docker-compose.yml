@@ -29,13 +29,12 @@ services:
     command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
     volumes:
       - ./sb.yml:/etc/sbproxy/sb.yml:ro
-      # sb.yml names the manifest by its repo-relative path; mounting it
-      # at that same path inside the container keeps one config valid in
-      # both places.
-      - ./models.yaml:/examples/use-case-air-gapped/models.yaml:ro
+      # catalog_file is relative to /etc/sbproxy/sb.yml.
+      - ./models.yaml:/etc/sbproxy/models.yaml:ro
       # Weights staged out of band. Read-only: the gateway verifies
       # digests against the manifest, it never writes here.
       - ./weights:/var/lib/sbproxy/weights:ro
+      - model-cache:/var/lib/sbproxy/models
     networks:
       - airgap
     # No ports: on purpose. Publishing a port would punch through the
@@ -56,3 +55,6 @@ networks:
     # internal: true removes the default gateway. The kernel enforces
     # what the config promises: traffic on this network cannot leave it.
     internal: true
+
+volumes:
+  model-cache:

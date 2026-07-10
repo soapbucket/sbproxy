@@ -29,9 +29,9 @@ origins:
           models: [offline-coder]
           serve:
             # The manifest is the reviewable allowlist: sources,
-            # revisions, digests, pull policy. Path is relative to the
-            # repo root; the compose file mounts it at the same path.
-            catalog_file: examples/use-case-air-gapped/models.yaml
+            # revisions, digests, pull policy. Relative paths resolve
+            # from the directory containing this sb.yml.
+            catalog_file: models.yaml
             # Weight cache for managed pulls. Unused for file: sources
             # (weights are read in place) but pinned here so nothing
             # falls back to $HF_HOME conventions.
@@ -41,6 +41,7 @@ origins:
               # Names a manifest id; engine and pull policy come from
               # the manifest entry.
               - model: offline-coder
+                variant: demo_q4
 
       guardrails:
         input:

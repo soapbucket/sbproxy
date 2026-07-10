@@ -109,10 +109,8 @@ install -m 0755 target/release/sbproxy /usr/local/bin/sbproxy
 
 ## 2. CLI reference
 
-The binary exposes a small surface. Everything that the runtime reads
-from disk lives in `sb.yml`; the CLI only points the binary at the
-config file and tunes the few process-level knobs that cannot live in
-config (log filter, shutdown timing, validation-only mode).
+The binary exposes a small surface. Runtime policy lives in `sb.yml`;
+operator commands also inspect and explicitly pull managed artifacts.
 
 ```
 sbproxy --config <path>
@@ -128,7 +126,7 @@ sbproxy apply -p <plan-file>
 sbproxy config {migrate|import-litellm|print}
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
 sbproxy run <model> [--name <alias>]
-sbproxy models [list|show <id>]
+sbproxy models [list|show <id>|pull [<id>...]]
 sbproxy update [--self]
 sbproxy ai ledger <subcommand>
 sbproxy doctor [--format text|json]
@@ -149,7 +147,7 @@ The full subcommand set, one line each:
 | `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked. |
 | `projections` | Render projection documents (robots.txt, llms.txt, ...) for an origin without starting the proxy. |
 | `run` | Serve a model in one command, with no YAML: synthesizes a minimal serving config and boots an OpenAI-compatible endpoint on loopback. |
-| `models` | Discover models: one row per catalog model with a per-GPU fit verdict and cache status; `models show <id>` prints the full entry. |
+| `models` | Discover and manage artifacts: list per-worker fit and cache state, show exact catalog variants, or pull and verify selected artifacts without starting an engine. |
 | `update` | Check the engine release feed and cached models for freshness; `--self` also checks the sbproxy binary. Report-only. |
 | `ai` | AI gateway tools; `ai ledger` verifies the usage ledger. |
 | `doctor` | Diagnose what this binary can do on the current host. |
@@ -159,6 +157,13 @@ The full subcommand set, one line each:
 Argv parsing is `clap` derive, so every subcommand also accepts
 `--help` for a focused usage block (`sbproxy plan --help`,
 `sbproxy projections render --help`, etc.).
+
+For managed models, `sbproxy models pull -f sb.yml` selects configured
+models plus the catalog's `on_boot` set, inherits catalog and cache
+settings, verifies exact artifacts, and starts no engine. Use positional
+model IDs for a subset, `--all` for every compatible v2 entry,
+`--variant` for an immutable pin, and `--offline` to forbid transport
+access. See [model-host.md](model-host.md).
 
 ### `serve` - start the proxy
 

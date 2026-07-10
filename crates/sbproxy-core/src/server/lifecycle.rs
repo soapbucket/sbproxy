@@ -365,7 +365,9 @@ fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
             }
         }
     }
-    if let Some(runtime) = super::model_host::initialize_model_host(&new_pipeline.actions) {
+    if let Some(runtime) = super::model_host::initialize_model_host(&new_pipeline.actions)
+        .map_err(|error| anyhow::anyhow!("model host initialization failed: {error}"))?
+    {
         super::model_host::warm_on_boot_blocking(runtime)
             .map_err(|error| anyhow::anyhow!("model host startup warming failed: {error}"))?;
     }
@@ -886,7 +888,9 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
 
     // Resolve and verify every `pull: on_boot` artifact before the
     // pipeline becomes requestable. No engine is started by warming.
-    if let Some(runtime) = super::model_host::initialize_model_host(&pipeline.actions) {
+    if let Some(runtime) = super::model_host::initialize_model_host(&pipeline.actions)
+        .map_err(|error| anyhow::anyhow!("model host initialization failed: {error}"))?
+    {
         super::model_host::warm_on_boot_blocking(runtime)
             .map_err(|error| anyhow::anyhow!("model host startup warming failed: {error}"))?;
     }

@@ -16,7 +16,7 @@ Registry version: `1`
 | `artifact.verified_acquisition` | `artifact` | `stable` | contract.verified_artifact_policy_blocks_unauthorized_network<br>test.artifact_manager<br>test.artifact_policy | Managed artifacts are exact, atomic, resumable, and policy enforced. |
 | `artifact.cache_addressing` | `artifact` | `stable` | contract.cache_directory_changes_artifact_path | Explicit cache directories deterministically change artifact paths. |
 | `artifact.cache_budget` | `artifact` | `stable` | contract.cache_budget_protects_active_artifacts<br>test.artifact_gc | Cache collection enforces LRU budgets without deleting protected artifacts. |
-| `engine.managed_launch` | `engine` | `preview` | none | llama.cpp and vLLM launch paths require managed-artifact hardening. |
+| `engine.managed_launch` | `engine` | `preview` | none | Managed v2 launches consume only verified local artifacts; final platform validation remains. |
 | `engine.container_launch` | `engine` | `config_only` | none | Container launch configuration is not an executable stable path. |
 | `lifecycle.single_node_residency` | `lifecycle` | `stable` | contract.eviction_changes_admission | Single-node residency honors the configured eviction policy. |
 | `lifecycle.keep_alive` | `lifecycle` | `preview` | none | Keep-alive is visible in status but idle unload is not complete. |
@@ -41,6 +41,7 @@ Registry version: `1`
 | `serve.queue_timeout_ms` | `preview` | `lifecycle.priority_admission` | `none` |
 | `serve.models[].model` | `stable` | `manifest.serve_model_declarations` | `contract.serve_models_change_desired_deployments` |
 | `serve.models[].name` | `stable` | `manifest.serve_model_declarations` | `contract.serve_models_change_desired_deployments` |
+| `serve.models[].variant` | `stable` | `manifest.catalog_v2` | `contract.catalog_v2_selects_exact_artifact` |
 | `serve.models[].engine` | `preview` | `engine.managed_launch` | `none` |
 | `serve.models[].keep_alive` | `preview` | `lifecycle.keep_alive` | `none` |
 | `serve.models[].max_context` | `preview` | `engine.managed_launch` | `none` |
