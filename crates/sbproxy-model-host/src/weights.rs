@@ -88,23 +88,14 @@ pub fn resolve_local_source(path: &Path, expected_sha256: Option<&str>) -> Resul
     Ok(path.to_path_buf())
 }
 
-/// The Hugging Face hub base. Overridable with `HF_ENDPOINT` for
-/// mirrors / air-gapped proxies.
-#[cfg(feature = "weights")]
-fn hf_endpoint() -> String {
-    std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string())
-}
-
 /// Download a file from a Hugging Face repo into the content-addressed
 /// cache and return its local path. Behind the `weights` feature.
 ///
-/// This is a plain HTTP GET of the `resolve` URL, streamed to disk.
-/// The hub answers with a 307 to its resolve-cache / Xet backend and
-/// the redirect `Location` it returns is *relative*; reqwest's default
-/// redirect policy resolves it against the request base, which is why
-/// this works where the older hf-hub 0.3 client failed with "relative
-/// URL without a base". `HF_TOKEN` is sent as a bearer token for gated
-/// repos. Verifies against `expected_sha256` when provided.
+/// This compatibility adapter uses the shared artifact manager's
+/// cross-process lock, partial file, verification, durable job, and
+/// atomic replacement path. A missing digest is recorded as
+/// `preview_unpinned` and can never satisfy a managed catalog v2 launch.
+/// `HF_TOKEN` is used only as a redacted transport credential.
 #[cfg(feature = "weights")]
 pub async fn ensure_weight_file(
     cache_root: &Path,
@@ -113,48 +104,21 @@ pub async fn ensure_weight_file(
     filename: &str,
     expected_sha256: Option<&str>,
 ) -> Result<PathBuf, String> {
-    use tokio::io::AsyncWriteExt;
-
-    let dest = cache_file(cache_root, hf_repo, revision, filename);
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("create cache dir {}: {e}", parent.display()))?;
-    }
-
-    let url = format!("{}/{hf_repo}/resolve/{revision}/{filename}", hf_endpoint());
-    let mut req = reqwest::Client::new().get(&url);
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        if !token.is_empty() {
-            req = req.bearer_auth(token);
-        }
-    }
-    let resp = req
-        .send()
+    let transport = std::sync::Arc::new(
+        crate::HttpArtifactTransport::new().map_err(|error| error.to_string())?,
+    );
+    let manager =
+        crate::ArtifactManager::new(cache_root, transport).map_err(|error| error.to_string())?;
+    let credential = std::env::var("HF_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(crate::SourceCredential::new)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    manager
+        .ensure_legacy_file(hf_repo, revision, filename, expected_sha256, credential)
         .await
-        .map_err(|e| format!("request {url}: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("download {hf_repo}@{revision}/{filename}: {e}"))?;
-
-    let mut file = tokio::fs::File::create(&dest)
-        .await
-        .map_err(|e| format!("create {}: {e}", dest.display()))?;
-    let mut resp = resp;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| format!("read body for {filename}: {e}"))?
-    {
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("write {}: {e}", dest.display()))?;
-    }
-    file.flush().await.ok();
-
-    if let Some(expected) = expected_sha256 {
-        verify_sha256(&dest, expected)?;
-    }
-    Ok(dest)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

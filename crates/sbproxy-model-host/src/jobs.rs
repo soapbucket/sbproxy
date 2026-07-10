@@ -17,7 +17,9 @@ use ulid::Ulid;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Operation performed for a model deployment or artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     /// Acquire and verify an artifact.
@@ -41,7 +43,9 @@ pub enum OperationKind {
 }
 
 /// Durable lifecycle state of an operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationState {
     /// Accepted but not yet started.

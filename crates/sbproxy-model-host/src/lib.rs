@@ -30,6 +30,7 @@
 //! - [`config`] - the `serve:` config block an operator writes.
 
 pub mod acquire;
+pub mod artifact;
 pub mod artifact_spec;
 pub mod capabilities;
 pub mod catalog;
@@ -65,6 +66,13 @@ pub mod uv_release;
 pub mod weights;
 
 pub use acquire::{plan_binary_acquire, BinaryAcquirePlan};
+#[cfg(feature = "weights")]
+pub use artifact::HttpArtifactTransport;
+pub use artifact::{
+    AcquisitionContext, ArtifactCacheMetadata, ArtifactCacheState, ArtifactError, ArtifactManager,
+    ArtifactObserver, ArtifactTransport, NetworkPolicy, PullIntent, ReadyArtifact,
+    ResponseDisposition, SourceCredential, TransportRequest, TransportResponse,
+};
 pub use artifact_spec::{
     AcceleratorKind, ArtifactFile, ArtifactFormat, ArtifactVariant, ComputeCapability,
     ResolveArtifactRequest, ResolvedArtifact, VariantRequirements, WorkerProfile,
