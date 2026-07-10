@@ -22,7 +22,7 @@
 # operators eyeballing the file. Origins that pair the chain with an
 # `ai_crawl_control` policy can leave `transforms:` empty and the
 # compiler auto-prepends the same four entries; example
-# 17-markdown-for-agents shows that path end-to-end.
+# The markdown-for-agents example shows that path end-to-end.
 #
 # `default_content_shape: html` is the explicit fallback for
 # wildcard `Accept: */*` (and missing-header) requests so a browser

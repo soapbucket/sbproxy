@@ -30,7 +30,7 @@
 #
 # Test:
 #   # Allowed callee, depth 1, no cycle - passes through to the
-#   # upstream (which answers 404 for /agents/*; see README.md)
+#   # upstream test agent, which answers 200 (see README.md)
 #   curl -i -H 'Host: a2a.local' \
 #        -H 'Content-Type: application/a2a+json' \
 #        -H 'X-A2A-Caller-Agent-Id: agent:caller' \
@@ -64,7 +64,7 @@
 #        http://127.0.0.1:8080/agents/invoke
 #
 #   # Pass-through - operator route_glob match (no A2A headers, path
-#   # under /agents; the upstream itself answers 404)
+#   # under /agents; the upstream's /agents/ping answers 200)
 #   curl -i -H 'Host: a2a.local' http://127.0.0.1:8080/agents/ping
 
 proxy:
