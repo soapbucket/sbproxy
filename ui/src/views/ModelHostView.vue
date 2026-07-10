@@ -47,6 +47,11 @@ const status = computed<ModelHostStatus | null>(() => req.data.value ?? null);
 const serving = computed(() => !!status.value?.serving);
 const models = computed<ResidentModel[]>(() => status.value?.models ?? []);
 const vram = computed(() => status.value?.vram);
+// Doctor's admission verdict: shown only when serving would reject.
+const localServing = computed(() => status.value?.local_serving);
+const blockers = computed(() =>
+  localServing.value && localServing.value.ready === false ? (localServing.value.blockers ?? []) : [],
+);
 
 // Avg tok/s per model name from the throughput histogram (WOR-895).
 const tps = computed(() => {
@@ -103,6 +108,17 @@ function stateTone(s: ResidentModel["state"]): "ok" | "warn" | "err" | "neutral"
     </div>
 
     <p v-if="banner" class="banner" :class="`banner--${banner.tone}`">{{ banner.text }}</p>
+
+    <div class="sb-card panel blockers" v-if="blockers.length">
+      <h3>Serving is blocked on this host</h3>
+      <ul>
+        <li v-for="(b, i) in blockers" :key="i">{{ b }}</li>
+      </ul>
+      <p v-if="localServing?.recommendation" class="sb-faint">
+        Recommended fix: <span class="sb-mono">{{ localServing.recommendation }}</span>
+      </p>
+      <p class="sb-faint">Run <span class="sb-mono">sbproxy doctor</span> on this host for the full report.</p>
+    </div>
 
     <div class="sb-card panel">
       <h3>Load a model</h3>
@@ -216,5 +232,15 @@ function stateTone(s: ResidentModel["state"]): "ok" | "warn" | "err" | "neutral"
 .banner--err {
   background: #fdecea;
   color: #c0392b;
+}
+.blockers {
+  border-left: 3px solid #c0392b;
+}
+.blockers ul {
+  margin: 0 0 var(--sb-space-3);
+  padding-left: 1.2em;
+}
+.blockers li {
+  margin-bottom: var(--sb-space-2);
 }
 </style>

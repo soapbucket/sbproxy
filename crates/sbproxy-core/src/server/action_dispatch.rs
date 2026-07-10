@@ -2173,6 +2173,7 @@ fn emit_mcp_tool_attribution(
         },
         request_id: Some(ctx.request_id.to_string()),
         tag: Some(format!("mcp_tool:{tool_name}")),
+        priority: ctx.ai_lane_priority.map(|p| p.as_str().to_string()),
     };
     for sink in &mcp.usage_sinks {
         sink.record(&event);

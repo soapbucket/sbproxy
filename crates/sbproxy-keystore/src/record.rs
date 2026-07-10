@@ -79,6 +79,15 @@ pub struct KeyRecord {
     /// Max requests per minute (None = unlimited).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_requests_per_minute: Option<u64>,
+    /// Max tokens (input + output) per minute (None = unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_per_minute: Option<u64>,
+    /// SLO priority lane: `interactive`, `standard`, or `batch`.
+    /// Validated at the admin boundary and re-validated at the AI-gateway
+    /// seam (like `principal_selectors`) so this leaf crate stays free of
+    /// the gateway's enum. `None` behaves as `standard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
     /// Per-key budget caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<RecordBudget>,
@@ -111,6 +120,13 @@ pub struct KeyRecord {
     /// provider-shaped JSON. Empty leaves the request's tools untouched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inject_tools: Vec<serde_json::Value>,
+    /// Reference to a federated MCP gateway whose live catalogue is
+    /// injected as this key's tool surface. Opaque JSON (the AI
+    /// gateway's `InjectMcpRef` shape: `{"ref": ..., "format": ...,
+    /// "filter": [...]}`), kept unvalidated here like
+    /// `principal_selectors`; the AI seam deserializes it at use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_mcp: Option<serde_json::Value>,
     /// Skip the body-aware prompt-injection scan for this key. Default false
     /// (every key is scanned). Set true for trusted callers (eval, red-team)
     /// that legitimately submit injection-shaped prompts.
@@ -160,6 +176,8 @@ impl KeyRecord {
             name: None,
             status: RecordStatus::Active,
             max_requests_per_minute: None,
+            max_tokens_per_minute: None,
+            priority: None,
             budget: None,
             allowed_models: Vec::new(),
             blocked_models: Vec::new(),
@@ -168,6 +186,7 @@ impl KeyRecord {
             principal_selectors: Vec::new(),
             route_to_model: None,
             inject_tools: Vec::new(),
+            inject_mcp: None,
             bypass_prompt_injection: false,
             project: None,
             user: None,

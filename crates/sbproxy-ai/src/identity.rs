@@ -36,6 +36,43 @@ pub struct InjectMcpRef {
     pub filter: Vec<String>,
 }
 
+/// A virtual key's SLO priority lane (WOR-1679). Bound to the key, never
+/// to a client-settable header, so a caller cannot self-promote. Drives
+/// the served-lane admission queue (interactive wakes before standard,
+/// standard before batch) and the spill decision (an interactive request
+/// spills to the next provider sooner than it queues behind batch work).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyPriority {
+    /// Latency-critical interactive traffic (chat UIs, agents).
+    Interactive,
+    /// The default lane.
+    Standard,
+    /// Best-effort bulk work; yields to everything above.
+    Batch,
+}
+
+impl KeyPriority {
+    /// Parse the lowercase lane name; `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "interactive" => Some(Self::Interactive),
+            "standard" => Some(Self::Standard),
+            "batch" => Some(Self::Batch),
+            _ => None,
+        }
+    }
+
+    /// The lowercase lane name (the wire and ledger spelling).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Standard => "standard",
+            Self::Batch => "batch",
+        }
+    }
+}
+
 /// Virtual API key configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VirtualKeyConfig {
@@ -64,6 +101,19 @@ pub struct VirtualKeyConfig {
     /// Maximum requests per minute for this key.
     #[serde(default)]
     pub max_requests_per_minute: Option<u64>,
+    /// Maximum tokens (input + output) per minute for this key
+    /// (WOR-1833). Enforced as a sliding one-minute window like
+    /// [`Self::max_requests_per_minute`]: a request is rejected with
+    /// 429 when the key's window has already consumed the cap. Usage
+    /// lands in the window when the response's token counts are
+    /// extracted, so the check is against completed spend, not an
+    /// estimate.
+    #[serde(default)]
+    pub max_tokens_per_minute: Option<u64>,
+    /// SLO priority lane for the served-model admission queue
+    /// (WOR-1679). `None` behaves as [`KeyPriority::Standard`].
+    #[serde(default)]
+    pub priority: Option<KeyPriority>,
     /// Per-key budget limits.
     #[serde(default)]
     pub budget: Option<KeyBudget>,
@@ -295,6 +345,7 @@ pub struct KeyRateLimiter {
 #[derive(Debug, Default)]
 struct KeyRateState {
     requests_this_minute: u64,
+    tokens_this_minute: u64,
     minute_start: Option<std::time::Instant>,
 }
 
@@ -344,8 +395,45 @@ impl KeyRateLimiter {
             }
         }
 
+        // Check tokens per minute (WOR-1833). The window holds tokens
+        // already consumed by completed responses; a request is refused
+        // once the cap is spent. Deliberately no pre-charge estimate:
+        // the first request of a window always passes, and heavy usage
+        // shuts the window for the remainder of the minute.
+        if let Some(max_tpm) = config.max_tokens_per_minute {
+            if entry.tokens_this_minute >= max_tpm {
+                return false;
+            }
+        }
+
         entry.requests_this_minute += 1;
         true
+    }
+
+    /// Add a completed response's token usage to the key's one-minute
+    /// window (WOR-1833). Called from the usage-extraction path with
+    /// input + output tokens; a no-op for keys without a TPM cap is
+    /// avoided by callers checking the cap first, but recording for an
+    /// uncapped key is harmless (the window resets each minute).
+    pub fn record_tokens(&self, key: &str, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        let mut state = self.state.lock();
+        if !state.contains_key(key) {
+            state.insert(key.to_string(), KeyRateState::default());
+        }
+        let entry = state.get_mut(key).expect("inserted above if absent");
+        let now = std::time::Instant::now();
+        if let Some(start) = entry.minute_start {
+            if now.duration_since(start).as_secs() >= 60 {
+                *entry = KeyRateState::default();
+            }
+        }
+        if entry.minute_start.is_none() {
+            entry.minute_start = Some(now);
+        }
+        entry.tokens_this_minute = entry.tokens_this_minute.saturating_add(tokens);
     }
 }
 
@@ -363,6 +451,8 @@ mod tests {
             principal_selectors: vec![],
             require_pii_redaction: vec![],
             max_requests_per_minute: None,
+            max_tokens_per_minute: None,
+            priority: None,
             budget: None,
             tags: vec![],
             project: None,
@@ -386,6 +476,8 @@ mod tests {
             principal_selectors: vec![],
             require_pii_redaction: vec![],
             max_requests_per_minute: None,
+            max_tokens_per_minute: None,
+            priority: None,
             budget: None,
             tags: vec![],
             project: None,
@@ -576,6 +668,8 @@ mod tests {
         let limiter = KeyRateLimiter::new();
         let config = VirtualKeyConfig {
             max_requests_per_minute: Some(10),
+            max_tokens_per_minute: None,
+            priority: None,
             ..make_key("sk-1", true)
         };
         assert!(limiter.check_rate("sk-1", &config));
@@ -587,6 +681,8 @@ mod tests {
         let limiter = KeyRateLimiter::new();
         let config = VirtualKeyConfig {
             max_requests_per_minute: Some(2),
+            max_tokens_per_minute: None,
+            priority: None,
             ..make_key("sk-1", true)
         };
         assert!(limiter.check_rate("sk-1", &config));

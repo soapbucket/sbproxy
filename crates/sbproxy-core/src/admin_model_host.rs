@@ -147,10 +147,16 @@ fn status_response() -> Resp {
     // blocking-pool thread and may block on the async snapshot.
     let snapshot =
         tokio::runtime::Handle::current().block_on(async move { runtime.status_snapshot().await });
+    // WOR-1829: include the doctor's admission verdict so the admin UI
+    // can say *why* a serve: block admits nothing (no memory budget, no
+    // engine) instead of showing an empty model list. `collect()` is the
+    // shallow probe set (no network), fine for an on-demand admin call.
+    let local_serving = crate::doctor::DoctorReport::collect().local_serving;
     match serde_json::to_string(&serde_json::json!({
         "serving": true,
         "models": snapshot.models,
         "vram": snapshot.vram,
+        "local_serving": local_serving,
     })) {
         Ok(body) => (200, JSON, body),
         Err(e) => (500, JSON, format!(r#"{{"error":"serialize status: {e}"}}"#)),

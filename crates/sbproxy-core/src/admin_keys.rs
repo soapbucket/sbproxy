@@ -133,6 +133,10 @@ fn credential_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
 struct KeyMutation {
     name: Option<String>,
     max_requests_per_minute: Option<u64>,
+    max_tokens_per_minute: Option<u64>,
+    /// SLO priority lane: `interactive` | `standard` | `batch`. An empty
+    /// string or "null" clears it (back to the standard default).
+    priority: Option<String>,
     max_budget_tokens: Option<u64>,
     max_budget_usd: Option<f64>,
     allowed_models: Option<Vec<String>>,
@@ -143,13 +147,57 @@ struct KeyMutation {
     /// Pin a model for this key. An empty string or "null" clears the pin.
     route_to_model: Option<String>,
     inject_tools: Option<Vec<serde_json::Value>>,
+    /// Federated-MCP injection ref (the gateway's `InjectMcpRef` JSON
+    /// shape). JSON `null` clears it.
+    #[serde(default, deserialize_with = "some_nullable")]
+    inject_mcp: Option<Option<serde_json::Value>>,
     bypass_prompt_injection: Option<bool>,
     project: Option<String>,
     user: Option<String>,
     tags: Option<Vec<String>>,
+    /// Free-form string metadata; replaces the record's map wholesale.
+    metadata: Option<std::collections::BTreeMap<String, String>>,
     tenant: Option<String>,
     /// RFC 3339 expiry. The literal string "null" or an empty string clears it.
     expires_at: Option<String>,
+}
+
+/// Deserialize a field so `"field": null` arrives as `Some(None)` (clear)
+/// while an absent field stays `None` (leave unchanged).
+fn some_nullable<'de, D>(de: D) -> Result<Option<Option<serde_json::Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<serde_json::Value>::deserialize(de)?))
+}
+
+/// Reject mutation values that would store an invalid policy: an unknown
+/// priority lane, or an `inject_mcp` value that is not an object carrying
+/// the required `ref` string. Runs before [`apply_key_mutation`] so a bad
+/// PATCH is a 400, never a silently-stored record the AI seam later drops.
+fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
+    if let Some(p) = m.priority.as_deref() {
+        if !p.is_empty() && p != "null" && sbproxy_ai::identity::KeyPriority::parse(p).is_none() {
+            return Err(format!(
+                "priority '{p}' is not a lane; use interactive, standard, or batch"
+            ));
+        }
+    }
+    if let Some(Some(v)) = &m.inject_mcp {
+        let has_ref = v
+            .as_object()
+            .and_then(|o| o.get("ref"))
+            .and_then(|r| r.as_str())
+            .is_some_and(|s| !s.is_empty());
+        if !has_ref {
+            return Err(
+                "inject_mcp must be an object with a non-empty `ref` naming a federated \
+                 MCP gateway, e.g. {\"ref\": \"toolhub\"}"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Apply the mutation fields that are present onto a record. Budget is set when
@@ -160,6 +208,16 @@ fn apply_key_mutation(rec: &mut KeyRecord, m: &KeyMutation) {
     }
     if m.max_requests_per_minute.is_some() {
         rec.max_requests_per_minute = m.max_requests_per_minute;
+    }
+    if m.max_tokens_per_minute.is_some() {
+        rec.max_tokens_per_minute = m.max_tokens_per_minute;
+    }
+    if let Some(v) = &m.priority {
+        rec.priority = if v.is_empty() || v == "null" {
+            None
+        } else {
+            Some(v.clone())
+        };
     }
     if m.max_budget_tokens.is_some() || m.max_budget_usd.is_some() {
         let mut b = rec.budget.clone().unwrap_or_default();
@@ -196,6 +254,12 @@ fn apply_key_mutation(rec: &mut KeyRecord, m: &KeyMutation) {
     if let Some(v) = &m.inject_tools {
         rec.inject_tools = v.clone();
     }
+    if let Some(v) = &m.inject_mcp {
+        rec.inject_mcp = v.clone();
+    }
+    if let Some(v) = &m.metadata {
+        rec.metadata = v.clone();
+    }
     if let Some(v) = m.bypass_prompt_injection {
         rec.bypass_prompt_injection = v;
     }
@@ -229,6 +293,9 @@ fn create_key(body: Option<&str>) -> Resp {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if let Err(e) = validate_key_mutation(&m) {
+        return bad_request(&e);
+    }
     let minted = plane.crypto().mint_key();
     let now = Utc::now();
     let mut rec = KeyRecord::new(minted.key_id.clone(), minted.secret_hash.clone(), now);
@@ -285,6 +352,9 @@ fn update_key(id: &str, body: Option<&str>) -> Resp {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if let Err(e) = validate_key_mutation(&m) {
+        return bad_request(&e);
+    }
     let mut rec = match load_key(&plane, id) {
         Ok(Some(r)) => r,
         Ok(None) => return not_found("key not found"),
@@ -584,6 +654,10 @@ struct KeyView {
     name: Option<String>,
     status: RecordStatus,
     max_requests_per_minute: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens_per_minute: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<String>,
     budget: Option<RecordBudget>,
     allowed_models: Vec<String>,
     blocked_models: Vec<String>,
@@ -596,10 +670,14 @@ struct KeyView {
     route_to_model: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     inject_tools: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inject_mcp: Option<serde_json::Value>,
     bypass_prompt_injection: bool,
     project: Option<String>,
     user: Option<String>,
     tags: Vec<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    metadata: std::collections::BTreeMap<String, String>,
     tenant_id: Option<String>,
     expires_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
@@ -616,6 +694,8 @@ impl From<&KeyRecord> for KeyView {
             name: r.name.clone(),
             status: r.status,
             max_requests_per_minute: r.max_requests_per_minute,
+            max_tokens_per_minute: r.max_tokens_per_minute,
+            priority: r.priority.clone(),
             budget: r.budget.clone(),
             allowed_models: r.allowed_models.clone(),
             blocked_models: r.blocked_models.clone(),
@@ -624,10 +704,12 @@ impl From<&KeyRecord> for KeyView {
             principal_selectors: r.principal_selectors.clone(),
             route_to_model: r.route_to_model.clone(),
             inject_tools: r.inject_tools.clone(),
+            inject_mcp: r.inject_mcp.clone(),
             bypass_prompt_injection: r.bypass_prompt_injection,
             project: r.project.clone(),
             user: r.user.clone(),
             tags: r.tags.clone(),
+            metadata: r.metadata.clone(),
             tenant_id: r.tenant_id.clone(),
             expires_at: r.expires_at,
             created_at: r.created_at,
@@ -886,6 +968,64 @@ mod tests {
                 .0,
             404
         );
+    }
+
+    #[test]
+    fn advanced_policy_fields_validate_and_roundtrip() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+
+        // Valid lane + tpm + inject_mcp + metadata all land on the view.
+        let resp = dispatch(
+            "POST",
+            "/admin/keys",
+            Some(
+                r#"{"name":"lanes","priority":"interactive","max_tokens_per_minute":50000,
+                    "inject_mcp":{"ref":"toolhub"},"metadata":{"owner":"platform"}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 201, "create failed: {}", resp.2);
+        let v = parse(&resp);
+        let key_id = v["key"]["key_id"].as_str().unwrap().to_string();
+        assert_eq!(v["key"]["priority"], "interactive");
+        assert_eq!(v["key"]["max_tokens_per_minute"], 50000);
+        assert_eq!(v["key"]["inject_mcp"]["ref"], "toolhub");
+        assert_eq!(v["key"]["metadata"]["owner"], "platform");
+
+        // Unknown lane and a ref-less inject_mcp are 400s, not stored.
+        assert_eq!(
+            dispatch(
+                "PATCH",
+                &format!("/admin/keys/{key_id}"),
+                Some(r#"{"priority":"urgent"}"#)
+            )
+            .unwrap()
+            .0,
+            400
+        );
+        assert_eq!(
+            dispatch(
+                "PATCH",
+                &format!("/admin/keys/{key_id}"),
+                Some(r#"{"inject_mcp":{"format":"openai"}}"#)
+            )
+            .unwrap()
+            .0,
+            400
+        );
+
+        // Explicit clears: priority "", inject_mcp null.
+        let resp = dispatch(
+            "PATCH",
+            &format!("/admin/keys/{key_id}"),
+            Some(r#"{"priority":"","inject_mcp":null}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 200);
+        let v = parse(&resp);
+        assert!(v["key"]["priority"].is_null());
+        assert!(v["key"]["inject_mcp"].is_null());
     }
 
     #[test]

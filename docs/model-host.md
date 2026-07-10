@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-10*
 
 The model host lets the gateway run the model itself, not just proxy to
 a model server someone else started. You name a model in a provider's
@@ -104,6 +104,41 @@ evicts the least-recently-used idle model, `never` pins residency and
 refuses a new model when full. See
 [`examples/ai-local-serving`](../examples/ai-local-serving) and
 [`examples/use-case-local-first`](../examples/use-case-local-first).
+
+## Priority lanes and admission
+
+A local engine has a hard concurrency ceiling in a way a cloud API does
+not, so the serve block can cap in-flight requests and queue the rest:
+
+```yaml
+serve:
+  # At most 4 requests inside the engine at once; more wait in a
+  # priority queue. Omit (or 0) to disable the gate entirely.
+  max_concurrent_requests: 4
+  # How long a queued request waits before failing over to the next
+  # provider in the array. Default 30000.
+  queue_timeout_ms: 30000
+```
+
+The queue is ordered by the calling key's `priority` lane
+(`interactive`, `standard`, or `batch`; unset means standard). A freed
+slot always goes to the highest lane first, oldest request first
+within a lane, so a flood of batch traffic cannot starve an
+interactive key. Two behaviors follow from the lane:
+
+- **Spill sooner:** when the lane is full and the provider array has a
+  non-served provider later in it, an `interactive` request overflows
+  to that fallback immediately instead of queuing. Standard and batch
+  requests wait.
+- **Timeout equals failover:** a request that exhausts
+  `queue_timeout_ms` fails over like any other failed attempt; with no
+  fallback it surfaces the usual no-provider error.
+
+The lane rides on the key record, never on a client header, so a
+caller cannot self-promote. Admission decisions land on the
+`sbproxy_serve_lane_admissions_total{priority, decision}` counter and
+each request's lane is attributed in the usage ledger's `priority`
+field.
 
 ## Inference engines
 

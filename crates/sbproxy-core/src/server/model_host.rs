@@ -293,6 +293,186 @@ pub async fn served_upstream(
     .await
 }
 
+// --- Served-lane priority admission gate (WOR-1679, OSS subset) ---
+//
+// A single multi-priority queue in front of the local engine. The pure
+// decision logic lives in `sbproxy_model_host::scheduling`; this is the
+// request-path binding: a slot pool sized by `serve.max_concurrent_requests`,
+// FIFO-within-class wakeups ordered by `next_to_admit`, and a spill signal
+// so an interactive request with a cloud fallback in the same provider
+// array overflows immediately instead of queuing behind batch work. True
+// preemption of an in-flight generation is the enterprise extension; the
+// OSS gate never cancels running work.
+
+use sbproxy_model_host::scheduling::{next_to_admit, PriorityClass};
+
+/// Result of asking the gate for a served-lane slot.
+pub(crate) enum LaneAdmission {
+    /// A slot is held; drop the permit to release it.
+    Admitted(ServeLanePermit),
+    /// The lane is saturated and the caller said a fallback exists:
+    /// spill to it now rather than queuing (interactive only).
+    Spill,
+    /// Waited the configured queue timeout without getting a slot.
+    TimedOut,
+}
+
+/// RAII slot on the served lane. Dropping it hands the slot to the
+/// highest-priority waiter (FIFO within a class), or frees it. Public
+/// only because it rides on `RequestContext`; there is no way to mint
+/// one outside the gate.
+pub struct ServeLanePermit {
+    gate: Arc<ServeLaneGate>,
+}
+
+impl Drop for ServeLanePermit {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+struct LaneWaiter {
+    class: PriorityClass,
+    arrival: u64,
+    id: u64,
+    wake: tokio::sync::oneshot::Sender<()>,
+}
+
+#[derive(Default)]
+struct LaneState {
+    in_flight: usize,
+    next_tick: u64,
+    waiting: Vec<LaneWaiter>,
+}
+
+/// The process-wide served-lane gate. One per process, matching the
+/// one-engine-runtime-per-node doctrine of `merged_serve_config`.
+pub(crate) struct ServeLaneGate {
+    capacity: usize,
+    queue_timeout: std::time::Duration,
+    state: parking_lot::Mutex<LaneState>,
+}
+
+impl ServeLaneGate {
+    fn new(capacity: usize, queue_timeout: std::time::Duration) -> Self {
+        Self {
+            capacity,
+            queue_timeout,
+            state: parking_lot::Mutex::new(LaneState::default()),
+        }
+    }
+
+    /// Acquire a slot for a request of `class`. `has_fallback` tells the
+    /// gate whether the provider array carries another lane to spill to;
+    /// only an interactive request uses it (standard and batch wait).
+    pub(crate) async fn acquire(
+        self: &Arc<Self>,
+        class: PriorityClass,
+        has_fallback: bool,
+    ) -> LaneAdmission {
+        let (rx, id) = {
+            let mut st = self.state.lock();
+            if st.in_flight < self.capacity {
+                st.in_flight += 1;
+                record_lane_decision(class, "admitted");
+                return LaneAdmission::Admitted(ServeLanePermit { gate: self.clone() });
+            }
+            if class == PriorityClass::Interactive && has_fallback {
+                record_lane_decision(class, "spilled");
+                return LaneAdmission::Spill;
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            st.next_tick += 1;
+            let id = st.next_tick;
+            st.waiting.push(LaneWaiter {
+                class,
+                arrival: id,
+                id,
+                wake: tx,
+            });
+            (rx, id)
+        };
+        match tokio::time::timeout(self.queue_timeout, rx).await {
+            // The releaser transferred its slot to us before waking.
+            Ok(Ok(())) => {
+                record_lane_decision(class, "queued_admitted");
+                LaneAdmission::Admitted(ServeLanePermit { gate: self.clone() })
+            }
+            // Sender dropped (gate shutdown edge) or timeout: leave the
+            // queue and report. On the timeout path the waiter entry must
+            // be removed so the releaser never wakes a dead receiver.
+            Ok(Err(_)) | Err(_) => {
+                let mut st = self.state.lock();
+                st.waiting.retain(|w| w.id != id);
+                record_lane_decision(class, "timed_out");
+                LaneAdmission::TimedOut
+            }
+        }
+    }
+
+    fn release(&self) {
+        let mut st = self.state.lock();
+        // Hand the slot to the best waiter whose receiver is still
+        // alive; a send failure means that waiter timed out between
+        // dropping the lock and now, so try the next one.
+        loop {
+            let Some(idx) = next_to_admit(
+                &st.waiting
+                    .iter()
+                    .map(|w| (w.class, w.arrival))
+                    .collect::<Vec<_>>(),
+            ) else {
+                st.in_flight = st.in_flight.saturating_sub(1);
+                return;
+            };
+            let waiter = st.waiting.remove(idx);
+            if waiter.wake.send(()).is_ok() {
+                // Slot transferred: in_flight stays constant.
+                return;
+            }
+        }
+    }
+}
+
+static SERVE_LANE_GATE: OnceLock<Option<Arc<ServeLaneGate>>> = OnceLock::new();
+
+/// The served-lane gate for this process, built from the first config
+/// that carries `serve.max_concurrent_requests`. `None` when the merged
+/// serve block sets no cap (gating disabled, the pre-WOR-1679 behavior).
+pub(crate) fn serve_lane_gate(config: &AiHandlerConfig) -> Option<Arc<ServeLaneGate>> {
+    SERVE_LANE_GATE
+        .get_or_init(|| {
+            let merged = merged_serve_config(config)?;
+            let capacity = merged.max_concurrent_requests?;
+            if capacity == 0 {
+                return None;
+            }
+            let timeout =
+                std::time::Duration::from_millis(merged.queue_timeout_ms.unwrap_or(30_000));
+            Some(Arc::new(ServeLaneGate::new(capacity, timeout)))
+        })
+        .clone()
+}
+
+/// Map a virtual key's lane onto the scheduler's class. No key or no
+/// declared lane both mean standard.
+pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>) -> PriorityClass {
+    match priority {
+        Some(sbproxy_ai::identity::KeyPriority::Interactive) => PriorityClass::Interactive,
+        Some(sbproxy_ai::identity::KeyPriority::Batch) => PriorityClass::Batch,
+        Some(sbproxy_ai::identity::KeyPriority::Standard) | None => PriorityClass::Standard,
+    }
+}
+
+fn record_lane_decision(class: PriorityClass, decision: &'static str) {
+    let priority = match class {
+        PriorityClass::Interactive => "interactive",
+        PriorityClass::Standard => "standard",
+        PriorityClass::Batch => "batch",
+    };
+    sbproxy_observe::metrics::record_serve_lane_decision(priority, decision);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +511,83 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    fn gate(capacity: usize, timeout_ms: u64) -> Arc<ServeLaneGate> {
+        Arc::new(ServeLaneGate::new(
+            capacity,
+            std::time::Duration::from_millis(timeout_ms),
+        ))
+    }
+
+    #[tokio::test]
+    async fn gate_admits_under_capacity() {
+        let g = gate(2, 50);
+        let a = g.acquire(PriorityClass::Standard, false).await;
+        let b = g.acquire(PriorityClass::Batch, false).await;
+        assert!(matches!(a, LaneAdmission::Admitted(_)));
+        assert!(matches!(b, LaneAdmission::Admitted(_)));
+    }
+
+    #[tokio::test]
+    async fn gate_spills_interactive_with_fallback_when_full() {
+        let g = gate(1, 5_000);
+        let _held = g.acquire(PriorityClass::Batch, false).await;
+        // Interactive with a fallback overflows immediately instead of
+        // queuing behind the batch job.
+        assert!(matches!(
+            g.acquire(PriorityClass::Interactive, true).await,
+            LaneAdmission::Spill
+        ));
+    }
+
+    #[tokio::test]
+    async fn gate_times_out_a_waiter_when_no_slot_frees() {
+        let g = gate(1, 20);
+        let _held = g.acquire(PriorityClass::Standard, false).await;
+        assert!(matches!(
+            g.acquire(PriorityClass::Standard, false).await,
+            LaneAdmission::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn gate_hands_freed_slot_to_higher_priority_waiter_first() {
+        let g = gate(1, 5_000);
+        let held = match g.acquire(PriorityClass::Standard, false).await {
+            LaneAdmission::Admitted(p) => p,
+            _ => panic!("first acquire admits"),
+        };
+        // Queue a batch waiter first, then an interactive one; the
+        // freed slot must go to interactive despite arriving later.
+        let g_batch = g.clone();
+        let batch = tokio::spawn(async move { g_batch.acquire(PriorityClass::Batch, false).await });
+        let g_inter = g.clone();
+        let interactive =
+            tokio::spawn(async move { g_inter.acquire(PriorityClass::Interactive, false).await });
+        // Let both waiters park before releasing.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            if g.state.lock().waiting.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(g.state.lock().waiting.len(), 2, "both waiters parked");
+        drop(held);
+        let first = interactive.await.unwrap();
+        assert!(matches!(first, LaneAdmission::Admitted(_)));
+        // Releasing the interactive permit then admits the batch waiter.
+        drop(first);
+        assert!(matches!(batch.await.unwrap(), LaneAdmission::Admitted(_)));
+    }
+
+    #[test]
+    fn lane_class_defaults_to_standard() {
+        assert_eq!(lane_class_for(None), PriorityClass::Standard);
+        assert_eq!(
+            lane_class_for(Some(sbproxy_ai::identity::KeyPriority::Batch)),
+            PriorityClass::Batch
         );
     }
 }

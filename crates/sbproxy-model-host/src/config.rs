@@ -492,6 +492,22 @@ pub struct ModelHostConfig {
     /// Absent engines use the default (resolve from `PATH`).
     #[serde(default)]
     pub engines: std::collections::BTreeMap<EngineKind, EngineProvisioning>,
+    /// Cap on concurrently dispatched served-lane requests (WOR-1679).
+    /// When set, the gateway holds an admission gate in front of the
+    /// local engine: requests beyond the cap wait in a priority queue
+    /// (a virtual key's `priority:` lane orders the queue, interactive
+    /// first), and an interactive request with a cloud fallback in the
+    /// same provider array spills to it instead of queuing. `None`
+    /// (the default) disables the gate; the engine's internal queue is
+    /// the only limit, exactly as before.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
+    /// How long a queued request waits for a served-lane slot before
+    /// the attempt fails over to the next provider (or errors when no
+    /// fallback exists). Milliseconds; defaults to 30000. Read only
+    /// when `max_concurrent_requests` is set.
+    #[serde(default)]
+    pub queue_timeout_ms: Option<u64>,
 }
 
 impl ServeEntry {

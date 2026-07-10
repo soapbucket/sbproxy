@@ -1218,6 +1218,30 @@ pub fn record_capture_budget_drop(workspace_id: &str, dimension: &'static str) {
         .inc();
 }
 
+/// Record a served-lane admission decision on
+/// `sbproxy_serve_lane_admissions_total{priority, decision}` (WOR-1679).
+///
+/// `priority` is the request's lane (`interactive` / `standard` /
+/// `batch`) and `decision` one of the closed set `admitted` (free
+/// slot), `queued_admitted` (waited, then got a slot), `spilled`
+/// (interactive overflowed to the next provider instead of queuing),
+/// or `timed_out` (queue wait exhausted). Both label sets are closed,
+/// so no sanitization is needed.
+pub fn record_serve_lane_decision(priority: &'static str, decision: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_serve_lane_admissions_total",
+            "Served-lane admission gate decisions by priority lane",
+            &["priority", "decision"],
+        )
+        .expect("serve lane counter registers")
+    });
+    counter.with_label_values(&[priority, decision]).inc();
+}
+
 /// Record a bot-auth hosted-directory fetch failure on
 /// `sbproxy_bot_auth_directory_fetch_failures_total{url}`.
 ///

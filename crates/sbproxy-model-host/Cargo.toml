@@ -16,10 +16,10 @@ default = []
 gpu-nvidia = ["dep:nvml-wrapper"]
 # Apple Silicon (Metal) GPU discovery for the fit planner (WOR-1800).
 # Reports unified memory as the serving budget so a Mac admits models
-# that fit. Dependency-free (reads `sysctl`); the module only compiles on
-# macOS. Off by default at the crate level; the `sbproxy` binary enables
-# it by default, harmless on non-Apple hosts where the CPU probe answers
-# instead.
+# that fit. Reads sysctl keys via the sysctlbyname(3) syscall with a CLI
+# fallback (WOR-1829); the module only compiles on macOS. Off by default
+# at the crate level; the `sbproxy` binary enables it by default,
+# harmless on non-Apple hosts where the CPU probe answers instead.
 gpu-apple = []
 # Hugging Face weight download. Off by default at the crate level;
 # enabled by default in the `sbproxy` binary.
@@ -62,6 +62,12 @@ minijinja = { workspace = true, optional = true }
 # WOR-1658 embedded engine (feature `embedded`). Large dep tree; opt-in only.
 mistralrs = { version = "0.8", optional = true }
 axum = { version = "0.8", optional = true }
+
+# WOR-1829: the GPU/RAM probes read sysctl keys via the sysctlbyname(3)
+# syscall so they work inside sandboxes that block spawning the `sysctl`
+# binary. libc is already in the lockfile transitively (tokio, pingora).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
