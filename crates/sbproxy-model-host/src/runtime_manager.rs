@@ -462,8 +462,14 @@ impl DeploymentSlot {
             )),
         };
         let mut lifecycle = self.lifecycle.lock().await;
+        if lifecycle.start_epoch != expected_start_epoch {
+            return Err(RuntimeManagerError::Draining(self.id.clone()));
+        }
+        let owns_preparation = lifecycle.state == DeploymentRuntimeState::Preparing
+            && lifecycle.running.is_none()
+            && lifecycle.activation.is_none();
         match &result {
-            Ok(_) if !remain_preparing && lifecycle.activation.is_none() => {
+            Ok(_) if !remain_preparing && owns_preparation => {
                 lifecycle.state = if was_stopped {
                     DeploymentRuntimeState::Stopped
                 } else {
@@ -471,10 +477,11 @@ impl DeploymentSlot {
                 };
             }
             Ok(_) => {}
-            Err(error) => {
+            Err(error) if owns_preparation => {
                 lifecycle.state = DeploymentRuntimeState::Failed;
                 lifecycle.last_error = Some(error.clone());
             }
+            Err(_) => {}
         }
         let state = lifecycle.state;
         drop(lifecycle);
@@ -911,8 +918,8 @@ impl DeploymentSlot {
     }
 
     async fn reset(&self) -> Result<Option<OperationJob>, RuntimeManagerError> {
-        {
-            let lifecycle = self.lifecycle.lock().await;
+        let owner_epoch = {
+            let mut lifecycle = self.lifecycle.lock().await;
             match lifecycle.state {
                 DeploymentRuntimeState::Failed if lifecycle.running.is_none() => {}
                 DeploymentRuntimeState::Failed => {
@@ -932,21 +939,42 @@ impl DeploymentSlot {
                     )));
                 }
             }
-        }
-        let job = self.runtime.reset().await?;
-        self.admission.resume();
+            lifecycle.start_epoch = lifecycle
+                .start_epoch
+                .checked_add(1)
+                .ok_or(RuntimeManagerError::CounterOverflow)?;
+            lifecycle.state = DeploymentRuntimeState::Draining;
+            lifecycle.start_epoch
+        };
+        self.publish_lifecycle_state().await;
+        let result = self.runtime.reset().await;
         let mut lifecycle = self.lifecycle.lock().await;
-        lifecycle.start_epoch = lifecycle
-            .start_epoch
-            .checked_add(1)
-            .ok_or(RuntimeManagerError::CounterOverflow)?;
-        lifecycle.state = DeploymentRuntimeState::Configured;
-        lifecycle.running = None;
-        lifecycle.last_error = None;
-        lifecycle.activation = None;
+        if lifecycle.start_epoch != owner_epoch
+            || lifecycle.state != DeploymentRuntimeState::Draining
+        {
+            return Err(RuntimeManagerError::Draining(self.id.clone()));
+        }
+        match &result {
+            Ok(_) => {
+                lifecycle.state = DeploymentRuntimeState::Configured;
+                lifecycle.running = None;
+                lifecycle.last_error = None;
+                lifecycle.activation = None;
+                self.admission.resume();
+            }
+            Err(error) => {
+                lifecycle.state = DeploymentRuntimeState::Failed;
+                lifecycle.last_error = Some(error.clone());
+            }
+        }
+        let state = lifecycle.state;
         drop(lifecycle);
-        self.publish_current_state().await;
-        Ok(job)
+        if state == DeploymentRuntimeState::Configured {
+            self.publish_current_state().await;
+        } else {
+            self.publish_lifecycle_state().await;
+        }
+        result
     }
 
     async fn status(&self) -> DeploymentRuntimeStatus {
@@ -1210,6 +1238,8 @@ pub struct ModelRuntimeManager {
     preparer: Arc<dyn DeploymentPreparer>,
     snapshot: ArcSwap<RuntimeSnapshot>,
     residency: Mutex<crate::DeviceResidencySet>,
+    retired_slots: Mutex<BTreeMap<(String, u64), Arc<DeploymentSlot>>>,
+    retirement_lock: Mutex<()>,
     placement_lock: Mutex<()>,
     observer: Arc<dyn crate::ModelHostObserver>,
     generation: AtomicU64,
@@ -1292,6 +1322,8 @@ impl ModelRuntimeManager {
             preparer,
             snapshot: ArcSwap::from_pointee(snapshot),
             residency: Mutex::new(crate::DeviceResidencySet::new(device_capacities)),
+            retired_slots: Mutex::new(BTreeMap::new()),
+            retirement_lock: Mutex::new(()),
             placement_lock: Mutex::new(()),
             observer: Arc::new(crate::NoopObserver),
             generation: AtomicU64::new(1),
@@ -1801,6 +1833,65 @@ impl ModelRuntimeManager {
         Some(slot.status().await)
     }
 
+    async fn register_retired_slots(&self, retired: &[(String, Arc<DeploymentSlot>)]) {
+        {
+            let mut retained = self.retired_slots.lock().await;
+            for (deployment, slot) in retired {
+                retained.insert((deployment.clone(), slot.generation), Arc::clone(slot));
+            }
+        }
+        let mut residency = self.residency.lock().await;
+        for (deployment, slot) in retired {
+            for reservation in residency.reservations().into_iter().filter(|reservation| {
+                reservation.deployment == *deployment && reservation.generation == slot.generation
+            }) {
+                let mut protection = reservation.protection;
+                protection.draining = true;
+                residency.update_protection(
+                    reservation.memory.device_index,
+                    deployment,
+                    slot.generation,
+                    protection,
+                );
+            }
+        }
+    }
+
+    async fn cleanup_retired_slot(
+        &self,
+        deployment: &str,
+        slot: &Arc<DeploymentSlot>,
+        grace: Duration,
+    ) -> Result<Option<crate::DrainReport>, RuntimeManagerError> {
+        let _cleanup = self.retirement_lock.lock().await;
+        let key = (deployment.to_string(), slot.generation);
+        let is_retained = self
+            .retired_slots
+            .lock()
+            .await
+            .get(&key)
+            .is_some_and(|retained| Arc::ptr_eq(retained, slot));
+        if !is_retained {
+            return Ok(None);
+        }
+        let report = slot.drain(grace).await?;
+        let mut residency = self.residency.lock().await;
+        for reservation in residency.reservations().into_iter().filter(|reservation| {
+            reservation.deployment == deployment && reservation.generation == slot.generation
+        }) {
+            residency.release(reservation.memory.device_index, deployment, slot.generation);
+        }
+        drop(residency);
+        let mut retained = self.retired_slots.lock().await;
+        if retained
+            .get(&key)
+            .is_some_and(|registered| Arc::ptr_eq(registered, slot))
+        {
+            retained.remove(&key);
+        }
+        Ok(Some(report))
+    }
+
     /// Stop ready generations whose keep-alive elapsed and which have no protection.
     pub async fn maintenance_tick(&self, now: tokio::time::Instant) -> Vec<String> {
         let _placement = self.placement_lock.lock().await;
@@ -1811,6 +1902,32 @@ impl ModelRuntimeManager {
                 tracing::warn!(deployment = %id, reason = error.reason_code(), %error, "managed engine health check failed");
             }
         }
+        let grace = Duration::from_millis(snapshot.desired.control.shutdown_deadline_ms);
+        let retired = self
+            .retired_slots
+            .lock()
+            .await
+            .iter()
+            .map(|((deployment, _), slot)| (deployment.clone(), Arc::clone(slot)))
+            .collect::<Vec<_>>();
+        for (deployment, slot) in retired {
+            if let Err(error) = self.cleanup_retired_slot(&deployment, &slot, grace).await {
+                tracing::warn!(
+                    %deployment,
+                    generation = slot.generation,
+                    reason = error.reason_code(),
+                    %error,
+                    "retired managed engine shutdown retry failed"
+                );
+            }
+        }
+        let retained = self
+            .retired_slots
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let reservations = self.residency.lock().await.reservations();
         for reservation in reservations {
             let keep = match snapshot.slots.get(&reservation.deployment) {
@@ -1818,7 +1935,8 @@ impl ModelRuntimeManager {
                     slot.owns_reservation().await
                 }
                 _ => false,
-            };
+            } || retained
+                .contains(&(reservation.deployment.clone(), reservation.generation));
             if !keep {
                 self.residency.lock().await.release(
                     reservation.memory.device_index,
@@ -2016,7 +2134,10 @@ impl ModelRuntimeManager {
             return Err(error);
         }
         self.refresh_residency_protections(&current).await;
-        let mut planned = self.residency.lock().await.clone();
+        let (mut planned, current_reservations) = {
+            let residency = self.residency.lock().await;
+            (residency.clone(), residency.reservations())
+        };
         for id in &recreate_ids {
             let Some(old) = current.slots.get(id) else {
                 continue;
@@ -2102,6 +2223,21 @@ impl ModelRuntimeManager {
                 Err(error) => capacity_error = Some(RuntimeManagerError::Admission(error)),
             }
         }
+        if capacity_error.is_none() {
+            for mut reservation in current_reservations.into_iter().filter(|reservation| {
+                capacity_evictions.contains(&reservation.deployment)
+                    && current
+                        .slots
+                        .get(&reservation.deployment)
+                        .is_some_and(|slot| slot.generation == reservation.generation)
+            }) {
+                reservation.protection.draining = true;
+                if let Err(error) = planned.retain_existing(reservation) {
+                    capacity_error = Some(RuntimeManagerError::Admission(error));
+                    break;
+                }
+            }
+        }
         if let Some(error) = capacity_error {
             teardown_slots(
                 candidate_ids
@@ -2178,6 +2314,7 @@ impl ModelRuntimeManager {
                 .then_some((id.clone(), old.clone()))
             })
             .collect::<Vec<_>>();
+        self.register_retired_slots(&retired).await;
         self.snapshot.store(Arc::new(RuntimeSnapshot {
             revision: next_revision,
             desired: prepared.desired.clone(),
@@ -2193,8 +2330,8 @@ impl ModelRuntimeManager {
         let grace = Duration::from_millis(prepared.desired.control.shutdown_deadline_ms);
         let mut retire_failures = BTreeMap::new();
         for (id, slot) in retired {
-            let stopped = match slot.drain(grace).await {
-                Ok(report) if report.timed_out => {
+            match self.cleanup_retired_slot(&id, &slot, grace).await {
+                Ok(Some(report)) if report.timed_out => {
                     retire_failures.insert(
                         id.clone(),
                         format!(
@@ -2202,20 +2339,10 @@ impl ModelRuntimeManager {
                             report.remaining_active
                         ),
                     );
-                    true
                 }
-                Ok(_) => true,
+                Ok(_) => {}
                 Err(error) => {
                     retire_failures.insert(id.clone(), error.to_string());
-                    false
-                }
-            };
-            if stopped {
-                let mut residency = self.residency.lock().await;
-                for reservation in residency.reservations().into_iter().filter(|reservation| {
-                    reservation.deployment == id && reservation.generation == slot.generation
-                }) {
-                    residency.release(reservation.memory.device_index, &id, slot.generation);
                 }
             }
         }

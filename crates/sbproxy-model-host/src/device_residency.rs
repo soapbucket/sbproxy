@@ -408,6 +408,59 @@ impl DeviceResidencySet {
         }
     }
 
+    /// Keep accounting for a generation that policy selected before its process stopped.
+    pub(crate) fn retain_existing(
+        &mut self,
+        reservation: DeviceReservation,
+    ) -> Result<(), AdmissionRejection> {
+        if let Some((device_index, existing)) =
+            self.devices.iter_mut().find_map(|(device_index, device)| {
+                device
+                    .reservations
+                    .iter_mut()
+                    .find(|existing| {
+                        existing.deployment == reservation.deployment
+                            && existing.generation == reservation.generation
+                    })
+                    .map(|existing| (*device_index, existing))
+            })
+        {
+            if device_index != reservation.memory.device_index
+                || existing.memory != reservation.memory
+            {
+                return Err(capacity_rejection(format!(
+                    "deployment {:?} generation {} changed its retained device or memory estimate",
+                    reservation.deployment, reservation.generation
+                )));
+            }
+            existing.protection = reservation.protection;
+            existing.last_used = reservation.last_used;
+            return Ok(());
+        }
+        let device = self
+            .devices
+            .get_mut(&reservation.memory.device_index)
+            .ok_or_else(|| {
+                capacity_rejection(format!(
+                    "retained deployment {:?} selected missing device {}",
+                    reservation.deployment, reservation.memory.device_index
+                ))
+            })?;
+        let used = device
+            .reservations
+            .iter()
+            .map(|existing| existing.memory.total_bytes)
+            .sum::<u64>();
+        if used.saturating_add(reservation.memory.total_bytes) > device.capacity_bytes {
+            return Err(capacity_rejection(format!(
+                "retained deployment {:?} generation {} no longer fits on device {}",
+                reservation.deployment, reservation.generation, reservation.memory.device_index
+            )));
+        }
+        device.reservations.push(reservation);
+        Ok(())
+    }
+
     /// Update lifecycle protection without changing capacity accounting.
     pub fn update_protection(
         &mut self,

@@ -333,6 +333,9 @@ struct FixtureRuntimeFacts {
     block_stop: AtomicBool,
     stop_entered: tokio::sync::Notify,
     stop_release: tokio::sync::Notify,
+    block_reset: AtomicBool,
+    reset_entered: tokio::sync::Notify,
+    reset_release: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -502,6 +505,10 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
     }
 
     async fn reset(&self) -> Result<Option<OperationJob>, RuntimeManagerError> {
+        if self.facts.block_reset.load(Ordering::SeqCst) {
+            self.facts.reset_entered.notify_one();
+            self.facts.reset_release.notified().await;
+        }
         self.facts.fail_start.lock().unwrap().remove(&self.id);
         Ok(None)
     }
@@ -837,6 +844,70 @@ async fn failed_health_cleanup_retains_process_ownership_and_residency() {
 }
 
 #[tokio::test]
+async fn failed_retirement_is_retained_and_retried_until_shutdown_succeeds() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("retirement-owner", &[("a", true, 30)], 1))
+        .await
+        .unwrap();
+    let generation = manager.status("a").await.unwrap().generation;
+    preparer
+        .facts
+        .fail_stop
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+
+    let report = manager
+        .reconcile(manager_desired("retired", &[], 1))
+        .await
+        .unwrap();
+    assert!(report.retire_failures.contains_key("a"));
+    assert!(manager.status("a").await.is_none());
+    let reservations = manager.residency_reservations().await;
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].generation, generation);
+    assert!(reservations[0].protection.draining);
+
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+    assert_eq!(
+        manager.residency_reservations().await.len(),
+        1,
+        "maintenance must retain capacity while retired shutdown still fails"
+    );
+
+    preparer.facts.fail_stop.lock().unwrap().remove("a");
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+    assert!(manager.residency_reservations().await.is_empty());
+    assert_eq!(
+        preparer.facts.stops.lock().unwrap().get("a").copied(),
+        Some(1)
+    );
+    let stop_events = preparer
+        .facts
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.starts_with("stop:a:"))
+        .count();
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+    assert_eq!(
+        preparer
+            .facts
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.starts_with("stop:a:"))
+            .count(),
+        stop_events,
+        "a successfully retired generation must leave the retry registry"
+    );
+}
+
+#[tokio::test]
 async fn explicit_stop_invalidates_a_cold_request_waiting_for_placement() {
     let preparer = FixturePreparer::new(Duration::from_millis(1));
     let manager = manager(preparer.clone());
@@ -946,6 +1017,113 @@ async fn stop_releases_a_reservation_created_by_an_inflight_activation() {
     assert_eq!(
         manager.status("a").await.unwrap().state,
         sbproxy_model_host::DeploymentRuntimeState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn stopped_slot_ignores_a_stale_memory_estimate_completion() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("stale-memory-stop", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    preparer.facts.block_memory.store(true, Ordering::SeqCst);
+
+    let cache_manager = manager.clone();
+    let cache = tokio::spawn(async move { cache_manager.cache("a").await });
+    preparer.facts.memory_entered.notified().await;
+    manager.stop("a").await.unwrap();
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Stopped
+    );
+
+    preparer.facts.memory_release.notify_one();
+    assert!(matches!(
+        cache.await.unwrap(),
+        Err(RuntimeManagerError::Draining(_))
+    ));
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Stopped,
+        "a stale estimate must not overwrite the stop lifecycle"
+    );
+}
+
+#[tokio::test]
+async fn ready_slot_ignores_a_stale_memory_estimate_completion() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired(
+            "stale-memory-ready",
+            &[("a", false, 30)],
+            2,
+        ))
+        .await
+        .unwrap();
+    preparer.facts.block_memory.store(true, Ordering::SeqCst);
+
+    let cache_manager = manager.clone();
+    let cache = tokio::spawn(async move { cache_manager.cache("a").await });
+    preparer.facts.memory_entered.notified().await;
+    preparer.facts.block_memory.store(false, Ordering::SeqCst);
+    let running = manager.ensure_ready("a").await.unwrap();
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+
+    preparer.facts.memory_release.notify_one();
+    cache.await.unwrap().unwrap();
+    let status = manager.status("a").await.unwrap();
+    assert_eq!(
+        status.state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready,
+        "an older estimate must not overwrite newer readiness"
+    );
+    assert_eq!(status.port, Some(running.port));
+}
+
+#[tokio::test]
+async fn explicit_stop_supersedes_a_blocked_reset_completion() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    preparer
+        .facts
+        .fail_start_once
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+    manager
+        .reconcile(manager_desired("stale-reset-stop", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    manager
+        .ensure_ready("a")
+        .await
+        .expect_err("the fixture must retain a resettable failure");
+    preparer.facts.block_reset.store(true, Ordering::SeqCst);
+
+    let reset_manager = manager.clone();
+    let reset = tokio::spawn(async move { reset_manager.reset("a").await });
+    preparer.facts.reset_entered.notified().await;
+    manager.stop("a").await.unwrap();
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Stopped
+    );
+
+    preparer.facts.reset_release.notify_one();
+    assert!(matches!(
+        reset.await.unwrap(),
+        Err(RuntimeManagerError::Draining(_))
+    ));
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Stopped,
+        "a stale reset must not overwrite an explicit stop"
     );
 }
 
@@ -1803,6 +1981,59 @@ async fn lowering_the_resident_limit_evicts_idle_preserved_slots() {
         preparer.facts.stops.lock().unwrap().get("a").copied(),
         Some(1)
     );
+}
+
+#[tokio::test]
+async fn failed_limit_eviction_keeps_the_physical_generation_accounted() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer.clone(),
+        BTreeMap::from([(0, 2)]),
+    )
+    .unwrap();
+    manager
+        .reconcile(manager_desired(
+            "resident-limit-failure",
+            &[("a", false, 30), ("b", false, 30)],
+            2,
+        ))
+        .await
+        .unwrap();
+    let a_generation = manager.ensure_ready("a").await.unwrap().generation;
+    manager.ensure_ready("b").await.unwrap();
+    preparer
+        .facts
+        .fail_stop
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+
+    let mut limited = manager_desired(
+        "resident-limit-failure-retained",
+        &[("a", false, 30), ("b", false, 30)],
+        2,
+    );
+    limited.control.cache.max_resident_models = Some(1);
+    let report = manager.reconcile(limited).await.unwrap();
+    assert!(report.retire_failures.contains_key("a"));
+    let reservations = manager.residency_reservations().await;
+    assert_eq!(
+        reservations.len(),
+        2,
+        "accounting must retain a process that failed its policy eviction"
+    );
+    assert!(reservations.iter().any(|reservation| {
+        reservation.deployment == "a"
+            && reservation.generation == a_generation
+            && reservation.protection.draining
+    }));
+
+    preparer.facts.fail_stop.lock().unwrap().remove("a");
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+    let reservations = manager.residency_reservations().await;
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].deployment, "b");
 }
 
 #[tokio::test]
