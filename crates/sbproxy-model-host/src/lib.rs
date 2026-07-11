@@ -130,8 +130,9 @@ pub use engine_driver::{
 };
 pub use fit::{
     estimate_throughput, fp8_supported, memory_occupancy, plan_fit_auto_kv_with_margin,
-    plan_fit_kv_with_margin, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor, MemoryEstimate,
-    ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
+    plan_fit_auto_kv_with_margin_and_concurrency, plan_fit_kv_with_margin,
+    plan_fit_kv_with_margin_and_concurrency, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
+    MemoryEstimate, ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
 };
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
 pub use jobs::{

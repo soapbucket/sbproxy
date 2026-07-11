@@ -672,9 +672,39 @@ pub fn plan_fit_kv_with_margin(
     safety_margin: f64,
     kv_bytes_per_element: Option<f64>,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_kv_with_margin_and_concurrency(
+        gpu,
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        safety_margin,
+        kv_bytes_per_element,
+        1,
+    )
+}
+
+/// Like [`plan_fit_kv_with_margin`], with KV capacity for every concurrent sequence.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_kv_with_margin_and_concurrency(
+    gpu: &GpuDescriptor,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+) -> Result<FitPlan, FitError> {
     let seq_len = seq_len.min(meta.max_context).max(1);
     let free = gpu.free_vram_bytes as f64;
 
+    if concurrency == 0 {
+        return Err(FitError::Incompatible {
+            gpu: gpu.name.clone(),
+            detail: "concurrency must be positive".to_string(),
+        });
+    }
     if !safety_margin.is_finite() || !(0.0..1.0).contains(&safety_margin) {
         return Err(FitError::Incompatible {
             gpu: gpu.name.clone(),
@@ -701,10 +731,11 @@ pub fn plan_fit_kv_with_margin(
             continue;
         }
         let weight_bytes = meta.weight_bytes(quant);
-        let kv_bytes = match kv_bytes_per_element {
+        let kv_bytes_per_sequence = match kv_bytes_per_element {
             Some(bytes) => meta.kv_bytes_with(bytes, seq_len),
             None => meta.kv_bytes(quant, seq_len),
         };
+        let kv_bytes = kv_bytes_per_sequence * f64::from(concurrency);
         let base = weight_bytes + kv_bytes;
         let runtime_overhead = base * (overhead.max(1.0) - 1.0);
         let subtotal = base + runtime_overhead;
@@ -804,6 +835,30 @@ pub fn plan_fit_auto_kv_with_margin(
     safety_margin: f64,
     kv_bytes_per_element: Option<f64>,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_auto_kv_with_margin_and_concurrency(
+        probe,
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        safety_margin,
+        kv_bytes_per_element,
+        1,
+    )
+}
+
+/// Like [`plan_fit_auto_kv_with_margin`], with KV capacity for concurrent sequences.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_auto_kv_with_margin_and_concurrency(
+    probe: &dyn GpuProbe,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+) -> Result<FitPlan, FitError> {
     let mut gpus = probe.probe();
     if gpus.is_empty() {
         return Err(FitError::NoGpu);
@@ -813,7 +868,7 @@ pub fn plan_fit_auto_kv_with_margin(
     // else the error from the most-free GPU (the most informative).
     let mut first_err = None;
     for gpu in &gpus {
-        match plan_fit_kv_with_margin(
+        match plan_fit_kv_with_margin_and_concurrency(
             gpu,
             meta,
             candidates,
@@ -821,6 +876,7 @@ pub fn plan_fit_auto_kv_with_margin(
             overhead,
             safety_margin,
             kv_bytes_per_element,
+            concurrency,
         ) {
             Ok(plan) => return Ok(plan),
             Err(e) => {

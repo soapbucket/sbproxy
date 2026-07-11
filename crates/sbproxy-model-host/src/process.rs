@@ -4,9 +4,10 @@
 //! Opaque process boundary used by every managed engine driver.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{mpsc, Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -269,39 +270,15 @@ impl CommandExecutor for TokioCommandExecutor {
         environment: &BTreeMap<String, String>,
         stderr_tail_lines: usize,
     ) -> Result<Arc<dyn EngineProcess>, EngineDriverError> {
-        let mut command = tokio::process::Command::new(executable);
-        command
-            .args(arguments)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        apply_engine_environment(&mut command, environment);
-        #[cfg(unix)]
-        command.process_group(0);
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt as _;
-
-            // SAFETY: pre_exec performs one async-signal-safe prctl call and
-            // returns its OS error without allocating in the child.
-            unsafe {
-                command.as_std_mut().pre_exec(|| {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                });
-            }
-        }
-        let mut child = command.spawn().map_err(|error| {
-            EngineDriverError::new(
-                EngineFailureReason::EngineSpawnFailed,
-                format!("spawn engine {:?}: {error}", executable),
-                "run model-host doctor and provision a compatible engine",
-                true,
-            )
-        })?;
+        let mut child =
+            spawn_engine_child(executable, arguments, environment).map_err(|error| {
+                EngineDriverError::new(
+                    EngineFailureReason::EngineSpawnFailed,
+                    format!("spawn engine {:?}: {error}", executable),
+                    "run model-host doctor and provision a compatible engine",
+                    true,
+                )
+            })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             EngineDriverError::new(
                 EngineFailureReason::EngineSpawnFailed,
@@ -312,23 +289,41 @@ impl CommandExecutor for TokioCommandExecutor {
         })?;
         let stderr_tail = Arc::new(StdMutex::new(BoundedStderrTail::default()));
         let capture = Arc::clone(&stderr_tail);
-        tokio::spawn(async move {
-            let mut stderr = stderr;
-            let mut buffer = [0u8; 4096];
-            loop {
-                match stderr.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(count) => capture
-                        .lock()
-                        .expect("engine stderr tail mutex poisoned")
-                        .push(&buffer[..count]),
+        let stderr_drain = std::thread::Builder::new()
+            .name(format!("sbproxy-engine-stderr-{}", child.id()))
+            .spawn(move || {
+                let mut stderr = stderr;
+                let mut buffer = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => capture
+                            .lock()
+                            .expect("engine stderr tail mutex poisoned")
+                            .push(&buffer[..count]),
+                    }
                 }
+            });
+        let stderr_drain = match stderr_drain {
+            Ok(stderr_drain) => stderr_drain,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(EngineDriverError::new(
+                    EngineFailureReason::EngineSpawnFailed,
+                    format!("spawn engine stderr drain: {error}"),
+                    "retry after restoring operating-system thread capacity",
+                    true,
+                ));
             }
-        });
-        Ok(Arc::new(TokioEngineProcess {
-            child: tokio::sync::Mutex::new(child),
+        };
+        Ok(Arc::new(NativeEngineProcess {
+            #[cfg(unix)]
+            process_group: child.id(),
+            child: StdMutex::new(child),
             stderr_tail,
             stderr_tail_lines,
+            stderr_drain: StdMutex::new(Some(stderr_drain)),
         }))
     }
 
@@ -355,7 +350,7 @@ impl CommandExecutor for TokioCommandExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        apply_engine_environment(&mut command, environment);
+        apply_engine_environment(command.as_std_mut(), environment);
         let output = tokio::time::timeout(timeout, command.output())
             .await
             .map_err(|_| {
@@ -382,8 +377,93 @@ impl CommandExecutor for TokioCommandExecutor {
     }
 }
 
+struct EngineSpawnRequest {
+    executable: PathBuf,
+    arguments: Vec<String>,
+    environment: BTreeMap<String, String>,
+    response: mpsc::SyncSender<Result<std::process::Child, String>>,
+}
+
+static ENGINE_SPAWNER: OnceLock<Result<mpsc::Sender<EngineSpawnRequest>, String>> = OnceLock::new();
+
+fn spawn_engine_child(
+    executable: &Path,
+    arguments: &[String],
+    environment: &BTreeMap<String, String>,
+) -> Result<std::process::Child, String> {
+    let spawner = ENGINE_SPAWNER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<EngineSpawnRequest>();
+        std::thread::Builder::new()
+            .name("sbproxy-engine-spawner".to_string())
+            .spawn(move || {
+                for request in receiver {
+                    let result = spawn_engine_command(
+                        &request.executable,
+                        &request.arguments,
+                        &request.environment,
+                    )
+                    .map_err(|error| error.to_string());
+                    let _ = request.response.send(result);
+                }
+            })
+            .map(|_| sender)
+            .map_err(|error| format!("start permanent engine spawner: {error}"))
+    });
+    let spawner = spawner.as_ref().map_err(Clone::clone)?;
+    let (response, result) = mpsc::sync_channel(1);
+    spawner
+        .send(EngineSpawnRequest {
+            executable: executable.to_path_buf(),
+            arguments: arguments.to_vec(),
+            environment: environment.clone(),
+            response,
+        })
+        .map_err(|_| "permanent engine spawner stopped unexpectedly".to_string())?;
+    result
+        .recv()
+        .map_err(|_| "permanent engine spawner dropped its response".to_string())?
+}
+
+fn spawn_engine_command(
+    executable: &Path,
+    arguments: &[String],
+    environment: &BTreeMap<String, String>,
+) -> std::io::Result<std::process::Child> {
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    apply_engine_environment(&mut command, environment);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        // The permanent spawner is the child's parent thread, so this signal
+        // tracks gateway-process death instead of a short-lived reconcile runtime.
+        // SAFETY: pre_exec performs one async-signal-safe prctl call and
+        // returns its OS error without allocating in the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    command.spawn()
+}
+
 fn apply_engine_environment(
-    command: &mut tokio::process::Command,
+    command: &mut std::process::Command,
     overrides: &BTreeMap<String, String>,
 ) {
     const BASELINE: &[&str] = &[
@@ -412,10 +492,13 @@ fn apply_engine_environment(
 }
 
 #[derive(Debug)]
-struct TokioEngineProcess {
-    child: tokio::sync::Mutex<tokio::process::Child>,
+struct NativeEngineProcess {
+    #[cfg(unix)]
+    process_group: u32,
+    child: StdMutex<std::process::Child>,
     stderr_tail: Arc<StdMutex<BoundedStderrTail>>,
     stderr_tail_lines: usize,
+    stderr_drain: StdMutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Default)]
@@ -437,16 +520,27 @@ impl BoundedStderrTail {
     }
 }
 
-#[async_trait]
-impl EngineProcess for TokioEngineProcess {
-    fn id(&self) -> Option<u32> {
-        self.child.try_lock().ok().and_then(|child| child.id())
+impl NativeEngineProcess {
+    fn join_finished_stderr_drain(&self) {
+        let mut drain = self
+            .stderr_drain
+            .lock()
+            .expect("engine stderr drain mutex poisoned");
+        if drain
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            if let Some(drain) = drain.take() {
+                let _ = drain.join();
+            }
+        }
     }
 
-    async fn has_exited(&self) -> Result<bool, EngineDriverError> {
-        self.child
+    fn try_wait(&self) -> Result<bool, EngineDriverError> {
+        let exited = self
+            .child
             .lock()
-            .await
+            .expect("engine child mutex poisoned")
             .try_wait()
             .map(|status| status.is_some())
             .map_err(|error| {
@@ -456,53 +550,65 @@ impl EngineProcess for TokioEngineProcess {
                     "retry the health check or restart the deployment",
                     true,
                 )
-            })
+            })?;
+        if exited {
+            self.join_finished_stderr_drain();
+        }
+        Ok(exited)
+    }
+}
+
+#[async_trait]
+impl EngineProcess for NativeEngineProcess {
+    fn id(&self) -> Option<u32> {
+        self.child.lock().ok().map(|child| child.id())
+    }
+
+    async fn has_exited(&self) -> Result<bool, EngineDriverError> {
+        self.try_wait()
     }
 
     async fn shutdown(&self, grace: Duration) -> Result<(), EngineDriverError> {
-        let mut child = self.child.lock().await;
-        if child.try_wait().map_err(shutdown_error)?.is_some() {
+        if self.try_wait()? {
             return Ok(());
         }
         #[cfg(unix)]
-        if let Some(pid) = child.id() {
-            let target = match (pgid_of(pid), pgid_of(std::process::id())) {
-                (Some(child_pgid), Some(our_pgid))
-                    if child_pgid == pid && child_pgid != our_pgid =>
-                {
-                    format!("-{child_pgid}")
-                }
-                _ => pid.to_string(),
-            };
-            let _ = std::process::Command::new("kill")
-                .args(["-TERM", &target])
-                .status();
-        }
+        signal_isolated_process_group(self.process_group, libc::SIGTERM);
         #[cfg(not(unix))]
-        child.start_kill().map_err(shutdown_error)?;
+        self.child
+            .lock()
+            .expect("engine child mutex poisoned")
+            .kill()
+            .map_err(shutdown_error)?;
 
-        match tokio::time::timeout(grace, child.wait()).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(shutdown_error(error)),
-            Err(_) => {
-                #[cfg(unix)]
-                if let Some(pid) = child.id() {
-                    match (pgid_of(pid), pgid_of(std::process::id())) {
-                        (Some(child_pgid), Some(our_pgid))
-                            if child_pgid == pid && child_pgid != our_pgid =>
-                        {
-                            let _ = std::process::Command::new("kill")
-                                .args(["-KILL", &format!("-{child_pgid}")])
-                                .status();
-                        }
-                        _ => {}
-                    }
-                }
-                child.start_kill().map_err(shutdown_error)?;
-                child.wait().await.map_err(shutdown_error)?;
-                Ok(())
+        let deadline = tokio::time::Instant::now() + grace;
+        while tokio::time::Instant::now() < deadline {
+            if self.try_wait()? {
+                return Ok(());
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+
+        #[cfg(unix)]
+        signal_isolated_process_group(self.process_group, libc::SIGKILL);
+        self.child
+            .lock()
+            .expect("engine child mutex poisoned")
+            .kill()
+            .map_err(shutdown_error)?;
+        let forced_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < forced_deadline {
+            if self.try_wait()? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(EngineDriverError::new(
+            EngineFailureReason::EngineShutdownFailed,
+            "engine process did not exit after forced termination",
+            "terminate the isolated engine process group and retry the operation",
+            true,
+        ))
     }
 
     fn stderr_tail(&self) -> String {
@@ -510,6 +616,34 @@ impl EngineProcess for TokioEngineProcess {
             .lock()
             .expect("engine stderr tail mutex poisoned")
             .render(self.stderr_tail_lines)
+    }
+}
+
+impl Drop for NativeEngineProcess {
+    fn drop(&mut self) {
+        let drain = self
+            .stderr_drain
+            .get_mut()
+            .expect("engine stderr drain mutex poisoned during drop");
+        let child = self
+            .child
+            .get_mut()
+            .expect("engine child mutex poisoned during drop");
+        let child_exited = child.try_wait().ok().flatten().is_some();
+        let drain_finished = drain
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished);
+        if !child_exited || !drain_finished {
+            #[cfg(unix)]
+            signal_isolated_process_group(self.process_group, libc::SIGKILL);
+        }
+        if !child_exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(drain) = drain.take() {
+            let _ = drain.join();
+        }
     }
 }
 
@@ -583,12 +717,15 @@ fn bounded_output(output: &[u8], max_output_bytes: usize) -> String {
 }
 
 #[cfg(unix)]
-fn pgid_of(pid: u32) -> Option<u32> {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "pgid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+fn signal_isolated_process_group(process_group: u32, signal: i32) {
+    let process_group = process_group as libc::pid_t;
+    // SAFETY: getpgrp has no preconditions, and kill receives the negative
+    // process-group ID created for this managed engine.
+    unsafe {
+        if process_group > 0 && process_group != libc::getpgrp() {
+            let _ = libc::kill(-process_group, signal);
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -644,5 +781,54 @@ mod tests {
         assert!(tail.contains("FINAL-MARKER"));
         assert!(tail.len() <= 8_192);
         assert!(tail.lines().count() <= 20);
+    }
+
+    #[test]
+    fn engine_stderr_capture_survives_the_launch_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let release_arg = release.display().to_string();
+        let process = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(TokioCommandExecutor.spawn(
+                Path::new("/bin/sh"),
+                &[
+                    "-c".to_string(),
+                    "echo BEFORE-RUNTIME-DROP >&2; while [ ! -f \"$1\" ]; do sleep 0.01; done; echo AFTER-RUNTIME-DROP >&2; sleep 5"
+                        .to_string(),
+                    "sbproxy-stderr-fixture".to_string(),
+                    release_arg,
+                ],
+                &BTreeMap::new(),
+                20,
+            ))
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+
+        std::fs::write(&release, b"release").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !process.stderr_tail().contains("AFTER-RUNTIME-DROP") {
+                    assert!(
+                        !process.has_exited().await.unwrap(),
+                        "engine exited when its launch runtime dropped"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("stderr emitted after runtime drop must remain readable");
+            assert!(!process.has_exited().await.unwrap());
+            process.shutdown(Duration::from_millis(100)).await.unwrap();
+        });
     }
 }

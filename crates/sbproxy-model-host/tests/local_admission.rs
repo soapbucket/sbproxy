@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sbproxy_model_host::{
-    plan_fit_kv_with_margin, AdmissionGate, AdmissionReason, DeploymentRuntimeState,
-    DeploymentRuntimeStatus, DeviceResidencyPolicy, DeviceResidencySet, EngineAvailability,
-    EngineKind, EvictionPolicy, GpuDescriptor, GpuVendor, MemoryEstimate, ModelMetadata,
-    PriorityClass, ResidencyProtection,
+    plan_fit_kv_with_margin, plan_fit_kv_with_margin_and_concurrency, AdmissionGate,
+    AdmissionReason, DeploymentRuntimeState, DeploymentRuntimeStatus, DeviceResidencyPolicy,
+    DeviceResidencySet, EngineAvailability, EngineKind, EvictionPolicy, GpuDescriptor, GpuVendor,
+    MemoryEstimate, ModelMetadata, PriorityClass, ResidencyProtection,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -82,6 +82,56 @@ fn fit_reports_a_complete_memory_breakdown_for_the_selected_device() {
             + plan.memory.safety_margin_bytes
     );
     assert_eq!(plan.estimated_vram_bytes, plan.memory.total_bytes);
+}
+
+#[test]
+fn fit_applies_overhead_and_margin_after_scaling_concurrent_kv() {
+    let metadata = ModelMetadata {
+        params: 1_000_000_000,
+        layers: 24,
+        kv_heads: 8,
+        head_dim: 128,
+        max_context: 8192,
+    };
+    let single = plan_fit_kv_with_margin(
+        &gpu(0, 24),
+        &metadata,
+        &["Q4_K_M".to_string()],
+        4096,
+        1.15,
+        0.10,
+        None,
+    )
+    .unwrap();
+    let concurrent = plan_fit_kv_with_margin_and_concurrency(
+        &gpu(0, 24),
+        &metadata,
+        &["Q4_K_M".to_string()],
+        4096,
+        1.15,
+        0.10,
+        None,
+        4,
+    )
+    .unwrap();
+
+    assert_eq!(concurrent.memory.weight_bytes, single.memory.weight_bytes);
+    assert_eq!(concurrent.memory.kv_bytes, single.memory.kv_bytes * 4);
+    assert!(
+        concurrent.memory.runtime_overhead_bytes > single.memory.runtime_overhead_bytes,
+        "additional KV must receive framework overhead"
+    );
+    assert!(
+        concurrent.memory.safety_margin_bytes > single.memory.safety_margin_bytes,
+        "additional KV must receive configured safety margin"
+    );
+    assert_eq!(
+        concurrent.memory.total_bytes,
+        concurrent.memory.weight_bytes
+            + concurrent.memory.kv_bytes
+            + concurrent.memory.runtime_overhead_bytes
+            + concurrent.memory.safety_margin_bytes
+    );
 }
 
 #[test]

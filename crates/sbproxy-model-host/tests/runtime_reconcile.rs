@@ -291,6 +291,7 @@ struct FixtureRuntimeFacts {
     fail_start: Mutex<BTreeSet<String>>,
     fail_start_once: Mutex<BTreeSet<String>>,
     fail_stop: Mutex<BTreeSet<String>>,
+    fail_health: Mutex<BTreeSet<String>>,
     events: Mutex<Vec<String>>,
     next_port: AtomicU16,
     block_memory: AtomicBool,
@@ -445,6 +446,22 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
         let mut stops = self.facts.stops.lock().unwrap();
         *stops.entry(self.id.clone()).or_default() += 1;
         Ok(())
+    }
+
+    async fn health(&self, running: &RunningEngine) -> Result<EngineHealth, RuntimeManagerError> {
+        if self.facts.fail_health.lock().unwrap().contains(&self.id) {
+            return Err(RuntimeManagerError::Engine(EngineDriverError::new(
+                EngineFailureReason::EngineHealthFailed,
+                format!("fixture deployment {} failed its health check", self.id),
+                "repair the fixture health boundary",
+                true,
+            )));
+        }
+        if running.process.has_exited().await? {
+            Ok(EngineHealth::Stopped)
+        } else {
+            Ok(EngineHealth::Ready)
+        }
     }
 
     async fn reset(&self) -> Result<Option<OperationJob>, RuntimeManagerError> {
@@ -735,6 +752,162 @@ async fn ready_generation_detects_a_process_that_exited_after_readiness() {
 }
 
 #[tokio::test]
+async fn failed_health_cleanup_retains_process_ownership_and_residency() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired(
+            "health-stop-failure",
+            &[("a", false, 30)],
+            1,
+        ))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    preparer
+        .facts
+        .fail_health
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+    preparer
+        .facts
+        .fail_stop
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+
+    let status = manager.status("a").await.unwrap();
+    assert_eq!(
+        status.state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
+    assert!(
+        status.port.is_some(),
+        "the possibly-live process stays owned"
+    );
+    assert_eq!(manager.residency_reservations().await.len(), 1);
+    assert!(
+        manager.reset("a").await.is_err(),
+        "reset cannot discard a process whose shutdown failed"
+    );
+
+    preparer.facts.fail_stop.lock().unwrap().remove("a");
+    manager.stop("a").await.unwrap();
+    assert!(manager.residency_reservations().await.is_empty());
+}
+
+#[tokio::test]
+async fn explicit_stop_invalidates_a_cold_request_waiting_for_placement() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    let mut desired = manager_desired("stop-race", &[("a", false, 30)], 1);
+    desired.control.shutdown_deadline_ms = 20;
+    manager.reconcile(desired).await.unwrap();
+    preparer.facts.block_memory.store(true, Ordering::SeqCst);
+
+    let request_manager = manager.clone();
+    let permit = request_manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    let request = tokio::spawn(async move {
+        let generation = permit.generation();
+        let start_epoch = permit.start_epoch();
+        let _permit = permit;
+        request_manager
+            .ensure_ready_for_generation(
+                "a",
+                generation,
+                start_epoch,
+                sbproxy_model_host::PriorityClass::Standard,
+            )
+            .await
+    });
+    preparer.facts.memory_entered.notified().await;
+
+    tokio::time::timeout(Duration::from_millis(200), manager.stop("a"))
+        .await
+        .expect("stop remains bounded")
+        .unwrap();
+    preparer.facts.memory_release.notify_one();
+    assert!(matches!(
+        request.await.unwrap(),
+        Err(RuntimeManagerError::Draining(_))
+    ));
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        None,
+        "a permit issued before stop must not restart the stopped engine"
+    );
+}
+
+#[tokio::test]
+async fn recreate_releases_placement_while_rejecting_a_cold_request() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    let mut initial = rollout_desired("recreate-race-old", ManagedRolloutPolicy::Rolling, 1);
+    initial.control.shutdown_deadline_ms = 1_000;
+    initial.deployments.get_mut("a").unwrap().desired.warm = false;
+    initial.revision.deployments.get_mut("a").unwrap().warm = false;
+    manager.reconcile(initial).await.unwrap();
+    preparer.facts.block_memory.store(true, Ordering::SeqCst);
+
+    let request_manager = manager.clone();
+    let permit = request_manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    let request = tokio::spawn(async move {
+        let generation = permit.generation();
+        let start_epoch = permit.start_epoch();
+        let _permit = permit;
+        request_manager
+            .ensure_ready_for_generation(
+                "a",
+                generation,
+                start_epoch,
+                sbproxy_model_host::PriorityClass::Standard,
+            )
+            .await
+    });
+    preparer.facts.memory_entered.notified().await;
+
+    let reconcile_manager = manager.clone();
+    let mut replacement = rollout_desired("recreate-race-new", ManagedRolloutPolicy::Recreate, 2);
+    replacement.control.shutdown_deadline_ms = 1_000;
+    replacement.deployments.get_mut("a").unwrap().desired.warm = false;
+    replacement.revision.deployments.get_mut("a").unwrap().warm = false;
+    let reconcile = tokio::spawn(async move { reconcile_manager.reconcile(replacement).await });
+    while manager.status("a").await.unwrap().state
+        != sbproxy_model_host::DeploymentRuntimeState::Draining
+    {
+        tokio::task::yield_now().await;
+    }
+    preparer.facts.memory_release.notify_one();
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_millis(200), request)
+            .await
+            .expect("stale request must acquire placement and reject promptly")
+            .unwrap(),
+        Err(RuntimeManagerError::Draining(_))
+    ));
+    tokio::time::timeout(Duration::from_millis(200), reconcile)
+        .await
+        .expect("recreate must not wait for its full drain deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(manager.current_revision(), 2);
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn reload_cannot_resurrect_a_cold_generation_removed_while_it_waits_for_placement() {
     let preparer = FixturePreparer::new(Duration::from_millis(1));
     let manager = manager(preparer.clone());
@@ -809,6 +982,7 @@ async fn admission_and_readiness_are_bound_to_the_same_generation() {
         .ensure_ready_for_generation(
             "a",
             permit.generation(),
+            permit.start_epoch(),
             sbproxy_model_host::PriorityClass::Standard,
         )
         .await

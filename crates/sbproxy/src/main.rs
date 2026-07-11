@@ -4780,6 +4780,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_multi_replica_single_node_deployments() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  model_host:\n    deployments:\n      coder:\n        model: qwen2.5-0.5b-instruct\n        variant: q4_k_m\n        replicas: 2\norigins:\n  x.local:\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: ok\n",
+        );
+        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn validate_missing_path_is_a_usage_error() {
         let args = ValidateArgs {
             config_path: None,

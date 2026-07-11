@@ -121,7 +121,12 @@ impl ManagedModelPermit {
         priority: sbproxy_model_host::PriorityClass,
     ) -> Result<sbproxy_model_host::RunningEngine, sbproxy_model_host::RuntimeManagerError> {
         self.manager
-            .ensure_ready_for_generation(&self.deployment, self.admission.generation(), priority)
+            .ensure_ready_for_generation(
+                &self.deployment,
+                self.admission.generation(),
+                self.admission.start_epoch(),
+                priority,
+            )
             .await
     }
 }

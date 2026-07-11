@@ -260,6 +260,7 @@ type Activation = Shared<BoxFuture<'static, Result<RunningEngine, RuntimeManager
 pub struct DeploymentAdmissionPermit {
     deployment: String,
     generation: u64,
+    start_epoch: u64,
     _permit: crate::AdmissionPermit,
 }
 
@@ -269,6 +270,7 @@ impl std::fmt::Debug for DeploymentAdmissionPermit {
             .debug_struct("DeploymentAdmissionPermit")
             .field("deployment", &self.deployment)
             .field("generation", &self.generation)
+            .field("start_epoch", &self.start_epoch)
             .finish_non_exhaustive()
     }
 }
@@ -283,12 +285,24 @@ impl DeploymentAdmissionPermit {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// Drain epoch in which this request was admitted.
+    pub fn start_epoch(&self) -> u64 {
+        self.start_epoch
+    }
 }
 
 struct SlotLifecycle {
+    start_epoch: u64,
     state: DeploymentRuntimeState,
     running: Option<RunningEngine>,
     last_error: Option<RuntimeManagerError>,
+    activation: Option<Activation>,
+}
+
+struct RecreateBegin {
+    prior_state: DeploymentRuntimeState,
+    prior_error: Option<RuntimeManagerError>,
     activation: Option<Activation>,
 }
 
@@ -350,6 +364,7 @@ impl DeploymentSlot {
             engine,
             observed: AtomicBool::new(false),
             lifecycle: Mutex::new(SlotLifecycle {
+                start_epoch: 0,
                 state: DeploymentRuntimeState::Configured,
                 running: None,
                 last_error: None,
@@ -358,14 +373,54 @@ impl DeploymentSlot {
         })
     }
 
+    async fn current_start_epoch(&self) -> u64 {
+        self.lifecycle.lock().await.start_epoch
+    }
+
+    async fn accepts_start_epoch(&self, expected: u64) -> bool {
+        let lifecycle = self.lifecycle.lock().await;
+        lifecycle.start_epoch == expected
+            && !matches!(
+                lifecycle.state,
+                DeploymentRuntimeState::Draining | DeploymentRuntimeState::Failed
+            )
+    }
+
+    async fn begin_draining(&self) -> Result<bool, RuntimeManagerError> {
+        let entered = {
+            let mut lifecycle = self.lifecycle.lock().await;
+            if matches!(
+                lifecycle.state,
+                DeploymentRuntimeState::Stopped | DeploymentRuntimeState::Draining
+            ) {
+                false
+            } else {
+                lifecycle.start_epoch = lifecycle
+                    .start_epoch
+                    .checked_add(1)
+                    .ok_or(RuntimeManagerError::CounterOverflow)?;
+                lifecycle.state = DeploymentRuntimeState::Draining;
+                true
+            }
+        };
+        if entered {
+            self.publish_lifecycle_state().await;
+        }
+        Ok(entered)
+    }
+
     async fn memory_estimate(
         &self,
         intent: PullIntent,
         limiter: Arc<Semaphore>,
         remain_preparing: bool,
+        expected_start_epoch: u64,
     ) -> Result<crate::MemoryEstimate, RuntimeManagerError> {
         let was_stopped = {
             let mut lifecycle = self.lifecycle.lock().await;
+            if lifecycle.start_epoch != expected_start_epoch {
+                return Err(RuntimeManagerError::Draining(self.id.clone()));
+            }
             match lifecycle.state {
                 DeploymentRuntimeState::Ready => {
                     return lifecycle
@@ -504,50 +559,60 @@ impl DeploymentSlot {
             ))
         })?;
         let health = self.runtime.health(&running).await;
-        match health {
-            Ok(EngineHealth::Ready) => Ok(Some(running)),
-            Ok(observed) => {
-                let error = RuntimeManagerError::Engine(EngineDriverError::new(
-                    EngineFailureReason::EngineHealthFailed,
-                    format!(
-                        "managed deployment {:?} health changed from ready to {observed:?}",
-                        self.id
-                    ),
-                    "inspect the retained engine diagnostics, then reset the deployment",
-                    true,
-                ));
-                let _ = self.runtime.stop(Duration::from_secs(1)).await;
+        let health_error = match health {
+            Ok(EngineHealth::Ready) => return Ok(Some(running)),
+            Ok(observed) => RuntimeManagerError::Engine(EngineDriverError::new(
+                EngineFailureReason::EngineHealthFailed,
+                format!(
+                    "managed deployment {:?} health changed from ready to {observed:?}",
+                    self.id
+                ),
+                "inspect the retained engine diagnostics, then reset the deployment",
+                true,
+            )),
+            Err(error) => error,
+        };
+        let cleanup = self.runtime.stop(Duration::from_secs(1)).await;
+        lifecycle.start_epoch = lifecycle
+            .start_epoch
+            .checked_add(1)
+            .ok_or(RuntimeManagerError::CounterOverflow)?;
+        lifecycle.activation = None;
+        lifecycle.state = DeploymentRuntimeState::Failed;
+        let surfaced = match cleanup {
+            Ok(()) => {
                 lifecycle.running = None;
-                lifecycle.activation = None;
-                lifecycle.state = DeploymentRuntimeState::Failed;
-                lifecycle.last_error = Some(error.clone());
-                drop(lifecycle);
-                self.publish_lifecycle_state().await;
-                Err(error)
+                health_error
             }
-            Err(error) => {
-                let _ = self.runtime.stop(Duration::from_secs(1)).await;
-                lifecycle.running = None;
-                lifecycle.activation = None;
-                lifecycle.state = DeploymentRuntimeState::Failed;
-                lifecycle.last_error = Some(error.clone());
-                drop(lifecycle);
-                self.publish_lifecycle_state().await;
-                Err(error)
+            Err(cleanup_error) => {
+                // The runtime still owns the process handle when shutdown fails.
+                // Keep that handle and its residency until a later stop succeeds.
+                cleanup_error
             }
-        }
+        };
+        lifecycle.last_error = Some(surfaced.clone());
+        drop(lifecycle);
+        self.publish_lifecycle_state().await;
+        Err(surfaced)
     }
 
     async fn ensure_ready(
         self: &Arc<Self>,
         intent: PullIntent,
         limiter: Arc<Semaphore>,
+        expected_start_epoch: u64,
     ) -> Result<RunningEngine, RuntimeManagerError> {
+        if !self.accepts_start_epoch(expected_start_epoch).await {
+            return Err(RuntimeManagerError::Draining(self.id.clone()));
+        }
         if let Some(running) = self.refresh_ready_health().await? {
             return Ok(running);
         }
         let activation = {
             let mut lifecycle = self.lifecycle.lock().await;
+            if lifecycle.start_epoch != expected_start_epoch {
+                return Err(RuntimeManagerError::Draining(self.id.clone()));
+            }
             match lifecycle.state {
                 DeploymentRuntimeState::Ready => {
                     return lifecycle.running.clone().ok_or_else(|| {
@@ -614,15 +679,14 @@ impl DeploymentSlot {
     }
 
     async fn stop(&self, grace: Duration) -> Result<(), RuntimeManagerError> {
+        self.begin_draining().await?;
         let activation = {
-            let mut lifecycle = self.lifecycle.lock().await;
+            let lifecycle = self.lifecycle.lock().await;
             if lifecycle.state == DeploymentRuntimeState::Stopped {
                 return Ok(());
             }
-            lifecycle.state = DeploymentRuntimeState::Draining;
             lifecycle.activation.clone()
         };
-        self.publish_lifecycle_state().await;
         if let Some(activation) = activation {
             let _ = activation.await;
         }
@@ -646,52 +710,65 @@ impl DeploymentSlot {
     }
 
     async fn drain(&self, grace: Duration) -> Result<crate::DrainReport, RuntimeManagerError> {
-        let entered_draining = {
-            let mut lifecycle = self.lifecycle.lock().await;
-            if lifecycle.state != DeploymentRuntimeState::Stopped {
-                lifecycle.state = DeploymentRuntimeState::Draining;
-                true
-            } else {
-                false
-            }
-        };
-        if entered_draining {
-            self.publish_lifecycle_state().await;
-        }
+        self.begin_draining().await?;
         let report = self.admission.drain(grace).await;
         self.stop(grace).await?;
         Ok(report)
     }
 
-    async fn stop_for_recreate(
-        &self,
-        grace: Duration,
-    ) -> Result<RecreateCheckpoint, RuntimeManagerError> {
-        let (prior_state, prior_error, activation) = {
+    async fn begin_recreate(&self) -> Result<RecreateBegin, RuntimeManagerError> {
+        let begin = {
             let mut lifecycle = self.lifecycle.lock().await;
-            let checkpoint = (
-                lifecycle.state,
-                lifecycle.last_error.clone(),
-                lifecycle.activation.clone(),
-            );
+            if lifecycle.state == DeploymentRuntimeState::Draining {
+                return Err(RuntimeManagerError::Draining(self.id.clone()));
+            }
+            let prior_state = if lifecycle.state == DeploymentRuntimeState::Preparing
+                && lifecycle.activation.is_none()
+            {
+                DeploymentRuntimeState::Configured
+            } else {
+                lifecycle.state
+            };
+            let begin = RecreateBegin {
+                prior_state,
+                prior_error: lifecycle.last_error.clone(),
+                activation: lifecycle.activation.clone(),
+            };
+            lifecycle.start_epoch = lifecycle
+                .start_epoch
+                .checked_add(1)
+                .ok_or(RuntimeManagerError::CounterOverflow)?;
             lifecycle.state = DeploymentRuntimeState::Draining;
-            checkpoint
+            begin
         };
         self.publish_lifecycle_state().await;
+        Ok(begin)
+    }
+
+    async fn abort_recreate_begin(&self, begin: RecreateBegin) {
+        self.admission.resume();
+        let mut lifecycle = self.lifecycle.lock().await;
+        lifecycle.state = begin.prior_state;
+        lifecycle.last_error = begin.prior_error;
+        lifecycle.activation = begin.activation;
+        drop(lifecycle);
+        self.publish_lifecycle_state().await;
+    }
+
+    async fn finish_recreate(
+        &self,
+        begin: RecreateBegin,
+        grace: Duration,
+    ) -> Result<RecreateCheckpoint, RuntimeManagerError> {
         let report = self.admission.drain(grace).await;
         if report.timed_out {
-            self.admission.resume();
-            let mut lifecycle = self.lifecycle.lock().await;
-            lifecycle.state = prior_state;
-            lifecycle.last_error = prior_error;
-            drop(lifecycle);
-            self.publish_lifecycle_state().await;
+            self.abort_recreate_begin(begin).await;
             return Err(RuntimeManagerError::Prepare(format!(
                 "recreate rollout for deployment {:?} exceeded the drain deadline with {} active requests",
                 self.id, report.remaining_active
             )));
         }
-        if let Some(activation) = activation {
+        if let Some(activation) = begin.activation.clone() {
             let _ = activation.await;
         }
         let (running, last_error) = {
@@ -703,14 +780,14 @@ impl DeploymentSlot {
         } else if last_error.is_some() {
             DeploymentRuntimeState::Failed
         } else {
-            prior_state
+            begin.prior_state
         };
         if let Err(error) = self.runtime.stop(grace).await {
             self.admission.resume();
             let mut lifecycle = self.lifecycle.lock().await;
             lifecycle.state = restore_state;
             lifecycle.running = running;
-            lifecycle.last_error = last_error.or(prior_error);
+            lifecycle.last_error = last_error.or(begin.prior_error);
             lifecycle.activation = None;
             drop(lifecycle);
             self.publish_lifecycle_state().await;
@@ -725,7 +802,7 @@ impl DeploymentSlot {
         self.publish_lifecycle_state().await;
         Ok(RecreateCheckpoint {
             restore_state,
-            last_error: last_error.or(prior_error),
+            last_error: last_error.or(begin.prior_error),
             was_running: running.is_some(),
         })
     }
@@ -736,7 +813,10 @@ impl DeploymentSlot {
         limiter: Arc<Semaphore>,
     ) -> Result<(), RuntimeManagerError> {
         if checkpoint.was_running {
-            self.ensure_ready(PullIntent::Startup, limiter).await?;
+            self.admission.resume();
+            let start_epoch = self.current_start_epoch().await;
+            self.ensure_ready(PullIntent::Startup, limiter, start_epoch)
+                .await?;
             return Ok(());
         }
         self.admission.resume();
@@ -754,7 +834,13 @@ impl DeploymentSlot {
         {
             let lifecycle = self.lifecycle.lock().await;
             match lifecycle.state {
-                DeploymentRuntimeState::Failed => {}
+                DeploymentRuntimeState::Failed if lifecycle.running.is_none() => {}
+                DeploymentRuntimeState::Failed => {
+                    return Err(RuntimeManagerError::Prepare(format!(
+                        "managed deployment {:?} cannot reset while a process whose shutdown failed remains owned; stop it first",
+                        self.id
+                    )));
+                }
                 DeploymentRuntimeState::Preparing | DeploymentRuntimeState::Draining => {
                     return Err(RuntimeManagerError::Draining(self.id.clone()));
                 }
@@ -770,6 +856,10 @@ impl DeploymentSlot {
         let job = self.runtime.reset().await?;
         self.admission.resume();
         let mut lifecycle = self.lifecycle.lock().await;
+        lifecycle.start_epoch = lifecycle
+            .start_epoch
+            .checked_add(1)
+            .ok_or(RuntimeManagerError::CounterOverflow)?;
         lifecycle.state = DeploymentRuntimeState::Configured;
         lifecycle.running = None;
         lifecycle.last_error = None;
@@ -828,8 +918,8 @@ impl DeploymentSlot {
     async fn admit(
         &self,
         priority: crate::PriorityClass,
-    ) -> Result<crate::AdmissionPermit, crate::AdmissionRejection> {
-        {
+    ) -> Result<(crate::AdmissionPermit, u64), crate::AdmissionRejection> {
+        let start_epoch = {
             let lifecycle = self.lifecycle.lock().await;
             match lifecycle.state {
                 DeploymentRuntimeState::Draining => {
@@ -866,8 +956,19 @@ impl DeploymentSlot {
                 | DeploymentRuntimeState::Ready => {}
                 DeploymentRuntimeState::Stopped => self.admission.resume(),
             }
+            lifecycle.start_epoch
+        };
+        let permit = self.admission.admit(priority).await?;
+        if !self.accepts_start_epoch(start_epoch).await {
+            drop(permit);
+            return Err(crate::AdmissionRejection::new(
+                crate::AdmissionReason::Draining,
+                "deployment drain began while admission waited",
+                true,
+                None,
+            ));
         }
-        self.admission.admit(priority).await
+        Ok((permit, start_epoch))
     }
 
     async fn reservation_facts(&self) -> Option<(u32, String, u64, crate::ResidencyProtection)> {
@@ -891,7 +992,7 @@ impl DeploymentSlot {
                 && lifecycle.activation.is_some())
     }
 
-    async fn begin_idle_eviction(&self) -> bool {
+    async fn begin_idle_eviction(&self) -> Result<bool, RuntimeManagerError> {
         let mut lifecycle = self.lifecycle.lock().await;
         if self
             .desired
@@ -902,12 +1003,16 @@ impl DeploymentSlot {
             || lifecycle.running.is_none()
             || !self.admission.begin_idle_drain()
         {
-            return false;
+            return Ok(false);
         }
+        lifecycle.start_epoch = lifecycle
+            .start_epoch
+            .checked_add(1)
+            .ok_or(RuntimeManagerError::CounterOverflow)?;
         lifecycle.state = DeploymentRuntimeState::Draining;
         drop(lifecycle);
         self.publish_lifecycle_state().await;
-        true
+        Ok(true)
     }
 
     fn emit_state(&self, state: DeploymentRuntimeState, engine: Option<EngineKind>) {
@@ -1217,13 +1322,15 @@ impl ModelRuntimeManager {
                         engine,
                     )?);
                     let memory = if warm {
+                        let start_epoch = slot.current_start_epoch().await;
                         Some(
-                            slot.memory_estimate(PullIntent::Startup, limiter, true)
+                            slot.memory_estimate(PullIntent::Startup, limiter, true, start_epoch)
                                 .await?,
                         )
                     } else if on_boot {
+                        let start_epoch = slot.current_start_epoch().await;
                         Some(
-                            slot.memory_estimate(PullIntent::Startup, limiter, false)
+                            slot.memory_estimate(PullIntent::Startup, limiter, false, start_epoch)
                                 .await?,
                         )
                     } else {
@@ -1312,7 +1419,7 @@ impl ModelRuntimeManager {
         deployment: &str,
         priority: crate::PriorityClass,
     ) -> Result<RunningEngine, RuntimeManagerError> {
-        let result = self.ensure_ready_inner(deployment, None).await;
+        let result = self.ensure_ready_inner(deployment, None, None).await;
         if let Err(RuntimeManagerError::Admission(rejection)) = &result {
             self.observer
                 .on_admission_rejected(deployment, priority, rejection.reason);
@@ -1325,9 +1432,12 @@ impl ModelRuntimeManager {
         &self,
         deployment: &str,
         generation: u64,
+        start_epoch: u64,
         priority: crate::PriorityClass,
     ) -> Result<RunningEngine, RuntimeManagerError> {
-        let result = self.ensure_ready_inner(deployment, Some(generation)).await;
+        let result = self
+            .ensure_ready_inner(deployment, Some(generation), Some(start_epoch))
+            .await;
         if let Err(RuntimeManagerError::Admission(rejection)) = &result {
             self.observer
                 .on_admission_rejected(deployment, priority, rejection.reason);
@@ -1339,6 +1449,7 @@ impl ModelRuntimeManager {
         &self,
         deployment: &str,
         expected_generation: Option<u64>,
+        expected_start_epoch: Option<u64>,
     ) -> Result<RunningEngine, RuntimeManagerError> {
         let snapshot = self.snapshot.load_full();
         let slot = snapshot
@@ -1346,19 +1457,34 @@ impl ModelRuntimeManager {
             .get(deployment)
             .cloned()
             .ok_or_else(|| RuntimeManagerError::UnknownDeployment(deployment.to_string()))?;
-        if expected_generation.is_some_and(|generation| generation != slot.generation) {
+        let start_epoch = match expected_start_epoch {
+            Some(start_epoch) => start_epoch,
+            None => slot.current_start_epoch().await,
+        };
+        if expected_generation.is_some_and(|generation| generation != slot.generation)
+            || !slot.accepts_start_epoch(start_epoch).await
+        {
             return Err(RuntimeManagerError::Draining(deployment.to_string()));
         }
         let memory = slot
-            .memory_estimate(PullIntent::Runtime, snapshot.limiter.clone(), true)
+            .memory_estimate(
+                PullIntent::Runtime,
+                snapshot.limiter.clone(),
+                true,
+                start_epoch,
+            )
             .await?;
-        let _placement = self.placement_lock.lock().await;
+        let placement = self.placement_lock.lock().await;
         let current = self.snapshot.load_full();
         if current
             .slots
             .get(deployment)
             .is_none_or(|current_slot| !Arc::ptr_eq(current_slot, &slot))
         {
+            slot.cancel_preparation().await;
+            return Err(RuntimeManagerError::Draining(deployment.to_string()));
+        }
+        if !slot.accepts_start_epoch(start_epoch).await {
             slot.cancel_preparation().await;
             return Err(RuntimeManagerError::Draining(deployment.to_string()));
         }
@@ -1388,7 +1514,7 @@ impl ModelRuntimeManager {
         let mut stopped_victims = Vec::new();
         for victim in reservation.evicted {
             if let Some(victim_slot) = current.slots.get(&victim) {
-                if !victim_slot.begin_idle_eviction().await {
+                if !victim_slot.begin_idle_eviction().await? {
                     self.restore_residency_after_failed_eviction(
                         previous_residency,
                         &stopped_victims,
@@ -1426,9 +1552,9 @@ impl ModelRuntimeManager {
                 }
             }
         }
-        drop(_placement);
+        drop(placement);
         match slot
-            .ensure_ready(PullIntent::Runtime, current.limiter.clone())
+            .ensure_ready(PullIntent::Runtime, current.limiter.clone(), start_epoch)
             .await
         {
             Ok(running) => {
@@ -1441,11 +1567,13 @@ impl ModelRuntimeManager {
                 Ok(running)
             }
             Err(error) => {
-                self.residency.lock().await.release(
-                    memory.device_index,
-                    deployment,
-                    slot.generation,
-                );
+                if !slot.owns_reservation().await {
+                    self.residency.lock().await.release(
+                        memory.device_index,
+                        deployment,
+                        slot.generation,
+                    );
+                }
                 Err(error)
             }
         }
@@ -1462,8 +1590,14 @@ impl ModelRuntimeManager {
             .get(deployment)
             .cloned()
             .ok_or_else(|| RuntimeManagerError::UnknownDeployment(deployment.to_string()))?;
+        let start_epoch = slot.current_start_epoch().await;
         let memory = slot
-            .memory_estimate(PullIntent::Explicit, snapshot.limiter.clone(), false)
+            .memory_estimate(
+                PullIntent::Explicit,
+                snapshot.limiter.clone(),
+                false,
+                start_epoch,
+            )
             .await?;
         slot.publish_current_state().await;
         Ok(memory)
@@ -1484,7 +1618,7 @@ impl ModelRuntimeManager {
                 None,
             )
         })?;
-        let permit = slot.admit(priority).await?;
+        let (permit, start_epoch) = slot.admit(priority).await?;
         let current = self.snapshot.load_full();
         if current
             .slots
@@ -1505,6 +1639,7 @@ impl ModelRuntimeManager {
         Ok(DeploymentAdmissionPermit {
             deployment: deployment.to_string(),
             generation: slot.generation,
+            start_epoch,
             _permit: permit,
         })
     }
@@ -1516,19 +1651,19 @@ impl ModelRuntimeManager {
 
     /// Reject new work, cancel queued work, wait boundedly, and stop one generation.
     pub async fn drain(&self, deployment: &str) -> Result<crate::DrainReport, RuntimeManagerError> {
-        let _placement = self.placement_lock.lock().await;
-        let snapshot = self.snapshot.load_full();
-        let slot = snapshot
-            .slots
-            .get(deployment)
-            .cloned()
-            .ok_or_else(|| RuntimeManagerError::UnknownDeployment(deployment.to_string()))?;
-        let reservation = slot.reservation_facts().await;
-        let report = slot
-            .drain(Duration::from_millis(
-                snapshot.desired.control.shutdown_deadline_ms,
-            ))
-            .await?;
+        let (slot, reservation, grace) = {
+            let _placement = self.placement_lock.lock().await;
+            let snapshot = self.snapshot.load_full();
+            let slot =
+                snapshot.slots.get(deployment).cloned().ok_or_else(|| {
+                    RuntimeManagerError::UnknownDeployment(deployment.to_string())
+                })?;
+            let reservation = slot.reservation_facts().await;
+            slot.begin_draining().await?;
+            let grace = Duration::from_millis(snapshot.desired.control.shutdown_deadline_ms);
+            (slot, reservation, grace)
+        };
+        let report = slot.drain(grace).await?;
         if let Some((device, _, generation, _)) = reservation {
             self.residency
                 .lock()
@@ -1641,7 +1776,7 @@ impl ModelRuntimeManager {
         &self,
         mut prepared: PreparedRevision,
     ) -> Result<ReconcileReport, RuntimeManagerError> {
-        let _placement = self.placement_lock.lock().await;
+        let placement = self.placement_lock.lock().await;
         let current = self.snapshot.load_full();
         if current.revision != prepared.base_revision {
             let error = RuntimeManagerError::StalePrepared {
@@ -1680,7 +1815,6 @@ impl ModelRuntimeManager {
             slots.insert(id.clone(), slot);
         }
 
-        self.refresh_residency_protections(&current).await;
         let candidate_ids = prepared
             .plan
             .added
@@ -1715,6 +1849,86 @@ impl ModelRuntimeManager {
             .cloned()
             .collect::<Vec<_>>();
         let grace = Duration::from_millis(prepared.desired.control.shutdown_deadline_ms);
+
+        let mut recreate_begins = Vec::new();
+        for id in &recreate_ids {
+            let Some(old) = current.slots.get(id).cloned() else {
+                continue;
+            };
+            match old.begin_recreate().await {
+                Ok(begin) => recreate_begins.push((old, begin)),
+                Err(error) => {
+                    for (begun, begin) in recreate_begins {
+                        begun.abort_recreate_begin(begin).await;
+                    }
+                    teardown_slots(
+                        candidate_ids
+                            .iter()
+                            .filter_map(|candidate| slots.get(candidate).cloned())
+                            .collect(),
+                        grace,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        }
+        drop(placement);
+
+        let mut recreate_checkpoints = Vec::new();
+        let mut pending_recreates = recreate_begins.into_iter();
+        while let Some((old, begin)) = pending_recreates.next() {
+            match old.finish_recreate(begin, grace).await {
+                Ok(checkpoint) => recreate_checkpoints.push((old, checkpoint)),
+                Err(error) => {
+                    for (pending, begin) in pending_recreates {
+                        pending.abort_recreate_begin(begin).await;
+                    }
+                    teardown_slots(
+                        candidate_ids
+                            .iter()
+                            .filter_map(|candidate| slots.get(candidate).cloned())
+                            .collect(),
+                        grace,
+                    )
+                    .await;
+                    if let Some(rollback) =
+                        rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
+                    {
+                        return Err(RuntimeManagerError::Prepare(format!(
+                            "{error}; recreate rollback failed: {rollback}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let placement = self.placement_lock.lock().await;
+        let latest = self.snapshot.load_full();
+        if latest.revision != prepared.base_revision {
+            let error = RuntimeManagerError::StalePrepared {
+                based_on: prepared.base_revision,
+                current: latest.revision,
+            };
+            teardown_slots(
+                candidate_ids
+                    .iter()
+                    .filter_map(|candidate| slots.get(candidate).cloned())
+                    .collect(),
+                grace,
+            )
+            .await;
+            if let Some(rollback) =
+                rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
+            {
+                return Err(RuntimeManagerError::Prepare(format!(
+                    "{error}; recreate rollback failed: {rollback}"
+                )));
+            }
+            return Err(error);
+        }
+        self.refresh_residency_protections(&current).await;
         let mut planned = self.residency.lock().await.clone();
         for id in &recreate_ids {
             let Some(old) = current.slots.get(id) else {
@@ -1810,41 +2024,21 @@ impl ModelRuntimeManager {
                 grace,
             )
             .await;
-            return Err(error);
-        }
-
-        let mut recreate_checkpoints = Vec::new();
-        for id in &recreate_ids {
-            let Some(old) = current.slots.get(id).cloned() else {
-                continue;
-            };
-            match old.stop_for_recreate(grace).await {
-                Ok(checkpoint) => recreate_checkpoints.push((old, checkpoint)),
-                Err(error) => {
-                    teardown_slots(
-                        candidate_ids
-                            .iter()
-                            .filter_map(|candidate| slots.get(candidate).cloned())
-                            .collect(),
-                        grace,
-                    )
-                    .await;
-                    if let Some(rollback) =
-                        rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
-                    {
-                        return Err(RuntimeManagerError::Prepare(format!(
-                            "{error}; recreate rollback failed: {rollback}"
-                        )));
-                    }
-                    return Err(error);
-                }
+            if let Some(rollback) =
+                rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
+            {
+                return Err(RuntimeManagerError::Prepare(format!(
+                    "{error}; recreate rollback failed: {rollback}"
+                )));
             }
+            return Err(error);
         }
 
         let mut launch_error = None;
         for (id, slot, memory, _) in &warm_specs {
+            let start_epoch = slot.current_start_epoch().await;
             match slot
-                .ensure_ready(PullIntent::Startup, prepared.limiter.clone())
+                .ensure_ready(PullIntent::Startup, prepared.limiter.clone(), start_epoch)
                 .await
             {
                 Ok(running) if &running.memory == memory => {
@@ -1903,7 +2097,7 @@ impl ModelRuntimeManager {
             slots,
             limiter: prepared.limiter,
         }));
-        drop(_placement);
+        drop(placement);
         let published = self.snapshot.load_full();
         for slot in published.slots.values() {
             slot.activate_observation().await;
@@ -2273,7 +2467,8 @@ impl ProductionPreparedDeployment {
             .as_ref()
             .map(|entry| entry.kv_quant)
             .unwrap_or(KvCacheQuant::Auto);
-        let mut fit = crate::fit::plan_fit_auto_kv_with_margin(
+        let concurrency = self.desired.desired.max_concurrency.unwrap_or(1);
+        let fit = crate::fit::plan_fit_auto_kv_with_margin_and_concurrency(
             self.probe.as_ref(),
             &metadata,
             std::slice::from_ref(&self.resolved.quant),
@@ -2281,26 +2476,9 @@ impl ProductionPreparedDeployment {
             crate::fit::DEFAULT_OVERHEAD,
             self.safety_margin,
             kv_quant.bytes_per_element(),
+            concurrency,
         )
         .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
-        let concurrency = u64::from(self.desired.desired.max_concurrency.unwrap_or(1));
-        fit.memory.kv_bytes = fit
-            .memory
-            .kv_bytes
-            .checked_mul(concurrency)
-            .ok_or_else(|| {
-                RuntimeManagerError::Prepare("KV memory estimate overflow".to_string())
-            })?;
-        fit.memory.total_bytes = fit
-            .memory
-            .weight_bytes
-            .checked_add(fit.memory.kv_bytes)
-            .and_then(|total| total.checked_add(fit.memory.runtime_overhead_bytes))
-            .and_then(|total| total.checked_add(fit.memory.safety_margin_bytes))
-            .ok_or_else(|| {
-                RuntimeManagerError::Prepare("total memory estimate overflow".to_string())
-            })?;
-        fit.estimated_vram_bytes = fit.memory.total_bytes;
         let selected_devices = if self.worker.accelerator == AcceleratorKind::Cpu {
             Vec::new()
         } else {
