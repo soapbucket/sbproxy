@@ -41,13 +41,20 @@ embedded = ["dep:mistralrs", "dep:axum"]
 sbproxy-util.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
 serde_yaml = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+fs2 = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+zeroize = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+ulid = { workspace = true }
 nvml-wrapper = { version = "0.10", optional = true }
 # Weight download is a plain HTTP GET that follows HF's redirect to the
 # resolve-cache/Xet backend; reqwest's default redirect policy resolves

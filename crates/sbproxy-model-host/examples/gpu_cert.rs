@@ -102,7 +102,7 @@ fn runtime_cert(repo: &str) {
         Arc::new(ConfigDirMetadataProvider {
             cache_root: cache.clone(),
             revision: "main".to_string(),
-            catalog: Catalog::builtin(),
+            catalog: Arc::new(Catalog::builtin()),
         }),
         Box::new(|| ProcessEngineLauncher::with_timeout(Duration::from_secs(420))),
         false, // no container runtime; venv vLLM on PATH
@@ -218,7 +218,7 @@ fn sleepwake_cert(repo: &str) {
         Arc::new(ConfigDirMetadataProvider {
             cache_root: cache.clone(),
             revision: "main".to_string(),
-            catalog: Catalog::builtin(),
+            catalog: Arc::new(Catalog::builtin()),
         }),
         Box::new(|| ProcessEngineLauncher::with_timeout(Duration::from_secs(420))),
         false,
@@ -347,7 +347,7 @@ fn llamacpp_cert(gguf_repo: &str) {
         Arc::new(ConfigDirMetadataProvider {
             cache_root: cache.clone(),
             revision: "main".to_string(),
-            catalog: Catalog::builtin(),
+            catalog: Arc::new(Catalog::builtin()),
         }),
         Box::new(|| ProcessEngineLauncher::with_timeout(Duration::from_secs(420))),
         false,
@@ -411,7 +411,7 @@ fn translators_cert(repo: &str) {
         Arc::new(ConfigDirMetadataProvider {
             cache_root: cache.clone(),
             revision: "main".to_string(),
-            catalog: Catalog::builtin(),
+            catalog: Arc::new(Catalog::builtin()),
         }),
         Box::new(|| ProcessEngineLauncher::with_timeout(Duration::from_secs(420))),
         false,

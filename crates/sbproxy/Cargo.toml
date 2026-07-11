@@ -89,6 +89,8 @@ sbproxy-config.workspace = true
 # `doctor --install`: PATH probes, the pinned llama.cpp release
 # download, and the cache-dir resolver.
 sbproxy-model-host.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
 # WOR-1540: `ai ledger verify` reuses the verifiable-ledger crypto.
 sbproxy-ai.workspace = true
 sbproxy-modules.workspace = true

@@ -1,5 +1,5 @@
 # SBproxy documentation
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-10*
 
 Call any model. Serve your own. Govern both. SBproxy is the open-source OpenRouter alternative: one Apache-2.0 binary that routes to 66 providers or serves the weights on your GPUs, with the guardrails, keys, budgets, and spend ledger applying to every model the same way, and a real Pingora-based reverse proxy underneath for the rest of your traffic.
 
@@ -51,6 +51,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [quickstart-serve.md](quickstart-serve.md) - run your first model in 60 seconds: `curl | sh`, then `sbproxy run <model>`, on a Linux GPU, a Mac, or a CPU box.
 - [self-hosting.md](self-hosting.md) - single binary to self-host: install, the serve-only quickstart, the model manifest, aliases, spill-to-cloud, and the OpenRouter parity map.
 - [model-host.md](model-host.md) - the gateway hosts the LLM itself: catalog, the `serve:` block, the GPU fit planner, and the engine supervisor (single-node local serving).
+- [model-host-capabilities.md](model-host-capabilities.md) - generated stable, preview, config-only, and unsupported contracts for model-host features and configuration fields.
 - [gpu-fit-planning.md](gpu-fit-planning.md) - how the fit planner picks a quant for your GPU: capability tiers, the weights + KV math, throughput, and why it refuses an impossible config.
 - [model-host-certification.md](model-host-certification.md) - provisioning a cloud L4 GPU and running the model-host Definition-of-Done certification (the `gpu-nvidia` / `weights` features).
 - [security-model-host.md](security-model-host.md) - the config-spawn attack surface: engine allowlist (no cmd:), sha256 weights, PATH/pinned binaries, and what the spawn phase must enforce.
@@ -137,6 +138,8 @@ Point a framework you already run at the gateway: chat completions through the O
 
 ### Contributing
 - [architecture.md](architecture.md) - internals: pipeline, hot reload, plugin system.
+- [self-hosted-openrouter-delivery-design.md](self-hosted-openrouter-delivery-design.md) - approved architecture, PR boundaries, and certification contract for managed multi-node model serving.
+- [self-hosted-openrouter-foundations-implementation-plan.md](self-hosted-openrouter-foundations-implementation-plan.md) - test-first task plan and review checkpoints for the catalog, artifact, and pull foundations PR.
 - [build.md](build.md) - building from source, supported platforms, optional features.
 - [CONTRIBUTING.md](../CONTRIBUTING.md) - how to set up a dev environment and submit changes.
 

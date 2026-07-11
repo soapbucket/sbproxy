@@ -1,4 +1,4 @@
-# Certified model catalog for the sbproxy model host (WOR-1662).
+# Certified model catalog for the sbproxy model host (WOR-1662, WOR-1837).
 #
 # Maps a short, stable catalog_id to the Hugging Face repo, the
 # official quant variants (most-preferred first), the parameter shape,
@@ -6,10 +6,10 @@
 # (crate::fit) does the precise capability-aware selection; this file
 # is data only.
 #
-# Seeded with the certified-first models from the design doc. Add a
-# model by appending an entry; catalog_id is the key an operator names
-# in `serve:`. An operator can always bypass this file with an
-# explicit hf:Org/Repo:QUANT reference.
+# Existing v1-shaped entries remain preview-compatible while their exact
+# files are curated. New v2 entries pin every byte needed by an engine.
+schema_version: 2
+catalog_revision: builtin-2026-07-10
 models:
   qwen3-32b:
     hf_repo: Qwen/Qwen3-32B
@@ -66,3 +66,27 @@ models:
     license: llama3.1
     family: llama
     min_vram_hint_gib: 6.0
+
+  # Small immutable artifact used to exercise the complete managed
+  # artifact path without claiming production certification yet.
+  qwen2.5-0.5b-instruct:
+    params: 0.5B
+    license: apache-2.0
+    family: qwen
+    context_length: 32768
+    variants:
+      - id: q4_k_m
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF
+        revision: 9217f5db79a29953eb74d5343926648285ec7e67
+        files:
+          - path: qwen2.5-0.5b-instruct-q4_k_m.gguf
+            sha256: 74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db
+            size_bytes: 491400032
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 1073741824
+        stability: preview
+        certification: bootstrap-metadata-2026-07-10

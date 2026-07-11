@@ -28,8 +28,19 @@ first so the `file:` source has something to verify):
 ```bash
 mkdir -p weights/qwen3-coder-gguf
 printf 'demo weights\n' > weights/qwen3-coder-gguf/model.gguf
+docker compose run --rm sbproxy models pull offline-coder \
+  --variant demo_q4 \
+  --catalog-file /etc/sbproxy/models.yaml \
+  --cache-dir /var/lib/sbproxy/models \
+  --offline
 docker compose up
 ```
+
+The explicit pull copies the read-only source into the content-addressed
+cache, checks its 13-byte length and SHA-256, and atomically publishes
+the snapshot. `--offline` makes a transport call impossible. Because
+the manifest says `pull: manual`, skipping this step makes the runtime
+fail closed instead of acquiring on the first request.
 
 ## What to expect
 
@@ -46,7 +57,9 @@ docker compose exec client curl -sS --max-time 5 https://test.sbproxy.dev
 # exits nonzero: timeout or resolution failure, nothing routes out
 ```
 
-On a host with no GPU, the proxy boots, logs a warning naming the
-blocker, and clean prompts return 502 because no engine is running.
-Serving actual tokens from the local weights needs a GPU host; see
+The 13-byte demo file proves the offline acquisition and policy chain;
+it is not a real GGUF and cannot produce tokens. Replace it and the
+manifest size/digest with a vetted GGUF for inference. On a host with
+no usable worker or engine, the proxy boots, logs a warning naming the
+blocker, and clean prompts return 502. See
 [`docs/model-host.md`](../../docs/model-host.md).

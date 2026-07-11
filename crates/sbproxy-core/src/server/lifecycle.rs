@@ -216,6 +216,7 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
 }
 
 fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
+    super::model_host::set_model_host_config_path(std::path::Path::new(config_path));
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{config_path}': {e}"))?;
     let compiled = sbproxy_config::compile_config(&yaml)?;
@@ -363,6 +364,12 @@ fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
                 }
             }
         }
+    }
+    if let Some(runtime) = super::model_host::initialize_model_host(&new_pipeline.actions)
+        .map_err(|error| anyhow::anyhow!("model host initialization failed: {error}"))?
+    {
+        super::model_host::warm_on_boot_blocking(runtime)
+            .map_err(|error| anyhow::anyhow!("model host startup warming failed: {error}"))?;
     }
     reload::load_pipeline(new_pipeline);
     tracing::info!("config reloaded successfully");
@@ -673,6 +680,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     use pingora_proxy::http_proxy_service;
 
     // Load and compile the config.
+    super::model_host::set_model_host_config_path(std::path::Path::new(config_path));
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
     let initial_content_hash = crate::identity::config_revision(yaml.as_bytes());
@@ -876,6 +884,15 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 "enterprise startup hook failed; continuing without enterprise features"
             );
         }
+    }
+
+    // Resolve and verify every `pull: on_boot` artifact before the
+    // pipeline becomes requestable. No engine is started by warming.
+    if let Some(runtime) = super::model_host::initialize_model_host(&pipeline.actions)
+        .map_err(|error| anyhow::anyhow!("model host initialization failed: {error}"))?
+    {
+        super::model_host::warm_on_boot_blocking(runtime)
+            .map_err(|error| anyhow::anyhow!("model host startup warming failed: {error}"))?;
     }
 
     // Store in hot-reload slot.

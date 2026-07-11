@@ -175,6 +175,10 @@ jobs:
         if: steps.filter.outputs.code == 'true'
         run: bash scripts/check-config-schema.sh
 
+      - name: model-host capability matrix is current (WOR-1836)
+        if: steps.filter.outputs.code == 'true'
+        run: bash scripts/check-model-host-capabilities.sh
+
       - name: cleanup build artifacts
         if: always() && steps.filter.outputs.code == 'true'
         run: bash scripts/cleanup-build-artifacts.sh --ci

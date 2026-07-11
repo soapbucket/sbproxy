@@ -110,6 +110,7 @@ futures = "0.3"
 
 # Bytes and buffers
 bytes = "1"
+zeroize = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

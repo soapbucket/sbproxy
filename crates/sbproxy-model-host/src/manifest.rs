@@ -307,31 +307,30 @@ mod tests {
     #[test]
     fn example_manifest_parses_with_all_fields() {
         // Locks examples/model-manifest/models.yaml to the parser and
-        // covers revision pin + per-file sha256 + source scheme + engine
-        // + pull policy (WOR-1681 acceptance).
+        // covers catalog v2 revision, exact files, source scheme,
+        // engine, requirements, and pull policy.
         let yaml = include_str!("../../../examples/model-manifest/models.yaml");
         let cat = crate::catalog::Catalog::from_yaml(yaml).expect("example manifest parses");
-        let hf = cat.get("qwen3-14b").expect("qwen3-14b");
-        assert_eq!(hf.source.as_deref(), Some("hf:Qwen/Qwen3-14B"));
-        assert_eq!(hf.revision.as_deref(), Some("main"));
+        assert_eq!(cat.catalog_revision, "example-model-manifest-2026-07-10");
+        let hf = cat.get("qwen2.5-0.5b-instruct").expect("managed Qwen");
         assert_eq!(hf.pull, crate::catalog::PullPolicy::OnBoot);
+        let variant = hf.variants.first().expect("exact Qwen variant");
+        assert_eq!(variant.id, "q4_k_m");
+        assert_eq!(variant.revision, "9217f5db79a29953eb74d5343926648285ec7e67");
+        assert_eq!(variant.files[0].size_bytes, 491_400_032);
         // The source scheme parses to an hf repo.
         assert_eq!(
-            SourceScheme::parse(hf.source.as_deref().unwrap()).unwrap(),
+            SourceScheme::parse(&variant.source).unwrap(),
             SourceScheme::Hf {
-                repo: "Qwen/Qwen3-14B".into()
+                repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF".into()
             }
         );
-        // Gated model carries a SecretResolver token reference.
-        let gated = cat.get("llama-3.1-8b").expect("llama");
-        assert_eq!(gated.hf_token.as_deref(), Some("${HF_TOKEN}"));
-        // Air-gapped model: file: source + per-file digest.
+        // Air-gapped model: file: source + exact file metadata.
         let offline = cat.get("offline-coder").expect("offline");
-        assert!(SourceScheme::parse(offline.source.as_deref().unwrap())
-            .unwrap()
-            .is_local());
-        assert!(offline.sha256.contains_key("model.gguf"));
-        assert_eq!(offline.engine, crate::config::EngineChoice::LlamaCpp);
+        let variant = offline.variants.first().expect("offline variant");
+        assert!(SourceScheme::parse(&variant.source).unwrap().is_local());
+        assert_eq!(variant.files[0].path, "model.gguf");
+        assert_eq!(variant.engines, [crate::config::EngineKind::LlamaCpp]);
     }
 
     #[test]

@@ -30,12 +30,18 @@
 //! - [`config`] - the `serve:` config block an operator writes.
 
 pub mod acquire;
+pub mod artifact;
+pub mod artifact_spec;
+pub mod capabilities;
 pub mod catalog;
 pub mod config;
+pub mod deployment;
+pub mod deployment_store;
 #[cfg(feature = "embedded")]
 pub mod embedded;
 pub mod fit;
 pub mod hybrid;
+pub mod jobs;
 pub mod kv_tiering;
 pub mod launch;
 pub mod llama_release;
@@ -60,17 +66,44 @@ pub mod uv_release;
 pub mod weights;
 
 pub use acquire::{plan_binary_acquire, BinaryAcquirePlan};
-pub use catalog::{Catalog, CatalogEntry, ModelRef, PullPolicy, ResolveError};
+#[cfg(feature = "weights")]
+pub use artifact::HttpArtifactTransport;
+pub use artifact::{
+    AcquisitionContext, ArtifactCacheMetadata, ArtifactCacheState, ArtifactError, ArtifactManager,
+    ArtifactObserver, ArtifactTransport, CacheProtection, GcReport, NetworkPolicy, PullIntent,
+    ReadyArtifact, ResponseDisposition, SourceCredential, TransportRequest, TransportResponse,
+    UnavailableArtifactTransport,
+};
+pub use artifact_spec::{
+    AcceleratorKind, ArtifactFile, ArtifactFormat, ArtifactVariant, ComputeCapability,
+    ResolveArtifactRequest, ResolvedArtifact, VariantRequirements, WorkerProfile,
+};
+pub use capabilities::{
+    capability_registry, CapabilityDomain, CapabilityEntry, CapabilityFinding, CapabilityRegistry,
+    ConfigFieldCapability, ConsumerContract, SupportLevel, CAPABILITY_REGISTRY_VERSION,
+};
+pub use catalog::{
+    ArtifactResolveError, Catalog, CatalogDiagnostic, CatalogEntry, CatalogError, CatalogLoad,
+    ModelRef, PullPolicy, ResolveError,
+};
 pub use config::{
     AcquireSource, ChunkedPrefill, EngineAccel, EngineAcquire, EngineChoice, EngineDoctor,
     EngineEnv, EngineKind, EngineLaunchMethod, EngineProvisioning, EvictionPolicy, KvCacheQuant,
     LoraAdapter, ModelHostConfig, ServeEntry, SpecMethod, SpeculativeConfig,
 };
+pub use deployment::{
+    DeploymentError, DeploymentRevision, DeploymentRevisionDraft, DeploymentSourceMode,
+    ModelDeployment, RolloutPolicy, DEPLOYMENT_SCHEMA_VERSION,
+};
+pub use deployment_store::{DeploymentStoreError, FileDeploymentRevisionStore};
 pub use fit::{
     estimate_throughput, fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
     ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
 };
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
+pub use jobs::{
+    FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
+};
 pub use kv_tiering::{KvTier, KvTieringPolicy, TierDecision};
 pub use launch::{
     build_launch_spec, chunk_size_for_ttft, serving_flags, should_speculate, ProcessEngineLauncher,

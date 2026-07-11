@@ -1,6 +1,6 @@
 # scripts/
 
-*Last modified: 2026-06-17*
+*Last modified: 2026-07-10*
 
 
 Helper scripts that wrap the day-to-day dev loop and the CI runners
@@ -20,6 +20,7 @@ script's header says otherwise.
 | `generate-certs.sh` | Mint a local CA + leaf cert for TLS tests. | local only |
 | `install.sh` | One-command install of `sbproxy` from a release archive. | end-user |
 | `docs-ci.sh` | Wave 1 / Q1.10 doc CI runner: lychee + code-block check. | `.github/workflows/docs-ci.yml` (B1.10) |
+| `check-model-host-capabilities.sh` | Fail when the generated model-host capability matrix drifts from the executable registry. | `.github/workflows/ci.yml` |
 | `examples-smoke.sh` | Local examples smoke runner. | local only: `make examples-smoke` |
 
 Per-script usage and env knobs live in each script's leading comment

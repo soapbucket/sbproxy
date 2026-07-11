@@ -13,22 +13,25 @@ across many nodes is separate work.
 
 ## Status
 
-This is landing in phases. What ships today is the hardware-independent
-core: the model catalog and its resolver, the `serve:` config surface,
-the GPU fit planner (which quant fits and runs on a given card), the
-engine-supervisor state machine, the process launcher (it builds the
-engine argv, spawns the subprocess, polls a loopback readiness probe,
-and kills it), the VRAM-budget residency manager (LRU eviction under a
-byte budget), and the hybrid pieces (model aliases and the dollars-saved
-math). GPU discovery, Hugging Face weight download, and real vLLM /
-llama.cpp bring-up plug in behind the traits this core defines
-(`GpuProbe`, `EngineLauncher`). These are certified on real GPUs: a GGUF
-model serves on Metal on an Apple Silicon Mac, and a safetensors model
-serves on an NVIDIA L4 through vLLM with the weights resident in GPU
-memory. The launcher's spawn / probe / kill machinery is also tested
-against a fake process so the lifecycle is exercised with no hardware. On
-a host with no GPU or no engine binary, a `serve:` block parses and
-validates but starts no engine.
+The single-node path is executable end to end. Catalog v2 resolves one
+immutable variant for the current worker, the artifact service stages
+and resumes downloads under cross-process locks, verifies every exact
+size and SHA-256, and atomically publishes a content-addressed
+snapshot. Startup blocks on `pull: on_boot`; `on_demand` verifies before
+fit or residency planning; `manual` requires `sbproxy models pull` on a
+miss. A managed engine receives only the verified local snapshot or
+GGUF path. It never falls back to a repository after exact resolution.
+
+The GPU fit planner, supervised process launcher, VRAM residency
+manager, local-provider routing, and governance path then run as before.
+Real GGUF on Apple Metal and safetensors through vLLM on an NVIDIA L4
+have hardware certification. GCP validation for this foundation series
+is intentionally deferred to the final integration PR. Legacy catalog
+v1 and raw `hf:` entries remain a documented preview compatibility path
+and do not have the complete atomic artifact contract. Multi-node
+placement, admin mutation, and UI management are later PRs; the
+[capability matrix](model-host-capabilities.md) is the exact status
+source.
 
 The real GPU bindings ship in the released binary: `gpu-nvidia` (an
 NVML `GpuProbe` with an `nvidia-smi` fallback) and `model-weights`
@@ -66,19 +69,19 @@ origins:
         # No base_url: the gateway resolves the engine's loopback port
         # itself once the engine is ready.
         - name: local
-          default_model: qwen3-14b
-          models: [qwen3-14b, qwen3-8b]
+          default_model: qwen2.5-0.5b-instruct
+          models: [qwen2.5-0.5b-instruct, qwen3-8b]
           serve:
             eviction: lru          # or `never`
-            cache_budget_gib: 200
+            cache_dir: /var/lib/sbproxy/models
             models:
-              # Catalog id: the repo, quant list, and GGUF file come
-              # from the catalog entry.
-              - model: qwen3-14b
-                engine: vllm
+              # Managed catalog v2: exact source revision, file, size,
+              # digest, format, and requirements come from the catalog.
+              - model: qwen2.5-0.5b-instruct
+                variant: q4_k_m
                 keep_alive: 30m
-              # Explicit ref: names the repo, quant, and file directly,
-              # belt-and-braces when you want zero catalog indirection.
+              # Legacy preview compatibility. It lacks the complete
+              # catalog v2 artifact contract.
               - model: hf:Qwen/Qwen3-8B-GGUF:Q4_K_M
                 name: qwen3-8b
                 gguf_file: Qwen3-8B-Q4_K_M.gguf
@@ -88,12 +91,12 @@ origins:
                 extra_args: ["--jinja"]
 ```
 
-A model is either a catalog id (see below) or an explicit
-`hf:Org/Repo:QUANT` reference that bypasses the catalog; both forms
-serve. A raw `hf:` entry needs a `name:` (the model id every other
-plane sees; a catalog entry borrows its id), and a GGUF entry from a
-multi-file repo should pin `gguf_file:` so the runtime never guesses
-the quant. `engine` is an
+A managed model is a catalog v2 logical ID plus an optional exact
+`variant:` pin. With no pin, resolution deterministically chooses the
+first compatible safe variant for this worker. Raw
+`hf:Org/Repo:QUANT` and catalog v1 entries still serve through the
+preview migration path. A raw `hf:` entry needs a `name:` and a GGUF
+entry from a multi-file repo should pin `gguf_file:`. `engine` is an
 allowlisted enum (`vllm`, `llama_cpp`), never a command string: config
 picks an engine and its knobs, and the runtime owns the argument
 template; `extra_args` appends engine flags one argv element at a
@@ -104,6 +107,88 @@ evicts the least-recently-used idle model, `never` pins residency and
 refuses a new model when full. See
 [`examples/ai-local-serving`](../examples/ai-local-serving) and
 [`examples/use-case-local-first`](../examples/use-case-local-first).
+
+## Managed artifacts
+
+Catalog v2 is the stable artifact boundary. Resolution returns one
+typed artifact identity containing the catalog revision, logical model,
+variant, format, quant, engine, source revision, complete file list,
+context, license, and support state. A canonical SHA-256 of that
+identity addresses the cache.
+
+Acquisition uses this order:
+
+1. Lock the artifact across processes and inspect any existing state.
+2. Enforce pull intent, `pull` policy, and offline policy before a
+   transport can run.
+3. Resume only when URL, entity tag, expected digest, expected size, and
+   completed byte count still match.
+4. Stage every file under `partials/`, verify exact lengths and hashes,
+   and scan opted-in pickle files before finalization.
+5. Publish blobs and the immutable snapshot atomically, then record a
+   durable ready job.
+6. Hand only verified local paths to vLLM, llama.cpp, or the embedded
+   engine.
+
+The cache root contains `blobs/sha256`, `snapshots`, `metadata`,
+`partials`, `locks`, and `jobs`. Credentials are transport-only,
+redacted in formatted errors, zeroized on drop, and absent from disk
+metadata. A failed digest or unsafe pickle never creates a ready
+snapshot.
+
+Pull policy is explicit:
+
+- `on_boot` is acquired and verified before the request pipeline is
+  published. Warming starts no engine and allocates no serving port.
+- `on_demand` is acquired before metadata fit, residency, or launch on
+  the first request.
+- `manual` refuses startup and runtime cache misses. Use an explicit
+  pull.
+
+```bash
+# With sb.yml, the default selects configured models plus catalog
+# entries marked on_boot and inherits catalog/cache policy.
+sbproxy models pull -f sb.yml
+
+# Without sb.yml, no model arguments selects the on_boot set.
+sbproxy models pull --catalog-file models.yaml
+
+# Pull one exact variant with human progress on stderr.
+sbproxy models pull qwen2.5-0.5b-instruct \
+  --variant q4_k_m \
+  --catalog-file models.yaml \
+  --cache-dir /var/lib/sbproxy/models
+
+# Permit only verified hits or file: sources.
+sbproxy models pull offline-coder \
+  --variant q4_k_m \
+  --catalog-file models.yaml \
+  --offline
+```
+
+`-f/--config` resolves `catalog_file` relative to `sb.yml`, inherits
+`cache_dir`, variant and engine choices, and applies `cache_budget_gib`
+after successful pulls. `--all` pulls every catalog v2 model compatible
+with the current worker and reports incompatible variants as skips. `--engine` can force
+`vllm`, `llama-cpp`, or `embedded`. JSON output includes the selected
+variant, engine, artifact digest, verified byte count, snapshot path,
+and durable job ID. `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN` are accepted
+for explicit gated pulls. Runtime secret-reference wiring is not yet a
+stable capability, so pre-pull gated artifacts before startup.
+
+`sbproxy models list` shows the selected worker-compatible variant,
+format, exact size, engine, fit, and verified cache state. Incomplete v1
+entries say `preview-incomplete` instead of inferring readiness from a
+nonempty legacy directory. `models show <id>` emits the catalog
+revision and every exact variant, including requirements and files.
+
+The artifact service also provides protected LRU collection. It never
+deletes resident, pinned, locked, downloading, verifying, or already
+deleting artifacts, and it accounts for shared physical blobs. The
+`models pull -f` enforces `cache_budget_gib` after a successful pull.
+Automatic server-side enforcement on every on-demand acquisition is
+not wired yet, so the field remains `config_only` in the capability
+matrix and should not be treated as a continuous disk quota in this PR.
 
 ## Priority lanes and admission
 
@@ -236,28 +321,34 @@ it cannot, the single thing to install.
 
 ## The catalog
 
-The catalog maps a short, stable id like `qwen3-32b` to a Hugging Face
-repo, its official quant variants, the parameter shape, license,
-family, and a coarse VRAM hint. A committed default catalog seeds the
-certified-first models so a stock deployment resolves them with no
-external fetch; an operator can supply their own catalog file, and can
-always skip the catalog with an `hf:` reference. The catalog is data
-only: it says what exists, and the fit planner decides what runs.
+The catalog maps a stable logical ID to immutable executable variants.
+Catalog v2 requires a nonempty `catalog_revision`; logical models carry
+shape, license, family, and context; variants carry exact format,
+quant, engines, source revision, files, hardware requirements, support
+level, and certification evidence. Variant order is deterministic and
+safe tensor formats outrank pickle. Pickle is refused unless the
+logical model explicitly opts in and the bytes pass opcode scanning.
+
+The built-in catalog contains one real pinned bootstrap GGUF while
+older entries migrate from v1. Operator catalogs replace the built-in
+catalog for that `serve:` block. A relative `catalog_file` resolves
+from the directory containing the active `sb.yml`, so startup, reload,
+doctor, and runtime do not depend on the shell's working directory.
 
 ## The model manifest
 
-Beyond a throwaway model, an operator keeps a manifest: one reviewable
-file that says which models exist and everything needed to fetch and
-verify them. Point `serve.catalog_file` at it. It is the fleet fact
-sheet; `sb.yml` is the box fact sheet (what this box serves, where its
-cache lives). Each entry carries a `source` (`hf:Org/Repo`, an
-air-gapped `file:` path, or `ms:` reserved for ModelScope), a pinned
-`revision`, per-file `sha256` digests (a curated manifest doubles as a
-supply-chain allowlist), a gated-repo `hf_token` as a secret reference,
-a default `engine`, and a `pull` policy (`on_boot`, `on_demand`,
-`manual`). The weight cache defaults to `/var/lib/sbproxy/models` for a
-service, honors `$HF_HOME` when set, and is overridable with
-`cache_dir`. See [`examples/model-manifest`](../examples/model-manifest).
+Beyond a throwaway model, keep one reviewable catalog v2 manifest. It
+is the fleet fact sheet; `sb.yml` is the node fact sheet that selects
+logical IDs and variants. `hf:` and `file:` sources are executable;
+ModelScope remains reserved and fails closed. Stable Hugging Face
+variants require a 40-character commit revision. Every file requires a
+safe relative path, positive exact size, and lowercase SHA-256.
+
+The cache honors an explicit `cache_dir`, then `$HF_HOME`, then the
+platform default. See
+[`examples/model-manifest`](../examples/model-manifest) for a real
+pinned artifact and [`examples/use-case-air-gapped`](../examples/use-case-air-gapped)
+for an offline `file:` pull.
 
 ## The fit planner
 

@@ -384,6 +384,11 @@ pub struct ServeEntry {
     /// Catalog id (`qwen3-32b`) or an explicit `hf:Org/Repo:QUANT`
     /// reference. Resolved by [`crate::catalog`].
     pub model: String,
+    /// Exact catalog v2 artifact variant to run. When omitted, the
+    /// runtime deterministically selects a compatible variant for the
+    /// current worker. Pin this for reproducible deployments.
+    #[serde(default)]
+    pub variant: Option<String>,
     /// The model id every other plane sees (WOR-1683): routing,
     /// `allowed_models`, rate limits, budgets, aliases. Defaults to the
     /// catalog id in `model`; **required** when `model` is a raw `hf:`
@@ -391,36 +396,45 @@ pub struct ServeEntry {
     /// [`Self::effective_name`].
     #[serde(default)]
     pub name: Option<String>,
+    /// Support: preview.
     /// Engine to serve it with. Defaults to `auto` (resolved per model
     /// at boot from the weight format and what is installed).
     #[serde(default)]
     pub engine: EngineChoice,
+    /// Support: preview.
     /// Idle time before the engine is unloaded to free VRAM. Go
     /// duration syntax (`10m`, `1h`); `None` means never auto-unload.
     #[serde(default)]
     pub keep_alive: Option<String>,
+    /// Support: preview.
     /// Context length to plan VRAM for and pass to the engine.
     /// `None` uses the model's declared max (clamped by the fit
     /// planner to what actually fits).
     #[serde(default)]
     pub max_context: Option<u64>,
+    /// Support: preview.
     /// Extra engine flags appended to the templated args. Values only,
     /// no shell: each entry is passed as one argv element.
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// Support: preview.
     /// KV-cache quantization. Defaults to `Auto` (the weight quant's
     /// default KV dtype).
     #[serde(default)]
     pub kv_quant: KvCacheQuant,
+    /// Support: preview.
     /// Speculative decoding. `None` disables it.
     #[serde(default)]
     pub speculative: Option<SpeculativeConfig>,
+    /// Support: preview.
     /// Chunked-prefill settings. `None` uses the engine default.
     #[serde(default)]
     pub chunked_prefill: Option<ChunkedPrefill>,
+    /// Support: preview.
     /// LoRA adapters served over this base model.
     #[serde(default)]
     pub lora_adapters: Vec<LoraAdapter>,
+    /// Support: preview.
     /// Keep this model resident: it is never evicted to make room for
     /// another (WOR-1672). Use for a latency-critical model that must
     /// stay hot. A set of pinned models is therefore never split.
@@ -428,6 +442,7 @@ pub struct ServeEntry {
     /// rejected instead.
     #[serde(default)]
     pub pinned: bool,
+    /// Support: preview.
     /// vLLM tool-call parser to enable auto tool-choice (WOR-1668), e.g.
     /// `hermes` (Qwen), `llama3_json`, `mistral`. When set, the engine
     /// launches with `--enable-auto-tool-choice --tool-call-parser
@@ -435,17 +450,20 @@ pub struct ServeEntry {
     /// rejects auto tool-choice. `None` leaves tool calling off.
     #[serde(default)]
     pub tool_call_parser: Option<String>,
+    /// Support: preview.
     /// CPU KV-cache tier size in GiB (WOR-1687): vLLM's `--swap-space`,
     /// the CPU pool it spills GPU KV blocks to under pressure so a
     /// longer effective context / larger batch survives beyond GPU
     /// VRAM. `None` uses the engine default.
     #[serde(default)]
     pub swap_space_gib: Option<u64>,
+    /// Support: preview.
     /// GiB of model weights to keep in CPU RAM (WOR-1687): vLLM's
     /// `--cpu-offload-gb`, trading PCIe bandwidth for VRAM so a model
     /// that does not fit can still load. `None` disables offload.
     #[serde(default)]
     pub cpu_offload_gib: Option<u64>,
+    /// Support: preview.
     /// Max LoRA adapters resident on the engine at once (WOR-1673).
     /// When set below the number of configured `lora_adapters`, the
     /// engine loads adapters on demand and evicts the least-recently
@@ -454,6 +472,7 @@ pub struct ServeEntry {
     /// suits a small, fixed adapter set.
     #[serde(default)]
     pub max_loras: Option<usize>,
+    /// Support: preview.
     /// For a llama.cpp GGUF model, the exact GGUF filename to serve from
     /// a multi-file repo (WOR-1656), e.g.
     /// `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf`. With the `weights` feature
@@ -473,14 +492,17 @@ pub struct ModelHostConfig {
     /// of any cloud fallback.
     #[serde(default)]
     pub models: Vec<ServeEntry>,
+    /// Support: preview.
     /// Optional path to an operator catalog file, replacing the
-    /// built-in certified catalog for id resolution.
+    /// built-in certified catalog for id resolution. Relative paths
+    /// resolve from the directory containing the active `sb.yml`.
     #[serde(default)]
     pub catalog_file: Option<String>,
     /// Directory for the content-addressed weight cache. `None` uses
     /// the platform default (`$HF_HOME` / `~/.cache/sbproxy/models`).
     #[serde(default)]
     pub cache_dir: Option<String>,
+    /// Support: config_only.
     /// Disk budget in GiB for the weight cache before GC. `None`
     /// means unbounded (operator manages the disk).
     #[serde(default)]
@@ -488,6 +510,7 @@ pub struct ModelHostConfig {
     /// What to do under VRAM pressure. Defaults to LRU eviction.
     #[serde(default)]
     pub eviction: EvictionPolicy,
+    /// Support: preview.
     /// Per-engine provisioning (how to acquire each engine binary).
     /// Absent engines use the default (resolve from `PATH`).
     #[serde(default)]
@@ -502,6 +525,7 @@ pub struct ModelHostConfig {
     /// the only limit, exactly as before.
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
+    /// Support: preview.
     /// How long a queued request waits for a served-lane slot before
     /// the attempt fails over to the next provider (or errors when no
     /// fallback exists). Milliseconds; defaults to 30000. Read only
@@ -570,6 +594,14 @@ impl ServeEntry {
 }
 
 impl ModelHostConfig {
+    /// Return support-level findings for every configured model-host
+    /// field that is not currently stable. The executable capability
+    /// registry is shared by validation, CLI planning, admin, and docs,
+    /// so those surfaces cannot classify the same field differently.
+    pub fn capability_findings(&self) -> Vec<crate::capabilities::CapabilityFinding> {
+        crate::capabilities::capability_registry().validate_config(self)
+    }
+
     /// True when no models are configured (the block is inert).
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
@@ -612,10 +644,25 @@ impl ModelHostConfig {
     /// - each `engines` entry is coherent: a container launch needs a
     ///   pinned image (no `:latest`, no untagged).
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(finding) = self
+            .capability_findings()
+            .into_iter()
+            .find(|finding| finding.status == crate::capabilities::SupportLevel::Unsupported)
+        {
+            return Err(finding.message);
+        }
         // Names: unique, no nameless raw refs.
         self.model_names()?;
         // keep_alive durations parse.
         for e in &self.models {
+            if let Some(variant) = &e.variant {
+                if !crate::artifact_spec::valid_identifier(variant) {
+                    return Err(format!(
+                        "serve model '{}' has an invalid variant '{variant}'",
+                        e.model
+                    ));
+                }
+            }
             if let Some(ka) = &e.keep_alive {
                 if sbproxy_util::parse_duration(ka).is_err() {
                     return Err(format!(
@@ -950,6 +997,7 @@ models:
         // carries only the known keys.
         let e = ServeEntry {
             model: "qwen3-8b".into(),
+            variant: None,
             name: None,
             engine: EngineChoice::Vllm,
             keep_alive: None,
@@ -1141,6 +1189,7 @@ engines:
     image: vllm/vllm-openai:v0.24.0
 models:
   - model: qwen3-14b
+    variant: q4_k_m
     keep_alive: 30m
   - model: hf:Org/Coder:Q4
     name: coder
@@ -1165,6 +1214,11 @@ models:
         let bad_ka: ModelHostConfig =
             serde_yaml::from_str("models:\n  - model: qwen3-14b\n    keep_alive: soon\n").unwrap();
         assert!(bad_ka.validate().unwrap_err().contains("keep_alive"));
+
+        let bad_variant: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: qwen3-14b\n    variant: ../unsafe\n")
+                .unwrap();
+        assert!(bad_variant.validate().unwrap_err().contains("variant"));
 
         // Container engine with an unpinned image.
         let latest: ModelHostConfig = serde_yaml::from_str(

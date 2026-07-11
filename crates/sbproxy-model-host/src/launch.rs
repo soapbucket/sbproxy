@@ -167,6 +167,17 @@ pub fn llama_use_local_model(args: &mut [String], model_path: &std::path::Path) 
     }
 }
 
+/// Retarget `vllm serve <source>` to one verified local snapshot. The
+/// rest of the generated argv is unchanged. A no-op for an unexpected
+/// argv shape.
+pub fn vllm_use_local_snapshot(args: &mut [String], snapshot: &std::path::Path) {
+    if args.first().map(String::as_str) == Some("serve") {
+        if let Some(model) = args.get_mut(1) {
+            *model = snapshot.display().to_string();
+        }
+    }
+}
+
 /// Add `--hf-file <file>` to a llama.cpp launch argv (WOR-1656) so a
 /// curl-enabled llama.cpp downloads the right GGUF from a multi-file
 /// repo. Used only when the local pre-fetch is unavailable (the
@@ -920,6 +931,7 @@ mod tests {
     ) -> crate::config::ServeEntry {
         crate::config::ServeEntry {
             model: "qwen3-8b".into(),
+            variant: None,
             name: None,
             engine: crate::config::EngineChoice::Vllm,
             keep_alive: None,

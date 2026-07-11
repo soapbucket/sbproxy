@@ -16,7 +16,7 @@
 //! catalog file, and can always bypass the catalog with an explicit
 //! `hf:Org/Repo:QUANT` reference.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +36,7 @@ pub type QuantName = String;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CatalogEntry {
     /// Hugging Face repo, e.g. `Qwen/Qwen3-32B`.
+    #[serde(default)]
     pub hf_repo: String,
     /// Quant variants published for this model, most-preferred first.
     /// The fit planner picks the best one the GPU can actually run.
@@ -50,7 +51,20 @@ pub struct CatalogEntry {
     /// Coarse minimum-VRAM hint in GiB for the smallest listed quant.
     /// A pre-flight sanity bound only; the fit planner computes the
     /// real requirement from model metadata.
+    #[serde(default)]
     pub min_vram_hint_gib: f64,
+
+    // --- Catalog v2 logical-model fields (WOR-1837). ---
+    /// Maximum context length declared for this logical model.
+    #[serde(default)]
+    pub context_length: u64,
+    /// Immutable artifact variants in deterministic preference order.
+    #[serde(default)]
+    pub variants: Vec<crate::artifact_spec::ArtifactVariant>,
+    /// Permit pickle checkpoints for this logical model. False by
+    /// default because pickle can execute code while loading.
+    #[serde(default)]
+    pub allow_pickle: bool,
 
     // --- Manifest fields (WOR-1681). All optional so the built-in
     // certified catalog and any pre-manifest file still parse. When
@@ -111,12 +125,126 @@ pub struct ModelRef {
 }
 
 /// The certified-model registry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Catalog {
+    /// Catalog document schema. Missing means legacy v1.
+    #[serde(default = "default_catalog_schema_version")]
+    pub schema_version: u32,
+    /// Versioned catalog identity pinned into resolved artifacts.
+    #[serde(default)]
+    pub catalog_revision: String,
     /// catalog_id -> entry. A `BTreeMap` so serialization is
     /// deterministic (stable diffs, reproducible schema).
     #[serde(default)]
     pub models: BTreeMap<String, CatalogEntry>,
+}
+
+fn default_catalog_schema_version() -> u32 {
+    1
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self {
+            schema_version: default_catalog_schema_version(),
+            catalog_revision: String::new(),
+            models: BTreeMap::new(),
+        }
+    }
+}
+
+/// Catalog parse or semantic-validation failure.
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogError {
+    /// YAML could not be deserialized.
+    #[error("parse catalog YAML: {0}")]
+    Parse(#[from] serde_yaml::Error),
+    /// The catalog parsed but violates its schema contract.
+    #[error("invalid catalog: {0}")]
+    Invalid(String),
+}
+
+/// Nonfatal migration information produced while loading a catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogDiagnostic {
+    /// A legacy entry remains usable through `Catalog::resolve` but
+    /// lacks the exact files required for managed artifact resolution.
+    PreviewIncomplete {
+        /// Logical model ID.
+        model: String,
+        /// Exact missing contract.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for CatalogDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreviewIncomplete { model, reason } => write!(
+                formatter,
+                "model '{model}' remains preview-only until migrated to catalog v2: {reason}"
+            ),
+        }
+    }
+}
+
+/// Catalog plus nonfatal v1 migration diagnostics.
+#[derive(Debug, Clone)]
+pub struct CatalogLoad {
+    /// Normalized catalog.
+    pub catalog: Catalog,
+    /// Ordered migration diagnostics.
+    pub diagnostics: Vec<CatalogDiagnostic>,
+}
+
+/// Why catalog v2 could not select one executable artifact.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ArtifactResolveError {
+    /// Logical model is absent.
+    #[error("model '{0}' is not in the catalog")]
+    UnknownModel(String),
+    /// Homogeneous replicas require an immutable variant pin.
+    #[error("deployment of model '{model}' has {replicas} replicas; pin a variant or enable heterogeneous_variants")]
+    VariantPinRequired {
+        /// Logical model ID.
+        model: String,
+        /// Requested replicas.
+        replicas: u32,
+    },
+    /// Explicit variant does not exist.
+    #[error("model '{model}' has no variant '{variant}' (available: {available})")]
+    UnknownVariant {
+        /// Logical model ID.
+        model: String,
+        /// Requested variant ID.
+        variant: String,
+        /// Declared variant IDs.
+        available: String,
+    },
+    /// Legacy entry cannot produce an exact verified artifact.
+    #[error("model '{model}' has no complete catalog v2 artifact variant: {reason}")]
+    IncompleteCatalogV2 {
+        /// Logical model ID.
+        model: String,
+        /// Missing metadata.
+        reason: String,
+    },
+    /// No declared variant can execute on this worker.
+    #[error("model '{model}' has no compatible artifact variant: {reasons}")]
+    NoCompatibleVariant {
+        /// Logical model ID.
+        model: String,
+        /// Per-variant rejection summary.
+        reasons: String,
+    },
+    /// Canonical digest generation failed.
+    #[error("resolve model '{model}': {reason}")]
+    Digest {
+        /// Logical model ID.
+        model: String,
+        /// Serialization failure.
+        reason: String,
+    },
 }
 
 /// Why a model reference could not be resolved.
@@ -147,13 +275,24 @@ impl Catalog {
     /// Only if the embedded YAML is malformed, which a unit test
     /// guards against, so a release build never hits it.
     pub fn builtin() -> Self {
-        serde_yaml::from_str(BUILTIN_CATALOG_YAML)
+        Self::from_yaml(BUILTIN_CATALOG_YAML)
             .expect("built-in model catalog YAML parses (guarded by a unit test)")
     }
 
     /// Parse a catalog from YAML (an operator-supplied file).
-    pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    pub fn from_yaml(yaml: &str) -> Result<Self, CatalogError> {
+        Ok(Self::from_yaml_with_diagnostics(yaml)?.catalog)
+    }
+
+    /// Parse and normalize a catalog while retaining actionable legacy
+    /// migration diagnostics.
+    pub fn from_yaml_with_diagnostics(yaml: &str) -> Result<CatalogLoad, CatalogError> {
+        let mut catalog: Self = serde_yaml::from_str(yaml)?;
+        let diagnostics = catalog.normalize_and_validate()?;
+        Ok(CatalogLoad {
+            catalog,
+            diagnostics,
+        })
     }
 
     /// Number of models in the catalog.
@@ -169,6 +308,106 @@ impl Catalog {
     /// Look up a catalog entry by id.
     pub fn get(&self, catalog_id: &str) -> Option<&CatalogEntry> {
         self.models.get(catalog_id)
+    }
+
+    /// Resolve one immutable artifact variant that can execute on the
+    /// supplied worker. Variant order is deterministic, with
+    /// safetensors preferred over pickle regardless of declaration
+    /// order. Replicated homogeneous deployments must pin a variant.
+    pub fn resolve_artifact(
+        &self,
+        request: &crate::artifact_spec::ResolveArtifactRequest,
+        worker: &crate::artifact_spec::WorkerProfile,
+    ) -> Result<crate::artifact_spec::ResolvedArtifact, ArtifactResolveError> {
+        use crate::artifact_spec::{
+            compatible_engine, worker_meets_requirements, ArtifactFormat, ResolvedArtifact,
+        };
+
+        let entry = self
+            .models
+            .get(&request.model)
+            .ok_or_else(|| ArtifactResolveError::UnknownModel(request.model.clone()))?;
+        if request.replicas > 1 && request.variant.is_none() && !request.heterogeneous_variants {
+            return Err(ArtifactResolveError::VariantPinRequired {
+                model: request.model.clone(),
+                replicas: request.replicas,
+            });
+        }
+        if entry.variants.is_empty() {
+            return Err(ArtifactResolveError::IncompleteCatalogV2 {
+                model: request.model.clone(),
+                reason:
+                    "exact files, sizes, digests, source revision, and requirements are missing"
+                        .to_string(),
+            });
+        }
+
+        let mut candidates: Vec<(usize, &crate::artifact_spec::ArtifactVariant)> =
+            match &request.variant {
+                Some(wanted) => {
+                    let variant = entry
+                        .variants
+                        .iter()
+                        .find(|variant| variant.id == *wanted)
+                        .ok_or_else(|| ArtifactResolveError::UnknownVariant {
+                            model: request.model.clone(),
+                            variant: wanted.clone(),
+                            available: entry
+                                .variants
+                                .iter()
+                                .map(|variant| variant.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        })?;
+                    vec![(0, variant)]
+                }
+                None => entry.variants.iter().enumerate().collect(),
+            };
+        if request.variant.is_none() {
+            candidates.sort_by_key(|(index, variant)| {
+                (matches!(variant.format, ArtifactFormat::Pickle), *index)
+            });
+        }
+
+        let mut reasons = Vec::new();
+        for (_, variant) in candidates {
+            if variant.format == ArtifactFormat::Pickle && !entry.allow_pickle {
+                reasons.push(format!(
+                    "{}: pickle requires allow_pickle: true",
+                    variant.id
+                ));
+                continue;
+            }
+            if let Err(reason) = worker_meets_requirements(variant, worker) {
+                reasons.push(format!("{}: {reason}", variant.id));
+                continue;
+            }
+            let Some(engine) = compatible_engine(variant, request.engine, worker) else {
+                reasons.push(format!(
+                    "{}: no compatible selected engine on worker",
+                    variant.id
+                ));
+                continue;
+            };
+            return ResolvedArtifact::from_variant(
+                &self.catalog_revision,
+                &request.model,
+                variant,
+                engine,
+                entry.context_length,
+                &entry.license,
+                entry.allow_pickle,
+            )
+            .map_err(|reason| ArtifactResolveError::Digest {
+                model: request.model.clone(),
+                reason,
+            });
+        }
+
+        Err(ArtifactResolveError::NoCompatibleVariant {
+            model: request.model.clone(),
+            reasons: reasons.join("; "),
+        })
     }
 
     /// Resolve a model reference to a concrete repo + quant.
@@ -214,6 +453,123 @@ impl Catalog {
             quant,
             catalog_id: Some(id.to_string()),
         })
+    }
+
+    fn normalize_and_validate(&mut self) -> Result<Vec<CatalogDiagnostic>, CatalogError> {
+        if !matches!(self.schema_version, 1 | 2) {
+            return Err(CatalogError::Invalid(format!(
+                "unsupported schema_version {}; expected 1 or 2",
+                self.schema_version
+            )));
+        }
+        if self.schema_version == 2 && self.catalog_revision.trim().is_empty() {
+            return Err(CatalogError::Invalid(
+                "catalog v2 requires a non-empty catalog_revision".to_string(),
+            ));
+        }
+        if self.schema_version == 1 && self.catalog_revision.is_empty() {
+            self.catalog_revision = "legacy-v1".to_string();
+        }
+
+        let mut diagnostics = Vec::new();
+        for (model, entry) in &mut self.models {
+            if !crate::artifact_spec::valid_identifier(model) {
+                return Err(CatalogError::Invalid(format!(
+                    "model '{model}' has an invalid logical ID"
+                )));
+            }
+            if entry.params.trim().is_empty()
+                || entry.license.trim().is_empty()
+                || entry.family.trim().is_empty()
+            {
+                return Err(CatalogError::Invalid(format!(
+                    "model '{model}' requires params, license, and family"
+                )));
+            }
+
+            if entry.variants.is_empty() {
+                if entry.hf_repo.trim().is_empty() || entry.quants.is_empty() {
+                    return Err(CatalogError::Invalid(format!(
+                        "model '{model}' has neither catalog v2 variants nor a complete v1 hf_repo/quants entry"
+                    )));
+                }
+                diagnostics.push(CatalogDiagnostic::PreviewIncomplete {
+                    model: model.clone(),
+                    reason: "exact variant files and byte sizes are absent".to_string(),
+                });
+                continue;
+            }
+            if entry.context_length == 0 {
+                return Err(CatalogError::Invalid(format!(
+                    "model '{model}' with catalog v2 variants requires context_length"
+                )));
+            }
+
+            let mut variant_ids = BTreeSet::new();
+            for variant in &entry.variants {
+                if !variant_ids.insert(variant.id.as_str()) {
+                    return Err(CatalogError::Invalid(format!(
+                        "model '{model}' has duplicate variant '{}'",
+                        variant.id
+                    )));
+                }
+                crate::artifact_spec::validate_variant(model, variant)
+                    .map_err(CatalogError::Invalid)?;
+            }
+            fill_legacy_projection(model, entry);
+        }
+        Ok(diagnostics)
+    }
+}
+
+/// Keep the legacy resolver and pull planner usable for complete v2
+/// entries while callers migrate to [`Catalog::resolve_artifact`]. The
+/// values are projections of the first declared exact variant, never a
+/// second source of catalog truth.
+fn fill_legacy_projection(model: &str, entry: &mut CatalogEntry) {
+    let Some(variant) = entry.variants.first() else {
+        return;
+    };
+
+    if entry.hf_repo.is_empty() {
+        entry.hf_repo = variant
+            .source
+            .strip_prefix("hf:")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("local/{model}"));
+    }
+    if entry.quants.is_empty() {
+        for variant in &entry.variants {
+            if !entry.quants.contains(&variant.quant) {
+                entry.quants.push(variant.quant.clone());
+            }
+        }
+    }
+    if entry.min_vram_hint_gib <= 0.0 {
+        const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        entry.min_vram_hint_gib = variant.requirements.min_memory_bytes as f64 / BYTES_PER_GIB;
+    }
+    if entry.source.is_none() {
+        entry.source = Some(variant.source.clone());
+    }
+    if entry.revision.is_none() {
+        entry.revision = Some(variant.revision.clone());
+    }
+    if entry.sha256.is_empty() {
+        entry.sha256.extend(
+            variant
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), file.sha256.clone())),
+        );
+    }
+    if entry.engine == crate::config::EngineChoice::Auto {
+        entry.engine = match variant.engines.first() {
+            Some(crate::config::EngineKind::Vllm) => crate::config::EngineChoice::Vllm,
+            Some(crate::config::EngineKind::LlamaCpp) => crate::config::EngineChoice::LlamaCpp,
+            Some(crate::config::EngineKind::Embedded) => crate::config::EngineChoice::Embedded,
+            None => crate::config::EngineChoice::Auto,
+        };
     }
 }
 
