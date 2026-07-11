@@ -16,7 +16,7 @@
 //! relies on ([`crate::fit::fp8_supported`]) is in the default build
 //! and unit-tested there.
 
-use crate::fit::{fp8_supported, GpuDescriptor, GpuProbe, GpuVendor};
+use crate::fit::{fp8_supported, memory_occupancy, GpuDescriptor, GpuProbe, GpuVendor};
 
 /// A [`GpuProbe`] backed by NVML, falling back to `nvidia-smi`.
 #[derive(Debug, Default)]
@@ -55,12 +55,18 @@ fn probe_via_nvml() -> Result<Vec<GpuDescriptor>, nvml_wrapper::error::NvmlError
             .ok()
             .map(|c| (c.major as u32, c.minor as u32));
         let mem_bandwidth_gbps = bandwidth_for_name(&name);
+        let compute_utilization = dev
+            .utilization_rates()
+            .ok()
+            .map(|rates| (rates.gpu as f64 / 100.0).clamp(0.0, 1.0));
         out.push(GpuDescriptor {
             index: i,
             vendor: GpuVendor::Nvidia,
             name,
             total_vram_bytes: mem.total,
             free_vram_bytes: mem.free,
+            compute_utilization,
+            memory_occupancy: memory_occupancy(mem.total, mem.free),
             compute_capability: cc,
             supports_fp8: cc.map(fp8_supported).unwrap_or(false),
             mem_bandwidth_gbps,
@@ -93,7 +99,7 @@ fn bandwidth_for_name(name: &str) -> Option<f64> {
 fn probe_via_nvidia_smi() -> Vec<GpuDescriptor> {
     let output = match std::process::Command::new("nvidia-smi")
         .args([
-            "--query-gpu=index,name,memory.total,memory.free,compute_cap",
+            "--query-gpu=index,name,memory.total,memory.free,compute_cap,utilization.gpu",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -106,7 +112,7 @@ fn probe_via_nvidia_smi() -> Vec<GpuDescriptor> {
 }
 
 /// Parse one `nvidia-smi` CSV row:
-/// `index, name, memory.total (MiB), memory.free (MiB), compute_cap`.
+/// `index, name, memory.total (MiB), memory.free (MiB), compute_cap, utilization.gpu`.
 fn parse_smi_line(line: &str) -> Option<GpuDescriptor> {
     let cols: Vec<&str> = line.split(',').map(str::trim).collect();
     if cols.len() < 5 {
@@ -118,13 +124,24 @@ fn parse_smi_line(line: &str) -> Option<GpuDescriptor> {
     let total_mib: u64 = cols[2].parse().ok()?;
     let free_mib: u64 = cols[3].parse().ok()?;
     let cc = parse_compute_cap(cols[4]);
+    let compute_utilization = cols.get(5).and_then(|value| {
+        value
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(|value| (value / 100.0).clamp(0.0, 1.0))
+    });
+    let total_vram_bytes = total_mib.saturating_mul(1024 * 1024);
+    let free_vram_bytes = free_mib.saturating_mul(1024 * 1024);
     let mem_bandwidth_gbps = bandwidth_for_name(&name);
     Some(GpuDescriptor {
         index,
         vendor: GpuVendor::Nvidia,
         name,
-        total_vram_bytes: total_mib * 1024 * 1024,
-        free_vram_bytes: free_mib * 1024 * 1024,
+        total_vram_bytes,
+        free_vram_bytes,
+        compute_utilization,
+        memory_occupancy: memory_occupancy(total_vram_bytes, free_vram_bytes),
         compute_capability: cc,
         supports_fp8: cc.map(fp8_supported).unwrap_or(false),
         mem_bandwidth_gbps,
@@ -144,20 +161,26 @@ mod tests {
     #[test]
     fn parses_an_nvidia_smi_l4_row() {
         // What an L4 prints: 24 GiB total, most free, compute cap 8.9.
-        let row = "0, NVIDIA L4, 23034, 22900, 8.9";
+        let row = "0, NVIDIA L4, 23034, 22900, 8.9, 42";
         let d = parse_smi_line(row).expect("parse");
         assert_eq!(d.index, 0);
         assert_eq!(d.name, "NVIDIA L4");
         assert_eq!(d.compute_capability, Some((8, 9)));
         assert!(d.supports_fp8, "L4 (8.9) supports FP8");
         assert_eq!(d.total_vram_bytes, 23034 * 1024 * 1024);
+        assert_eq!(d.compute_utilization, Some(0.42));
+        let expected_memory = (23034.0 - 22900.0) / 23034.0;
+        assert!((d.memory_occupancy.unwrap() - expected_memory).abs() < f64::EPSILON);
     }
 
     #[test]
     fn parses_a_t4_row_without_fp8() {
-        let row = "0, Tesla T4, 15360, 15109, 7.5";
+        let row = "0, Tesla T4, 15360, 15109, 7.5, N/A";
         let d = parse_smi_line(row).expect("parse");
         assert!(!d.supports_fp8, "T4 (7.5) has no FP8");
+        assert_eq!(d.compute_utilization, None);
+        assert!(d.memory_occupancy.is_some());
+        assert!(serde_json::to_value(d).unwrap()["compute_utilization"].is_null());
     }
 
     #[test]

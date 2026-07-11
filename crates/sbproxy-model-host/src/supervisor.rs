@@ -16,7 +16,7 @@
 //! binary from the templated args, poll `/health`, kill the whole
 //! process tree) implements the same trait in a later phase.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -299,6 +299,7 @@ pub struct EngineSupervisor {
     backoff: BackoffPolicy,
     clock: Arc<dyn SupervisorClock>,
     job_store: Option<FileJobStore>,
+    last_job_id: Mutex<Option<String>>,
     running: Option<RunningEngine>,
     crash_loop: Option<CrashLoopState>,
 }
@@ -330,6 +331,7 @@ impl EngineSupervisor {
             backoff,
             clock: Arc::new(TokioSupervisorClock),
             job_store,
+            last_job_id: Mutex::new(None),
             running: None,
             crash_loop: None,
         }
@@ -349,6 +351,14 @@ impl EngineSupervisor {
     /// Retained terminal crash loop, when reset is required.
     pub fn crash_loop(&self) -> Option<&CrashLoopState> {
         self.crash_loop.as_ref()
+    }
+
+    /// Most recently created durable engine lifecycle job.
+    pub fn last_job_id(&self) -> Option<String> {
+        self.last_job_id
+            .lock()
+            .expect("engine supervisor job mutex poisoned")
+            .clone()
     }
 
     /// Provision one exact managed engine and retain a durable lifecycle job.
@@ -536,14 +546,22 @@ impl EngineSupervisor {
     }
 
     fn begin_job(&self, kind: OperationKind) -> Result<Option<OperationJob>, EngineDriverError> {
-        self.job_store
+        let job = self
+            .job_store
             .as_ref()
             .map(|store| {
                 store
                     .create(kind, format!("deployment:{}", self.deployment))
                     .map_err(|error| lifecycle_job_error("create", error))
             })
-            .transpose()
+            .transpose()?;
+        if let Some(job) = &job {
+            *self
+                .last_job_id
+                .lock()
+                .expect("engine supervisor job mutex poisoned") = Some(job.id.clone());
+        }
+        Ok(job)
     }
 
     fn finish_job(

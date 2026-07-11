@@ -4,7 +4,7 @@
 //! Process-wide managed model runtime and atomic desired-state reconciliation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,6 +103,42 @@ pub trait PreparedDeploymentRuntime: Send + Sync {
     async fn stop(&self, grace: Duration) -> Result<(), RuntimeManagerError>;
     /// Clear retained failure state before another explicit start.
     async fn reset(&self) -> Result<Option<OperationJob>, RuntimeManagerError>;
+    /// Snapshot static assignment, artifact, and durable-job details for status.
+    async fn telemetry(&self) -> PreparedRuntimeTelemetry {
+        PreparedRuntimeTelemetry::default()
+    }
+}
+
+/// Cold-runtime progress that exists below the public lifecycle state machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparedRuntimePhase {
+    /// Desired state exists but has no reported worker assignment yet.
+    #[default]
+    Configured,
+    /// A compatible worker, artifact, and engine have been selected.
+    Assigned,
+    /// Verified artifact bytes are present in the local cache.
+    Cached,
+}
+
+/// Driver, artifact, placement, and durable-job details for a prepared runtime.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PreparedRuntimeTelemetry {
+    /// Cold-runtime progress before engine preparation begins.
+    pub phase: PreparedRuntimePhase,
+    /// Resolved engine kind.
+    pub engine: Option<EngineKind>,
+    /// Driver availability observed during preparation.
+    pub driver_availability: Option<EngineAvailability>,
+    /// Canonical verified-artifact identity selected from the catalog.
+    pub artifact_digest: Option<String>,
+    /// Worker-local devices selected by fit planning.
+    pub selected_devices: Vec<u32>,
+    /// Complete selected-device memory estimate, when fit has run.
+    pub memory: Option<crate::MemoryEstimate>,
+    /// Most recently retained durable lifecycle job.
+    pub job_id: Option<String>,
 }
 
 /// Planned relationship between current and candidate deployment slots.
@@ -135,6 +171,10 @@ pub struct ReconcileReport {
 pub enum DeploymentRuntimeState {
     /// Statically validated but not loaded.
     Configured,
+    /// Worker, artifact, and engine assignment is complete.
+    Assigned,
+    /// Verified artifact bytes are cached but the engine is not running.
+    Cached,
     /// Artifact, engine, or model readiness is in progress.
     Preparing,
     /// Engine is ready on its loopback port.
@@ -147,6 +187,22 @@ pub enum DeploymentRuntimeState {
     Failed,
 }
 
+impl DeploymentRuntimeState {
+    /// Stable snake-case lifecycle label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Assigned => "assigned",
+            Self::Cached => "cached",
+            Self::Preparing => "preparing",
+            Self::Ready => "ready",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Point-in-time lifecycle status for one current deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DeploymentRuntimeStatus {
@@ -156,8 +212,26 @@ pub struct DeploymentRuntimeStatus {
     pub generation: u64,
     /// Current lifecycle state.
     pub state: DeploymentRuntimeState,
+    /// Exact requests holding an active permit.
+    pub active_requests: usize,
+    /// Exact requests waiting in the priority queue.
+    pub queued_requests: usize,
+    /// Resolved managed engine.
+    pub engine: Option<EngineKind>,
+    /// Driver availability retained from worker preparation.
+    pub driver_availability: Option<EngineAvailability>,
+    /// Canonical artifact digest, without a source or local path.
+    pub artifact_digest: Option<String>,
+    /// Worker-local devices assigned to this generation.
+    pub selected_devices: Vec<u32>,
+    /// Complete memory reservation for the selected device.
+    pub memory: Option<crate::MemoryEstimate>,
     /// Ready loopback port.
     pub port: Option<u16>,
+    /// Stable bounded failure reason code.
+    pub reason_code: Option<String>,
+    /// Most recently retained durable lifecycle job ID.
+    pub job_id: Option<String>,
     /// Bounded last failure, when state is failed.
     pub last_error: Option<String>,
 }
@@ -178,6 +252,9 @@ struct DeploymentSlot {
     preparation_identity: PreparationIdentity,
     runtime: Arc<dyn PreparedDeploymentRuntime>,
     admission: crate::AdmissionGate,
+    observer: Arc<dyn crate::ModelHostObserver>,
+    engine: Option<EngineKind>,
+    observed: AtomicBool,
     lifecycle: Mutex<SlotLifecycle>,
 }
 
@@ -199,6 +276,8 @@ impl DeploymentSlot {
         desired: CompiledDeployment,
         preparation_identity: PreparationIdentity,
         runtime: Arc<dyn PreparedDeploymentRuntime>,
+        observer: Arc<dyn crate::ModelHostObserver>,
+        engine: Option<EngineKind>,
     ) -> Result<Self, RuntimeManagerError> {
         let max_active = desired.desired.max_concurrency.unwrap_or(1) as usize;
         let admission = crate::AdmissionGate::new(
@@ -214,6 +293,9 @@ impl DeploymentSlot {
             preparation_identity,
             runtime,
             admission,
+            observer,
+            engine,
+            observed: AtomicBool::new(false),
             lifecycle: Mutex::new(SlotLifecycle {
                 state: DeploymentRuntimeState::Configured,
                 running: None,
@@ -227,11 +309,90 @@ impl DeploymentSlot {
         &self,
         intent: PullIntent,
         limiter: Arc<Semaphore>,
+        remain_preparing: bool,
     ) -> Result<crate::MemoryEstimate, RuntimeManagerError> {
-        let _permit = limiter.acquire_owned().await.map_err(|_| {
-            RuntimeManagerError::Prepare("model preparation limiter is closed".to_string())
-        })?;
-        self.runtime.memory_estimate(intent).await
+        let was_stopped = {
+            let mut lifecycle = self.lifecycle.lock().await;
+            match lifecycle.state {
+                DeploymentRuntimeState::Ready => {
+                    return lifecycle
+                        .running
+                        .as_ref()
+                        .map(|running| running.memory.clone())
+                        .ok_or_else(|| {
+                            RuntimeManagerError::Prepare(format!(
+                                "deployment {:?} is ready without a running engine",
+                                self.id
+                            ))
+                        });
+                }
+                DeploymentRuntimeState::Draining => {
+                    return Err(RuntimeManagerError::Draining(self.id.clone()));
+                }
+                DeploymentRuntimeState::Failed => {
+                    return Err(lifecycle.last_error.clone().unwrap_or_else(|| {
+                        RuntimeManagerError::Prepare(format!(
+                            "deployment {:?} failed without a retained reason",
+                            self.id
+                        ))
+                    }));
+                }
+                _ => {
+                    let was_stopped = lifecycle.state == DeploymentRuntimeState::Stopped;
+                    lifecycle.state = DeploymentRuntimeState::Preparing;
+                    lifecycle.last_error = None;
+                    was_stopped
+                }
+            }
+        };
+        if was_stopped && remain_preparing {
+            self.admission.resume();
+        }
+        self.publish_lifecycle_state().await;
+        let result = match limiter.acquire_owned().await {
+            Ok(_permit) => self.runtime.memory_estimate(intent).await,
+            Err(_) => Err(RuntimeManagerError::Prepare(
+                "model preparation limiter is closed".to_string(),
+            )),
+        };
+        let mut lifecycle = self.lifecycle.lock().await;
+        match &result {
+            Ok(_) if !remain_preparing && lifecycle.activation.is_none() => {
+                lifecycle.state = if was_stopped {
+                    DeploymentRuntimeState::Stopped
+                } else {
+                    DeploymentRuntimeState::Configured
+                };
+            }
+            Ok(_) => {}
+            Err(error) => {
+                lifecycle.state = DeploymentRuntimeState::Failed;
+                lifecycle.last_error = Some(error.clone());
+            }
+        }
+        let state = lifecycle.state;
+        drop(lifecycle);
+        if matches!(
+            state,
+            DeploymentRuntimeState::Configured | DeploymentRuntimeState::Stopped
+        ) {
+            self.publish_current_state().await;
+        } else {
+            self.publish_lifecycle_state().await;
+        }
+        result
+    }
+
+    fn start_activation(&self, intent: PullIntent, limiter: Arc<Semaphore>) -> Activation {
+        let runtime = self.runtime.clone();
+        async move {
+            let _permit = limiter.acquire_owned().await.map_err(|_| {
+                RuntimeManagerError::Prepare("model preparation limiter is closed".to_string())
+            })?;
+            runtime.start(intent).await
+        }
+        .boxed()
+        .shared()
     }
 
     async fn ensure_ready(
@@ -251,12 +412,13 @@ impl DeploymentSlot {
                     });
                 }
                 DeploymentRuntimeState::Preparing => {
-                    lifecycle.activation.clone().ok_or_else(|| {
-                        RuntimeManagerError::Prepare(format!(
-                            "deployment {:?} is preparing without shared work",
-                            self.id
-                        ))
-                    })?
+                    if let Some(activation) = lifecycle.activation.clone() {
+                        activation
+                    } else {
+                        let future = self.start_activation(intent, limiter.clone());
+                        lifecycle.activation = Some(future.clone());
+                        future
+                    }
                 }
                 DeploymentRuntimeState::Draining => {
                     return Err(RuntimeManagerError::Draining(self.id.clone()));
@@ -269,21 +431,14 @@ impl DeploymentSlot {
                         ))
                     }));
                 }
-                DeploymentRuntimeState::Configured | DeploymentRuntimeState::Stopped => {
+                DeploymentRuntimeState::Configured
+                | DeploymentRuntimeState::Assigned
+                | DeploymentRuntimeState::Cached
+                | DeploymentRuntimeState::Stopped => {
                     if lifecycle.state == DeploymentRuntimeState::Stopped {
                         self.admission.resume();
                     }
-                    let runtime = self.runtime.clone();
-                    let future = async move {
-                        let _permit = limiter.acquire_owned().await.map_err(|_| {
-                            RuntimeManagerError::Prepare(
-                                "model preparation limiter is closed".to_string(),
-                            )
-                        })?;
-                        runtime.start(intent).await
-                    }
-                    .boxed()
-                    .shared();
+                    let future = self.start_activation(intent, limiter.clone());
                     lifecycle.state = DeploymentRuntimeState::Preparing;
                     lifecycle.last_error = None;
                     lifecycle.activation = Some(future.clone());
@@ -291,6 +446,7 @@ impl DeploymentSlot {
                 }
             }
         };
+        self.publish_lifecycle_state().await;
 
         let result = activation.await.and_then(|running| {
             if running.deployment != self.id || running.generation != self.generation {
@@ -323,6 +479,8 @@ impl DeploymentSlot {
                 }
             }
         }
+        drop(lifecycle);
+        self.publish_lifecycle_state().await;
         result
     }
 
@@ -335,6 +493,7 @@ impl DeploymentSlot {
             lifecycle.state = DeploymentRuntimeState::Draining;
             lifecycle.activation.clone()
         };
+        self.publish_lifecycle_state().await;
         if let Some(activation) = activation {
             let _ = activation.await;
         }
@@ -352,10 +511,24 @@ impl DeploymentSlot {
                 lifecycle.last_error = Some(error.clone());
             }
         }
+        drop(lifecycle);
+        self.publish_lifecycle_state().await;
         result
     }
 
     async fn drain(&self, grace: Duration) -> Result<crate::DrainReport, RuntimeManagerError> {
+        let entered_draining = {
+            let mut lifecycle = self.lifecycle.lock().await;
+            if lifecycle.state != DeploymentRuntimeState::Stopped {
+                lifecycle.state = DeploymentRuntimeState::Draining;
+                true
+            } else {
+                false
+            }
+        };
+        if entered_draining {
+            self.publish_lifecycle_state().await;
+        }
         let report = self.admission.drain(grace).await;
         self.stop(grace).await?;
         Ok(report)
@@ -377,17 +550,54 @@ impl DeploymentSlot {
         lifecycle.running = None;
         lifecycle.last_error = None;
         lifecycle.activation = None;
+        drop(lifecycle);
+        self.publish_current_state().await;
         Ok(job)
     }
 
     async fn status(&self) -> DeploymentRuntimeStatus {
+        let telemetry = self.runtime.telemetry().await;
         let lifecycle = self.lifecycle.lock().await;
+        let counts = self.admission.counts();
+        let running = lifecycle.running.as_ref();
+        let state = if lifecycle.state == DeploymentRuntimeState::Configured {
+            match telemetry.phase {
+                PreparedRuntimePhase::Configured => DeploymentRuntimeState::Configured,
+                PreparedRuntimePhase::Assigned => DeploymentRuntimeState::Assigned,
+                PreparedRuntimePhase::Cached => DeploymentRuntimeState::Cached,
+            }
+        } else {
+            lifecycle.state
+        };
         DeploymentRuntimeStatus {
             deployment: self.id.clone(),
             generation: self.generation,
-            state: lifecycle.state,
-            port: lifecycle.running.as_ref().map(|running| running.port),
-            last_error: lifecycle.last_error.as_ref().map(ToString::to_string),
+            state,
+            active_requests: counts.active,
+            queued_requests: counts.queued,
+            engine: running.map(|running| running.kind).or(telemetry.engine),
+            driver_availability: telemetry.driver_availability,
+            artifact_digest: running
+                .map(|running| running.artifact_digest.clone())
+                .or(telemetry.artifact_digest),
+            selected_devices: running
+                .map(|running| running.selected_devices.clone())
+                .unwrap_or(telemetry.selected_devices),
+            memory: running
+                .map(|running| running.memory.clone())
+                .or(telemetry.memory),
+            port: running.map(|running| running.port),
+            reason_code: lifecycle
+                .last_error
+                .as_ref()
+                .map(runtime_error_reason_code)
+                .map(str::to_string),
+            job_id: telemetry.job_id,
+            last_error: lifecycle
+                .last_error
+                .as_ref()
+                .map(ToString::to_string)
+                .map(|error| bounded_status_text(&error)),
         }
     }
 
@@ -426,6 +636,8 @@ impl DeploymentSlot {
                     ));
                 }
                 DeploymentRuntimeState::Configured
+                | DeploymentRuntimeState::Assigned
+                | DeploymentRuntimeState::Cached
                 | DeploymentRuntimeState::Preparing
                 | DeploymentRuntimeState::Ready => {}
                 DeploymentRuntimeState::Stopped => self.admission.resume(),
@@ -466,7 +678,53 @@ impl DeploymentSlot {
             return false;
         }
         lifecycle.state = DeploymentRuntimeState::Draining;
+        drop(lifecycle);
+        self.publish_lifecycle_state().await;
         true
+    }
+
+    fn emit_state(&self, state: DeploymentRuntimeState, engine: Option<EngineKind>) {
+        if self.observed.load(Ordering::SeqCst) {
+            self.observer.set_deployment_state(&self.id, engine, state);
+        }
+    }
+
+    async fn publish_lifecycle_state(&self) {
+        if !self.observed.load(Ordering::SeqCst) {
+            return;
+        }
+        let lifecycle = self.lifecycle.lock().await;
+        let state = lifecycle.state;
+        let engine = lifecycle
+            .running
+            .as_ref()
+            .map(|running| running.kind)
+            .or(self.engine);
+        drop(lifecycle);
+        self.emit_state(state, engine);
+    }
+
+    async fn publish_current_state(&self) {
+        let status = self.status().await;
+        self.emit_state(status.state, status.engine);
+    }
+
+    async fn activate_observation(&self) {
+        if !self.observed.swap(true, Ordering::SeqCst) {
+            self.admission
+                .set_observer(self.id.clone(), self.observer.clone());
+        }
+        self.publish_current_state().await;
+    }
+
+    async fn cancel_preparation(&self) {
+        let mut lifecycle = self.lifecycle.lock().await;
+        if lifecycle.state == DeploymentRuntimeState::Preparing && lifecycle.activation.is_none() {
+            lifecycle.state = DeploymentRuntimeState::Configured;
+            lifecycle.last_error = None;
+        }
+        drop(lifecycle);
+        self.publish_current_state().await;
     }
 
     fn protection(&self, preparing: bool, draining: bool) -> crate::ResidencyProtection {
@@ -535,6 +793,7 @@ pub struct ModelRuntimeManager {
     snapshot: ArcSwap<RuntimeSnapshot>,
     residency: Mutex<crate::DeviceResidencySet>,
     placement_lock: Mutex<()>,
+    observer: Arc<dyn crate::ModelHostObserver>,
     generation: AtomicU64,
     residency_tick: AtomicU64,
     reconcile_lock: Mutex<()>,
@@ -616,10 +875,17 @@ impl ModelRuntimeManager {
             snapshot: ArcSwap::from_pointee(snapshot),
             residency: Mutex::new(crate::DeviceResidencySet::new(device_capacities)),
             placement_lock: Mutex::new(()),
+            observer: Arc::new(crate::NoopObserver),
             generation: AtomicU64::new(1),
             residency_tick: AtomicU64::new(1),
             reconcile_lock: Mutex::new(()),
         })
+    }
+
+    /// Attach lifecycle metrics before reconciling the first deployment.
+    pub fn with_observer(mut self, observer: Arc<dyn crate::ModelHostObserver>) -> Self {
+        self.observer = observer;
+        self
     }
 
     /// Current process-local committed revision number.
@@ -676,6 +942,7 @@ impl ModelRuntimeManager {
 
         let parallelism = desired.control.max_parallel_prepares;
         let preparer = self.preparer.clone();
+        let observer = self.observer.clone();
         let warm_ids = desired
             .deployments
             .iter()
@@ -685,6 +952,7 @@ impl ModelRuntimeManager {
         let mut preparations = stream::iter(requests)
             .map(|request| {
                 let preparer = preparer.clone();
+                let observer = observer.clone();
                 let limiter = limiter.clone();
                 let warm = warm_ids.contains(&request.deployment_id);
                 async move {
@@ -699,15 +967,18 @@ impl ModelRuntimeManager {
                     })?;
                     let runtime = preparer.prepare(request).await?;
                     drop(permit);
+                    let engine = runtime.telemetry().await.engine;
                     let slot = Arc::new(DeploymentSlot::new(
                         id.clone(),
                         generation,
                         desired,
                         preparation_identity,
                         runtime,
+                        observer,
+                        engine,
                     )?);
                     if warm {
-                        slot.memory_estimate(PullIntent::Startup, limiter.clone())
+                        slot.memory_estimate(PullIntent::Startup, limiter.clone(), true)
                             .await?;
                         if let Err(error) = slot.ensure_ready(PullIntent::Startup, limiter).await {
                             let _ = slot.stop(shutdown_grace).await;
@@ -782,6 +1053,28 @@ impl ModelRuntimeManager {
         &self,
         deployment: &str,
     ) -> Result<RunningEngine, RuntimeManagerError> {
+        self.ensure_ready_for(deployment, crate::PriorityClass::Standard)
+            .await
+    }
+
+    /// Bring one generation to ready and attribute capacity rejection to request priority.
+    pub async fn ensure_ready_for(
+        &self,
+        deployment: &str,
+        priority: crate::PriorityClass,
+    ) -> Result<RunningEngine, RuntimeManagerError> {
+        let result = self.ensure_ready_inner(deployment).await;
+        if let Err(RuntimeManagerError::Admission(rejection)) = &result {
+            self.observer
+                .on_admission_rejected(deployment, priority, rejection.reason);
+        }
+        result
+    }
+
+    async fn ensure_ready_inner(
+        &self,
+        deployment: &str,
+    ) -> Result<RunningEngine, RuntimeManagerError> {
         let snapshot = self.snapshot.load_full();
         let slot = snapshot
             .slots
@@ -789,7 +1082,7 @@ impl ModelRuntimeManager {
             .cloned()
             .ok_or_else(|| RuntimeManagerError::UnknownDeployment(deployment.to_string()))?;
         let memory = slot
-            .memory_estimate(PullIntent::Runtime, snapshot.limiter.clone())
+            .memory_estimate(PullIntent::Runtime, snapshot.limiter.clone(), true)
             .await?;
         let _placement = self.placement_lock.lock().await;
         self.refresh_residency_protections(&snapshot).await;
@@ -806,7 +1099,13 @@ impl ModelRuntimeManager {
             );
             (previous, reservation)
         };
-        let reservation = reservation.map_err(RuntimeManagerError::Admission)?;
+        let reservation = match reservation {
+            Ok(reservation) => reservation,
+            Err(rejection) => {
+                slot.cancel_preparation().await;
+                return Err(RuntimeManagerError::Admission(rejection));
+            }
+        };
         let mut stopped_victims = Vec::new();
         for victim in reservation.evicted {
             if let Some(victim_slot) = snapshot.slots.get(&victim) {
@@ -817,6 +1116,7 @@ impl ModelRuntimeManager {
                         &snapshot,
                     )
                     .await;
+                    slot.cancel_preparation().await;
                     return Err(RuntimeManagerError::Admission(
                         crate::AdmissionRejection::new(
                             crate::AdmissionReason::InsufficientCapacity,
@@ -839,6 +1139,7 @@ impl ModelRuntimeManager {
                         &snapshot,
                     )
                     .await;
+                    slot.cancel_preparation().await;
                     return Err(error);
                 }
                 if let Some(facts) = facts {
@@ -869,6 +1170,24 @@ impl ModelRuntimeManager {
                 Err(error)
             }
         }
+    }
+
+    /// Acquire and verify one deployment artifact without launching its engine.
+    pub async fn cache(
+        &self,
+        deployment: &str,
+    ) -> Result<crate::MemoryEstimate, RuntimeManagerError> {
+        let snapshot = self.snapshot.load_full();
+        let slot = snapshot
+            .slots
+            .get(deployment)
+            .cloned()
+            .ok_or_else(|| RuntimeManagerError::UnknownDeployment(deployment.to_string()))?;
+        let memory = slot
+            .memory_estimate(PullIntent::Explicit, snapshot.limiter.clone(), false)
+            .await?;
+        slot.publish_current_state().await;
+        Ok(memory)
     }
 
     /// Acquire one deployment-specific request permit before engine readiness.
@@ -1116,6 +1435,10 @@ impl ModelRuntimeManager {
             slots,
             limiter: prepared.limiter,
         }));
+        let published = self.snapshot.load_full();
+        for slot in published.slots.values() {
+            slot.activate_observation().await;
+        }
 
         let grace = Duration::from_millis(prepared.desired.control.shutdown_deadline_ms);
         let mut retire_failures = BTreeMap::new();
@@ -1262,6 +1585,7 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
         })?;
         let provisioning = provisioning_for(&request, resolved.engine);
         let detection = driver.detect(&worker, &provisioning);
+        let driver_availability = detection.availability;
         match detection.availability {
             EngineAvailability::Available | EngineAvailability::Acquirable => {}
             EngineAvailability::Incompatible => {
@@ -1297,6 +1621,11 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             self.backoff,
             Some(self.artifacts.jobs().clone()),
         );
+        let artifact_cached = self.artifacts.cached_artifacts().is_ok_and(|artifacts| {
+            artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_digest == resolved.artifact_digest)
+        });
         Ok(Arc::new(ProductionPreparedDeployment {
             id: request.deployment_id,
             generation: request.generation,
@@ -1311,6 +1640,9 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             network_policy: self.network_policy,
             params_fallback,
             safety_margin: request.control.safety_margin,
+            driver_availability: AtomicU8::new(engine_availability_code(driver_availability)),
+            artifact_cached: AtomicBool::new(artifact_cached),
+            last_job_id: Mutex::new(None),
             activation: Mutex::new(None),
             supervisor: Mutex::new(supervisor),
         }))
@@ -1331,6 +1663,9 @@ struct ProductionPreparedDeployment {
     network_policy: NetworkPolicy,
     params_fallback: u64,
     safety_margin: f64,
+    driver_availability: AtomicU8,
+    artifact_cached: AtomicBool,
+    last_job_id: Mutex<Option<String>>,
     activation: Mutex<Option<PreparedActivation>>,
     supervisor: Mutex<crate::EngineSupervisor>,
 }
@@ -1370,7 +1705,8 @@ impl ProductionPreparedDeployment {
             } else {
                 intent
             };
-        self.artifacts
+        let ready = self
+            .artifacts
             .ensure(
                 &self.resolved,
                 AcquisitionContext {
@@ -1381,7 +1717,10 @@ impl ProductionPreparedDeployment {
                 },
             )
             .await
-            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))
+            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+        self.artifact_cached.store(true, Ordering::SeqCst);
+        *self.last_job_id.lock().await = Some(ready.job.id.clone());
+        Ok(ready)
     }
 
     async fn activation_plan(
@@ -1474,6 +1813,10 @@ impl PreparedDeploymentRuntime for ProductionPreparedDeployment {
                 job_store: Some(self.artifacts.jobs().clone()),
             })
             .await?;
+        self.driver_availability.store(
+            engine_availability_code(EngineAvailability::Available),
+            Ordering::SeqCst,
+        );
         let port = allocate_loopback_port()?;
         supervisor
             .ensure_ready(
@@ -1496,21 +1839,63 @@ impl PreparedDeploymentRuntime for ProductionPreparedDeployment {
     }
 
     async fn stop(&self, grace: Duration) -> Result<(), RuntimeManagerError> {
-        self.supervisor
+        let job = self
+            .supervisor
             .lock()
             .await
             .shutdown(grace)
             .await
-            .map(|_| ())
-            .map_err(RuntimeManagerError::Engine)
+            .map_err(RuntimeManagerError::Engine)?;
+        if let Some(job) = job {
+            *self.last_job_id.lock().await = Some(job.id);
+        }
+        Ok(())
     }
 
     async fn reset(&self) -> Result<Option<OperationJob>, RuntimeManagerError> {
-        self.supervisor
+        let job = self
+            .supervisor
             .lock()
             .await
             .reset()
-            .map_err(RuntimeManagerError::Engine)
+            .map_err(RuntimeManagerError::Engine)?;
+        if let Some(job) = &job {
+            *self.last_job_id.lock().await = Some(job.id.clone());
+        }
+        Ok(job)
+    }
+
+    async fn telemetry(&self) -> PreparedRuntimeTelemetry {
+        let activation = self
+            .activation
+            .try_lock()
+            .ok()
+            .and_then(|activation| activation.clone());
+        let supervisor_job = self
+            .supervisor
+            .try_lock()
+            .ok()
+            .and_then(|supervisor| supervisor.last_job_id());
+        let retained_job = self.last_job_id.try_lock().ok().and_then(|job| job.clone());
+        let job_id = supervisor_job.or(retained_job);
+        PreparedRuntimeTelemetry {
+            phase: if self.artifact_cached.load(Ordering::SeqCst) {
+                PreparedRuntimePhase::Cached
+            } else {
+                PreparedRuntimePhase::Assigned
+            },
+            engine: Some(self.resolved.engine),
+            driver_availability: Some(engine_availability_from_code(
+                self.driver_availability.load(Ordering::SeqCst),
+            )),
+            artifact_digest: Some(self.resolved.artifact_digest.clone()),
+            selected_devices: activation
+                .as_ref()
+                .map(|prepared| prepared.selected_devices.clone())
+                .unwrap_or_default(),
+            memory: activation.map(|prepared| prepared.fit.memory),
+            job_id,
+        }
     }
 }
 
@@ -1788,6 +2173,51 @@ fn load_admin_candidate(
     desired.control.deployments.clear();
     desired.legacy_host_policy = None;
     Ok(desired)
+}
+
+fn runtime_error_reason_code(error: &RuntimeManagerError) -> &'static str {
+    match error {
+        RuntimeManagerError::InvalidDesired(_) => "invalid_desired",
+        RuntimeManagerError::Prepare(_) => "prepare_failed",
+        RuntimeManagerError::Engine(error) => error.reason().as_str(),
+        RuntimeManagerError::Admission(rejection) => rejection.reason.as_str(),
+        RuntimeManagerError::Store(_) => "store_failed",
+        RuntimeManagerError::UnknownDeployment(_) => "unknown_deployment",
+        RuntimeManagerError::Draining(_) => "draining",
+        RuntimeManagerError::StalePrepared { .. } => "stale_revision",
+        RuntimeManagerError::CounterOverflow => "counter_overflow",
+    }
+}
+
+const fn engine_availability_code(availability: EngineAvailability) -> u8 {
+    match availability {
+        EngineAvailability::Available => 0,
+        EngineAvailability::Acquirable => 1,
+        EngineAvailability::Incompatible => 2,
+        EngineAvailability::Blocked => 3,
+    }
+}
+
+const fn engine_availability_from_code(code: u8) -> EngineAvailability {
+    match code {
+        0 => EngineAvailability::Available,
+        1 => EngineAvailability::Acquirable,
+        2 => EngineAvailability::Incompatible,
+        _ => EngineAvailability::Blocked,
+    }
+}
+
+fn bounded_status_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(512)
+        .collect()
 }
 
 async fn teardown_slots(slots: Vec<Arc<DeploymentSlot>>, grace: Duration) {

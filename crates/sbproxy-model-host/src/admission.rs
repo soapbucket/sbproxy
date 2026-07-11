@@ -124,8 +124,42 @@ struct GateCore {
     max_active: usize,
     max_queue: usize,
     queue_timeout: Duration,
+    telemetry: Mutex<AdmissionTelemetry>,
     state: Mutex<GateState>,
     idle_notify: Notify,
+}
+
+struct AdmissionTelemetry {
+    deployment: Option<String>,
+    observer: Arc<dyn crate::ModelHostObserver>,
+}
+
+impl GateCore {
+    fn publish_counts(&self) {
+        let (deployment, observer) = {
+            let telemetry = self.telemetry.lock().expect("admission telemetry poisoned");
+            (telemetry.deployment.clone(), telemetry.observer.clone())
+        };
+        let Some(deployment) = deployment else {
+            return;
+        };
+        let counts = {
+            let state = self.state.lock().expect("admission mutex poisoned");
+            (state.active, state.queue.len())
+        };
+        observer.set_deployment_requests(&deployment, counts.0, counts.1);
+    }
+
+    fn publish_rejection(&self, priority: PriorityClass, rejection: &AdmissionRejection) {
+        let (deployment, observer) = {
+            let telemetry = self.telemetry.lock().expect("admission telemetry poisoned");
+            (telemetry.deployment.clone(), telemetry.observer.clone())
+        };
+        let Some(deployment) = deployment else {
+            return;
+        };
+        observer.on_admission_rejected(&deployment, priority, rejection.reason);
+    }
 }
 
 /// Cloneable per-deployment admission gate.
@@ -161,6 +195,10 @@ impl AdmissionGate {
                 max_active,
                 max_queue,
                 queue_timeout,
+                telemetry: Mutex::new(AdmissionTelemetry {
+                    deployment: None,
+                    observer: Arc::new(crate::NoopObserver),
+                }),
                 state: Mutex::new(GateState {
                     active: 0,
                     draining: false,
@@ -173,6 +211,32 @@ impl AdmissionGate {
         })
     }
 
+    /// Attach bounded deployment telemetry before the gate receives traffic.
+    pub fn with_observer(
+        self,
+        deployment: impl Into<String>,
+        observer: Arc<dyn crate::ModelHostObserver>,
+    ) -> Self {
+        self.set_observer(deployment, observer);
+        self
+    }
+
+    pub(crate) fn set_observer(
+        &self,
+        deployment: impl Into<String>,
+        observer: Arc<dyn crate::ModelHostObserver>,
+    ) {
+        let mut telemetry = self
+            .core
+            .telemetry
+            .lock()
+            .expect("admission telemetry poisoned");
+        telemetry.deployment = Some(deployment.into());
+        telemetry.observer = observer;
+        drop(telemetry);
+        self.core.publish_counts();
+    }
+
     /// Admit immediately or wait in priority/FIFO order until the queue deadline.
     pub async fn admit(
         &self,
@@ -181,19 +245,27 @@ impl AdmissionGate {
         let receiver = {
             let mut state = self.core.state.lock().expect("admission mutex poisoned");
             if state.draining {
-                return Err(draining_rejection());
+                let rejection = draining_rejection();
+                drop(state);
+                self.core.publish_rejection(priority, &rejection);
+                return Err(rejection);
             }
             if state.active < self.core.max_active && state.queue.is_empty() {
                 state.active += 1;
+                drop(state);
+                self.core.publish_counts();
                 return Ok(AdmissionPermit::new(self.core.clone()));
             }
             if state.queue.len() >= self.core.max_queue {
-                return Err(AdmissionRejection::new(
+                let rejection = AdmissionRejection::new(
                     AdmissionReason::QueueFull,
                     "deployment admission queue is full",
                     true,
                     Some(duration_ms(self.core.queue_timeout)),
-                ));
+                );
+                drop(state);
+                self.core.publish_rejection(priority, &rejection);
+                return Err(rejection);
             }
             let id = state.next_waiter_id;
             state.next_waiter_id = state.next_waiter_id.saturating_add(1);
@@ -207,6 +279,7 @@ impl AdmissionGate {
             (id, receiver)
         };
         let (id, receiver) = receiver;
+        self.core.publish_counts();
         let mut cancellation = QueueCancellation {
             core: Arc::downgrade(&self.core),
             id,
@@ -231,6 +304,9 @@ impl AdmissionGate {
             )),
         };
         cancellation.cancel();
+        if let Err(rejection) = &result {
+            self.core.publish_rejection(priority, rejection);
+        }
         result.map(|()| AdmissionPermit::new(self.core.clone()))
     }
 
@@ -246,6 +322,7 @@ impl AdmissionGate {
         for waiter in waiters {
             let _ = waiter.sender.send(Err(draining_rejection()));
         }
+        self.core.publish_counts();
         let wait = async {
             loop {
                 let notified = self.core.idle_notify.notified();
@@ -271,6 +348,7 @@ impl AdmissionGate {
             .lock()
             .expect("admission mutex poisoned")
             .draining = false;
+        self.core.publish_counts();
     }
 
     /// Mark a ready deployment with no requests as newly idle.
@@ -303,6 +381,8 @@ impl AdmissionGate {
             return false;
         }
         state.draining = true;
+        drop(state);
+        self.core.publish_counts();
         true
     }
 
@@ -313,6 +393,8 @@ impl AdmissionGate {
             return false;
         }
         state.draining = true;
+        drop(state);
+        self.core.publish_counts();
         true
     }
 
@@ -374,6 +456,8 @@ impl AdmissionPermit {
                 state.active += 1;
             }
         }
+        drop(state);
+        self.core.publish_counts();
     }
 }
 
@@ -398,6 +482,8 @@ impl QueueCancellation {
         if let Some(core) = self.core.upgrade() {
             let mut state = core.state.lock().expect("admission mutex poisoned");
             state.queue.retain(|waiter| waiter.id != self.id);
+            drop(state);
+            core.publish_counts();
         }
     }
 }

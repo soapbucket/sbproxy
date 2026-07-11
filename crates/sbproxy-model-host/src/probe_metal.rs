@@ -20,7 +20,7 @@
 //! that gates admission and `sysctl` reports it directly with no extra
 //! dependency.
 
-use crate::fit::{GpuDescriptor, GpuProbe, GpuVendor};
+use crate::fit::{memory_occupancy, GpuDescriptor, GpuProbe, GpuVendor};
 use crate::probe_cpu::{sysctl_string, sysctl_u64};
 
 /// Default fraction of unified memory offered as the Metal working-set
@@ -66,6 +66,8 @@ fn probe_metal() -> Option<GpuDescriptor> {
         name,
         total_vram_bytes: budget,
         free_vram_bytes: budget,
+        compute_utilization: None,
+        memory_occupancy: memory_occupancy(budget, budget),
         compute_capability: None,
         supports_fp8: false,
         mem_bandwidth_gbps: None,

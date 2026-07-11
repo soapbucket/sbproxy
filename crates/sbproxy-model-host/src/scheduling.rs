@@ -36,6 +36,15 @@ pub enum PriorityClass {
 }
 
 impl PriorityClass {
+    /// Stable snake-case label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PriorityClass::Interactive => "interactive",
+            PriorityClass::Standard => "standard",
+            PriorityClass::Batch => "batch",
+        }
+    }
+
     /// Rank, lower is higher priority (Interactive = 0).
     pub(crate) const fn rank(self) -> u8 {
         match self {

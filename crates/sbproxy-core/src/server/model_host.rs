@@ -119,12 +119,20 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     fn set_resident_models(&self, count: i64) {
         sbproxy_observe::metrics::set_model_host_resident_models(count);
     }
-    fn set_gpu_stats(&self, device: &str, total_bytes: u64, free_bytes: u64, utilization: f64) {
+    fn set_gpu_stats(
+        &self,
+        device: &str,
+        total_bytes: u64,
+        free_bytes: u64,
+        compute_utilization: Option<f64>,
+        memory_occupancy: Option<f64>,
+    ) {
         sbproxy_observe::metrics::set_model_host_gpu_stats(
             device,
-            total_bytes as i64,
-            free_bytes as i64,
-            utilization,
+            i64::try_from(total_bytes).unwrap_or(i64::MAX),
+            i64::try_from(free_bytes).unwrap_or(i64::MAX),
+            compute_utilization,
+            memory_occupancy,
         );
     }
     fn on_adapter_loaded(&self, _base: &str, _adapter: &str) {
@@ -141,6 +149,43 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     }
     fn on_weight_download(&self, _model: &str, bytes: u64, secs: f64, ok: bool) {
         sbproxy_observe::metrics::record_model_host_weight_download(bytes, secs, ok);
+    }
+    fn set_deployment_requests(&self, deployment: &str, active: usize, queued: usize) {
+        sbproxy_observe::metrics::set_model_host_deployment_requests(
+            deployment,
+            i64::try_from(active).unwrap_or(i64::MAX),
+            i64::try_from(queued).unwrap_or(i64::MAX),
+        );
+    }
+    fn set_deployment_state(
+        &self,
+        deployment: &str,
+        engine: Option<sbproxy_model_host::EngineKind>,
+        state: sbproxy_model_host::DeploymentRuntimeState,
+    ) {
+        let engine = match engine {
+            Some(sbproxy_model_host::EngineKind::Vllm) => "vllm",
+            Some(sbproxy_model_host::EngineKind::LlamaCpp) => "llama_cpp",
+            Some(sbproxy_model_host::EngineKind::Embedded) => "embedded",
+            None => "unknown",
+        };
+        sbproxy_observe::metrics::set_model_host_deployment_state(
+            deployment,
+            engine,
+            state.as_str(),
+        );
+    }
+    fn on_admission_rejected(
+        &self,
+        deployment: &str,
+        priority: sbproxy_model_host::PriorityClass,
+        reason: sbproxy_model_host::AdmissionReason,
+    ) {
+        sbproxy_observe::metrics::record_model_host_admission_rejection(
+            deployment,
+            priority.as_str(),
+            reason.as_str(),
+        );
     }
 }
 

@@ -13,10 +13,10 @@ use sbproxy_model_host::{
     EngineCapabilities, EngineDetection, EngineDriver, EngineDriverError, EngineFailureReason,
     EngineHealth, EngineKind, EngineProcess, EngineProvisioning, FileDeploymentRevisionStore,
     GpuDescriptor, GpuVendor, LegacyServeInput, ManagedProviderInput, ModelHostConfig,
-    ModelMetadata, ModelMetadataProvider, ModelRuntimeManager, NetworkPolicy, OperationJob,
-    PreparedDeploymentRuntime, ProductionDeploymentPreparer, ProvisionRequest, ProvisionedEngine,
-    PullIntent, RunningEngine, RuntimeDesiredInput, RuntimeManagerError, StaticGpuProbe,
-    UnavailableArtifactTransport, WorkerProfile,
+    ModelHostObserver, ModelMetadata, ModelMetadataProvider, ModelRuntimeManager, NetworkPolicy,
+    OperationJob, PreparedDeploymentRuntime, ProductionDeploymentPreparer, ProvisionRequest,
+    ProvisionedEngine, PullIntent, RunningEngine, RuntimeDesiredInput, RuntimeManagerError,
+    StaticGpuProbe, UnavailableArtifactTransport, WorkerProfile,
 };
 use sha2::{Digest, Sha256};
 
@@ -261,6 +261,52 @@ struct FixtureRuntimeFacts {
     next_port: AtomicU16,
 }
 
+#[derive(Default)]
+struct ManagerTelemetryObserver {
+    states: Mutex<Vec<(String, sbproxy_model_host::DeploymentRuntimeState)>>,
+    requests: Mutex<Vec<(String, usize, usize)>>,
+    rejections: Mutex<
+        Vec<(
+            String,
+            sbproxy_model_host::PriorityClass,
+            sbproxy_model_host::AdmissionReason,
+        )>,
+    >,
+}
+
+impl ModelHostObserver for ManagerTelemetryObserver {
+    fn set_deployment_requests(&self, deployment: &str, active: usize, queued: usize) {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((deployment.to_string(), active, queued));
+    }
+
+    fn set_deployment_state(
+        &self,
+        deployment: &str,
+        _engine: Option<EngineKind>,
+        state: sbproxy_model_host::DeploymentRuntimeState,
+    ) {
+        self.states
+            .lock()
+            .unwrap()
+            .push((deployment.to_string(), state));
+    }
+
+    fn on_admission_rejected(
+        &self,
+        deployment: &str,
+        priority: sbproxy_model_host::PriorityClass,
+        reason: sbproxy_model_host::AdmissionReason,
+    ) {
+        self.rejections
+            .lock()
+            .unwrap()
+            .push((deployment.to_string(), priority, reason));
+    }
+}
+
 struct FixturePreparedRuntime {
     id: String,
     generation: u64,
@@ -447,6 +493,57 @@ async fn manager_starts_empty_and_swaps_only_after_complete_preparation() {
         "revision-one"
     );
     assert_eq!(manager.ensure_ready("a").await.unwrap().port, running.port);
+}
+
+#[tokio::test]
+async fn manager_telemetry_observes_committed_lifecycle_and_request_counts() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let observer = Arc::new(ManagerTelemetryObserver::default());
+    let manager = Arc::new(
+        ModelRuntimeManager::new(Catalog::builtin().catalog_revision, preparer)
+            .unwrap()
+            .with_observer(observer.clone()),
+    );
+    manager
+        .reconcile(manager_desired("telemetry", &[("a", false, 30)], 2))
+        .await
+        .unwrap();
+    let permit = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    drop(permit);
+    manager.drain("a").await.unwrap();
+    manager.cache("a").await.unwrap();
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Stopped
+    );
+    let resumed = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .expect("a stopped cached deployment can be started again");
+    drop(resumed);
+
+    let states = observer.states.lock().unwrap();
+    for expected in [
+        sbproxy_model_host::DeploymentRuntimeState::Configured,
+        sbproxy_model_host::DeploymentRuntimeState::Preparing,
+        sbproxy_model_host::DeploymentRuntimeState::Ready,
+        sbproxy_model_host::DeploymentRuntimeState::Draining,
+        sbproxy_model_host::DeploymentRuntimeState::Stopped,
+    ] {
+        assert!(
+            states
+                .iter()
+                .any(|(deployment, state)| deployment == "a" && *state == expected),
+            "missing lifecycle transition {expected:?}"
+        );
+    }
+    let requests = observer.requests.lock().unwrap();
+    assert!(requests.contains(&("a".to_string(), 1, 0)));
+    assert_eq!(requests.last(), Some(&("a".to_string(), 0, 0)));
 }
 
 #[tokio::test]
@@ -809,6 +906,8 @@ models:
         name: "fixture CPU".to_string(),
         total_vram_bytes: 8 * 1024 * 1024 * 1024,
         free_vram_bytes: 8 * 1024 * 1024 * 1024,
+        compute_utilization: None,
+        memory_occupancy: Some(0.0),
         compute_capability: None,
         supports_fp8: false,
         mem_bandwidth_gbps: None,
@@ -838,7 +937,7 @@ models:
         ManagedDeploymentConfig {
             model: "fixture-model".to_string(),
             variant: Some("safe".to_string()),
-            warm: true,
+            warm: false,
             engine: ManagedEngineChoice::Vllm,
             ..serde_yaml::from_str("model: fixture-model").unwrap()
         },
@@ -855,8 +954,41 @@ models:
     .unwrap();
 
     manager.reconcile(desired).await.unwrap();
+    let assigned = manager.status("fixture").await.unwrap();
+    assert_eq!(
+        assigned.state,
+        sbproxy_model_host::DeploymentRuntimeState::Assigned
+    );
+    assert_eq!(assigned.engine, Some(EngineKind::Vllm));
+    assert_eq!(
+        assigned.driver_availability,
+        Some(EngineAvailability::Available)
+    );
+    assert_eq!(assigned.active_requests, 0);
+    assert_eq!(assigned.queued_requests, 0);
+    assert_eq!(assigned.selected_devices, Vec::<u32>::new());
+    assert!(assigned.artifact_digest.is_some());
+    assert!(assigned.job_id.is_none());
+
+    manager.cache("fixture").await.unwrap();
+    let cached = manager.status("fixture").await.unwrap();
+    assert_eq!(
+        cached.state,
+        sbproxy_model_host::DeploymentRuntimeState::Cached
+    );
+    assert!(cached.memory.is_some());
+    assert!(cached.job_id.is_some());
+
     let running = manager.ensure_ready("fixture").await.unwrap();
     assert_eq!(running.kind, EngineKind::Vllm);
+    let ready = manager.status("fixture").await.unwrap();
+    assert_eq!(
+        ready.state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+    assert_eq!(ready.artifact_digest, Some(running.artifact_digest.clone()));
+    assert_eq!(ready.memory, Some(running.memory.clone()));
+    assert!(ready.reason_code.is_none());
     let launches = launches.lock().unwrap();
     assert_eq!(launches.len(), 1);
     assert_eq!(launches[0].0, "fixture");
@@ -900,6 +1032,9 @@ async fn manager_admission_drains_queued_work_and_waits_for_the_active_permit() 
         .await
         .unwrap();
     manager.ensure_ready("a").await.unwrap();
+    let active_status = manager.status("a").await.unwrap();
+    assert_eq!(active_status.active_requests, 1);
+    assert_eq!(active_status.queued_requests, 0);
     let queued_manager = manager.clone();
     let queued = tokio::spawn(async move {
         queued_manager
@@ -907,6 +1042,9 @@ async fn manager_admission_drains_queued_work_and_waits_for_the_active_permit() 
             .await
     });
     tokio::task::yield_now().await;
+    let queued_status = manager.status("a").await.unwrap();
+    assert_eq!(queued_status.active_requests, 1);
+    assert_eq!(queued_status.queued_requests, 1);
     let drain_manager = manager.clone();
     let drain = tokio::spawn(async move { drain_manager.drain("a").await });
     tokio::task::yield_now().await;
@@ -915,6 +1053,13 @@ async fn manager_admission_drains_queued_work_and_waits_for_the_active_permit() 
         sbproxy_model_host::AdmissionReason::Draining
     );
     assert!(!drain.is_finished());
+    let draining_status = manager.status("a").await.unwrap();
+    assert_eq!(
+        draining_status.state,
+        sbproxy_model_host::DeploymentRuntimeState::Draining
+    );
+    assert_eq!(draining_status.active_requests, 1);
+    assert_eq!(draining_status.queued_requests, 0);
     drop(active);
     let report = drain.await.unwrap().unwrap();
     assert_eq!(report.cancelled_queued, 1);
@@ -928,13 +1073,15 @@ async fn manager_admission_drains_queued_work_and_waits_for_the_active_permit() 
 #[tokio::test]
 async fn manager_capacity_evicts_only_after_active_protection_is_released() {
     let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let observer = Arc::new(ManagerTelemetryObserver::default());
     let manager = Arc::new(
         ModelRuntimeManager::new_with_device_capacities(
             Catalog::builtin().catalog_revision,
             preparer.clone(),
             BTreeMap::from([(0, 1)]),
         )
-        .unwrap(),
+        .unwrap()
+        .with_observer(observer.clone()),
     );
     manager
         .reconcile(manager_desired(
@@ -950,10 +1097,25 @@ async fn manager_capacity_evicts_only_after_active_protection_is_released() {
         .unwrap();
     manager.ensure_ready("a").await.unwrap();
     assert!(matches!(
-        manager.ensure_ready("b").await,
+        manager
+            .ensure_ready_for("b", sbproxy_model_host::PriorityClass::Interactive)
+            .await,
         Err(RuntimeManagerError::Admission(ref rejection))
             if rejection.reason == sbproxy_model_host::AdmissionReason::InsufficientCapacity
     ));
+    assert_ne!(
+        manager.status("b").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Preparing,
+        "a rejected placement must not leave a phantom preparation"
+    );
+    assert_eq!(
+        observer.rejections.lock().unwrap().as_slice(),
+        &[(
+            "b".to_string(),
+            sbproxy_model_host::PriorityClass::Interactive,
+            sbproxy_model_host::AdmissionReason::InsufficientCapacity,
+        )]
+    );
     drop(active);
 
     manager.ensure_ready("b").await.unwrap();
@@ -1088,8 +1250,14 @@ async fn manager_keep_alive_never_reaps_a_failed_generation() {
         .maintenance_tick(tokio::time::Instant::now())
         .await
         .is_empty());
+    let failed = manager.status("a").await.unwrap();
     assert_eq!(
-        manager.status("a").await.unwrap().state,
+        failed.state,
         sbproxy_model_host::DeploymentRuntimeState::Failed
     );
+    assert_eq!(failed.reason_code.as_deref(), Some("engine_early_exit"));
+    assert!(failed
+        .last_error
+        .as_ref()
+        .is_some_and(|error| error.len() <= 512));
 }

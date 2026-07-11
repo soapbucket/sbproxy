@@ -1,12 +1,37 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sbproxy_model_host::{
-    plan_fit_kv_with_margin, AdmissionGate, AdmissionReason, DeviceResidencySet, GpuDescriptor,
+    plan_fit_kv_with_margin, AdmissionGate, AdmissionReason, DeploymentRuntimeState,
+    DeploymentRuntimeStatus, DeviceResidencySet, EngineAvailability, EngineKind, GpuDescriptor,
     GpuVendor, MemoryEstimate, ModelMetadata, PriorityClass, ResidencyProtection,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
+
+#[derive(Default)]
+struct AdmissionTelemetryObserver {
+    counts: Mutex<Vec<(usize, usize)>>,
+    rejections: Mutex<Vec<(PriorityClass, AdmissionReason)>>,
+}
+
+impl sbproxy_model_host::ModelHostObserver for AdmissionTelemetryObserver {
+    fn set_deployment_requests(&self, deployment: &str, active: usize, queued: usize) {
+        assert_eq!(deployment, "coder");
+        self.counts.lock().unwrap().push((active, queued));
+    }
+
+    fn on_admission_rejected(
+        &self,
+        deployment: &str,
+        priority: PriorityClass,
+        reason: AdmissionReason,
+    ) {
+        assert_eq!(deployment, "coder");
+        self.rejections.lock().unwrap().push((priority, reason));
+    }
+}
 
 fn gpu(index: u32, free_gib: u64) -> GpuDescriptor {
     GpuDescriptor {
@@ -15,6 +40,8 @@ fn gpu(index: u32, free_gib: u64) -> GpuDescriptor {
         name: format!("GPU {index}"),
         total_vram_bytes: free_gib * GIB,
         free_vram_bytes: free_gib * GIB,
+        compute_utilization: None,
+        memory_occupancy: Some(0.0),
         compute_capability: Some((8, 9)),
         supports_fp8: true,
         mem_bandwidth_gbps: None,
@@ -257,5 +284,81 @@ async fn timeout_drain_and_keep_alive_account_for_the_full_permit_lifecycle() {
             .unwrap_err()
             .reason,
         AdmissionReason::Draining
+    );
+}
+
+#[test]
+fn status_contract_covers_every_managed_deployment_phase() {
+    for (state, expected) in [
+        (DeploymentRuntimeState::Configured, "configured"),
+        (DeploymentRuntimeState::Assigned, "assigned"),
+        (DeploymentRuntimeState::Cached, "cached"),
+        (DeploymentRuntimeState::Preparing, "preparing"),
+        (DeploymentRuntimeState::Ready, "ready"),
+        (DeploymentRuntimeState::Draining, "draining"),
+        (DeploymentRuntimeState::Stopped, "stopped"),
+        (DeploymentRuntimeState::Failed, "failed"),
+    ] {
+        let status = DeploymentRuntimeStatus {
+            deployment: "coder".to_string(),
+            generation: 7,
+            state,
+            active_requests: 2,
+            queued_requests: 3,
+            engine: Some(EngineKind::Vllm),
+            driver_availability: Some(EngineAvailability::Available),
+            artifact_digest: Some("a".repeat(64)),
+            selected_devices: vec![0],
+            memory: Some(MemoryEstimate::from_total(0, 1024)),
+            port: Some(18_080),
+            reason_code: Some("queue_full".to_string()),
+            job_id: Some("01JFIXTURESTATUSJOB000000000".to_string()),
+            last_error: Some("bounded fixture".to_string()),
+        };
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["state"], expected);
+        assert_eq!(json["active_requests"], 2);
+        assert_eq!(json["queued_requests"], 3);
+        assert_eq!(json["engine"], "vllm");
+        assert_eq!(json["driver_availability"], "available");
+        assert_eq!(json["selected_devices"], serde_json::json!([0]));
+        assert_eq!(json["reason_code"], "queue_full");
+        assert!(json["job_id"].as_str().is_some());
+    }
+}
+
+#[tokio::test]
+async fn status_telemetry_observes_every_admission_count_transition() {
+    let observer = Arc::new(AdmissionTelemetryObserver::default());
+    let gate = AdmissionGate::new(1, 1, Duration::from_secs(30))
+        .unwrap()
+        .with_observer("coder", observer.clone());
+    let active = gate.admit(PriorityClass::Standard).await.unwrap();
+    let queued_gate = gate.clone();
+    let queued = tokio::spawn(async move { queued_gate.admit(PriorityClass::Batch).await });
+    tokio::task::yield_now().await;
+    assert_eq!(gate.counts().queued, 1);
+    assert_eq!(
+        gate.admit(PriorityClass::Interactive)
+            .await
+            .unwrap_err()
+            .reason,
+        AdmissionReason::QueueFull
+    );
+    queued.abort();
+    tokio::task::yield_now().await;
+    drop(active);
+
+    let counts = observer.counts.lock().unwrap();
+    assert_eq!(counts.first(), Some(&(0, 0)));
+    for expected in [(1, 0), (1, 1), (1, 0), (0, 0)] {
+        assert!(
+            counts.contains(&expected),
+            "missing count transition {expected:?}"
+        );
+    }
+    assert_eq!(
+        observer.rejections.lock().unwrap().as_slice(),
+        &[(PriorityClass::Interactive, AdmissionReason::QueueFull)]
     );
 }

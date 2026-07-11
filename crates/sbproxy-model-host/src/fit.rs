@@ -48,6 +48,14 @@ pub struct GpuDescriptor {
     pub total_vram_bytes: u64,
     /// Free device memory in bytes at probe time.
     pub free_vram_bytes: u64,
+    /// Device compute-engine utilization as a fraction in `[0, 1]`.
+    /// `None` means the platform probe could not report it.
+    #[serde(default)]
+    pub compute_utilization: Option<f64>,
+    /// Occupied device memory as a fraction in `[0, 1]`, derived only
+    /// from total and free memory. `None` means total memory was zero.
+    #[serde(default)]
+    pub memory_occupancy: Option<f64>,
     /// CUDA compute capability as `(major, minor)`, e.g. `(7, 5)` for
     /// Turing (T4), `(8, 9)` for Ada (L4). `None` for non-NVIDIA.
     pub compute_capability: Option<(u32, u32)>,
@@ -72,6 +80,8 @@ impl GpuDescriptor {
             name: "Tesla T4".to_string(),
             total_vram_bytes: 16 * GIB,
             free_vram_bytes: 15 * GIB,
+            compute_utilization: None,
+            memory_occupancy: memory_occupancy(16 * GIB, 15 * GIB),
             compute_capability: Some((7, 5)),
             supports_fp8: false,
             mem_bandwidth_gbps: Some(320.0),
@@ -86,11 +96,18 @@ impl GpuDescriptor {
             name: "NVIDIA L4".to_string(),
             total_vram_bytes: 24 * GIB,
             free_vram_bytes: 23 * GIB,
+            compute_utilization: None,
+            memory_occupancy: memory_occupancy(24 * GIB, 23 * GIB),
             compute_capability: Some((8, 9)),
             supports_fp8: true,
             mem_bandwidth_gbps: Some(300.0),
         }
     }
+}
+
+/// Derive occupied-memory fraction from total and free bytes.
+pub fn memory_occupancy(total_bytes: u64, free_bytes: u64) -> Option<f64> {
+    (total_bytes > 0).then(|| total_bytes.saturating_sub(free_bytes) as f64 / total_bytes as f64)
 }
 
 /// One GiB in bytes.

@@ -128,9 +128,9 @@ pub use engine_driver::{
     ProvisionedEngine, RunningEngine,
 };
 pub use fit::{
-    estimate_throughput, fp8_supported, plan_fit_auto_kv_with_margin, plan_fit_kv_with_margin,
-    FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor, MemoryEstimate, ModelMetadata, Quant,
-    StaticGpuProbe, ThroughputEstimate,
+    estimate_throughput, fp8_supported, memory_occupancy, plan_fit_auto_kv_with_margin,
+    plan_fit_kv_with_margin, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor, MemoryEstimate,
+    ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
 };
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
 pub use jobs::{
@@ -172,8 +172,9 @@ pub use runtime::{
 };
 pub use runtime_manager::{
     DeploymentPrepareRequest, DeploymentPreparer, DeploymentRuntimeState, DeploymentRuntimeStatus,
-    ModelRuntimeManager, PreparedDeploymentRuntime, PreparedRevision, ProductionDeploymentPreparer,
-    ReconcilePlan, ReconcileReport, RuntimeManagerError,
+    ModelRuntimeManager, PreparedDeploymentRuntime, PreparedRevision, PreparedRuntimePhase,
+    PreparedRuntimeTelemetry, ProductionDeploymentPreparer, ReconcilePlan, ReconcileReport,
+    RuntimeManagerError,
 };
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
 pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};

@@ -3031,16 +3031,23 @@ pub fn set_model_host_load_queue_depth(model: &str, depth: i64) {
     gauge.with_label_values(&[model.as_str()]).set(depth);
 }
 
-/// Publish per-device GPU VRAM and utilization on
+/// Publish per-device GPU VRAM, compute utilization, and memory occupancy on
 /// `sbproxy_model_host_gpu_vram_bytes{device, kind}` (kind = `total` |
-/// `free`) and `sbproxy_model_host_gpu_utilization{device}` (0.0..1.0).
-/// The utilization gauge is the signal the gpu-aware routing strategy
-/// reads; before this, nothing published it.
-pub fn set_model_host_gpu_stats(device: &str, total_bytes: i64, free_bytes: i64, utilization: f64) {
+/// `free`), `sbproxy_model_host_gpu_utilization{device}`, and
+/// `sbproxy_model_host_gpu_memory_occupancy{device}`. Unknown compute
+/// utilization is not published and is never synthesized from memory.
+pub fn set_model_host_gpu_stats(
+    device: &str,
+    total_bytes: i64,
+    free_bytes: i64,
+    compute_utilization: Option<f64>,
+    memory_occupancy: Option<f64>,
+) {
     use prometheus::{register_gauge_vec, register_int_gauge_vec, GaugeVec, IntGaugeVec};
     use std::sync::OnceLock;
     static VRAM: OnceLock<IntGaugeVec> = OnceLock::new();
-    static UTIL: OnceLock<GaugeVec> = OnceLock::new();
+    static COMPUTE: OnceLock<GaugeVec> = OnceLock::new();
+    static MEMORY: OnceLock<GaugeVec> = OnceLock::new();
     let vram = VRAM.get_or_init(|| {
         register_int_gauge_vec!(
             "sbproxy_model_host_gpu_vram_bytes",
@@ -3049,20 +3056,160 @@ pub fn set_model_host_gpu_stats(device: &str, total_bytes: i64, free_bytes: i64,
         )
         .expect("model host gpu vram gauge registers")
     });
-    let util = UTIL.get_or_init(|| {
+    let compute = COMPUTE.get_or_init(|| {
         register_gauge_vec!(
             "sbproxy_model_host_gpu_utilization",
-            "GPU utilization fraction (0.0-1.0), by device",
+            "GPU compute utilization fraction (0.0-1.0), by device",
             &["device"],
         )
         .expect("model host gpu utilization gauge registers")
+    });
+    let memory = MEMORY.get_or_init(|| {
+        register_gauge_vec!(
+            "sbproxy_model_host_gpu_memory_occupancy",
+            "GPU occupied-memory fraction (0.0-1.0), by device",
+            &["device"],
+        )
+        .expect("model host gpu memory-occupancy gauge registers")
     });
     let device = sanitize_label("device", device);
     vram.with_label_values(&[device.as_str(), "total"])
         .set(total_bytes);
     vram.with_label_values(&[device.as_str(), "free"])
         .set(free_bytes);
-    util.with_label_values(&[device.as_str()]).set(utilization);
+    if let Some(utilization) = bounded_fraction(compute_utilization) {
+        compute
+            .with_label_values(&[device.as_str()])
+            .set(utilization);
+    }
+    if let Some(occupancy) = bounded_fraction(memory_occupancy) {
+        memory.with_label_values(&[device.as_str()]).set(occupancy);
+    }
+}
+
+/// Set exact active and queued requests for one managed deployment.
+pub fn set_model_host_deployment_requests(deployment: &str, active: i64, queued: i64) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::OnceLock;
+    static ACTIVE: OnceLock<IntGaugeVec> = OnceLock::new();
+    static QUEUED: OnceLock<IntGaugeVec> = OnceLock::new();
+    let active_gauge = ACTIVE.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_model_host_active_requests",
+            "Requests holding an active managed-model permit",
+            &["deployment"],
+        )
+        .expect("model host active-requests gauge registers")
+    });
+    let queued_gauge = QUEUED.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_model_host_queued_requests",
+            "Requests waiting in a managed-model admission queue",
+            &["deployment"],
+        )
+        .expect("model host queued-requests gauge registers")
+    });
+    let deployment = sanitize_label("deployment", deployment);
+    active_gauge
+        .with_label_values(&[deployment.as_str()])
+        .set(active.max(0));
+    queued_gauge
+        .with_label_values(&[deployment.as_str()])
+        .set(queued.max(0));
+}
+
+/// Publish the current one-hot lifecycle state for a managed deployment.
+pub fn set_model_host_deployment_state(deployment: &str, engine: &str, state: &str) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    const STATES: &[&str] = &[
+        "configured",
+        "assigned",
+        "cached",
+        "preparing",
+        "ready",
+        "draining",
+        "stopped",
+        "failed",
+        "unknown",
+    ];
+    static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+    static PREVIOUS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+    let gauge = GAUGE.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_model_host_deployment_state",
+            "One-hot managed-model deployment lifecycle state",
+            &["deployment", "engine", "state"],
+        )
+        .expect("model host deployment-state gauge registers")
+    });
+    let deployment = sanitize_label("deployment", deployment);
+    let engine = closed_label(engine, &["vllm", "llama_cpp", "embedded"], "unknown");
+    let state = closed_label(state, STATES, "unknown");
+    let previous = PREVIOUS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut previous = previous
+        .lock()
+        .expect("model host deployment-state mutex poisoned");
+    let old_engine = previous.insert(deployment.clone(), engine.to_string());
+    if let Some(old_engine) = old_engine.filter(|old| old != engine) {
+        for candidate in STATES {
+            let _ =
+                gauge.remove_label_values(&[deployment.as_str(), old_engine.as_str(), candidate]);
+        }
+    }
+    for candidate in STATES {
+        gauge
+            .with_label_values(&[deployment.as_str(), engine, candidate])
+            .set(i64::from(*candidate == state));
+    }
+    drop(previous);
+}
+
+/// Count a bounded managed-model admission rejection.
+pub fn record_model_host_admission_rejection(deployment: &str, priority: &str, reason: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_host_admission_rejections_total",
+            "Managed-model admission rejections by deployment, priority, and reason",
+            &["deployment", "priority", "reason"],
+        )
+        .expect("model host admission-rejections counter registers")
+    });
+    let deployment = sanitize_label("deployment", deployment);
+    let priority = closed_label(priority, &["interactive", "standard", "batch"], "unknown");
+    let reason = closed_label(
+        reason,
+        &[
+            "insufficient_capacity",
+            "queue_full",
+            "queue_timeout",
+            "engine_unhealthy",
+            "crash_loop",
+            "draining",
+        ],
+        "unknown",
+    );
+    counter
+        .with_label_values(&[deployment.as_str(), priority, reason])
+        .inc();
+}
+
+fn bounded_fraction(value: Option<f64>) -> Option<f64> {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 1.0))
+}
+
+fn closed_label(value: &str, allowed: &[&'static str], fallback: &'static str) -> &'static str {
+    allowed
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == value)
+        .unwrap_or(fallback)
 }
 
 // --- k8s operator metrics ----------------------------------------------
@@ -4393,7 +4540,17 @@ mod tests {
         record_model_host_eviction("lru");
         set_model_host_resident_models(2);
         set_model_host_load_queue_depth("qwen3-32b", 4);
-        set_model_host_gpu_stats("0", 24 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024, 0.42);
+        set_model_host_gpu_stats(
+            "0",
+            24 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+            Some(0.42),
+            Some(2.0 / 3.0),
+        );
+        set_model_host_gpu_stats("unknown", 1024, 512, None, Some(0.5));
+        set_model_host_deployment_requests("qwen3-32b", 2, 4);
+        set_model_host_deployment_state("qwen3-32b", "vllm", "ready");
+        record_model_host_admission_rejection("qwen3-32b", "interactive", "queue_full");
         // WOR-1709 / WOR-1711 / WOR-1712 additions.
         record_model_host_lora_load();
         record_model_host_lora_eviction();
@@ -4410,6 +4567,11 @@ mod tests {
             "sbproxy_model_host_load_queue_depth",
             "sbproxy_model_host_gpu_vram_bytes",
             "sbproxy_model_host_gpu_utilization",
+            "sbproxy_model_host_gpu_memory_occupancy",
+            "sbproxy_model_host_active_requests",
+            "sbproxy_model_host_queued_requests",
+            "sbproxy_model_host_deployment_state",
+            "sbproxy_model_host_admission_rejections_total",
             "sbproxy_model_host_lora_loads_total",
             "sbproxy_model_host_lora_evictions_total",
             "sbproxy_model_host_resident_adapters",
@@ -4420,6 +4582,17 @@ mod tests {
         ] {
             assert!(out.contains(name), "missing model-host metric {name}");
         }
+        assert!(out.contains("sbproxy_model_host_gpu_utilization{device=\"0\"} 0.42"));
+        assert!(!out.contains("sbproxy_model_host_gpu_utilization{device=\"unknown\"}"));
+        assert!(out.contains("sbproxy_model_host_gpu_memory_occupancy{device=\"unknown\"} 0.5"));
+        assert!(out.contains("sbproxy_model_host_active_requests{deployment=\"qwen3-32b\"} 2"));
+        assert!(out.contains("sbproxy_model_host_queued_requests{deployment=\"qwen3-32b\"} 4"));
+        assert!(out.contains(
+            "sbproxy_model_host_deployment_state{deployment=\"qwen3-32b\",engine=\"vllm\",state=\"ready\"} 1"
+        ));
+        assert!(out.contains(
+            "sbproxy_model_host_admission_rejections_total{deployment=\"qwen3-32b\",priority=\"interactive\",reason=\"queue_full\"} 1"
+        ));
     }
 
     // --- k8s operator metrics ---
