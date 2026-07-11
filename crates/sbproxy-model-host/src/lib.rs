@@ -82,10 +82,10 @@ pub use admission::{
 #[cfg(feature = "weights")]
 pub use artifact::HttpArtifactTransport;
 pub use artifact::{
-    AcquisitionContext, ArtifactCacheMetadata, ArtifactCacheState, ArtifactError, ArtifactManager,
-    ArtifactObserver, ArtifactTransport, CacheProtection, GcReport, NetworkPolicy, PullIntent,
-    ReadyArtifact, ResponseDisposition, SourceCredential, TransportRequest, TransportResponse,
-    UnavailableArtifactTransport,
+    AcquisitionContext, ArtifactCacheMetadata, ArtifactCacheState, ArtifactError, ArtifactLease,
+    ArtifactManager, ArtifactObserver, ArtifactTransport, CacheProtection, GcReport, NetworkPolicy,
+    PullIntent, ReadyArtifact, ResponseDisposition, SourceCredential, TransportRequest,
+    TransportResponse, UnavailableArtifactTransport,
 };
 pub use artifact_spec::{
     AcceleratorKind, ArtifactFile, ArtifactFormat, ArtifactVariant, ComputeCapability,
@@ -120,7 +120,8 @@ pub use desired::{
     RuntimeDesiredInput, RuntimeDesiredState,
 };
 pub use device_residency::{
-    DeviceReservation, DeviceReservationResult, DeviceResidencySet, ResidencyProtection,
+    DeviceReservation, DeviceReservationResult, DeviceResidencyPolicy, DeviceResidencySet,
+    ResidencyProtection,
 };
 pub use engine_driver::{
     validate_engine_args, EngineAvailability, EngineCapabilities, EngineDetection, EngineDriver,
@@ -171,10 +172,10 @@ pub use runtime::{
     ModelHostStatus, ModelMetadataProvider, ModelStatus, NoopObserver, RuntimeError, VramStatus,
 };
 pub use runtime_manager::{
-    DeploymentPrepareRequest, DeploymentPreparer, DeploymentRuntimeState, DeploymentRuntimeStatus,
-    ModelRuntimeManager, PreparedDeploymentRuntime, PreparedRevision, PreparedRuntimePhase,
-    PreparedRuntimeTelemetry, ProductionDeploymentPreparer, ReconcilePlan, ReconcileReport,
-    RuntimeManagerError,
+    DeploymentAdmissionPermit, DeploymentPrepareRequest, DeploymentPreparer,
+    DeploymentRuntimeState, DeploymentRuntimeStatus, ModelRuntimeManager,
+    PreparedDeploymentRuntime, PreparedRevision, PreparedRuntimePhase, PreparedRuntimeTelemetry,
+    ProductionDeploymentPreparer, ReconcilePlan, ReconcileReport, RuntimeManagerError,
 };
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
 pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};

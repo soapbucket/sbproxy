@@ -1,6 +1,6 @@
 # Model host hardware certification
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-11*
 
 This page separates evidence already produced by deterministic tests from work
 that requires a real accelerator. It is an evidence ledger and a repeatable
@@ -12,14 +12,30 @@ certification.
 | Target | Status | Evidence |
 |---|---|---|
 | CPU contracts | covered in CI | Artifact, driver, fit, admission, reconcile, reload, and CLI suites. |
-| Apple Silicon Metal | pending before this PR is published | One real managed GGUF completion, status query, stop, and cache reuse on the development Mac. |
+| Apple Silicon Metal | passed 2026-07-11 | Real managed GGUF completion, status and stop truth, cache reuse, maintenance health, and ready-engine Ctrl-C shutdown on Apple M4 Max. |
 | NVIDIA CUDA single node | pending final GCP PR | Deterministic T4/L4 descriptors, vLLM plans, container isolation, and CUDA llama.cpp source-build tests exist. No live claim is made in this PR. |
 | NVIDIA multi-GPU | pending final GCP PR | Placement and device-scoping tests only. |
 | Three-node GCP runtime | pending final GCP PR | Cluster membership, placement, peer transport, and fleet operations land in later PR groups. |
 
-The generated [capability matrix](model-host-capabilities.md) keeps Apple and
-NVIDIA platform claims at `preview` until the corresponding live gate is
-recorded.
+The generated [capability matrix](model-host-capabilities.md) records Apple
+Metal as stable. NVIDIA stays at `preview` until the final GCP gate is recorded.
+
+### Apple Metal evidence from 2026-07-11
+
+The PR gate ran on arm64 macOS 26.5.1 build 25F80, Apple M4 Max, with 36 GiB
+of memory. The branch worktree was based on `36d95ddd`; the PR description
+records the final review-fix commit that contains the same runtime code.
+
+- Model: `qwen2.5-0.5b-instruct:q4_k_m`
+- Managed engine: llama.cpp b9905 on Metal
+- Artifact identity: `830f2915ca0008994cbddaeba38634f6e999d34fea89c048ebb73753be0a0591`
+- Engine archive SHA-256: `0d3deb02fd7912c8ef360fa33b3b4a8c97967a3ac703c0ed7d5edd3680723ea8`
+- Completion content: `Ready`
+- Ready status: deployment `local`, state `ready`, top-level `serving: true`, and `local_serving.ready: true`
+- Stopped status: deployment `local`, state `stopped`, top-level `serving: false`, and `local_serving.ready: false`
+- Cache reuse: the verified engine archive mtime remained `1783790888` across the repeated launch
+- Shutdown: Ctrl-C exited the gateway cleanly and the observed ready engine PID `8710` was absent afterward
+- Maintenance: repeated health ticks completed without a Tokio panic
 
 ## Deterministic gate
 
@@ -72,10 +88,9 @@ and the verified artifact digest. Stop must reach `stopped` without deleting the
 snapshot. A second run against the same cache must verify a cache hit without
 another weight download.
 
-Record the exact binary revision, macOS version, chip, memory, engine version,
-artifact digest, command output, and elapsed times in the PR description. After
-that evidence exists, promote the Apple capability from `preview` to `stable`
-and regenerate the matrix.
+Record the final binary revision and retained command output in the PR
+description. The evidence above promotes the Apple capability from `preview`
+to `stable`; regenerate the matrix whenever this record changes.
 
 ## Final GCP NVIDIA gate
 

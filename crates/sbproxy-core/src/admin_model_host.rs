@@ -183,6 +183,79 @@ fn reset_response(body: Option<&str>) -> Resp {
     }
 }
 
+fn runtime_serving_summary(
+    statuses: &[sbproxy_model_host::DeploymentRuntimeStatus],
+    fallback: crate::doctor::LocalServing,
+) -> (bool, crate::doctor::LocalServing) {
+    use sbproxy_model_host::DeploymentRuntimeState;
+
+    if statuses.is_empty() {
+        return (false, fallback);
+    }
+
+    let serving = statuses
+        .iter()
+        .any(|status| status.state == DeploymentRuntimeState::Ready);
+    if serving {
+        return (
+            true,
+            crate::doctor::LocalServing {
+                ready: true,
+                blockers: Vec::new(),
+                recommendation: None,
+            },
+        );
+    }
+
+    let blockers = statuses
+        .iter()
+        .map(|status| match status.reason_code.as_deref() {
+            Some(reason) => format!(
+                "managed deployment {} is {} ({reason})",
+                status.deployment,
+                status.state.as_str()
+            ),
+            None => format!(
+                "managed deployment {} is {}",
+                status.deployment,
+                status.state.as_str()
+            ),
+        })
+        .collect();
+    let recommendation = if statuses
+        .iter()
+        .any(|status| status.state == DeploymentRuntimeState::Failed)
+    {
+        "inspect the retained failure, correct its cause, then reset the deployment"
+    } else if statuses
+        .iter()
+        .any(|status| status.state == DeploymentRuntimeState::Preparing)
+    {
+        "wait for the preparing deployment to become ready"
+    } else if statuses
+        .iter()
+        .any(|status| status.state == DeploymentRuntimeState::Draining)
+    {
+        "wait for the draining deployment to stop"
+    } else if statuses
+        .iter()
+        .any(|status| status.state == DeploymentRuntimeState::Stopped)
+    {
+        "load a stopped deployment or send it a routed request"
+    } else {
+        "load a configured deployment or send it a routed request"
+    };
+
+    (
+        false,
+        crate::doctor::LocalServing {
+            ready: false,
+            blockers,
+            recommendation: Some(recommendation.to_string()),
+        },
+    )
+}
+
 fn status_response() -> Resp {
     let runtime = crate::server::model_host::model_runtime_manager();
     // The admin dispatcher runs under `spawn_blocking`, so we are on a
@@ -192,9 +265,10 @@ fn status_response() -> Resp {
     // can say *why* a serve: block admits nothing (no memory budget, no
     // engine) instead of showing an empty model list. `collect()` is the
     // shallow probe set (no network), fine for an on-demand admin call.
-    let local_serving = crate::doctor::DoctorReport::collect().local_serving;
+    let fallback = crate::doctor::DoctorReport::collect().local_serving;
+    let (serving, local_serving) = runtime_serving_summary(&statuses, fallback);
     match serde_json::to_string(&serde_json::json!({
-        "serving": !statuses.is_empty(),
+        "serving": serving,
         "runtime_revision": runtime.current_revision(),
         "deployments": &statuses,
         "models": &statuses,
@@ -226,6 +300,64 @@ fn runtime_error_response(operation: &str, error: sbproxy_model_host::RuntimeMan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_status(
+        state: sbproxy_model_host::DeploymentRuntimeState,
+    ) -> sbproxy_model_host::DeploymentRuntimeStatus {
+        sbproxy_model_host::DeploymentRuntimeStatus {
+            deployment: "local".to_string(),
+            generation: 1,
+            state,
+            active_requests: 0,
+            queued_requests: 0,
+            engine: Some(sbproxy_model_host::EngineKind::LlamaCpp),
+            driver_availability: Some(sbproxy_model_host::EngineAvailability::Available),
+            artifact_digest: Some("a".repeat(64)),
+            selected_devices: vec![0],
+            memory: None,
+            port: (state == sbproxy_model_host::DeploymentRuntimeState::Ready).then_some(41000),
+            reason_code: None,
+            job_id: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn live_runtime_state_overrides_the_path_only_doctor_verdict() {
+        let fallback = crate::doctor::LocalServing {
+            ready: false,
+            blockers: vec!["no inference engine is installed yet".to_string()],
+            recommendation: Some("install an engine".to_string()),
+        };
+
+        let (serving, verdict) = runtime_serving_summary(
+            &[runtime_status(
+                sbproxy_model_host::DeploymentRuntimeState::Ready,
+            )],
+            fallback.clone(),
+        );
+        assert!(serving);
+        assert!(verdict.ready);
+        assert!(verdict.blockers.is_empty());
+        assert!(verdict.recommendation.is_none());
+
+        let (serving, verdict) = runtime_serving_summary(
+            &[runtime_status(
+                sbproxy_model_host::DeploymentRuntimeState::Stopped,
+            )],
+            fallback,
+        );
+        assert!(!serving);
+        assert!(!verdict.ready);
+        assert_eq!(
+            verdict.blockers,
+            ["managed deployment local is stopped".to_string()]
+        );
+        assert_eq!(
+            verdict.recommendation.as_deref(),
+            Some("load a stopped deployment or send it a routed request")
+        );
+    }
 
     #[test]
     fn non_matching_path_falls_through() {

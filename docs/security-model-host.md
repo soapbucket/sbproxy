@@ -1,6 +1,6 @@
 # Model host security
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-11*
 
 The model host starts inference processes beside a gateway that may hold cloud
 provider credentials. Treat write access to `sb.yml`, the deployment revision
@@ -60,10 +60,13 @@ also fail preparation instead of disappearing silently.
 
 ## No shell boundary
 
-The process layer receives an executable plus tokenized arguments and an
-environment map. It calls the operating-system process API directly. Shell
-metacharacters inside one argument remain data because `/bin/sh`, `bash`, and
-PowerShell are not involved.
+The process layer receives an executable plus tokenized arguments and a typed
+environment map. It clears the gateway environment, restores only an audited
+operating-system baseline such as `PATH`, locale, and temporary-directory
+settings, then adds driver-owned overrides. Cloud credentials held by the
+gateway are not inherited by an engine. The runner calls the operating-system
+process API directly. Shell metacharacters inside one argument remain data
+because `/bin/sh`, `bash`, and PowerShell are not involved.
 
 This blocks command injection through argument punctuation, but it does not make
 an unsafe engine flag harmless. The allowlist remains necessary because an
@@ -95,11 +98,12 @@ environment.
 
 ### Cache deletion
 
-Exact removal acquires the cache mutation lock and artifact digest lock, then
-rechecks protection. Configured, resident, pinned, locked, downloading,
-verifying, and deleting artifacts fail closed. A queued pull also blocks removal
-before a ready snapshot exists. Shared blobs are reclaimed only after the last
-snapshot reference disappears.
+Exact removal acquires the cache mutation lock, artifact digest lock, and an
+exclusive digest lease, then rechecks protection. A prepared or running engine
+keeps a shared lease in another process. Configured, resident, pinned, locked,
+downloading, verifying, leased, and deleting artifacts fail closed. A queued
+pull also blocks removal before a ready snapshot exists. Shared blobs are
+reclaimed only after the last snapshot reference disappears.
 
 The CLI can query the authenticated admin status before deletion, but the
 configuration file is the durable protection source. Supply `-f sb.yml` when
@@ -110,10 +114,10 @@ removing from the cache used by a running file-managed gateway.
 ### llama.cpp binary and source build
 
 The driver can use a trusted explicit path, a compatible `PATH` executable, or a
-pinned release. A custom release may carry an expected SHA-256. Linux CUDA
-source builds use an official tag archive URL and mandatory source digest; the
-built-in tag has a checked-in archive digest. Builders share a lock, stage away
-from the ready path, and publish only an executable final file.
+pinned release. Built-in b9905 prebuilt assets and the Linux CUDA source archive
+have checked-in SHA-256 digests. A custom release may carry an expected digest.
+Acquirers share an identity-scoped lock, stage away from the ready path, verify
+the archive, and publish only a complete executable directory.
 
 A release version without a digest is weaker than a digest-pinned release. The
 availability report says so and provides remediation. Pin the digest for a
@@ -143,11 +147,13 @@ control its socket may already have host-level authority.
 
 ## Process lifecycle
 
-The process runner keeps a bounded stderr tail for diagnosis. Readiness races
-the child exit, so a broken engine fails early instead of waiting through the
-full health timeout. Shutdown first asks the child process group to exit, then
-uses a bounded force-kill backstop. The group guard prevents the runtime from
-targeting the gateway's own process group.
+The process runner keeps the last 64 KiB of stderr in memory. It does not leave a
+predictable engine log file in the temporary directory. Readiness races the
+child exit, so a broken engine fails early instead of waiting through the full
+health timeout. Shutdown first asks the child process group to exit, then uses a
+bounded force-kill backstop. The group guard prevents the runtime from targeting
+the gateway's own process group. On Linux, a parent-death signal also kills the
+engine process leader if the gateway exits without running normal shutdown.
 
 Crash retries use bounded exponential backoff. Exhaustion produces retained
 `crash_loop` state and requires an explicit reset after the cause is corrected.
@@ -162,7 +168,9 @@ deployment with active or queued requests.
 
 Every startup and reload path builds a complete candidate. Catalog, routes,
 engine policy, artifacts, capacity, and warm deployments must prepare before the
-runtime swaps. A failure tears down staged work and preserves the last good
+runtime swaps. Rolling replacements prove overlap capacity before launch.
+Recreate replacements stop the old generation first and restart it if the warm
+replacement fails. A failure tears down staged work and preserves the last good
 routes and resident generations.
 
 This transaction protects availability. It does not turn an untrusted config
@@ -177,7 +185,8 @@ zeroized on drop, redacted from errors, and omitted from partial, snapshot, and
 job metadata.
 
 `sbproxy run` generates a 32-byte random admin password, writes its temporary
-config with owner-only permissions on Unix, and binds admin to loopback. The
+config with owner-only permissions on Unix, binds admin to loopback, and removes
+the temporary directory when the handler returns on success or failure. The
 password appears in the terminal because the operator needs it for lifecycle
 commands. Do not redirect that banner into a world-readable log.
 

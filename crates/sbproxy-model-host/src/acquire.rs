@@ -131,7 +131,7 @@ pub fn plan_binary_acquire_with_cuda(
                 .and_then(|a| a.version.clone())
                 .unwrap_or_else(|| DEFAULT_LLAMA_RELEASE_TAG.to_string());
             let accel = acquire.map(|a| a.accel).unwrap_or_default();
-            let sha256 = acquire.and_then(|a| a.sha256.clone());
+            let configured_sha256 = acquire.and_then(|a| a.sha256.clone());
             let source_build_requested = acquire
                 .is_some_and(|acquire| acquire.source == AcquireSource::SourceBuild)
                 || accel == EngineAccel::Cuda;
@@ -150,7 +150,7 @@ pub fn plan_binary_acquire_with_cuda(
                         ));
                     }
                 } else {
-                    let source_sha256 = match sha256 {
+                    let source_sha256 = match configured_sha256 {
                         Some(sha256) => sha256,
                         None if tag == DEFAULT_LLAMA_RELEASE_TAG => {
                             crate::DEFAULT_LLAMA_SOURCE_SHA256.to_string()
@@ -164,6 +164,12 @@ pub fn plan_binary_acquire_with_cuda(
                     return BinaryAcquirePlan::BuildCuda { tag, source_sha256 };
                 }
             }
+            let sha256 = configured_sha256.or_else(|| {
+                Platform::detect().and_then(|platform| {
+                    crate::llama_release::default_release_sha256(&tag, platform, accel)
+                        .map(str::to_string)
+                })
+            });
             BinaryAcquirePlan::FetchRelease { tag, accel, sha256 }
         }
         EngineKind::Vllm => match acquire.map(|a| a.source) {
@@ -248,13 +254,13 @@ mod tests {
     #[test]
     fn release_uses_default_tag_when_unset() {
         // No engine on PATH, default provisioning: fetch the pinned
-        // default release for this platform (the test host is a
-        // supported platform).
+        // default release and its built-in asset digest for this platform
+        // (the test host is a supported platform).
         let plan = plan_binary_acquire(EngineKind::LlamaCpp, None, None);
         match plan {
             BinaryAcquirePlan::FetchRelease { tag, sha256, .. } => {
                 assert_eq!(tag, DEFAULT_LLAMA_RELEASE_TAG);
-                assert!(sha256.is_none());
+                assert_eq!(sha256.as_deref().map(str::len), Some(64));
             }
             // A platform with no prebuilt asset blocks instead; both are
             // valid depending on the test host.

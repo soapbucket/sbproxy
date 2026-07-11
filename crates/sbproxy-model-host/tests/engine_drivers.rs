@@ -260,6 +260,7 @@ async fn driver_contract_is_complete_and_object_safe() {
                     selected_devices: Vec::new(),
                     kv_quant: KvCacheQuant::Auto,
                     extra_args: Vec::new(),
+                    max_concurrency: 1,
                     ready_timeout: Duration::from_secs(1),
                 },
             )
@@ -419,6 +420,7 @@ async fn crash_loop_observes_backoff_retains_failure_and_requires_durable_reset(
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
+        max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
     let task_request = request.clone();
@@ -596,6 +598,7 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: vec!["--flash-attn".to_string()],
+        max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
     request
@@ -622,6 +625,7 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
+        max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
     request.artifact.metadata.trust = "legacy-unverified".to_string();
@@ -643,6 +647,7 @@ fn launch_request_requires_devices_that_match_the_accelerator() {
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
+        max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
     assert_eq!(
@@ -923,8 +928,8 @@ fn llama_detection_distinguishes_available_acquirable_incompatible_and_blocked()
     let acquirable = LlamaCppDriver::new(runner.clone(), llama_source(None, true));
     let detection = acquirable.detect(&llama_worker(), &EngineProvisioning::default());
     assert_eq!(detection.availability, EngineAvailability::Acquirable);
-    assert!(detection.reason.contains("sha256"));
-    assert!(detection.remediation.is_some());
+    assert!(detection.reason.contains("digest-pinned"));
+    assert!(detection.remediation.is_none());
 
     let mut incompatible_worker = llama_worker();
     incompatible_worker.engines.clear();
@@ -1096,6 +1101,7 @@ async fn llama_launch_uses_one_verified_gguf_and_runtime_owned_network_and_devic
         selected_devices: vec![2],
         kv_quant: KvCacheQuant::Int4,
         extra_args: vec!["--flash-attn".to_string()],
+        max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
 
@@ -1156,6 +1162,7 @@ async fn llama_metal_launch_offloads_without_exporting_a_cuda_device() {
                 selected_devices: vec![0],
                 kv_quant: KvCacheQuant::Auto,
                 extra_args: Vec::new(),
+                max_concurrency: 1,
                 ready_timeout: Duration::from_secs(1),
             },
         )
@@ -1459,7 +1466,7 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
         vllm_host(&[("vllm", "/usr/bin/vllm"), ("python3", "/usr/bin/python3")]),
     );
     let provisioned = driver.provision(&request).await.expect("binary vLLM");
-    let launch = LaunchRequest {
+    let mut launch = LaunchRequest {
         deployment: "coder".to_string(),
         generation: 5,
         artifact: ready(EngineKind::Vllm, ArtifactFormat::Safetensors),
@@ -1469,7 +1476,16 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
         selected_devices: vec![3],
         kv_quant: KvCacheQuant::Fp8,
         extra_args: vec!["--enable-prefix-caching".to_string()],
+        max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
+    };
+    launch.fit.memory = sbproxy_model_host::MemoryEstimate {
+        device_index: 0,
+        weight_bytes: 512,
+        kv_bytes: 256,
+        runtime_overhead_bytes: 128,
+        safety_margin_bytes: 128,
+        total_bytes: 1024,
     };
     let running = driver
         .launch(&provisioned, &launch)
@@ -1490,6 +1506,11 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
     assert_eq!(
         flag_value(&captured[0].arguments, "--kv-cache-dtype"),
         "fp8"
+    );
+    assert_eq!(flag_value(&captured[0].arguments, "--max-num-seqs"), "1");
+    assert_eq!(
+        flag_value(&captured[0].arguments, "--kv-cache-memory-bytes"),
+        "256"
     );
     assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "3");
 }
@@ -1532,6 +1553,7 @@ acquire:
                 selected_devices: vec![0],
                 kv_quant: KvCacheQuant::Auto,
                 extra_args: Vec::new(),
+                max_concurrency: 1,
                 ready_timeout: Duration::from_secs(1),
             },
         )
@@ -1558,6 +1580,7 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
         selected_devices: vec![1],
         kv_quant: KvCacheQuant::Auto,
         extra_args: vec!["--enable-prefix-caching".to_string()],
+        max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
     let image = format!("ghcr.io/vllm-project/vllm-openai@sha256:{}", "a".repeat(64));

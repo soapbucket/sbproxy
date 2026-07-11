@@ -815,7 +815,7 @@ impl CapabilityRegistry {
     /// Render the deterministic checked-in Markdown capability matrix.
     pub fn render_markdown(&self) -> String {
         let mut output = String::from(
-            "# Model-host capability matrix\n*Last modified: 2026-07-10*\n\n*Generated from the executable registry; do not hand-edit.*\n\n",
+            "# Model-host capability matrix\n*Last modified: 2026-07-11*\n\n*Generated from the executable registry; do not hand-edit.*\n\n",
         );
         output.push_str(&format!("Registry version: `{}`\n\n", self.version));
         output.push_str("## Product capabilities\n\n");
@@ -1026,7 +1026,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "artifact.exact_removal",
         domain: CapabilityDomain::Artifact,
         status: SupportLevel::Stable,
-        summary: "Exact cache removal is idempotent and rejects configured, resident, pinned, locked, or active artifacts.",
+        summary: "Exact cache removal is idempotent and rejects configured, resident, pinned, locked, leased, or active artifacts.",
         evidence: &[
             "contract.exact_removal_protects_references",
             "test.artifact_manager",
@@ -1049,8 +1049,12 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "engine.llama_cpp_managed",
         domain: CapabilityDomain::Engine,
         status: SupportLevel::Preview,
-        summary: "Managed llama.cpp supports pinned binary acquisition and Linux CUDA source builds; live Mac certification is pending the PR gate.",
-        evidence: &["test.engine_drivers", "test.cuda_build"],
+        summary: "Managed llama.cpp supports digest-verified binary acquisition and Linux CUDA source builds; Apple Metal is certified while live CUDA remains deferred.",
+        evidence: &[
+            "test.engine_drivers",
+            "test.cuda_build",
+            "cert.apple_metal.2026-07-11",
+        ],
         consumer: None,
     },
     CapabilityEntry {
@@ -1085,7 +1089,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "lifecycle.single_node_residency",
         domain: CapabilityDomain::Lifecycle,
         status: SupportLevel::Stable,
-        summary: "Single-node residency honors the configured eviction policy.",
+        summary: "Single-node residency honors the global resident limit and configured eviction policy across devices.",
         evidence: &["contract.eviction_changes_admission"],
         consumer: Some(ConsumerContract::EvictionChangesAdmission),
     },
@@ -1140,10 +1144,14 @@ const CAPABILITIES: &[CapabilityEntry] = &[
     CapabilityEntry {
         id: "platform.apple_metal",
         domain: CapabilityDomain::Platform,
-        status: SupportLevel::Preview,
-        summary: "Apple Metal discovery and managed llama.cpp are implemented; the real completion gate runs before PR publication.",
-        evidence: &["test.catalog_v2", "test.engine_drivers"],
-        consumer: None,
+        status: SupportLevel::Stable,
+        summary: "Apple Metal completed a real managed gateway completion, status, stop, cache-reuse, and Ctrl-C shutdown gate on Apple M4 Max.",
+        evidence: &[
+            "contract.catalog_v2_selects_exact_artifact",
+            "test.engine_drivers",
+            "cert.apple_metal.2026-07-11",
+        ],
+        consumer: Some(ConsumerContract::CatalogV2SelectsExactArtifact),
     },
     CapabilityEntry {
         id: "platform.nvidia_cuda",

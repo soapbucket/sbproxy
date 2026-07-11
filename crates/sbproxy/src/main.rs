@@ -736,7 +736,10 @@ fn main() {
             run_subcommand("ai", 2, handle_ai_subcommand(&cmd));
         }
         Some(Cmd::Run(args)) => {
-            handle_run_subcommand(&args, grace);
+            let code = handle_run_subcommand(&args, grace);
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Some(Cmd::Models(cmd)) => {
             run_subcommand(
@@ -1301,14 +1304,22 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
         .and_then(|yaml| {
             let compiled = sbproxy_config::compile_config(&yaml)
                 .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
-            sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
-                .map(|_| ())
+            let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "config '{path_str}' compiled, but a module failed to construct \
                          (this would fail at boot):\n{e:#}"
                     )
-                })
+                })?;
+            let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            sbproxy_core::model_runtime::validate_model_runtime(&pipeline, config_dir).map_err(
+                |e| {
+                    anyhow::anyhow!(
+                        "config '{path_str}' has invalid model-host desired state \
+                         (this would fail at boot):\n{e:#}"
+                    )
+                },
+            )
         });
 
     match (json, outcome) {
@@ -1457,17 +1468,46 @@ struct PreparedRun {
     yaml: String,
 }
 
+struct PrivateRunDirectory {
+    path: PathBuf,
+}
+
+impl PrivateRunDirectory {
+    fn new() -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "sbproxy-run-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            )),
+        }
+    }
+
+    fn config_path(&self) -> PathBuf {
+        self.path.join("sb.yml")
+    }
+}
+
+impl Drop for PrivateRunDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// `sbproxy run <model>`: resolve one certified artifact, synthesize the
 /// canonical managed desired state, and wait for a warm deployment before
 /// advertising the endpoint.
-fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
+fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) -> i32 {
     use zeroize::Zeroize;
 
     let mut prepared = match prepare_run(args) {
         Ok(prepared) => prepared,
         Err(error) => {
             eprintln!("sbproxy run: {error:#}");
-            std::process::exit(2);
+            return 2;
         }
     };
 
@@ -1481,25 +1521,18 @@ fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
         );
         prepared.admin_password.zeroize();
         prepared.yaml.zeroize();
-        return;
+        return 0;
     }
 
     raise_fd_limit();
     warn_low_fd_limit();
-    let run_dir = std::env::temp_dir().join(format!(
-        "sbproxy-run-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-    ));
-    let path = run_dir.join("sb.yml");
+    let run_dir = PrivateRunDirectory::new();
+    let path = run_dir.config_path();
     if let Err(error) = write_private_run_config(&path, prepared.yaml.as_bytes()) {
         prepared.admin_password.zeroize();
         prepared.yaml.zeroize();
         eprintln!("sbproxy run: {error:#}");
-        std::process::exit(1);
+        return 1;
     }
     prepared.yaml.zeroize();
 
@@ -1519,7 +1552,7 @@ fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
         Err(error) => {
             prepared.admin_password.zeroize();
             eprintln!("sbproxy run: start gateway thread: {error}");
-            std::process::exit(1);
+            return 1;
         }
     };
 
@@ -1536,13 +1569,12 @@ fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
             if let Some(password) = admin_args.password.as_mut() {
                 password.zeroize();
             }
-            let _ = std::fs::remove_dir_all(&run_dir);
             match result {
                 Ok(Ok(())) => eprintln!("sbproxy run: gateway exited before the model was ready"),
                 Ok(Err(error)) => eprintln!("sbproxy run: gateway failed: {error:#}"),
                 Err(_) => eprintln!("sbproxy run: gateway thread panicked"),
             }
-            std::process::exit(1);
+            return 1;
         }
 
         if let Ok(status) = admin_request_json(
@@ -1578,7 +1610,7 @@ fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
                         password.zeroize();
                     }
                     eprintln!("sbproxy run: {reason}");
-                    std::process::exit(1);
+                    return 1;
                 }
                 _ => {}
             }
@@ -1601,16 +1633,15 @@ fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
     }
 
     let result = server.join();
-    let _ = std::fs::remove_dir_all(&run_dir);
     match result {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => 0,
         Ok(Err(error)) => {
             eprintln!("sbproxy run: gateway failed: {error:#}");
-            std::process::exit(1);
+            1
         }
         Err(_) => {
             eprintln!("sbproxy run: gateway thread panicked");
-            std::process::exit(1);
+            1
         }
     }
 }
@@ -4137,6 +4168,23 @@ mod tests {
     }
 
     #[test]
+    fn private_run_directory_removes_credentials_when_the_handler_returns() {
+        let root = std::env::temp_dir().join(format!(
+            "sbproxy-private-run-dir-{}-{}",
+            std::process::id(),
+            random_local_password(),
+        ));
+        let run_dir = PrivateRunDirectory { path: root.clone() };
+        let config = run_dir.config_path();
+        write_private_run_config(&config, b"admin_password: fixture-secret\n").unwrap();
+        assert!(config.exists());
+
+        drop(run_dir);
+
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn run_ready_banner_contains_copyable_sdk_and_admin_settings() {
         let banner = run_ready_banner("coder", 8080, "http://127.0.0.1:9090", "fixture-secret");
         assert!(banner.contains("OPENAI_BASE_URL=http://127.0.0.1:8080/v1"));
@@ -4710,6 +4758,19 @@ mod tests {
     #[test]
     fn validate_bad_config_text_errors_json_exits_two() {
         let path = temp_config("this is not: [valid yaml");
+        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_rejects_model_host_semantics_that_boot_rejects() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  model_host:\n    max_parallel_prepares: 0\norigins:\n  x.local:\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: ok\n",
+        );
         assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
         assert_eq!(
             handle_validate_subcommand(&validate_args(&path, true)).unwrap(),

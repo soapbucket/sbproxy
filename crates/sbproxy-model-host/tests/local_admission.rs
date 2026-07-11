@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use sbproxy_model_host::{
     plan_fit_kv_with_margin, AdmissionGate, AdmissionReason, DeploymentRuntimeState,
-    DeploymentRuntimeStatus, DeviceResidencySet, EngineAvailability, EngineKind, GpuDescriptor,
-    GpuVendor, MemoryEstimate, ModelMetadata, PriorityClass, ResidencyProtection,
+    DeploymentRuntimeStatus, DeviceResidencyPolicy, DeviceResidencySet, EngineAvailability,
+    EngineKind, EvictionPolicy, GpuDescriptor, GpuVendor, MemoryEstimate, ModelMetadata,
+    PriorityClass, ResidencyProtection,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -167,6 +168,97 @@ fn residency_is_per_device_and_never_evicts_protected_generations() {
     );
     assert!(residency.contains(1, "large", 1));
     assert!(!residency.contains(0, "large", 1));
+}
+
+#[test]
+fn max_resident_models_is_global_across_devices() {
+    let mut residency = DeviceResidencySet::new(BTreeMap::from([(0, 8 * GIB), (1, 8 * GIB)]));
+    let estimate = |device_index| MemoryEstimate {
+        device_index,
+        weight_bytes: GIB,
+        kv_bytes: 0,
+        runtime_overhead_bytes: 0,
+        safety_margin_bytes: 0,
+        total_bytes: GIB,
+    };
+
+    residency
+        .reserve_with_policy(
+            "oldest",
+            1,
+            estimate(0),
+            ResidencyProtection::default(),
+            1,
+            DeviceResidencyPolicy::new(Some(2), EvictionPolicy::Lru),
+        )
+        .unwrap();
+    residency
+        .reserve_with_policy(
+            "newer",
+            1,
+            estimate(1),
+            ResidencyProtection::default(),
+            2,
+            DeviceResidencyPolicy::new(Some(2), EvictionPolicy::Lru),
+        )
+        .unwrap();
+
+    let admitted = residency
+        .reserve_with_policy(
+            "newest",
+            1,
+            estimate(1),
+            ResidencyProtection::default(),
+            3,
+            DeviceResidencyPolicy::new(Some(2), EvictionPolicy::Lru),
+        )
+        .unwrap();
+
+    assert_eq!(admitted.evicted, vec!["oldest".to_string()]);
+    assert!(!residency.contains(0, "oldest", 1));
+    assert!(residency.contains(1, "newer", 1));
+    assert!(residency.contains(1, "newest", 1));
+    assert_eq!(residency.reservations().len(), 2);
+}
+
+#[test]
+fn never_eviction_rejects_resident_limit_displacement() {
+    let mut residency = DeviceResidencySet::new(BTreeMap::from([(0, 8 * GIB), (1, 8 * GIB)]));
+    let estimate = |device_index| MemoryEstimate {
+        device_index,
+        weight_bytes: GIB,
+        kv_bytes: 0,
+        runtime_overhead_bytes: 0,
+        safety_margin_bytes: 0,
+        total_bytes: GIB,
+    };
+
+    residency
+        .reserve_with_policy(
+            "resident",
+            1,
+            estimate(0),
+            ResidencyProtection::default(),
+            1,
+            DeviceResidencyPolicy::new(Some(1), EvictionPolicy::Never),
+        )
+        .unwrap();
+
+    let blocked = residency
+        .reserve_with_policy(
+            "candidate",
+            1,
+            estimate(1),
+            ResidencyProtection::default(),
+            2,
+            DeviceResidencyPolicy::new(Some(1), EvictionPolicy::Never),
+        )
+        .unwrap_err();
+
+    assert_eq!(blocked.reason, AdmissionReason::InsufficientCapacity);
+    assert!(blocked.detail.contains("eviction policy is never"));
+    assert!(residency.contains(0, "resident", 1));
+    assert!(!residency.contains(1, "candidate", 1));
 }
 
 #[tokio::test]

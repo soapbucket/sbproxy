@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-11*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -187,7 +187,8 @@ SB_CONFIG_FILE=/etc/sbproxy/sb.yml sbproxy
 
 Loads and compiles the config without binding any listener. Exits 0 if
 the file compiles, 2 otherwise. Suitable for CI gates before a
-rolling deployment.
+rolling deployment. Managed-model configuration also runs through the same
+desired-state semantic validation used at boot.
 
 ```bash
 sbproxy validate /etc/sbproxy/sb.yml
@@ -302,7 +303,9 @@ sbproxy run qwen2.5-0.5b-instruct --dry-run
 
 The ready banner includes the endpoint, generated admin URL and credential,
 curl request, `OPENAI_BASE_URL`, and `OPENAI_API_KEY`. A raw `hf:` reference is
-rejected because it lacks the complete catalog v2 identity.
+rejected because it lacks the complete catalog v2 identity. The private
+temporary config is removed whenever the command returns, including startup and
+readiness failures.
 
 ### `models` - artifact and runtime lifecycle
 
@@ -326,7 +329,8 @@ sbproxy models remove qwen2.5-0.5b-instruct \
 ```
 
 Removal is exact and idempotent. It refuses configured, resident, pinned,
-locked, or active artifacts. Supplying the active config with `-f` gives the
+locked, leased, or active artifacts. A prepared or running engine holds a
+cross-process digest lease. Supplying the active config with `-f` gives the
 command its durable protection set; `--admin-url` and admin credentials add the
 live resident set.
 
@@ -377,8 +381,8 @@ The managed runtime resolves an engine in this order:
 
 - An explicit trusted `engines.<kind>.path` wins.
 - A compatible binary on `PATH` is next for ordinary binary launch.
-- llama.cpp can fetch a pinned release. Linux CUDA may build the fixed,
-  digest-pinned source archive when its toolchain is present.
+- llama.cpp can fetch a pinned release. Built-in prebuilt assets and the Linux
+  CUDA source archive have checked-in digests and identity-scoped caches.
 - vLLM can use a version-pinned managed uv environment or a digest-pinned
   private container.
 

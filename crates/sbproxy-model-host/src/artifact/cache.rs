@@ -261,6 +261,10 @@ pub(crate) struct ArtifactLockGuard {
     _file: File,
 }
 
+pub(crate) struct ArtifactLeaseGuard {
+    _file: File,
+}
+
 /// Serializes blob and ready-metadata mutation against collection.
 pub(crate) struct CacheMutationGuard {
     _file: File,
@@ -298,6 +302,31 @@ impl ArtifactCache {
         FileExt::lock_exclusive(&file)
             .map_err(|source| io_error("lock artifact", &path, source))?;
         Ok(ArtifactLockGuard { _file: file })
+    }
+
+    pub(crate) fn lock_shared_lease(
+        &self,
+        digest: &str,
+    ) -> Result<ArtifactLeaseGuard, ArtifactError> {
+        validate_digest(digest)?;
+        let path = self.root.join("locks").join(format!("lease-{digest}.lock"));
+        let file = open_lock(&path)?;
+        FileExt::lock_shared(&file).map_err(|source| io_error("lease artifact", &path, source))?;
+        Ok(ArtifactLeaseGuard { _file: file })
+    }
+
+    pub(crate) fn try_lock_exclusive_lease(
+        &self,
+        digest: &str,
+    ) -> Result<Option<ArtifactLeaseGuard>, ArtifactError> {
+        validate_digest(digest)?;
+        let path = self.root.join("locks").join(format!("lease-{digest}.lock"));
+        let file = open_lock(&path)?;
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(ArtifactLeaseGuard { _file: file })),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(source) => Err(io_error("try lock artifact lease", &path, source)),
+        }
     }
 
     pub(crate) fn lock_shared_mutation(&self) -> Result<CacheMutationGuard, ArtifactError> {

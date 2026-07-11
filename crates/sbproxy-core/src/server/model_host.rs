@@ -98,7 +98,7 @@ impl std::fmt::Debug for PreparedModelRuntime {
 pub struct ManagedModelPermit {
     manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
     deployment: String,
-    _admission: sbproxy_model_host::AdmissionPermit,
+    admission: sbproxy_model_host::DeploymentAdmissionPermit,
 }
 
 impl std::fmt::Debug for ManagedModelPermit {
@@ -121,7 +121,7 @@ impl ManagedModelPermit {
         priority: sbproxy_model_host::PriorityClass,
     ) -> Result<sbproxy_model_host::RunningEngine, sbproxy_model_host::RuntimeManagerError> {
         self.manager
-            .ensure_ready_for(&self.deployment, priority)
+            .ensure_ready_for_generation(&self.deployment, self.admission.generation(), priority)
             .await
     }
 }
@@ -302,6 +302,12 @@ pub(crate) fn make_probe() -> Arc<dyn GpuProbe> {
     Arc::new(sbproxy_model_host::CpuProbe::from_system())
 }
 
+fn build_model_maintenance_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
 impl ProductionModelRuntime {
     fn empty() -> Result<Self, sbproxy_model_host::RuntimeManagerError> {
         let catalog = Catalog::builtin();
@@ -327,10 +333,7 @@ impl ProductionModelRuntime {
         if let Err(error) = std::thread::Builder::new()
             .name("sbproxy-model-maintenance".to_string())
             .spawn(move || {
-                let executor = match tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                {
+                let executor = match build_model_maintenance_runtime() {
                     Ok(executor) => executor,
                     Err(error) => {
                         tracing::error!(%error, "failed to build model maintenance runtime");
@@ -401,7 +404,7 @@ impl ProductionModelRuntime {
         Ok(ManagedModelPermit {
             manager,
             deployment: deployment.to_string(),
-            _admission: admission,
+            admission,
         })
     }
 
@@ -420,6 +423,36 @@ impl ProductionModelRuntime {
     ) -> Result<Option<sbproxy_model_host::OperationJob>, sbproxy_model_host::RuntimeManagerError>
     {
         self.active_manager().reset(deployment).await
+    }
+
+    /// Drain and stop every configured deployment before process exit.
+    pub async fn shutdown(&self) -> BTreeMap<String, String> {
+        let manager = self.active_manager();
+        let deployments = manager
+            .statuses()
+            .await
+            .into_iter()
+            .map(|status| status.deployment)
+            .collect::<Vec<_>>();
+        let mut failures = BTreeMap::new();
+        for deployment in deployments {
+            match manager.drain(&deployment).await {
+                Ok(report) if report.timed_out => {
+                    failures.insert(
+                        deployment,
+                        format!(
+                            "drain deadline elapsed with {} active requests",
+                            report.remaining_active
+                        ),
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    failures.insert(deployment, error.to_string());
+                }
+            }
+        }
+        failures
     }
 
     async fn prepare(
@@ -585,6 +618,14 @@ fn compile_runtime_candidate(
     })
 }
 
+/// Run the side-effect-free managed-model checks shared by validate and boot.
+pub fn validate_model_runtime(
+    pipeline: &crate::pipeline::CompiledPipeline,
+    config_dir: &Path,
+) -> anyhow::Result<()> {
+    compile_runtime_candidate(pipeline, config_dir).map(|_| ())
+}
+
 fn build_production_manager(
     catalog: Arc<Catalog>,
     cache_root: PathBuf,
@@ -687,6 +728,25 @@ pub(crate) fn reconcile_model_runtime_blocking(
                 config_dir.display()
             )
         })?
+}
+
+/// Stop every managed engine from synchronous process-shutdown paths.
+pub(crate) fn shutdown_model_runtime_blocking() -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(runtime) = MODEL_RUNTIME.get().cloned() else {
+        return Ok(BTreeMap::new());
+    };
+    std::thread::Builder::new()
+        .name("sbproxy-model-shutdown".to_string())
+        .spawn(move || {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| anyhow::anyhow!("build model shutdown runtime: {error}"))?;
+            Ok::<_, anyhow::Error>(executor.block_on(runtime.shutdown()))
+        })
+        .map_err(|error| anyhow::anyhow!("spawn model shutdown thread: {error}"))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("model shutdown thread panicked"))?
 }
 
 /// Warn, at pipeline load time (startup and every hot reload), about
@@ -792,6 +852,8 @@ pub struct ManagedLocalUpstream {
     pub base_url: String,
     /// Stable public model name selected by the route table.
     pub public_model: String,
+    /// Exact model identifier accepted by the managed engine.
+    pub engine_model: String,
     /// Deployment admission held until the complete request context drops.
     pub permit: ManagedModelPermit,
 }
@@ -835,6 +897,7 @@ pub async fn managed_upstream(
             )
         })?;
     let deployment = route.deployment.clone();
+    let engine_model = deployment.clone();
     let admission = manager
         .admit(&deployment, priority)
         .await
@@ -842,7 +905,7 @@ pub async fn managed_upstream(
     let permit = ManagedModelPermit {
         manager,
         deployment,
-        _admission: admission,
+        admission,
     };
     let running = permit
         .ensure_ready(priority)
@@ -851,6 +914,7 @@ pub async fn managed_upstream(
     Ok(Some(ManagedLocalUpstream {
         base_url: format!("http://127.0.0.1:{}/v1", running.port),
         public_model,
+        engine_model,
         permit,
     }))
 }
@@ -919,5 +983,19 @@ mod tests {
             lane_class_for(Some(sbproxy_ai::identity::KeyPriority::Batch)),
             PriorityClass::Batch
         );
+    }
+
+    #[test]
+    fn model_maintenance_runtime_supports_engine_health_io() {
+        let executor = build_model_maintenance_runtime().unwrap();
+        executor.block_on(async {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = tokio::spawn(async move { tokio::net::TcpStream::connect(address).await });
+            let _server = listener.accept().await.unwrap();
+            client.await.unwrap().unwrap();
+        });
     }
 }

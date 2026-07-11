@@ -195,7 +195,8 @@ async fn empty_startup_reload_is_atomic_and_collects_every_origin() {
     );
     drop(held);
     let drain_report = drain.await.expect("drain task").expect("drain result");
-    assert_eq!(drain_report.active_at_start, 1);
+    assert!(drain_report.active_at_start <= 1);
+    assert_eq!(drain_report.remaining_active, 0);
     assert!(!drain_report.timed_out);
 
     let before = runtime.statuses().await;
@@ -233,4 +234,12 @@ async fn empty_startup_reload_is_atomic_and_collects_every_origin() {
         sbproxy_core::reload::current_pipeline().config_revision,
         stable_pipeline_revision,
     );
+
+    let failures = runtime.shutdown().await;
+    assert!(failures.is_empty(), "shutdown failures: {failures:?}");
+    assert!(runtime
+        .statuses()
+        .await
+        .iter()
+        .all(|status| { status.state == sbproxy_model_host::DeploymentRuntimeState::Stopped }));
 }

@@ -5,18 +5,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sbproxy_config::{
-    ManagedDeploymentConfig, ManagedEngineChoice, ModelHostAuthority, ModelHostControlConfig,
+    ManagedDeploymentConfig, ManagedEngineChoice, ManagedPullPolicy, ManagedRolloutPolicy,
+    ModelHostAuthority, ModelHostControlConfig,
 };
 use sbproxy_model_host::{
     compile_desired_state, ArtifactFormat, ArtifactManager, Catalog, DeploymentPrepareRequest,
     DeploymentPreparer, DeploymentSourceMode, DesiredStateError, EngineAvailability,
     EngineCapabilities, EngineDetection, EngineDriver, EngineDriverError, EngineFailureReason,
-    EngineHealth, EngineKind, EngineProcess, EngineProvisioning, FileDeploymentRevisionStore,
-    GpuDescriptor, GpuVendor, LegacyServeInput, ManagedProviderInput, ModelHostConfig,
-    ModelHostObserver, ModelMetadata, ModelMetadataProvider, ModelRuntimeManager, NetworkPolicy,
-    OperationJob, PreparedDeploymentRuntime, ProductionDeploymentPreparer, ProvisionRequest,
-    ProvisionedEngine, PullIntent, RunningEngine, RuntimeDesiredInput, RuntimeManagerError,
-    StaticGpuProbe, UnavailableArtifactTransport, WorkerProfile,
+    EngineHealth, EngineKind, EngineProcess, EngineProvisioning, EvictionPolicy,
+    FileDeploymentRevisionStore, GpuDescriptor, GpuVendor, LegacyServeInput, ManagedProviderInput,
+    ModelHostConfig, ModelHostObserver, ModelMetadata, ModelMetadataProvider, ModelRuntimeManager,
+    NetworkPolicy, OperationJob, PreparedDeploymentRuntime, ProductionDeploymentPreparer,
+    ProvisionRequest, ProvisionedEngine, PullIntent, RunningEngine, RuntimeDesiredInput,
+    RuntimeManagerError, StaticGpuProbe, UnavailableArtifactTransport, WorkerProfile,
 };
 use sha2::{Digest, Sha256};
 
@@ -225,6 +226,35 @@ fn manager_desired(
     .unwrap()
 }
 
+fn rollout_desired(
+    source_revision: &str,
+    rollout: ManagedRolloutPolicy,
+    max_concurrency: u32,
+) -> sbproxy_model_host::RuntimeDesiredState {
+    let mut host = ModelHostControlConfig::default();
+    host.deployments.insert(
+        "a".to_string(),
+        ManagedDeploymentConfig {
+            model: "qwen2.5-0.5b-instruct".to_string(),
+            variant: Some("q4_k_m".to_string()),
+            warm: true,
+            max_concurrency: Some(max_concurrency),
+            rollout,
+            ..serde_yaml::from_str("model: qwen2.5-0.5b-instruct").unwrap()
+        },
+    );
+    compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: source_revision.to_string(),
+            canonical: Some(host),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &Catalog::builtin(),
+    )
+    .unwrap()
+}
+
 #[derive(Debug)]
 struct ManagerFixtureProcess {
     stopped: AtomicBool,
@@ -252,13 +282,23 @@ impl EngineProcess for ManagerFixtureProcess {
 
 #[derive(Default)]
 struct FixtureRuntimeFacts {
+    estimates: Mutex<BTreeMap<String, usize>>,
     starts: Mutex<BTreeMap<String, usize>>,
     stops: Mutex<BTreeMap<String, usize>>,
+    processes: Mutex<BTreeMap<String, Arc<ManagerFixtureProcess>>>,
     active_starts: AtomicUsize,
     max_active_starts: AtomicUsize,
     fail_start: Mutex<BTreeSet<String>>,
+    fail_start_once: Mutex<BTreeSet<String>>,
     fail_stop: Mutex<BTreeSet<String>>,
+    events: Mutex<Vec<String>>,
     next_port: AtomicU16,
+    block_memory: AtomicBool,
+    memory_entered: tokio::sync::Notify,
+    memory_release: tokio::sync::Notify,
+    block_start: AtomicBool,
+    start_entered: tokio::sync::Notify,
+    start_release: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -320,6 +360,17 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
         &self,
         _intent: PullIntent,
     ) -> Result<sbproxy_model_host::MemoryEstimate, RuntimeManagerError> {
+        *self
+            .facts
+            .estimates
+            .lock()
+            .unwrap()
+            .entry(self.id.clone())
+            .or_default() += 1;
+        if self.facts.block_memory.load(Ordering::SeqCst) {
+            self.facts.memory_entered.notify_one();
+            self.facts.memory_release.notified().await;
+        }
         Ok(sbproxy_model_host::MemoryEstimate::from_total(0, 1))
     }
 
@@ -328,11 +379,21 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
             let mut starts = self.facts.starts.lock().unwrap();
             *starts.entry(self.id.clone()).or_default() += 1;
         }
+        self.facts
+            .events
+            .lock()
+            .unwrap()
+            .push(format!("start:{}:{}", self.id, self.generation));
         let active = self.facts.active_starts.fetch_add(1, Ordering::SeqCst) + 1;
         record_max(&self.facts.max_active_starts, active);
+        if self.facts.block_start.load(Ordering::SeqCst) {
+            self.facts.start_entered.notify_one();
+            self.facts.start_release.notified().await;
+        }
         tokio::time::sleep(self.delay).await;
         self.facts.active_starts.fetch_sub(1, Ordering::SeqCst);
-        if self.facts.fail_start.lock().unwrap().contains(&self.id) {
+        let fail_once = self.facts.fail_start_once.lock().unwrap().remove(&self.id);
+        if fail_once || self.facts.fail_start.lock().unwrap().contains(&self.id) {
             return Err(RuntimeManagerError::Engine(EngineDriverError::new(
                 EngineFailureReason::EngineEarlyExit,
                 format!("fixture deployment {} failed to start", self.id),
@@ -345,6 +406,14 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
             .next_port
             .fetch_add(1, Ordering::SeqCst)
             .max(20_000);
+        let process = Arc::new(ManagerFixtureProcess {
+            stopped: AtomicBool::new(false),
+        });
+        self.facts
+            .processes
+            .lock()
+            .unwrap()
+            .insert(self.id.clone(), process.clone());
         Ok(RunningEngine {
             deployment: self.id.clone(),
             generation: self.generation,
@@ -355,13 +424,16 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
             started_at_ms: 1,
             artifact_digest: "a".repeat(64),
             memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1),
-            process: Arc::new(ManagerFixtureProcess {
-                stopped: AtomicBool::new(false),
-            }),
+            process,
         })
     }
 
     async fn stop(&self, _grace: Duration) -> Result<(), RuntimeManagerError> {
+        self.facts
+            .events
+            .lock()
+            .unwrap()
+            .push(format!("stop:{}:{}", self.id, self.generation));
         if self.facts.fail_stop.lock().unwrap().contains(&self.id) {
             return Err(RuntimeManagerError::Engine(EngineDriverError::new(
                 EngineFailureReason::EngineInternal,
@@ -513,6 +585,7 @@ async fn manager_telemetry_observes_committed_lifecycle_and_request_counts() {
         .await
         .unwrap();
     manager.ensure_ready("a").await.unwrap();
+    assert_eq!(manager.residency_reservations().await.len(), 1);
     drop(permit);
     manager.drain("a").await.unwrap();
     manager.cache("a").await.unwrap();
@@ -631,6 +704,220 @@ async fn manager_shares_one_cold_start_and_prepares_different_deployments_concur
     b.unwrap();
     c.unwrap();
     assert_eq!(preparer.facts.max_active_starts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn ready_generation_detects_a_process_that_exited_after_readiness() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("health", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    assert_eq!(manager.residency_reservations().await.len(), 1);
+    preparer.facts.processes.lock().unwrap()["a"]
+        .stopped
+        .store(true, Ordering::SeqCst);
+
+    let error = manager
+        .ensure_ready("a")
+        .await
+        .expect_err("an exited ready process must not remain routable");
+    assert_eq!(error.reason_code(), "engine_health_failed");
+    let status = manager.status("a").await.unwrap();
+    assert_eq!(
+        status.state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
+    assert!(status.port.is_none());
+    assert!(manager.residency_reservations().await.is_empty());
+}
+
+#[tokio::test]
+async fn reload_cannot_resurrect_a_cold_generation_removed_while_it_waits_for_placement() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    let mut initial = manager_desired("initial", &[("a", false, 30)], 1);
+    initial.control.shutdown_deadline_ms = 1_000;
+    manager.reconcile(initial).await.unwrap();
+    preparer.facts.block_memory.store(true, Ordering::SeqCst);
+
+    let request_manager = manager.clone();
+    let permit = request_manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    let request = tokio::spawn(async move {
+        let _permit = permit;
+        request_manager.ensure_ready("a").await
+    });
+    preparer.facts.memory_entered.notified().await;
+
+    let reconcile_manager = manager.clone();
+    let mut removed = manager_desired("removed", &[], 1);
+    removed.control.shutdown_deadline_ms = 1_000;
+    let reconcile = tokio::spawn(async move { reconcile_manager.reconcile(removed).await });
+    while manager.current_revision() == 1 {
+        tokio::task::yield_now().await;
+    }
+    preparer.facts.memory_release.notify_one();
+
+    let request_result = tokio::time::timeout(Duration::from_millis(200), request)
+        .await
+        .expect("stale request must not wait for the retirement deadline")
+        .unwrap();
+    assert!(matches!(
+        request_result,
+        Err(RuntimeManagerError::Draining(_))
+    ));
+    tokio::time::timeout(Duration::from_millis(200), reconcile)
+        .await
+        .expect("reconcile must finish after the stale permit is released")
+        .unwrap()
+        .unwrap();
+    assert!(!manager.current_desired().deployments.contains_key("a"));
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        None,
+        "the retired cold slot must never start"
+    );
+}
+
+#[tokio::test]
+async fn admission_and_readiness_are_bound_to_the_same_generation() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer);
+    let mut initial = manager_desired("initial", &[("a", false, 30)], 1);
+    initial.control.shutdown_deadline_ms = 1_000;
+    manager.reconcile(initial).await.unwrap();
+    let permit = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    assert_eq!(permit.generation(), 1);
+
+    let reconcile_manager = manager.clone();
+    let mut changed = manager_desired("changed", &[("a", false, 60)], 1);
+    changed.control.shutdown_deadline_ms = 1_000;
+    let reconcile = tokio::spawn(async move { reconcile_manager.reconcile(changed).await });
+    while manager.current_revision() == 1 {
+        tokio::task::yield_now().await;
+    }
+
+    let error = manager
+        .ensure_ready_for_generation(
+            "a",
+            permit.generation(),
+            sbproxy_model_host::PriorityClass::Standard,
+        )
+        .await
+        .expect_err("an old admission permit cannot start the replacement generation");
+    assert!(matches!(error, RuntimeManagerError::Draining(_)));
+    drop(permit);
+    tokio::time::timeout(Duration::from_millis(200), reconcile)
+        .await
+        .expect("replacement reconcile must finish when the old permit is released")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_the_only_cold_start_waiter_does_not_strand_activation() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("cancel", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    preparer.facts.block_start.store(true, Ordering::SeqCst);
+
+    let request_manager = manager.clone();
+    let request = tokio::spawn(async move { request_manager.ensure_ready("a").await });
+    preparer.facts.start_entered.notified().await;
+    request.abort();
+    let _ = request.await;
+    preparer.facts.start_release.notify_one();
+
+    tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if manager.status("a").await.is_some_and(|status| {
+                status.state == sbproxy_model_host::DeploymentRuntimeState::Ready
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manager-owned activation must complete without a request poller");
+    manager.ensure_ready("a").await.unwrap();
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn non_warm_on_boot_deployment_is_acquired_during_reconciliation() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    let mut host = ModelHostControlConfig::default();
+    host.deployments.insert(
+        "a".to_string(),
+        ManagedDeploymentConfig {
+            model: "qwen2.5-0.5b-instruct".to_string(),
+            variant: Some("q4_k_m".to_string()),
+            pull: ManagedPullPolicy::OnBoot,
+            warm: false,
+            ..serde_yaml::from_str("model: qwen2.5-0.5b-instruct").unwrap()
+        },
+    );
+    let desired = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "on-boot".to_string(),
+            canonical: Some(host),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &Catalog::builtin(),
+    )
+    .unwrap();
+
+    manager.reconcile(desired).await.unwrap();
+
+    assert_eq!(
+        preparer.facts.estimates.lock().unwrap().get("a").copied(),
+        Some(1)
+    );
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn reset_rejects_a_healthy_ready_generation_without_hiding_it() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer);
+    manager
+        .reconcile(manager_desired("ready-reset", &[("a", true, 30)], 1))
+        .await
+        .unwrap();
+    let before = manager.status("a").await.unwrap();
+    assert_eq!(
+        before.state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+
+    manager
+        .reset("a")
+        .await
+        .expect_err("reset is only valid for a retained failure");
+
+    let after = manager.status("a").await.unwrap();
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.port, before.port);
 }
 
 #[tokio::test]
@@ -1126,6 +1413,127 @@ async fn manager_capacity_evicts_only_after_active_protection_is_released() {
 }
 
 #[tokio::test]
+async fn manager_enforces_the_canonical_global_resident_limit() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer.clone(),
+        BTreeMap::from([(0, 2)]),
+    )
+    .unwrap();
+    let mut desired = manager_desired("resident-limit", &[("a", false, 30), ("b", false, 30)], 2);
+    desired.control.cache.max_resident_models = Some(1);
+    manager.reconcile(desired).await.unwrap();
+
+    manager.ensure_ready("a").await.unwrap();
+    manager.ensure_ready("b").await.unwrap();
+
+    assert_eq!(manager.residency_reservations().await.len(), 1);
+    assert_eq!(
+        preparer.facts.stops.lock().unwrap().get("a").copied(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn lowering_the_resident_limit_evicts_idle_preserved_slots() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer.clone(),
+        BTreeMap::from([(0, 2)]),
+    )
+    .unwrap();
+    manager
+        .reconcile(manager_desired(
+            "resident-limit-unbounded",
+            &[("a", false, 30), ("b", false, 30)],
+            2,
+        ))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    manager.ensure_ready("b").await.unwrap();
+    assert_eq!(manager.residency_reservations().await.len(), 2);
+
+    let mut limited = manager_desired(
+        "resident-limit-one",
+        &[("a", false, 30), ("b", false, 30)],
+        2,
+    );
+    limited.control.cache.max_resident_models = Some(1);
+    let report = manager.reconcile(limited).await.unwrap();
+
+    assert_eq!(
+        report.plan.preserved,
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert_eq!(manager.residency_reservations().await.len(), 1);
+    assert_eq!(
+        preparer.facts.stops.lock().unwrap().get("a").copied(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn manager_honors_legacy_never_eviction_policy() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer.clone(),
+        BTreeMap::from([(0, 1)]),
+    )
+    .unwrap();
+    let mut config: ModelHostConfig = serde_yaml::from_str(
+        r#"
+eviction: never
+models:
+  - model: qwen3-8b
+    name: first
+  - model: qwen3-14b
+    name: second
+"#,
+    )
+    .unwrap();
+    config.eviction = EvictionPolicy::Never;
+    let desired = compile_desired_state(
+        input(
+            None,
+            Vec::new(),
+            vec![LegacyServeInput {
+                origin: "origin-a".to_string(),
+                provider: "local".to_string(),
+                config,
+            }],
+        ),
+        &Catalog::builtin(),
+    )
+    .unwrap();
+    let first = desired
+        .route_for("origin-a", "local", "first")
+        .unwrap()
+        .deployment
+        .clone();
+    let second = desired
+        .route_for("origin-a", "local", "second")
+        .unwrap()
+        .deployment
+        .clone();
+    manager.reconcile(desired).await.unwrap();
+
+    manager.ensure_ready(&first).await.unwrap();
+    let blocked = manager.ensure_ready(&second).await.unwrap_err();
+
+    assert!(matches!(
+        blocked,
+        RuntimeManagerError::Admission(ref rejection)
+            if rejection.reason == sbproxy_model_host::AdmissionReason::InsufficientCapacity
+                && rejection.detail.contains("eviction policy is never")
+    ));
+    assert!(preparer.facts.stops.lock().unwrap().get(&first).is_none());
+}
+
+#[tokio::test]
 async fn failed_eviction_shutdown_restores_the_previous_capacity_owner() {
     let preparer = FixturePreparer::new(Duration::from_millis(1));
     let manager = ModelRuntimeManager::new_with_device_capacities(
@@ -1172,7 +1580,7 @@ async fn warm_revision_that_cannot_fit_atomically_preserves_the_prior_revision()
     let preparer = FixturePreparer::new(Duration::from_millis(1));
     let manager = ModelRuntimeManager::new_with_device_capacities(
         Catalog::builtin().catalog_revision,
-        preparer,
+        preparer.clone(),
         BTreeMap::from([(0, 1)]),
     )
     .unwrap();
@@ -1191,6 +1599,141 @@ async fn warm_revision_that_cannot_fit_atomically_preserves_the_prior_revision()
     ));
     assert_eq!(manager.current_revision(), 0);
     assert!(manager.current_desired().deployments.is_empty());
+    assert!(
+        preparer.facts.starts.lock().unwrap().is_empty(),
+        "capacity must be proven before any staged warm engine starts"
+    );
+}
+
+#[tokio::test]
+async fn rolling_warm_replacement_requires_capacity_for_both_generations() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer.clone(),
+        BTreeMap::from([(0, 1)]),
+    )
+    .unwrap();
+    manager
+        .reconcile(rollout_desired(
+            "rolling-old",
+            ManagedRolloutPolicy::Rolling,
+            1,
+        ))
+        .await
+        .unwrap();
+    let old = manager.ensure_ready("a").await.unwrap();
+
+    let error = manager
+        .reconcile(rollout_desired(
+            "rolling-new",
+            ManagedRolloutPolicy::Rolling,
+            2,
+        ))
+        .await
+        .expect_err("rolling replacement cannot displace its old generation");
+
+    assert!(matches!(
+        error,
+        RuntimeManagerError::Admission(ref rejection)
+            if rejection.reason == sbproxy_model_host::AdmissionReason::InsufficientCapacity
+    ));
+    assert_eq!(manager.current_revision(), 1);
+    assert_eq!(manager.ensure_ready("a").await.unwrap().port, old.port);
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        Some(1),
+        "failed capacity preflight must not start the replacement"
+    );
+}
+
+#[tokio::test]
+async fn recreate_warm_replacement_stops_old_before_starting_new() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer.clone(),
+        BTreeMap::from([(0, 1)]),
+    )
+    .unwrap();
+    manager
+        .reconcile(rollout_desired(
+            "recreate-old",
+            ManagedRolloutPolicy::Rolling,
+            1,
+        ))
+        .await
+        .unwrap();
+    let old = manager.ensure_ready("a").await.unwrap();
+
+    manager
+        .reconcile(rollout_desired(
+            "recreate-new",
+            ManagedRolloutPolicy::Recreate,
+            2,
+        ))
+        .await
+        .unwrap();
+    let new = manager.ensure_ready("a").await.unwrap();
+
+    assert_ne!(new.generation, old.generation);
+    let events = preparer.facts.events.lock().unwrap();
+    let old_stop = events
+        .iter()
+        .position(|event| event == "stop:a:1")
+        .expect("old generation stop");
+    let new_start = events
+        .iter()
+        .position(|event| event == "start:a:2")
+        .expect("new generation start");
+    assert!(
+        old_stop < new_start,
+        "recreate must stop before replacement launch"
+    );
+}
+
+#[tokio::test]
+async fn failed_recreate_warm_replacement_restarts_the_old_generation() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer.clone(),
+        BTreeMap::from([(0, 1)]),
+    )
+    .unwrap();
+    manager
+        .reconcile(rollout_desired(
+            "rollback-old",
+            ManagedRolloutPolicy::Rolling,
+            1,
+        ))
+        .await
+        .unwrap();
+    let old_generation = manager.ensure_ready("a").await.unwrap().generation;
+    preparer
+        .facts
+        .fail_start_once
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+
+    manager
+        .reconcile(rollout_desired(
+            "rollback-new",
+            ManagedRolloutPolicy::Recreate,
+            2,
+        ))
+        .await
+        .expect_err("replacement launch fails");
+
+    assert_eq!(manager.current_revision(), 1);
+    let restored = manager.ensure_ready("a").await.unwrap();
+    assert_eq!(restored.generation, old_generation);
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        Some(3),
+        "initial start, failed replacement, and rollback restart"
+    );
 }
 
 #[tokio::test(start_paused = true)]

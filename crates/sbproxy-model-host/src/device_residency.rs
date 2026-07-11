@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{AdmissionReason, AdmissionRejection, MemoryEstimate};
+use crate::{AdmissionReason, AdmissionRejection, EvictionPolicy, MemoryEstimate};
 
 /// Lifecycle facts that prevent one resident generation from being evicted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -54,6 +54,25 @@ pub struct DeviceReservationResult {
     pub evicted: Vec<String>,
 }
 
+/// Host-wide limits applied while placing one generation on a device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceResidencyPolicy {
+    /// Maximum generations resident across every device.
+    pub max_resident_models: Option<usize>,
+    /// Whether an idle resident generation may be displaced.
+    pub eviction: EvictionPolicy,
+}
+
+impl DeviceResidencyPolicy {
+    /// Construct one explicit host-wide residency policy.
+    pub const fn new(max_resident_models: Option<usize>, eviction: EvictionPolicy) -> Self {
+        Self {
+            max_resident_models,
+            eviction,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DeviceState {
     capacity_bytes: u64,
@@ -94,6 +113,26 @@ impl DeviceResidencySet {
         protection: ResidencyProtection,
         now: u64,
     ) -> Result<DeviceReservationResult, AdmissionRejection> {
+        self.reserve_with_policy(
+            deployment,
+            generation,
+            memory,
+            protection,
+            now,
+            DeviceResidencyPolicy::default(),
+        )
+    }
+
+    /// Reserve one generation while enforcing the host-wide resident limit and eviction policy.
+    pub fn reserve_with_policy(
+        &mut self,
+        deployment: &str,
+        generation: u64,
+        memory: MemoryEstimate,
+        protection: ResidencyProtection,
+        now: u64,
+        policy: DeviceResidencyPolicy,
+    ) -> Result<DeviceReservationResult, AdmissionRejection> {
         let existing_device = self.devices.iter().find_map(|(device_index, device)| {
             device
                 .reservations
@@ -110,13 +149,13 @@ impl DeviceResidencySet {
                 )));
             }
         }
-        let device = self.devices.get_mut(&memory.device_index).ok_or_else(|| {
+        let device = self.devices.get(&memory.device_index).ok_or_else(|| {
             capacity_rejection(format!(
                 "selected device {} is not present",
                 memory.device_index
             ))
         })?;
-        if let Some(existing) = device.reservations.iter_mut().find(|reservation| {
+        if let Some(existing) = device.reservations.iter().find(|reservation| {
             reservation.deployment == deployment && reservation.generation == generation
         }) {
             if existing.memory != memory {
@@ -124,6 +163,17 @@ impl DeviceResidencySet {
                     "deployment {deployment:?} generation {generation} changed its immutable memory estimate"
                 )));
             }
+            let device = self
+                .devices
+                .get_mut(&memory.device_index)
+                .expect("selected device was checked above");
+            let existing = device
+                .reservations
+                .iter_mut()
+                .find(|reservation| {
+                    reservation.deployment == deployment && reservation.generation == generation
+                })
+                .expect("existing reservation was checked above");
             existing.last_used = now;
             existing.protection = protection;
             return Ok(DeviceReservationResult {
@@ -136,37 +186,83 @@ impl DeviceResidencySet {
                 memory.total_bytes, memory.device_index, device.capacity_bytes
             )));
         }
+        let target_capacity = device.capacity_bytes;
         let used = device
             .reservations
             .iter()
             .map(|reservation| reservation.memory.total_bytes)
             .sum::<u64>();
-        let free = device.capacity_bytes.saturating_sub(used);
+        let free = target_capacity.saturating_sub(used);
         let needed = memory.total_bytes.saturating_sub(free);
-        let mut victims = device
-            .reservations
+        let current_residents = self
+            .devices
+            .values()
+            .map(|device| device.reservations.len())
+            .sum::<usize>();
+        let count_overflow = policy
+            .max_resident_models
+            .map(|limit| current_residents.saturating_add(1).saturating_sub(limit))
+            .unwrap_or(0);
+        if needed == 0 && count_overflow == 0 {
+            self.devices
+                .get_mut(&memory.device_index)
+                .expect("selected device was checked above")
+                .reservations
+                .push(DeviceReservation {
+                    deployment: deployment.to_string(),
+                    generation,
+                    memory,
+                    protection,
+                    last_used: now,
+                });
+            return Ok(DeviceReservationResult {
+                evicted: Vec::new(),
+            });
+        }
+        if policy.eviction == EvictionPolicy::Never {
+            return Err(capacity_rejection(format!(
+                "deployment {deployment:?} requires displacing a resident generation, but the eviction policy is never"
+            )));
+        }
+
+        let mut victims = self
+            .devices
             .iter()
-            .filter(|reservation| !reservation.protection.is_protected())
-            .map(|reservation| {
-                (
-                    reservation.last_used,
-                    reservation.deployment.clone(),
-                    reservation.generation,
-                    reservation.memory.total_bytes,
-                )
+            .flat_map(|(device_index, device)| {
+                device
+                    .reservations
+                    .iter()
+                    .filter(|reservation| !reservation.protection.is_protected())
+                    .map(|reservation| {
+                        (
+                            reservation.last_used,
+                            reservation.deployment.clone(),
+                            reservation.generation,
+                            *device_index,
+                            reservation.memory.total_bytes,
+                        )
+                    })
             })
             .collect::<Vec<_>>();
         victims.sort_by(|left, right| {
-            (left.0, left.1.as_str(), left.2).cmp(&(right.0, right.1.as_str(), right.2))
+            (left.0, left.1.as_str(), left.2, left.3).cmp(&(
+                right.0,
+                right.1.as_str(),
+                right.2,
+                right.3,
+            ))
         });
         let mut reclaimed = 0u64;
         let mut selected = Vec::new();
-        for victim in victims {
+        for victim in victims
+            .iter()
+            .filter(|victim| victim.3 == memory.device_index)
+        {
             if reclaimed >= needed {
                 break;
             }
-            reclaimed = reclaimed.saturating_add(victim.3);
-            selected.push(victim);
+            reclaimed = reclaimed.saturating_add(victim.4);
+            selected.push(victim.clone());
         }
         if reclaimed < needed {
             return Err(capacity_rejection(format!(
@@ -175,27 +271,141 @@ impl DeviceResidencySet {
                 needed.saturating_sub(reclaimed)
             )));
         }
-        let selected_keys = selected
-            .iter()
-            .map(|victim| (victim.1.as_str(), victim.2))
-            .collect::<Vec<_>>();
-        device.reservations.retain(|reservation| {
-            !selected_keys.iter().any(|(deployment, generation)| {
-                *deployment == reservation.deployment && *generation == reservation.generation
-            })
+        for victim in victims {
+            if selected.len() >= count_overflow {
+                break;
+            }
+            if !selected.iter().any(|selected| {
+                selected.1 == victim.1 && selected.2 == victim.2 && selected.3 == victim.3
+            }) {
+                selected.push(victim);
+            }
+        }
+        if selected.len() < count_overflow {
+            return Err(capacity_rejection(format!(
+                "resident model limit requires {} additional evictions after protecting active, queued, pinned, preparing, and draining generations",
+                count_overflow.saturating_sub(selected.len())
+            )));
+        }
+        selected.sort_by(|left, right| {
+            (left.0, left.1.as_str(), left.2, left.3).cmp(&(
+                right.0,
+                right.1.as_str(),
+                right.2,
+                right.3,
+            ))
         });
+        for (device_index, device) in &mut self.devices {
+            device.reservations.retain(|reservation| {
+                !selected.iter().any(|victim| {
+                    victim.3 == *device_index
+                        && victim.1 == reservation.deployment
+                        && victim.2 == reservation.generation
+                })
+            });
+        }
         let evicted = selected
-            .into_iter()
-            .map(|victim| victim.1)
+            .iter()
+            .map(|victim| victim.1.clone())
             .collect::<Vec<_>>();
-        device.reservations.push(DeviceReservation {
-            deployment: deployment.to_string(),
-            generation,
-            memory,
-            protection,
-            last_used: now,
-        });
+        self.devices
+            .get_mut(&memory.device_index)
+            .expect("selected device was checked above")
+            .reservations
+            .push(DeviceReservation {
+                deployment: deployment.to_string(),
+                generation,
+                memory,
+                protection,
+                last_used: now,
+            });
         Ok(DeviceReservationResult { evicted })
+    }
+
+    /// Apply a new host-wide resident limit to generations that are already resident.
+    pub fn enforce_policy(
+        &mut self,
+        policy: DeviceResidencyPolicy,
+    ) -> Result<DeviceReservationResult, AdmissionRejection> {
+        let Some(max_resident_models) = policy.max_resident_models else {
+            return Ok(DeviceReservationResult {
+                evicted: Vec::new(),
+            });
+        };
+        let resident_count = self
+            .devices
+            .values()
+            .map(|device| device.reservations.len())
+            .sum::<usize>();
+        let overflow = resident_count.saturating_sub(max_resident_models);
+        if overflow == 0 {
+            return Ok(DeviceReservationResult {
+                evicted: Vec::new(),
+            });
+        }
+        if policy.eviction == EvictionPolicy::Never {
+            return Err(capacity_rejection(format!(
+                "resident model limit requires displacing {overflow} generations, but the eviction policy is never"
+            )));
+        }
+
+        let mut victims = self
+            .devices
+            .iter()
+            .flat_map(|(device_index, device)| {
+                device
+                    .reservations
+                    .iter()
+                    .filter(|reservation| !reservation.protection.is_protected())
+                    .map(|reservation| {
+                        (
+                            reservation.last_used,
+                            reservation.deployment.clone(),
+                            reservation.generation,
+                            *device_index,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        victims.sort_by(|left, right| {
+            (left.0, left.1.as_str(), left.2, left.3).cmp(&(
+                right.0,
+                right.1.as_str(),
+                right.2,
+                right.3,
+            ))
+        });
+        if victims.len() < overflow {
+            return Err(capacity_rejection(format!(
+                "resident model limit requires {} additional evictions after protecting active, queued, pinned, preparing, and draining generations",
+                overflow.saturating_sub(victims.len())
+            )));
+        }
+        victims.truncate(overflow);
+        for (device_index, device) in &mut self.devices {
+            device.reservations.retain(|reservation| {
+                !victims.iter().any(|victim| {
+                    victim.3 == *device_index
+                        && victim.1 == reservation.deployment
+                        && victim.2 == reservation.generation
+                })
+            });
+        }
+        Ok(DeviceReservationResult {
+            evicted: victims
+                .into_iter()
+                .map(|victim| victim.1)
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Protect every current generation while probing overlap capacity for a rolling launch.
+    pub(crate) fn protect_all_for_rollout(&mut self) {
+        for device in self.devices.values_mut() {
+            for reservation in &mut device.reservations {
+                reservation.protection.preparing = true;
+            }
+        }
     }
 
     /// Update lifecycle protection without changing capacity accounting.

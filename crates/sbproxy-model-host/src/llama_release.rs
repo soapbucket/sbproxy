@@ -19,6 +19,14 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "weights")]
+use fs2::FileExt;
+
+#[cfg(feature = "weights")]
+const MAX_LLAMA_RELEASE_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(any(feature = "weights", test))]
+const UNPINNED_RELEASE_MARKER: &str = "digest-unpinned";
+
 /// A host platform ggml-org publishes a llama.cpp binary asset for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -72,16 +80,44 @@ impl Platform {
 }
 
 /// The default pinned llama.cpp release tag used when
-/// `engines.llama_cpp.acquire.version` is unset (WOR-1801). Operators
-/// pin their own; bump this as ggml-org ships. No digest is bundled
-/// (assets differ per platform + accel), so an unpinned default fetch
-/// logs a warning: pin `acquire.sha256` to verify.
+/// `engines.llama_cpp.acquire.version` is unset (WOR-1801). The supported
+/// prebuilt assets for this tag have built-in digests. Operators using a
+/// different tag must provide `acquire.sha256` to verify its asset.
 ///
 /// Pinned to a tag that ships the `ubuntu-vulkan-x64` asset (the Linux
 /// GPU path): the older `b4589` had only a CPU `ubuntu-x64` build, so a
 /// `cuda`/`vulkan` acquisition 404'd on Linux. From this tag the macOS
 /// and Linux assets are `.tar.gz` (they were `.zip` at `b4589`).
 pub const DEFAULT_LLAMA_RELEASE_TAG: &str = "b9905";
+
+const DEFAULT_LLAMA_MACOS_ARM64_SHA256: &str =
+    "0d3deb02fd7912c8ef360fa33b3b4a8c97967a3ac703c0ed7d5edd3680723ea8";
+const DEFAULT_LLAMA_MACOS_X64_SHA256: &str =
+    "5910cec4ce883d0ddef39974a54a5c9569c4c8b3d13b5e79dfcb32ffda19e44e";
+const DEFAULT_LLAMA_LINUX_X64_SHA256: &str =
+    "69f1496c1eda919097668db49e529819e4eda9e8e3d504f90c680fed3587f5b0";
+const DEFAULT_LLAMA_LINUX_VULKAN_X64_SHA256: &str =
+    "81492d7844bcb40c4c025b826dced6b3faa6e484863482d6bd255c84db53bd55";
+
+/// Built-in digest for one supported default release asset.
+pub(crate) fn default_release_sha256(
+    tag: &str,
+    platform: Platform,
+    accel: crate::config::EngineAccel,
+) -> Option<&'static str> {
+    use crate::config::EngineAccel;
+
+    if tag != DEFAULT_LLAMA_RELEASE_TAG {
+        return None;
+    }
+    match (platform, accel) {
+        (Platform::MacOsArm64, _) => Some(DEFAULT_LLAMA_MACOS_ARM64_SHA256),
+        (Platform::MacOsX64, _) => Some(DEFAULT_LLAMA_MACOS_X64_SHA256),
+        (Platform::LinuxX64, EngineAccel::Vulkan) => Some(DEFAULT_LLAMA_LINUX_VULKAN_X64_SHA256),
+        (Platform::LinuxX64, EngineAccel::Cuda) => None,
+        (Platform::LinuxX64, _) => Some(DEFAULT_LLAMA_LINUX_X64_SHA256),
+    }
+}
 
 /// The archive extension for a platform's release asset. macOS and Linux
 /// assets are `.tar.gz`; only Windows (unsupported here) would be `.zip`.
@@ -198,21 +234,72 @@ pub async fn ensure_llama_server(
         )
     })?;
     let url = asset_url_accel(tag, platform, accel)?;
-    let dest_dir = cache_dir.join("llama.cpp").join(tag);
-    tokio::fs::create_dir_all(&dest_dir)
+    let asset = platform.asset_infix_accel(accel)?;
+    let ready_dir = cache_dir.join("llama.cpp").join(tag).join(asset);
+    if let Some(binary) = cached_release_binary(&ready_dir, expected_sha256) {
+        return Ok(binary);
+    }
+
+    let lock_path = cache_dir
+        .join("locks")
+        .join(format!("llama-release-{tag}-{asset}.lock"));
+    if let Some(parent) = lock_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let lock = tokio::task::spawn_blocking(move || open_release_lock(&lock_path))
         .await
-        .map_err(|e| format!("create {}: {e}", dest_dir.display()))?;
-    let archive_path = dest_dir.join(format!("llama.{}", archive_ext(platform)));
+        .map_err(|e| format!("join llama.cpp release lock: {e}"))??;
+    if let Some(binary) = cached_release_binary(&ready_dir, expected_sha256) {
+        drop(lock);
+        return Ok(binary);
+    }
+
+    let staging = cache_dir
+        .join("staging")
+        .join(format!("llama-release-{tag}-{asset}-{}", ulid::Ulid::new()));
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .map_err(|e| format!("create {}: {e}", staging.display()))?;
+    let result = install_release(&url, platform, &staging, &ready_dir, expected_sha256).await;
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    drop(lock);
+    result
+}
+
+#[cfg(feature = "weights")]
+async fn install_release(
+    url: &str,
+    platform: Platform,
+    staging: &std::path::Path,
+    ready_dir: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> Result<PathBuf, String> {
+    let archive_path = staging.join(format!("llama.{}", archive_ext(platform)));
 
     // Download.
     let resp = reqwest::Client::new()
-        .get(&url)
+        .get(url)
         .send()
         .await
         .map_err(|e| format!("download {url}: {e}"))?
         .error_for_status()
         .map_err(|e| format!("download {url}: {e}"))?;
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_LLAMA_RELEASE_BYTES)
+    {
+        return Err(format!(
+            "llama.cpp release exceeds {MAX_LLAMA_RELEASE_BYTES} bytes"
+        ));
+    }
     let bytes = resp.bytes().await.map_err(|e| format!("read {url}: {e}"))?;
+    if bytes.len() as u64 > MAX_LLAMA_RELEASE_BYTES {
+        return Err(format!(
+            "llama.cpp release exceeds {MAX_LLAMA_RELEASE_BYTES} bytes"
+        ));
+    }
     tokio::fs::write(&archive_path, &bytes)
         .await
         .map_err(|e| format!("write {}: {e}", archive_path.display()))?;
@@ -221,8 +308,8 @@ pub async fn ensure_llama_server(
     match expected_sha256 {
         Some(hex) => crate::weights::verify_sha256(&archive_path, hex)?,
         None => tracing::warn!(
-            tag,
-            "llama.cpp release {tag} fetched without a pinned sha256; set \
+            url,
+            "llama.cpp release fetched without a pinned sha256; set \
              engines.llama_cpp.acquire.sha256 to verify the download"
         ),
     }
@@ -233,7 +320,7 @@ pub async fn ensure_llama_server(
         .arg("-xzf")
         .arg(&archive_path)
         .arg("-C")
-        .arg(&dest_dir)
+        .arg(staging)
         .status()
         .await
         .map_err(|e| format!("tar: {e}"))?;
@@ -244,27 +331,81 @@ pub async fn ensure_llama_server(
     // The binary lands under a bin/ dir in the archive. Check the common
     // layouts first, then fall back to a recursive scan (the layout has
     // shifted across ggml-org releases).
-    for candidate in [
-        dest_dir.join("build/bin/llama-server"),
-        dest_dir.join("bin/llama-server"),
-        dest_dir.join("llama-server"),
-    ] {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
+    let binary = [
+        staging.join("build/bin/llama-server"),
+        staging.join("bin/llama-server"),
+        staging.join("llama-server"),
+    ]
+    .into_iter()
+    .find(|candidate| is_executable_file(candidate))
+    .or_else(|| find_file_named(staging, "llama-server").filter(|path| is_executable_file(path)))
+    .ok_or_else(|| {
+        format!(
+            "executable llama-server not found in the extracted release under {}",
+            staging.display()
+        )
+    })?;
+    let relative_binary = binary
+        .strip_prefix(staging)
+        .map_err(|e| format!("resolve extracted llama-server path: {e}"))?
+        .to_path_buf();
+    let marker = expected_sha256.unwrap_or(UNPINNED_RELEASE_MARKER);
+    tokio::fs::write(staging.join(".archive.sha256"), marker)
+        .await
+        .map_err(|e| format!("write llama.cpp release digest marker: {e}"))?;
+
+    if ready_dir.exists() {
+        tokio::fs::remove_dir_all(ready_dir)
+            .await
+            .map_err(|e| format!("remove stale {}: {e}", ready_dir.display()))?;
     }
-    if let Some(found) = find_file_named(&dest_dir, "llama-server") {
-        return Ok(found);
+    if let Some(parent) = ready_dir.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    Err(format!(
-        "llama-server not found in the extracted release under {}",
-        dest_dir.display()
-    ))
+    tokio::fs::rename(staging, ready_dir)
+        .await
+        .map_err(|e| format!("publish llama.cpp release: {e}"))?;
+    let published = ready_dir.join(relative_binary);
+    if !is_executable_file(&published) {
+        return Err(format!(
+            "published llama-server is not executable at {}",
+            published.display()
+        ));
+    }
+    Ok(published)
+}
+
+#[cfg(any(feature = "weights", test))]
+fn cached_release_binary(
+    ready_dir: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> Option<PathBuf> {
+    let marker = std::fs::read_to_string(ready_dir.join(".archive.sha256")).ok()?;
+    if marker.trim() != expected_sha256.unwrap_or(UNPINNED_RELEASE_MARKER) {
+        return None;
+    }
+    find_file_named(ready_dir, "llama-server").filter(|path| is_executable_file(path))
+}
+
+#[cfg(feature = "weights")]
+fn open_release_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| format!("open llama.cpp release lock {}: {e}", path.display()))?;
+    file.lock_exclusive()
+        .map_err(|e| format!("lock llama.cpp release {}: {e}", path.display()))?;
+    Ok(file)
 }
 
 /// Recursively search `root` for a file named `name`, returning the first
 /// match. Bounded to a small depth: release archives are shallow.
-#[cfg(feature = "weights")]
+#[cfg(any(feature = "weights", test))]
 pub(crate) fn find_file_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
     fn walk(dir: &std::path::Path, name: &str, depth: usize) -> Option<PathBuf> {
         if depth == 0 {
@@ -336,6 +477,84 @@ mod tests {
                 .unwrap_err()
                 .contains("source build")
         );
+    }
+
+    #[test]
+    fn default_release_assets_have_exact_built_in_digests() {
+        use crate::config::EngineAccel;
+
+        assert_eq!(
+            default_release_sha256(
+                DEFAULT_LLAMA_RELEASE_TAG,
+                Platform::MacOsArm64,
+                EngineAccel::Metal,
+            ),
+            Some("0d3deb02fd7912c8ef360fa33b3b4a8c97967a3ac703c0ed7d5edd3680723ea8")
+        );
+        assert_eq!(
+            default_release_sha256(
+                DEFAULT_LLAMA_RELEASE_TAG,
+                Platform::MacOsX64,
+                EngineAccel::Auto,
+            ),
+            Some("5910cec4ce883d0ddef39974a54a5c9569c4c8b3d13b5e79dfcb32ffda19e44e")
+        );
+        assert_eq!(
+            default_release_sha256(
+                DEFAULT_LLAMA_RELEASE_TAG,
+                Platform::LinuxX64,
+                EngineAccel::Cpu,
+            ),
+            Some("69f1496c1eda919097668db49e529819e4eda9e8e3d504f90c680fed3587f5b0")
+        );
+        assert_eq!(
+            default_release_sha256(
+                DEFAULT_LLAMA_RELEASE_TAG,
+                Platform::LinuxX64,
+                EngineAccel::Vulkan,
+            ),
+            Some("81492d7844bcb40c4c025b826dced6b3faa6e484863482d6bd255c84db53bd55")
+        );
+        assert_eq!(
+            default_release_sha256(
+                DEFAULT_LLAMA_RELEASE_TAG,
+                Platform::LinuxX64,
+                EngineAccel::Cuda,
+            ),
+            None
+        );
+        assert_eq!(
+            default_release_sha256("b-custom", Platform::MacOsArm64, EngineAccel::Metal),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_release_cache_hit_requires_the_matching_digest_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let binary = ready.join("llama-b9905").join("llama-server");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"fixture").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            ready.join(".archive.sha256"),
+            DEFAULT_LLAMA_MACOS_ARM64_SHA256,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cached_release_binary(&ready, Some(DEFAULT_LLAMA_MACOS_ARM64_SHA256)),
+            Some(binary.clone())
+        );
+        assert_eq!(
+            cached_release_binary(&ready, Some(DEFAULT_LLAMA_MACOS_X64_SHA256)),
+            None
+        );
+        assert_eq!(cached_release_binary(&ready, None), None);
     }
 
     #[test]

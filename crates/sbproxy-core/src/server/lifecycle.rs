@@ -902,6 +902,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         .unwrap_or_else(|| std::path::Path::new("."));
     super::model_host::reconcile_model_runtime_blocking(&pipeline, config_dir)
         .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
+    let _model_runtime_shutdown = ModelRuntimeShutdownGuard;
 
     // Store in hot-reload slot.
     reload::load_pipeline(pipeline);
@@ -1517,6 +1518,24 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     spawn_shutdown_phase_logger(server.watch_execution_phase(), grace_seconds);
 
     server.run_forever();
+}
+
+struct ModelRuntimeShutdownGuard;
+
+impl Drop for ModelRuntimeShutdownGuard {
+    fn drop(&mut self) {
+        match super::model_host::shutdown_model_runtime_blocking() {
+            Ok(failures) if failures.is_empty() => {
+                tracing::info!("managed model runtime stopped");
+            }
+            Ok(failures) => {
+                tracing::error!(?failures, "managed model runtime shutdown was incomplete");
+            }
+            Err(error) => {
+                tracing::error!(%error, "managed model runtime shutdown failed");
+            }
+        }
+    }
 }
 
 /// Render the ARDP (`/.well-known/sbproxy-agent`) capability

@@ -3,11 +3,10 @@
 
 //! Opaque process boundary used by every managed engine driver.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{EngineDriverError, EngineFailureReason};
 
-static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAX_STDERR_TAIL_BYTES: usize = 64 * 1024;
 
 /// Process operations available to engine drivers after a typed spawn.
 #[async_trait]
@@ -270,29 +269,32 @@ impl CommandExecutor for TokioCommandExecutor {
         environment: &BTreeMap<String, String>,
         stderr_tail_lines: usize,
     ) -> Result<Arc<dyn EngineProcess>, EngineDriverError> {
-        let sequence = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let stderr_path = std::env::temp_dir().join(format!(
-            "sbproxy-engine-{}-{sequence}.log",
-            std::process::id()
-        ));
-        let stderr = std::fs::File::create(&stderr_path).map_err(|error| {
-            EngineDriverError::new(
-                EngineFailureReason::EngineSpawnFailed,
-                format!("create bounded engine stderr log: {error}"),
-                "verify the process temporary directory is writable",
-                true,
-            )
-        })?;
         let mut command = tokio::process::Command::new(executable);
         command
             .args(arguments)
-            .envs(environment)
             .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
+        apply_engine_environment(&mut command, environment);
         #[cfg(unix)]
         command.process_group(0);
-        let child = command.spawn().map_err(|error| {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt as _;
+
+            // SAFETY: pre_exec performs one async-signal-safe prctl call and
+            // returns its OS error without allocating in the child.
+            unsafe {
+                command.as_std_mut().pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
+        let mut child = command.spawn().map_err(|error| {
             EngineDriverError::new(
                 EngineFailureReason::EngineSpawnFailed,
                 format!("spawn engine {:?}: {error}", executable),
@@ -300,9 +302,32 @@ impl CommandExecutor for TokioCommandExecutor {
                 true,
             )
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            EngineDriverError::new(
+                EngineFailureReason::EngineSpawnFailed,
+                "engine stderr pipe was unavailable after spawn",
+                "retry with a process boundary that supports piped diagnostics",
+                true,
+            )
+        })?;
+        let stderr_tail = Arc::new(StdMutex::new(BoundedStderrTail::default()));
+        let capture = Arc::clone(&stderr_tail);
+        tokio::spawn(async move {
+            let mut stderr = stderr;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => capture
+                        .lock()
+                        .expect("engine stderr tail mutex poisoned")
+                        .push(&buffer[..count]),
+                }
+            }
+        });
         Ok(Arc::new(TokioEngineProcess {
             child: tokio::sync::Mutex::new(child),
-            stderr_path,
+            stderr_tail,
             stderr_tail_lines,
         }))
     }
@@ -326,11 +351,11 @@ impl CommandExecutor for TokioCommandExecutor {
         let mut command = tokio::process::Command::new(executable);
         command
             .args(arguments)
-            .envs(environment)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        apply_engine_environment(&mut command, environment);
         let output = tokio::time::timeout(timeout, command.output())
             .await
             .map_err(|_| {
@@ -357,11 +382,59 @@ impl CommandExecutor for TokioCommandExecutor {
     }
 }
 
+fn apply_engine_environment(
+    command: &mut tokio::process::Command,
+    overrides: &BTreeMap<String, String>,
+) {
+    const BASELINE: &[&str] = &[
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "SYSTEMROOT",
+        "WINDIR",
+    ];
+    command.env_clear();
+    for key in BASELINE {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command.envs(overrides);
+}
+
 #[derive(Debug)]
 struct TokioEngineProcess {
     child: tokio::sync::Mutex<tokio::process::Child>,
-    stderr_path: PathBuf,
+    stderr_tail: Arc<StdMutex<BoundedStderrTail>>,
     stderr_tail_lines: usize,
+}
+
+#[derive(Debug, Default)]
+struct BoundedStderrTail {
+    bytes: VecDeque<u8>,
+}
+
+impl BoundedStderrTail {
+    fn push(&mut self, bytes: &[u8]) {
+        self.bytes.extend(bytes.iter().copied());
+        while self.bytes.len() > MAX_STDERR_TAIL_BYTES {
+            self.bytes.pop_front();
+        }
+    }
+
+    fn render(&self, lines: usize) -> String {
+        let bytes = self.bytes.iter().copied().collect::<Vec<_>>();
+        bounded_stderr_tail(&String::from_utf8_lossy(&bytes), lines)
+    }
 }
 
 #[async_trait]
@@ -393,8 +466,16 @@ impl EngineProcess for TokioEngineProcess {
         }
         #[cfg(unix)]
         if let Some(pid) = child.id() {
+            let target = match (pgid_of(pid), pgid_of(std::process::id())) {
+                (Some(child_pgid), Some(our_pgid))
+                    if child_pgid == pid && child_pgid != our_pgid =>
+                {
+                    format!("-{child_pgid}")
+                }
+                _ => pid.to_string(),
+            };
             let _ = std::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
+                .args(["-TERM", &target])
                 .status();
         }
         #[cfg(not(unix))]
@@ -425,10 +506,10 @@ impl EngineProcess for TokioEngineProcess {
     }
 
     fn stderr_tail(&self) -> String {
-        std::fs::read_to_string(&self.stderr_path)
-            .ok()
-            .map(|contents| bounded_stderr_tail(&contents, self.stderr_tail_lines))
-            .unwrap_or_default()
+        self.stderr_tail
+            .lock()
+            .expect("engine stderr tail mutex poisoned")
+            .render(self.stderr_tail_lines)
     }
 }
 
@@ -508,4 +589,60 @@ fn pgid_of(pid: u32) -> Option<u32> {
         .output()
         .ok()?;
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn compatibility_process_receives_only_baseline_and_typed_environment() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var("SBPROXY_ENGINE_SECRET_SENTINEL", "must-not-leak");
+        let output = TokioCommandExecutor
+            .output(
+                Path::new("/usr/bin/env"),
+                &[],
+                &BTreeMap::from([("SBPROXY_TYPED_VISIBLE".to_string(), "yes".to_string())]),
+                Duration::from_secs(2),
+                64 * 1024,
+            )
+            .await
+            .unwrap();
+        std::env::remove_var("SBPROXY_ENGINE_SECRET_SENTINEL");
+
+        assert!(output.stdout.contains("SBPROXY_TYPED_VISIBLE=yes"));
+        assert!(!output.stdout.contains("SBPROXY_ENGINE_SECRET_SENTINEL"));
+        assert!(!output.stdout.contains("must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn engine_stderr_is_retained_only_in_a_bounded_memory_tail() {
+        let process = TokioCommandExecutor
+            .spawn(
+                Path::new("/bin/sh"),
+                &[
+                    "-c".to_string(),
+                    "i=0; while [ $i -lt 12000 ]; do echo noise-$i >&2; i=$((i+1)); done; echo FINAL-MARKER >&2"
+                        .to_string(),
+                ],
+                &BTreeMap::new(),
+                20,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !process.has_exited().await.unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let tail = process.stderr_tail();
+        assert!(tail.contains("FINAL-MARKER"));
+        assert!(tail.len() <= 8_192);
+        assert!(tail.lines().count() <= 20);
+    }
 }

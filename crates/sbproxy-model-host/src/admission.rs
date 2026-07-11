@@ -109,7 +109,7 @@ struct Waiter {
     id: u64,
     priority: PriorityClass,
     arrival: u64,
-    sender: oneshot::Sender<Result<(), AdmissionRejection>>,
+    sender: oneshot::Sender<Result<AdmissionPermit, AdmissionRejection>>,
 }
 
 struct GateState {
@@ -307,7 +307,7 @@ impl AdmissionGate {
         if let Err(rejection) = &result {
             self.core.publish_rejection(priority, rejection);
         }
-        result.map(|()| AdmissionPermit::new(self.core.clone()))
+        result
     }
 
     /// Enter draining, reject queued work, and wait boundedly for active permits.
@@ -452,8 +452,11 @@ impl AdmissionPermit {
                 .map(|(index, _)| index)
                 .expect("nonempty admission queue");
             let waiter = state.queue.remove(index);
-            if waiter.sender.send(Ok(())).is_ok() {
-                state.active += 1;
+            state.active += 1;
+            let permit = AdmissionPermit::new(self.core.clone());
+            if let Err(Ok(mut permit)) = waiter.sender.send(Ok(permit)) {
+                permit.released = true;
+                state.active = state.active.saturating_sub(1);
             }
         }
         drop(state);
@@ -528,4 +531,28 @@ fn bounded_detail(detail: &str) -> String {
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropped_handoff_receiver_rolls_back_active_capacity() {
+        let gate = AdmissionGate::new(1, 1, Duration::from_secs(1)).unwrap();
+        let active = gate.admit(PriorityClass::Standard).await.unwrap();
+        let (sender, receiver) = oneshot::channel();
+        drop(receiver);
+        gate.core.state.lock().unwrap().queue.push(Waiter {
+            id: 1,
+            priority: PriorityClass::Standard,
+            arrival: 1,
+            sender,
+        });
+
+        drop(active);
+
+        assert_eq!(gate.counts().active, 0);
+        assert_eq!(gate.counts().queued, 0);
+    }
 }

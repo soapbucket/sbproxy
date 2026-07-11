@@ -741,6 +741,10 @@ pub fn build_vllm_container_plan(
         request.deployment.clone(),
         "--max-model-len".to_string(),
         request.fit.seq_len.to_string(),
+        "--max-num-seqs".to_string(),
+        request.max_concurrency.to_string(),
+        "--kv-cache-memory-bytes".to_string(),
+        request.fit.memory.kv_bytes.to_string(),
     ]);
     append_vllm_precision_arguments(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(
@@ -766,6 +770,10 @@ fn direct_vllm_arguments(request: &LaunchRequest) -> Result<Vec<String>, EngineD
         request.deployment.clone(),
         "--max-model-len".to_string(),
         request.fit.seq_len.to_string(),
+        "--max-num-seqs".to_string(),
+        request.max_concurrency.to_string(),
+        "--kv-cache-memory-bytes".to_string(),
+        request.fit.memory.kv_bytes.to_string(),
     ];
     append_vllm_precision_arguments(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(

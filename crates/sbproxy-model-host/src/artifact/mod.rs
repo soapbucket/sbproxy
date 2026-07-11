@@ -32,8 +32,21 @@ use crate::{
 };
 use cache::{
     hash_file, validate_digest, validate_relative_path, validate_resolved_artifact, ArtifactCache,
-    CacheLookup, LegacyArtifactMetadata,
+    ArtifactLeaseGuard, CacheLookup, LegacyArtifactMetadata,
 };
+
+/// Cross-process shared lease held while a digest is configured or resident.
+pub struct ArtifactLease {
+    _guard: ArtifactLeaseGuard,
+}
+
+impl std::fmt::Debug for ArtifactLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArtifactLease")
+            .finish_non_exhaustive()
+    }
+}
 
 /// Why an artifact could not become verified ready state.
 #[derive(Debug, thiserror::Error)]
@@ -258,6 +271,13 @@ impl ArtifactManager {
     /// for the selected digest.
     pub fn cached_artifacts(&self) -> Result<Vec<ArtifactCacheMetadata>, ArtifactError> {
         self.cache.metadata_entries()
+    }
+
+    /// Hold one digest against collection or exact removal across processes.
+    pub fn lease(&self, artifact_digest: &str) -> Result<ArtifactLease, ArtifactError> {
+        self.cache
+            .lock_shared_lease(artifact_digest)
+            .map(|guard| ArtifactLease { _guard: guard })
     }
 
     /// Return verified local bytes, downloading and finalizing atomically on a miss.

@@ -68,8 +68,8 @@ pub mod mesh_counters;
 #[doc(hidden)]
 pub mod model_runtime {
     pub use crate::server::model_host::{
-        commit_model_runtime, model_runtime_manager, prepare_model_runtime, ManagedModelPermit,
-        PreparedModelRuntime, ProductionModelRuntime,
+        commit_model_runtime, model_runtime_manager, prepare_model_runtime, validate_model_runtime,
+        ManagedModelPermit, PreparedModelRuntime, ProductionModelRuntime,
     };
 }
 pub mod pipeline;

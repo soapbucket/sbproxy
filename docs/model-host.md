@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-11*
 
 SBproxy can own a model process on the same node as the gateway. The stable
 single-node configuration lives under `proxy.model_host`; an AI provider with
@@ -137,9 +137,12 @@ Pull policy controls cache misses:
 revision becomes active. Use it when readiness must mean the first token path is
 available. A warm failure aborts the candidate revision.
 
-`rollout: rolling` prepares a replacement generation before draining the old
-one. This needs enough memory for both generations. `recreate` drains first and
-is usually the safer choice on a single full GPU.
+`rollout: rolling` proves that both generations fit before it starts the
+replacement, then drains the old one after the route swap. It fails without
+launching the replacement when overlap capacity is unavailable. `recreate`
+drains and stops the old generation first. If a warm replacement fails, the
+runtime restarts the old generation and keeps the prior revision active.
+`recreate` is usually the safer choice on a single full GPU.
 
 `required_labels` and replicas are part of the desired-state contract, but this
 PR has no multi-node placement service. Keep replicas at one for a real
@@ -158,8 +161,10 @@ drop, and never written to snapshot or job metadata. Explicit pulls accept
 
 `cache.budget_gib` is enforced by explicit pull-time collection. Collection
 protects configured, resident, pinned, locked, downloading, verifying, and
-deleting artifacts, and it accounts for shared blobs. Continuous collection
-after every on-demand acquisition is still outside the stable contract.
+deleting artifacts, and it accounts for shared blobs. A live runtime holds a
+cross-process digest lease, so another CLI process cannot remove its snapshot
+between a stale status check and deletion. Continuous collection after every
+on-demand acquisition is still outside the stable contract.
 
 ### Lifecycle commands
 
@@ -206,7 +211,11 @@ The runtime reports one of four availability states before provisioning:
 
 llama.cpp consumes one verified GGUF path. The driver prefers an explicitly
 allowlisted path, then a compatible executable on `PATH`, then pinned
-acquisition. Apple Silicon uses Metal, and a CPU worker uses system RAM.
+acquisition. The built-in b9905 release assets have checked-in per-platform
+SHA-256 digests. Downloads use a release lock and publish under an
+asset-identity directory only after verification, so later starts reuse the
+same archive and executable. Apple Silicon uses Metal, and a CPU worker uses
+system RAM.
 
 Linux CUDA can build the pinned llama.cpp source archive on the node. The build
 requires Linux x86-64, an NVIDIA driver, `nvcc`, CMake, a C or C++ compiler, and
@@ -240,7 +249,8 @@ engines:
 
 Compatibility checks report Python, torch, CUDA, and vLLM mismatches with a
 bounded remediation. A failed check does not fall back to an unrelated Python
-environment.
+environment. Launch bounds `max-num-seqs` to deployment concurrency and derives
+the engine KV-cache byte limit from the admitted memory estimate.
 
 ### vLLM in a container
 
@@ -277,7 +287,9 @@ weights + KV cache + runtime overhead + safety margin = reserved bytes
 
 The residency manager never evicts active, queued, preparing, draining, or
 pinned generations. It does not substitute the largest device's free memory for
-the selected device's capacity.
+the selected device's capacity. `cache.max_resident_models` is one global count
+across all devices. Compatibility `eviction: never` rejects a load that would
+displace any resident generation.
 
 Stable admission reason codes are:
 
@@ -337,9 +349,11 @@ is a separate measurement and never masquerades as compute activity.
 
 The runtime collects canonical and compatibility deployments from every origin.
 It validates the complete catalog, cache and engine policy, routes, capacity,
-and warm preparations before commit. On success it preserves unchanged engine
-generations and replaces only changed deployments. On failure it tears down
-staged work and keeps the prior routes and resident engines.
+and warm preparations before commit. Capacity is reserved before a staged warm
+engine starts. On success it preserves unchanged engine generations and
+replaces only changed deployments. On failure it tears down staged work and
+keeps the prior routes and resident engines. A recreate launch failure also
+restarts the stopped prior generation before returning the error.
 
 A cache root, catalog revision, or engine foundation cannot change under a
 resident deployment. Reconcile to an empty desired state first, then apply the
@@ -359,6 +373,8 @@ worker, generates a high-entropy loopback admin credential, writes a private
 temporary config, enables `pull: on_boot` and `warm: true`, and waits for the
 deployment to report `ready`. Only then does it print the endpoint, admin
 credential, curl request, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` settings.
+The owner-only temporary config is removed when the command returns, including
+startup and readiness failures.
 
 Raw `hf:` references are deliberately rejected by this command because they
 bypass the catalog v2 identity. Operator catalog selection remains available

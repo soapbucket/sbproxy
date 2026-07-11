@@ -165,6 +165,32 @@ async fn shared_blob_survives_deleting_one_reference() {
 }
 
 #[tokio::test]
+async fn a_live_digest_lease_blocks_exact_removal_until_released() {
+    let directory = tempdir().unwrap();
+    let manager = ArtifactManager::new(directory.path(), Arc::new(NoNetwork)).unwrap();
+    let artifact = prepare_artifact(directory.path(), &manager, 'e', b"leased-010", 1).await;
+    let lease = manager.lease(&artifact.artifact_digest).unwrap();
+
+    let error = manager
+        .remove(&artifact.artifact_digest, &CacheProtection::default())
+        .await
+        .expect_err("a configured or resident generation holds a digest lease");
+    assert!(matches!(
+        error,
+        ArtifactError::RemovalBlocked { ref reason, .. } if reason == "leased"
+    ));
+
+    drop(lease);
+    assert!(
+        manager
+            .remove(&artifact.artifact_digest, &CacheProtection::default())
+            .await
+            .unwrap()
+            .removed
+    );
+}
+
+#[tokio::test]
 async fn resident_and_pinned_artifacts_are_nonfatal_budget_constraints() {
     let directory = tempdir().unwrap();
     let manager = ArtifactManager::new(directory.path(), Arc::new(NoNetwork)).unwrap();

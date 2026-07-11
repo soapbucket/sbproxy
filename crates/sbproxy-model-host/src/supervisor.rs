@@ -464,6 +464,26 @@ impl EngineSupervisor {
         }
     }
 
+    /// Check the retained running generation through its typed driver.
+    pub async fn health(
+        &self,
+        running: &RunningEngine,
+    ) -> Result<crate::EngineHealth, EngineDriverError> {
+        self.validate_deployment()?;
+        if running.deployment != self.deployment {
+            return Err(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                format!(
+                    "health deployment {:?} does not match supervisor {:?}",
+                    running.deployment, self.deployment
+                ),
+                "check health through the deployment that owns the running generation",
+                false,
+            ));
+        }
+        self.driver.health(running).await
+    }
+
     /// Clear a retained crash loop and persist the explicit reset event.
     pub fn reset(&mut self) -> Result<Option<OperationJob>, EngineDriverError> {
         self.validate_deployment()?;

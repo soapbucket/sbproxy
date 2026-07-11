@@ -80,6 +80,10 @@ impl ArtifactManager {
                 skipped_artifacts.insert(digest, reason.to_string());
                 continue;
             }
+            let Some(_lease_lock) = self.cache.try_lock_exclusive_lease(&digest)? else {
+                skipped_artifacts.insert(digest, "leased".to_string());
+                continue;
+            };
             let Some(_artifact_lock) = self.cache.try_lock_artifact(&digest)? else {
                 skipped_artifacts.insert(digest, "locked".to_string());
                 continue;
@@ -151,6 +155,9 @@ impl ArtifactManager {
         let protection = protection.clone();
         tokio::task::spawn_blocking(move || {
             let _mutation = cache.lock_exclusive_mutation()?;
+            let Some(_lease_lock) = cache.try_lock_exclusive_lease(&digest)? else {
+                return Err(removal_blocked(&digest, "leased"));
+            };
             let Some(_artifact_lock) = cache.try_lock_artifact(&digest)? else {
                 return Err(removal_blocked(&digest, "locked"));
             };

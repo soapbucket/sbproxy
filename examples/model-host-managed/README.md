@@ -1,6 +1,6 @@
 # Managed local model
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-11*
 
 This example runs the built-in pinned Qwen bootstrap artifact through the
 canonical single-node model host. `proxy.model_host` owns the deployment;
@@ -59,9 +59,10 @@ Edit the deployment in `sb.yml`, then use the normal reload transaction:
 sbproxy apply -f examples/model-host-managed/sb.yml
 ```
 
-The runtime prepares the complete candidate before swapping routes. If the new
-artifact, engine, or capacity check fails, the current `local-qwen` generation
-keeps serving.
+The runtime prepares the complete candidate before swapping routes. This
+example uses `rollout: recreate`, so it drains the old generation before the
+warm replacement starts. If that launch fails, the runtime restarts the old
+generation and keeps the prior revision active.
 
 ## Hardware note
 

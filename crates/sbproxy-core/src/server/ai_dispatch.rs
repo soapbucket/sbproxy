@@ -2605,6 +2605,7 @@ pub(super) async fn handle_ai_proxy(
         ctx.managed_model_permit = None;
         let mut resolved_provider = config.providers[provider_idx].clone();
         let mut local_public_model = None;
+        let mut local_engine_model = None;
         if resolved_provider.serve.is_some() || resolved_provider.is_managed_model() {
             let requested = (!model.is_empty()).then_some(model.as_str());
             let origin = ctx
@@ -2624,6 +2625,7 @@ pub(super) async fn handle_ai_proxy(
                 Ok(Some(upstream)) => {
                     resolved_provider.base_url = Some(upstream.base_url);
                     local_public_model = Some(upstream.public_model);
+                    local_engine_model = Some(upstream.engine_model);
                     ctx.managed_model_permit = Some(upstream.permit);
                 }
                 Ok(None) => {}
@@ -2659,6 +2661,9 @@ pub(super) async fn handle_ai_proxy(
         } else {
             String::new()
         };
+        if let Some(engine_model) = local_engine_model.as_deref() {
+            rewrite_managed_request_model(&mut attempt_body, engine_model);
+        }
 
         // Stamp the resolved provider + model on the context so the
         // access log captures them even when the upstream errors out
@@ -5386,11 +5391,17 @@ fn prepend_system_message(body: &mut serde_json::Value, text: &str) {
     }
 }
 
-/// WOR-1534: restrict the routing set to providers that declare the requested
-/// model. A provider with an empty `models` list is a wildcard and stays
-/// eligible. Returns `None` (leave the order unchanged) when the model is
-/// empty, when no provider declares it (so unenumerated models still pass
-/// straight through), or when the filter would not exclude any provider.
+/// Rewrite a managed local request to the exact name accepted by its engine.
+/// The public alias is retained separately for logs and response rewriting.
+fn rewrite_managed_request_model(body: &mut serde_json::Value, engine_model: &str) {
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(engine_model.to_string()),
+        );
+    }
+}
+
 /// Rewrite the top-level `model` field of an OpenAI-shaped JSON body to
 /// `model`. A served (local) engine reports its weights file path there
 /// (e.g. `/var/lib/sbproxy/models/.../Qwen3-14B-Q4_K_M.gguf`), which is
@@ -6136,7 +6147,14 @@ mod dynamic_key_resolution_tests {
 
 #[cfg(test)]
 mod served_model_rewrite_tests {
-    use super::rewrite_response_model;
+    use super::{rewrite_managed_request_model, rewrite_response_model};
+
+    #[test]
+    fn rewrites_public_model_to_the_engine_served_deployment() {
+        let mut body = serde_json::json!({"model": "alias", "messages": []});
+        rewrite_managed_request_model(&mut body, "local");
+        assert_eq!(body["model"], "local");
+    }
 
     #[test]
     fn rewrites_weights_path_to_serve_name() {

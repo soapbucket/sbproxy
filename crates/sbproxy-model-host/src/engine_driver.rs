@@ -110,6 +110,8 @@ pub struct LaunchRequest {
     pub kv_quant: crate::KvCacheQuant,
     /// Additional allowlisted engine arguments.
     pub extra_args: Vec<String>,
+    /// Maximum concurrent sequences accounted for by admission and KV memory.
+    pub max_concurrency: u32,
     /// Maximum wait for the engine's readiness endpoint.
     pub ready_timeout: Duration,
 }
@@ -427,6 +429,14 @@ impl LaunchRequest {
                 false,
             ));
         }
+        if self.max_concurrency == 0 {
+            return Err(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                "launch max_concurrency must be positive",
+                "compile a positive managed deployment concurrency limit",
+                false,
+            ));
+        }
         if self.artifact.metadata.trust != "verified" {
             return Err(EngineDriverError::artifact_not_ready(format!(
                 "artifact {} has trust state {:?}",
@@ -609,9 +619,7 @@ fn argument_rule(kind: EngineKind, flag: &str) -> Option<ArgumentRule> {
             EngineKind::Vllm,
             "--enable-prefix-caching" | "--disable-log-requests" | "--enforce-eager",
         ) => Some(ArgumentRule::Boolean),
-        (EngineKind::Vllm, "--seed" | "--max-num-seqs") => {
-            Some(ArgumentRule::Value(ArgumentValue::Unsigned))
-        }
+        (EngineKind::Vllm, "--seed") => Some(ArgumentRule::Value(ArgumentValue::Unsigned)),
         (EngineKind::Vllm, "--dtype") => Some(ArgumentRule::Value(ArgumentValue::VllmDtype)),
         (EngineKind::LlamaCpp, "--flash-attn" | "--no-mmap" | "--mlock") => {
             Some(ArgumentRule::Boolean)
