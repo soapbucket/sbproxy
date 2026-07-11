@@ -166,17 +166,11 @@ enum Cmd {
     Projections(ProjectionsCmd),
     /// AI gateway tools (usage ledger verification, ...).
     Ai(AiCmd),
-    /// Serve a model in one command, with no YAML. `sbproxy run
-    /// qwen3-14b` (or `sbproxy run hf:Org/Repo:Q4_K_M --name coder`)
-    /// synthesizes a minimal serving config, checks the model can run
-    /// here, and boots the gateway with an OpenAI-compatible endpoint on
-    /// loopback. The engine and weights are acquired on the first
-    /// request.
+    /// Serve a certified catalog model in one command, with no YAML.
+    /// Resolves an immutable artifact, generates local admin auth, warms
+    /// the managed deployment, then advertises its OpenAI-compatible endpoint.
     Run(RunArgs),
-    /// Discover models: what can this host run. `sbproxy models` (or
-    /// `models list`) prints one row per catalog model with a real
-    /// per-GPU fit verdict and cache status; `models show <id>` prints
-    /// the full entry.
+    /// Discover, cache, remove, and operate managed local models.
     Models(ModelsCmd),
     /// Freshness: is any of it out of date. `sbproxy update` checks the
     /// engine release feed and the cached models; `--self` also checks
@@ -360,34 +354,32 @@ struct RenderArgs {
 
 #[derive(clap::Args, Debug)]
 struct RunArgs {
-    /// The model to serve: a catalog id (`qwen3-14b`) or an explicit
-    /// `hf:Org/Repo:QUANT` reference. A raw reference needs `--name`.
+    /// Certified catalog model ID to serve.
     #[arg(value_name = "MODEL")]
     model: String,
-    /// The model id clients request (and the routing id). Defaults to
-    /// the catalog id; required when MODEL is a raw `hf:` reference.
+    /// Client-facing model alias. Defaults to the certified catalog ID.
     #[arg(long = "name")]
     name: Option<String>,
     /// Loopback port to serve on.
     #[arg(long = "port", default_value_t = 8080)]
     port: u16,
-    /// Engine to serve with: `auto` (default), `vllm`, `llama_cpp`, or
-    /// `embedded`.
+    /// Managed engine: `auto` (default), `vllm`, or `llama_cpp`.
     #[arg(long = "engine", default_value = "auto")]
     engine: String,
     /// Acceleration to acquire an engine build for: `auto` (default),
-    /// `cuda`, `vulkan`, `metal`, or `cpu`.
+    /// `cuda`, `metal`, or `cpu`.
     #[arg(long = "accel", default_value = "auto")]
     accel: String,
     /// Weight/engine cache directory. Defaults to the platform cache.
     #[arg(long = "cache-dir")]
     cache_dir: Option<PathBuf>,
-    /// For a GGUF (llama.cpp) model, the exact GGUF filename in the repo,
-    /// e.g. `qwen2.5-0.5b-instruct-q4_k_m.gguf`. A GGUF-only repo has no
-    /// `config.json`, so the model host needs this to fetch the file and
-    /// read its header for the fit metadata.
-    #[arg(long = "gguf-file")]
-    gguf_file: Option<String>,
+    /// Exact certified artifact variant. Omission selects one compatible
+    /// with the detected worker and engine.
+    #[arg(long = "variant")]
+    variant: Option<String>,
+    /// Loopback admin port. Omission selects an available local port.
+    #[arg(long = "admin-port")]
+    admin_port: Option<u16>,
     /// Print the synthesized config and the resolution, then exit
     /// without serving. For inspection / CI.
     #[arg(long = "dry-run")]
@@ -408,6 +400,12 @@ enum ModelsSub {
     Show(ModelsShowArgs),
     /// Resolve, download, verify, and atomically cache exact artifacts.
     Pull(ModelsPullArgs),
+    /// Remove one exact cached artifact when it is not configured or resident.
+    Remove(ModelsRemoveArgs),
+    /// List deployment lifecycle state from a running local gateway.
+    Ps(ModelsPsArgs),
+    /// Drain and stop one deployment on a running local gateway.
+    Stop(ModelsStopArgs),
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -484,6 +482,66 @@ struct ModelsShowArgs {
     /// Weight cache directory to check for pulled models.
     #[arg(long = "cache-dir")]
     cache_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug, Clone, Default)]
+struct ModelsAdminArgs {
+    /// Local admin API base URL. Defaults to `http://127.0.0.1:9090` for
+    /// `ps` and `stop`; removal queries live protection only when supplied.
+    #[arg(long = "admin-url", env = "SB_ADMIN_URL")]
+    admin_url: Option<String>,
+    /// Admin Basic Auth username.
+    #[arg(long = "username", env = "SB_ADMIN_USERNAME")]
+    username: Option<String>,
+    /// Admin Basic Auth password. Never printed.
+    #[arg(long = "password", env = "SB_ADMIN_PASSWORD")]
+    password: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct ModelsRemoveArgs {
+    /// Catalog model ID to remove from the verified cache.
+    model: String,
+    /// Exact artifact variant. Omission selects for the current worker.
+    #[arg(long = "variant")]
+    variant: Option<String>,
+    /// Restrict resolution to one managed engine.
+    #[arg(long = "engine", value_enum, default_value_t = ModelEngineArg::Auto)]
+    engine: ModelEngineArg,
+    /// Operator catalog file, replacing the built-in catalog.
+    #[arg(long = "catalog-file")]
+    catalog_file: Option<PathBuf>,
+    /// Content-addressed artifact cache directory.
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
+    /// Optional live admin endpoint and credentials for resident protection.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ModelsPsArgs {
+    /// Admin endpoint and credentials.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ModelsStopArgs {
+    /// Canonical deployment ID to drain and stop.
+    deployment: String,
+    /// Admin endpoint and credentials.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[derive(clap::Args, Debug)]
@@ -678,7 +736,10 @@ fn main() {
             run_subcommand("ai", 2, handle_ai_subcommand(&cmd));
         }
         Some(Cmd::Run(args)) => {
-            handle_run_subcommand(&args, grace);
+            let code = handle_run_subcommand(&args, grace);
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Some(Cmd::Models(cmd)) => {
             run_subcommand(
@@ -1243,14 +1304,22 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
         .and_then(|yaml| {
             let compiled = sbproxy_config::compile_config(&yaml)
                 .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
-            sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
-                .map(|_| ())
+            let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "config '{path_str}' compiled, but a module failed to construct \
                          (this would fail at boot):\n{e:#}"
                     )
-                })
+                })?;
+            let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            sbproxy_core::model_runtime::validate_model_runtime(&pipeline, config_dir).map_err(
+                |e| {
+                    anyhow::anyhow!(
+                        "config '{path_str}' has invalid model-host desired state \
+                         (this would fail at boot):\n{e:#}"
+                    )
+                },
+            )
         });
 
     match (json, outcome) {
@@ -1391,181 +1460,394 @@ fn extract_serve_and_catalog(
 
 // --- `run` handler (WOR-1802) ---
 
-/// `sbproxy run <model>`: synthesize a minimal serving config, check the
-/// model can run here, and boot the gateway. On a preflight failure it
-/// exits non-zero with the remediation; on success it serves (blocks).
-fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
-    // Resolve the model id every plane sees (routing + the served name).
-    let name = match resolve_run_name(&args.model, args.name.as_deref()) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("sbproxy run: {e}");
-            std::process::exit(2);
-        }
-    };
+struct PreparedRun {
+    name: String,
+    artifact: sbproxy_model_host::ResolvedArtifact,
+    admin_port: u16,
+    admin_password: String,
+    yaml: String,
+}
 
-    // Build the `serve:` block once as JSON, reused for the preflight
-    // (parsed to a ModelHostConfig) and for the synthesized config.
-    let serve_value = build_run_serve_value(args);
-    let serve_cfg: sbproxy_model_host::ModelHostConfig =
-        match serde_json::from_value(serve_value.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("sbproxy run: could not build serve config: {e}");
-                std::process::exit(2);
-            }
-        };
+struct PrivateRunDirectory {
+    path: PathBuf,
+}
 
-    // Preflight against this host (offline: engine viability + fit), the
-    // same detection layer `doctor` uses, so a model that cannot run
-    // here fails now with a remediation instead of 502-ing later.
-    let report = sbproxy_core::doctor::DoctorReport::collect();
-    let catalog = sbproxy_model_host::Catalog::builtin();
-    let entries = report.evaluate_serve(&serve_cfg, &catalog);
-    for e in &entries {
-        println!(
-            "model {} -> {} [{}]: {}",
-            e.model, e.engine_reason, e.fit.verdict, e.fit.detail
-        );
-    }
-    if let Some(bad) = entries.iter().find(|e| !e.runnable) {
-        eprintln!(
-            "\nsbproxy run: '{}' has no viable engine on this host: {}",
-            bad.model,
-            bad.blocker.as_deref().unwrap_or("engine unavailable")
-        );
-        if let Some(rec) = &report.local_serving.recommendation {
-            eprintln!("try: {rec}");
+impl PrivateRunDirectory {
+    fn new() -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "sbproxy-run-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            )),
         }
-        eprintln!("run `sbproxy doctor` for the full host report");
-        std::process::exit(1);
     }
 
-    // Synthesize the full config: one ai_proxy origin under both the
-    // loopback IP and localhost (origins match the port-stripped Host
-    // exactly, with no wildcard), so a plain curl to either routes.
-    let action = serde_json::json!({
-        "type": "ai_proxy",
-        "providers": [{
-            "name": "local",
-            "default_model": name,
-            "serve": serve_value,
-        }],
-    });
-    let origin = serde_json::json!({ "action": action });
-    let config = serde_json::json!({
-        "proxy": { "http_bind_port": args.port },
-        "origins": { "127.0.0.1": origin, "localhost": origin },
-    });
-    let yaml = match serde_yaml::to_string(&config) {
-        Ok(y) => y,
-        Err(e) => {
-            eprintln!("sbproxy run: could not serialize config: {e}");
-            std::process::exit(2);
+    fn config_path(&self) -> PathBuf {
+        self.path.join("sb.yml")
+    }
+}
+
+impl Drop for PrivateRunDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// `sbproxy run <model>`: resolve one certified artifact, synthesize the
+/// canonical managed desired state, and wait for a warm deployment before
+/// advertising the endpoint.
+fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) -> i32 {
+    use zeroize::Zeroize;
+
+    let mut prepared = match prepare_run(args) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("sbproxy run: {error:#}");
+            return 2;
         }
     };
 
     if args.dry_run {
-        println!("\n# synthesized config\n{yaml}");
-        return;
+        println!(
+            "# resolved {}:{} with {}\n# generated admin credential is embedded below\n{}",
+            prepared.artifact.logical_model,
+            prepared.artifact.variant_id,
+            engine_kind_name(prepared.artifact.engine),
+            prepared.yaml,
+        );
+        prepared.admin_password.zeroize();
+        prepared.yaml.zeroize();
+        return 0;
     }
 
-    // Write the synthesized config to a temp file (the serve boot path
-    // takes a path, not an in-memory config). Use a dedicated per-run
-    // directory, not the shared temp dir: the hot-reload watcher watches
-    // the config's *directory*, and while an engine provisions (vLLM's uv
-    // env, weight downloads) the shared temp dir churns, which would
-    // otherwise fire a reload storm and exhaust file descriptors.
-    let run_dir = std::env::temp_dir().join(format!("sbproxy-run-{}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&run_dir) {
-        eprintln!("sbproxy run: could not create {}: {e}", run_dir.display());
-        std::process::exit(1);
+    raise_fd_limit();
+    warn_low_fd_limit();
+    let run_dir = PrivateRunDirectory::new();
+    let path = run_dir.config_path();
+    if let Err(error) = write_private_run_config(&path, prepared.yaml.as_bytes()) {
+        prepared.admin_password.zeroize();
+        prepared.yaml.zeroize();
+        eprintln!("sbproxy run: {error:#}");
+        return 1;
     }
-    let path = run_dir.join("sb.yml");
-    if let Err(e) = std::fs::write(&path, &yaml) {
-        eprintln!("sbproxy run: could not write {}: {e}", path.display());
-        std::process::exit(1);
-    }
+    prepared.yaml.zeroize();
 
-    let port = args.port;
-    println!("\nServing {name} on http://127.0.0.1:{port}");
-    println!(
-        "Try: curl http://127.0.0.1:{port}/v1/chat/completions \\\n  \
-         -H 'content-type: application/json' \\\n  \
-         -d '{{\"model\":\"{name}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}]}}'"
-    );
-    println!(
-        "The first request acquires the engine and downloads the weights; \
-         watch the log for progress.\n"
+    eprintln!(
+        "Preparing {}:{} with {}. Artifact and engine progress follows on stderr.",
+        prepared.artifact.logical_model,
+        prepared.artifact.variant_id,
+        engine_kind_name(prepared.artifact.engine),
     );
 
-    // Boot the gateway (blocks until shutdown). Reuses the serve path, so
-    // an invalid synthesized config fails loud here rather than at a
-    // request.
-    run_proxy(Some(&path), grace);
+    let path_string = path.to_string_lossy().into_owned();
+    let server = match std::thread::Builder::new()
+        .name("sbproxy-run-server".to_string())
+        .spawn(move || sbproxy_core::run(&path_string, grace))
+    {
+        Ok(server) => server,
+        Err(error) => {
+            prepared.admin_password.zeroize();
+            eprintln!("sbproxy run: start gateway thread: {error}");
+            return 1;
+        }
+    };
+
+    let admin_url = format!("http://127.0.0.1:{}", prepared.admin_port);
+    let mut admin_args = ModelsAdminArgs {
+        admin_url: Some(admin_url.clone()),
+        username: Some("admin".to_string()),
+        password: Some(prepared.admin_password.clone()),
+    };
+    loop {
+        if server.is_finished() {
+            let result = server.join();
+            prepared.admin_password.zeroize();
+            if let Some(password) = admin_args.password.as_mut() {
+                password.zeroize();
+            }
+            match result {
+                Ok(Ok(())) => eprintln!("sbproxy run: gateway exited before the model was ready"),
+                Ok(Err(error)) => eprintln!("sbproxy run: gateway failed: {error:#}"),
+                Err(_) => eprintln!("sbproxy run: gateway thread panicked"),
+            }
+            return 1;
+        }
+
+        if let Ok(status) = admin_request_json(
+            &admin_args,
+            None,
+            reqwest::Method::GET,
+            "/admin/model-host/status",
+            None,
+        ) {
+            let deployment = status
+                .get("deployments")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|deployments| {
+                    deployments.iter().find(|deployment| {
+                        deployment
+                            .get("deployment")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("local")
+                    })
+                });
+            match deployment
+                .and_then(|deployment| deployment.get("state"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("ready") => break,
+                Some("failed") => {
+                    let reason = deployment
+                        .and_then(|deployment| deployment.get("last_error"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("managed deployment preparation failed");
+                    prepared.admin_password.zeroize();
+                    if let Some(password) = admin_args.password.as_mut() {
+                        password.zeroize();
+                    }
+                    eprintln!("sbproxy run: {reason}");
+                    return 1;
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    print!(
+        "{}",
+        run_ready_banner(
+            &prepared.name,
+            args.port,
+            &admin_url,
+            &prepared.admin_password,
+        )
+    );
+    prepared.admin_password.zeroize();
+    if let Some(password) = admin_args.password.as_mut() {
+        password.zeroize();
+    }
+
+    let result = server.join();
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => {
+            eprintln!("sbproxy run: gateway failed: {error:#}");
+            1
+        }
+        Err(_) => {
+            eprintln!("sbproxy run: gateway thread panicked");
+            1
+        }
+    }
 }
 
-/// The served model id for `sbproxy run`: the explicit `--name`, else
-/// the catalog id in MODEL. A raw `hf:`/pathy reference needs `--name`,
-/// mirroring [`sbproxy_model_host::ServeEntry::effective_name`].
+fn run_ready_banner(name: &str, port: u16, admin_url: &str, admin_password: &str) -> String {
+    format!(
+        "\n{name} is ready on http://127.0.0.1:{port}\n\
+         Admin: {admin_url}\n\
+         Admin username: admin\n\
+         Admin password: {admin_password}\n\
+         export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1\n\
+         export OPENAI_API_KEY=local\n\
+         Try: curl http://127.0.0.1:{port}/v1/chat/completions \\\n  \
+           -H 'content-type: application/json' \\\n  \
+           -d '{{\"model\":\"{name}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}]}}'\n"
+    )
+}
+
+/// Resolve the public model name. One-command serving intentionally accepts
+/// certified catalog IDs only; an optional name is a client-facing alias.
 fn resolve_run_name(model: &str, name: Option<&str>) -> Result<String, String> {
-    if let Some(n) = name {
-        if n.trim().is_empty() {
-            return Err("--name is empty".to_string());
-        }
-        return Ok(n.to_string());
-    }
     if model.starts_with("hf:") || model.contains(':') || model.contains('/') {
         return Err(format!(
-            "'{model}' is a raw model reference; pass --name to set the served model id"
+            "'{model}' is a raw model reference; add it to a catalog before managed serving"
         ));
     }
-    Ok(model.to_string())
+    match name {
+        Some(name) if name.trim().is_empty() => Err("--name is empty".to_string()),
+        Some(name) => Ok(name.to_string()),
+        None => Ok(model.to_string()),
+    }
 }
 
-/// Build the `serve:` block (as JSON) for `sbproxy run`: one model, with
-/// the engine / accel / cache-dir overrides applied.
-fn build_run_serve_value(args: &RunArgs) -> serde_json::Value {
-    let mut entry = serde_json::Map::new();
-    entry.insert("model".to_string(), serde_json::json!(args.model));
-    if let Some(n) = &args.name {
-        entry.insert("name".to_string(), serde_json::json!(n));
+fn parse_run_engine(value: &str) -> anyhow::Result<sbproxy_model_host::EngineChoice> {
+    match value {
+        "auto" => Ok(sbproxy_model_host::EngineChoice::Auto),
+        "vllm" => Ok(sbproxy_model_host::EngineChoice::Vllm),
+        "llama_cpp" => Ok(sbproxy_model_host::EngineChoice::LlamaCpp),
+        "embedded" => {
+            anyhow::bail!("embedded is not a managed process engine; use auto, vllm, or llama_cpp")
+        }
+        other => anyhow::bail!("unknown engine '{other}'; use auto, vllm, or llama_cpp"),
     }
-    if args.engine != "auto" {
-        entry.insert("engine".to_string(), serde_json::json!(args.engine));
-    }
-    if let Some(f) = &args.gguf_file {
-        entry.insert("gguf_file".to_string(), serde_json::json!(f));
-    }
+}
 
-    let mut serve = serde_json::Map::new();
-    serve.insert(
-        "models".to_string(),
-        serde_json::Value::Array(vec![serde_json::Value::Object(entry)]),
-    );
-    if let Some(cd) = &args.cache_dir {
-        serve.insert(
-            "cache_dir".to_string(),
-            serde_json::json!(cd.to_string_lossy()),
+fn run_acceleration(
+    value: &str,
+    worker: &sbproxy_model_host::WorkerProfile,
+) -> anyhow::Result<&'static str> {
+    let detected = match worker.accelerator {
+        sbproxy_model_host::AcceleratorKind::Cpu => "cpu",
+        sbproxy_model_host::AcceleratorKind::Metal => "metal",
+        sbproxy_model_host::AcceleratorKind::Cuda => "cuda",
+    };
+    match value {
+        "auto" => Ok(detected),
+        "cpu" | "metal" | "cuda" if value == detected => Ok(detected),
+        "cpu" | "metal" | "cuda" => {
+            anyhow::bail!("requested {value} acceleration but the selected worker is {detected}")
+        }
+        "vulkan" => {
+            anyhow::bail!("vulkan is not yet represented by the certified catalog worker contract")
+        }
+        other => anyhow::bail!("unknown acceleration '{other}'; use auto, cuda, metal, or cpu"),
+    }
+}
+
+fn available_loopback_port() -> anyhow::Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn random_local_password() -> String {
+    use rand::RngCore;
+    use std::fmt::Write as _;
+
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let mut password = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut password, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    password
+}
+
+fn prepare_run(args: &RunArgs) -> anyhow::Result<PreparedRun> {
+    let name = resolve_run_name(&args.model, args.name.as_deref()).map_err(anyhow::Error::msg)?;
+    let report = sbproxy_core::doctor::DoctorReport::collect();
+    let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&report.gpus)
+        .map_err(|error| anyhow::anyhow!("detect model worker: {error}"))?;
+    let acceleration = run_acceleration(&args.accel, &worker)?;
+    let catalog = sbproxy_model_host::Catalog::builtin();
+    let artifact = catalog.resolve_artifact(
+        &sbproxy_model_host::ResolveArtifactRequest {
+            model: args.model.clone(),
+            variant: args.variant.clone(),
+            engine: parse_run_engine(&args.engine)?,
+            replicas: 1,
+            heterogeneous_variants: false,
+        },
+        &worker,
+    )?;
+    let admin_port = args.admin_port.unwrap_or(available_loopback_port()?);
+    if admin_port == args.port {
+        anyhow::bail!("--admin-port must differ from --port");
+    }
+    let admin_password = random_local_password();
+
+    let mut cache = serde_json::Map::new();
+    if let Some(cache_dir) = &args.cache_dir {
+        cache.insert(
+            "directory".to_string(),
+            serde_json::json!(cache_dir.to_string_lossy()),
         );
     }
-    // Engines block. vLLM is provisioned via uvx (fetch uv, run
-    // `uv tool run`), so a safetensors model serves on a GPU box with no
-    // manual install; this is harmless when llama.cpp is the resolved
-    // engine. Accel steers the acquired llama.cpp binary build.
-    let mut engines = serde_json::Map::new();
-    engines.insert(
-        "vllm".to_string(),
-        serde_json::json!({ "acquire": { "source": "uvx" } }),
-    );
-    if args.accel != "auto" {
-        engines.insert(
-            "llama_cpp".to_string(),
-            serde_json::json!({ "acquire": { "accel": args.accel } }),
-        );
+    let engine_name = engine_kind_name(artifact.engine);
+    let engine_config = match artifact.engine {
+        sbproxy_model_host::EngineKind::Vllm => serde_json::json!({
+            "launch": "uv",
+            "version": sbproxy_model_host::DEFAULT_VLLM_VERSION,
+            "acceleration": acceleration,
+        }),
+        sbproxy_model_host::EngineKind::LlamaCpp => serde_json::json!({
+            "launch": "binary",
+            "version": sbproxy_model_host::DEFAULT_LLAMA_RELEASE_TAG,
+            "acceleration": acceleration,
+        }),
+        sbproxy_model_host::EngineKind::Embedded => {
+            anyhow::bail!("catalog resolved the unsupported embedded managed engine")
+        }
+    };
+    let action = serde_json::json!({
+        "type": "ai_proxy",
+        "providers": [{
+            "name": "local",
+            "provider_type": "managed_model",
+            "deployment": "local",
+            "models": [name.clone()],
+            "default_model": name.clone(),
+        }],
+    });
+    let origin = serde_json::json!({ "action": action });
+    let config = serde_json::json!({
+        "proxy": {
+            "http_bind_port": args.port,
+            "admin": {
+                "enabled": true,
+                "port": admin_port,
+                "bind": "127.0.0.1",
+                "username": "admin",
+                "password": admin_password,
+            },
+            "model_host": {
+                "cache": serde_json::Value::Object(cache),
+                "engines": { engine_name: engine_config },
+                "deployments": {
+                    "local": {
+                        "model": args.model,
+                        "variant": artifact.variant_id,
+                        "pull": "on_boot",
+                        "warm": true,
+                        "engine": engine_name,
+                    },
+                },
+            },
+        },
+        "origins": {
+            "127.0.0.1": origin.clone(),
+            "localhost": origin,
+        },
+    });
+    let yaml = serde_yaml::to_string(&config)?;
+    sbproxy_config::compile_config(&yaml)
+        .map_err(|error| anyhow::anyhow!("generated config is invalid: {error:#}"))?;
+    Ok(PreparedRun {
+        name,
+        artifact,
+        admin_port,
+        admin_password,
+        yaml,
+    })
+}
+
+fn write_private_run_config(path: &std::path::Path, yaml: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("generated config has no parent directory"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", parent.display()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    serve.insert("engines".to_string(), serde_json::Value::Object(engines));
-    serde_json::Value::Object(serve)
+    let mut file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", path.display()))?;
+    file.write_all(yaml)
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| anyhow::anyhow!("sync '{}': {error}", path.display()))?;
+    Ok(())
 }
 
 // --- `models` handler (WOR-1803) ---
@@ -1580,6 +1862,9 @@ fn handle_models_subcommand(
         Some(ModelsSub::List(a)) => handle_models_list(a),
         Some(ModelsSub::Show(a)) => handle_models_show(a),
         Some(ModelsSub::Pull(a)) => handle_models_pull(a, config_path),
+        Some(ModelsSub::Remove(a)) => handle_models_remove(a, config_path),
+        Some(ModelsSub::Ps(a)) => handle_models_ps(a),
+        Some(ModelsSub::Stop(a)) => handle_models_stop(a),
     }
 }
 
@@ -1684,6 +1969,8 @@ struct ModelsPullResult {
 
 #[derive(serde::Serialize)]
 struct ModelsPullOutput {
+    schema_version: u32,
+    command: &'static str,
     artifacts: Vec<ModelsPullResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gc: Option<sbproxy_model_host::GcReport>,
@@ -1705,11 +1992,97 @@ fn artifact_format_name(format: sbproxy_model_host::ArtifactFormat) -> &'static 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullSelection {
+    model: String,
+    variant: Option<String>,
+    engine: sbproxy_model_host::EngineChoice,
+    replicas: u32,
+    heterogeneous_variants: bool,
+    configured: bool,
+    pinned: bool,
+}
+
+impl PullSelection {
+    fn catalog(model: String, args: &ModelsPullArgs) -> Self {
+        Self {
+            model,
+            variant: args.variant.clone(),
+            engine: args.engine.into(),
+            replicas: 1,
+            heterogeneous_variants: false,
+            configured: false,
+            pinned: false,
+        }
+    }
+}
+
+fn managed_engine_choice(
+    engine: sbproxy_config::ManagedEngineChoice,
+) -> sbproxy_model_host::EngineChoice {
+    match engine {
+        sbproxy_config::ManagedEngineChoice::Auto => sbproxy_model_host::EngineChoice::Auto,
+        sbproxy_config::ManagedEngineChoice::Vllm => sbproxy_model_host::EngineChoice::Vllm,
+        sbproxy_config::ManagedEngineChoice::LlamaCpp => sbproxy_model_host::EngineChoice::LlamaCpp,
+    }
+}
+
+fn configured_pull_selections(
+    serve: Option<&sbproxy_model_host::ModelHostConfig>,
+    canonical: Option<&sbproxy_config::ModelHostControlConfig>,
+) -> Vec<PullSelection> {
+    let mut selections = Vec::new();
+    if let Some(canonical) = canonical {
+        selections.extend(
+            canonical
+                .deployments
+                .values()
+                .map(|deployment| PullSelection {
+                    model: deployment.model.clone(),
+                    variant: deployment.variant.clone(),
+                    engine: managed_engine_choice(deployment.engine),
+                    replicas: deployment.replicas,
+                    heterogeneous_variants: deployment.heterogeneous_variants,
+                    configured: true,
+                    pinned: false,
+                }),
+        );
+    }
+    if let Some(serve) = serve {
+        selections.extend(serve.models.iter().map(|entry| PullSelection {
+            model: entry.model.clone(),
+            variant: entry.variant.clone(),
+            engine: entry.engine,
+            replicas: 1,
+            heterogeneous_variants: false,
+            configured: true,
+            pinned: entry.pinned,
+        }));
+    }
+    selections
+}
+
+fn push_pull_selection(selections: &mut Vec<PullSelection>, candidate: PullSelection) {
+    if let Some(existing) = selections.iter_mut().find(|existing| {
+        existing.model == candidate.model
+            && existing.variant == candidate.variant
+            && existing.engine == candidate.engine
+            && existing.replicas == candidate.replicas
+            && existing.heterogeneous_variants == candidate.heterogeneous_variants
+    }) {
+        existing.configured |= candidate.configured;
+        existing.pinned |= candidate.pinned;
+    } else {
+        selections.push(candidate);
+    }
+}
+
 fn selected_pull_models(
     args: &ModelsPullArgs,
     catalog: &sbproxy_model_host::Catalog,
     serve: Option<&sbproxy_model_host::ModelHostConfig>,
-) -> anyhow::Result<Vec<String>> {
+    canonical: Option<&sbproxy_config::ModelHostControlConfig>,
+) -> anyhow::Result<Vec<PullSelection>> {
     if args.all && !args.models.is_empty() {
         anyhow::bail!("--all cannot be combined with positional model IDs");
     }
@@ -1721,27 +2094,43 @@ fn selected_pull_models(
             .models
             .iter()
             .filter(|(_, entry)| !entry.variants.is_empty())
-            .map(|(model, _)| model.clone())
+            .map(|(model, _)| PullSelection::catalog(model.clone(), args))
             .collect());
     }
-    if !args.models.is_empty() {
-        return Ok(args.models.clone());
-    }
+
+    let configured = configured_pull_selections(serve, canonical);
     let mut selected = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    if let Some(serve) = serve {
-        for entry in &serve.models {
-            if seen.insert(entry.model.clone()) {
-                selected.push(entry.model.clone());
+    if !args.models.is_empty() {
+        for model in &args.models {
+            if args.variant.is_some() {
+                push_pull_selection(&mut selected, PullSelection::catalog(model.clone(), args));
+                continue;
+            }
+            let mut matched = false;
+            for mut selection in configured
+                .iter()
+                .filter(|selection| selection.model == *model)
+                .cloned()
+            {
+                if args.engine != ModelEngineArg::Auto {
+                    selection.engine = args.engine.into();
+                }
+                push_pull_selection(&mut selected, selection);
+                matched = true;
+            }
+            if !matched {
+                push_pull_selection(&mut selected, PullSelection::catalog(model.clone(), args));
             }
         }
+        return Ok(selected);
+    }
+
+    for selection in configured {
+        push_pull_selection(&mut selected, selection);
     }
     for (model, entry) in &catalog.models {
-        if !entry.variants.is_empty()
-            && entry.pull == sbproxy_model_host::PullPolicy::OnBoot
-            && seen.insert(model.clone())
-        {
-            selected.push(model.clone());
+        if !entry.variants.is_empty() && entry.pull == sbproxy_model_host::PullPolicy::OnBoot {
+            push_pull_selection(&mut selected, PullSelection::catalog(model.clone(), args));
         }
     }
     Ok(selected)
@@ -1751,7 +2140,7 @@ fn handle_models_pull(
     args: &ModelsPullArgs,
     config_path: Option<&std::path::Path>,
 ) -> anyhow::Result<i32> {
-    let (serve, catalog) = match config_path {
+    let (serve, canonical, catalog) = match config_path {
         Some(config_path) => {
             if args.catalog_file.is_some() {
                 anyhow::bail!("--catalog-file cannot be combined with -f/--config");
@@ -1762,18 +2151,29 @@ fn handle_models_pull(
             let config_dir = config_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
-            let Some((serve, catalog)) = extract_serve_and_catalog(&yaml, config_dir)? else {
+            let compiled = sbproxy_config::compile_config(&yaml)?;
+            let canonical = compiled.server.model_host.clone();
+            let legacy = extract_serve_and_catalog(&yaml, config_dir)?;
+            if canonical.is_none() && legacy.is_none() {
                 anyhow::bail!(
-                    "config '{}' has no local serve block",
+                    "config '{}' has no proxy.model_host or local serve block",
                     config_path.display()
                 );
+            }
+            let (serve, catalog) = match legacy {
+                Some((serve, catalog)) => (Some(serve), catalog),
+                None => (None, sbproxy_model_host::Catalog::builtin()),
             };
-            (Some(serve), catalog)
+            (serve, canonical, catalog)
         }
-        None => (None, load_models_catalog(args.catalog_file.as_deref())?),
+        None => (
+            None,
+            None,
+            load_models_catalog(args.catalog_file.as_deref())?,
+        ),
     };
-    let models = selected_pull_models(args, &catalog, serve.as_ref())?;
-    if models.is_empty() {
+    let selections = selected_pull_models(args, &catalog, serve.as_ref(), canonical.as_ref())?;
+    if selections.is_empty() {
         eprintln!("sbproxy models pull: no catalog v2 artifacts selected");
         return Ok(0);
     }
@@ -1781,11 +2181,16 @@ fn handle_models_pull(
     let report = sbproxy_core::doctor::DoctorReport::collect();
     let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&report.gpus)
         .map_err(|error| anyhow::anyhow!("resolve pull worker: {error}"))?;
-    let configured_cache = serve
+    let canonical_cache = canonical
+        .as_ref()
+        .and_then(|control| control.cache.directory.as_deref())
+        .map(PathBuf::from);
+    let legacy_cache = serve
         .as_ref()
         .and_then(|serve| serve.cache_dir.as_deref())
         .map(PathBuf::from);
-    let root = model_cache_root(args.cache_dir.as_deref().or(configured_cache.as_deref()));
+    let configured_cache = canonical_cache.as_deref().or(legacy_cache.as_deref());
+    let root = model_cache_root(args.cache_dir.as_deref().or(configured_cache));
     let manager = sbproxy_model_host::ArtifactManager::new(root, models_pull_transport()?)?
         .with_observer(std::sync::Arc::new(ModelsPullProgress));
     let network = if args.offline {
@@ -1794,73 +2199,49 @@ fn handle_models_pull(
         sbproxy_model_host::NetworkPolicy::Allowed
     };
 
-    let mut configured_protection = sbproxy_model_host::CacheProtection::default();
-    if let Some(serve) = &serve {
-        for configured in serve.models.iter().filter(|configured| configured.pinned) {
-            let artifact = catalog
-                .resolve_artifact(
-                    &sbproxy_model_host::ResolveArtifactRequest {
-                        model: configured.model.clone(),
-                        variant: configured.variant.clone(),
-                        engine: configured.engine,
-                        replicas: 1,
-                        heterogeneous_variants: false,
-                    },
-                    &worker,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "resolve pinned model '{}' for cache protection: {error}",
-                        configured.model
-                    )
-                })?;
-            configured_protection
-                .pinned
-                .insert(artifact.artifact_digest);
-        }
-    }
+    let configured_protection = match config_path {
+        Some(path) => configured_artifact_protection(path, &catalog, &worker)?,
+        None => sbproxy_model_host::CacheProtection::default(),
+    };
 
-    let mut requests = Vec::with_capacity(models.len());
-    for model in models {
+    let mut requests: Vec<(
+        sbproxy_model_host::ResolvedArtifact,
+        sbproxy_model_host::PullPolicy,
+        bool,
+        Option<sbproxy_model_host::SourceCredential>,
+    )> = Vec::with_capacity(selections.len());
+    for selection in selections {
+        let model = &selection.model;
         let entry = catalog
-            .get(&model)
+            .get(model)
             .ok_or_else(|| anyhow::anyhow!("model '{model}' is not in the catalog"))?;
         if entry.variants.is_empty() {
             anyhow::bail!(
                 "model '{model}' has no exact catalog v2 variant; migrate its files, sizes, digests, and revision before pulling"
             );
         }
-        let configured = serve.as_ref().and_then(|serve| {
-            serve
-                .models
-                .iter()
-                .find(|configured| configured.model == model)
-        });
-        let engine = if args.engine == ModelEngineArg::Auto {
-            configured
-                .map(|configured| configured.engine)
-                .unwrap_or(sbproxy_model_host::EngineChoice::Auto)
-        } else {
-            args.engine.into()
-        };
-        let variant = args
-            .variant
-            .clone()
-            .or_else(|| configured.and_then(|configured| configured.variant.clone()));
         let request = sbproxy_model_host::ResolveArtifactRequest {
-            model: model.clone(),
-            variant,
-            engine,
-            replicas: 1,
-            heterogeneous_variants: false,
+            model: selection.model.clone(),
+            variant: selection.variant,
+            engine: selection.engine,
+            replicas: selection.replicas,
+            heterogeneous_variants: selection.heterogeneous_variants,
         };
         match catalog.resolve_artifact(&request, &worker) {
-            Ok(artifact) => requests.push((
-                artifact,
-                entry.pull,
-                models_pull_credential(entry.hf_token.as_deref())?,
-                configured.is_some_and(|configured| configured.pinned),
-            )),
+            Ok(artifact) => {
+                if let Some(existing) = requests.iter().position(|(existing, _, _, _)| {
+                    existing.artifact_digest == artifact.artifact_digest
+                }) {
+                    requests[existing].2 |= selection.pinned;
+                } else {
+                    requests.push((
+                        artifact,
+                        entry.pull,
+                        selection.pinned,
+                        models_pull_credential(entry.hf_token.as_deref())?,
+                    ));
+                }
+            }
             Err(error) if args.all => {
                 eprintln!("sbproxy models pull: skip {model}: {error}");
             }
@@ -1875,7 +2256,7 @@ fn handle_models_pull(
     let (results, protection) = executor.block_on(async {
         let mut results = Vec::with_capacity(requests.len());
         let mut protection = configured_protection;
-        for (artifact, pull_policy, credential, pinned) in requests {
+        for (artifact, pull_policy, pinned, credential) in requests {
             let ready = manager
                 .ensure(
                     &artifact,
@@ -1903,9 +2284,11 @@ fn handle_models_pull(
         Ok::<_, sbproxy_model_host::ArtifactError>((results, protection))
     })?;
 
-    let gc = serve
+    let budget_gib = canonical
         .as_ref()
-        .and_then(|serve| serve.cache_budget_gib)
+        .and_then(|control| control.cache.budget_gib)
+        .or_else(|| serve.as_ref().and_then(|serve| serve.cache_budget_gib));
+    let gc = budget_gib
         .map(|gib| {
             if !gib.is_finite() || gib < 0.0 {
                 anyhow::bail!("serve.cache_budget_gib must be a finite nonnegative number");
@@ -1920,6 +2303,8 @@ fn handle_models_pull(
         })
         .transpose()?;
     let output = ModelsPullOutput {
+        schema_version: 1,
+        command: "models.pull",
         artifacts: results,
         gc,
     };
@@ -1945,6 +2330,288 @@ fn handle_models_pull(
                     gc.reclaimed_bytes,
                     gc.budget_unsatisfied_bytes
                 );
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn admin_request_json(
+    args: &ModelsAdminArgs,
+    default_url: Option<&str>,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    use zeroize::Zeroize;
+
+    let base_url =
+        args.admin_url.as_deref().or(default_url).ok_or_else(|| {
+            anyhow::anyhow!("--admin-url is required for live runtime protection")
+        })?;
+    let username = args.username.as_deref().unwrap_or("admin");
+    let mut password = args.password.clone().ok_or_else(|| {
+        anyhow::anyhow!("admin password is required via --password or SB_ADMIN_PASSWORD")
+    })?;
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let mut request = client
+        .request(method, &url)
+        .basic_auth(username, Some(password.as_str()));
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let request = request.build();
+    password.zeroize();
+    let response = client.execute(request?)?;
+    let status = response.status();
+    let value: serde_json::Value = response
+        .json()
+        .map_err(|error| anyhow::anyhow!("admin endpoint returned invalid JSON: {error}"))?;
+    if !status.is_success() {
+        let reason = value
+            .get("reason_code")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
+            .unwrap_or("admin request failed");
+        anyhow::bail!("admin request returned HTTP {}: {reason}", status.as_u16());
+    }
+    Ok(value)
+}
+
+fn models_command_envelope(command: &'static str, value: serde_json::Value) -> serde_json::Value {
+    let mut object = match value {
+        serde_json::Value::Object(object) => object,
+        value => serde_json::Map::from_iter([("result".to_string(), value)]),
+    };
+    object.insert("command".to_string(), serde_json::json!(command));
+    object.insert("schema_version".to_string(), serde_json::json!(1));
+    serde_json::Value::Object(object)
+}
+
+fn handle_models_ps(args: &ModelsPsArgs) -> anyhow::Result<i32> {
+    let status = admin_request_json(
+        &args.admin,
+        Some("http://127.0.0.1:9090"),
+        reqwest::Method::GET,
+        "/admin/model-host/status",
+        None,
+    )?;
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&models_command_envelope("models.ps", status))?
+        ),
+        OutputFormat::Text => {
+            let deployments = status
+                .get("deployments")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            println!(
+                "{:<24} {:<12} {:<8} {:<8} {:<8} REASON",
+                "DEPLOYMENT", "STATE", "PORT", "ACTIVE", "QUEUED"
+            );
+            for deployment in deployments {
+                println!(
+                    "{:<24} {:<12} {:<8} {:<8} {:<8} {}",
+                    deployment
+                        .get("deployment")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("-"),
+                    deployment
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("-"),
+                    deployment
+                        .get("port")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    deployment
+                        .get("active_requests")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    deployment
+                        .get("queued_requests")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    deployment
+                        .get("reason_code")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("-"),
+                );
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn handle_models_stop(args: &ModelsStopArgs) -> anyhow::Result<i32> {
+    let stopped = admin_request_json(
+        &args.admin,
+        Some("http://127.0.0.1:9090"),
+        reqwest::Method::POST,
+        "/admin/model-host/stop",
+        Some(serde_json::json!({ "deployment": args.deployment })),
+    )?;
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&models_command_envelope("models.stop", stopped))?
+        ),
+        OutputFormat::Text => println!("{} stopped", args.deployment),
+    }
+    Ok(0)
+}
+
+fn configured_artifact_protection(
+    config_path: &std::path::Path,
+    catalog: &sbproxy_model_host::Catalog,
+    worker: &sbproxy_model_host::WorkerProfile,
+) -> anyhow::Result<sbproxy_model_host::CacheProtection> {
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|error| anyhow::anyhow!("read config '{}': {error}", config_path.display()))?;
+    let compiled = sbproxy_config::compile_config(&yaml)?;
+    let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)?;
+    let mut protection = sbproxy_model_host::CacheProtection::default();
+
+    if let Some(control) = pipeline.config.server.model_host.as_ref() {
+        for deployment in control.deployments.values() {
+            let engine = match deployment.engine {
+                sbproxy_config::ManagedEngineChoice::Auto => sbproxy_model_host::EngineChoice::Auto,
+                sbproxy_config::ManagedEngineChoice::Vllm => sbproxy_model_host::EngineChoice::Vllm,
+                sbproxy_config::ManagedEngineChoice::LlamaCpp => {
+                    sbproxy_model_host::EngineChoice::LlamaCpp
+                }
+            };
+            let artifact = catalog.resolve_artifact(
+                &sbproxy_model_host::ResolveArtifactRequest {
+                    model: deployment.model.clone(),
+                    variant: deployment.variant.clone(),
+                    engine,
+                    replicas: deployment.replicas,
+                    heterogeneous_variants: deployment.heterogeneous_variants,
+                },
+                worker,
+            )?;
+            protection.configured.insert(artifact.artifact_digest);
+        }
+    }
+    for action in &pipeline.actions {
+        let sbproxy_modules::Action::AiProxy(ai) = action else {
+            continue;
+        };
+        for serve in ai
+            .config
+            .providers
+            .iter()
+            .filter_map(|provider| provider.serve.as_ref())
+        {
+            for configured in &serve.models {
+                let artifact = catalog.resolve_artifact(
+                    &sbproxy_model_host::ResolveArtifactRequest {
+                        model: configured.model.clone(),
+                        variant: configured.variant.clone(),
+                        engine: configured.engine,
+                        replicas: 1,
+                        heterogeneous_variants: false,
+                    },
+                    worker,
+                )?;
+                protection
+                    .configured
+                    .insert(artifact.artifact_digest.clone());
+                if configured.pinned {
+                    protection.pinned.insert(artifact.artifact_digest);
+                }
+            }
+        }
+    }
+    Ok(protection)
+}
+
+fn handle_models_remove(
+    args: &ModelsRemoveArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let catalog = load_models_catalog(args.catalog_file.as_deref())?;
+    let report = sbproxy_core::doctor::DoctorReport::collect();
+    let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&report.gpus)
+        .map_err(|error| anyhow::anyhow!("resolve removal worker: {error}"))?;
+    let artifact = catalog.resolve_artifact(
+        &sbproxy_model_host::ResolveArtifactRequest {
+            model: args.model.clone(),
+            variant: args.variant.clone(),
+            engine: args.engine.into(),
+            replicas: 1,
+            heterogeneous_variants: false,
+        },
+        &worker,
+    )?;
+    let mut protection = match config_path {
+        Some(path) => configured_artifact_protection(path, &catalog, &worker)?,
+        None => sbproxy_model_host::CacheProtection::default(),
+    };
+    if args.admin.admin_url.is_some() {
+        let live = admin_request_json(
+            &args.admin,
+            None,
+            reqwest::Method::GET,
+            "/admin/model-host/status",
+            None,
+        )?;
+        if let Some(deployments) = live
+            .get("deployments")
+            .and_then(serde_json::Value::as_array)
+        {
+            for deployment in deployments {
+                if let Some(digest) = deployment
+                    .get("artifact_digest")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    protection.resident.insert(digest.to_string());
+                }
+            }
+        }
+    }
+
+    let root = model_cache_root(args.cache_dir.as_deref());
+    let manager = sbproxy_model_host::ArtifactManager::new(
+        root,
+        std::sync::Arc::new(sbproxy_model_host::UnavailableArtifactTransport),
+    )?;
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("build models remove runtime: {error}"))?;
+    let removed = executor.block_on(manager.remove(&artifact.artifact_digest, &protection))?;
+    let output = models_command_envelope(
+        "models.remove",
+        serde_json::json!({
+            "model": args.model,
+            "variant": artifact.variant_id,
+            "artifact_digest": removed.artifact_digest,
+            "removed": removed.removed,
+            "reclaimed_bytes": removed.reclaimed_bytes,
+            "job_id": removed.job_id,
+        }),
+    );
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output)?),
+        OutputFormat::Text => {
+            if output["removed"].as_bool() == Some(true) {
+                println!(
+                    "{}:{} removed ({} bytes reclaimed)",
+                    args.model,
+                    output["variant"].as_str().unwrap_or("-"),
+                    output["reclaimed_bytes"].as_u64().unwrap_or(0),
+                );
+            } else {
+                println!("{} is not cached", args.model);
             }
         }
     }
@@ -2092,7 +2759,13 @@ fn handle_models_list(args: &ModelsListArgs) -> anyhow::Result<i32> {
     let rows = build_model_rows(&catalog, &report, &root);
 
     match args.format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&models_command_envelope(
+                "models.list",
+                serde_json::json!({ "models": rows }),
+            ))?
+        ),
         OutputFormat::Text => {
             println!(
                 "{:<27} {:<13} {:<12} {:<11} {:<10} {:<18} {:<10} {:<12} STATUS",
@@ -2198,7 +2871,13 @@ fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
         cached: model_is_cached(&root, &args.id, entry),
     };
     match args.format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&detail)?),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&models_command_envelope(
+                "models.show",
+                serde_json::to_value(&detail)?,
+            ))?
+        ),
         OutputFormat::Text => {
             println!("{}", detail.id);
             println!("  catalog:      {}", detail.catalog_revision);
@@ -3189,34 +3868,57 @@ mod tests {
         }
     }
 
+    fn selected_models(selections: Vec<PullSelection>) -> Vec<String> {
+        selections
+            .into_iter()
+            .map(|selection| selection.model)
+            .collect()
+    }
+
     #[test]
     fn models_pull_defaults_to_boot_and_supports_explicit_or_all_selection() {
         let catalog = pull_catalog();
         assert_eq!(
-            selected_pull_models(&pull_args(), &catalog, None).unwrap(),
+            selected_models(selected_pull_models(&pull_args(), &catalog, None, None).unwrap()),
             ["boot"]
         );
 
         let mut explicit = pull_args();
         explicit.models = vec!["demand".to_string()];
         assert_eq!(
-            selected_pull_models(&explicit, &catalog, None).unwrap(),
+            selected_models(selected_pull_models(&explicit, &catalog, None, None).unwrap()),
             ["demand"]
         );
 
         let mut all = pull_args();
         all.all = true;
         assert_eq!(
-            selected_pull_models(&all, &catalog, None).unwrap(),
+            selected_models(selected_pull_models(&all, &catalog, None, None).unwrap()),
             ["boot", "demand"]
         );
 
         let configured: sbproxy_model_host::ModelHostConfig =
             serde_yaml::from_str("models:\n  - model: demand\n").unwrap();
         assert_eq!(
-            selected_pull_models(&pull_args(), &catalog, Some(&configured)).unwrap(),
+            selected_models(
+                selected_pull_models(&pull_args(), &catalog, Some(&configured), None).unwrap()
+            ),
             ["demand", "boot"]
         );
+
+        let canonical: sbproxy_config::ModelHostControlConfig = serde_yaml::from_str(
+            "deployments:\n  coder:\n    model: demand\n    variant: cpu\n    engine: llama_cpp\n",
+        )
+        .unwrap();
+        let selected = selected_pull_models(&pull_args(), &catalog, None, Some(&canonical))
+            .expect("canonical deployment selection");
+        assert_eq!(selected_models(selected.clone()), ["demand", "boot"]);
+        assert_eq!(selected[0].variant.as_deref(), Some("cpu"));
+        assert_eq!(
+            selected[0].engine,
+            sbproxy_model_host::EngineChoice::LlamaCpp
+        );
+        assert!(selected[0].configured);
     }
 
     #[test]
@@ -3224,7 +3926,7 @@ mod tests {
         let catalog = pull_catalog();
         let mut args = pull_args();
         args.variant = Some("cpu".to_string());
-        assert!(selected_pull_models(&args, &catalog, None)
+        assert!(selected_pull_models(&args, &catalog, None, None)
             .unwrap_err()
             .to_string()
             .contains("exactly one"));
@@ -3269,7 +3971,7 @@ mod tests {
         ));
         let catalog_filename = catalog_path.file_name().unwrap().to_string_lossy();
         let config_path = temp_config(&format!(
-            "origins:\n  ai.local:\n    action:\n      providers:\n        - name: local\n          serve:\n            catalog_file: {catalog_filename}\n            cache_dir: {}\n            cache_budget_gib: 0\n            models:\n              - model: offline\n                variant: demo\n                engine: llama_cpp\n                pinned: true\n",
+            "origins:\n  ai.local:\n    action:\n      type: ai_proxy\n      providers:\n        - name: local\n          serve:\n            catalog_file: {catalog_filename}\n            cache_dir: {}\n            cache_budget_gib: 0\n            models:\n              - model: offline\n                variant: demo\n                engine: llama_cpp\n                pinned: true\n",
             cache.display()
         ));
         let args = ModelsPullArgs {
@@ -3321,14 +4023,15 @@ mod tests {
     }
 
     #[test]
-    fn run_name_defaults_to_catalog_id_and_hf_ref_needs_name() {
+    fn run_name_defaults_to_catalog_id_and_rejects_raw_refs() {
         // A plain catalog id is its own name.
         assert_eq!(resolve_run_name("qwen3-14b", None).unwrap(), "qwen3-14b");
-        // A raw hf: ref without a name is an error.
+        // Raw references bypass the certified artifact contract and are
+        // rejected even when a client-facing alias is supplied.
         assert!(resolve_run_name("hf:Qwen/Qwen3-8B-GGUF:Q4_K_M", None).is_err());
-        // With a name it resolves to the name.
+        assert!(resolve_run_name("hf:Qwen/Qwen3-8B-GGUF:Q4_K_M", Some("coder")).is_err());
         assert_eq!(
-            resolve_run_name("hf:Qwen/Qwen3-8B-GGUF:Q4_K_M", Some("coder")).unwrap(),
+            resolve_run_name("qwen2.5-0.5b-instruct", Some("coder")).unwrap(),
             "coder"
         );
         // An empty name is rejected.
@@ -3336,43 +4039,33 @@ mod tests {
     }
 
     #[test]
-    fn run_serve_value_parses_into_a_valid_model_host_config() {
-        // The synthesized serve block must round-trip into a
-        // ModelHostConfig the runtime accepts, with the overrides applied.
+    fn run_prepares_canonical_warm_managed_config() {
         let args = RunArgs {
-            model: "hf:Qwen/Qwen3-8B-GGUF:Q4_K_M".to_string(),
+            model: "qwen2.5-0.5b-instruct".to_string(),
             name: Some("coder".to_string()),
             port: 8080,
-            engine: "llama_cpp".to_string(),
-            accel: "metal".to_string(),
+            engine: "auto".to_string(),
+            accel: "auto".to_string(),
             cache_dir: None,
-            gguf_file: Some("qwen3-8b-q4_k_m.gguf".to_string()),
+            variant: Some("q4_k_m".to_string()),
+            admin_port: Some(9091),
             dry_run: false,
         };
-        let value = build_run_serve_value(&args);
-        let cfg: sbproxy_model_host::ModelHostConfig =
-            serde_json::from_value(value).expect("serve config parses");
-        assert!(cfg.validate().is_ok());
-        assert_eq!(cfg.models.len(), 1);
-        assert_eq!(cfg.models[0].effective_name().unwrap(), "coder");
+        let prepared = prepare_run(&args).expect("prepare canonical run");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&prepared.yaml).unwrap();
+        assert_eq!(prepared.name, "coder");
+        assert_eq!(prepared.artifact.variant_id, "q4_k_m");
         assert_eq!(
-            cfg.models[0].engine,
-            sbproxy_model_host::EngineChoice::LlamaCpp
+            yaml["proxy"]["model_host"]["deployments"]["local"]["warm"],
+            true
         );
-        // The GGUF filename threads through to the serve entry (WOR-1808).
         assert_eq!(
-            cfg.models[0].gguf_file.as_deref(),
-            Some("qwen3-8b-q4_k_m.gguf")
+            yaml["origins"]["localhost"]["action"]["providers"][0]["provider_type"],
+            "managed_model"
         );
-        // accel override keyed under the llama_cpp engine's acquire block.
-        let prov = cfg
-            .engines
-            .get(&sbproxy_model_host::EngineKind::LlamaCpp)
-            .expect("llama_cpp engine provisioning");
-        assert_eq!(
-            prov.acquire.as_ref().unwrap().accel,
-            sbproxy_model_host::EngineAccel::Metal
-        );
+        assert_eq!(yaml["proxy"]["admin"]["port"], 9091);
+        assert_eq!(prepared.admin_password.len(), 64);
+        assert!(!prepared.yaml.contains("serve:"));
     }
 
     #[test]
@@ -3455,35 +4148,50 @@ mod tests {
     }
 
     #[test]
-    fn run_serve_value_defaults_vllm_to_uvx() {
-        // A plain catalog id (auto engine + accel) defaults vLLM to uvx
-        // acquisition, so a safetensors model serves on a GPU box with no
-        // manual install; no llama_cpp override is added.
-        let args = RunArgs {
-            model: "qwen3-14b".to_string(),
-            name: None,
-            port: 8080,
-            engine: "auto".to_string(),
-            accel: "auto".to_string(),
-            cache_dir: None,
-            gguf_file: None,
-            dry_run: false,
-        };
-        let cfg: sbproxy_model_host::ModelHostConfig =
-            serde_json::from_value(build_run_serve_value(&args)).unwrap();
-        assert_eq!(cfg.models[0].engine, sbproxy_model_host::EngineChoice::Auto);
-        let vllm = cfg
-            .engines
-            .get(&sbproxy_model_host::EngineKind::Vllm)
-            .expect("vllm provisioning");
-        assert_eq!(
-            vllm.acquire.as_ref().unwrap().source,
-            sbproxy_model_host::AcquireSource::Uvx
-        );
-        // No llama.cpp override when accel is auto.
-        assert!(!cfg
-            .engines
-            .contains_key(&sbproxy_model_host::EngineKind::LlamaCpp));
+    fn run_config_is_written_with_private_permissions() {
+        let root = std::env::temp_dir().join(format!(
+            "sbproxy-private-config-{}-{}",
+            std::process::id(),
+            random_local_password(),
+        ));
+        let path = root.join("sb.yml");
+        write_private_run_config(&path, b"proxy: {}\norigins: {}\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_run_directory_removes_credentials_when_the_handler_returns() {
+        let root = std::env::temp_dir().join(format!(
+            "sbproxy-private-run-dir-{}-{}",
+            std::process::id(),
+            random_local_password(),
+        ));
+        let run_dir = PrivateRunDirectory { path: root.clone() };
+        let config = run_dir.config_path();
+        write_private_run_config(&config, b"admin_password: fixture-secret\n").unwrap();
+        assert!(config.exists());
+
+        drop(run_dir);
+
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn run_ready_banner_contains_copyable_sdk_and_admin_settings() {
+        let banner = run_ready_banner("coder", 8080, "http://127.0.0.1:9090", "fixture-secret");
+        assert!(banner.contains("OPENAI_BASE_URL=http://127.0.0.1:8080/v1"));
+        assert!(banner.contains("OPENAI_API_KEY=local"));
+        assert!(banner.contains("Admin: http://127.0.0.1:9090"));
+        assert!(banner.contains("Admin password: fixture-secret"));
+        assert!(banner.contains("\"model\":\"coder\""));
     }
 
     #[test]
@@ -4050,6 +4758,45 @@ mod tests {
     #[test]
     fn validate_bad_config_text_errors_json_exits_two() {
         let path = temp_config("this is not: [valid yaml");
+        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_rejects_model_host_semantics_that_boot_rejects() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  model_host:\n    max_parallel_prepares: 0\norigins:\n  x.local:\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: ok\n",
+        );
+        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_rejects_multi_replica_single_node_deployments() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  model_host:\n    deployments:\n      coder:\n        model: qwen2.5-0.5b-instruct\n        variant: q4_k_m\n        replicas: 2\norigins:\n  x.local:\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: ok\n",
+        );
+        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_legacy_managed_fields() {
+        let path = temp_config(
+            "origins:\n  ai.local:\n    action:\n      type: ai_proxy\n      providers:\n        - name: local\n          serve:\n            models:\n              - model: qwen3-14b\n                speculative: {}\n",
+        );
         assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
         assert_eq!(
             handle_validate_subcommand(&validate_args(&path, true)).unwrap(),

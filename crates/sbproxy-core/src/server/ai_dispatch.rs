@@ -2393,6 +2393,10 @@ pub(super) async fn handle_ai_proxy(
     // request to the right provider without re-deriving from
     // `provider_idx`.
     let mut last_provider_name: String = String::new();
+    let has_managed_local = provider_order.iter().any(|&index| {
+        let provider = &config.providers[index];
+        provider.serve.is_some() || provider.is_managed_model()
+    });
 
     // --- Cascade routing ---
     //
@@ -2407,7 +2411,10 @@ pub(super) async fn handle_ai_proxy(
     // skipping `relay_ai_response_with_cache` also means cascade
     // does not engage the semantic cache write or idempotency
     // capture in v1, which is documented in the example README.
-    if let Some(cascade_cfg) = router.cascade_config().filter(|_| !disallow_training) {
+    if let Some(cascade_cfg) = router
+        .cascade_config()
+        .filter(|_| !disallow_training && !has_managed_local)
+    {
         if !is_stream {
             let outcome = AI_CLIENT
                 .load()
@@ -2470,6 +2477,12 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
+    if !is_stream && has_managed_local && router.cascade_config().is_some() {
+        warn!(
+            "AI proxy: confidence cascade includes a managed local provider; using the normal \
+             failover path so local admission and engine lifecycle remain governed"
+        );
+    }
 
     // --- Hedged / raced dispatch (WOR-1545) ---
     //
@@ -2480,7 +2493,8 @@ pub(super) async fn handle_ai_proxy(
     // through to the sequential path below (mid-stream racing is out of
     // scope); the operator opted into the extra calls, so a raced request
     // does not also run the sequential failover loop afterward.
-    let race_mode = router.is_race() && !is_stream && provider_order.len() >= 2;
+    let race_mode =
+        router.is_race() && !is_stream && provider_order.len() >= 2 && !has_managed_local;
     if race_mode {
         use futures::stream::{FuturesUnordered, StreamExt as _};
         let client = AI_CLIENT.load();
@@ -2586,72 +2600,42 @@ pub(super) async fn handle_ai_proxy(
         if attempt >= max_attempts {
             break;
         }
-        // WOR-1680: a provider with a serve: block hosts its model on
-        // this box. Resolve its live loopback engine port and route
-        // there instead of a base_url (which a served provider does not
-        // carry). Bring the engine to ready on demand. If it cannot be
-        // brought up, treat this like a failed attempt and fail over to
-        // the next provider (a lone served provider that fails then
-        // yields the "no provider succeeded" 502 after the loop).
-        // A failed prior served attempt may still hold a lane slot;
-        // release it before this attempt queues or dispatches.
-        ctx.serve_lane_permit = None;
+        // A failed prior managed attempt may still hold deployment capacity.
+        // Release it before this attempt queues or dispatches.
+        ctx.managed_model_permit = None;
         let mut resolved_provider = config.providers[provider_idx].clone();
-        if resolved_provider.serve.is_some() {
-            // WOR-1679: served-lane admission. When the serve block caps
-            // concurrency, take a slot before touching the engine. The
-            // queue is priority-ordered by the key's lane; an interactive
-            // request that would have to queue spills to a later hosted
-            // provider in the same array instead (if one exists), and a
-            // queue-timeout fails over like any other failed attempt.
-            if let Some(gate) = crate::server::model_host::serve_lane_gate(config) {
-                let class = crate::server::model_host::lane_class_for(ctx.ai_lane_priority);
-                let has_fallback = provider_order
-                    .iter()
-                    .enumerate()
-                    .skip(attempt + 1)
-                    .take_while(|(j, _)| *j < max_attempts)
-                    .any(|(_, &idx)| config.providers[idx].serve.is_none());
-                match gate.acquire(class, has_fallback).await {
-                    crate::server::model_host::LaneAdmission::Admitted(permit) => {
-                        ctx.serve_lane_permit = Some(permit);
-                    }
-                    crate::server::model_host::LaneAdmission::Spill => {
-                        warn!(
-                            provider = %resolved_provider.name,
-                            attempt = %attempt,
-                            "AI proxy: served lane saturated, spilling interactive \
-                             request to the next provider"
-                        );
-                        continue;
-                    }
-                    crate::server::model_host::LaneAdmission::TimedOut => {
-                        sbproxy_observe::metrics::record_provider_attempt(
-                            &resolved_provider.name,
-                            "error",
-                        );
-                        warn!(
-                            provider = %resolved_provider.name,
-                            attempt = %attempt,
-                            "AI proxy: served lane queue timeout, failing over"
-                        );
-                        continue;
-                    }
-                }
-            }
+        let mut local_public_model = None;
+        let mut local_engine_model = None;
+        if resolved_provider.serve.is_some() || resolved_provider.is_managed_model() {
             let requested = (!model.is_empty()).then_some(model.as_str());
-            match crate::server::model_host::served_upstream(config, &resolved_provider, requested)
-                .await
+            let origin = ctx
+                .origin_idx
+                .and_then(|index| ctx.pipeline.config.origins.get(index))
+                .map(|origin| origin.origin_id.to_string())
+                .unwrap_or_else(|| ctx.hostname.to_string());
+            let priority = crate::server::model_host::lane_class_for(ctx.ai_lane_priority);
+            match crate::server::model_host::managed_upstream(
+                &origin,
+                &resolved_provider,
+                requested,
+                priority,
+            )
+            .await
             {
-                Ok(Some(url)) => resolved_provider.base_url = Some(url),
+                Ok(Some(upstream)) => {
+                    resolved_provider.base_url = Some(upstream.base_url);
+                    local_public_model = Some(upstream.public_model);
+                    local_engine_model = Some(upstream.engine_model);
+                    ctx.managed_model_permit = Some(upstream.permit);
+                }
                 Ok(None) => {}
                 Err(e) => {
                     sbproxy_observe::metrics::record_provider_attempt(
                         &resolved_provider.name,
                         "error",
                     );
-                    // Give the slot back before failing over.
-                    ctx.serve_lane_permit = None;
+                    // Give deployment capacity back before failing over.
+                    ctx.managed_model_permit = None;
                     warn!(
                         provider = %resolved_provider.name,
                         attempt = %attempt,
@@ -2677,6 +2661,9 @@ pub(super) async fn handle_ai_proxy(
         } else {
             String::new()
         };
+        if let Some(engine_model) = local_engine_model.as_deref() {
+            rewrite_managed_request_model(&mut attempt_body, engine_model);
+        }
 
         // Stamp the resolved provider + model on the context so the
         // access log captures them even when the upstream errors out
@@ -2686,13 +2673,12 @@ pub(super) async fn handle_ai_proxy(
         if !resolved_model.is_empty() {
             ctx.ai_model = Some(resolved_model.clone());
         }
-        // WOR-1809: mark served-provider attempts so the response
+        // Mark managed local-provider attempts so the response
         // handler can rewrite the engine's `model` field (a local
         // engine reports its weights file path there) back to the
-        // serve-entry name the client asked for. Reset per attempt so
+        // public name the client asked for. Reset per attempt so
         // a failover to a hosted lane clears it.
-        ctx.ai_serve_model = (provider.serve.is_some() && !resolved_model.is_empty())
-            .then(|| resolved_model.clone());
+        ctx.ai_serve_model = local_public_model;
         ai_span.record("gen_ai.system", provider.name.as_str());
         ai_span.record("llm.provider", provider.name.as_str());
         if !resolved_model.is_empty() {
@@ -5405,11 +5391,17 @@ fn prepend_system_message(body: &mut serde_json::Value, text: &str) {
     }
 }
 
-/// WOR-1534: restrict the routing set to providers that declare the requested
-/// model. A provider with an empty `models` list is a wildcard and stays
-/// eligible. Returns `None` (leave the order unchanged) when the model is
-/// empty, when no provider declares it (so unenumerated models still pass
-/// straight through), or when the filter would not exclude any provider.
+/// Rewrite a managed local request to the exact name accepted by its engine.
+/// The public alias is retained separately for logs and response rewriting.
+fn rewrite_managed_request_model(body: &mut serde_json::Value, engine_model: &str) {
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(engine_model.to_string()),
+        );
+    }
+}
+
 /// Rewrite the top-level `model` field of an OpenAI-shaped JSON body to
 /// `model`. A served (local) engine reports its weights file path there
 /// (e.g. `/var/lib/sbproxy/models/.../Qwen3-14B-Q4_K_M.gguf`), which is
@@ -6155,7 +6147,14 @@ mod dynamic_key_resolution_tests {
 
 #[cfg(test)]
 mod served_model_rewrite_tests {
-    use super::rewrite_response_model;
+    use super::{rewrite_managed_request_model, rewrite_response_model};
+
+    #[test]
+    fn rewrites_public_model_to_the_engine_served_deployment() {
+        let mut body = serde_json::json!({"model": "alias", "messages": []});
+        rewrite_managed_request_model(&mut body, "local");
+        assert_eq!(body["model"], "local");
+    }
 
     #[test]
     fn rewrites_weights_path_to_serve_name() {

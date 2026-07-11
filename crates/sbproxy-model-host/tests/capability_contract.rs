@@ -36,6 +36,43 @@ fn registry_covers_every_domain_and_validates() {
 }
 
 #[test]
+fn local_runtime_capabilities_match_the_pr2_support_boundary() {
+    let registry = capability_registry();
+    let status = |id: &str| {
+        registry
+            .entries()
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap_or_else(|| panic!("missing capability {id}"))
+            .status
+    };
+
+    for id in [
+        "manifest.canonical_desired_state",
+        "artifact.exact_removal",
+        "engine.typed_managed_drivers",
+        "lifecycle.atomic_reconciliation",
+        "lifecycle.keep_alive",
+        "lifecycle.priority_admission",
+        "lifecycle.model_cli",
+        "admin.model_status",
+        "platform.apple_metal",
+    ] {
+        assert_eq!(status(id), SupportLevel::Stable, "{id}");
+    }
+    for id in [
+        "engine.vllm_uv",
+        "engine.vllm_container",
+        "platform.nvidia_cuda",
+    ] {
+        assert_eq!(status(id), SupportLevel::Preview, "{id}");
+    }
+    for id in ["cluster.managed_replicas", "admin.model_management"] {
+        assert_eq!(status(id), SupportLevel::Unsupported, "{id}");
+    }
+}
+
+#[test]
 fn every_stable_claim_has_executable_evidence() {
     let registry = capability_registry();
 
@@ -109,9 +146,9 @@ models:
     assert!(findings.iter().any(|finding| {
         finding.path == "serve.engines" && finding.status == SupportLevel::Preview
     }));
-    assert!(findings.iter().any(|finding| {
-        finding.path == "serve.models[].keep_alive" && finding.status == SupportLevel::Preview
-    }));
+    assert!(!findings
+        .iter()
+        .any(|finding| finding.path == "serve.models[].keep_alive"));
     assert!(findings
         .iter()
         .all(|finding| finding.message.contains(finding.status.as_str())));
@@ -143,7 +180,7 @@ fn markdown_is_deterministic_and_exposes_all_support_levels() {
     let second = capability_registry().render_markdown();
 
     assert_eq!(first, second);
-    assert!(first.starts_with("# Model-host capability matrix\n*Last modified: 2026-07-10*\n"));
+    assert!(first.starts_with("# Model-host capability matrix\n*Last modified: 2026-07-11*\n"));
     assert!(first.contains("Registry version: `1`"));
     for status in ["stable", "preview", "config_only", "unsupported"] {
         assert!(first.contains(&format!("`{status}`")), "missing {status}");

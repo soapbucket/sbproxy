@@ -18,7 +18,7 @@ use tokio::io::AsyncWriteExt;
 
 pub use cache::{ArtifactCacheMetadata, ArtifactCacheState, ReadyArtifact};
 pub(crate) use gc::explicit_protection_reason;
-pub use gc::{CacheProtection, GcReport};
+pub use gc::{CacheProtection, GcReport, RemoveArtifactReport};
 #[cfg(feature = "weights")]
 pub use http::HttpArtifactTransport;
 pub use http::{
@@ -32,8 +32,21 @@ use crate::{
 };
 use cache::{
     hash_file, validate_digest, validate_relative_path, validate_resolved_artifact, ArtifactCache,
-    CacheLookup, LegacyArtifactMetadata,
+    ArtifactLeaseGuard, CacheLookup, LegacyArtifactMetadata,
 };
+
+/// Cross-process shared lease held while a digest is configured or resident.
+pub struct ArtifactLease {
+    _guard: ArtifactLeaseGuard,
+}
+
+impl std::fmt::Debug for ArtifactLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArtifactLease")
+            .finish_non_exhaustive()
+    }
+}
 
 /// Why an artifact could not become verified ready state.
 #[derive(Debug, thiserror::Error)]
@@ -145,6 +158,15 @@ pub enum ArtifactError {
     /// Blocking cache task panicked or was cancelled.
     #[error("artifact cache task failed: {0}")]
     Join(String),
+    /// Exact removal was blocked by a configured, resident, pinned, busy, or
+    /// nonterminal reference.
+    #[error("artifact '{digest}' cannot be removed: {reason}")]
+    RemovalBlocked {
+        /// Canonical artifact digest.
+        digest: String,
+        /// Stable bounded protection reason.
+        reason: String,
+    },
 }
 
 impl ArtifactError {
@@ -249,6 +271,13 @@ impl ArtifactManager {
     /// for the selected digest.
     pub fn cached_artifacts(&self) -> Result<Vec<ArtifactCacheMetadata>, ArtifactError> {
         self.cache.metadata_entries()
+    }
+
+    /// Hold one digest against collection or exact removal across processes.
+    pub fn lease(&self, artifact_digest: &str) -> Result<ArtifactLease, ArtifactError> {
+        self.cache
+            .lock_shared_lease(artifact_digest)
+            .map(|guard| ArtifactLease { _guard: guard })
     }
 
     /// Return verified local bytes, downloading and finalizing atomically on a miss.

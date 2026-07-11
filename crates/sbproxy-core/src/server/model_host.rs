@@ -1,68 +1,154 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Process-global local model host (WOR-1680).
+//! Process-global managed local model runtime (WOR-1680, WOR-1841).
 //!
 //! When any `ai_proxy` provider carries a `serve:` block, the gateway
 //! itself hosts those models: it spawns and supervises an inference
 //! engine and routes requests to its loopback port. The
-//! [`ModelHostRuntime`] that does this owns child processes and VRAM
-//! residency, so it must be built once and survive hot config reloads
-//! (rebuilding it would kill and respawn a resident model on every
-//! config touch). It lives here as a lazily-initialized global,
-//! mirroring the `AI_CLIENT` global.
+//! [`ProductionModelRuntime`] owns the permanent process-wide handle.
+//! Complete desired revisions prepare before publication, so an invalid
+//! reload preserves both the prior pipeline and the prior resident engines.
 //!
-//! [`served_upstream`] is the request-path entry point: given the AI
-//! config, the selected provider, and the requested model, it resolves
-//! a served provider to its live loopback base URL (bringing the engine
-//! to ready on demand), or returns `Ok(None)` for a normal proxied
-//! provider so the caller keeps its `base_url`.
+//! [`managed_upstream`] is the request-path entry point for canonical
+//! `managed_model` providers and compatibility `serve:` blocks.
 //!
 //! The GPU probe is feature-selected: with `gpu-nvidia` it is the real
 //! NVML probe; without it a zero-GPU probe, so on a CPU-only build a
 //! `serve:` provider fails admission with a clear residency error
 //! rather than pretending to serve.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use sbproxy_ai::local_host::{resolve_served_base_url, LocalModelHost};
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use sbproxy_ai::local_host::pick_local_model_name;
 use sbproxy_ai::AiHandlerConfig;
 use sbproxy_model_host::{
     ArtifactManager, ArtifactTransport, Catalog, ConfigDirMetadataProvider, GpuProbe,
-    ModelHostConfig, ModelHostRuntime, ProcessEngineLauncher,
+    ModelHostConfig,
 };
 
-/// Built once from the first config that declares any `serve:` block;
-/// `None` when no provider serves locally. Survives hot reload so a
-/// resident engine is not killed on an unrelated config change.
-static MODEL_HOST: OnceLock<Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>>> = OnceLock::new();
-
-/// Directory containing the active `sb.yml`, used to resolve a relative
-/// `serve.catalog_file`. Reload updates this before a runtime is first
-/// constructed; the process-global runtime keeps its original immutable
-/// catalog for the lifetime of its resident engines.
-static MODEL_HOST_CONFIG_DIR: OnceLock<RwLock<PathBuf>> = OnceLock::new();
-
-pub(crate) fn set_model_host_config_path(config_path: &Path) {
-    let directory = config_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let lock = MODEL_HOST_CONFIG_DIR.get_or_init(|| RwLock::new(directory.clone()));
-    *lock.write().expect("model-host config directory lock") = directory;
+/// Permanent process-wide managed-model runtime adapter.
+///
+/// The outer handle never changes, including when the process starts with an
+/// empty config. Its active worker-local manager may be replaced only when an
+/// immutable runtime foundation, such as the catalog revision or cache root,
+/// changes. Ordinary desired-state reloads reconcile in place and preserve
+/// unaffected engine generations.
+pub struct ProductionModelRuntime {
+    active: ArcSwap<sbproxy_model_host::ModelRuntimeManager>,
+    foundation: RwLock<Option<RuntimeFoundation>>,
+    epoch: AtomicU64,
+    commit_lock: tokio::sync::Mutex<()>,
 }
 
-fn model_host_config_dir() -> PathBuf {
-    MODEL_HOST_CONFIG_DIR
-        .get()
-        .and_then(|lock| lock.read().ok().map(|directory| directory.clone()))
-        .unwrap_or_else(|| PathBuf::from("."))
+impl std::fmt::Debug for ProductionModelRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProductionModelRuntime")
+            .field("epoch", &self.epoch.load(Ordering::SeqCst))
+            .field(
+                "foundation",
+                &self
+                    .foundation
+                    .read()
+                    .expect("model runtime foundation lock")
+                    .clone(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
-fn load_catalog(config: &ModelHostConfig) -> Result<Arc<Catalog>, String> {
-    load_catalog_from_dir(config, &model_host_config_dir())
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeFoundation {
+    catalog_revision: String,
+    cache_root: PathBuf,
 }
+
+/// A complete model-runtime candidate prepared without changing live routes.
+pub struct PreparedModelRuntime {
+    owner: Arc<ProductionModelRuntime>,
+    manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
+    prepared: sbproxy_model_host::PreparedRevision,
+    base_epoch: u64,
+    foundation: Option<RuntimeFoundation>,
+    replace_manager: bool,
+}
+
+impl std::fmt::Debug for PreparedModelRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedModelRuntime")
+            .field("prepared", &self.prepared)
+            .field("base_epoch", &self.base_epoch)
+            .field("foundation", &self.foundation)
+            .field("replace_manager", &self.replace_manager)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Admission permit bound to the exact manager revision that resolved a route.
+///
+/// Keeping this value in the request context holds deployment capacity through
+/// the complete response stream. Dropping it releases capacity.
+pub struct ManagedModelPermit {
+    manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
+    deployment: String,
+    admission: sbproxy_model_host::DeploymentAdmissionPermit,
+}
+
+impl std::fmt::Debug for ManagedModelPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedModelPermit")
+            .field("deployment", &self.deployment)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedModelPermit {
+    /// Canonical deployment held by this request.
+    pub fn deployment(&self) -> &str {
+        &self.deployment
+    }
+
+    async fn ensure_ready(
+        &self,
+        priority: sbproxy_model_host::PriorityClass,
+    ) -> Result<sbproxy_model_host::RunningEngine, sbproxy_model_host::RuntimeManagerError> {
+        self.manager
+            .ensure_ready_for_generation(
+                &self.deployment,
+                self.admission.generation(),
+                self.admission.start_epoch(),
+                priority,
+            )
+            .await
+    }
+}
+
+struct EmptyDeploymentPreparer;
+
+#[async_trait]
+impl sbproxy_model_host::DeploymentPreparer for EmptyDeploymentPreparer {
+    async fn prepare(
+        &self,
+        _request: sbproxy_model_host::DeploymentPrepareRequest,
+    ) -> Result<
+        Arc<dyn sbproxy_model_host::PreparedDeploymentRuntime>,
+        sbproxy_model_host::RuntimeManagerError,
+    > {
+        Err(sbproxy_model_host::RuntimeManagerError::Prepare(
+            "empty model runtime cannot prepare a deployment".to_string(),
+        ))
+    }
+}
+
+static MODEL_RUNTIME: OnceLock<Arc<ProductionModelRuntime>> = OnceLock::new();
 
 fn load_catalog_from_dir(
     config: &ModelHostConfig,
@@ -119,12 +205,20 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     fn set_resident_models(&self, count: i64) {
         sbproxy_observe::metrics::set_model_host_resident_models(count);
     }
-    fn set_gpu_stats(&self, device: &str, total_bytes: u64, free_bytes: u64, utilization: f64) {
+    fn set_gpu_stats(
+        &self,
+        device: &str,
+        total_bytes: u64,
+        free_bytes: u64,
+        compute_utilization: Option<f64>,
+        memory_occupancy: Option<f64>,
+    ) {
         sbproxy_observe::metrics::set_model_host_gpu_stats(
             device,
-            total_bytes as i64,
-            free_bytes as i64,
-            utilization,
+            i64::try_from(total_bytes).unwrap_or(i64::MAX),
+            i64::try_from(free_bytes).unwrap_or(i64::MAX),
+            compute_utilization,
+            memory_occupancy,
         );
     }
     fn on_adapter_loaded(&self, _base: &str, _adapter: &str) {
@@ -141,6 +235,43 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     }
     fn on_weight_download(&self, _model: &str, bytes: u64, secs: f64, ok: bool) {
         sbproxy_observe::metrics::record_model_host_weight_download(bytes, secs, ok);
+    }
+    fn set_deployment_requests(&self, deployment: &str, active: usize, queued: usize) {
+        sbproxy_observe::metrics::set_model_host_deployment_requests(
+            deployment,
+            i64::try_from(active).unwrap_or(i64::MAX),
+            i64::try_from(queued).unwrap_or(i64::MAX),
+        );
+    }
+    fn set_deployment_state(
+        &self,
+        deployment: &str,
+        engine: Option<sbproxy_model_host::EngineKind>,
+        state: sbproxy_model_host::DeploymentRuntimeState,
+    ) {
+        let engine = match engine {
+            Some(sbproxy_model_host::EngineKind::Vllm) => "vllm",
+            Some(sbproxy_model_host::EngineKind::LlamaCpp) => "llama_cpp",
+            Some(sbproxy_model_host::EngineKind::Embedded) => "embedded",
+            None => "unknown",
+        };
+        sbproxy_observe::metrics::set_model_host_deployment_state(
+            deployment,
+            engine,
+            state.as_str(),
+        );
+    }
+    fn on_admission_rejected(
+        &self,
+        deployment: &str,
+        priority: sbproxy_model_host::PriorityClass,
+        reason: sbproxy_model_host::AdmissionReason,
+    ) {
+        sbproxy_observe::metrics::record_model_host_admission_rejection(
+            deployment,
+            priority.as_str(),
+            reason.as_str(),
+        );
     }
 }
 
@@ -174,6 +305,453 @@ pub(crate) fn make_probe() -> Arc<dyn GpuProbe> {
     // budget. Reports no device (so admission still rejects) when RAM
     // cannot be read or the operator set the fraction to 0.
     Arc::new(sbproxy_model_host::CpuProbe::from_system())
+}
+
+fn build_model_maintenance_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+impl ProductionModelRuntime {
+    fn empty() -> Result<Self, sbproxy_model_host::RuntimeManagerError> {
+        let catalog = Catalog::builtin();
+        let manager = sbproxy_model_host::ModelRuntimeManager::new(
+            catalog.catalog_revision,
+            Arc::new(EmptyDeploymentPreparer),
+        )?
+        .with_observer(Arc::new(MetricsObserver));
+        Ok(Self {
+            active: ArcSwap::from_pointee(manager),
+            foundation: RwLock::new(None),
+            epoch: AtomicU64::new(0),
+            commit_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    fn active_manager(&self) -> Arc<sbproxy_model_host::ModelRuntimeManager> {
+        self.active.load_full()
+    }
+
+    fn start_maintenance(runtime: &Arc<Self>) {
+        let weak = Arc::downgrade(runtime);
+        if let Err(error) = std::thread::Builder::new()
+            .name("sbproxy-model-maintenance".to_string())
+            .spawn(move || {
+                let executor = match build_model_maintenance_runtime() {
+                    Ok(executor) => executor,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to build model maintenance runtime");
+                        return;
+                    }
+                };
+                executor.block_on(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                    loop {
+                        interval.tick().await;
+                        let Some(runtime) = weak.upgrade() else {
+                            break;
+                        };
+                        let stopped = runtime
+                            .active_manager()
+                            .maintenance_tick(tokio::time::Instant::now())
+                            .await;
+                        for deployment in stopped {
+                            tracing::info!(%deployment, "managed model keep-alive elapsed");
+                        }
+                    }
+                });
+            })
+        {
+            tracing::error!(%error, "failed to spawn model maintenance thread");
+        }
+    }
+
+    /// Current process-local desired-state revision.
+    pub fn current_revision(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Current atomic managed-model desired state.
+    pub fn current_desired(&self) -> Arc<sbproxy_model_host::RuntimeDesiredState> {
+        self.active_manager().current_desired()
+    }
+
+    /// Snapshot every configured deployment in deterministic ID order.
+    pub async fn statuses(&self) -> Vec<sbproxy_model_host::DeploymentRuntimeStatus> {
+        self.active_manager().statuses().await
+    }
+
+    /// Snapshot one configured deployment.
+    pub async fn status(
+        &self,
+        deployment: &str,
+    ) -> Option<sbproxy_model_host::DeploymentRuntimeStatus> {
+        self.active_manager().status(deployment).await
+    }
+
+    /// Bring one configured deployment to ready.
+    pub async fn ensure_ready(
+        &self,
+        deployment: &str,
+    ) -> Result<sbproxy_model_host::RunningEngine, sbproxy_model_host::RuntimeManagerError> {
+        self.active_manager().ensure_ready(deployment).await
+    }
+
+    /// Acquire request capacity from the current deployment generation.
+    pub async fn admit_request(
+        &self,
+        deployment: &str,
+        priority: sbproxy_model_host::PriorityClass,
+    ) -> Result<ManagedModelPermit, sbproxy_model_host::AdmissionRejection> {
+        let manager = self.active_manager();
+        let admission = manager.admit(deployment, priority).await?;
+        Ok(ManagedModelPermit {
+            manager,
+            deployment: deployment.to_string(),
+            admission,
+        })
+    }
+
+    /// Drain and stop one configured deployment within its configured deadline.
+    pub async fn drain(
+        &self,
+        deployment: &str,
+    ) -> Result<sbproxy_model_host::DrainReport, sbproxy_model_host::RuntimeManagerError> {
+        self.active_manager().drain(deployment).await
+    }
+
+    /// Clear retained crash-loop state for one configured deployment.
+    pub async fn reset(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<sbproxy_model_host::OperationJob>, sbproxy_model_host::RuntimeManagerError>
+    {
+        self.active_manager().reset(deployment).await
+    }
+
+    /// Drain and stop every configured deployment before process exit.
+    pub async fn shutdown(&self) -> BTreeMap<String, String> {
+        let manager = self.active_manager();
+        let deployments = manager
+            .statuses()
+            .await
+            .into_iter()
+            .map(|status| status.deployment)
+            .collect::<Vec<_>>();
+        let mut failures = BTreeMap::new();
+        for deployment in deployments {
+            match manager.drain(&deployment).await {
+                Ok(report) if report.timed_out => {
+                    failures.insert(
+                        deployment,
+                        format!(
+                            "drain deadline elapsed with {} active requests",
+                            report.remaining_active
+                        ),
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    failures.insert(deployment, error.to_string());
+                }
+            }
+        }
+        failures
+    }
+
+    async fn prepare(
+        self: &Arc<Self>,
+        pipeline: &crate::pipeline::CompiledPipeline,
+        config_dir: &Path,
+    ) -> anyhow::Result<PreparedModelRuntime> {
+        let candidate = compile_runtime_candidate(pipeline, config_dir)?;
+        self.prepare_candidate(candidate).await
+    }
+
+    async fn prepare_candidate(
+        self: &Arc<Self>,
+        candidate: RuntimeCandidate,
+    ) -> anyhow::Result<PreparedModelRuntime> {
+        let base_epoch = self.epoch.load(Ordering::SeqCst);
+        let current_foundation = self
+            .foundation
+            .read()
+            .expect("model runtime foundation lock")
+            .clone();
+        let active_manager = self.active_manager();
+
+        let needs_production_manager = !candidate.desired.deployments.is_empty()
+            || candidate.desired.control.authority
+                == sbproxy_config::ModelHostAuthority::AdminManaged;
+        let (manager, foundation) = if !needs_production_manager {
+            (active_manager.clone(), current_foundation)
+        } else {
+            let foundation = RuntimeFoundation {
+                catalog_revision: candidate.catalog.catalog_revision.clone(),
+                cache_root: candidate.cache_root.clone(),
+            };
+            if current_foundation.as_ref() == Some(&foundation) {
+                (active_manager.clone(), Some(foundation))
+            } else {
+                if !active_manager.current_desired().deployments.is_empty() {
+                    anyhow::bail!(
+                        "model runtime catalog or cache foundation changed while deployments are configured; reload an empty model_host revision first so the prior engines drain before replacing the foundation"
+                    );
+                }
+                (
+                    build_production_manager(
+                        candidate.catalog.clone(),
+                        candidate.cache_root.clone(),
+                    )?,
+                    Some(foundation),
+                )
+            }
+        };
+        let replace_manager = !Arc::ptr_eq(&manager, &active_manager);
+        let prepared = manager.prepare_revision(candidate.desired).await?;
+        Ok(PreparedModelRuntime {
+            owner: Arc::clone(self),
+            manager,
+            prepared,
+            base_epoch,
+            foundation,
+            replace_manager,
+        })
+    }
+
+    async fn commit(
+        &self,
+        candidate: PreparedModelRuntime,
+    ) -> Result<sbproxy_model_host::ReconcileReport, sbproxy_model_host::RuntimeManagerError> {
+        let _guard = self.commit_lock.lock().await;
+        let current_epoch = self.epoch.load(Ordering::SeqCst);
+        if candidate.base_epoch != current_epoch {
+            candidate.manager.abort_prepared(candidate.prepared).await;
+            return Err(sbproxy_model_host::RuntimeManagerError::StalePrepared {
+                based_on: candidate.base_epoch,
+                current: current_epoch,
+            });
+        }
+        let next_epoch = current_epoch
+            .checked_add(1)
+            .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
+        let report = candidate
+            .manager
+            .commit_revision(candidate.prepared)
+            .await?;
+        if candidate.replace_manager {
+            self.active.store(candidate.manager);
+        }
+        *self
+            .foundation
+            .write()
+            .expect("model runtime foundation lock") = candidate.foundation;
+        self.epoch.store(next_epoch, Ordering::SeqCst);
+        Ok(report)
+    }
+}
+
+struct RuntimeCandidate {
+    desired: sbproxy_model_host::RuntimeDesiredState,
+    catalog: Arc<Catalog>,
+    cache_root: PathBuf,
+}
+
+fn compile_runtime_candidate(
+    pipeline: &crate::pipeline::CompiledPipeline,
+    config_dir: &Path,
+) -> anyhow::Result<RuntimeCandidate> {
+    let mut managed_providers = Vec::new();
+    let mut legacy_providers = Vec::new();
+    for (origin, action) in pipeline.config.origins.iter().zip(&pipeline.actions) {
+        let sbproxy_modules::Action::AiProxy(ai) = action else {
+            continue;
+        };
+        for provider in &ai.config.providers {
+            if provider.is_managed_model() {
+                managed_providers.push(sbproxy_model_host::ManagedProviderInput {
+                    origin: origin.origin_id.to_string(),
+                    provider: provider.name.as_str().to_string(),
+                    deployment: provider
+                        .deployment
+                        .clone()
+                        .expect("managed provider shape validated during action compilation"),
+                    models: provider
+                        .models
+                        .iter()
+                        .map(|model| model.as_str().to_string())
+                        .collect(),
+                });
+            }
+            if let Some(config) = &provider.serve {
+                legacy_providers.push(sbproxy_model_host::LegacyServeInput {
+                    origin: origin.origin_id.to_string(),
+                    provider: provider.name.as_str().to_string(),
+                    config: config.clone(),
+                });
+            }
+        }
+    }
+
+    let catalog = match legacy_providers.first() {
+        Some(legacy) => {
+            load_catalog_from_dir(&legacy.config, config_dir).map_err(anyhow::Error::msg)?
+        }
+        None => Arc::new(Catalog::builtin()),
+    };
+    let desired = sbproxy_model_host::compile_desired_state(
+        sbproxy_model_host::RuntimeDesiredInput {
+            source_revision: pipeline.config_revision.clone(),
+            canonical: pipeline.config.server.model_host.clone(),
+            managed_providers,
+            legacy_providers,
+        },
+        &catalog,
+    )?;
+    let configured_cache = desired.control.cache.directory.as_deref().or_else(|| {
+        desired
+            .legacy_host_policy
+            .as_ref()
+            .and_then(|policy| policy.cache_dir.as_deref())
+    });
+    let cache_root = sbproxy_model_host::resolve_cache_dir_default(configured_cache);
+    Ok(RuntimeCandidate {
+        desired,
+        catalog,
+        cache_root,
+    })
+}
+
+/// Run the side-effect-free managed-model checks shared by validate and boot.
+pub fn validate_model_runtime(
+    pipeline: &crate::pipeline::CompiledPipeline,
+    config_dir: &Path,
+) -> anyhow::Result<()> {
+    compile_runtime_candidate(pipeline, config_dir).map(|_| ())
+}
+
+fn build_production_manager(
+    catalog: Arc<Catalog>,
+    cache_root: PathBuf,
+) -> anyhow::Result<Arc<sbproxy_model_host::ModelRuntimeManager>> {
+    let transport = artifact_transport().map_err(anyhow::Error::msg)?;
+    let artifacts = Arc::new(
+        ArtifactManager::new(cache_root.clone(), transport)
+            .map_err(|error| anyhow::anyhow!("open model artifact cache: {error}"))?,
+    );
+    let metadata = Arc::new(ConfigDirMetadataProvider {
+        cache_root,
+        revision: "main".to_string(),
+        catalog: Arc::clone(&catalog),
+    });
+    let probe = make_probe();
+    let descriptors = probe.probe();
+    let capacities = if descriptors.is_empty() {
+        BTreeMap::from([(0, 0)])
+    } else {
+        descriptors
+            .iter()
+            .map(|device| (device.index, device.free_vram_bytes))
+            .collect()
+    };
+    let preparer = Arc::new(sbproxy_model_host::ProductionDeploymentPreparer::new(
+        Arc::clone(&catalog),
+        artifacts,
+        probe,
+        metadata,
+        sbproxy_model_host::NetworkPolicy::Allowed,
+    ));
+    let manager = sbproxy_model_host::ModelRuntimeManager::new_with_device_capacities(
+        catalog.catalog_revision.clone(),
+        preparer,
+        capacities,
+    )?
+    .with_observer(Arc::new(MetricsObserver));
+    Ok(Arc::new(manager))
+}
+
+/// Return the permanent process-wide managed-model runtime handle.
+pub fn model_runtime_manager() -> Arc<ProductionModelRuntime> {
+    MODEL_RUNTIME
+        .get_or_init(|| {
+            let runtime = Arc::new(
+                ProductionModelRuntime::empty()
+                    .expect("built-in empty model runtime must be valid"),
+            );
+            ProductionModelRuntime::start_maintenance(&runtime);
+            runtime
+        })
+        .clone()
+}
+
+/// Prepare a complete pipeline model revision without changing live state.
+pub async fn prepare_model_runtime(
+    pipeline: &crate::pipeline::CompiledPipeline,
+    config_dir: &Path,
+) -> anyhow::Result<PreparedModelRuntime> {
+    model_runtime_manager().prepare(pipeline, config_dir).await
+}
+
+/// Atomically publish a prepared model revision.
+pub async fn commit_model_runtime(
+    prepared: PreparedModelRuntime,
+) -> Result<sbproxy_model_host::ReconcileReport, sbproxy_model_host::RuntimeManagerError> {
+    let owner = Arc::clone(&prepared.owner);
+    owner.commit(prepared).await
+}
+
+/// Prepare and commit a complete model-runtime revision on an isolated Tokio
+/// executor. This is safe from synchronous startup, file-watch threads, and
+/// callbacks already running inside another executor.
+pub(crate) fn reconcile_model_runtime_blocking(
+    pipeline: &crate::pipeline::CompiledPipeline,
+    config_dir: &Path,
+) -> anyhow::Result<sbproxy_model_host::ReconcileReport> {
+    let runtime = model_runtime_manager();
+    let candidate = compile_runtime_candidate(pipeline, config_dir)?;
+    let config_dir = config_dir.to_path_buf();
+    let pipeline_revision = pipeline.config_revision.clone();
+    std::thread::Builder::new()
+        .name("sbproxy-model-reconcile".to_string())
+        .spawn(move || {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| anyhow::anyhow!("build model reconcile runtime: {error}"))?;
+            executor.block_on(async move {
+                let prepared = runtime.prepare_candidate(candidate).await?;
+                runtime.commit(prepared).await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .map_err(|error| anyhow::anyhow!("spawn model reconcile thread: {error}"))?
+        .join()
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "model runtime reconcile thread panicked for config revision {pipeline_revision:?} in {}",
+                config_dir.display()
+            )
+        })?
+}
+
+/// Stop every managed engine from synchronous process-shutdown paths.
+pub(crate) fn shutdown_model_runtime_blocking() -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(runtime) = MODEL_RUNTIME.get().cloned() else {
+        return Ok(BTreeMap::new());
+    };
+    std::thread::Builder::new()
+        .name("sbproxy-model-shutdown".to_string())
+        .spawn(move || {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| anyhow::anyhow!("build model shutdown runtime: {error}"))?;
+            Ok::<_, anyhow::Error>(executor.block_on(runtime.shutdown()))
+        })
+        .map_err(|error| anyhow::anyhow!("spawn model shutdown thread: {error}"))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("model shutdown thread panicked"))?
 }
 
 /// Warn, at pipeline load time (startup and every hot reload), about
@@ -273,333 +851,80 @@ fn merged_serve_config(config: &AiHandlerConfig) -> Option<ModelHostConfig> {
     merged
 }
 
-/// Build the runtime from the merged serve config, or `None` when no
-/// provider serves locally or the merged config is invalid.
-fn build_runtime(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>> {
-    let merged = merged_serve_config(config)?;
-    // Reject a cross-provider duplicate/nameless model here; per-provider
-    // validation ran at config load, this catches collisions across
-    // several serve blocks.
-    if let Err(e) = merged.validate() {
-        tracing::error!("model host: merged serve config is invalid: {e}");
-        return None;
-    }
-    let catalog = match load_catalog(&merged) {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            tracing::error!("model host: {error}");
-            return None;
-        }
-    };
-    let cache_root = sbproxy_model_host::resolve_cache_dir_default(merged.cache_dir.as_deref());
-    let metadata = Arc::new(ConfigDirMetadataProvider {
-        cache_root: cache_root.clone(),
-        revision: "main".to_string(),
-        catalog: Arc::clone(&catalog),
-    });
-    let transport = match artifact_transport() {
-        Ok(transport) => transport,
-        Err(error) => {
-            tracing::error!("model host: build artifact transport: {error}");
-            return None;
-        }
-    };
-    let artifact_manager = match ArtifactManager::new(cache_root, transport) {
-        Ok(manager) => Arc::new(manager),
-        Err(error) => {
-            tracing::error!("model host: open artifact cache: {error}");
-            return None;
-        }
-    };
-    let runtime = ModelHostRuntime::new(
-        merged,
-        catalog,
-        make_probe(),
-        metadata,
-        // A cold weight-load + engine warm-up can take minutes; give the
-        // readiness probe a generous budget so the first request does
-        // not fail over while the engine is still loading.
-        Box::new(|| ProcessEngineLauncher::with_timeout(std::time::Duration::from_secs(600))),
-        // Real container-runtime detection (WOR-1801): a present
-        // docker/podman lets `engine: auto` resolve to vLLM (its
-        // container path) for safetensors weights, instead of always
-        // falling back to llama.cpp.
-        sbproxy_model_host::resolve_on_path("docker").is_some()
-            || sbproxy_model_host::resolve_on_path("podman").is_some(),
-    )
-    .with_artifact_manager(artifact_manager)
-    .with_health_recheck(true)
-    .with_observer(Arc::new(MetricsObserver));
-    Some(Arc::new(runtime))
+/// Loopback target and request-lifetime permit for one managed local attempt.
+pub struct ManagedLocalUpstream {
+    /// OpenAI-compatible loopback engine URL.
+    pub base_url: String,
+    /// Stable public model name selected by the route table.
+    pub public_model: String,
+    /// Exact model identifier accepted by the managed engine.
+    pub engine_model: String,
+    /// Deployment admission held until the complete request context drops.
+    pub permit: ManagedModelPermit,
 }
 
-/// The process-global model host, built lazily from `config` on first
-/// use and cached for the process lifetime.
-fn model_host(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>> {
-    MODEL_HOST.get_or_init(|| build_runtime(config)).clone()
-}
-
-/// Construct the process-global host from a compiled pipeline during
-/// startup, before request dispatch begins. Returns `None` when the
-/// pipeline declares no local models.
-pub(crate) fn initialize_model_host(
-    actions: &[sbproxy_modules::Action],
-) -> Result<Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>>, String> {
-    let config = actions.iter().find_map(|action| match action {
-        sbproxy_modules::Action::AiProxy(ai)
-            if ai
-                .config
-                .providers
-                .iter()
-                .any(|provider| provider.serve.is_some()) =>
-        {
-            Some(&ai.config)
-        }
-        _ => None,
-    });
-    let Some(config) = config else {
-        return Ok(None);
-    };
-    if let Some(existing) = MODEL_HOST.get() {
-        return existing
-            .clone()
-            .map(Some)
-            .ok_or_else(|| "model host was previously initialized without a runtime".to_string());
-    }
-    let runtime = build_runtime(config)
-        .ok_or_else(|| "model-host construction failed; inspect the preceding error".to_string())?;
-    if MODEL_HOST.set(Some(Arc::clone(&runtime))).is_err() {
-        return MODEL_HOST
-            .get()
-            .and_then(Clone::clone)
-            .map(Some)
-            .ok_or_else(|| "model host initialization raced with an invalid runtime".to_string());
-    }
-    Ok(Some(runtime))
-}
-
-/// Complete `pull: on_boot` acquisition on an isolated Tokio runtime.
-/// The dedicated thread makes this safe from both synchronous startup
-/// and reload callbacks that may already run inside another runtime.
-pub(crate) fn warm_on_boot_blocking(
-    runtime: Arc<ModelHostRuntime<ProcessEngineLauncher>>,
-) -> Result<(), String> {
-    std::thread::Builder::new()
-        .name("sbproxy-model-warm".to_string())
-        .spawn(move || {
-            let executor = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("build model warm runtime: {error}"))?;
-            executor
-                .block_on(runtime.warm_on_boot())
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
-        .map_err(|error| format!("spawn model warm thread: {error}"))?
-        .join()
-        .map_err(|_| "model warm thread panicked".to_string())?
-}
-
-/// The current model host, resolved from the live compiled pipeline's
-/// `ai_proxy` config, for read-only surfaces like the status admin API
-/// (WOR-1665). Returns `None` when no provider serves locally. Builds
-/// the runtime on first use (construction only, no engine spawn).
-pub(crate) fn current_model_host() -> Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>> {
-    use sbproxy_modules::Action;
-    let pipeline = crate::reload::current_pipeline();
-    let cfg = pipeline.actions.iter().find_map(|a| match a {
-        Action::AiProxy(ai) => Some(&ai.config),
-        _ => None,
-    })?;
-    model_host(cfg)
-}
-
-/// Resolve a served provider's upstream to its live loopback base URL,
-/// bringing the engine to ready on demand.
+/// Resolve, admit, and ready a canonical or legacy managed provider.
 ///
-/// Returns `Ok(None)` for a provider with no `serve:` block (the caller
-/// keeps the provider's normal `base_url`). For a served provider it
-/// returns `Ok(Some(url))`, or an error string when no served models are
-/// configured or the engine could not be brought to ready.
-pub async fn served_upstream(
-    config: &AiHandlerConfig,
+/// `Ok(None)` identifies an ordinary proxied provider. Every local provider
+/// uses the current atomic desired-state route map, then binds admission and
+/// readiness to the same manager snapshot so a concurrent reload cannot mix
+/// generations within one request attempt.
+pub async fn managed_upstream(
+    origin: &str,
     provider: &sbproxy_ai::provider::ProviderConfig,
     requested_model: Option<&str>,
-) -> Result<Option<String>, String> {
-    if provider.serve.is_none() {
+    priority: sbproxy_model_host::PriorityClass,
+) -> Result<Option<ManagedLocalUpstream>, String> {
+    if provider.serve.is_none() && !provider.is_managed_model() {
         return Ok(None);
     }
-    let runtime = model_host(config)
-        .ok_or_else(|| "no local model host configured for this served provider".to_string())?;
-    resolve_served_base_url(
-        provider,
-        requested_model,
-        runtime.as_ref() as &dyn LocalModelHost,
-    )
-    .await
+    let runtime = model_runtime_manager();
+    let manager = runtime.active_manager();
+    let desired = manager.current_desired();
+    let names = desired
+        .routes
+        .iter()
+        .filter(|route| route.origin == origin && route.provider == provider.name.as_str())
+        .map(|route| route.model.clone())
+        .collect::<Vec<_>>();
+    let public_model = pick_local_model_name(&names, requested_model, provider).ok_or_else(|| {
+        format!(
+            "engine_unhealthy: provider {:?} has local routes {names:?}, but request model {requested_model:?} has no unambiguous match",
+            provider.name.as_str()
+        )
+    })?;
+    let route = desired
+        .route_for(origin, provider.name.as_str(), &public_model)
+        .ok_or_else(|| {
+            format!(
+                "engine_unhealthy: provider {:?} model {public_model:?} has no committed deployment route",
+                provider.name.as_str()
+            )
+        })?;
+    let deployment = route.deployment.clone();
+    let engine_model = deployment.clone();
+    let admission = manager
+        .admit(&deployment, priority)
+        .await
+        .map_err(|error| format!("{}: {}", error.reason.as_str(), error.detail))?;
+    let permit = ManagedModelPermit {
+        manager,
+        deployment,
+        admission,
+    };
+    let running = permit
+        .ensure_ready(priority)
+        .await
+        .map_err(|error| format!("{}: {error}", error.reason_code()))?;
+    Ok(Some(ManagedLocalUpstream {
+        base_url: format!("http://127.0.0.1:{}/v1", running.port),
+        public_model,
+        engine_model,
+        permit,
+    }))
 }
 
-// --- Served-lane priority admission gate (WOR-1679, OSS subset) ---
-//
-// A single multi-priority queue in front of the local engine. The pure
-// decision logic lives in `sbproxy_model_host::scheduling`; this is the
-// request-path binding: a slot pool sized by `serve.max_concurrent_requests`,
-// FIFO-within-class wakeups ordered by `next_to_admit`, and a spill signal
-// so an interactive request with a cloud fallback in the same provider
-// array overflows immediately instead of queuing behind batch work. True
-// preemption of an in-flight generation is the enterprise extension; the
-// OSS gate never cancels running work.
-
-use sbproxy_model_host::scheduling::{next_to_admit, PriorityClass};
-
-/// Result of asking the gate for a served-lane slot.
-pub(crate) enum LaneAdmission {
-    /// A slot is held; drop the permit to release it.
-    Admitted(ServeLanePermit),
-    /// The lane is saturated and the caller said a fallback exists:
-    /// spill to it now rather than queuing (interactive only).
-    Spill,
-    /// Waited the configured queue timeout without getting a slot.
-    TimedOut,
-}
-
-/// RAII slot on the served lane. Dropping it hands the slot to the
-/// highest-priority waiter (FIFO within a class), or frees it. Public
-/// only because it rides on `RequestContext`; there is no way to mint
-/// one outside the gate.
-pub struct ServeLanePermit {
-    gate: Arc<ServeLaneGate>,
-}
-
-impl Drop for ServeLanePermit {
-    fn drop(&mut self) {
-        self.gate.release();
-    }
-}
-
-struct LaneWaiter {
-    class: PriorityClass,
-    arrival: u64,
-    id: u64,
-    wake: tokio::sync::oneshot::Sender<()>,
-}
-
-#[derive(Default)]
-struct LaneState {
-    in_flight: usize,
-    next_tick: u64,
-    waiting: Vec<LaneWaiter>,
-}
-
-/// The process-wide served-lane gate. One per process, matching the
-/// one-engine-runtime-per-node doctrine of `merged_serve_config`.
-pub(crate) struct ServeLaneGate {
-    capacity: usize,
-    queue_timeout: std::time::Duration,
-    state: parking_lot::Mutex<LaneState>,
-}
-
-impl ServeLaneGate {
-    fn new(capacity: usize, queue_timeout: std::time::Duration) -> Self {
-        Self {
-            capacity,
-            queue_timeout,
-            state: parking_lot::Mutex::new(LaneState::default()),
-        }
-    }
-
-    /// Acquire a slot for a request of `class`. `has_fallback` tells the
-    /// gate whether the provider array carries another lane to spill to;
-    /// only an interactive request uses it (standard and batch wait).
-    pub(crate) async fn acquire(
-        self: &Arc<Self>,
-        class: PriorityClass,
-        has_fallback: bool,
-    ) -> LaneAdmission {
-        let (rx, id) = {
-            let mut st = self.state.lock();
-            if st.in_flight < self.capacity {
-                st.in_flight += 1;
-                record_lane_decision(class, "admitted");
-                return LaneAdmission::Admitted(ServeLanePermit { gate: self.clone() });
-            }
-            if class == PriorityClass::Interactive && has_fallback {
-                record_lane_decision(class, "spilled");
-                return LaneAdmission::Spill;
-            }
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            st.next_tick += 1;
-            let id = st.next_tick;
-            st.waiting.push(LaneWaiter {
-                class,
-                arrival: id,
-                id,
-                wake: tx,
-            });
-            (rx, id)
-        };
-        match tokio::time::timeout(self.queue_timeout, rx).await {
-            // The releaser transferred its slot to us before waking.
-            Ok(Ok(())) => {
-                record_lane_decision(class, "queued_admitted");
-                LaneAdmission::Admitted(ServeLanePermit { gate: self.clone() })
-            }
-            // Sender dropped (gate shutdown edge) or timeout: leave the
-            // queue and report. On the timeout path the waiter entry must
-            // be removed so the releaser never wakes a dead receiver.
-            Ok(Err(_)) | Err(_) => {
-                let mut st = self.state.lock();
-                st.waiting.retain(|w| w.id != id);
-                record_lane_decision(class, "timed_out");
-                LaneAdmission::TimedOut
-            }
-        }
-    }
-
-    fn release(&self) {
-        let mut st = self.state.lock();
-        // Hand the slot to the best waiter whose receiver is still
-        // alive; a send failure means that waiter timed out between
-        // dropping the lock and now, so try the next one.
-        loop {
-            let Some(idx) = next_to_admit(
-                &st.waiting
-                    .iter()
-                    .map(|w| (w.class, w.arrival))
-                    .collect::<Vec<_>>(),
-            ) else {
-                st.in_flight = st.in_flight.saturating_sub(1);
-                return;
-            };
-            let waiter = st.waiting.remove(idx);
-            if waiter.wake.send(()).is_ok() {
-                // Slot transferred: in_flight stays constant.
-                return;
-            }
-        }
-    }
-}
-
-static SERVE_LANE_GATE: OnceLock<Option<Arc<ServeLaneGate>>> = OnceLock::new();
-
-/// The served-lane gate for this process, built from the first config
-/// that carries `serve.max_concurrent_requests`. `None` when the merged
-/// serve block sets no cap (gating disabled, the pre-WOR-1679 behavior).
-pub(crate) fn serve_lane_gate(config: &AiHandlerConfig) -> Option<Arc<ServeLaneGate>> {
-    SERVE_LANE_GATE
-        .get_or_init(|| {
-            let merged = merged_serve_config(config)?;
-            let capacity = merged.max_concurrent_requests?;
-            if capacity == 0 {
-                return None;
-            }
-            let timeout =
-                std::time::Duration::from_millis(merged.queue_timeout_ms.unwrap_or(30_000));
-            Some(Arc::new(ServeLaneGate::new(capacity, timeout)))
-        })
-        .clone()
-}
+use sbproxy_model_host::PriorityClass;
 
 /// Map a virtual key's lane onto the scheduler's class. No key or no
 /// declared lane both mean standard.
@@ -609,15 +934,6 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
         Some(sbproxy_ai::identity::KeyPriority::Batch) => PriorityClass::Batch,
         Some(sbproxy_ai::identity::KeyPriority::Standard) | None => PriorityClass::Standard,
     }
-}
-
-fn record_lane_decision(class: PriorityClass, decision: &'static str) {
-    let priority = match class {
-        PriorityClass::Interactive => "interactive",
-        PriorityClass::Standard => "standard",
-        PriorityClass::Batch => "batch",
-    };
-    sbproxy_observe::metrics::record_serve_lane_decision(priority, decision);
 }
 
 #[cfg(test)]
@@ -665,86 +981,6 @@ mod tests {
         assert!(catalog.get("exact").is_some());
     }
 
-    #[tokio::test]
-    async fn served_upstream_is_none_for_a_proxied_provider() {
-        let cfg = config_with_serve(None);
-        let provider = &cfg.providers[0];
-        assert_eq!(
-            served_upstream(&cfg, provider, Some("gpt-4o"))
-                .await
-                .unwrap(),
-            None
-        );
-    }
-
-    fn gate(capacity: usize, timeout_ms: u64) -> Arc<ServeLaneGate> {
-        Arc::new(ServeLaneGate::new(
-            capacity,
-            std::time::Duration::from_millis(timeout_ms),
-        ))
-    }
-
-    #[tokio::test]
-    async fn gate_admits_under_capacity() {
-        let g = gate(2, 50);
-        let a = g.acquire(PriorityClass::Standard, false).await;
-        let b = g.acquire(PriorityClass::Batch, false).await;
-        assert!(matches!(a, LaneAdmission::Admitted(_)));
-        assert!(matches!(b, LaneAdmission::Admitted(_)));
-    }
-
-    #[tokio::test]
-    async fn gate_spills_interactive_with_fallback_when_full() {
-        let g = gate(1, 5_000);
-        let _held = g.acquire(PriorityClass::Batch, false).await;
-        // Interactive with a fallback overflows immediately instead of
-        // queuing behind the batch job.
-        assert!(matches!(
-            g.acquire(PriorityClass::Interactive, true).await,
-            LaneAdmission::Spill
-        ));
-    }
-
-    #[tokio::test]
-    async fn gate_times_out_a_waiter_when_no_slot_frees() {
-        let g = gate(1, 20);
-        let _held = g.acquire(PriorityClass::Standard, false).await;
-        assert!(matches!(
-            g.acquire(PriorityClass::Standard, false).await,
-            LaneAdmission::TimedOut
-        ));
-    }
-
-    #[tokio::test]
-    async fn gate_hands_freed_slot_to_higher_priority_waiter_first() {
-        let g = gate(1, 5_000);
-        let held = match g.acquire(PriorityClass::Standard, false).await {
-            LaneAdmission::Admitted(p) => p,
-            _ => panic!("first acquire admits"),
-        };
-        // Queue a batch waiter first, then an interactive one; the
-        // freed slot must go to interactive despite arriving later.
-        let g_batch = g.clone();
-        let batch = tokio::spawn(async move { g_batch.acquire(PriorityClass::Batch, false).await });
-        let g_inter = g.clone();
-        let interactive =
-            tokio::spawn(async move { g_inter.acquire(PriorityClass::Interactive, false).await });
-        // Let both waiters park before releasing.
-        for _ in 0..50 {
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            if g.state.lock().waiting.len() == 2 {
-                break;
-            }
-        }
-        assert_eq!(g.state.lock().waiting.len(), 2, "both waiters parked");
-        drop(held);
-        let first = interactive.await.unwrap();
-        assert!(matches!(first, LaneAdmission::Admitted(_)));
-        // Releasing the interactive permit then admits the batch waiter.
-        drop(first);
-        assert!(matches!(batch.await.unwrap(), LaneAdmission::Admitted(_)));
-    }
-
     #[test]
     fn lane_class_defaults_to_standard() {
         assert_eq!(lane_class_for(None), PriorityClass::Standard);
@@ -752,5 +988,19 @@ mod tests {
             lane_class_for(Some(sbproxy_ai::identity::KeyPriority::Batch)),
             PriorityClass::Batch
         );
+    }
+
+    #[test]
+    fn model_maintenance_runtime_supports_engine_health_io() {
+        let executor = build_model_maintenance_runtime().unwrap();
+        executor.block_on(async {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = tokio::spawn(async move { tokio::net::TcpStream::connect(address).await });
+            let _server = listener.accept().await.unwrap();
+            client.await.unwrap().unwrap();
+        });
     }
 }

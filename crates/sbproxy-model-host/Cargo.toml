@@ -39,6 +39,7 @@ embedded = ["dep:mistralrs", "dep:axum"]
 
 [dependencies]
 sbproxy-util.workspace = true
+sbproxy-config.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
@@ -49,6 +50,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 fs2 = { workspace = true }
 async-trait = { workspace = true }
+arc-swap = { workspace = true }
 bytes = { workspace = true }
 zeroize = { workspace = true }
 futures = { workspace = true }
@@ -73,8 +75,9 @@ axum = { version = "0.8", optional = true }
 # WOR-1829: the GPU/RAM probes read sysctl keys via the sysctlbyname(3)
 # syscall so they work inside sandboxes that block spawning the `sysctl`
 # binary. libc is already in the lockfile transitively (tokio, pingora).
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,169 +1,223 @@
 # Model host security
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-11*
 
-The model host lets configuration start inference-engine subprocesses
-inside a gateway that also holds provider API keys. Spawning processes
-from config is a real attack surface, so it is constrained
-deliberately. This page states the posture, what the config surface
-guarantees, what the shipped engine-spawn phase enforces, and the
-hardening that remains. It mirrors the review done for unsandboxed ONNX
-model parsing.
+The model host starts inference processes beside a gateway that may hold cloud
+provider credentials. Treat write access to `sb.yml`, the deployment revision
+store, engine paths, and the artifact cache as privileged operator access.
 
-## Threat model
+This page describes the current single-node boundary. It is intentionally
+blunt: a compromised trusted config can select an explicit engine executable,
+so configuration integrity is part of the process-execution trust root.
 
-The attacker we care about is whoever can influence the `serve:`
-config or the weights it points at: a compromised config source, a
-malicious model repo, or a supply-chain swap of an engine binary. The
-gateway process holds outbound provider credentials, so the worst
-outcome is arbitrary code execution in that process's context or
-exfiltration of those keys. The controls below aim to make config
-unable to name an arbitrary executable and to make weights and engine
-binaries verifiable.
+## Trust boundaries
 
-## What the config surface guarantees today
+Four inputs matter:
 
-These hold in the shipped config layer and are covered by unit tests
-in `sbproxy-model-host::config`:
+1. Desired state selects models, engines, cache roots, and process policy.
+2. The catalog identifies immutable model artifacts and allowed formats.
+3. Engine acquisition selects an executable, uv environment, or container image.
+4. Requests arrive through the gateway and must stay outside process control.
 
-- **No arbitrary command.** There is no `cmd:`, `command:`,
-  `program:`, `binary:`, `exec:`, or `shell:` field anywhere in the
-  `serve:` block. The only executable-selecting key is `engine`, an
-  allowlisted enum (`vllm`, `llama_cpp`, `embedded`). Config chooses
-  among a fixed set; it cannot introduce a new executable. `embedded`
-  spawns no subprocess at all (it runs in-process), so it removes the
-  spawn surface rather than adding to it.
-- **Fixed engine-to-binary mapping.** Each `EngineKind` resolves to
-  one hard-coded binary name (`vllm`, `llama-server`); `embedded` maps
-  to no external binary. There is no config path that supplies or
-  overrides the binary name.
-- **No shell.** `extra_args` entries are opaque argv values, stored
-  and passed one element at a time. Shell metacharacters (`$(...)`,
-  `;`, `&&`, redirects) are inert data because no shell ever
-  interprets them; the runtime spawns the program directly with an
-  argument vector, not a command line.
-- **Unknown fields do not silently pass.** An unrecognized engine
-  value is a config error, not a fallthrough.
+The first three are operator-controlled supply-chain inputs. Request callers are
+untrusted. They may choose only a public model exposed by a configured provider;
+they cannot supply an engine, artifact path, device, port, or argv.
 
-This is the entire executable-selecting surface a config gets. The
-shape matches [`examples/ai-local-serving`](../examples/ai-local-serving):
+## Configuration is privileged
+
+Canonical engine configuration has a typed shape:
 
 ```yaml
-serve:
-  eviction: lru
-  models:
-    - model: qwen2.5-0.5b-instruct
-      variant: q4_k_m       # exact catalog v2 artifact
-      engine: llama_cpp     # allowlisted: vllm, llama_cpp, or embedded
-                            # (default `auto` resolves to one of these at boot)
-      keep_alive: 30m
-      extra_args:           # one argv element per entry; a `$(...)` or `;`
-        - "--max-model-len" # inside a value is inert data because no
-        - "8192"            # shell ever parses the line
+proxy:
+  model_host:
+    engines:
+      llama_cpp:
+        launch: binary
+        version: b9905
+        acceleration: metal
+        # path: /opt/sbproxy/engines/llama-server
+      vllm:
+        launch: uv
+        version: 0.10.0
+        acceleration: cuda
 ```
 
-Writing `engine: run-my-script` fails the config load. There is no
-field anywhere in the block that names a program.
+There is no free-form shell command. Engine kind, launch method, acceleration,
+image, version, digest, path, and shared-memory size are typed fields. The
+runtime constructs the remaining argv and environment.
 
-## What the shipped engine-spawn phase enforces
+An explicit `path` is still executable authority. SBproxy checks that it is an
+executable file and uses it as the selected engine; it does not prove that an
+operator path contains an authentic llama.cpp or vLLM binary. Restrict config
+writers, make engine directories root-owned, and prefer pinned managed
+acquisition when config comes through automation.
 
-The runtime launcher (`ProcessEngineLauncher`) has landed and been
-certified on a real NVIDIA L4. The review of that surface:
+Legacy `serve.models[].extra_args` receives a fixed allowlist. Flags that can
+replace the model, host, port, API key, network, mount, device selection, or
+runtime-owned lifecycle settings are rejected during candidate preparation.
+Unsupported LoRA, speculative, chunked-prefill, parser, swap, and offload fields
+also fail preparation instead of disappearing silently.
 
-- **Binary resolved from `PATH` or a pinned release only, never from
-  config.** `EngineKind::binary_name` is the only source of the program
-  name; there is no config path that supplies one. The optional
-  auto-fetch (`llama_release`) downloads a pinned ggml-org release for
-  the host platform and refuses an unpinned tag (no `latest`); a fetched
-  release is sha256-verified before use.
-- **Exact artifacts become visible atomically.** Catalog v2 resolution
-  pins source revision, file paths, byte lengths, and SHA-256 digests.
-  The manager stages partials under an artifact lock, resumes only when
-  all validators still match, verifies every file, then atomically
-  publishes an immutable snapshot. The managed launcher receives only
-  that local snapshot. A mismatch leaves no ready artifact and no
-  repository fallback.
-- **Unsafe formats fail closed.** Safetensors and GGUF are preferred.
-  Pickle requires explicit logical-model opt-in and opcode scanning
-  before finalization.
-- **Credentials are transport-only.** Source credentials are redacted
-  from formatting, zeroized on drop, and never serialized into cache,
-  resume, or durable-job metadata.
-- **The engine process tree is reaped, and the gateway is never
-  killed.** vLLM forks `EngineCore` workers that hold VRAM. Eviction and
-  shutdown are graceful-first: `SIGTERM` lets the engine tear down its
-  own workers, and only if it does not exit does a `SIGKILL` backstop
-  fire, guarded so it targets **only a process group the child truly
-  leads and that is distinct from the gateway's own group**. The L4
-  certification caught an earlier form of this that could `SIGKILL` the
-  gateway's own group; that is fixed and regression-tested. A crashed
-  engine also fails fast (readiness is raced against the child exiting)
-  with its captured stderr, so a broken model cannot hang a request for
-  the full retry budget.
-- **The loopback exception stays narrow.** A served provider carries no
-  `base_url`; `serve:` and `base_url` on one provider is a config error,
-  rejected at `plan` time. `allow_private_base_url` remains only for a
-  separately-running external engine, and does not widen the SSRF guard
-  for any other upstream.
-- **Container images are pinned.** An `engines:` container launch is
-  rejected at `plan` time unless it names a tagged/digest image (no
-  `latest`, no untagged).
+## No shell boundary
 
-### Pinning weights in the manifest
+The process layer receives an executable plus tokenized arguments and a typed
+environment map. It clears the gateway environment, restores only an audited
+operating-system baseline such as `PATH`, locale, and temporary-directory
+settings, then adds driver-owned overrides. Cloud credentials held by the
+gateway are not inherited by an engine. The runner calls the operating-system
+process API directly. Shell metacharacters inside one argument remain data
+because `/bin/sh`, `bash`, and PowerShell are not involved.
 
-The model manifest is where the digest pins live: each entry names its
-source, pins a revision, and carries per-file sha256 digests, so a
-curated manifest doubles as a supply-chain allowlist. This stanza is
-from [`examples/model-manifest`](../examples/model-manifest), an
-air-gapped model whose weights never touch the network but still
-verify before the engine reads them:
+This blocks command injection through argument punctuation, but it does not make
+an unsafe engine flag harmless. The allowlist remains necessary because an
+engine can interpret its own arguments.
 
-```yaml
-schema_version: 2
-catalog_revision: operator-catalog-2026-07-10
-models:
-  offline-coder:
-    params: 30B-A3B
-    license: apache-2.0
-    family: qwen
-    context_length: 32768
-    pull: manual
-    variants:
-      - id: q4_k_m
-        format: gguf
-        quant: Q4_K_M
-        engines: [llama_cpp]
-        source: file:/var/lib/sbproxy/weights/offline-coder/model.gguf
-        revision: approved-transfer-42
-        files:
-          - path: model.gguf
-            sha256: 0000000000000000000000000000000000000000000000000000000000000000
-            size_bytes: 1 # replace with the approved file's exact size
-        requirements:
-          accelerators: [cpu, metal, cuda]
-          min_memory_bytes: 19327352832
-        stability: preview
-        certification: operator-approval-required
-```
+## Model artifact integrity
 
-Point `serve.catalog_file` at the manifest, then run `sbproxy models
-pull offline-coder --variant q4_k_m --offline`. A file whose size or
-digest differs never becomes ready. For an explicit gated pull, provide
-`HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`; runtime secret-reference wiring
-is not yet a stable capability, so pre-pull gated artifacts.
+Stable managed deployments use catalog v2. Each variant pins:
 
-### Remaining hardening (not yet enforced)
+- source and immutable source revision;
+- every repository-relative file path;
+- exact byte length and SHA-256;
+- artifact format, quantization, engine compatibility, and worker requirements;
+- support and certification identifiers.
 
-- **Resource-bound the child.** cgroup memory/CPU limits (Linux) and
-  dropping ambient privileges are not applied yet; a compromised engine
-  currently runs with the gateway's privileges. Track before a
-  multi-tenant deployment where an untrusted party controls the weights.
-- **Retire legacy acquisition.** Raw `hf:` and catalog v1 serving remain
-  preview compatibility paths. They do not carry exact sizes and must
-  not be treated as equivalent to catalog v2 managed artifacts.
+The artifact manager downloads into a partial area under a cross-process lock.
+Resume is allowed only while URL, entity tag, expected digest, expected size,
+and completed length still agree. It verifies every file before atomically
+publishing a content-addressed snapshot.
+
+llama.cpp receives one GGUF path from that snapshot. vLLM receives the snapshot
+root as a read-only model location. A managed driver cannot fall back to the
+catalog repository after resolution.
+
+Safetensors and GGUF are non-executable data formats. Pickle remains dangerous:
+the logical catalog model must opt in, and the artifact is scanned before
+publication. Do not accept an unreviewed pickle allowlist in a multi-tenant
+environment.
+
+### Cache deletion
+
+Exact removal acquires the cache mutation lock, artifact digest lock, and an
+exclusive digest lease, then rechecks protection. A prepared or running engine
+keeps a shared lease in another process. Configured, resident, pinned, locked,
+downloading, verifying, leased, and deleting artifacts fail closed. A queued
+pull also blocks removal before a ready snapshot exists. Shared blobs are
+reclaimed only after the last snapshot reference disappears.
+
+The CLI can query the authenticated admin status before deletion, but the
+configuration file is the durable protection source. Supply `-f sb.yml` when
+removing from the cache used by a running file-managed gateway.
+
+## Engine supply chain
+
+### llama.cpp binary and source build
+
+The driver can use a trusted explicit path, a compatible `PATH` executable, or a
+pinned release. Built-in b9905 prebuilt assets and the Linux CUDA source archive
+have checked-in SHA-256 digests. A custom release may carry an expected digest.
+Acquirers share an identity-scoped lock, stage away from the ready path, verify
+the archive, and publish only a complete executable directory.
+
+A release version without a digest is weaker than a digest-pinned release. The
+availability report says so and provides remediation. Pin the digest for a
+production supply-chain policy.
+
+### vLLM uv environment
+
+Managed uv mode pins the vLLM package version and keeps its environment under
+the engine cache. Compatibility probing reports the Python, torch, CUDA, and
+vLLM relationship before launch. Package-index integrity and the uv download
+source remain part of the operator's network and mirror policy.
+
+### vLLM container
+
+Container launch requires `repository@sha256:<64 hex>`. Tags and `latest` are
+rejected. The runtime:
+
+- creates an internal private network;
+- publishes the engine port on loopback only;
+- mounts the verified artifact snapshot read-only;
+- scopes the selected NVIDIA devices;
+- validates shared-memory size against host capacity;
+- builds tokenized Docker or Podman argv without a shell.
+
+The container runtime daemon is a privileged trust boundary. Anyone who can
+control its socket may already have host-level authority.
+
+## Process lifecycle
+
+The process runner keeps the last 64 KiB of stderr in memory. It does not leave a
+predictable engine log file in the temporary directory. Readiness races the
+child exit, so a broken engine fails early instead of waiting through the full
+health timeout. Shutdown first asks the child process group to exit, then uses a
+bounded force-kill backstop. The group guard prevents the runtime from targeting
+the gateway's own process group. On Linux, a parent-death signal also kills the
+engine process leader if the gateway exits without running normal shutdown.
+
+Crash retries use bounded exponential backoff. Exhaustion produces retained
+`crash_loop` state and requires an explicit reset after the cause is corrected.
+This prevents a bad artifact or incompatible runtime from becoming an endless
+spawn loop.
+
+The gateway holds a per-request admission permit through the response stream.
+Drain blocks new work and waits for those permits. Keep-alive cannot evict a
+deployment with active or queued requests.
+
+## Reload and rollback
+
+Every startup and reload path builds a complete candidate. Catalog, routes,
+engine policy, artifacts, capacity, and warm deployments must prepare before the
+runtime swaps. Rolling replacements prove overlap capacity before launch.
+Recreate replacements stop the old generation first and restart it if the warm
+replacement fails. A failure tears down staged work and preserves the last good
+routes and resident generations.
+
+This transaction protects availability. It does not turn an untrusted config
+into safe input. A malicious candidate can still consume download, build, or
+preparation resources before it fails, so config write access must remain
+restricted.
+
+## Credentials and local admin
+
+Hugging Face credentials exist only in the transport request. Secret values are
+zeroized on drop, redacted from errors, and omitted from partial, snapshot, and
+job metadata.
+
+`sbproxy run` generates a 32-byte random admin password, writes its temporary
+config with owner-only permissions on Unix, binds admin to loopback, and removes
+the temporary directory when the handler returns on success or failure. The
+password appears in the terminal because the operator needs it for lifecycle
+commands. Do not redirect that banner into a world-readable log.
+
+For a persistent config, use an environment or secret-backend reference and keep
+the admin listener on `127.0.0.1`. Remote admin needs TLS, an IP allowlist, and
+separate named operators. Model lifecycle routes use the same authentication
+and audit boundary as the rest of `/admin/*`.
+
+## Remaining hardening
+
+These controls are not part of the current stable single-node contract:
+
+- Linux cgroup CPU and memory limits per engine process;
+- dropping ambient capabilities and switching to a dedicated Unix user;
+- seccomp or another syscall sandbox for native engines;
+- signature verification for every engine release and package index;
+- a rootless container requirement;
+- persistent desired-state mutation with review and approval in the admin UI;
+- peer identity, transport encryption, and authorization for multi-node model
+  dispatch.
+
+Live NVIDIA and multi-node validation runs on GCP in the final PR group. Until
+that evidence is recorded, NVIDIA uv, container, and CUDA source-build paths
+remain preview even though their deterministic process and isolation contracts
+run in CI.
 
 ## Related
 
-- [model-host.md](model-host.md) - the subsystem this secures.
-- [local-inference.md](local-inference.md) - the ONNX sidecar
-  precedent, isolated in its own process for the same reason.
+- [model-host.md](model-host.md) covers configuration and operation.
+- [model-host-capabilities.md](model-host-capabilities.md) is generated from the
+  executable support registry.
+- [model-host-certification.md](model-host-certification.md) records the hardware
+  validation procedure and evidence boundary.
+- [threat-model.md](threat-model.md) covers the broader gateway trust model.

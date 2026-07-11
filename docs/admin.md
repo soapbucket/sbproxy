@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-10*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -174,10 +174,55 @@ mutations need the `admin` role.
 | GET | `/admin/log-level` | Current tracing filter directive. |
 | PUT | `/admin/log-level` | Change the log level at runtime, e.g. `{"level":"debug"}` or `{"level":"sbproxy_ai=debug"}`, no restart. |
 | GET | `/api/health/targets` | Per-target health, outlier, and breaker state. |
-| GET | `/admin/model-host/status` | Locally served models, VRAM, keep-alive. |
-| POST | `/admin/model-host/load` | Load (spawn + ready) a model, `{"model":"<catalog id or hf: ref>"}`. |
-| POST | `/admin/model-host/evict` | Unload a model to free VRAM, `{"model":"<name>"}`. |
+| GET | `/admin/model-host/status` | Managed deployment generation, lifecycle, engine, artifact, memory, device, port, queue, reason, and job state. |
+| POST | `/admin/model-host/load` | Start one configured deployment and wait for ready, `{"deployment":"<id>"}`. |
+| POST | `/admin/model-host/stop` | Drain and stop one configured deployment, `{"deployment":"<id>"}`. |
+| POST | `/admin/model-host/drain` | Alias for the bounded drain and stop operation. |
+| POST | `/admin/model-host/evict` | Compatibility alias for the bounded drain and stop operation. |
+| POST | `/admin/model-host/reset` | Clear retained crash-loop state for a configured deployment. |
 | GET | `/admin/cluster/metrics` | Fleet-aggregated metrics (mesh tier; see [observability.md](observability.md)). |
+
+### Managed model lifecycle
+
+These routes adapt the same process-wide runtime used by startup, reload, and
+request admission. They do not create arbitrary deployments. The deployment ID
+must already exist in the active desired state.
+
+```bash
+export SB_ADMIN_URL=http://127.0.0.1:9090
+export SB_ADMIN_PASSWORD='replace-me'
+
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/status"
+
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  -H 'content-type: application/json' \
+  -d '{"deployment":"local-qwen"}' \
+  "${SB_ADMIN_URL}/admin/model-host/stop"
+
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  -H 'content-type: application/json' \
+  -d '{"deployment":"local-qwen"}' \
+  "${SB_ADMIN_URL}/admin/model-host/reset"
+```
+
+The local CLI provides the same common operations with stable JSON envelopes:
+
+```bash
+export SB_ADMIN_USERNAME=admin
+sbproxy models ps --format json
+sbproxy models stop local-qwen --format json
+```
+
+Lifecycle errors include bounded `reason_code` values. A stop enters drain,
+rejects new requests, waits for active stream permits up to the configured
+deadline, and then stops the engine. Reset does not change `sb.yml`; it clears a
+retained failure so the configured generation can be started again.
+
+The current web UI shows model-host health on Overview. Selecting models,
+editing desired deployments, and fleet management land in the later admin UI
+PRs. Until then, `file_managed` desired state changes go through config review
+and the shared reload transaction.
 
 Config values support environment-variable interpolation (`${ENV_VAR}`)
 and secret backend references (HashiCorp Vault, AWS and GCP Secret

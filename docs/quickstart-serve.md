@@ -1,85 +1,100 @@
-# Run your first model in 60 seconds
+# Run your first managed model
 
-*Last modified: 2026-07-07*
+*Last modified: 2026-07-10*
 
-Two commands take a bare box to a served model with an OpenAI-compatible
-endpoint. Install the binary, then run a model.
+Install SBproxy, then run the pinned bootstrap model from the built-in catalog:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
-sbproxy run hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF \
-  --name qwen --gguf-file qwen2.5-0.5b-instruct-q4_k_m.gguf
+sbproxy run qwen2.5-0.5b-instruct --variant q4_k_m
 ```
 
-The first line downloads the sbproxy binary. The second one serves the
-model. It detects your hardware, plans a fit, downloads the weights, and,
-if you have no inference engine installed, fetches one. Then it serves on
-`http://127.0.0.1:8080`. The download and the engine fetch happen on the
-first request, so give it a minute the first time.
+`sbproxy run` detects the worker, resolves the exact GGUF artifact, verifies its
+size and SHA-256, provisions the matching llama.cpp engine, and warms the model.
+It does not print a success banner while an engine is still downloading or
+starting.
 
-Send it an OpenAI-shaped request:
+When the deployment reports `ready`, the output includes lines like these:
+
+```text
+qwen2.5-0.5b-instruct is ready on http://127.0.0.1:8080
+Admin: http://127.0.0.1:<generated-port>
+Admin username: admin
+Admin password: <generated-password>
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=local
+```
+
+The generated admin password is high entropy and the admin listener binds to
+loopback. Keep that terminal output if you want to use lifecycle commands during
+the run.
+
+## Send a completion
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"qwen2.5-0.5b-instruct","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-## It works on any box
+An OpenAI-compatible SDK can use the two exported variables from the ready
+banner. `OPENAI_API_KEY=local` satisfies SDKs that require a nonempty value; it
+is separate from the generated admin credential.
 
-The same command runs on a Linux GPU server, an Apple Silicon Mac, or a
-plain CPU box. sbproxy detects what it is running on and picks a path:
+## Inspect and stop the deployment
 
-- An NVIDIA GPU: it uses the GPU. GGUF models run on llama.cpp and
-  safetensors models run on vLLM, and sbproxy provisions both for you
-  (llama.cpp is a fetched binary; vLLM runs through `uv`, which sbproxy
-  also fetches). See [model-host.md](model-host.md) for the engines.
-- An Apple Silicon Mac: it uses Metal and unified memory, with llama.cpp.
-- A CPU-only box: it serves small models against a slice of system RAM.
-
-It picks a quant that fits the memory it found. If nothing fits, it says
-so up front and names why, at config load, so you find out before the
-first request instead of after it.
-
-## Pick a model
-
-`sbproxy run` takes a catalog id or an explicit Hugging Face reference. A
-GGUF repo needs `--gguf-file` (the exact file), since a GGUF-only repo
-carries no `config.json` for the planner to read:
+Copy the generated admin URL and password into environment variables:
 
 ```bash
-# A GGUF model on any box (llama.cpp, fetched for you):
-sbproxy run hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF \
-  --name qwen --gguf-file qwen2.5-0.5b-instruct-q4_k_m.gguf
+export SB_ADMIN_URL=http://127.0.0.1:49123
+export SB_ADMIN_USERNAME=admin
+export SB_ADMIN_PASSWORD='paste-generated-password'
 
-# A catalog id on a GPU box (safetensors, served by vLLM via uv):
-sbproxy run qwen3-14b
+sbproxy models ps --format json
+sbproxy models stop local --format json
 ```
 
-On an NVIDIA GPU box, a safetensors model needs a C toolchain and the
-Python headers (`build-essential`, `python3-dev`) for vLLM's runtime
-compile step. GGUF models on llama.cpp need neither.
+`models stop` drains active requests, stops the engine process, and leaves the
+verified artifact in cache. A later start reuses it.
 
-Flags override the port, engine, acceleration, and cache directory. Add
-`--dry-run` to see the config and the resolution without serving.
+## Inspect without starting
 
-## Check the box first
-
-Two read-only commands tell you what a box can do before you run
-anything:
+`--dry-run` prints the generated canonical configuration and exits. It still
+resolves the model against the actual worker, and it embeds a newly generated
+admin credential in the printed file.
 
 ```bash
-sbproxy doctor        # OS, GPU or memory budget, engines, and how to serve
-sbproxy models        # one row per catalog model with a per-GPU fit verdict
+sbproxy run qwen2.5-0.5b-instruct \
+  --variant q4_k_m \
+  --port 8080 \
+  --admin-port 9090 \
+  --dry-run
 ```
 
-When a model has no way to run, `sbproxy doctor` names the one thing to
-install and the exact command to install it.
+Use `sbproxy doctor` and `sbproxy models list` for read-only host and catalog
+inspection:
 
-## Where to go next
+```bash
+sbproxy doctor --format json
+sbproxy models list --format json
+sbproxy models show qwen2.5-0.5b-instruct --format json
+```
 
-- [self-hosting.md](self-hosting.md) for a real `serve:` config, the model
-  manifest, aliases, and spilling over to cloud providers.
-- [model-host.md](model-host.md) for the catalog, the fit planner, and the
-  engine supervisor.
-- [configuration.md](configuration.md) for the full config schema.
+## Hardware status
+
+The bootstrap GGUF supports CPU, Apple Metal, and CUDA catalog workers. This PR
+runs a real Apple Silicon request before publication. NVIDIA discovery, managed
+vLLM, and the CUDA llama.cpp build have deterministic coverage, while the live
+GCP NVIDIA and multi-node gate remains in the final integration PR.
+
+If the selected artifact does not fit, the command exits before claiming the
+endpoint is ready. Use a smaller variant, free device memory, or configure a
+different worker.
+
+## Move to a managed config
+
+`sbproxy run` is a single-deployment convenience command. Use
+[`examples/model-host-managed`](../examples/model-host-managed) when you need a
+stable cache path, fixed admin port, queue limits, reload, or more than one
+origin. [model-host.md](model-host.md) explains every field and the migration
+from provider `serve:` blocks.

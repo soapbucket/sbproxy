@@ -12,9 +12,10 @@ use bytes::Bytes;
 use futures::stream;
 use sbproxy_model_host::{
     AcquisitionContext, ArtifactCacheState, ArtifactError, ArtifactFile, ArtifactFormat,
-    ArtifactManager, ArtifactObserver, ArtifactTransport, EngineKind, NetworkPolicy, OperationJob,
-    OperationState, PullIntent, PullPolicy, ReadyArtifact, ResolvedArtifact, ResponseDisposition,
-    SupportLevel, TransportRequest, TransportResponse,
+    ArtifactManager, ArtifactObserver, ArtifactTransport, CacheProtection, EngineKind,
+    NetworkPolicy, OperationJob, OperationKind, OperationState, PullIntent, PullPolicy,
+    ReadyArtifact, ResolvedArtifact, ResponseDisposition, SupportLevel, TransportRequest,
+    TransportResponse,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -113,6 +114,104 @@ fn fixture_files() -> BTreeMap<String, Vec<u8>> {
             b"safe tensor fixture bytes".to_vec(),
         ),
     ])
+}
+
+#[tokio::test]
+async fn exact_removal_is_atomic_idempotent_and_records_a_deletion_job() {
+    let directory = tempdir().expect("temp dir");
+    let files = fixture_files();
+    let artifact = artifact('9', &files);
+    let manager = ArtifactManager::new(directory.path(), Arc::new(FakeTransport::new(files)))
+        .expect("artifact manager");
+    manager.ensure(&artifact, context()).await.expect("pull");
+
+    let removed = manager
+        .remove(&artifact.artifact_digest, &CacheProtection::default())
+        .await
+        .expect("remove exact artifact");
+    assert!(removed.removed);
+    assert!(removed.reclaimed_bytes > 0);
+    assert_eq!(removed.artifact_digest, artifact.artifact_digest);
+    assert!(removed.job_id.is_some());
+    assert!(matches!(
+        manager.inspect(&artifact.artifact_digest).unwrap(),
+        ArtifactCacheState::Missing
+    ));
+
+    let again = manager
+        .remove(&artifact.artifact_digest, &CacheProtection::default())
+        .await
+        .expect("missing artifact is idempotent");
+    assert!(!again.removed);
+    assert_eq!(again.reclaimed_bytes, 0);
+    assert!(again.job_id.is_none());
+}
+
+#[tokio::test]
+async fn exact_removal_revalidates_configured_and_resident_protection() {
+    let directory = tempdir().expect("temp dir");
+    let files = fixture_files();
+    let artifact = artifact('8', &files);
+    let manager = ArtifactManager::new(directory.path(), Arc::new(FakeTransport::new(files)))
+        .expect("artifact manager");
+    manager.ensure(&artifact, context()).await.expect("pull");
+
+    for (reason, protection) in [
+        (
+            "configured",
+            CacheProtection {
+                configured: BTreeSet::from([artifact.artifact_digest.clone()]),
+                ..CacheProtection::default()
+            },
+        ),
+        (
+            "resident",
+            CacheProtection {
+                resident: BTreeSet::from([artifact.artifact_digest.clone()]),
+                ..CacheProtection::default()
+            },
+        ),
+    ] {
+        let error = manager
+            .remove(&artifact.artifact_digest, &protection)
+            .await
+            .expect_err("protected artifact cannot be removed");
+        assert!(matches!(
+            error,
+            ArtifactError::RemovalBlocked {
+                reason: actual,
+                ..
+            } if actual == reason
+        ));
+        assert!(matches!(
+            manager.inspect(&artifact.artifact_digest).unwrap(),
+            ArtifactCacheState::Ready { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn exact_removal_blocks_a_queued_artifact_that_is_not_ready_yet() {
+    let directory = tempdir().expect("temp dir");
+    let manager = ArtifactManager::new(
+        directory.path(),
+        Arc::new(FakeTransport::new(BTreeMap::new())),
+    )
+    .expect("artifact manager");
+    let digest = "7".repeat(64);
+    manager
+        .jobs()
+        .create(OperationKind::Pull, format!("artifact:sha256:{digest}"))
+        .expect("queued pull job");
+
+    let error = manager
+        .remove(&digest, &CacheProtection::default())
+        .await
+        .expect_err("queued artifact cannot be removed as an idempotent miss");
+    assert!(matches!(
+        error,
+        ArtifactError::RemovalBlocked { reason, .. } if reason == "queued"
+    ));
 }
 
 #[derive(Default)]

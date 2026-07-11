@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    username: admin
+    password: ${SB_ADMIN_PASSWORD:-change-this-before-running}
+
+  model_host:
+    authority: file_managed
+    max_parallel_prepares: 1
+    safety_margin: 0.10
+    shutdown_deadline_ms: 30000
+
+    cache:
+      directory: ./.cache/sbproxy-models
+      budget_gib: 20
+      max_resident_models: 1
+
+    engines:
+      llama_cpp:
+        launch: binary
+        version: b9905
+        acceleration: auto
+
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+        replicas: 1
+        pull: on_boot
+        warm: true
+        keep_alive_secs: 1800
+        max_concurrency: 2
+        max_queue_depth: 16
+        queue_timeout_ms: 30000
+        engine: llama_cpp
+        rollout: recreate
+
+origins:
+  "127.0.0.1":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
+          default_model: qwen
+
+  "localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
+          default_model: qwen

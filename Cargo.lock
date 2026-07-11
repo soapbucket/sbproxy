@@ -8217,6 +8217,8 @@ dependencies = [
  "clap_complete",
  "fs2",
  "mimalloc",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
  "rlimit",
  "rustls",
  "sbproxy-ai",
@@ -8687,6 +8689,7 @@ dependencies = [
 name = "sbproxy-model-host"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum 0.8.9",
  "bytes",
@@ -8698,6 +8701,7 @@ dependencies = [
  "mistralrs",
  "nvml-wrapper",
  "reqwest 0.12.28",
+ "sbproxy-config",
  "sbproxy-util",
  "schemars 0.8.22",
  "serde",

@@ -19,7 +19,7 @@
 
 use std::process::Command;
 
-use crate::fit::{GpuDescriptor, GpuProbe, GpuVendor};
+use crate::fit::{memory_occupancy, GpuDescriptor, GpuProbe, GpuVendor};
 
 /// Default fraction of total system RAM offered as the CPU serving
 /// budget. Leaves headroom for the OS, the gateway process, and the KV
@@ -79,6 +79,8 @@ impl GpuProbe for CpuProbe {
             name: "CPU (system RAM)".to_string(),
             total_vram_bytes: self.budget_bytes,
             free_vram_bytes: self.budget_bytes,
+            compute_utilization: None,
+            memory_occupancy: memory_occupancy(self.budget_bytes, self.budget_bytes),
             compute_capability: None,
             supports_fp8: false,
             mem_bandwidth_gbps: None,

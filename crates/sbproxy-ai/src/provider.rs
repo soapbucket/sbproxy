@@ -14,6 +14,10 @@ pub struct ProviderConfig {
     /// Optional provider type (e.g. "openai", "anthropic"); inferred from name if absent.
     #[serde(default)]
     pub provider_type: Option<String>,
+    /// Canonical model-host deployment ID. This is required when
+    /// `provider_type` is `managed_model` and rejected for every other provider.
+    #[serde(default)]
+    pub deployment: Option<String>,
     /// API key used to authenticate with the upstream provider.
     pub api_key: Option<String>,
     /// Override the upstream base URL (defaults to the provider's well-known URL).
@@ -96,6 +100,41 @@ fn default_true() -> bool {
 }
 
 impl ProviderConfig {
+    /// Whether this provider routes to an SBproxy-managed deployment.
+    pub fn is_managed_model(&self) -> bool {
+        self.provider_type.as_deref() == Some("managed_model")
+    }
+
+    /// Validate the managed-deployment reference and reject ambiguous upstream state.
+    pub fn validate_managed_model(&self) -> Result<(), String> {
+        if !self.is_managed_model() {
+            if self.deployment.is_some() {
+                return Err(
+                    "deployment is only valid when provider_type is managed_model".to_string(),
+                );
+            }
+            return Ok(());
+        }
+
+        if self
+            .deployment
+            .as_deref()
+            .is_none_or(|deployment| deployment.trim().is_empty())
+        {
+            return Err("provider_type managed_model requires deployment".to_string());
+        }
+        if self.base_url.is_some() {
+            return Err("managed_model provider must not set base_url".to_string());
+        }
+        if self.serve.is_some() {
+            return Err("managed_model provider must not also set legacy serve".to_string());
+        }
+        if self.api_key.is_some() {
+            return Err("managed_model provider must not set api_key".to_string());
+        }
+        Ok(())
+    }
+
     /// Get the effective base URL for this provider.
     ///
     /// Priority: explicit `base_url` > registry default > fallback localhost.
@@ -201,6 +240,7 @@ mod tests {
         ProviderConfig {
             name: name.into(),
             provider_type: None,
+            deployment: None,
             api_key: None,
             base_url: None,
             models: Vec::new(),

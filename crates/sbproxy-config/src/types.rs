@@ -459,6 +459,9 @@ pub struct ProxyServerConfig {
     /// Embedded admin/stats API server configuration.
     #[serde(default)]
     pub admin: Option<AdminConfig>,
+    /// Canonical desired state and lifecycle policy for models hosted by SBproxy.
+    #[serde(default)]
+    pub model_host: Option<crate::model_host::ModelHostControlConfig>,
     /// Secrets management configuration.
     #[serde(default)]
     pub secrets: Option<SecretsConfig>,
@@ -643,6 +646,7 @@ impl Default for ProxyServerConfig {
             observability: None,
             alerting: None,
             admin: None,
+            model_host: None,
             secrets: None,
             key_management: None,
             l2_cache: None,

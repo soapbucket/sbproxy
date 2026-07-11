@@ -1,6 +1,6 @@
 # Serve Qwen, GLM, or Gemma on one cloud L4
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-10*
 
 ![sbproxy validate, plan, and doctor running the serve preflight for this page's config on a machine with no GPU](assets/use-case-serve-on-l4.gif)
 
@@ -8,11 +8,11 @@
 
 You have GCP credits and a model you want to run on your own terms. The open-weight releases from Qwen, GLM, and Gemma are good enough for real work now, but most serving guides stop at a bare `vllm serve` with nothing in front of it and no plan for the day you need a hosted fallback. SBproxy is built for exactly this gap: "Call any model. Serve your own. Govern both." One Apache-2.0 binary routes to 66 providers or serves the weights on your own GPUs, and this page walks the serving half, from `gcloud compute instances create` to a first completion on a single NVIDIA L4.
 
-A status note before you spend money. The model host is the newest part of SBproxy and is landing in phases. The released binary ships GPU discovery and managed weight download as default features, and the L4 in this guide is the reference card the whole path is certified against, by hand, at feature-complete points rather than by CI on every push. On a host with no GPU or no engine, a `serve:` block validates but starts no engine. Trust `sbproxy doctor` on your box over any document, including this one; [model-host.md](model-host.md) keeps the current status.
+A status note before you spend money. This is the planned L4 procedure, not evidence that the current PR passed on an L4. NVIDIA vLLM, container, CUDA llama.cpp, multi-GPU, and multi-node GCP validation is reserved for the final integration PR. The deterministic driver and capacity suites run in CI. Use [model-host-certification.md](model-host-certification.md) for the evidence ledger and tear the VM down when the final gate finishes.
 
 ## What you will build
 
-A `g2-standard-8` VM with one 24 GB L4, running an OpenAI-compatible gateway on port 8080. A `serve:` block names the official `Qwen/Qwen3-14B-GGUF` weights at `Q4_K_M`; SBproxy downloads them into its cache, launches llama-server as a supervised subprocess on a loopback port, and routes chat completions to it. That GGUF-plus-llama-server pairing is the path certified on this exact card; the catalog-id form, where the fit planner picks the quant for your card (FP8 on an Ada L4), works as well. The same routing, guardrail, budget, and ledger planes that govern hosted providers apply to this local one, so the config you write here can grow a cloud spill lane later without rework.
+A `g2-standard-8` VM with one 24 GB L4, running an OpenAI-compatible gateway on port 8080. The final gate will use canonical managed deployments and exact catalog v2 artifacts, then record vLLM and CUDA llama.cpp readiness, completion, status, stop, and cache reuse. The same routing, guardrail, budget, and ledger planes that govern hosted providers apply to a local deployment.
 
 ## Prerequisites
 
@@ -48,7 +48,12 @@ gcloud compute ssh sbproxy-l4 --zone=us-central1-a
 
 The repo wraps these commands in `scripts/provision-l4.sh` (`up`, `ssh`, `down`) if you would rather not retype them, and [`deploy/terraform/l4-demo`](../deploy/terraform/l4-demo) is the Terraform version with a public IP, Let's Encrypt TLS, and a bearer token in front, for when this stops being an experiment.
 
-SBproxy acquires a missing engine on first use, but on this particular box the GGUF path deserves one manual step. The pinned `llama-server` prebuilt SBproxy fetches on Linux is the Vulkan build, and a stock Deep Learning VM ships no working NVIDIA Vulkan driver, so the fetched engine would serve on the CPU even with the L4 present. Put a CUDA build of `llama-server` on `PATH` instead; SBproxy prefers a `PATH` binary over its own fetch, so this takes over with no config change. Grab the CUDA build for your platform from the [llama.cpp releases page](https://github.com/ggml-org/llama.cpp/releases) (the asset names are version-pinned, pick the `ubuntu` `cuda` zip), unzip it, and put `llama-server` somewhere on `PATH` such as `/usr/local/bin`. The safetensors path needs no manual engine install: `engine: auto` routes safetensors weights to vLLM, and SBproxy provisions vLLM through `uvx` (it fetches `uv`, then runs vLLM with `uv tool run`). The host does need the NVIDIA driver plus a C toolchain and Python headers (`build-essential`, `python3-dev`) for vLLM's startup JIT; [model-host.md](model-host.md#inference-engines) has the details.
+The final gate exercises both managed NVIDIA paths. vLLM uses a pinned uv
+environment or digest-pinned container. llama.cpp uses the fixed CUDA source
+build when Linux x86-64, the NVIDIA driver, `nvcc`, CMake, a compiler, and `tar`
+are present. The build verifies the official source archive before CMake runs
+and publishes the executable atomically. See
+[model-host.md](model-host.md#managed-engines) for the exact policies.
 
 Then install SBproxy itself:
 

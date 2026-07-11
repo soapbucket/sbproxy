@@ -48,6 +48,14 @@ pub struct GpuDescriptor {
     pub total_vram_bytes: u64,
     /// Free device memory in bytes at probe time.
     pub free_vram_bytes: u64,
+    /// Device compute-engine utilization as a fraction in `[0, 1]`.
+    /// `None` means the platform probe could not report it.
+    #[serde(default)]
+    pub compute_utilization: Option<f64>,
+    /// Occupied device memory as a fraction in `[0, 1]`, derived only
+    /// from total and free memory. `None` means total memory was zero.
+    #[serde(default)]
+    pub memory_occupancy: Option<f64>,
     /// CUDA compute capability as `(major, minor)`, e.g. `(7, 5)` for
     /// Turing (T4), `(8, 9)` for Ada (L4). `None` for non-NVIDIA.
     pub compute_capability: Option<(u32, u32)>,
@@ -72,6 +80,8 @@ impl GpuDescriptor {
             name: "Tesla T4".to_string(),
             total_vram_bytes: 16 * GIB,
             free_vram_bytes: 15 * GIB,
+            compute_utilization: None,
+            memory_occupancy: memory_occupancy(16 * GIB, 15 * GIB),
             compute_capability: Some((7, 5)),
             supports_fp8: false,
             mem_bandwidth_gbps: Some(320.0),
@@ -86,11 +96,18 @@ impl GpuDescriptor {
             name: "NVIDIA L4".to_string(),
             total_vram_bytes: 24 * GIB,
             free_vram_bytes: 23 * GIB,
+            compute_utilization: None,
+            memory_occupancy: memory_occupancy(24 * GIB, 23 * GIB),
             compute_capability: Some((8, 9)),
             supports_fp8: true,
             mem_bandwidth_gbps: Some(300.0),
         }
     }
+}
+
+/// Derive occupied-memory fraction from total and free bytes.
+pub fn memory_occupancy(total_bytes: u64, free_bytes: u64) -> Option<f64> {
+    (total_bytes > 0).then(|| total_bytes.saturating_sub(free_bytes) as f64 / total_bytes as f64)
 }
 
 /// One GiB in bytes.
@@ -481,6 +498,39 @@ pub struct FitPlan {
     pub gpu_index: u32,
     /// Context length the estimate assumed.
     pub seq_len: u64,
+    /// Exact components used by admission and status.
+    pub memory: MemoryEstimate,
+}
+
+/// Device-specific memory requirement for one deployment generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MemoryEstimate {
+    /// Selected worker-local device index.
+    pub device_index: u32,
+    /// Quantized model weight bytes.
+    pub weight_bytes: u64,
+    /// KV-cache bytes at the selected context and dtype.
+    pub kv_bytes: u64,
+    /// Framework, activation, and device-context overhead.
+    pub runtime_overhead_bytes: u64,
+    /// Configured headroom added after runtime overhead.
+    pub safety_margin_bytes: u64,
+    /// Sum of every component above.
+    pub total_bytes: u64,
+}
+
+impl MemoryEstimate {
+    /// Construct a compatibility estimate when only a total is known.
+    pub fn from_total(device_index: u32, total_bytes: u64) -> Self {
+        Self {
+            device_index,
+            weight_bytes: total_bytes,
+            kv_bytes: 0,
+            runtime_overhead_bytes: 0,
+            safety_margin_bytes: 0,
+            total_bytes,
+        }
+    }
 }
 
 /// Why no quant could be fit.
@@ -600,8 +650,67 @@ pub fn plan_fit_kv(
     overhead: f64,
     kv_bytes_per_element: Option<f64>,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_kv_with_margin(
+        gpu,
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        0.0,
+        kv_bytes_per_element,
+    )
+}
+
+/// Like [`plan_fit_kv`], with an explicit additive safety margin.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_kv_with_margin(
+    gpu: &GpuDescriptor,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+) -> Result<FitPlan, FitError> {
+    plan_fit_kv_with_margin_and_concurrency(
+        gpu,
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        safety_margin,
+        kv_bytes_per_element,
+        1,
+    )
+}
+
+/// Like [`plan_fit_kv_with_margin`], with KV capacity for every concurrent sequence.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_kv_with_margin_and_concurrency(
+    gpu: &GpuDescriptor,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+) -> Result<FitPlan, FitError> {
     let seq_len = seq_len.min(meta.max_context).max(1);
     let free = gpu.free_vram_bytes as f64;
+
+    if concurrency == 0 {
+        return Err(FitError::Incompatible {
+            gpu: gpu.name.clone(),
+            detail: "concurrency must be positive".to_string(),
+        });
+    }
+    if !safety_margin.is_finite() || !(0.0..1.0).contains(&safety_margin) {
+        return Err(FitError::Incompatible {
+            gpu: gpu.name.clone(),
+            detail: "safety margin must be finite and in [0, 1)".to_string(),
+        });
+    }
 
     let mut capability_reject: Option<String> = None;
     let mut smallest_fit_candidate: Option<f64> = None;
@@ -621,18 +730,45 @@ pub fn plan_fit_kv(
             });
             continue;
         }
-        let est = meta.vram_estimate_with_kv(quant, kv_bytes_per_element, seq_len, overhead);
+        let weight_bytes = meta.weight_bytes(quant);
+        let kv_bytes_per_sequence = match kv_bytes_per_element {
+            Some(bytes) => meta.kv_bytes_with(bytes, seq_len),
+            None => meta.kv_bytes(quant, seq_len),
+        };
+        let kv_bytes = kv_bytes_per_sequence * f64::from(concurrency);
+        let base = weight_bytes + kv_bytes;
+        let runtime_overhead = base * (overhead.max(1.0) - 1.0);
+        let subtotal = base + runtime_overhead;
+        let margin = subtotal * safety_margin;
+        let est = subtotal + margin;
         smallest_fit_candidate = Some(match smallest_fit_candidate {
             Some(s) => s.min(est),
             None => est,
         });
         if est <= free {
+            let weight_bytes = weight_bytes as u64;
+            let kv_bytes = kv_bytes as u64;
+            let runtime_overhead_bytes = runtime_overhead as u64;
+            let safety_margin_bytes = margin as u64;
+            let total_bytes = weight_bytes
+                .saturating_add(kv_bytes)
+                .saturating_add(runtime_overhead_bytes)
+                .saturating_add(safety_margin_bytes);
+            let memory = MemoryEstimate {
+                device_index: gpu.index,
+                weight_bytes,
+                kv_bytes,
+                runtime_overhead_bytes,
+                safety_margin_bytes,
+                total_bytes,
+            };
             return Ok(FitPlan {
                 quant_name: name.clone(),
                 quant,
-                estimated_vram_bytes: est as u64,
+                estimated_vram_bytes: memory.total_bytes,
                 gpu_index: gpu.index,
                 seq_len,
+                memory,
             });
         }
     }
@@ -677,6 +813,52 @@ pub fn plan_fit_auto_kv(
     overhead: f64,
     kv_bytes_per_element: Option<f64>,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_auto_kv_with_margin(
+        probe,
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        0.0,
+        kv_bytes_per_element,
+    )
+}
+
+/// Like [`plan_fit_auto_kv`], with an explicit additive safety margin.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_auto_kv_with_margin(
+    probe: &dyn GpuProbe,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+) -> Result<FitPlan, FitError> {
+    plan_fit_auto_kv_with_margin_and_concurrency(
+        probe,
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        safety_margin,
+        kv_bytes_per_element,
+        1,
+    )
+}
+
+/// Like [`plan_fit_auto_kv_with_margin`], with KV capacity for concurrent sequences.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_auto_kv_with_margin_and_concurrency(
+    probe: &dyn GpuProbe,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+) -> Result<FitPlan, FitError> {
     let mut gpus = probe.probe();
     if gpus.is_empty() {
         return Err(FitError::NoGpu);
@@ -686,13 +868,15 @@ pub fn plan_fit_auto_kv(
     // else the error from the most-free GPU (the most informative).
     let mut first_err = None;
     for gpu in &gpus {
-        match plan_fit_kv(
+        match plan_fit_kv_with_margin_and_concurrency(
             gpu,
             meta,
             candidates,
             seq_len,
             overhead,
+            safety_margin,
             kv_bytes_per_element,
+            concurrency,
         ) {
             Ok(plan) => return Ok(plan),
             Err(e) => {

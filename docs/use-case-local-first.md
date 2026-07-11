@@ -1,6 +1,6 @@
 # You bought a GPU. Prove it pays for itself.
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-10*
 
 ![A local Qwen3 answer from the GPU, a training-sensitive prompt pinned to the local lane, then the ledger split across both lanes and the dollars the GPU displaced](assets/use-case-local-first.gif)
 
@@ -19,7 +19,7 @@ An OpenAI-compatible endpoint backed by a single provider array. Provider zero i
 - An OpenAI API key (`OPENAI_API_KEY`) for the spill lane.
 - `curl` for sending requests, `jq` for reading responses and the ledger.
 
-One caveat. The catalog, the fit planner, the engine supervisor, engine acquisition, and the `serve:` config surface all ship today, and the real vLLM and llama.cpp bring-up is certified on hardware: GGUF on Apple Silicon Metal, safetensors on an NVIDIA L4 through vLLM. Hosts still differ, so run `sbproxy doctor` before trusting a box; [model-host.md](model-host.md) has the reference.
+One caveat. This page still shows the provider-level `serve:` compatibility form. New deployments should use `proxy.model_host` and `provider_type: managed_model`. Apple Metal runs the live gate before this PR is published; NVIDIA vLLM and CUDA validation remains in the final GCP PR. Run `sbproxy doctor` before trusting a box, and use [model-host.md](model-host.md) for the current contract.
 
 ## Install
 

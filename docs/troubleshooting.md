@@ -1,5 +1,5 @@
 # Troubleshooting
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-10*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -212,13 +212,38 @@ Check:
 
 ## A local model will not serve
 
-A `serve:` block parses and validates on any host, but an engine only launches where the hardware and runtime support it.
+A managed deployment commits only after its catalog, artifact, engine, and
+capacity checks pass. A failed reload preserves the last good runtime.
 
 Check:
-- Run `sbproxy doctor`. It reports the host-wide verdict with no config needed: build capabilities, visible GPUs, inference engines, container runtime, the model cache, and a serve-readiness verdict listing every blocker. Engine acquisition comes first in that verdict: a binary engine that is not on PATH still counts as runnable when a viable acquisition method exists, because sbproxy fetches it itself (a pinned llama.cpp release download, an operator-supplied path, or vLLM via `uv tool run`). A model is only blocked when no acquisition path works on this host, and doctor names the reason.
-- The proxy re-checks the same prerequisites whenever a config with `serve:` loads and logs a warning per missing piece, naming the model and the blocker. Read boot logs before chasing anything else.
-- `sbproxy_model_host_ensure_failures_total{reason}` separates a model that cannot fit the GPU (`fit`) from an engine that crash-loops (`launch`) from a bad reference (`unknown_model`, `resolve`). The bundled `SBProxyModelHostEngineLaunchFailing` alert points at GPU VRAM, the engine binary on PATH, and weight integrity as the first three suspects.
-- Weight downloads are governed by the manifest entry's pull policy (`on_boot`, `on_demand`, `manual`). With `manual`, the weights must already be in the cache directory; with `on_demand`, the first request pays the download, which can look like a hang on a multi-GB pull. `sbproxy_model_host_weight_download_seconds` makes the slow pull visible. See [model-host.md](model-host.md).
+- Run `sbproxy doctor --format json`. It reports visible devices, engines,
+  container runtime, cache, and availability as `available`, `acquirable`,
+  `incompatible`, or `blocked`.
+- Query `sbproxy models ps --format json` with admin credentials. Check the
+  deployment's state, `reason_code`, bounded `last_error`, engine availability,
+  artifact digest, selected device, and memory breakdown.
+- `insufficient_capacity` means the selected device cannot hold weights, KV,
+  runtime overhead, and safety margin together. Use a smaller variant, reduce
+  context or concurrency, choose `rollout: recreate`, or free device memory.
+- `queue_full` and `queue_timeout` are load signals. Adjust queue depth or
+  timeout, reduce callers, or configure a fallback provider.
+- `engine_unhealthy` and `crash_loop` retain the engine failure. Correct the
+  version, runtime, artifact, or driver mismatch, then call
+  `POST /admin/model-host/reset` before another load.
+- `draining` means stop or replacement is still waiting on active stream
+  permits. Check active and queued counts before forcing a process restart.
+- Pull policy is per deployment. `manual` needs `sbproxy models pull -f sb.yml`;
+  `on_demand` may make the first request wait for a large verified download;
+  `on_boot` moves that work into candidate preparation.
+- `sbproxy_model_host_deployment_state`, active and queued gauges, admission
+  rejection counters, and weight-download timing separate lifecycle, load, and
+  artifact failures.
+
+Provider-level `serve:` blocks use the same runtime through compatibility
+lowering. New configurations should use `proxy.model_host`. Live NVIDIA
+remediation is verified in the final GCP integration PR; see
+[model-host-certification.md](model-host-certification.md) before treating a
+simulated device test as hardware evidence.
 
 ## An example docker compose stack will not start
 

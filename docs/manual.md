@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-11*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -125,8 +125,12 @@ sbproxy apply -f <yaml>
 sbproxy apply -p <plan-file>
 sbproxy config {migrate|import-litellm|print}
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
-sbproxy run <model> [--name <alias>]
-sbproxy models [list|show <id>|pull [<id>...]]
+sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
+                           [--engine auto|vllm|llama_cpp]
+                           [--accel auto|cuda|metal|cpu]
+                           [--port <port>] [--admin-port <port>]
+                           [--cache-dir <path>] [--dry-run]
+sbproxy models [list|show <id>|pull [<id>...]|remove <id>|ps|stop <deployment>]
 sbproxy update [--self]
 sbproxy ai ledger <subcommand>
 sbproxy doctor [--format text|json]
@@ -146,8 +150,8 @@ The full subcommand set, one line each:
 | `apply` | Validate and reload a config in place; the same primitive the SIGHUP handler and file watcher use. |
 | `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked. |
 | `projections` | Render projection documents (robots.txt, llms.txt, ...) for an origin without starting the proxy. |
-| `run` | Serve a model in one command, with no YAML: synthesizes a minimal serving config and boots an OpenAI-compatible endpoint on loopback. |
-| `models` | Discover and manage artifacts: list per-worker fit and cache state, show exact catalog variants, or pull and verify selected artifacts without starting an engine. |
+| `run` | Resolve a certified artifact, generate local admin auth, warm a canonical managed deployment, then print an OpenAI-compatible endpoint. |
+| `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, or drain and stop one. |
 | `update` | Check the engine release feed and cached models for freshness; `--self` also checks the sbproxy binary. Report-only. |
 | `ai` | AI gateway tools; `ai ledger` verifies the usage ledger. |
 | `doctor` | Diagnose what this binary can do on the current host. |
@@ -158,12 +162,11 @@ Argv parsing is `clap` derive, so every subcommand also accepts
 `--help` for a focused usage block (`sbproxy plan --help`,
 `sbproxy projections render --help`, etc.).
 
-For managed models, `sbproxy models pull -f sb.yml` selects configured
-models plus the catalog's `on_boot` set, inherits catalog and cache
-settings, verifies exact artifacts, and starts no engine. Use positional
-model IDs for a subset, `--all` for every compatible v2 entry,
-`--variant` for an immutable pin, and `--offline` to forbid transport
-access. See [model-host.md](model-host.md).
+For managed models, `sbproxy models pull -f sb.yml` selects canonical
+deployments and compatibility `serve:` entries plus the catalog's `on_boot`
+set. It inherits exact variant and engine pins, cache location, budget, and
+protection, verifies artifacts, and starts no engine. See
+[model-host.md](model-host.md).
 
 ### `serve` - start the proxy
 
@@ -184,7 +187,8 @@ SB_CONFIG_FILE=/etc/sbproxy/sb.yml sbproxy
 
 Loads and compiles the config without binding any listener. Exits 0 if
 the file compiles, 2 otherwise. Suitable for CI gates before a
-rolling deployment.
+rolling deployment. Managed-model configuration also runs through the same
+desired-state semantic validation used at boot.
 
 ```bash
 sbproxy validate /etc/sbproxy/sb.yml
@@ -284,14 +288,73 @@ When `--hostname` is omitted, the first origin in the config is
 chosen. Accepted `--kind` values: `robots`, `llms`, `llms-full`,
 `licenses`, `tdmrep`.
 
+### `run` - one managed model without a config file
+
+`run` accepts a certified catalog v2 ID. It resolves an exact artifact against
+the current worker, generates an authenticated loopback admin listener, writes
+a private temporary canonical config, and sets the deployment to pull on boot
+and warm. The success banner waits for runtime state `ready`.
+
+```bash
+sbproxy run qwen2.5-0.5b-instruct --variant q4_k_m
+sbproxy run qwen2.5-0.5b-instruct --name coder --port 8081
+sbproxy run qwen2.5-0.5b-instruct --dry-run
+```
+
+The ready banner includes the endpoint, generated admin URL and credential,
+curl request, `OPENAI_BASE_URL`, and `OPENAI_API_KEY`. A raw `hf:` reference is
+rejected because it lacks the complete catalog v2 identity. The private
+temporary config is removed whenever the command returns, including startup and
+readiness failures.
+
+### `models` - artifact and runtime lifecycle
+
+All JSON forms use `schema_version: 1` and a command name. Progress from pulls
+stays on stderr.
+
+```bash
+sbproxy models list --format json
+sbproxy models show qwen2.5-0.5b-instruct --format json
+
+sbproxy models pull -f /etc/sbproxy/sb.yml --format json
+sbproxy models pull qwen2.5-0.5b-instruct \
+  --variant q4_k_m \
+  --offline \
+  --format json
+
+sbproxy models remove qwen2.5-0.5b-instruct \
+  --variant q4_k_m \
+  -f /etc/sbproxy/sb.yml \
+  --format json
+```
+
+Removal is exact and idempotent. It refuses configured, resident, pinned,
+locked, leased, or active artifacts. A prepared or running engine holds a
+cross-process digest lease. Supplying the active config with `-f` gives the
+command its durable protection set; `--admin-url` and admin credentials add the
+live resident set.
+
+`ps` and `stop` use the authenticated admin API:
+
+```bash
+export SB_ADMIN_URL=http://127.0.0.1:9090
+export SB_ADMIN_USERNAME=admin
+export SB_ADMIN_PASSWORD='replace-me'
+
+sbproxy models ps --format json
+sbproxy models stop local-qwen --format json
+```
+
+`stop` drains active requests before stopping the engine and leaves verified
+weights in cache.
+
 ### `doctor` - what can this binary do on this host
 
 Prints a host-capability report: the capability features the binary
-was compiled with, the GPUs the local model host would see (same probe
-as the `serve:` admission path, so the two can never disagree), which
+was compiled with, the devices the managed runtime would see, which
 inference engine binaries (`vllm`, `llama-server`) resolve on `PATH`,
 the default model-weight cache directory, and a final verdict on
-whether a `serve:` provider could admit a model on this host, with
+whether a local deployment could admit a model on this host, with
 every blocker listed when it could not.
 
 ```bash
@@ -305,42 +368,28 @@ NVIDIA driver library at runtime (falling back to `nvidia-smi`), so
 the same artifact reports "ready" on a GPU host and lists what is
 missing everywhere else. Always exits 0 once the report is produced;
 "this host cannot serve local models" is a finding, not an error. See
-[model-host.md](model-host.md) for the `serve:` block itself.
+[model-host.md](model-host.md) for canonical managed configuration.
 
-The same host state is checked at startup and on every hot reload:
-when a loaded config declares `serve:` but the host is missing a
-prerequisite (no visible GPU, or a serve entry whose engine has no
-binary and no container runtime), the proxy logs a warning naming the
-model, the resolved engine, and the blocker. Requests still degrade
-gracefully (admission rejects, the attempt fails over to the next
-provider), but the gap surfaces when the config lands instead of on
-the first request.
+The same host state is checked at startup and on every hot reload. When a
+managed deployment is missing a prerequisite, candidate preparation reports
+the model, engine, availability state, and blocker. A failed reload preserves
+the last good runtime.
 
 #### Engine acquisition
 
-sbproxy acquires inference engines itself; a bare box serves without a
-manual install. When a `serve:` entry needs an engine, the runtime
-resolves it in this order:
+The managed runtime resolves an engine in this order:
 
-- **A binary already on `PATH` wins.** If `llama-server` (or `vllm`)
-  resolves on `PATH`, sbproxy uses it. This is also the escape hatch
-  for custom builds: put a CUDA-built `llama-server` on `PATH` and it
-  takes over with no config change.
-- **llama.cpp** (GGUF models): sbproxy fetches a pinned ggml-org
-  prebuilt release for the host platform (a fixed tag, never `latest`,
-  with an optional sha256 to verify). No compiler or build step on the
-  box. An explicit `acquire.source: path` pins an operator-provided
-  binary instead.
-- **vLLM** (safetensors): vLLM is a Python package, not a binary, so
-  sbproxy fetches `uv` (Astral's single static binary, also a pinned
-  release) and runs vLLM through `uv tool run`, a.k.a. `uvx`. uv
-  provisions and caches the environment, including its own Python, on
-  first use. Opt in with `engines.vllm.acquire.source: uvx`; `sbproxy
-  run <model>` sets it for you.
+- An explicit trusted `engines.<kind>.path` wins.
+- A compatible binary on `PATH` is next for ordinary binary launch.
+- llama.cpp can fetch a pinned release. Built-in prebuilt assets and the Linux
+  CUDA source archive have checked-in digests and identity-scoped caches.
+- vLLM can use a version-pinned managed uv environment or a digest-pinned
+  private container.
 
 GPU drivers are never installed by sbproxy; a missing driver is
-reported with guidance only. See [model-host.md](model-host.md) for
-the `serve:` block, per-engine details, and host prerequisites.
+reported with guidance only. See [model-host.md](model-host.md) for canonical
+fields, per-engine details, and host prerequisites. Live NVIDIA certification
+remains in the final GCP integration PR.
 
 ### `completions` - shell tab-completion scripts
 

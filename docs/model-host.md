@@ -1,393 +1,445 @@
 # Model host
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-11*
 
-The model host lets the gateway run the model itself, not just proxy to
-a model server someone else started. You name a model in a provider's
-`serve:` block, and sbproxy resolves it to weights, fits an inference
-engine to the local GPU, spawns and supervises that engine, and
-registers it as a local provider that sits ahead of any cloud fallback
-in the same routing, guardrail, budget, and usage-ledger planes every
-other provider uses. It is single-node and Apache-2.0; fleet placement
-across many nodes is separate work.
+SBproxy can own a model process on the same node as the gateway. The stable
+single-node configuration lives under `proxy.model_host`; an AI provider with
+`provider_type: managed_model` exposes a deployment to clients. Requests still
+pass through the normal key, policy, budget, routing, and usage planes before
+they reach the engine.
 
-## Status
+Use this page for the managed runtime. Provider-level `serve:` blocks still
+load during the compatibility window, but new configurations should use the
+canonical form below.
 
-The single-node path is executable end to end. Catalog v2 resolves one
-immutable variant for the current worker, the artifact service stages
-and resumes downloads under cross-process locks, verifies every exact
-size and SHA-256, and atomically publishes a content-addressed
-snapshot. Startup blocks on `pull: on_boot`; `on_demand` verifies before
-fit or residency planning; `manual` requires `sbproxy models pull` on a
-miss. A managed engine receives only the verified local snapshot or
-GGUF path. It never falls back to a repository after exact resolution.
+## Current boundary
 
-The GPU fit planner, supervised process launcher, VRAM residency
-manager, local-provider routing, and governance path then run as before.
-Real GGUF on Apple Metal and safetensors through vLLM on an NVIDIA L4
-have hardware certification. GCP validation for this foundation series
-is intentionally deferred to the final integration PR. Legacy catalog
-v1 and raw `hf:` entries remain a documented preview compatibility path
-and do not have the complete atomic artifact contract. Multi-node
-placement, admin mutation, and UI management are later PRs; the
-[capability matrix](model-host-capabilities.md) is the exact status
-source.
+The worker-local runtime is complete enough to operate as one coherent system:
 
-The real GPU bindings ship in the released binary: `gpu-nvidia` (an
-NVML `GpuProbe` with an `nvidia-smi` fallback) and `model-weights`
-(Hugging Face weight download) are default features of the `sbproxy`
-binary, so the artifact you download adapts to its host at runtime. The
-NVIDIA driver library is loaded with `dlopen` when present, never
-linked, so the same binary runs on a GPU-free host (the probe reports
-zero GPUs and `serve:` admission rejects cleanly) and discovers real
-devices on a GPU host with no rebuild. Run `sbproxy doctor` to see what
-the current host supports: compiled features, visible GPUs, engines on
-`PATH`, container runtime, and the `serve:` readiness verdict, plus the
-acquisition options viable here for each engine. The runtime then
-acquires the engine on first use rather than leaving you to install it:
-it fetches the pinned llama.cpp release binary, or fetches `uv` and runs
-vLLM through `uv tool run` (see [Inference engines](#inference-engines)).
-The same prerequisites are checked when a config loads: a `serve:` block
-on a host with no visible GPU, or a serve entry whose engine cannot be
-acquired here, logs a warning at startup and on every hot reload naming
-the model and the blocker. Library consumers of the workspace
-crates still opt into these features per crate. The bindings are exercised on
-a GPU host; see
-[model-host-certification.md](model-host-certification.md) for the
-provisioning and Definition-of-Done run on a cloud L4.
+- Catalog v2 resolves a logical model to an immutable source revision, exact
+  files, sizes, SHA-256 digests, format, and worker requirements.
+- The artifact manager resumes downloads under cross-process locks, verifies
+  every file, and publishes a content-addressed snapshot atomically.
+- Typed llama.cpp and vLLM drivers receive verified local paths. They cannot
+  replace those paths with a repository reference at launch.
+- One process-wide manager owns deployment generations, per-device memory,
+  request admission, keep-alive, drain, crash-loop state, and durable jobs.
+- Startup and every reload path prepare the full candidate before changing
+  routes. A bad candidate leaves the last good runtime in place.
+- The CLI can pull, inspect, remove, list running deployments, and stop one.
 
-## The `serve:` block
+This PR is a single-node runtime. Persistent desired-state editing in the admin
+UI, cluster membership, placement, peer dispatch, and fleet commands are later
+work. Apple Metal receives a real completion test before this PR is published.
+Live NVIDIA and multi-node certification on GCP is deliberately reserved for
+the final integration PR. The generated
+[capability matrix](model-host-capabilities.md) records this boundary.
 
-`serve:` hangs off an `ai_proxy` provider:
+## Canonical configuration
+
+This is the smallest useful file-managed deployment:
 
 ```yaml
+# yaml-language-server: $schema=../schemas/sb-config.schema.json
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    username: admin
+    password: ${SB_ADMIN_PASSWORD}
+
+  model_host:
+    authority: file_managed
+    max_parallel_prepares: 1
+    safety_margin: 0.10
+    shutdown_deadline_ms: 30000
+
+    cache:
+      directory: /var/lib/sbproxy/models
+      budget_gib: 100
+      max_resident_models: 2
+
+    engines:
+      llama_cpp:
+        launch: binary
+        version: b9905
+        acceleration: auto
+      vllm:
+        launch: uv
+        version: 0.10.0
+        acceleration: auto
+
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+        replicas: 1
+        pull: on_boot
+        warm: true
+        keep_alive_secs: 1800
+        max_concurrency: 4
+        max_queue_depth: 32
+        queue_timeout_ms: 30000
+        engine: auto
+        rollout: recreate
+
 origins:
-  "ai.local":
+  "localhost":
     action:
       type: ai_proxy
       providers:
-        # No base_url: the gateway resolves the engine's loopback port
-        # itself once the engine is ready.
         - name: local
-          default_model: qwen2.5-0.5b-instruct
-          models: [qwen2.5-0.5b-instruct, qwen3-8b]
-          serve:
-            eviction: lru          # or `never`
-            cache_dir: /var/lib/sbproxy/models
-            models:
-              # Managed catalog v2: exact source revision, file, size,
-              # digest, format, and requirements come from the catalog.
-              - model: qwen2.5-0.5b-instruct
-                variant: q4_k_m
-                keep_alive: 30m
-              # Legacy preview compatibility. It lacks the complete
-              # catalog v2 artifact contract.
-              - model: hf:Qwen/Qwen3-8B-GGUF:Q4_K_M
-                name: qwen3-8b
-                gguf_file: Qwen3-8B-Q4_K_M.gguf
-                engine: llama_cpp
-                keep_alive: 15m
-                # llama-server applies the GGUF's embedded chat template.
-                extra_args: ["--jinja"]
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
+          default_model: qwen
 ```
 
-A managed model is a catalog v2 logical ID plus an optional exact
-`variant:` pin. With no pin, resolution deterministically chooses the
-first compatible safe variant for this worker. Raw
-`hf:Org/Repo:QUANT` and catalog v1 entries still serve through the
-preview migration path. A raw `hf:` entry needs a `name:` and a GGUF
-entry from a multi-file repo should pin `gguf_file:`. `engine` is an
-allowlisted enum (`vllm`, `llama_cpp`), never a command string: config
-picks an engine and its knobs, and the runtime owns the argument
-template; `extra_args` appends engine flags one argv element at a
-time, no shell. `keep_alive` is the idle time before the engine
-unloads to free VRAM; `eviction` decides what happens under VRAM
-pressure, `lru`
-evicts the least-recently-used idle model, `never` pins residency and
-refuses a new model when full. See
-[`examples/ai-local-serving`](../examples/ai-local-serving) and
-[`examples/use-case-local-first`](../examples/use-case-local-first).
+The deployment ID, `local-qwen`, is an operator identity. The provider exposes
+the client model name `qwen`. Several origins may reference the same deployment,
+and one origin may expose a different public name, without creating another
+engine process.
 
-## Managed artifacts
+The complete runnable example is
+[`examples/model-host-managed`](../examples/model-host-managed).
 
-Catalog v2 is the stable artifact boundary. Resolution returns one
-typed artifact identity containing the catalog revision, logical model,
-variant, format, quant, engine, source revision, complete file list,
-context, license, and support state. A canonical SHA-256 of that
-identity addresses the cache.
+## Desired-state authority
 
-Acquisition uses this order:
+`authority` says which system owns deployment definitions:
 
-1. Lock the artifact across processes and inspect any existing state.
-2. Enforce pull intent, `pull` policy, and offline policy before a
-   transport can run.
-3. Resume only when URL, entity tag, expected digest, expected size, and
-   completed byte count still match.
-4. Stage every file under `partials/`, verify exact lengths and hashes,
-   and scan opted-in pickle files before finalization.
-5. Publish blobs and the immutable snapshot atomically, then record a
-   durable ready job.
-6. Hand only verified local paths to vLLM, llama.cpp, or the embedded
-   engine.
+| Value | Behavior |
+|---|---|
+| `file_managed` | `sb.yml` is authoritative. This is the recommended and stable mode for this PR. |
+| `admin_managed` | A revision store at `store_path` is authoritative. The runtime and restart-safe store contract exist, but public desired-state CRUD and the management UI ship in a later PR. |
+| `cluster_authority` | A cluster controller will publish revisions. Multi-node membership and placement are not available yet. |
 
-The cache root contains `blobs/sha256`, `snapshots`, `metadata`,
-`partials`, `locks`, and `jobs`. Credentials are transport-only,
-redacted in formatted errors, zeroized on drop, and absent from disk
-metadata. A failed digest or unsafe pickle never creates a ready
-snapshot.
+`file_managed` participates in ordinary config reload. Editing the file,
+`sbproxy apply`, the file watcher, and `POST /admin/reload` all use the same
+prepare-and-commit transaction.
 
-Pull policy is explicit:
+## Deployment fields
 
-- `on_boot` is acquired and verified before the request pipeline is
-  published. Warming starts no engine and allocates no serving port.
-- `on_demand` is acquired before metadata fit, residency, or launch on
-  the first request.
-- `manual` refuses startup and runtime cache misses. Use an explicit
-  pull.
+`model` must be a catalog v2 logical ID. `variant` pins one exact artifact.
+Omitting it lets the worker choose a compatible variant, but a deployment with
+more than one replica must pin a variant unless
+`heterogeneous_variants: true` is explicit.
+
+Pull policy controls cache misses:
+
+- `on_boot` verifies the artifact while the candidate revision is prepared.
+- `on_demand` waits until the first request needs the deployment.
+- `manual` refuses a cache miss. Run `sbproxy models pull` first.
+
+`warm: true` goes beyond artifact verification and starts the engine before the
+revision becomes active. Use it when readiness must mean the first token path is
+available. A warm failure aborts the candidate revision.
+
+`rollout: rolling` proves that both generations fit before it starts the
+replacement, then drains the old one after the route swap. It fails without
+launching the replacement when overlap capacity is unavailable. `recreate`
+drains and stops the old generation first. If a warm replacement fails, the
+runtime restarts the old generation and keeps the prior revision active.
+`recreate` is usually the safer choice on a single full GPU.
+
+`required_labels` and replicas are part of the desired-state contract, but this
+PR has no multi-node placement service. Keep replicas at one for a real
+single-node deployment.
+
+## Artifacts and cache safety
+
+The cache root contains `blobs/sha256`, `snapshots`, `metadata`, `partials`,
+`locks`, and `jobs`. A snapshot becomes ready only after every declared file
+matches its exact byte length and SHA-256. Unsafe pickle artifacts require an
+explicit catalog opt-in and a supply-chain scan.
+
+Source credentials are transport-only. They are redacted in errors, zeroized on
+drop, and never written to snapshot or job metadata. Explicit pulls accept
+`HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN` for gated repositories.
+
+`cache.budget_gib` is enforced by explicit pull-time collection. Collection
+protects configured, resident, pinned, locked, downloading, verifying, and
+deleting artifacts, and it accounts for shared blobs. A live runtime holds a
+cross-process digest lease, so another CLI process cannot remove its snapshot
+between a stale status check and deletion. Continuous collection after every
+on-demand acquisition is still outside the stable contract.
+
+### Lifecycle commands
+
+Progress always goes to stderr. JSON goes to stdout without ANSI control bytes
+or carriage returns.
 
 ```bash
-# With sb.yml, the default selects configured models plus catalog
-# entries marked on_boot and inherits catalog/cache policy.
+# Pull every configured deployment plus catalog entries marked on_boot.
 sbproxy models pull -f sb.yml
 
-# Without sb.yml, no model arguments selects the on_boot set.
-sbproxy models pull --catalog-file models.yaml
-
-# Pull one exact variant with human progress on stderr.
+# Pull one exact artifact without allowing network access.
 sbproxy models pull qwen2.5-0.5b-instruct \
   --variant q4_k_m \
-  --catalog-file models.yaml \
-  --cache-dir /var/lib/sbproxy/models
+  --offline \
+  --format json
 
-# Permit only verified hits or file: sources.
-sbproxy models pull offline-coder \
+# Inspect the catalog and cache.
+sbproxy models list --format json
+sbproxy models show qwen2.5-0.5b-instruct --format json
+
+# Remove one exact artifact. Configured or resident artifacts fail closed.
+sbproxy models remove qwen2.5-0.5b-instruct \
   --variant q4_k_m \
-  --catalog-file models.yaml \
-  --offline
+  --cache-dir /var/lib/sbproxy/models \
+  --format json
 ```
 
-`-f/--config` resolves `catalog_file` relative to `sb.yml`, inherits
-`cache_dir`, variant and engine choices, and applies `cache_budget_gib`
-after successful pulls. `--all` pulls every catalog v2 model compatible
-with the current worker and reports incompatible variants as skips. `--engine` can force
-`vllm`, `llama-cpp`, or `embedded`. JSON output includes the selected
-variant, engine, artifact digest, verified byte count, snapshot path,
-and durable job ID. `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN` are accepted
-for explicit gated pulls. Runtime secret-reference wiring is not yet a
-stable capability, so pre-pull gated artifacts before startup.
+Every JSON command uses `schema_version: 1` and a stable command name such as
+`models.pull` or `models.remove`. Pull and removal results include durable job
+IDs when a mutation occurred.
 
-`sbproxy models list` shows the selected worker-compatible variant,
-format, exact size, engine, fit, and verified cache state. Incomplete v1
-entries say `preview-incomplete` instead of inferring readiness from a
-nonempty legacy directory. `models show <id>` emits the catalog
-revision and every exact variant, including requirements and files.
+## Managed engines
 
-The artifact service also provides protected LRU collection. It never
-deletes resident, pinned, locked, downloading, verifying, or already
-deleting artifacts, and it accounts for shared physical blobs. The
-`models pull -f` enforces `cache_budget_gib` after a successful pull.
-Automatic server-side enforcement on every on-demand acquisition is
-not wired yet, so the field remains `config_only` in the capability
-matrix and should not be treated as a continuous disk quota in this PR.
+The runtime reports one of four availability states before provisioning:
 
-## Priority lanes and admission
+| State | Meaning |
+|---|---|
+| `available` | A compatible executable is already present. |
+| `acquirable` | The pinned engine can be fetched, built, or provisioned. |
+| `incompatible` | The artifact, engine, or worker cannot run together. |
+| `blocked` | Host policy or an incomplete pin prevents safe provisioning. |
 
-A local engine has a hard concurrency ceiling in a way a cloud API does
-not, so the serve block can cap in-flight requests and queue the rest:
+### llama.cpp
+
+llama.cpp consumes one verified GGUF path. The driver prefers an explicitly
+allowlisted path, then a compatible executable on `PATH`, then pinned
+acquisition. The built-in b9905 release assets have checked-in per-platform
+SHA-256 digests. Downloads use a release lock and publish under an
+asset-identity directory only after verification, so later starts reuse the
+same archive and executable. Apple Silicon uses Metal, and a CPU worker uses
+system RAM.
+
+Linux CUDA can build the pinned llama.cpp source archive on the node. The build
+requires Linux x86-64, an NVIDIA driver, `nvcc`, CMake, a C or C++ compiler, and
+`tar`. The source URL and SHA-256 are fixed, concurrent builders share one lock,
+and only an executable final binary is published. A custom source tag needs an
+explicit archive digest.
 
 ```yaml
-serve:
-  # At most 4 requests inside the engine at once; more wait in a
-  # priority queue. Omit (or 0) to disable the gate entirely.
-  max_concurrent_requests: 4
-  # How long a queued request waits before failing over to the next
-  # provider in the array. Default 30000.
-  queue_timeout_ms: 30000
+engines:
+  llama_cpp:
+    launch: binary
+    version: b9905
+    acceleration: cuda
 ```
 
-The queue is ordered by the calling key's `priority` lane
-(`interactive`, `standard`, or `batch`; unset means standard). A freed
-slot always goes to the highest lane first, oldest request first
-within a lane, so a flood of batch traffic cannot starve an
-interactive key. Two behaviors follow from the lane:
+Live CUDA validation is part of the final GCP PR, so this path remains preview
+despite deterministic source-build coverage in CI.
 
-- **Spill sooner:** when the lane is full and the provider array has a
-  non-served provider later in it, an `interactive` request overflows
-  to that fallback immediately instead of queuing. Standard and batch
-  requests wait.
-- **Timeout equals failover:** a request that exhausts
-  `queue_timeout_ms` fails over like any other failed attempt; with no
-  fallback it surfaces the usual no-provider error.
+### vLLM with uv
 
-The lane rides on the key record, never on a client header, so a
-caller cannot self-promote. Admission decisions land on the
-`sbproxy_serve_lane_admissions_total{priority, decision}` counter and
-each request's lane is attributed in the usage ledger's `priority`
-field.
+vLLM consumes a read-only verified snapshot and requires a CUDA worker. Managed
+uv mode creates a version-pinned environment in the engine cache:
 
-## Inference engines
+```yaml
+engines:
+  vllm:
+    launch: uv
+    version: 0.10.0
+    acceleration: cuda
+```
 
-The model host runs the model through one of two engines. You pick one
-per serve entry with `engine:`, or leave it `auto` and the host chooses
-by model format. Either way sbproxy acquires the engine for you, so a
-bare box serves without a manual install.
+Compatibility checks report Python, torch, CUDA, and vLLM mismatches with a
+bounded remediation. A failed check does not fall back to an unrelated Python
+environment. Launch bounds `max-num-seqs` to deployment concurrency and derives
+the engine KV-cache byte limit from the admitted memory estimate.
 
-| | llama.cpp | vLLM |
-|---|---|---|
-| Model format | GGUF | safetensors (the Hugging Face default) |
-| How sbproxy gets it | fetches a pinned ggml-org prebuilt binary | fetches `uv`, runs vLLM through `uv tool run` |
-| GPU | Metal on Apple Silicon, Vulkan on Linux | CUDA, NVIDIA only |
-| Host prerequisites | none beyond the GPU driver | NVIDIA driver, `build-essential`, `python3-dev` |
-| Good for | a Mac, a laptop, a CPU box, one GGUF file | an NVIDIA GPU serving a safetensors model at throughput |
+### vLLM in a container
 
-### llama.cpp (GGUF)
+Container mode accepts only an immutable `repository@sha256:<digest>` image.
+The runtime creates a private internal network, mounts the verified artifact
+read-only, publishes the engine only on loopback, scopes the selected NVIDIA
+devices, and passes shared memory as a validated typed setting.
 
-llama.cpp serves GGUF weights. sbproxy fetches a pinned ggml-org prebuilt
-`llama-server` for the host platform (a `.tar.gz` release asset), so
-there is no build step and no compiler on the box. On an Apple Silicon
-Mac it uses Metal and the unified memory. On a CPU-only box it runs on
-the CPU against a slice of system RAM. On Linux with an NVIDIA GPU it
-uses the Vulkan build.
+```yaml
+engines:
+  vllm:
+    launch: container
+    # Replace this example digest with the approved image digest.
+    image: vllm/vllm-openai@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    acceleration: cuda
+    shm_size_gib: 8
+```
 
-One caveat on that last case: a stock cloud image such as the GCP Deep
-Learning VM often ships no working NVIDIA Vulkan driver, so the model
-serves on the CPU there even though the GPU is present and `sbproxy
-doctor` detects it. Two ways to get the GPU on Linux with an NVIDIA card:
+Tagged images, `latest`, writable artifact mounts, arbitrary container argv, and
+unscoped devices are rejected. Live container certification is also deferred to
+the final GCP PR.
 
-- Serve a safetensors model on vLLM (below), which uses CUDA.
-- Or put a CUDA-built `llama-server` on `PATH`. sbproxy prefers a
-  `PATH` binary over the fetched Vulkan prebuilt, so this takes over with
-  no config change. `sbproxy doctor` prints these same commands under the
-  llama.cpp acquisition options:
+## Admission and residency
+
+Each deployment has its own active cap and bounded queue. Priority is read from
+the authenticated key record, never from a client header. Waiting requests are
+FIFO within a class, with `interactive` ahead of `standard`, then `batch`.
+
+Memory admission uses the selected device and a full estimate:
+
+```text
+weights + KV cache + runtime overhead + safety margin = reserved bytes
+```
+
+The residency manager never evicts active, queued, preparing, draining, or
+pinned generations. It does not substitute the largest device's free memory for
+the selected device's capacity. `cache.max_resident_models` is one global count
+across all devices. Compatibility `eviction: never` rejects a load that would
+displace any resident generation.
+
+Stable admission reason codes are:
+
+| Reason | Operator action |
+|---|---|
+| `insufficient_capacity` | Choose a smaller variant, reduce context or concurrency, use `recreate`, or move the deployment to a larger device. |
+| `queue_full` | Increase `max_queue_depth`, reduce callers, or add a fallback provider. |
+| `queue_timeout` | Raise `queue_timeout_ms`, reduce load, or add a fallback. |
+| `engine_unhealthy` | Inspect the retained engine error and reset after correcting the cause. |
+| `crash_loop` | Fix the engine or artifact problem, then call reset. Automatic retries stay bounded. |
+| `draining` | Wait for the stop or replacement operation to finish. |
+
+Keep-alive starts after the last request permit is released. Active or queued
+work pauses expiry. A draining deployment rejects new work and waits up to the
+configured shutdown deadline for active requests.
+
+## Status and operations
+
+The admin listener is authenticated and should remain on loopback unless TLS,
+an IP allowlist, and an operator network are configured together.
 
 ```bash
-git clone https://github.com/ggml-org/llama.cpp
-cmake llama.cpp -B build -DGGML_CUDA=ON
-cmake --build build -j --target llama-server
-export PATH="$PWD/build/bin:$PATH"   # or install it somewhere on PATH
+export SB_ADMIN_URL=http://127.0.0.1:9090
+export SB_ADMIN_USERNAME=admin
+export SB_ADMIN_PASSWORD='replace-me'
+
+sbproxy models ps --format json
+sbproxy models stop local-qwen --format json
 ```
 
-  Building needs the CUDA toolkit (`nvcc`) and a C++ compiler; the Deep
-  Learning VM already carries them.
+`models ps` reports deployment generation, state, engine availability, artifact
+digest, selected devices, complete memory estimate, loopback engine port, active
+and queued counts, reason code, job ID, and bounded last error. `models stop`
+enters drain and then stops the selected deployment. The verified artifact stays
+in cache for a later restart.
 
-The Metal path is certified: a GGUF model serves on Metal on an M4 Max,
-the engine fetched and spawned by sbproxy.
+The equivalent authenticated routes are:
 
-### vLLM (safetensors, via uvx)
+```text
+GET  /admin/model-host/status
+POST /admin/model-host/load
+POST /admin/model-host/stop
+POST /admin/model-host/drain
+POST /admin/model-host/reset
+```
 
-vLLM serves safetensors weights, the format most Hugging Face models
-publish, and it is the throughput path on an NVIDIA GPU. vLLM is a Python
-package rather than a single binary, so sbproxy acquires it with `uv`: it
-fetches `uv` (Astral's single static binary, a pinned GitHub release like
-the llama.cpp one) and runs vLLM through `uv tool run`, also known as
-`uvx`. uv provisions and caches the environment on first use and brings
-its own Python, so the box does not need one. The default vLLM wheel is
-CUDA-enabled, so the model offloads to the GPU.
+Load, stop, drain, and reset accept `{"deployment":"local-qwen"}`. The legacy
+`model` request field remains an input alias during the compatibility window.
 
-Opt in with `engines.vllm.acquire.source: uvx`, or let `sbproxy run
-<model>` set it for you:
+Useful metrics include `sbproxy_model_host_active_requests`,
+`sbproxy_model_host_queued_requests`, `sbproxy_model_host_deployment_state`,
+`sbproxy_model_host_admission_rejections_total`, GPU VRAM, compute utilization,
+and memory occupancy. Unknown compute utilization stays absent; memory occupancy
+is a separate measurement and never masquerades as compute activity.
+
+## Reload behavior
+
+The runtime collects canonical and compatibility deployments from every origin.
+It validates the complete catalog, cache and engine policy, routes, capacity,
+and warm preparations before commit. Capacity is reserved before a staged warm
+engine starts. On success it preserves unchanged engine generations and
+replaces only changed deployments. On failure it tears down staged work and
+keeps the prior routes and resident engines. A recreate launch failure also
+restarts the stopped prior generation before returning the error.
+
+A cache root, catalog revision, or engine foundation cannot change under a
+resident deployment. Reconcile to an empty desired state first, then apply the
+new foundation. This rule prevents two incompatible artifact stores or engine
+sets from living in one worker process.
+
+## One-command local run
+
+`sbproxy run` is the fastest route to the same canonical runtime:
+
+```bash
+sbproxy run qwen2.5-0.5b-instruct --variant q4_k_m
+```
+
+It accepts certified catalog IDs, resolves the exact artifact against the real
+worker, generates a high-entropy loopback admin credential, writes a private
+temporary config, enables `pull: on_boot` and `warm: true`, and waits for the
+deployment to report `ready`. Only then does it print the endpoint, admin
+credential, curl request, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` settings.
+The owner-only temporary config is removed when the command returns, including
+startup and readiness failures.
+
+Raw `hf:` references are deliberately rejected by this command because they
+bypass the catalog v2 identity. Operator catalog selection remains available
+through compatibility `serve.catalog_file` in this PR. Canonical custom-catalog
+selection moves into the later model-management plane.
+
+## Migrating from provider `serve:`
+
+Compatibility lowering reads every provider-level `serve:` block, assigns a
+deterministic deployment ID, and routes its public model name through the same
+runtime manager. Equivalent declarations deduplicate. Conflicting routes, cache
+roots, or host policies reject the entire candidate instead of picking the first
+origin.
+
+Move host policy to `proxy.model_host`, then replace each provider block:
 
 ```yaml
-serve:
-  models:
-    - model: hf:Qwen/Qwen2.5-0.5B-Instruct   # a safetensors repo
-      name: qwen
-      engine: vllm
-  engines:
-    vllm:
-      acquire:
-        source: uvx          # fetch uv, run vLLM via `uv tool run`
-        # version: 0.24.0    # pin the vLLM package version (optional)
+# Compatibility form
+- name: local
+  models: [qwen]
+  serve:
+    cache_dir: /var/lib/sbproxy/models
+    models:
+      - model: qwen2.5-0.5b-instruct
+        name: qwen
+        variant: q4_k_m
+        engine: llama_cpp
+        keep_alive: 30m
 ```
 
-The host needs two things: the NVIDIA driver, and a C toolchain plus the
-Python headers (`build-essential`, `python3-dev`). vLLM's Triton
-JIT-compiles a small CUDA helper at engine startup, and that compile
-fails without them, so the engine core will not initialize. The
-Terraform demo installs both on the release path.
+with:
 
-This is certified: on an L4, sbproxy fetched `uv`, ran vLLM through
-`uv tool run`, and served a safetensors model with the weights resident
-in GPU memory (about 21 GiB, 84% GPU utilization). vLLM is Linux and CUDA
-only; a Mac has no GPU passthrough for it.
+```yaml
+proxy:
+  model_host:
+    cache:
+      directory: /var/lib/sbproxy/models
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+        engine: llama_cpp
+        keep_alive_secs: 1800
 
-### Choosing an engine
+origins:
+  "localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
+```
 
-`engine: auto` is the default, and it is what `sbproxy run` uses. It
-picks by model format and host: a GGUF reference goes to llama.cpp, a
-safetensors model goes to vLLM. Set `engine:` on a serve entry to force
-one. `sbproxy doctor` reports which engines the host can run, and for one
-it cannot, the single thing to install.
+Raw repository references, `gguf_file`, arbitrary legacy engine knobs, and
+unsupported LoRA, speculative, chunked-prefill, parser, swap, or offload fields
+do not silently survive canonical preparation. Pin a catalog v2 artifact and
+remove unsupported fields before the compatibility window closes.
 
-## The catalog
+## Related guides
 
-The catalog maps a stable logical ID to immutable executable variants.
-Catalog v2 requires a nonempty `catalog_revision`; logical models carry
-shape, license, family, and context; variants carry exact format,
-quant, engines, source revision, files, hardware requirements, support
-level, and certification evidence. Variant order is deterministic and
-safe tensor formats outrank pickle. Pickle is refused unless the
-logical model explicitly opts in and the bytes pass opcode scanning.
-
-The built-in catalog contains one real pinned bootstrap GGUF while
-older entries migrate from v1. Operator catalogs replace the built-in
-catalog for that `serve:` block. A relative `catalog_file` resolves
-from the directory containing the active `sb.yml`, so startup, reload,
-doctor, and runtime do not depend on the shell's working directory.
-
-## The model manifest
-
-Beyond a throwaway model, keep one reviewable catalog v2 manifest. It
-is the fleet fact sheet; `sb.yml` is the node fact sheet that selects
-logical IDs and variants. `hf:` and `file:` sources are executable;
-ModelScope remains reserved and fails closed. Stable Hugging Face
-variants require a 40-character commit revision. Every file requires a
-safe relative path, positive exact size, and lowercase SHA-256.
-
-The cache honors an explicit `cache_dir`, then `$HF_HOME`, then the
-platform default. See
-[`examples/model-manifest`](../examples/model-manifest) for a real
-pinned artifact and [`examples/use-case-air-gapped`](../examples/use-case-air-gapped)
-for an offline `file:` pull.
-
-## The fit planner
-
-The planner answers two questions the naive "does it fit VRAM" check
-misses. First, capability: a Turing card (a cloud T4) has no FP8
-kernels, so an FP8 quant that would fit by size still cannot run there.
-The planner gates on the card's compute capability, so a T4 refuses FP8
-with a clear message and falls back to an int4 or GGUF quant, while an
-Ada card (an L4) accepts FP8. Second, size: it estimates VRAM as the
-weight bytes for the chosen quant plus the KV-cache bytes at the
-planned context length, `2 x layers x kv_heads x head_dim x bytes x
-seq_len`, times a framework-overhead headroom, and refuses a quant that
-would not fit the free VRAM. It walks the catalog's quant list in
-preference order and returns the first quant that both runs and fits.
-
-## Metrics
-
-The model host publishes `sbproxy_model_host_*` metrics: engine
-time-to-ready, launch and eviction counts, resident-model and
-load-queue-depth gauges, and per-device `gpu_vram_bytes` plus
-`gpu_utilization`. The utilization gauge is the observability view of
-that signal; the `gpu-aware` routing strategy reads a
-`gpu_utilization` entry in each target's metadata, which operators
-feed from a metrics scrape or a sidecar. See
-[`metrics-stability.md`](metrics-stability.md).
-
-## Security
-
-The gateway holds provider keys, so spawning subprocesses from config
-is a real surface and is constrained deliberately: engines are an
-allowlisted enum with runtime-owned argument templates (no arbitrary
-`cmd:`), weights verify against a sha256, and engine binaries come from
-`PATH` or pinned releases. The dedicated security review is tracked
-with the epic.
-
-## Related
-
-- [local-inference.md](local-inference.md) - running embeddings and
-  prompt-injection classify on local ONNX models (the sidecar
-  precedent this generalizes).
-- [ai-gateway.md](ai-gateway.md) - the routing, guardrail, budget, and
-  ledger planes local models plug into.
+- [quickstart-serve.md](quickstart-serve.md) covers the first local completion.
+- [security-model-host.md](security-model-host.md) defines process, artifact,
+  credential, and container boundaries.
+- [admin.md](admin.md) covers admin authentication and lifecycle routes.
+- [model-host-certification.md](model-host-certification.md) is the hardware
+  validation procedure and current evidence ledger.

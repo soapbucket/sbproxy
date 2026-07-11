@@ -61,7 +61,9 @@ impl LocalModelHost for ModelHostRuntime<ProcessEngineLauncher> {
 /// entry when there is exactly one. Ambiguous (several entries, no
 /// match) returns `None` so the caller can report a clear error rather
 /// than route to an arbitrary engine.
-fn pick_served_name(
+/// Select one public local-model name from the request, provider default, or
+/// an unambiguous single candidate.
+pub fn pick_local_model_name(
     names: &[String],
     requested_model: Option<&str>,
     provider: &ProviderConfig,
@@ -106,7 +108,7 @@ pub async fn resolve_served_base_url(
         return Ok(None);
     };
     let names = serve.model_names()?;
-    let name = pick_served_name(&names, requested_model, provider).ok_or_else(|| {
+    let name = pick_local_model_name(&names, requested_model, provider).ok_or_else(|| {
         format!(
             "provider {:?} serves {names:?}: request model {requested_model:?} matches none and there is no unique default; set the request model or a default_model",
             provider.name.as_str()
@@ -150,6 +152,7 @@ mod tests {
         let mut p = ProviderConfig {
             name: "local".into(),
             provider_type: None,
+            deployment: None,
             api_key: None,
             base_url: None,
             models: Vec::new(),

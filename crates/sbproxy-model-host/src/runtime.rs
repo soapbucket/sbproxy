@@ -87,10 +87,23 @@ pub trait ModelHostObserver: Send + Sync {
     fn set_resident_models(&self, count: i64) {
         let _ = count;
     }
-    /// Current GPU stats for `device` (index), for the residency budget
-    /// view: total and free VRAM in bytes and the used fraction.
-    fn set_gpu_stats(&self, device: &str, total_bytes: u64, free_bytes: u64, utilization: f64) {
-        let _ = (device, total_bytes, free_bytes, utilization);
+    /// Current device memory plus independently reported compute utilization
+    /// and derived memory occupancy. Unknown values remain `None`.
+    fn set_gpu_stats(
+        &self,
+        device: &str,
+        total_bytes: u64,
+        free_bytes: u64,
+        compute_utilization: Option<f64>,
+        memory_occupancy: Option<f64>,
+    ) {
+        let _ = (
+            device,
+            total_bytes,
+            free_bytes,
+            compute_utilization,
+            memory_occupancy,
+        );
     }
     /// A LoRA adapter was loaded onto a base engine (WOR-1709), i.e. a
     /// dynamic-paging cache miss that reached the engine.
@@ -120,6 +133,28 @@ pub trait ModelHostObserver: Send + Sync {
     fn on_weight_download(&self, model: &str, bytes: u64, secs: f64, ok: bool) {
         let _ = (model, bytes, secs, ok);
     }
+    /// Exact active and queued request counts for one managed deployment.
+    fn set_deployment_requests(&self, deployment: &str, active: usize, queued: usize) {
+        let _ = (deployment, active, queued);
+    }
+    /// Current lifecycle state for one managed deployment generation.
+    fn set_deployment_state(
+        &self,
+        deployment: &str,
+        engine: Option<crate::EngineKind>,
+        state: crate::DeploymentRuntimeState,
+    ) {
+        let _ = (deployment, engine, state);
+    }
+    /// One bounded admission rejection from the managed runtime.
+    fn on_admission_rejected(
+        &self,
+        deployment: &str,
+        priority: crate::PriorityClass,
+        reason: crate::AdmissionReason,
+    ) {
+        let _ = (deployment, priority, reason);
+    }
 }
 
 /// A [`ModelHostObserver`] that does nothing; the runtime default.
@@ -127,17 +162,17 @@ pub struct NoopObserver;
 impl ModelHostObserver for NoopObserver {}
 
 /// A point-in-time view of the model host for the status admin API
-/// (WOR-1665): what is loaded now and the VRAM picture. Serializable so
+/// (WOR-1665): configured and loaded state plus the VRAM picture. Serializable so
 /// an admin handler can return it as JSON.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelHostStatus {
-    /// Currently resident models, one entry each, sorted by name.
+    /// Every configured model, one entry each, sorted by name.
     pub models: Vec<ModelStatus>,
     /// VRAM residency + per-device view.
     pub vram: VramStatus,
 }
 
-/// The status of one resident model.
+/// The status of one configured model, whether cold or resident.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelStatus {
     /// The served model name (the id every plane sees).
@@ -177,6 +212,10 @@ pub struct DeviceVram {
     pub total_bytes: u64,
     /// Free VRAM at the last probe, in bytes.
     pub free_bytes: u64,
+    /// Compute-engine utilization, when the platform reports it.
+    pub compute_utilization: Option<f64>,
+    /// Occupied-memory fraction derived from total and free bytes.
+    pub memory_occupancy: Option<f64>,
 }
 
 /// Parse a catalog `params` string (`14B`, `30B-A3B`, `120b`, `8M`)
@@ -452,17 +491,12 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     /// Emit the current GPU residency view (per device) to the observer.
     fn report_gpu_stats(&self) {
         for g in self.probe.probe() {
-            let util = if g.total_vram_bytes > 0 {
-                (g.total_vram_bytes.saturating_sub(g.free_vram_bytes)) as f64
-                    / g.total_vram_bytes as f64
-            } else {
-                0.0
-            };
             self.observer.set_gpu_stats(
                 &g.index.to_string(),
                 g.total_vram_bytes,
                 g.free_vram_bytes,
-                util,
+                g.compute_utilization,
+                g.memory_occupancy,
             );
         }
     }
@@ -584,30 +618,34 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     }
 
     /// A point-in-time status snapshot for the admin API (WOR-1665):
-    /// resident models with their engine state, port, and VRAM
+    /// configured models with their engine state, port, and VRAM
     /// estimate, plus the residency budget and per-device totals.
     pub async fn status_snapshot(&self) -> ModelHostStatus {
         let mut models: Vec<ModelStatus> = {
             let engines = self.engines.lock().await;
-            engines
+            self.config
+                .models
                 .iter()
-                .map(|(name, handle)| {
-                    let state = handle.supervisor.state();
-                    let port = state.port();
-                    let keep_alive_secs = self
-                        .config
-                        .models
-                        .iter()
-                        .find(|e| e.effective_name().ok().as_deref() == Some(name.as_str()))
-                        .and_then(|e| e.keep_alive_duration())
-                        .map(|d| d.as_secs());
-                    ModelStatus {
-                        name: name.clone(),
+                .filter_map(|entry| {
+                    let name = entry.effective_name().ok()?;
+                    let (state, port, vram_bytes) = engines.get(&name).map_or_else(
+                        || (crate::EngineState::Idle, None, 0),
+                        |handle| {
+                            let state = handle.supervisor.state();
+                            let port = state.port();
+                            let vram_bytes = handle.supervisor.vram_bytes();
+                            (state, port, vram_bytes)
+                        },
+                    );
+                    Some(ModelStatus {
+                        name,
                         state,
                         port,
-                        vram_bytes: handle.supervisor.vram_bytes(),
-                        keep_alive_secs,
-                    }
+                        vram_bytes,
+                        keep_alive_secs: entry
+                            .keep_alive_duration()
+                            .map(|duration| duration.as_secs()),
+                    })
                 })
                 .collect()
         };
@@ -626,6 +664,8 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                 name: g.name,
                 total_bytes: g.total_vram_bytes,
                 free_bytes: g.free_vram_bytes,
+                compute_utilization: g.compute_utilization,
+                memory_occupancy: g.memory_occupancy,
             })
             .collect();
 
@@ -939,6 +979,21 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         crate::uv_release::ensure_uv(&cache_root, crate::uv_release::DEFAULT_UV_VERSION).await
     }
 
+    async fn acquire_cuda_llama(
+        &self,
+        tag: &str,
+        source_sha256: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        let cache_root =
+            crate::manifest::resolve_cache_dir_default(self.config.cache_dir.as_deref());
+        let plan = crate::CudaBuildPlan::official(&cache_root, tag, source_sha256)
+            .map_err(|error| error.to_string())?;
+        crate::CudaLlamaBuilder::default()
+            .build(&plan, &crate::CudaBuildPrerequisites::detect_system())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     #[cfg(not(feature = "weights"))]
     async fn acquire_uv(&self) -> Result<std::path::PathBuf, String> {
         Err(
@@ -1208,16 +1263,12 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         }
 
         // WOR-1801: acquire the engine binary rather than relying on
-        // PATH alone. The `acquire:` plan resolves it (PATH, an explicit
-        // operator path, or a pinned prebuilt release); a release fetch
-        // happens here so a box with no engine still serves. Best-effort:
-        // it only overrides `spec.program` on success and otherwise
-        // leaves the PATH name for the launcher to resolve (or fail
-        // cleanly on). That keeps a fake/embedded launcher and an on-box
-        // PATH install unaffected, and a genuinely blocked engine (e.g.
-        // vLLM, which is not a single binary) still spawns from PATH as
-        // before rather than aborting admission here. A misconfigured
-        // acquire block is caught earlier, at config validate/plan time.
+        // PATH alone. The `acquire:` plan resolves PATH, an explicit
+        // operator path, a pinned release, or the fixed CUDA source build.
+        // Legacy release and uv failures retain their PATH fallback for
+        // compatibility. An explicit CUDA build fails closed because an
+        // unknown PATH binary cannot prove CUDA support or source identity.
+        // Misconfigured acquisition is caught at config validate/plan time.
         // In-process engines have no binary to acquire.
         if !engine_kind.is_in_process() {
             let prov = self.config.engines.get(&engine_kind);
@@ -1238,6 +1289,13 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                             "engine release acquisition failed: {e}; falling back to PATH"
                         ),
                     }
+                }
+                crate::acquire::BinaryAcquirePlan::BuildCuda { tag, source_sha256 } => {
+                    let path = self
+                        .acquire_cuda_llama(&tag, &source_sha256)
+                        .await
+                        .map_err(RuntimeError::Launch)?;
+                    spec.program = path.to_string_lossy().into_owned();
                 }
                 crate::acquire::BinaryAcquirePlan::ProvisionUvx { vllm_version } => {
                     // Fetch uv, then run vLLM through `uv tool run`. uv sets
@@ -1552,7 +1610,14 @@ mod tests {
         fn set_resident_models(&self, count: i64) {
             self.resident_last.store(count as u64, Ordering::SeqCst);
         }
-        fn set_gpu_stats(&self, _d: &str, _t: u64, _f: u64, _u: f64) {
+        fn set_gpu_stats(
+            &self,
+            _d: &str,
+            _t: u64,
+            _f: u64,
+            _compute: Option<f64>,
+            _memory: Option<f64>,
+        ) {
             self.gpu_reports.fetch_add(1, Ordering::SeqCst);
         }
         fn on_adapter_loaded(&self, _base: &str, _adapter: &str) {
@@ -1723,11 +1788,15 @@ mod tests {
         let rt = l4_runtime(config(
             "models:\n  - model: qwen3-14b\n    keep_alive: 30m\n",
         ));
-        // Nothing loaded yet.
-        let empty = rt.status_snapshot().await;
-        assert!(empty.models.is_empty());
-        assert!(empty.vram.budget_bytes > 0, "L4 budget reported");
-        assert!(!empty.vram.devices.is_empty(), "device listed");
+        // Configured models remain visible before they are resident.
+        let configured = rt.status_snapshot().await;
+        assert_eq!(configured.models.len(), 1);
+        assert_eq!(configured.models[0].name, "qwen3-14b");
+        assert_eq!(configured.models[0].state, crate::EngineState::Idle);
+        assert!(configured.vram.budget_bytes > 0, "L4 budget reported");
+        assert!(!configured.vram.devices.is_empty(), "device listed");
+        assert_eq!(configured.vram.devices[0].compute_utilization, None);
+        assert!(configured.vram.devices[0].memory_occupancy.is_some());
 
         rt.ensure_ready("qwen3-14b").await.expect("ready");
         let s = rt.status_snapshot().await;

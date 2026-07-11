@@ -1,162 +1,198 @@
-# Model host GPU certification
+# Model host hardware certification
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-11*
 
-The model host's core is hardware-independent and unit-tested on CPU
-(see [model-host.md](model-host.md)). The parts that only a real GPU
-and a real engine can prove, that a model loads, serves tokens,
-recovers from a crash, and evicts under pressure, are certified on a
-cloud GPU with this procedure. It is written for a single NVIDIA L4
-(24 GB, Ada, FP8-capable) on GCP, which is the reference certification
-target.
+This page separates evidence already produced by deterministic tests from work
+that requires a real accelerator. It is an evidence ledger and a repeatable
+procedure. Passing a simulated GPU test is never recorded as live hardware
+certification.
 
-The GPU-only code is behind two cargo features that the `sbproxy`
-binary enables by default (the crates themselves leave them off, so
-library builds and the crate-level CI test lane stay GPU-free):
+## Current evidence
 
-- `gpu-nvidia` turns on `NvmlGpuProbe` (real VRAM / compute-capability
-  discovery via NVML at runtime via `dlopen`, with an `nvidia-smi`
-  fallback; nothing CUDA is needed at build time).
-- `weights` (`model-weights` at the binary level) turns on the Hugging
-  Face weight download.
+| Target | Status | Evidence |
+|---|---|---|
+| CPU contracts | covered in CI | Artifact, driver, fit, admission, reconcile, reload, and CLI suites. |
+| Apple Silicon Metal | passed 2026-07-11 | Real managed GGUF completion, status and stop truth, cache reuse, maintenance health, and ready-engine Ctrl-C shutdown on Apple M4 Max. |
+| NVIDIA CUDA single node | pending final GCP PR | Deterministic T4/L4 descriptors, vLLM plans, container isolation, and CUDA llama.cpp source-build tests exist. No live claim is made in this PR. |
+| NVIDIA multi-GPU | pending final GCP PR | Placement and device-scoping tests only. |
+| Three-node GCP runtime | pending final GCP PR | Cluster membership, placement, peer transport, and fleet operations land in later PR groups. |
 
-A released binary therefore needs no rebuild for this procedure; the
-build step below matters when certifying from source. `sbproxy doctor`
-on the box shows what the probe sees before any config is written.
+The generated [capability matrix](model-host-capabilities.md) records Apple
+Metal as stable. NVIDIA stays at `preview` until the final GCP gate is recorded.
 
-## 1. Provision an L4
+### Apple Metal evidence from 2026-07-11
+
+The PR gate ran on arm64 macOS 26.5.1 build 25F80, Apple M4 Max, with 36 GiB
+of memory. The branch worktree was based on `36d95ddd`; the PR description
+records the final review-fix commit that contains the same runtime code.
+
+- Model: `qwen2.5-0.5b-instruct:q4_k_m`
+- Managed engine: llama.cpp b9905 on Metal
+- Artifact identity: `830f2915ca0008994cbddaeba38634f6e999d34fea89c048ebb73753be0a0591`
+- Engine archive SHA-256: `0d3deb02fd7912c8ef360fa33b3b4a8c97967a3ac703c0ed7d5edd3680723ea8`
+- Completion content: `Ready`
+- Ready status: deployment `local`, state `ready`, top-level `serving: true`, and `local_serving.ready: true`
+- Stopped status: deployment `local`, state `stopped`, top-level `serving: false`, and `local_serving.ready: false`
+- Cache reuse: the verified engine archive mtime remained `1783790888` across the repeated launch
+- Shutdown: Ctrl-C exited the gateway cleanly and the observed ready engine PID `8710` was absent afterward
+- Maintenance: repeated health ticks completed without a Tokio panic
+
+## Deterministic gate
+
+These suites run without a GPU and must pass before any hardware run:
 
 ```bash
-gcloud auth login                       # interactive, once
-scripts/provision-l4.sh up              # g2-standard-8 + 1x L4, CUDA image
+cargo test -p sbproxy-model-host --test engine_drivers
+cargo test -p sbproxy-model-host --test cuda_build
+cargo test -p sbproxy-model-host --test runtime_reconcile
+cargo test -p sbproxy-model-host --test local_admission
+cargo test -p sbproxy-core --test model_host_reload
+cargo test -p sbproxy --test models_lifecycle_cli
+```
+
+They prove immutable artifact selection, process argv, container isolation,
+source-build publication, per-device capacity, bounded queue behavior, atomic
+rollback, status shape, and CLI contracts. They cannot prove a driver loads a
+model or returns tokens on real hardware.
+
+## Apple Metal gate for this PR
+
+Use an isolated cache and ports on Apple Silicon:
+
+```bash
+export SBPROXY_SMOKE_CACHE="$(mktemp -d)"
+sbproxy run qwen2.5-0.5b-instruct \
+  --variant q4_k_m \
+  --cache-dir "${SBPROXY_SMOKE_CACHE}" \
+  --port 48123 \
+  --admin-port 48124
+```
+
+After the ready banner:
+
+```bash
+curl http://127.0.0.1:48123/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwen2.5-0.5b-instruct","messages":[{"role":"user","content":"Return only the word ready."}]}'
+
+export SB_ADMIN_URL=http://127.0.0.1:48124
+export SB_ADMIN_USERNAME=admin
+export SB_ADMIN_PASSWORD='paste-the-generated-password'
+sbproxy models ps --format json
+sbproxy models stop local --format json
+```
+
+The completion must contain nonempty assistant content. Status must report
+deployment `local`, state `ready`, engine `llama_cpp`, a Metal-selected worker,
+and the verified artifact digest. Stop must reach `stopped` without deleting the
+snapshot. A second run against the same cache must verify a cache hit without
+another weight download.
+
+Record the final binary revision and retained command output in the PR
+description. The evidence above promotes the Apple capability from `preview`
+to `stable`; regenerate the matrix whenever this record changes.
+
+## Final GCP NVIDIA gate
+
+The user explicitly reserved NVIDIA and multi-node validation for the final PR
+group. Run this procedure only after the cluster and fleet slices have landed.
+
+### Provision an L4 worker
+
+```bash
+gcloud auth login
+scripts/provision-l4.sh up
 scripts/provision-l4.sh ssh
 ```
 
-Check L4 quota first if `up` fails with a quota error:
+Check regional quota if provisioning fails:
 
 ```bash
 gcloud compute regions describe us-central1 \
-  --format="value(quotas)" | tr ',' '\n' | grep -i l4
+  --format='value(quotas)'
 ```
 
-Tear the VM down when finished, so billing stops:
+Tear the VM down after the run:
 
 ```bash
 scripts/provision-l4.sh down
 ```
 
-## 2. Install the engine and build sbproxy (on the box)
+### Single-node vLLM
 
-```bash
-# vLLM in a uv venv (or a container; see the design doc).
-pipx install uv && uv venv && uv pip install vllm
+Use a catalog v2 safetensors artifact and canonical engine policy:
 
-# Build sbproxy. The GPU features are already in the binary's default
-# feature set. A from-scratch box also needs cmake, clang,
-# protobuf-compiler, and python3-dev (see the test-tier note at the
-# end).
-cargo build --release -p sbproxy
+```yaml
+proxy:
+  model_host:
+    engines:
+      vllm:
+        launch: uv
+        version: 0.10.0
+        acceleration: cuda
+    deployments:
+      gpu-qwen:
+        model: REPLACE_WITH_CERTIFIED_SAFETENSORS_MODEL
+        variant: REPLACE_WITH_PINNED_VARIANT
+        pull: on_boot
+        warm: true
+        engine: vllm
 ```
 
-## 3. Run with a serve: config and certify
+The gate must prove all of the following with retained logs and status output:
 
-Point an `ai_proxy` provider at a small model with a `serve:` block
-(see [`examples/ai-local-serving`](../examples/ai-local-serving)), start
-the proxy, then:
+1. NVML or the `nvidia-smi` fallback reports the exact device and compute
+   capability.
+2. The artifact downloads once, verifies, and reaches the immutable snapshot.
+3. Managed uv provisions the pinned vLLM version and passes Python, torch, and
+   CUDA compatibility checks.
+4. A chat completion returns nonempty assistant content through the gateway.
+5. Status reports selected device, artifact digest, memory breakdown, engine
+   port, active and queued counts, and ready state.
+6. Stop drains, reaps the engine process tree, and preserves verified bytes.
+7. Restart reuses the artifact and managed environment.
 
-```bash
-MODEL=qwen3-8b ENGINE_PID=<engine pid> scripts/certify-model-host.sh
-```
+Repeat with a digest-pinned container. Inspect the exact Docker or Podman argv,
+private network, loopback port, read-only snapshot mount, selected devices, and
+shared-memory bound.
 
-The script checks the Definition of Done:
+### CUDA llama.cpp
 
-1. the first call returns tokens (cold load allowed a long timeout);
-2. the second call is materially faster (model resident);
-3. `kill -9` on the engine is recovered from and the next call serves;
-4. an FP8 request is accepted on the L4 (and, on a T4, refused with a
-   capability message rather than a generic error).
+On Linux x86-64 with the NVIDIA toolkit installed, configure llama.cpp binary
+launch with `acceleration: cuda`. The gate must show the official source archive
+digest, shared build lock, successful CMake CUDA build, atomic executable
+publication, GGUF load, and a completion through the gateway. Repeat once from
+the ready build cache to prove no rebuild occurs.
 
-A second model larger than the remaining VRAM should evict the idle
-one rather than OOM; drive that by requesting two models in sequence
-and watching `sbproxy_model_host_evictions_total` and
-`sbproxy_model_host_resident_models`.
+### T4 capability refusal
 
-## 4. Lower-end card (optional)
+Repeat the compatibility portion on a T4. An FP8-only artifact must fail with a
+bounded incompatibility reason, while a compatible int4 or GGUF variant may be
+selected. A generic engine error is not acceptable evidence.
 
-To certify the capability gate on Turing, repeat on a T4 (16 GB, no
-FP8): an FP8-only model must be refused with a capability message and
-the planner must fall back to an int4 / GGUF quant. The `nvidia-l4`
-accelerator in `provision-l4.sh` becomes `nvidia-tesla-t4` with an
-`n1` machine type.
+### Multi-node gate
 
-## What this certifies
+After cluster authority exists, provision three GCP nodes with mixed labels or
+devices. Record membership convergence, deterministic placement, peer identity,
+revision propagation, request dispatch, node loss, replacement, and fleet CLI
+status. A worker must never select a variant outside the catalog or receive an
+artifact path from another node without passing the peer and artifact trust
+boundaries.
 
-Passing this closes the hardware-gated half of the model-host epic: the
-`NvmlGpuProbe`, the weight download, and the launcher driving a real
-vLLM, end to end. The CPU-tested planner, supervisor state machine,
-residency manager, and metrics do not change; this proves they hold
-against real hardware.
+## Evidence retention
 
-## Test tiers (the CI matrix)
+For every live run, retain:
 
-The model host is tested in two tiers, because the interesting parts
-split cleanly into "runs anywhere" and "needs a real GPU."
+- git revision and dirty status;
+- binary version and feature set;
+- operating system, kernel, driver, CUDA, container runtime, and engine versions;
+- catalog revision, logical model, variant, source revision, and artifact digest;
+- generated config with secrets removed;
+- readiness, completion, status, stop, and restart output;
+- relevant `sbproxy_model_host_*` metrics;
+- failure logs for every expected refusal;
+- GCP machine type, accelerator type, zone, and teardown confirmation.
 
-**Tier 0, CPU, every push (CI).** The whole crate except the two
-GPU/network cargo features. This is the bulk of the coverage and runs
-in the normal workspace gate (`cargo nextest run --workspace`): the fit
-planner and capability gate (synthetic T4/L4 descriptors via
-`StaticGpuProbe`), the KV-quant lever, the supervisor state machine and
-backoff, the residency/eviction solver (evict-large-idle, pinned
-protection, reload-cost tiebreak), the launch-spec argv templates, the
-metadata parser, the sleep/wake client (against a mock endpoint), the
-`ModelHostRuntime` orchestration (with a fake launcher), the metrics
-observer seam, and the request-path resolution (`resolve_served_base_url`
-against a fake engine that binds a real loopback endpoint). The
-`gpu-nvidia` and `weights` features are off at the crate level, so
-this lane needs no GPU, no CUDA, and no network (the binary's default
-features only dlopen NVML at runtime; they add no build-time GPU
-dependency either).
-
-**Tier 1, real GPU, manual.** The code Tier 0 cannot exercise: NVML
-discovery, the Hugging Face weight pull, and a launcher spawning a real
-vLLM / llama-server. This is the procedure above, driven by the
-`gpu_cert` example built with `--features gpu-nvidia,weights`. Its modes
-map to what each certifies: `probe` (NVML + capability gate + throughput),
-`weights` (HF pull), `runtime` (spawn to tokens, evict-reap-reload),
-`sleepwake` (vLLM sleep/wake), `llamacpp` (llama.cpp GGUF serve),
-`translators` (structured-output / tool-calling / Open-Responses through
-the served engine), and the full binary end-to-end (a `serve:`-only
-config, `POST /v1/chat/completions`, `/admin/model-host/status`,
-`/metrics`).
-
-There is no cloud-GPU CI runner today, so Tier 1 is run by hand on an L4
-(and a T4 for the capability-refusal path) at feature-complete points,
-not per push. A fresh Deep Learning image also needs `cmake`, `clang`,
-`protobuf-compiler`, and `python3-dev` for the full binary and for
-vLLM's runtime `torch.compile`; the `gpu_cert` example alone needs none
-of these.
-
-## Embedded engine (mistral.rs)
-
-The in-process embedded engine (`engine: embedded`) runs a
-model inside the gateway with no subprocess, behind the off-by-default
-`embedded` cargo feature. It has its own cert mode, since it neither
-spawns a process nor uses the Hugging Face weight-pull path (mistral.rs
-does its own download):
-
-```bash
-# HF_TOKEN is required for gated repos such as Gemma.
-HF_TOKEN=hf_... cargo run --release --example gpu_cert \
-  --features embedded,gpu-nvidia -- embedded google/gemma-2-2b-it
-```
-
-This loads the model with mistral.rs (in-situ 4-bit quantized), serves
-it on a loopback OpenAI endpoint, and asserts a `/v1/chat/completions`
-request returns tokens. It certifies the whole embedded path:
-`ModelBuilder` load, the axum server, and the runtime routing to it like
-any other engine. Repeat with a Qwen or Llama id to confirm other
-architectures. Gemma is Hugging Face-gated, so accept the license and
-set `HF_TOKEN`; without it the load fails with an auth error. The
-`embedded` feature pulls the (large) mistral.rs + candle trees, so build
-it only for this cert, not in the default binary.
+Do not promote a capability from this checklist alone. Promotion requires the
+recorded output attached to the PR and a deterministic regression test for any
+bug found during the hardware run.

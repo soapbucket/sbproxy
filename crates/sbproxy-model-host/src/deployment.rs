@@ -68,6 +68,9 @@ pub struct ModelDeployment {
     /// Per-replica request concurrency cap.
     #[serde(default)]
     pub max_concurrency: Option<u32>,
+    /// Maximum requests waiting behind active capacity.
+    #[serde(default = "default_max_queue_depth")]
+    pub max_queue_depth: usize,
     /// Maximum queue wait in milliseconds.
     #[serde(default = "default_queue_timeout_ms")]
     pub queue_timeout_ms: u64,
@@ -85,6 +88,10 @@ const fn one_replica() -> u32 {
 
 const fn default_queue_timeout_ms() -> u64 {
     30_000
+}
+
+const fn default_max_queue_depth() -> usize {
+    128
 }
 
 /// Validated immutable desired-state revision.
@@ -269,6 +276,11 @@ fn validate_common(
         if matches!(deployment.max_concurrency, Some(0)) {
             return Err(DeploymentError::Invalid(format!(
                 "deployment '{id}' max_concurrency must be positive"
+            )));
+        }
+        if deployment.queue_timeout_ms == 0 {
+            return Err(DeploymentError::Invalid(format!(
+                "deployment '{id}' queue_timeout_ms must be positive"
             )));
         }
         for (key, value) in &deployment.required_labels {

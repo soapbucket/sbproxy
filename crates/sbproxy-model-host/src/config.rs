@@ -142,14 +142,14 @@ pub enum EngineLaunchMethod {
     /// Run the engine from a pinned container image.
     Container,
     /// Run the engine from a managed uv/venv (vLLM's Python path).
+    #[serde(alias = "uv")]
     Venv,
 }
 
 /// Hardware-acceleration flavour to acquire a binary engine build for
-/// (WOR-1801). `Auto` picks from the host GPU: Apple gets the Metal
-/// build (built into the macOS asset), an NVIDIA Linux box gets the
-/// Vulkan build (ggml-org ships no CUDA Linux prebuilt), everything else
-/// gets the CPU build.
+/// (WOR-1801). `Auto` picks from the host: Apple gets the Metal build,
+/// a compatible NVIDIA Linux host may build CUDA from pinned source, and
+/// other hosts use the platform release.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -158,9 +158,8 @@ pub enum EngineAccel {
     /// Detect from the host GPU.
     #[default]
     Auto,
-    /// CUDA. For llama.cpp on Linux this resolves to the Vulkan prebuilt
-    /// (no upstream CUDA Linux asset); a CUDA container or source build
-    /// is the alternative.
+    /// CUDA. llama.cpp uses the digest-pinned Linux source-build path
+    /// because upstream does not publish a CUDA Linux release asset.
     Cuda,
     /// Vulkan (a portable GPU path on Linux).
     Vulkan,
@@ -192,6 +191,8 @@ pub enum AcquireSource {
     /// single-binary release. `version` pins the *engine package* version
     /// (the vLLM version); the `uv` version is pinned internally.
     Uvx,
+    /// Build a digest-pinned llama.cpp source archive with fixed CMake CUDA flags.
+    SourceBuild,
 }
 
 /// The `acquire:` block on a binary engine's provisioning (WOR-1801):
@@ -203,18 +204,19 @@ pub struct EngineAcquire {
     /// Where the binary comes from. Defaults to a pinned release.
     #[serde(default)]
     pub source: AcquireSource,
-    /// Release tag to pin (for `release`); `None` uses the built-in
-    /// default pin. Never `latest`.
+    /// Release or source tag to pin; `None` uses the built-in default.
+    /// Never `latest`.
     #[serde(default)]
     pub version: Option<String>,
-    /// Acceleration flavour to fetch (for `release`).
+    /// Acceleration flavour to acquire.
     #[serde(default)]
     pub accel: EngineAccel,
     /// Explicit binary path (required for `path`).
     #[serde(default)]
     pub path: Option<String>,
-    /// Expected sha256 hex of the release asset. Verifies the download
-    /// when set; a `release` fetch without it logs a warning.
+    /// Expected SHA-256 of the release asset or source archive. A
+    /// `release` fetch without it logs a warning; CUDA source builds
+    /// require it unless using the built-in source pin.
     #[serde(default)]
     pub sha256: Option<String>,
 }
@@ -236,6 +238,9 @@ pub struct EngineProvisioning {
     /// `PATH` only.
     #[serde(default)]
     pub acquire: Option<EngineAcquire>,
+    /// Shared-memory allocation in GiB for container launch.
+    #[serde(default)]
+    pub shm_size_gib: Option<u64>,
 }
 
 impl EngineProvisioning {
@@ -255,6 +260,19 @@ impl EngineProvisioning {
                 }
             }
         }
+    }
+
+    /// Whether the image uses an immutable full SHA-256 digest.
+    pub fn image_is_digest_pinned(&self) -> bool {
+        let Some(image) = self.image.as_deref() else {
+            return false;
+        };
+        let Some((repository, digest)) = image.rsplit_once("@sha256:") else {
+            return false;
+        };
+        !repository.is_empty()
+            && digest.len() == 64
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
 }
 
@@ -401,7 +419,6 @@ pub struct ServeEntry {
     /// at boot from the weight format and what is installed).
     #[serde(default)]
     pub engine: EngineChoice,
-    /// Support: preview.
     /// Idle time before the engine is unloaded to free VRAM. Go
     /// duration syntax (`10m`, `1h`); `None` means never auto-unload.
     #[serde(default)]
@@ -525,7 +542,6 @@ pub struct ModelHostConfig {
     /// the only limit, exactly as before.
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
-    /// Support: preview.
     /// How long a queued request waits for a served-lane slot before
     /// the attempt fails over to the next provider (or errors when no
     /// fallback exists). Milliseconds; defaults to 30000. Read only
@@ -686,6 +702,9 @@ impl ModelHostConfig {
                         prov.image
                     ));
                 }
+                if matches!(prov.shm_size_gib, Some(0)) {
+                    return Err(format!("engine {kind:?} shm_size_gib must be positive"));
+                }
             }
             // Acquire-block coherence (WOR-1801): a `path` source needs a
             // path; a pinned `version` must not be `latest`.
@@ -701,6 +720,13 @@ impl ModelHostConfig {
                         "engine {kind:?} acquire.version must be pinned, not `latest`"
                     ));
                 }
+                if *kind == EngineKind::LlamaCpp {
+                    if let Some(version) = acq.version.as_deref() {
+                        crate::llama_release::validate_pinned_tag(version).map_err(|reason| {
+                            format!("engine {kind:?} acquire.version is invalid: {reason}")
+                        })?;
+                    }
+                }
                 // `uvx` provisions a Python package via `uv tool run`, which
                 // is the vLLM path; a binary engine (llama.cpp) uses a
                 // release or an explicit path instead.
@@ -708,6 +734,14 @@ impl ModelHostConfig {
                     return Err(format!(
                         "engine {kind:?} acquire.source: uvx is only for vllm (a Python package); \
                          use release or path for a binary engine"
+                    ));
+                }
+                if acq.source == AcquireSource::SourceBuild
+                    && (*kind != EngineKind::LlamaCpp
+                        || !matches!(acq.accel, EngineAccel::Auto | EngineAccel::Cuda))
+                {
+                    return Err(format!(
+                        "engine {kind:?} acquire.source: source_build requires llama_cpp with auto or cuda acceleration"
                     ));
                 }
             }
@@ -1233,6 +1267,15 @@ models:
         )
         .unwrap();
         assert!(noimg.validate().unwrap_err().contains("no image"));
+
+        let unsafe_source_tag: ModelHostConfig = serde_yaml::from_str(
+            "engines:\n  llama_cpp:\n    acquire:\n      source: source_build\n      version: ../escape\n      accel: cuda\nmodels:\n  - model: qwen3-14b\n",
+        )
+        .unwrap();
+        assert!(unsafe_source_tag
+            .validate()
+            .unwrap_err()
+            .contains("acquire.version"));
     }
 
     #[test]
