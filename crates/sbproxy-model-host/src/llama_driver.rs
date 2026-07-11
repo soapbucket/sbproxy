@@ -436,7 +436,7 @@ impl EngineDriver for LlamaCppDriver {
             "--ctx-size".to_string(),
             request.fit.seq_len.to_string(),
             "--n-gpu-layers".to_string(),
-            if request.selected_devices.is_empty() {
+            if request.accelerator == AcceleratorKind::Cpu {
                 "0".to_string()
             } else {
                 "999".to_string()
@@ -455,7 +455,7 @@ impl EngineDriver for LlamaCppDriver {
             &request.extra_args,
         )?);
         let mut environment = BTreeMap::new();
-        if !request.selected_devices.is_empty() {
+        if request.accelerator == AcceleratorKind::Cuda && !request.selected_devices.is_empty() {
             environment.insert(
                 "CUDA_VISIBLE_DEVICES".to_string(),
                 request
@@ -484,8 +484,10 @@ impl EngineDriver for LlamaCppDriver {
             kind: EngineKind::LlamaCpp,
             port: request.port,
             selected_devices: request.selected_devices.clone(),
+            accelerator: request.accelerator,
             started_at_ms: unix_time_ms()?,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            memory: request.fit.memory.clone(),
             process,
         })
     }

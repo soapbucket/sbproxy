@@ -437,6 +437,7 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
         warm: config.warm,
         keep_alive_secs: config.keep_alive_secs,
         max_concurrency: config.max_concurrency,
+        max_queue_depth: config.max_queue_depth,
         queue_timeout_ms: config.queue_timeout_ms,
         engine: match config.engine {
             ManagedEngineChoice::Auto => EngineChoice::Auto,
@@ -480,6 +481,7 @@ fn lower_legacy_deployment(
             .keep_alive_duration()
             .map(|duration| duration.as_secs()),
         max_concurrency,
+        max_queue_depth: 128,
         queue_timeout_ms: host.queue_timeout_ms.unwrap_or(30_000),
         engine: entry.engine,
         rollout: RolloutPolicy::Rolling,

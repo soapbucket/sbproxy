@@ -30,6 +30,7 @@
 //! - [`config`] - the `serve:` config block an operator writes.
 
 pub mod acquire;
+pub mod admission;
 pub mod artifact;
 pub mod artifact_spec;
 pub mod capabilities;
@@ -39,6 +40,7 @@ pub mod cuda_build;
 pub mod deployment;
 pub mod deployment_store;
 pub mod desired;
+pub mod device_residency;
 #[cfg(feature = "embedded")]
 pub mod embedded;
 pub mod engine_driver;
@@ -73,6 +75,10 @@ pub mod vllm_driver;
 pub mod weights;
 
 pub use acquire::{plan_binary_acquire, plan_binary_acquire_with_cuda, BinaryAcquirePlan};
+pub use admission::{
+    AdmissionCounts, AdmissionGate, AdmissionPermit, AdmissionReason, AdmissionRejection,
+    DrainReport,
+};
 #[cfg(feature = "weights")]
 pub use artifact::HttpArtifactTransport;
 pub use artifact::{
@@ -113,14 +119,18 @@ pub use desired::{
     DesiredStateError, LegacyHostPolicy, LegacyServeInput, ManagedProviderInput,
     RuntimeDesiredInput, RuntimeDesiredState,
 };
+pub use device_residency::{
+    DeviceReservation, DeviceReservationResult, DeviceResidencySet, ResidencyProtection,
+};
 pub use engine_driver::{
     validate_engine_args, EngineAvailability, EngineCapabilities, EngineDetection, EngineDriver,
     EngineDriverError, EngineFailureReason, EngineHealth, LaunchRequest, ProvisionRequest,
     ProvisionedEngine, RunningEngine,
 };
 pub use fit::{
-    estimate_throughput, fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
-    ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
+    estimate_throughput, fp8_supported, plan_fit_auto_kv_with_margin, plan_fit_kv_with_margin,
+    FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor, MemoryEstimate, ModelMetadata, Quant,
+    StaticGpuProbe, ThroughputEstimate,
 };
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
 pub use jobs::{

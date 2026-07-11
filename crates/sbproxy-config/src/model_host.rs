@@ -88,6 +88,9 @@ pub struct ManagedDeploymentConfig {
     /// Per-replica in-flight request cap.
     #[serde(default)]
     pub max_concurrency: Option<u32>,
+    /// Maximum requests waiting behind active capacity.
+    #[serde(default = "default_max_queue_depth")]
+    pub max_queue_depth: usize,
     /// Maximum queue wait in milliseconds.
     #[serde(default = "default_queue_timeout_ms")]
     pub queue_timeout_ms: u64,
@@ -105,6 +108,10 @@ const fn one_replica() -> u32 {
 
 const fn default_queue_timeout_ms() -> u64 {
     30_000
+}
+
+const fn default_max_queue_depth() -> usize {
+    128
 }
 
 /// Supported managed inference engines.

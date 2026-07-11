@@ -576,6 +576,7 @@ mod tests {
             estimated_vram_bytes: 12 * crate::fit::GIB,
             gpu_index: 0,
             seq_len: 8192,
+            memory: crate::MemoryEstimate::from_total(0, 12 * crate::fit::GIB),
         }
     }
 

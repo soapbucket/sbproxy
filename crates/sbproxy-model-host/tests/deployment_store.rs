@@ -22,6 +22,7 @@ fn deployment(model: &str) -> ModelDeployment {
         warm: false,
         keep_alive_secs: None,
         max_concurrency: Some(8),
+        max_queue_depth: 128,
         queue_timeout_ms: 30_000,
         engine: EngineChoice::Auto,
         rollout: RolloutPolicy::Rolling,

@@ -13,7 +13,19 @@
 //! (enterprise), which reuses this decision.
 
 /// A request's SLO priority, highest first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum PriorityClass {
     /// Latency-critical interactive traffic (chat UIs, agents).
     Interactive,
@@ -25,7 +37,7 @@ pub enum PriorityClass {
 
 impl PriorityClass {
     /// Rank, lower is higher priority (Interactive = 0).
-    fn rank(self) -> u8 {
+    pub(crate) const fn rank(self) -> u8 {
         match self {
             PriorityClass::Interactive => 0,
             PriorityClass::Standard => 1,

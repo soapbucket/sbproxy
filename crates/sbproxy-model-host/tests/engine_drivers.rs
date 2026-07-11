@@ -103,9 +103,11 @@ impl EngineDriver for FixtureDriver {
             generation: request.generation,
             kind: provisioned.kind,
             port: request.port,
+            accelerator: request.accelerator,
             selected_devices: request.selected_devices.clone(),
             started_at_ms: 1,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            memory: request.fit.memory.clone(),
             process: Arc::new(FixtureProcess {
                 stopped: AtomicBool::new(false),
             }),
@@ -219,6 +221,7 @@ fn fit() -> FitPlan {
         estimated_vram_bytes: 1024,
         gpu_index: 0,
         seq_len: 4096,
+        memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1024),
     }
 }
 
@@ -253,7 +256,8 @@ async fn driver_contract_is_complete_and_object_safe() {
                     artifact: ready(kind, format),
                     fit: fit(),
                     port: 18080,
-                    selected_devices: vec![0],
+                    accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+                    selected_devices: Vec::new(),
                     kv_quant: KvCacheQuant::Auto,
                     extra_args: Vec::new(),
                     ready_timeout: Duration::from_secs(1),
@@ -411,7 +415,8 @@ async fn crash_loop_observes_backoff_retains_failure_and_requires_durable_reset(
         artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
         fit: fit(),
         port: 18080,
-        selected_devices: vec![0],
+        accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+        selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
         ready_timeout: Duration::from_secs(1),
@@ -587,7 +592,8 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
         fit: fit(),
         port: 18080,
-        selected_devices: vec![0],
+        accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+        selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: vec!["--flash-attn".to_string()],
         ready_timeout: Duration::from_secs(1),
@@ -612,7 +618,8 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
         fit: fit(),
         port: 18080,
-        selected_devices: vec![0],
+        accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+        selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
         ready_timeout: Duration::from_secs(1),
@@ -622,6 +629,37 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         .validate(EngineKind::LlamaCpp)
         .expect_err("unverified metadata");
     assert_eq!(error.reason(), EngineFailureReason::ArtifactNotReady);
+}
+
+#[test]
+fn launch_request_requires_devices_that_match_the_accelerator() {
+    let mut request = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 1,
+        artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+        fit: fit(),
+        port: 18080,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
+        selected_devices: Vec::new(),
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: Vec::new(),
+        ready_timeout: Duration::from_secs(1),
+    };
+    assert_eq!(
+        request.validate(EngineKind::LlamaCpp).unwrap_err().reason(),
+        EngineFailureReason::EngineInternal
+    );
+
+    request.accelerator = sbproxy_model_host::AcceleratorKind::Metal;
+    assert_eq!(
+        request.validate(EngineKind::LlamaCpp).unwrap_err().reason(),
+        EngineFailureReason::EngineInternal
+    );
+
+    request.selected_devices = vec![0];
+    request
+        .validate(EngineKind::LlamaCpp)
+        .expect("one Metal device");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1054,6 +1092,7 @@ async fn llama_launch_uses_one_verified_gguf_and_runtime_owned_network_and_devic
         artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
         fit: fit(),
         port: 18080,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
         selected_devices: vec![2],
         kv_quant: KvCacheQuant::Int4,
         extra_args: vec!["--flash-attn".to_string()],
@@ -1088,6 +1127,44 @@ async fn llama_launch_uses_one_verified_gguf_and_runtime_owned_network_and_devic
     assert_eq!(flag_value(arguments, "--cache-type-k"), "q4_0");
     assert_eq!(flag_value(arguments, "--cache-type-v"), "q4_0");
     assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "2");
+}
+
+#[tokio::test]
+async fn llama_metal_launch_offloads_without_exporting_a_cuda_device() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let driver = LlamaCppDriver::new(
+        fixture_runner(commands.clone()),
+        llama_source(Some("/usr/bin/llama-server"), true),
+    );
+    let provisioned = ProvisionedEngine {
+        kind: EngineKind::LlamaCpp,
+        executable: PathBuf::from("/usr/bin/llama-server"),
+        version: Some("fixture".to_string()),
+        fingerprint: "fixture".to_string(),
+        provisioning: EngineProvisioning::default(),
+    };
+    driver
+        .launch(
+            &provisioned,
+            &LaunchRequest {
+                deployment: "mac-coder".to_string(),
+                generation: 1,
+                artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+                fit: fit(),
+                port: 18081,
+                accelerator: sbproxy_model_host::AcceleratorKind::Metal,
+                selected_devices: vec![0],
+                kv_quant: KvCacheQuant::Auto,
+                extra_args: Vec::new(),
+                ready_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+
+    let captured = commands.lock().unwrap();
+    assert_eq!(flag_value(&captured[0].arguments, "--n-gpu-layers"), "999");
+    assert!(!captured[0].environment.contains_key("CUDA_VISIBLE_DEVICES"));
 }
 
 fn flag_value<'a>(arguments: &'a [String], flag: &str) -> &'a str {
@@ -1388,6 +1465,7 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
         artifact: ready(EngineKind::Vllm, ArtifactFormat::Safetensors),
         fit: fit(),
         port: 18124,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
         selected_devices: vec![3],
         kv_quant: KvCacheQuant::Fp8,
         extra_args: vec!["--enable-prefix-caching".to_string()],
@@ -1450,6 +1528,7 @@ acquire:
                 artifact: ready(EngineKind::Vllm, ArtifactFormat::Safetensors),
                 fit: fit(),
                 port: 18125,
+                accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
                 selected_devices: vec![0],
                 kv_quant: KvCacheQuant::Auto,
                 extra_args: Vec::new(),
@@ -1475,6 +1554,7 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
         artifact: ready(EngineKind::Vllm, ArtifactFormat::Safetensors),
         fit: fit(),
         port: 18123,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
         selected_devices: vec![1],
         kv_quant: KvCacheQuant::Auto,
         extra_args: vec!["--enable-prefix-caching".to_string()],

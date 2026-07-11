@@ -1,0 +1,445 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Soap Bucket LLC
+
+//! Per-deployment bounded priority admission and drain lifecycle.
+
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{oneshot, Notify};
+
+use crate::PriorityClass;
+
+/// Stable local admission rejection taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionReason {
+    /// Selected device cannot hold the requested generation.
+    InsufficientCapacity,
+    /// Per-deployment queue reached its configured bound.
+    QueueFull,
+    /// Request did not reach active capacity before its deadline.
+    QueueTimeout,
+    /// Engine health prevents safe admission.
+    EngineUnhealthy,
+    /// Engine launch budget is exhausted until explicit reset.
+    CrashLoop,
+    /// Deployment is draining and rejects new work.
+    Draining,
+}
+
+impl AdmissionReason {
+    /// Stable snake-case reason code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InsufficientCapacity => "insufficient_capacity",
+            Self::QueueFull => "queue_full",
+            Self::QueueTimeout => "queue_timeout",
+            Self::EngineUnhealthy => "engine_unhealthy",
+            Self::CrashLoop => "crash_loop",
+            Self::Draining => "draining",
+        }
+    }
+}
+
+impl std::fmt::Display for AdmissionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Bounded operator-safe admission rejection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, thiserror::Error)]
+#[error("{reason}: {detail}")]
+pub struct AdmissionRejection {
+    /// Stable reason code.
+    pub reason: AdmissionReason,
+    /// Concise bounded explanation.
+    pub detail: String,
+    /// Whether a later attempt may succeed without config changes.
+    pub retryable: bool,
+    /// Suggested delay before retry, when meaningful.
+    pub retry_after_ms: Option<u64>,
+}
+
+impl AdmissionRejection {
+    /// Construct a bounded rejection.
+    pub fn new(
+        reason: AdmissionReason,
+        detail: impl AsRef<str>,
+        retryable: bool,
+        retry_after_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            reason,
+            detail: bounded_detail(detail.as_ref()),
+            retryable,
+            retry_after_ms,
+        }
+    }
+}
+
+/// Current active and queued request counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdmissionCounts {
+    /// Requests holding an active permit.
+    pub active: usize,
+    /// Live waiters in the priority queue.
+    pub queued: usize,
+    /// Whether new work is rejected for drain.
+    pub draining: bool,
+}
+
+/// Result of one bounded drain wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DrainReport {
+    /// Active requests when drain began.
+    pub active_at_start: usize,
+    /// Queued requests rejected when drain began.
+    pub cancelled_queued: usize,
+    /// Active requests still present when the wait returned.
+    pub remaining_active: usize,
+    /// Whether the deadline elapsed before every active permit left.
+    pub timed_out: bool,
+}
+
+struct Waiter {
+    id: u64,
+    priority: PriorityClass,
+    arrival: u64,
+    sender: oneshot::Sender<Result<(), AdmissionRejection>>,
+}
+
+struct GateState {
+    active: usize,
+    draining: bool,
+    next_waiter_id: u64,
+    queue: Vec<Waiter>,
+    last_completed: Option<tokio::time::Instant>,
+}
+
+struct GateCore {
+    max_active: usize,
+    max_queue: usize,
+    queue_timeout: Duration,
+    state: Mutex<GateState>,
+    idle_notify: Notify,
+}
+
+/// Cloneable per-deployment admission gate.
+#[derive(Clone)]
+pub struct AdmissionGate {
+    core: Arc<GateCore>,
+}
+
+impl std::fmt::Debug for AdmissionGate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdmissionGate")
+            .field("max_active", &self.core.max_active)
+            .field("max_queue", &self.core.max_queue)
+            .field("queue_timeout", &self.core.queue_timeout)
+            .field("counts", &self.counts())
+            .finish()
+    }
+}
+
+impl AdmissionGate {
+    /// Create one gate with a positive active cap and timeout.
+    pub fn new(
+        max_active: usize,
+        max_queue: usize,
+        queue_timeout: Duration,
+    ) -> Result<Self, String> {
+        if max_active == 0 || queue_timeout.is_zero() {
+            return Err("admission max_active and queue_timeout must be positive".to_string());
+        }
+        Ok(Self {
+            core: Arc::new(GateCore {
+                max_active,
+                max_queue,
+                queue_timeout,
+                state: Mutex::new(GateState {
+                    active: 0,
+                    draining: false,
+                    next_waiter_id: 1,
+                    queue: Vec::new(),
+                    last_completed: None,
+                }),
+                idle_notify: Notify::new(),
+            }),
+        })
+    }
+
+    /// Admit immediately or wait in priority/FIFO order until the queue deadline.
+    pub async fn admit(
+        &self,
+        priority: PriorityClass,
+    ) -> Result<AdmissionPermit, AdmissionRejection> {
+        let receiver = {
+            let mut state = self.core.state.lock().expect("admission mutex poisoned");
+            if state.draining {
+                return Err(draining_rejection());
+            }
+            if state.active < self.core.max_active && state.queue.is_empty() {
+                state.active += 1;
+                return Ok(AdmissionPermit::new(self.core.clone()));
+            }
+            if state.queue.len() >= self.core.max_queue {
+                return Err(AdmissionRejection::new(
+                    AdmissionReason::QueueFull,
+                    "deployment admission queue is full",
+                    true,
+                    Some(duration_ms(self.core.queue_timeout)),
+                ));
+            }
+            let id = state.next_waiter_id;
+            state.next_waiter_id = state.next_waiter_id.saturating_add(1);
+            let (sender, receiver) = oneshot::channel();
+            state.queue.push(Waiter {
+                id,
+                priority,
+                arrival: id,
+                sender,
+            });
+            (id, receiver)
+        };
+        let (id, receiver) = receiver;
+        let mut cancellation = QueueCancellation {
+            core: Arc::downgrade(&self.core),
+            id,
+            armed: true,
+        };
+        let result = tokio::select! {
+            biased;
+            result = receiver => match result {
+                Ok(result) => result,
+                Err(_) => Err(AdmissionRejection::new(
+                    AdmissionReason::EngineUnhealthy,
+                    "deployment admission queue closed unexpectedly",
+                    true,
+                    None,
+                )),
+            },
+            () = tokio::time::sleep(self.core.queue_timeout) => Err(AdmissionRejection::new(
+                AdmissionReason::QueueTimeout,
+                "deployment admission queue deadline elapsed",
+                true,
+                Some(duration_ms(self.core.queue_timeout)),
+            )),
+        };
+        cancellation.cancel();
+        result.map(|()| AdmissionPermit::new(self.core.clone()))
+    }
+
+    /// Enter draining, reject queued work, and wait boundedly for active permits.
+    pub async fn drain(&self, deadline: Duration) -> DrainReport {
+        let (active_at_start, cancelled_queued, waiters) = {
+            let mut state = self.core.state.lock().expect("admission mutex poisoned");
+            state.draining = true;
+            let active = state.active;
+            let waiters = std::mem::take(&mut state.queue);
+            (active, waiters.len(), waiters)
+        };
+        for waiter in waiters {
+            let _ = waiter.sender.send(Err(draining_rejection()));
+        }
+        let wait = async {
+            loop {
+                let notified = self.core.idle_notify.notified();
+                if self.counts().active == 0 {
+                    break;
+                }
+                notified.await;
+            }
+        };
+        let timed_out = tokio::time::timeout(deadline, wait).await.is_err();
+        DrainReport {
+            active_at_start,
+            cancelled_queued,
+            remaining_active: self.counts().active,
+            timed_out,
+        }
+    }
+
+    /// Leave drain state after an explicit reset or restart.
+    pub fn resume(&self) {
+        self.core
+            .state
+            .lock()
+            .expect("admission mutex poisoned")
+            .draining = false;
+    }
+
+    /// Mark a ready deployment with no requests as newly idle.
+    pub fn mark_ready_idle(&self) {
+        let mut state = self.core.state.lock().expect("admission mutex poisoned");
+        if state.active == 0 && state.queue.is_empty() && !state.draining {
+            state.last_completed = Some(tokio::time::Instant::now());
+        }
+    }
+
+    /// Whether an otherwise eligible deployment exceeded keep-alive.
+    pub fn is_idle_expired(&self, keep_alive: Duration) -> bool {
+        self.is_idle_expired_at(tokio::time::Instant::now(), keep_alive)
+    }
+
+    /// Deterministic keep-alive check at an explicit monotonic instant.
+    pub fn is_idle_expired_at(&self, now: tokio::time::Instant, keep_alive: Duration) -> bool {
+        let state = self.core.state.lock().expect("admission mutex poisoned");
+        idle_expired(&state, now, keep_alive)
+    }
+
+    /// Atomically enter drain only when the gate is idle and keep-alive has elapsed.
+    pub fn begin_idle_drain_if_expired_at(
+        &self,
+        now: tokio::time::Instant,
+        keep_alive: Duration,
+    ) -> bool {
+        let mut state = self.core.state.lock().expect("admission mutex poisoned");
+        if !idle_expired(&state, now, keep_alive) {
+            return false;
+        }
+        state.draining = true;
+        true
+    }
+
+    /// Atomically enter drain only when no active or queued request exists.
+    pub(crate) fn begin_idle_drain(&self) -> bool {
+        let mut state = self.core.state.lock().expect("admission mutex poisoned");
+        if state.draining || state.active != 0 || !state.queue.is_empty() {
+            return false;
+        }
+        state.draining = true;
+        true
+    }
+
+    /// Current exact active, queued, and draining counts.
+    pub fn counts(&self) -> AdmissionCounts {
+        let state = self.core.state.lock().expect("admission mutex poisoned");
+        AdmissionCounts {
+            active: state.active,
+            queued: state.queue.len(),
+            draining: state.draining,
+        }
+    }
+}
+
+/// Active request ownership. Dropping it completes the request and wakes one waiter.
+pub struct AdmissionPermit {
+    core: Arc<GateCore>,
+    released: bool,
+}
+
+impl std::fmt::Debug for AdmissionPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdmissionPermit")
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdmissionPermit {
+    fn new(core: Arc<GateCore>) -> Self {
+        Self {
+            core,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let mut state = self.core.state.lock().expect("admission mutex poisoned");
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            state.last_completed = Some(tokio::time::Instant::now());
+            self.core.idle_notify.notify_waiters();
+        }
+        while !state.draining && state.active < self.core.max_active && !state.queue.is_empty() {
+            let index = state
+                .queue
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, waiter)| (waiter.priority.rank(), waiter.arrival))
+                .map(|(index, _)| index)
+                .expect("nonempty admission queue");
+            let waiter = state.queue.remove(index);
+            if waiter.sender.send(Ok(())).is_ok() {
+                state.active += 1;
+            }
+        }
+    }
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct QueueCancellation {
+    core: Weak<GateCore>,
+    id: u64,
+    armed: bool,
+}
+
+impl QueueCancellation {
+    fn cancel(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        if let Some(core) = self.core.upgrade() {
+            let mut state = core.state.lock().expect("admission mutex poisoned");
+            state.queue.retain(|waiter| waiter.id != self.id);
+        }
+    }
+}
+
+impl Drop for QueueCancellation {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+fn draining_rejection() -> AdmissionRejection {
+    AdmissionRejection::new(
+        AdmissionReason::Draining,
+        "deployment is draining",
+        true,
+        None,
+    )
+}
+
+fn idle_expired(state: &GateState, now: tokio::time::Instant, keep_alive: Duration) -> bool {
+    !state.draining
+        && state.active == 0
+        && state.queue.is_empty()
+        && state
+            .last_completed
+            .is_some_and(|completed| now.saturating_duration_since(completed) >= keep_alive)
+}
+
+fn bounded_detail(detail: &str) -> String {
+    detail
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(512)
+        .collect()
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}

@@ -481,6 +481,39 @@ pub struct FitPlan {
     pub gpu_index: u32,
     /// Context length the estimate assumed.
     pub seq_len: u64,
+    /// Exact components used by admission and status.
+    pub memory: MemoryEstimate,
+}
+
+/// Device-specific memory requirement for one deployment generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MemoryEstimate {
+    /// Selected worker-local device index.
+    pub device_index: u32,
+    /// Quantized model weight bytes.
+    pub weight_bytes: u64,
+    /// KV-cache bytes at the selected context and dtype.
+    pub kv_bytes: u64,
+    /// Framework, activation, and device-context overhead.
+    pub runtime_overhead_bytes: u64,
+    /// Configured headroom added after runtime overhead.
+    pub safety_margin_bytes: u64,
+    /// Sum of every component above.
+    pub total_bytes: u64,
+}
+
+impl MemoryEstimate {
+    /// Construct a compatibility estimate when only a total is known.
+    pub fn from_total(device_index: u32, total_bytes: u64) -> Self {
+        Self {
+            device_index,
+            weight_bytes: total_bytes,
+            kv_bytes: 0,
+            runtime_overhead_bytes: 0,
+            safety_margin_bytes: 0,
+            total_bytes,
+        }
+    }
 }
 
 /// Why no quant could be fit.
@@ -600,8 +633,37 @@ pub fn plan_fit_kv(
     overhead: f64,
     kv_bytes_per_element: Option<f64>,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_kv_with_margin(
+        gpu,
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        0.0,
+        kv_bytes_per_element,
+    )
+}
+
+/// Like [`plan_fit_kv`], with an explicit additive safety margin.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_kv_with_margin(
+    gpu: &GpuDescriptor,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+) -> Result<FitPlan, FitError> {
     let seq_len = seq_len.min(meta.max_context).max(1);
     let free = gpu.free_vram_bytes as f64;
+
+    if !safety_margin.is_finite() || !(0.0..1.0).contains(&safety_margin) {
+        return Err(FitError::Incompatible {
+            gpu: gpu.name.clone(),
+            detail: "safety margin must be finite and in [0, 1)".to_string(),
+        });
+    }
 
     let mut capability_reject: Option<String> = None;
     let mut smallest_fit_candidate: Option<f64> = None;
@@ -621,18 +683,44 @@ pub fn plan_fit_kv(
             });
             continue;
         }
-        let est = meta.vram_estimate_with_kv(quant, kv_bytes_per_element, seq_len, overhead);
+        let weight_bytes = meta.weight_bytes(quant);
+        let kv_bytes = match kv_bytes_per_element {
+            Some(bytes) => meta.kv_bytes_with(bytes, seq_len),
+            None => meta.kv_bytes(quant, seq_len),
+        };
+        let base = weight_bytes + kv_bytes;
+        let runtime_overhead = base * (overhead.max(1.0) - 1.0);
+        let subtotal = base + runtime_overhead;
+        let margin = subtotal * safety_margin;
+        let est = subtotal + margin;
         smallest_fit_candidate = Some(match smallest_fit_candidate {
             Some(s) => s.min(est),
             None => est,
         });
         if est <= free {
+            let weight_bytes = weight_bytes as u64;
+            let kv_bytes = kv_bytes as u64;
+            let runtime_overhead_bytes = runtime_overhead as u64;
+            let safety_margin_bytes = margin as u64;
+            let total_bytes = weight_bytes
+                .saturating_add(kv_bytes)
+                .saturating_add(runtime_overhead_bytes)
+                .saturating_add(safety_margin_bytes);
+            let memory = MemoryEstimate {
+                device_index: gpu.index,
+                weight_bytes,
+                kv_bytes,
+                runtime_overhead_bytes,
+                safety_margin_bytes,
+                total_bytes,
+            };
             return Ok(FitPlan {
                 quant_name: name.clone(),
                 quant,
-                estimated_vram_bytes: est as u64,
+                estimated_vram_bytes: memory.total_bytes,
                 gpu_index: gpu.index,
                 seq_len,
+                memory,
             });
         }
     }
@@ -677,6 +765,28 @@ pub fn plan_fit_auto_kv(
     overhead: f64,
     kv_bytes_per_element: Option<f64>,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_auto_kv_with_margin(
+        probe,
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        0.0,
+        kv_bytes_per_element,
+    )
+}
+
+/// Like [`plan_fit_auto_kv`], with an explicit additive safety margin.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_auto_kv_with_margin(
+    probe: &dyn GpuProbe,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+) -> Result<FitPlan, FitError> {
     let mut gpus = probe.probe();
     if gpus.is_empty() {
         return Err(FitError::NoGpu);
@@ -686,12 +796,13 @@ pub fn plan_fit_auto_kv(
     // else the error from the most-free GPU (the most informative).
     let mut first_err = None;
     for gpu in &gpus {
-        match plan_fit_kv(
+        match plan_fit_kv_with_margin(
             gpu,
             meta,
             candidates,
             seq_len,
             overhead,
+            safety_margin,
             kv_bytes_per_element,
         ) {
             Ok(plan) => return Ok(plan),

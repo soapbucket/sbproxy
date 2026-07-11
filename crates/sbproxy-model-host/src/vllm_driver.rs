@@ -630,8 +630,10 @@ impl EngineDriver for VllmDriver {
             kind: EngineKind::Vllm,
             port: request.port,
             selected_devices: request.selected_devices.clone(),
+            accelerator: request.accelerator,
             started_at_ms: unix_time_ms()?,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            memory: request.fit.memory.clone(),
             process,
         })
     }
@@ -797,7 +799,7 @@ fn append_vllm_precision_arguments(arguments: &mut Vec<String>, request: &Launch
 }
 
 fn device_environment(request: &LaunchRequest) -> BTreeMap<String, String> {
-    if request.selected_devices.is_empty() {
+    if request.accelerator != AcceleratorKind::Cuda || request.selected_devices.is_empty() {
         return BTreeMap::new();
     }
     BTreeMap::from([(

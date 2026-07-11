@@ -102,6 +102,8 @@ pub struct LaunchRequest {
     pub fit: FitPlan,
     /// Loopback serving port allocated by the runtime.
     pub port: u16,
+    /// Accelerator selected during worker compatibility and fit.
+    pub accelerator: AcceleratorKind,
     /// Worker-local device indices assigned to this replica.
     pub selected_devices: Vec<u32>,
     /// Typed KV-cache precision selected for the engine.
@@ -125,10 +127,14 @@ pub struct RunningEngine {
     pub port: u16,
     /// Worker-local device indices assigned to the process.
     pub selected_devices: Vec<u32>,
+    /// Accelerator used by this process.
+    pub accelerator: AcceleratorKind,
     /// Process start time as Unix milliseconds.
     pub started_at_ms: u64,
     /// Canonical digest of the verified artifact snapshot.
     pub artifact_digest: String,
+    /// Device-specific memory reserved for this generation.
+    pub memory: crate::MemoryEstimate,
     /// Opaque process handle owned by the low-level process boundary.
     pub process: Arc<dyn EngineProcess>,
 }
@@ -142,8 +148,10 @@ impl fmt::Debug for RunningEngine {
             .field("kind", &self.kind)
             .field("port", &self.port)
             .field("selected_devices", &self.selected_devices)
+            .field("accelerator", &self.accelerator)
             .field("started_at_ms", &self.started_at_ms)
             .field("artifact_digest", &self.artifact_digest)
+            .field("memory", &self.memory)
             .field("process_id", &self.process.id())
             .finish()
     }
@@ -500,6 +508,30 @@ impl LaunchRequest {
                 EngineFailureReason::EngineInternal,
                 "selected device indices must be unique",
                 "recompute placement before launching the engine",
+                false,
+            ));
+        }
+        if self.accelerator == AcceleratorKind::Cpu && !self.selected_devices.is_empty() {
+            return Err(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                "CPU launch cannot select accelerator device indices",
+                "clear selected devices for a CPU deployment",
+                false,
+            ));
+        }
+        if self.accelerator == AcceleratorKind::Metal && self.selected_devices.len() != 1 {
+            return Err(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                "Metal launch requires one unified-memory device",
+                "select one Apple accelerator device",
+                false,
+            ));
+        }
+        if self.accelerator == AcceleratorKind::Cuda && self.selected_devices.is_empty() {
+            return Err(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                "CUDA launch requires at least one accelerator device",
+                "select one or more NVIDIA accelerator devices",
                 false,
             ));
         }

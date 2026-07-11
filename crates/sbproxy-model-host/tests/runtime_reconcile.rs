@@ -257,6 +257,7 @@ struct FixtureRuntimeFacts {
     active_starts: AtomicUsize,
     max_active_starts: AtomicUsize,
     fail_start: Mutex<BTreeSet<String>>,
+    fail_stop: Mutex<BTreeSet<String>>,
     next_port: AtomicU16,
 }
 
@@ -269,6 +270,13 @@ struct FixturePreparedRuntime {
 
 #[async_trait]
 impl PreparedDeploymentRuntime for FixturePreparedRuntime {
+    async fn memory_estimate(
+        &self,
+        _intent: PullIntent,
+    ) -> Result<sbproxy_model_host::MemoryEstimate, RuntimeManagerError> {
+        Ok(sbproxy_model_host::MemoryEstimate::from_total(0, 1))
+    }
+
     async fn start(&self, _intent: PullIntent) -> Result<RunningEngine, RuntimeManagerError> {
         {
             let mut starts = self.facts.starts.lock().unwrap();
@@ -296,9 +304,11 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
             generation: self.generation,
             kind: EngineKind::LlamaCpp,
             port,
-            selected_devices: vec![0],
+            accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+            selected_devices: Vec::new(),
             started_at_ms: 1,
             artifact_digest: "a".repeat(64),
+            memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1),
             process: Arc::new(ManagerFixtureProcess {
                 stopped: AtomicBool::new(false),
             }),
@@ -306,6 +316,14 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
     }
 
     async fn stop(&self, _grace: Duration) -> Result<(), RuntimeManagerError> {
+        if self.facts.fail_stop.lock().unwrap().contains(&self.id) {
+            return Err(RuntimeManagerError::Engine(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                format!("fixture deployment {} failed to stop", self.id),
+                "repair the fixture shutdown boundary",
+                true,
+            )));
+        }
         let mut stops = self.facts.stops.lock().unwrap();
         *stops.entry(self.id.clone()).or_default() += 1;
         Ok(())
@@ -711,9 +729,11 @@ impl EngineDriver for ProductionFixtureDriver {
             generation: request.generation,
             kind: provisioned.kind,
             port: request.port,
+            accelerator: request.accelerator,
             selected_devices: request.selected_devices.clone(),
             started_at_ms: 1,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            memory: request.fit.memory.clone(),
             process: Arc::new(ManagerFixtureProcess {
                 stopped: AtomicBool::new(false),
             }),
@@ -842,4 +862,234 @@ models:
     assert_eq!(launches[0].0, "fixture");
     assert_eq!(launches[0].2, "verified");
     assert!(launches[0].1.starts_with(cache.join("snapshots")));
+}
+
+#[tokio::test]
+async fn manager_admission_drains_queued_work_and_waits_for_the_active_permit() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer);
+    let mut desired = manager_desired("admission", &[("a", false, 30)], 2);
+    desired
+        .deployments
+        .get_mut("a")
+        .unwrap()
+        .desired
+        .max_concurrency = Some(1);
+    desired
+        .deployments
+        .get_mut("a")
+        .unwrap()
+        .desired
+        .max_queue_depth = 1;
+    desired
+        .revision
+        .deployments
+        .get_mut("a")
+        .unwrap()
+        .max_concurrency = Some(1);
+    desired
+        .revision
+        .deployments
+        .get_mut("a")
+        .unwrap()
+        .max_queue_depth = 1;
+    manager.reconcile(desired).await.unwrap();
+
+    let active = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    let queued_manager = manager.clone();
+    let queued = tokio::spawn(async move {
+        queued_manager
+            .admit("a", sbproxy_model_host::PriorityClass::Interactive)
+            .await
+    });
+    tokio::task::yield_now().await;
+    let drain_manager = manager.clone();
+    let drain = tokio::spawn(async move { drain_manager.drain("a").await });
+    tokio::task::yield_now().await;
+    assert_eq!(
+        queued.await.unwrap().unwrap_err().reason,
+        sbproxy_model_host::AdmissionReason::Draining
+    );
+    assert!(!drain.is_finished());
+    drop(active);
+    let report = drain.await.unwrap().unwrap();
+    assert_eq!(report.cancelled_queued, 1);
+    assert_eq!(report.remaining_active, 0);
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn manager_capacity_evicts_only_after_active_protection_is_released() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = Arc::new(
+        ModelRuntimeManager::new_with_device_capacities(
+            Catalog::builtin().catalog_revision,
+            preparer.clone(),
+            BTreeMap::from([(0, 1)]),
+        )
+        .unwrap(),
+    );
+    manager
+        .reconcile(manager_desired(
+            "capacity",
+            &[("a", false, 30), ("b", false, 30)],
+            2,
+        ))
+        .await
+        .unwrap();
+    let active = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    assert!(matches!(
+        manager.ensure_ready("b").await,
+        Err(RuntimeManagerError::Admission(ref rejection))
+            if rejection.reason == sbproxy_model_host::AdmissionReason::InsufficientCapacity
+    ));
+    drop(active);
+
+    manager.ensure_ready("b").await.unwrap();
+    assert_eq!(
+        preparer.facts.stops.lock().unwrap().get("a").copied(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn failed_eviction_shutdown_restores_the_previous_capacity_owner() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer.clone(),
+        BTreeMap::from([(0, 1)]),
+    )
+    .unwrap();
+    manager
+        .reconcile(manager_desired(
+            "eviction-rollback",
+            &[("a", false, 30), ("b", false, 30)],
+            2,
+        ))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    preparer
+        .facts
+        .fail_stop
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+
+    assert!(matches!(
+        manager.ensure_ready("b").await,
+        Err(RuntimeManagerError::Engine(ref error))
+            if error.reason() == EngineFailureReason::EngineInternal
+    ));
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
+    assert!(matches!(
+        manager.ensure_ready("b").await,
+        Err(RuntimeManagerError::Admission(ref rejection))
+            if rejection.reason == sbproxy_model_host::AdmissionReason::InsufficientCapacity
+    ));
+    assert!(preparer.facts.starts.lock().unwrap().get("b").is_none());
+}
+
+#[tokio::test]
+async fn warm_revision_that_cannot_fit_atomically_preserves_the_prior_revision() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer,
+        BTreeMap::from([(0, 1)]),
+    )
+    .unwrap();
+    let error = manager
+        .reconcile(manager_desired(
+            "too-large",
+            &[("a", true, 30), ("b", true, 30)],
+            2,
+        ))
+        .await
+        .expect_err("both warm generations cannot share one byte");
+    assert!(matches!(
+        error,
+        RuntimeManagerError::Admission(ref rejection)
+            if rejection.reason == sbproxy_model_host::AdmissionReason::InsufficientCapacity
+    ));
+    assert_eq!(manager.current_revision(), 0);
+    assert!(manager.current_desired().deployments.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn manager_keep_alive_starts_after_the_last_permit_completes() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer);
+    manager
+        .reconcile(manager_desired("keep-alive", &[("a", false, 30)], 2))
+        .await
+        .unwrap();
+    let permit = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    tokio::time::advance(Duration::from_secs(100)).await;
+    assert!(manager
+        .maintenance_tick(tokio::time::Instant::now())
+        .await
+        .is_empty());
+    drop(permit);
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(manager
+        .maintenance_tick(tokio::time::Instant::now())
+        .await
+        .is_empty());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        manager.maintenance_tick(tokio::time::Instant::now()).await,
+        vec!["a"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn manager_keep_alive_never_reaps_a_failed_generation() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    preparer
+        .facts
+        .fail_start
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+    let manager = manager(preparer);
+    manager
+        .reconcile(manager_desired("failed-keep-alive", &[("a", false, 30)], 2))
+        .await
+        .unwrap();
+    let permit = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    assert!(manager.ensure_ready("a").await.is_err());
+    drop(permit);
+    tokio::time::advance(Duration::from_secs(30)).await;
+
+    assert!(manager
+        .maintenance_tick(tokio::time::Instant::now())
+        .await
+        .is_empty());
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
 }
