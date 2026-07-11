@@ -187,6 +187,8 @@ pub enum EngineFailureReason {
     EngineHealthFailed,
     /// Graceful and forced shutdown failed.
     EngineShutdownFailed,
+    /// The bounded launch retry budget is exhausted until explicit reset.
+    CrashLoop,
     /// Internal invariant or clock failure.
     EngineInternal,
 }
@@ -205,6 +207,7 @@ impl EngineFailureReason {
             Self::EngineReadinessTimeout => "engine_readiness_timeout",
             Self::EngineHealthFailed => "engine_health_failed",
             Self::EngineShutdownFailed => "engine_shutdown_failed",
+            Self::CrashLoop => "crash_loop",
             Self::EngineInternal => "engine_internal",
         }
     }
@@ -223,6 +226,7 @@ pub struct EngineDriverError {
     message: String,
     remediation: String,
     retryable: bool,
+    diagnostic_tail: Option<String>,
 }
 
 impl EngineDriverError {
@@ -233,10 +237,15 @@ impl EngineDriverError {
         remediation: impl Into<String>,
         retryable: bool,
     ) -> Self {
-        let remediation = remediation.into();
+        let message = bounded_operator_text(&message.into(), 2_048);
+        let remediation = bounded_operator_text(&remediation.into(), 1_024);
         Self {
             reason,
-            message: message.into(),
+            message: if message.trim().is_empty() {
+                "managed engine operation failed".to_string()
+            } else {
+                message
+            },
             remediation: if remediation.trim().is_empty() {
                 "inspect the model-host operation job and retry after correcting the cause"
                     .to_string()
@@ -244,6 +253,7 @@ impl EngineDriverError {
                 remediation
             },
             retryable,
+            diagnostic_tail: None,
         }
     }
 
@@ -291,6 +301,23 @@ impl EngineDriverError {
     pub const fn retryable(&self) -> bool {
         self.retryable
     }
+
+    /// Concise operator-safe failure message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Attach a bounded, credential-redacted diagnostic tail.
+    pub fn with_diagnostic_tail(mut self, diagnostic: impl AsRef<str>) -> Self {
+        let diagnostic = sanitize_diagnostic_tail(diagnostic.as_ref());
+        self.diagnostic_tail = (!diagnostic.is_empty()).then_some(diagnostic);
+        self
+    }
+
+    /// Bounded, credential-redacted diagnostic retained for crash-loop status.
+    pub fn diagnostic_tail(&self) -> Option<&str> {
+        self.diagnostic_tail.as_deref()
+    }
 }
 
 impl fmt::Display for EngineDriverError {
@@ -304,6 +331,58 @@ impl fmt::Display for EngineDriverError {
 }
 
 impl std::error::Error for EngineDriverError {}
+
+fn sanitize_diagnostic_tail(diagnostic: &str) -> String {
+    let bounded = diagnostic
+        .lines()
+        .rev()
+        .take(100)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(8_192)
+        .collect::<String>();
+    redact_sensitive_tokens(&bounded)
+        .chars()
+        .take(8_192)
+        .collect()
+}
+
+fn bounded_operator_text(text: &str, max_chars: usize) -> String {
+    let printable = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(max_chars)
+        .collect::<String>();
+    redact_sensitive_tokens(&printable)
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn redact_sensitive_tokens(text: &str) -> String {
+    let mut tokens = text.split_whitespace().peekable();
+    let mut redacted = Vec::new();
+    while let Some(token) = tokens.next() {
+        redacted.push(token.to_string());
+        if (token.eq_ignore_ascii_case("bearer")
+            || matches!(token, "--api-key" | "--token" | "--hf-token"))
+            && tokens.next().is_some()
+        {
+            redacted.push("[REDACTED]".to_string());
+        }
+    }
+    redacted.join(" ")
+}
 
 impl LaunchRequest {
     /// Validate verified artifact identity, paths, runtime identity, and extra arguments.

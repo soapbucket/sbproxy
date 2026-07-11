@@ -150,19 +150,17 @@ impl EngineProcessRunner {
         loop {
             if process.has_exited().await? {
                 let tail = process.stderr_tail();
-                return Err(EngineDriverError::new(
+                let error = EngineDriverError::new(
                     EngineFailureReason::EngineEarlyExit,
-                    if tail.is_empty() {
-                        format!("engine {:?} exited before readiness", command.executable)
-                    } else {
-                        format!(
-                            "engine {:?} exited before readiness; stderr tail: {tail}",
-                            command.executable
-                        )
-                    },
+                    format!("engine {:?} exited before readiness", command.executable),
                     "inspect the bounded stderr tail, correct engine compatibility, and retry",
                     true,
-                ));
+                );
+                return Err(if tail.is_empty() {
+                    error
+                } else {
+                    error.with_diagnostic_tail(tail)
+                });
             }
             if self.probe.ready(command.port, &command.health_path).await? {
                 return Ok(process);

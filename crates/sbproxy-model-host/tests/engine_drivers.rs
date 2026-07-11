@@ -1,21 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use sbproxy_model_host::{
     build_vllm_container_plan, validate_engine_args, ArtifactCacheMetadata, ArtifactFile,
-    ArtifactFormat, CommandExecutor, CommandOutput, ContainerRuntime, CudaBuildPrerequisites,
-    EngineAccel, EngineAvailability, EngineCapabilities, EngineCommand, EngineDetection,
-    EngineDriver, EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineProcess,
-    EngineProcessRunner, EngineProvisioning, EngineReadinessProbe, FitPlan, KvCacheQuant,
-    LaunchRequest, LlamaBinarySource, LlamaCppDriver, OperationJob, OperationKind,
-    OperationProgress, OperationState, ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact,
-    ResolvedArtifact, RunningEngine, SupportLevel, VllmDriver, VllmHost, VllmLaunchMode,
-    WorkerProfile,
+    ArtifactFormat, BackoffPolicy, CommandExecutor, CommandOutput, ContainerRuntime,
+    CudaBuildPrerequisites, EngineAccel, EngineAvailability, EngineCapabilities, EngineCommand,
+    EngineDetection, EngineDriver, EngineDriverError, EngineFailureReason, EngineHealth,
+    EngineKind, EngineProcess, EngineProcessRunner, EngineProvisioning, EngineReadinessProbe,
+    EngineSupervisor, FileJobStore, FitPlan, KvCacheQuant, LaunchRequest, LlamaBinarySource,
+    LlamaCppDriver, OperationJob, OperationKind, OperationProgress, OperationState,
+    ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact, ResolvedArtifact, RunningEngine,
+    SupervisorClock, SupportLevel, VllmDriver, VllmHost, VllmLaunchMode, WorkerProfile,
 };
+use tempfile::tempdir;
 
 #[derive(Debug)]
 struct FixtureProcess {
@@ -267,6 +268,255 @@ async fn driver_contract_is_complete_and_object_safe() {
             .await
             .expect("fixture shutdown");
     }
+}
+
+struct CrashDriver {
+    launches: Arc<AtomicU32>,
+    allow_success: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl EngineDriver for CrashDriver {
+    fn kind(&self) -> EngineKind {
+        EngineKind::LlamaCpp
+    }
+
+    fn capabilities(&self) -> EngineCapabilities {
+        FixtureDriver {
+            kind: EngineKind::LlamaCpp,
+        }
+        .capabilities()
+    }
+
+    fn detect(&self, worker: &WorkerProfile, provisioning: &EngineProvisioning) -> EngineDetection {
+        FixtureDriver {
+            kind: EngineKind::LlamaCpp,
+        }
+        .detect(worker, provisioning)
+    }
+
+    async fn provision(
+        &self,
+        request: &ProvisionRequest,
+    ) -> Result<ProvisionedEngine, EngineDriverError> {
+        FixtureDriver {
+            kind: EngineKind::LlamaCpp,
+        }
+        .provision(request)
+        .await
+    }
+
+    async fn launch(
+        &self,
+        provisioned: &ProvisionedEngine,
+        request: &LaunchRequest,
+    ) -> Result<RunningEngine, EngineDriverError> {
+        let attempt = self.launches.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.allow_success.load(Ordering::SeqCst) {
+            return FixtureDriver {
+                kind: EngineKind::LlamaCpp,
+            }
+            .launch(provisioned, request)
+            .await;
+        }
+        Err(EngineDriverError::new(
+            EngineFailureReason::EngineEarlyExit,
+            format!("fixture launch attempt {attempt} exited"),
+            "repair the fixture engine and reset the crash loop",
+            true,
+        )
+        .with_diagnostic_tail(format!(
+            "stderr attempt {attempt}: Authorization: Bearer secret-token\n{}",
+            "x".repeat(10_000)
+        )))
+    }
+
+    async fn health(&self, running: &RunningEngine) -> Result<EngineHealth, EngineDriverError> {
+        FixtureDriver {
+            kind: EngineKind::LlamaCpp,
+        }
+        .health(running)
+        .await
+    }
+
+    async fn shutdown(
+        &self,
+        running: RunningEngine,
+        grace: Duration,
+    ) -> Result<(), EngineDriverError> {
+        FixtureDriver {
+            kind: EngineKind::LlamaCpp,
+        }
+        .shutdown(running, grace)
+        .await
+    }
+}
+
+struct PausedClock {
+    now_ms: AtomicU64,
+}
+
+#[async_trait]
+impl SupervisorClock for PausedClock {
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+        self.now_ms.fetch_add(
+            u64::try_from(duration.as_millis()).unwrap(),
+            Ordering::SeqCst,
+        );
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.now_ms.load(Ordering::SeqCst)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn crash_loop_observes_backoff_retains_failure_and_requires_durable_reset() {
+    let directory = tempdir().unwrap();
+    let store = FileJobStore::open(directory.path(), 50).unwrap();
+    let launches = Arc::new(AtomicU32::new(0));
+    let allow_success = Arc::new(AtomicBool::new(false));
+    let driver: Arc<dyn EngineDriver> = Arc::new(CrashDriver {
+        launches: launches.clone(),
+        allow_success: allow_success.clone(),
+    });
+    let clock = Arc::new(PausedClock {
+        now_ms: AtomicU64::new(1_000),
+    });
+    let mut supervisor = EngineSupervisor::new(
+        "coder",
+        driver,
+        BackoffPolicy {
+            base: Duration::from_millis(10),
+            max: Duration::from_millis(25),
+            max_attempts: Some(4),
+        },
+        Some(store.clone()),
+    )
+    .with_clock(clock);
+    let provisioned = supervisor
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+            worker: worker(),
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .unwrap();
+    let request = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 1,
+        artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+        fit: fit(),
+        port: 18080,
+        selected_devices: vec![0],
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: Vec::new(),
+        ready_timeout: Duration::from_secs(1),
+    };
+    let task_request = request.clone();
+    let task_provisioned = provisioned.clone();
+    let task = tokio::spawn(async move {
+        let result = supervisor
+            .ensure_ready(&task_provisioned, &task_request)
+            .await;
+        (supervisor, result)
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(9)).await;
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(launches.load(Ordering::SeqCst), 2);
+    tokio::time::advance(Duration::from_millis(19)).await;
+    assert_eq!(launches.load(Ordering::SeqCst), 2);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(launches.load(Ordering::SeqCst), 3);
+    tokio::time::advance(Duration::from_millis(24)).await;
+    assert_eq!(launches.load(Ordering::SeqCst), 3);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    let (mut supervisor, result) = task.await.unwrap();
+    assert_eq!(
+        result.unwrap_err().reason(),
+        EngineFailureReason::EngineEarlyExit
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 4);
+    let crash = supervisor.crash_loop().expect("retained crash loop");
+    assert_eq!(crash.attempts, 4);
+    assert_eq!(crash.reason, EngineFailureReason::EngineEarlyExit);
+    assert!(crash.last_error.contains("attempt 4"));
+    assert_eq!(crash.first_failure_at_ms, 1_000);
+    assert_eq!(crash.last_failure_at_ms, 1_055);
+    assert!(crash.stderr_tail.as_deref().unwrap().len() <= 8_192);
+    assert!(!crash
+        .stderr_tail
+        .as_deref()
+        .unwrap()
+        .contains("secret-token"));
+    assert!(!crash.next_remediation.is_empty());
+
+    let blocked = supervisor
+        .ensure_ready(&provisioned, &request)
+        .await
+        .expect_err("crash loop requires reset");
+    assert_eq!(blocked.reason(), EngineFailureReason::CrashLoop);
+    assert_eq!(launches.load(Ordering::SeqCst), 4);
+
+    let reset = supervisor
+        .reset()
+        .expect("durable reset")
+        .expect("reset job");
+    assert_eq!(reset.kind, OperationKind::Reset);
+    assert_eq!(reset.state, OperationState::Ready);
+    allow_success.store(true, Ordering::SeqCst);
+    let running = supervisor
+        .ensure_ready(&provisioned, &request)
+        .await
+        .expect("launch after explicit reset");
+    let drain = supervisor.begin_drain_job().expect("begin durable drain");
+    let drain = supervisor
+        .finish_drain_job(drain.as_ref(), None)
+        .expect("finish durable drain")
+        .expect("drain job");
+    assert_eq!(drain.kind, OperationKind::Drain);
+    assert_eq!(drain.state, OperationState::Ready);
+    supervisor
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("durable stop");
+    assert!(running.process.has_exited().await.unwrap());
+
+    let jobs = FileJobStore::open(directory.path(), 50)
+        .unwrap()
+        .list()
+        .unwrap();
+    for kind in [
+        OperationKind::Provision,
+        OperationKind::Launch,
+        OperationKind::Load,
+        OperationKind::Drain,
+        OperationKind::Stop,
+        OperationKind::Reset,
+    ] {
+        assert!(jobs.iter().any(|job| job.kind == kind), "{kind:?}");
+    }
+    assert!(jobs
+        .iter()
+        .filter(|job| matches!(job.kind, OperationKind::Launch | OperationKind::Load))
+        .any(|job| job.state == OperationState::Failed));
+    let stored = jobs
+        .iter()
+        .map(|job| serde_json::to_string(job).unwrap())
+        .collect::<String>();
+    assert!(!stored.contains("secret-token"));
+    assert!(!stored.contains("stderr attempt"));
 }
 
 #[test]

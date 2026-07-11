@@ -40,6 +40,8 @@ pub enum OperationKind {
     Rollout,
     /// Delete an artifact or deployment resource.
     Delete,
+    /// Explicitly clear a retained deployment crash loop.
+    Reset,
 }
 
 /// Durable lifecycle state of an operation.

@@ -16,9 +16,18 @@
 //! binary from the templated args, poll `/health`, kill the whole
 //! process tree) implements the same trait in a later phase.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    EngineDriver, EngineDriverError, EngineFailureReason, FileJobStore, LaunchRequest,
+    OperationJob, OperationKind, OperationProgress, OperationState, ProvisionRequest,
+    ProvisionedEngine, RunningEngine,
+};
 
 /// The lifecycle state of one supervised engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -142,6 +151,34 @@ impl BackoffPolicy {
     }
 }
 
+/// Clock and sleep boundary used by managed-engine retry supervision.
+#[async_trait]
+pub trait SupervisorClock: Send + Sync {
+    /// Wait for one retry delay.
+    async fn sleep(&self, duration: Duration);
+    /// Current Unix timestamp in milliseconds.
+    fn now_ms(&self) -> u64;
+}
+
+/// Production supervisor clock backed by Tokio and the system wall clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokioSupervisorClock;
+
+#[async_trait]
+impl SupervisorClock for TokioSupervisorClock {
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+
+    fn now_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+            .unwrap_or(0)
+    }
+}
+
 /// Errors the supervisor surfaces to a caller.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SupervisorError {
@@ -185,10 +222,8 @@ impl<L: EngineLauncher> Supervisor<L> {
 
     /// Bring the engine to Ready, launching (and retrying with
     /// backoff) as needed. Returns the serving port. Already-Ready is
-    /// a no-op fast path. This does NOT sleep between retries itself,
-    /// so it stays synchronous-friendly for tests; the retry cadence
-    /// is [`BackoffPolicy::delay_for`], which the runtime honors at
-    /// the call site. Gives up per the backoff's `max_attempts`.
+    /// a no-op fast path. Retries wait for the policy delay and stop at
+    /// the configured attempt budget.
     pub async fn ensure_ready(&mut self) -> Result<u16, SupervisorError> {
         if let EngineState::Ready { port } = self.state {
             return Ok(port);
@@ -213,8 +248,7 @@ impl<L: EngineLauncher> Supervisor<L> {
                     if !self.backoff.should_retry(attempts) {
                         return Err(SupervisorError::LaunchGaveUp { attempts, reason });
                     }
-                    // Retry immediately in the loop; the runtime sleeps
-                    // delay_for(attempts) before calling back in prod.
+                    tokio::time::sleep(self.backoff.delay_for(attempts)).await;
                 }
             }
         }
@@ -235,6 +269,317 @@ impl<L: EngineLauncher> Supervisor<L> {
     pub fn vram_bytes(&self) -> u64 {
         self.spec.vram_bytes
     }
+}
+
+/// Retained terminal launch failure. No automatic launch is attempted while present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CrashLoopState {
+    /// Consecutive failed launch attempts.
+    pub attempts: u32,
+    /// Stable reason reported by the last attempt.
+    pub reason: EngineFailureReason,
+    /// Bounded operator-safe message from the last attempt.
+    pub last_error: String,
+    /// Bounded, credential-redacted engine diagnostic tail.
+    pub stderr_tail: Option<String>,
+    /// Timestamp of the first failure in this retry sequence.
+    pub first_failure_at_ms: u64,
+    /// Timestamp of the terminal failure in this retry sequence.
+    pub last_failure_at_ms: u64,
+    /// Operator action required before retrying.
+    pub next_remediation: String,
+    /// Durable terminal load job associated with this crash loop.
+    pub last_job_id: Option<String>,
+}
+
+/// Typed managed-engine supervisor used by the process-wide runtime manager.
+pub struct EngineSupervisor {
+    deployment: String,
+    driver: Arc<dyn EngineDriver>,
+    backoff: BackoffPolicy,
+    clock: Arc<dyn SupervisorClock>,
+    job_store: Option<FileJobStore>,
+    running: Option<RunningEngine>,
+    crash_loop: Option<CrashLoopState>,
+}
+
+impl std::fmt::Debug for EngineSupervisor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EngineSupervisor")
+            .field("deployment", &self.deployment)
+            .field("driver_kind", &self.driver.kind())
+            .field("backoff", &self.backoff)
+            .field("running", &self.running)
+            .field("crash_loop", &self.crash_loop)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EngineSupervisor {
+    /// Construct an idle supervisor for one canonical deployment.
+    pub fn new(
+        deployment: impl Into<String>,
+        driver: Arc<dyn EngineDriver>,
+        backoff: BackoffPolicy,
+        job_store: Option<FileJobStore>,
+    ) -> Self {
+        Self {
+            deployment: deployment.into(),
+            driver,
+            backoff,
+            clock: Arc::new(TokioSupervisorClock),
+            job_store,
+            running: None,
+            crash_loop: None,
+        }
+    }
+
+    /// Override the retry clock for deterministic tests.
+    pub fn with_clock(mut self, clock: Arc<dyn SupervisorClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Currently running engine generation, when ready.
+    pub fn running(&self) -> Option<&RunningEngine> {
+        self.running.as_ref()
+    }
+
+    /// Retained terminal crash loop, when reset is required.
+    pub fn crash_loop(&self) -> Option<&CrashLoopState> {
+        self.crash_loop.as_ref()
+    }
+
+    /// Provision one exact managed engine and retain a durable lifecycle job.
+    pub async fn provision(
+        &self,
+        request: &ProvisionRequest,
+    ) -> Result<ProvisionedEngine, EngineDriverError> {
+        self.validate_deployment()?;
+        let job = self.begin_job(OperationKind::Provision)?;
+        match self.driver.provision(request).await {
+            Ok(provisioned) => {
+                self.finish_job(job.as_ref(), None)?;
+                Ok(provisioned)
+            }
+            Err(error) => {
+                self.finish_job(job.as_ref(), Some(&error))?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Launch a provisioned engine with bounded delayed retries.
+    ///
+    /// A terminal failure is retained and every later call fails as
+    /// `crash_loop` without invoking the driver until [`Self::reset`].
+    pub async fn ensure_ready(
+        &mut self,
+        provisioned: &ProvisionedEngine,
+        request: &LaunchRequest,
+    ) -> Result<RunningEngine, EngineDriverError> {
+        self.validate_deployment()?;
+        if request.deployment != self.deployment {
+            return Err(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                format!(
+                    "launch deployment {:?} does not match supervisor {:?}",
+                    request.deployment, self.deployment
+                ),
+                "reconcile the launch through the matching deployment slot",
+                false,
+            ));
+        }
+        if let Some(running) = &self.running {
+            return Ok(running.clone());
+        }
+        if let Some(crash_loop) = &self.crash_loop {
+            return Err(self.crash_loop_error(crash_loop));
+        }
+
+        let launch_job = self.begin_job(OperationKind::Launch)?;
+        let load_job = match self.begin_job(OperationKind::Load) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = self.finish_job(launch_job.as_ref(), Some(&error));
+                return Err(error);
+            }
+        };
+        let mut attempts = 0u32;
+        let mut retained: Option<CrashLoopState> = None;
+        loop {
+            match self.driver.launch(provisioned, request).await {
+                Ok(running) => {
+                    let launch_result = self.finish_job(launch_job.as_ref(), None);
+                    let load_result = self.finish_job(load_job.as_ref(), None);
+                    if let Err(error) = launch_result.and(load_result) {
+                        let _ = self
+                            .driver
+                            .shutdown(running.clone(), Duration::from_secs(1))
+                            .await;
+                        return Err(error);
+                    }
+                    self.crash_loop = None;
+                    self.running = Some(running.clone());
+                    return Ok(running);
+                }
+                Err(error) => {
+                    attempts = attempts.saturating_add(1);
+                    let now_ms = self.clock.now_ms();
+                    let first_failure_at_ms = retained
+                        .as_ref()
+                        .map_or(now_ms, |state| state.first_failure_at_ms);
+                    retained = Some(CrashLoopState {
+                        attempts,
+                        reason: error.reason(),
+                        last_error: error.message().to_string(),
+                        stderr_tail: error.diagnostic_tail().map(str::to_string),
+                        first_failure_at_ms,
+                        last_failure_at_ms: now_ms.max(first_failure_at_ms),
+                        next_remediation: error.remediation().to_string(),
+                        last_job_id: load_job.as_ref().map(|job| job.id.clone()),
+                    });
+                    if error.retryable() && self.backoff.should_retry(attempts) {
+                        self.clock.sleep(self.backoff.delay_for(attempts)).await;
+                        continue;
+                    }
+                    self.crash_loop = retained;
+                    let launch_result = self.finish_job(launch_job.as_ref(), Some(&error));
+                    let load_result = self.finish_job(load_job.as_ref(), Some(&error));
+                    launch_result.and(load_result)?;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Clear a retained crash loop and persist the explicit reset event.
+    pub fn reset(&mut self) -> Result<Option<OperationJob>, EngineDriverError> {
+        self.validate_deployment()?;
+        let job = self.begin_job(OperationKind::Reset)?;
+        let previous = self.crash_loop.take();
+        match self.finish_job(job.as_ref(), None) {
+            Ok(terminal) => Ok(terminal),
+            Err(error) => {
+                self.crash_loop = previous;
+                Err(error)
+            }
+        }
+    }
+
+    /// Stop the running generation and persist a terminal stop job.
+    pub async fn shutdown(
+        &mut self,
+        grace: Duration,
+    ) -> Result<Option<OperationJob>, EngineDriverError> {
+        self.validate_deployment()?;
+        let job = self.begin_job(OperationKind::Stop)?;
+        if let Some(running) = self.running.clone() {
+            if let Err(error) = self.driver.shutdown(running, grace).await {
+                self.finish_job(job.as_ref(), Some(&error))?;
+                return Err(error);
+            }
+            self.running = None;
+        }
+        self.finish_job(job.as_ref(), None)
+    }
+
+    /// Begin a durable drain operation for the admission layer.
+    pub fn begin_drain_job(&self) -> Result<Option<OperationJob>, EngineDriverError> {
+        self.validate_deployment()?;
+        self.begin_job(OperationKind::Drain)
+    }
+
+    /// Finish a durable drain operation after active requests leave.
+    pub fn finish_drain_job(
+        &self,
+        job: Option<&OperationJob>,
+        failure: Option<&EngineDriverError>,
+    ) -> Result<Option<OperationJob>, EngineDriverError> {
+        if job.is_some_and(|job| job.kind != OperationKind::Drain) {
+            return Err(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                "finish_drain_job received a non-drain operation",
+                "retain and finish the drain job returned by begin_drain_job",
+                false,
+            ));
+        }
+        self.finish_job(job, failure)
+    }
+
+    fn validate_deployment(&self) -> Result<(), EngineDriverError> {
+        if self.deployment.trim().is_empty()
+            || self.deployment.len() > 128
+            || self.deployment.chars().any(char::is_control)
+        {
+            return Err(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                "engine supervisor deployment ID is invalid",
+                "reconcile a canonical deployment ID before provisioning",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    fn crash_loop_error(&self, state: &CrashLoopState) -> EngineDriverError {
+        EngineDriverError::new(
+            EngineFailureReason::CrashLoop,
+            format!(
+                "deployment {:?} exhausted {} launch attempts",
+                self.deployment, state.attempts
+            ),
+            &state.next_remediation,
+            false,
+        )
+    }
+
+    fn begin_job(&self, kind: OperationKind) -> Result<Option<OperationJob>, EngineDriverError> {
+        self.job_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .create(kind, format!("deployment:{}", self.deployment))
+                    .map_err(|error| lifecycle_job_error("create", error))
+            })
+            .transpose()
+    }
+
+    fn finish_job(
+        &self,
+        job: Option<&OperationJob>,
+        failure: Option<&EngineDriverError>,
+    ) -> Result<Option<OperationJob>, EngineDriverError> {
+        let (Some(store), Some(job)) = (&self.job_store, job) else {
+            return Ok(None);
+        };
+        let state = if failure.is_some() {
+            OperationState::Failed
+        } else {
+            OperationState::Ready
+        };
+        let detail = failure
+            .map(|error| format!("{}; remediation: {}", error.reason(), error.remediation()));
+        store
+            .transition(
+                &job.id,
+                state,
+                OperationProgress::default(),
+                detail.as_deref(),
+            )
+            .map(Some)
+            .map_err(|error| lifecycle_job_error("finish", error))
+    }
+}
+
+fn lifecycle_job_error(operation: &str, error: crate::JobError) -> EngineDriverError {
+    EngineDriverError::new(
+        EngineFailureReason::EngineInternal,
+        format!("{operation} durable engine lifecycle job: {error}"),
+        "repair the model-host job store before retrying the lifecycle operation",
+        false,
+    )
 }
 
 /// Choose which resident engine to evict under LRU: the entry with
@@ -325,17 +670,41 @@ mod tests {
     #[tokio::test]
     async fn retries_then_succeeds() {
         // Fail twice, succeed on the third; within the default budget of 5.
-        let mut sup = Supervisor::new(FakeLauncher::new(2, 8003), spec(), BackoffPolicy::default());
+        let backoff = BackoffPolicy {
+            base: Duration::from_millis(1),
+            max: Duration::from_millis(2),
+            max_attempts: Some(5),
+        };
+        let mut sup = Supervisor::new(FakeLauncher::new(2, 8003), spec(), backoff);
         let port = sup.ensure_ready().await.expect("eventually ready");
         assert_eq!(port, 8003);
         assert!(sup.state().is_ready());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn retries_wait_for_base_exponential_and_capped_delays() {
+        let backoff = BackoffPolicy {
+            base: Duration::from_millis(10),
+            max: Duration::from_millis(25),
+            max_attempts: Some(4),
+        };
+        let mut sup = Supervisor::new(FakeLauncher::new(3, 8007), spec(), backoff);
+        let started = tokio::time::Instant::now();
+
+        assert_eq!(sup.ensure_ready().await.unwrap(), 8007);
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            Duration::from_millis(55)
+        );
+    }
+
     #[tokio::test]
     async fn gives_up_after_max_attempts() {
         let backoff = BackoffPolicy {
+            base: Duration::from_millis(1),
+            max: Duration::from_millis(2),
             max_attempts: Some(3),
-            ..BackoffPolicy::default()
         };
         // Always fails.
         let mut sup = Supervisor::new(FakeLauncher::new(u32::MAX, 8004), spec(), backoff);

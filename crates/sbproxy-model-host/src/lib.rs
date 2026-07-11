@@ -161,7 +161,10 @@ pub use runtime::{
 };
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
 pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};
-pub use supervisor::{EngineLauncher, EngineState, LaunchSpec, SupervisorError};
+pub use supervisor::{
+    BackoffPolicy, CrashLoopState, EngineLauncher, EngineState, EngineSupervisor, LaunchSpec,
+    SupervisorClock, SupervisorError, TokioSupervisorClock,
+};
 pub use supply_chain::{scan_pickle, select_weight_file, SupplyChainError, WeightFormat};
 #[cfg(feature = "tokenizer")]
 pub use tokenize::{count_tokens, render_chat_template, ChatMessage};
