@@ -3,13 +3,10 @@
 
 //! Building and running engine launches (WOR-1653 runtime, WOR-1656).
 //!
-//! Two halves live here. [`build_launch_spec`] is the pure argument
-//! template: given an engine, a resolved model, a fit plan, and a
-//! port, it produces the exact argv the engine binary is spawned
-//! with. [`ProcessEngineLauncher`] is the real [`EngineLauncher`]:
-//! it spawns that argv as a supervised subprocess, polls a readiness
-//! endpoint over loopback until the engine answers, and kills the
-//! process on eviction.
+//! [`build_launch_spec`] is the legacy pure argument template: given an
+//! engine, a resolved model, a fit plan, and a port, it produces the exact
+//! argv. [`ProcessEngineLauncher`] is a compatibility adapter over the shared
+//! typed process boundary in [`crate::process`].
 //!
 //! The launcher is engine-agnostic and needs no GPU, so its spawn /
 //! probe / kill machinery is exercised here against a fake process
@@ -19,7 +16,6 @@
 //! minimal raw-HTTP GET so the crate keeps its lean dependency set
 //! (no HTTP client, no TLS).
 
-use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,6 +24,7 @@ use tokio::net::TcpStream;
 use crate::catalog::ModelRef;
 use crate::config::{EngineKind, KvCacheQuant};
 use crate::fit::FitPlan;
+use crate::process::{EngineCommand, EngineProcess, EngineProcessRunner};
 use crate::supervisor::{EngineLauncher, LaunchSpec};
 
 /// Build the launch spec (program + argv + env) for an engine.
@@ -360,8 +357,10 @@ pub struct ProcessEngineLauncher {
     /// Path polled for readiness (vLLM and llama-server both expose
     /// `/health`).
     pub health_path: String,
-    /// Shared handle to the running child so `kill` can reach it.
-    child: std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
+    /// Shared process implementation used by the compatibility adapter.
+    runner: EngineProcessRunner,
+    /// Opaque running process handle so `kill` can reach it.
+    process: std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<dyn EngineProcess>>>>,
     /// In-process embedded engine (WOR-1658), when the launched engine is
     /// `EngineKind::Embedded`. Present only under the `embedded` feature.
     #[cfg(feature = "embedded")]
@@ -373,7 +372,8 @@ impl Default for ProcessEngineLauncher {
         Self {
             ready_timeout: Duration::from_secs(300),
             health_path: "/health".to_string(),
-            child: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            runner: EngineProcessRunner::default(),
+            process: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "embedded")]
             embedded: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -530,72 +530,22 @@ impl EngineLauncher for ProcessEngineLauncher {
         if spec.engine.is_in_process() {
             return self.launch_embedded(spec, port).await;
         }
-        let mut cmd = tokio::process::Command::new(&spec.program);
-        cmd.args(&spec.args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        for (k, v) in &spec.env {
-            cmd.env(k, v);
-        }
-        // Put the engine in its own process group so a later group
-        // kill can reap the workers vLLM forks, and so it does not
-        // receive signals aimed at the gateway. `process_group` is
-        // tokio's inherent Unix method.
-        #[cfg(unix)]
-        cmd.process_group(0);
-        // Capture the engine's stderr to a per-port log so a crash
-        // reports why, not just that it died. A file sink needs no
-        // draining (unlike a pipe), so it cannot deadlock the child.
-        let log_path = std::env::temp_dir().join(format!("sbproxy-engine-{port}.log"));
-        match std::fs::File::create(&log_path) {
-            Ok(f) => {
-                cmd.stderr(Stdio::from(f));
-            }
-            Err(_) => {
-                cmd.stderr(Stdio::null());
-            }
-        }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn {}: {e}", spec.program))?;
-
-        // Race readiness against the child exiting. A crashed engine
-        // (bad flag, OOM, missing CUDA) would otherwise be polled for
-        // the full readiness timeout, and the supervisor would repeat
-        // that for every retry: a broken model could block a request
-        // for tens of minutes. Detecting the early exit fails fast.
-        let outcome = tokio::select! {
-            biased;
-            exited = child.wait() => {
-                let tail = std::fs::read_to_string(&log_path)
-                    .ok()
-                    .map(|s| last_lines(&s, 15))
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "(no stderr captured)".to_string());
-                Err(format!(
-                    "engine '{}' exited before ready ({exited:?}); stderr tail:\n{tail}",
-                    spec.program
-                ))
-            }
-            ready = wait_for_ready(port, &self.health_path, self.ready_timeout) => {
-                ready.map(|()| port)
-            }
+        let command = EngineCommand {
+            executable: spec.program.clone().into(),
+            arguments: spec.args.clone(),
+            environment: spec.env.iter().cloned().collect(),
+            port,
+            health_path: self.health_path.clone(),
+            ready_timeout: self.ready_timeout,
+            stderr_tail_lines: 15,
         };
-
-        match outcome {
-            Ok(p) => {
-                *self.child.lock().await = Some(child);
-                Ok(p)
-            }
-            Err(e) => {
-                // Readiness failed or the engine exited; make sure the
-                // child (and its group) is reaped, then report.
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                Err(e)
-            }
-        }
+        let process = self
+            .runner
+            .launch(&command)
+            .await
+            .map_err(|error| error.to_string())?;
+        *self.process.lock().await = Some(process);
+        Ok(port)
     }
 
     async fn kill(&self) {
@@ -606,66 +556,12 @@ impl EngineLauncher for ProcessEngineLauncher {
             server.shutdown().await;
             return;
         }
-        if let Some(mut child) = self.child.lock().await.take() {
-            // vLLM forks worker processes (EngineCore) that hold the
-            // VRAM, and it double-forks, so neither a parent SIGKILL nor
-            // a child-group kill reliably reaps them. The reliable path
-            // is graceful: SIGTERM the engine and let it tear down its
-            // own workers (SIGKILL cannot be caught, so it would orphan
-            // them). We SIGKILL only as a backstop if it does not exit,
-            // and even then only its own process group, never ours (that
-            // would take down the gateway).
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
-            }
-            // Give it a moment to shut its workers down cleanly.
-            if tokio::time::timeout(Duration::from_secs(10), child.wait())
-                .await
-                .is_err()
-            {
-                #[cfg(unix)]
-                if let Some(pid) = child.id() {
-                    // Backstop: group-kill, but only a distinct group the
-                    // child truly leads (pgid == pid), never our own.
-                    match (pgid_of(pid), pgid_of(std::process::id())) {
-                        (Some(child_pgid), Some(our_pgid))
-                            if child_pgid == pid && child_pgid != our_pgid =>
-                        {
-                            let _ = std::process::Command::new("kill")
-                                .args(["-KILL", &format!("-{child_pgid}")])
-                                .status();
-                        }
-                        _ => {}
-                    }
-                }
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+        if let Some(process) = self.process.lock().await.take() {
+            if let Err(error) = process.shutdown(Duration::from_secs(10)).await {
+                tracing::warn!(reason = %error.reason(), "managed engine shutdown failed");
             }
         }
     }
-}
-
-/// The last `n` non-empty lines of `s`, joined, for a compact error
-/// tail from an engine's captured stderr.
-fn last_lines(s: &str, n: usize) -> String {
-    let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
-
-/// The process-group id of `pid` via `ps`, or `None` if it cannot be
-/// read. Used to guard the backstop group kill so it never targets our
-/// own group (which would SIGKILL the gateway).
-#[cfg(unix)]
-fn pgid_of(pid: u32) -> Option<u32> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "pgid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -1190,13 +1086,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn last_lines_takes_the_tail() {
-        assert_eq!(last_lines("a\nb\nc\nd", 2), "c\nd");
-        assert_eq!(last_lines("only", 5), "only");
-        assert_eq!(last_lines("\n\n  \n", 3), "");
-    }
-
     #[tokio::test]
     async fn probe_health_true_when_live_false_when_dead() {
         let Some((port, handle)) = fake_health_server().await else {
@@ -1241,7 +1130,7 @@ mod tests {
                 assert_eq!(p, port);
                 // The child is tracked and killable.
                 launcher.kill().await;
-                assert!(launcher.child.lock().await.is_none());
+                assert!(launcher.process.lock().await.is_none());
             }
             Err(e) => {
                 // Spawn may be denied by the sandbox; treat as skip.

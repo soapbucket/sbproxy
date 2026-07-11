@@ -40,6 +40,7 @@ pub mod deployment_store;
 pub mod desired;
 #[cfg(feature = "embedded")]
 pub mod embedded;
+pub mod engine_driver;
 pub mod fit;
 pub mod hybrid;
 pub mod jobs;
@@ -53,6 +54,7 @@ pub mod probe_cpu;
 pub mod probe_metal;
 #[cfg(feature = "gpu-nvidia")]
 pub mod probe_nvidia;
+pub mod process;
 pub mod pull;
 pub mod report;
 pub mod residency;
@@ -102,6 +104,11 @@ pub use desired::{
     DesiredStateError, LegacyHostPolicy, LegacyServeInput, ManagedProviderInput,
     RuntimeDesiredInput, RuntimeDesiredState,
 };
+pub use engine_driver::{
+    validate_engine_args, EngineAvailability, EngineCapabilities, EngineDetection, EngineDriver,
+    EngineDriverError, EngineFailureReason, EngineHealth, LaunchRequest, ProvisionRequest,
+    ProvisionedEngine, RunningEngine,
+};
 pub use fit::{
     estimate_throughput, fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
     ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
@@ -130,6 +137,10 @@ pub use probe_cpu::{detect_total_memory_bytes, CpuProbe};
 pub use probe_metal::MetalGpuProbe;
 #[cfg(feature = "gpu-nvidia")]
 pub use probe_nvidia::NvmlGpuProbe;
+pub use process::{
+    CommandExecutor, EngineCommand, EngineProcess, EngineProcessRunner, EngineReadinessProbe,
+    LoopbackReadinessProbe, TokioCommandExecutor,
+};
 pub use pull::{pull_plan, PullItem, PullMode};
 pub use report::{ModelValue, ValueReport};
 pub use residency::{Admission, ResidencyManager, Resident};
