@@ -917,8 +917,8 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         }
     };
 
-    let compiled = match sbproxy_config::compile_config(&yaml) {
-        Ok(c) => c,
+    match sbproxy_config::compile_config(&yaml) {
+        Ok(_) => {}
         Err(e) => {
             tracing::warn!(error = %e, "admin reload: YAML parse failed");
             let msg = sanitise_path_in_error(&e.to_string(), &path);
@@ -931,58 +931,23 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
                 ),
             );
         }
-    };
-
-    let mut new_pipeline = match crate::pipeline::CompiledPipeline::from_config(compiled) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "admin reload: pipeline compile failed");
-            let msg = sanitise_path_in_error(&e.to_string(), &path);
-            return (
-                500,
-                "application/json",
-                format!(
-                    r#"{{"error":"failed to compile pipeline: {}"}}"#,
-                    msg.replace('"', "'")
-                ),
-            );
-        }
-    };
-
-    // Mirror the file-watcher's enterprise reload-hook contract so a
-    // manual reload triggers the same lifecycle hooks as a
-    // file-watcher reload. We are already on a tokio runtime here
-    // (the admin listener task), so a current-thread runtime would
-    // panic; use a one-shot block on the existing runtime via
-    // `tokio::task::block_in_place` only if the hook is present.
-    if let Some(startup) = new_pipeline.hooks.startup.clone() {
-        // Run the hook on a fresh current-thread runtime spawned on a
-        // dedicated thread so we don't depend on whatever runtime the
-        // caller is on. This matches how the file watcher drives the
-        // hook from a plain std thread.
-        let res = std::thread::scope(|s| {
-            s.spawn(|| -> Result<(), String> {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("hook runtime: {e}"))?;
-                rt.block_on(startup.on_reload(&mut new_pipeline))
-                    .map_err(|e| format!("reload hook: {e}"))
-            })
-            .join()
-            .map_err(|_| "hook thread panicked".to_string())?
-        });
-        if let Err(e) = res {
-            tracing::warn!(
-                error = %e,
-                "admin reload: enterprise reload hook failed; serving with prior hook state"
-            );
-        }
     }
 
-    let revision = new_pipeline.config_revision.clone();
+    let path_text = path.to_string_lossy();
+    if let Err(error) = crate::server::reload_from_config_yaml(&path_text, &yaml) {
+        sbproxy_observe::metrics::record_config_reload("failure");
+        tracing::error!(error = %error, "admin reload: shared reload transaction failed");
+        let msg = sanitise_path_in_error(&error.to_string(), &path);
+        return (
+            500,
+            "application/json",
+            format!(r#"{{"error":"reload failed: {}"}}"#, msg.replace('"', "'")),
+        );
+    }
+    sbproxy_observe::metrics::record_config_reload("success");
+
+    let revision = crate::reload::current_pipeline().config_revision.clone();
     let content_hash = crate::identity::config_revision(yaml.as_bytes());
-    crate::reload::load_pipeline(new_pipeline);
     *state
         .loaded_config_content_hash
         .lock()
@@ -3344,6 +3309,8 @@ origins:
     #[test]
     fn admin_reload_succeeds_with_valid_config() {
         let f = write_yaml(&reload_yaml("reload-success.example.com"));
+        let runtime = crate::server::model_host::model_runtime_manager();
+        let runtime_revision_before = runtime.current_revision();
         let state = AdminState::new(AdminConfig {
             enabled: true,
             port: 9090,
@@ -3378,6 +3345,14 @@ origins:
                 .map(|s| !s.is_empty())
                 .unwrap_or(false),
             "expected loaded_at: {body}"
+        );
+        assert!(
+            runtime.current_revision() > runtime_revision_before,
+            "admin reload must commit the permanent model runtime even for an empty desired state",
+        );
+        assert_eq!(
+            runtime.current_desired().revision.source_revision,
+            parsed["config_revision"].as_str().unwrap(),
         );
     }
 

@@ -63,6 +63,15 @@ pub mod key_plane;
 pub mod mesh_cache;
 /// WOR-1563: distributed per-key spend + rate counters via mesh CRDTs.
 pub mod mesh_counters;
+/// Managed-model runtime integration exposed for lifecycle adapters and
+/// black-box reload tests.
+#[doc(hidden)]
+pub mod model_runtime {
+    pub use crate::server::model_host::{
+        commit_model_runtime, model_runtime_manager, prepare_model_runtime, ManagedModelPermit,
+        PreparedModelRuntime, ProductionModelRuntime,
+    };
+}
 pub mod pipeline;
 /// Policy verdict audit event bus.
 ///

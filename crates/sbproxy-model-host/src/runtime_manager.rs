@@ -64,6 +64,13 @@ pub enum RuntimeManagerError {
     CounterOverflow,
 }
 
+impl RuntimeManagerError {
+    /// Stable bounded reason code for request failover and admin responses.
+    pub fn reason_code(&self) -> &'static str {
+        runtime_error_reason_code(self)
+    }
+}
+
 /// Immutable input used to create one deployment runtime generation.
 #[derive(Debug, Clone)]
 pub struct DeploymentPrepareRequest {
@@ -1583,6 +1590,9 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
                 resolved.engine, request.deployment_id
             ))
         })?;
+        if let Some(entry) = request.desired.legacy_entry.as_ref() {
+            validate_legacy_managed_entry(entry, resolved.engine)?;
+        }
         let provisioning = provisioning_for(&request, resolved.engine);
         let detection = driver.detect(&worker, &provisioning);
         let driver_availability = detection.availability;
@@ -1612,9 +1622,13 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             .get(&resolved.logical_model)
             .map(|entry| crate::parse_params(&entry.params))
             .unwrap_or(0);
-        let engine_cache_dir =
-            crate::resolve_cache_dir_default(request.control.cache.directory.as_deref())
-                .join("engines");
+        let configured_cache = request.control.cache.directory.as_deref().or_else(|| {
+            request
+                .legacy_host_policy
+                .as_ref()
+                .and_then(|policy| policy.cache_dir.as_deref())
+        });
+        let engine_cache_dir = crate::resolve_cache_dir_default(configured_cache).join("engines");
         let supervisor = crate::EngineSupervisor::new(
             request.deployment_id.clone(),
             driver,
@@ -1647,6 +1661,40 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             supervisor: Mutex::new(supervisor),
         }))
     }
+}
+
+fn validate_legacy_managed_entry(
+    entry: &crate::ServeEntry,
+    engine: EngineKind,
+) -> Result<(), RuntimeManagerError> {
+    let mut unsupported = Vec::new();
+    if entry.speculative.is_some() {
+        unsupported.push("speculative");
+    }
+    if entry.chunked_prefill.is_some() {
+        unsupported.push("chunked_prefill");
+    }
+    if !entry.lora_adapters.is_empty() || entry.max_loras.is_some() {
+        unsupported.push("lora_adapters/max_loras");
+    }
+    if entry.tool_call_parser.is_some() {
+        unsupported.push("tool_call_parser");
+    }
+    if entry.swap_space_gib.is_some() {
+        unsupported.push("swap_space_gib");
+    }
+    if entry.cpu_offload_gib.is_some() {
+        unsupported.push("cpu_offload_gib");
+    }
+    if !unsupported.is_empty() {
+        return Err(RuntimeManagerError::Prepare(format!(
+            "legacy serve model {:?} uses fields not yet available through the verified managed driver: {}; remove them during migration instead of allowing the runtime to ignore them",
+            entry.model,
+            unsupported.join(", "),
+        )));
+    }
+    crate::validate_engine_args(engine, &entry.extra_args).map_err(RuntimeManagerError::Engine)?;
+    Ok(())
 }
 
 struct ProductionPreparedDeployment {

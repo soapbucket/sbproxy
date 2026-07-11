@@ -10,6 +10,8 @@
 
 use super::*;
 
+static CONFIG_RELOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Start a file watcher that reloads the config on changes.
 ///
 /// Spawns a background thread that watches the config file for modifications.
@@ -216,10 +218,18 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
 }
 
 fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
-    super::model_host::set_model_host_config_path(std::path::Path::new(config_path));
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{config_path}': {e}"))?;
-    let compiled = sbproxy_config::compile_config(&yaml)?;
+    reload_from_config_yaml(config_path, &yaml)
+}
+
+/// Reload one exact config payload through the same prepare and publish
+/// transaction used by file-watch and SIGHUP reloads.
+pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::Result<()> {
+    let _reload_guard = CONFIG_RELOAD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let compiled = sbproxy_config::compile_config(yaml)?;
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
@@ -365,12 +375,11 @@ fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
             }
         }
     }
-    if let Some(runtime) = super::model_host::initialize_model_host(&new_pipeline.actions)
-        .map_err(|error| anyhow::anyhow!("model host initialization failed: {error}"))?
-    {
-        super::model_host::warm_on_boot_blocking(runtime)
-            .map_err(|error| anyhow::anyhow!("model host startup warming failed: {error}"))?;
-    }
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    super::model_host::reconcile_model_runtime_blocking(&new_pipeline, config_dir)
+        .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
     reload::load_pipeline(new_pipeline);
     tracing::info!("config reloaded successfully");
     Ok(())
@@ -680,7 +689,6 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     use pingora_proxy::http_proxy_service;
 
     // Load and compile the config.
-    super::model_host::set_model_host_config_path(std::path::Path::new(config_path));
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
     let initial_content_hash = crate::identity::config_revision(yaml.as_bytes());
@@ -886,14 +894,14 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Resolve and verify every `pull: on_boot` artifact before the
-    // pipeline becomes requestable. No engine is started by warming.
-    if let Some(runtime) = super::model_host::initialize_model_host(&pipeline.actions)
-        .map_err(|error| anyhow::anyhow!("model host initialization failed: {error}"))?
-    {
-        super::model_host::warm_on_boot_blocking(runtime)
-            .map_err(|error| anyhow::anyhow!("model host startup warming failed: {error}"))?;
-    }
+    // Prepare and publish the complete model desired state before the
+    // pipeline becomes requestable. The permanent runtime exists even
+    // when this first snapshot contains no managed deployments.
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    super::model_host::reconcile_model_runtime_blocking(&pipeline, config_dir)
+        .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
 
     // Store in hot-reload slot.
     reload::load_pipeline(pipeline);

@@ -726,11 +726,10 @@ pub struct RequestContext {
     /// model admission gate reads it to decide queue ordering and
     /// spill behavior; `None` means the standard lane.
     pub ai_lane_priority: Option<sbproxy_ai::identity::KeyPriority>,
-    /// Held admission slot on the served-model concurrency gate
-    /// (WOR-1679). Present only while a request occupies a served
-    /// lane; dropping the context releases the slot to the next
-    /// queued request.
-    pub serve_lane_permit: Option<crate::server::model_host::ServeLanePermit>,
+    /// Deployment-specific admission held across the complete managed-model
+    /// response stream. Dropping the context releases capacity to the next
+    /// priority-ordered request.
+    pub managed_model_permit: Option<crate::server::model_host::ManagedModelPermit>,
     /// Derived AI request cost in micro-USD (`1e-6` USD), computed
     /// from the same pricing catalog used by AI billing metrics.
     pub ai_cost_usd_micros: Option<u64>,
@@ -1119,7 +1118,7 @@ impl RequestContext {
             ai_tokens_out: None,
             ai_key_tpm_bucket: None,
             ai_lane_priority: None,
-            serve_lane_permit: None,
+            managed_model_permit: None,
             ai_cost_usd_micros: None,
             ai_surface: None,
             ai_outcome: None,
