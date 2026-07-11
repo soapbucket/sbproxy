@@ -1809,6 +1809,15 @@ impl ModelRuntimeManager {
         }
         drop(residency);
         slot.finalize_stop_owned(owner_epoch).await?;
+        let _cleanup = self.retirement_lock.lock().await;
+        let key = (deployment.to_string(), slot.generation);
+        let mut retired = self.retired_slots.lock().await;
+        if retired
+            .get(&key)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.slot, &slot))
+        {
+            retired.remove(&key);
+        }
         Ok(report)
     }
 

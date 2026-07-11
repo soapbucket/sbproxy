@@ -2086,6 +2086,54 @@ async fn failed_limit_eviction_keeps_the_physical_generation_accounted() {
 }
 
 #[tokio::test]
+async fn operator_stop_clears_a_failed_policy_retirement_before_restart() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = ModelRuntimeManager::new_with_device_capacities(
+        Catalog::builtin().catalog_revision,
+        preparer.clone(),
+        BTreeMap::from([(0, 2)]),
+    )
+    .unwrap();
+    manager
+        .reconcile(manager_desired(
+            "operator-retirement-owner",
+            &[("a", false, 30), ("b", false, 30)],
+            2,
+        ))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    manager.ensure_ready("b").await.unwrap();
+    preparer
+        .facts
+        .fail_stop
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+
+    let mut limited = manager_desired(
+        "operator-retirement-failed",
+        &[("a", false, 30), ("b", false, 30)],
+        2,
+    );
+    limited.control.cache.max_resident_models = Some(1);
+    let report = manager.reconcile(limited).await.unwrap();
+    assert!(report.retire_failures.contains_key("a"));
+
+    preparer.facts.fail_stop.lock().unwrap().remove("a");
+    manager.stop("a").await.unwrap();
+    let restarted = manager.ensure_ready("a").await.unwrap();
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+    let status = manager.status("a").await.unwrap();
+    assert_eq!(
+        status.state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready,
+        "maintenance must not act on a retiree registration cleared by operator stop"
+    );
+    assert_eq!(status.port, Some(restarted.port));
+}
+
+#[tokio::test]
 async fn manager_honors_legacy_never_eviction_policy() {
     let preparer = FixturePreparer::new(Duration::from_millis(1));
     let manager = ModelRuntimeManager::new_with_device_capacities(
