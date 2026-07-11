@@ -1984,6 +1984,55 @@ async fn lowering_the_resident_limit_evicts_idle_preserved_slots() {
 }
 
 #[tokio::test]
+async fn policy_eviction_owns_the_idle_generation_before_shutdown() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = Arc::new(
+        ModelRuntimeManager::new_with_device_capacities(
+            Catalog::builtin().catalog_revision,
+            preparer.clone(),
+            BTreeMap::from([(0, 2)]),
+        )
+        .unwrap(),
+    );
+    manager
+        .reconcile(manager_desired(
+            "policy-owner",
+            &[("a", false, 30), ("b", false, 30)],
+            2,
+        ))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    manager.ensure_ready("b").await.unwrap();
+    preparer.facts.block_stop.store(true, Ordering::SeqCst);
+
+    let mut limited = manager_desired(
+        "policy-owner-limited",
+        &[("a", false, 30), ("b", false, 30)],
+        2,
+    );
+    limited.control.cache.max_resident_models = Some(1);
+    let reconcile_manager = manager.clone();
+    let reconcile = tokio::spawn(async move { reconcile_manager.reconcile(limited).await });
+    preparer.facts.stop_entered.notified().await;
+
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Draining
+    );
+    assert!(matches!(
+        manager
+            .admit("a", sbproxy_model_host::PriorityClass::Standard)
+            .await,
+        Err(ref rejection)
+            if rejection.reason == sbproxy_model_host::AdmissionReason::Draining
+    ));
+    preparer.facts.stop_release.notify_one();
+    reconcile.await.unwrap().unwrap();
+    assert_eq!(manager.residency_reservations().await.len(), 1);
+}
+
+#[tokio::test]
 async fn failed_limit_eviction_keeps_the_physical_generation_accounted() {
     let preparer = FixturePreparer::new(Duration::from_millis(1));
     let manager = ModelRuntimeManager::new_with_device_capacities(

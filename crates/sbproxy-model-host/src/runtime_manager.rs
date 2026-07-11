@@ -314,6 +314,12 @@ struct RecreateCheckpoint {
     was_running: bool,
 }
 
+#[derive(Clone)]
+struct RetiredSlot {
+    slot: Arc<DeploymentSlot>,
+    drain_owner: Option<u64>,
+}
+
 struct DeploymentSlot {
     id: String,
     generation: u64,
@@ -1102,6 +1108,10 @@ impl DeploymentSlot {
 
     async fn begin_idle_eviction(&self) -> Result<Option<u64>, RuntimeManagerError> {
         let mut lifecycle = self.lifecycle.lock().await;
+        let owner_epoch = lifecycle
+            .start_epoch
+            .checked_add(1)
+            .ok_or(RuntimeManagerError::CounterOverflow)?;
         if self
             .desired
             .legacy_entry
@@ -1113,15 +1123,25 @@ impl DeploymentSlot {
         {
             return Ok(None);
         }
-        lifecycle.start_epoch = lifecycle
-            .start_epoch
-            .checked_add(1)
-            .ok_or(RuntimeManagerError::CounterOverflow)?;
+        lifecycle.start_epoch = owner_epoch;
         lifecycle.state = DeploymentRuntimeState::Draining;
-        let owner_epoch = lifecycle.start_epoch;
         drop(lifecycle);
         self.publish_lifecycle_state().await;
         Ok(Some(owner_epoch))
+    }
+
+    async fn abort_idle_eviction(&self, owner_epoch: u64) {
+        let mut lifecycle = self.lifecycle.lock().await;
+        if lifecycle.start_epoch != owner_epoch
+            || lifecycle.state != DeploymentRuntimeState::Draining
+            || lifecycle.running.is_none()
+        {
+            return;
+        }
+        lifecycle.state = DeploymentRuntimeState::Ready;
+        self.admission.resume();
+        drop(lifecycle);
+        self.publish_lifecycle_state().await;
     }
 
     fn emit_state(&self, state: DeploymentRuntimeState, engine: Option<EngineKind>) {
@@ -1238,7 +1258,7 @@ pub struct ModelRuntimeManager {
     preparer: Arc<dyn DeploymentPreparer>,
     snapshot: ArcSwap<RuntimeSnapshot>,
     residency: Mutex<crate::DeviceResidencySet>,
-    retired_slots: Mutex<BTreeMap<(String, u64), Arc<DeploymentSlot>>>,
+    retired_slots: Mutex<BTreeMap<(String, u64), RetiredSlot>>,
     retirement_lock: Mutex<()>,
     placement_lock: Mutex<()>,
     observer: Arc<dyn crate::ModelHostObserver>,
@@ -1833,15 +1853,21 @@ impl ModelRuntimeManager {
         Some(slot.status().await)
     }
 
-    async fn register_retired_slots(&self, retired: &[(String, Arc<DeploymentSlot>)]) {
+    async fn register_retired_slots(&self, retired: &[(String, Arc<DeploymentSlot>, Option<u64>)]) {
         {
             let mut retained = self.retired_slots.lock().await;
-            for (deployment, slot) in retired {
-                retained.insert((deployment.clone(), slot.generation), Arc::clone(slot));
+            for (deployment, slot, drain_owner) in retired {
+                retained.insert(
+                    (deployment.clone(), slot.generation),
+                    RetiredSlot {
+                        slot: Arc::clone(slot),
+                        drain_owner: *drain_owner,
+                    },
+                );
             }
         }
         let mut residency = self.residency.lock().await;
-        for (deployment, slot) in retired {
+        for (deployment, slot, _) in retired {
             for reservation in residency.reservations().into_iter().filter(|reservation| {
                 reservation.deployment == *deployment && reservation.generation == slot.generation
             }) {
@@ -1865,16 +1891,29 @@ impl ModelRuntimeManager {
     ) -> Result<Option<crate::DrainReport>, RuntimeManagerError> {
         let _cleanup = self.retirement_lock.lock().await;
         let key = (deployment.to_string(), slot.generation);
-        let is_retained = self
-            .retired_slots
-            .lock()
-            .await
-            .get(&key)
-            .is_some_and(|retained| Arc::ptr_eq(retained, slot));
-        if !is_retained {
+        let retained = self.retired_slots.lock().await.get(&key).cloned();
+        let Some(retained) = retained.filter(|retained| Arc::ptr_eq(&retained.slot, slot)) else {
             return Ok(None);
-        }
-        let report = slot.drain(grace).await?;
+        };
+        let result = match retained.drain_owner {
+            Some(owner_epoch) => slot.drain_owned(grace, owner_epoch).await,
+            None => slot.drain(grace).await,
+        };
+        let report = match result {
+            Ok(report) => report,
+            Err(error) => {
+                if retained.drain_owner.is_some() {
+                    let mut registry = self.retired_slots.lock().await;
+                    if let Some(registered) = registry.get_mut(&key).filter(|registered| {
+                        Arc::ptr_eq(&registered.slot, slot)
+                            && registered.drain_owner == retained.drain_owner
+                    }) {
+                        registered.drain_owner = None;
+                    }
+                }
+                return Err(error);
+            }
+        };
         let mut residency = self.residency.lock().await;
         for reservation in residency.reservations().into_iter().filter(|reservation| {
             reservation.deployment == deployment && reservation.generation == slot.generation
@@ -1885,7 +1924,7 @@ impl ModelRuntimeManager {
         let mut retained = self.retired_slots.lock().await;
         if retained
             .get(&key)
-            .is_some_and(|registered| Arc::ptr_eq(registered, slot))
+            .is_some_and(|registered| Arc::ptr_eq(&registered.slot, slot))
         {
             retained.remove(&key);
         }
@@ -1908,7 +1947,7 @@ impl ModelRuntimeManager {
             .lock()
             .await
             .iter()
-            .map(|((deployment, _), slot)| (deployment.clone(), Arc::clone(slot)))
+            .map(|((deployment, _), retired)| (deployment.clone(), Arc::clone(&retired.slot)))
             .collect::<Vec<_>>();
         for (deployment, slot) in retired {
             if let Err(error) = self.cleanup_retired_slot(&deployment, &slot, grace).await {
@@ -2303,6 +2342,63 @@ impl ModelRuntimeManager {
             }
             return Err(error);
         }
+        let mut eviction_claims = BTreeMap::new();
+        let mut claim_error = None;
+        for id in &capacity_evictions {
+            let Some(slot) = current.slots.get(id).cloned() else {
+                claim_error = Some(RuntimeManagerError::Prepare(format!(
+                    "policy eviction selected unknown deployment {id:?}"
+                )));
+                break;
+            };
+            match slot.begin_idle_eviction().await {
+                Ok(Some(owner_epoch)) => {
+                    eviction_claims.insert((id.clone(), slot.generation), owner_epoch);
+                }
+                Ok(None) => {
+                    claim_error = Some(RuntimeManagerError::Admission(
+                        crate::AdmissionRejection::new(
+                            crate::AdmissionReason::InsufficientCapacity,
+                            format!("deployment {id:?} became protected before policy eviction"),
+                            true,
+                            None,
+                        ),
+                    ));
+                    break;
+                }
+                Err(error) => {
+                    claim_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = claim_error {
+            for ((id, generation), owner_epoch) in &eviction_claims {
+                if let Some(slot) = current
+                    .slots
+                    .get(id)
+                    .filter(|slot| slot.generation == *generation)
+                {
+                    slot.abort_idle_eviction(*owner_epoch).await;
+                }
+            }
+            teardown_slots(
+                candidate_ids
+                    .iter()
+                    .filter_map(|id| slots.get(id).cloned())
+                    .collect(),
+                grace,
+            )
+            .await;
+            if let Some(rollback) =
+                rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
+            {
+                return Err(RuntimeManagerError::Prepare(format!(
+                    "{error}; recreate rollback failed: {rollback}"
+                )));
+            }
+            return Err(error);
+        }
         *self.residency.lock().await = planned;
 
         let retired = current
@@ -2311,7 +2407,11 @@ impl ModelRuntimeManager {
             .filter_map(|(id, old)| {
                 (capacity_evictions.contains(id)
                     || slots.get(id).is_none_or(|new| !Arc::ptr_eq(old, new)))
-                .then_some((id.clone(), old.clone()))
+                .then_some((
+                    id.clone(),
+                    old.clone(),
+                    eviction_claims.get(&(id.clone(), old.generation)).copied(),
+                ))
             })
             .collect::<Vec<_>>();
         self.register_retired_slots(&retired).await;
@@ -2329,7 +2429,7 @@ impl ModelRuntimeManager {
 
         let grace = Duration::from_millis(prepared.desired.control.shutdown_deadline_ms);
         let mut retire_failures = BTreeMap::new();
-        for (id, slot) in retired {
+        for (id, slot, _) in retired {
             match self.cleanup_retired_slot(&id, &slot, grace).await {
                 Ok(Some(report)) if report.timed_out => {
                     retire_failures.insert(
