@@ -1586,18 +1586,14 @@ fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    println!(
-        "\n{} is ready on http://127.0.0.1:{}",
-        prepared.name, args.port
-    );
-    println!("Admin: {admin_url}");
-    println!("Admin username: admin");
-    println!("Admin password: {}", prepared.admin_password);
-    println!(
-        "Try: curl http://127.0.0.1:{}/v1/chat/completions \\\n  \
-         -H 'content-type: application/json' \\\n  \
-         -d '{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}]}}'",
-        args.port, prepared.name,
+    print!(
+        "{}",
+        run_ready_banner(
+            &prepared.name,
+            args.port,
+            &admin_url,
+            &prepared.admin_password,
+        )
     );
     prepared.admin_password.zeroize();
     if let Some(password) = admin_args.password.as_mut() {
@@ -1617,6 +1613,20 @@ fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) {
             std::process::exit(1);
         }
     }
+}
+
+fn run_ready_banner(name: &str, port: u16, admin_url: &str, admin_password: &str) -> String {
+    format!(
+        "\n{name} is ready on http://127.0.0.1:{port}\n\
+         Admin: {admin_url}\n\
+         Admin username: admin\n\
+         Admin password: {admin_password}\n\
+         export OPENAI_BASE_URL=http://127.0.0.1:{port}/v1\n\
+         export OPENAI_API_KEY=local\n\
+         Try: curl http://127.0.0.1:{port}/v1/chat/completions \\\n  \
+           -H 'content-type: application/json' \\\n  \
+           -d '{{\"model\":\"{name}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}]}}'\n"
+    )
 }
 
 /// Resolve the public model name. One-command serving intentionally accepts
@@ -4124,6 +4134,16 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn run_ready_banner_contains_copyable_sdk_and_admin_settings() {
+        let banner = run_ready_banner("coder", 8080, "http://127.0.0.1:9090", "fixture-secret");
+        assert!(banner.contains("OPENAI_BASE_URL=http://127.0.0.1:8080/v1"));
+        assert!(banner.contains("OPENAI_API_KEY=local"));
+        assert!(banner.contains("Admin: http://127.0.0.1:9090"));
+        assert!(banner.contains("Admin password: fixture-secret"));
+        assert!(banner.contains("\"model\":\"coder\""));
     }
 
     #[test]
