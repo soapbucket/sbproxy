@@ -125,11 +125,30 @@ pub fn resolve_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Some(candidate);
         }
     }
     None
+}
+
+/// Whether `path` is a regular executable file for the current platform.
+pub fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Ensure a `llama-server` binary is available: prefer one on `PATH`,

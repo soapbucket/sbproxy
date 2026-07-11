@@ -7,12 +7,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sbproxy_model_host::{
     validate_engine_args, ArtifactCacheMetadata, ArtifactFile, ArtifactFormat, CommandExecutor,
-    EngineAvailability, EngineCapabilities, EngineCommand, EngineDetection, EngineDriver,
-    EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineProcess,
-    EngineProcessRunner, EngineProvisioning, EngineReadinessProbe, FitPlan, LaunchRequest,
-    OperationJob, OperationKind, OperationProgress, OperationState, ProvisionRequest,
-    ProvisionedEngine, Quant, ReadyArtifact, ResolvedArtifact, RunningEngine, SupportLevel,
-    WorkerProfile,
+    EngineAccel, EngineAvailability, EngineCapabilities, EngineCommand, EngineDetection,
+    EngineDriver, EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineProcess,
+    EngineProcessRunner, EngineProvisioning, EngineReadinessProbe, FitPlan, KvCacheQuant,
+    LaunchRequest, LlamaBinarySource, LlamaCppDriver, OperationJob, OperationKind,
+    OperationProgress, OperationState, ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact,
+    ResolvedArtifact, RunningEngine, SupportLevel, WorkerProfile,
 };
 
 #[derive(Debug)]
@@ -161,10 +161,16 @@ fn resolved(kind: EngineKind, format: ArtifactFormat) -> ResolvedArtifact {
 fn ready(kind: EngineKind, format: ArtifactFormat) -> ReadyArtifact {
     let resolved = resolved(kind, format);
     let snapshot = PathBuf::from("/verified/fixture");
+    let filename = match format {
+        ArtifactFormat::Gguf => "model.gguf",
+        ArtifactFormat::Safetensors | ArtifactFormat::Pickle => "model.bin",
+    };
+    let mut metadata_files = resolved.files;
+    metadata_files[0].path = filename.to_string();
     ReadyArtifact {
         artifact_digest: resolved.artifact_digest.clone(),
         snapshot_path: snapshot.clone(),
-        files: BTreeMap::from([("model.bin".to_string(), snapshot.join("model.bin"))]),
+        files: BTreeMap::from([(filename.to_string(), snapshot.join(filename))]),
         metadata: ArtifactCacheMetadata {
             schema_version: 1,
             artifact_digest: resolved.artifact_digest,
@@ -175,7 +181,7 @@ fn ready(kind: EngineKind, format: ArtifactFormat) -> ReadyArtifact {
             quant: resolved.quant,
             source: resolved.source,
             revision: resolved.revision,
-            files: resolved.files,
+            files: metadata_files,
             total_size_bytes: 16,
             context_length: 4096,
             license: resolved.license,
@@ -245,6 +251,7 @@ async fn driver_contract_is_complete_and_object_safe() {
                     fit: fit(),
                     port: 18080,
                     selected_devices: vec![0],
+                    kv_quant: KvCacheQuant::Auto,
                     extra_args: Vec::new(),
                     ready_timeout: Duration::from_secs(1),
                 },
@@ -329,6 +336,7 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         fit: fit(),
         port: 18080,
         selected_devices: vec![0],
+        kv_quant: KvCacheQuant::Auto,
         extra_args: vec!["--flash-attn".to_string()],
         ready_timeout: Duration::from_secs(1),
     };
@@ -336,10 +344,11 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         .validate(EngineKind::LlamaCpp)
         .expect("verified snapshot request");
 
-    request.artifact.files.insert(
-        "model.bin".to_string(),
-        PathBuf::from("/unverified/model.bin"),
-    );
+    let relative = request.artifact.metadata.files[0].path.clone();
+    request
+        .artifact
+        .files
+        .insert(relative, PathBuf::from("/unverified/model.gguf"));
     let error = request
         .validate(EngineKind::LlamaCpp)
         .expect_err("path escaped snapshot");
@@ -352,6 +361,7 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         fit: fit(),
         port: 18080,
         selected_devices: vec![0],
+        kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
         ready_timeout: Duration::from_secs(1),
     };
@@ -470,4 +480,233 @@ async fn process_runner_reports_early_exit_with_a_stable_reason() {
     let error = runner.launch(&command).await.expect_err("early exit");
     assert_eq!(error.reason(), EngineFailureReason::EngineEarlyExit);
     assert!(!error.remediation().is_empty());
+}
+
+type LlamaFetchRecord = (String, EngineAccel, Option<String>);
+
+#[derive(Clone)]
+struct FixtureLlamaSource {
+    on_path: Option<PathBuf>,
+    executable: bool,
+    fetched: Result<PathBuf, String>,
+    fetches: Arc<Mutex<Vec<LlamaFetchRecord>>>,
+}
+
+#[async_trait]
+impl LlamaBinarySource for FixtureLlamaSource {
+    fn resolve_on_path(&self) -> Option<PathBuf> {
+        self.on_path.clone()
+    }
+
+    fn is_executable(&self, _path: &std::path::Path) -> bool {
+        self.executable
+    }
+
+    async fn fetch_release(
+        &self,
+        _cache_dir: &std::path::Path,
+        version: &str,
+        acceleration: EngineAccel,
+        sha256: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        self.fetches.lock().unwrap().push((
+            version.to_string(),
+            acceleration,
+            sha256.map(str::to_string),
+        ));
+        self.fetched.clone()
+    }
+}
+
+fn llama_source(on_path: Option<&str>, executable: bool) -> Arc<FixtureLlamaSource> {
+    Arc::new(FixtureLlamaSource {
+        on_path: on_path.map(PathBuf::from),
+        executable,
+        fetched: Ok(PathBuf::from("/engines/llama-server")),
+        fetches: Arc::new(Mutex::new(Vec::new())),
+    })
+}
+
+fn llama_worker() -> WorkerProfile {
+    WorkerProfile {
+        accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+        compute_capability: None,
+        memory_bytes: 8 * 1024 * 1024 * 1024,
+        engines: BTreeSet::from([EngineKind::LlamaCpp]),
+    }
+}
+
+fn fixture_runner(commands: Arc<Mutex<Vec<CapturedCommand>>>) -> EngineProcessRunner {
+    EngineProcessRunner::new(
+        Arc::new(RecordingExecutor {
+            commands,
+            process: Arc::new(FixtureProcess {
+                stopped: AtomicBool::new(false),
+            }),
+        }),
+        Arc::new(FixtureProbe { ready: true }),
+    )
+}
+
+#[test]
+fn llama_detection_distinguishes_available_acquirable_incompatible_and_blocked() {
+    let runner = fixture_runner(Arc::new(Mutex::new(Vec::new())));
+    let available = LlamaCppDriver::new(
+        runner.clone(),
+        llama_source(Some("/usr/bin/llama-server"), true),
+    );
+    assert_eq!(
+        available
+            .detect(&llama_worker(), &EngineProvisioning::default())
+            .availability,
+        EngineAvailability::Available
+    );
+
+    let acquirable = LlamaCppDriver::new(runner.clone(), llama_source(None, true));
+    let detection = acquirable.detect(&llama_worker(), &EngineProvisioning::default());
+    assert_eq!(detection.availability, EngineAvailability::Acquirable);
+    assert!(detection.reason.contains("sha256"));
+    assert!(detection.remediation.is_some());
+
+    let mut incompatible_worker = llama_worker();
+    incompatible_worker.engines.clear();
+    assert_eq!(
+        acquirable
+            .detect(&incompatible_worker, &EngineProvisioning::default())
+            .availability,
+        EngineAvailability::Incompatible
+    );
+
+    let explicit: EngineProvisioning = serde_yaml::from_str(
+        r#"
+acquire:
+  source: path
+  path: /opt/llama/llama-server
+"#,
+    )
+    .unwrap();
+    let blocked = LlamaCppDriver::new(runner.clone(), llama_source(None, false));
+    assert_eq!(
+        blocked.detect(&llama_worker(), &explicit).availability,
+        EngineAvailability::Blocked
+    );
+
+    let cuda: EngineProvisioning = serde_yaml::from_str(
+        r#"
+acquire:
+  source: release
+  accel: cuda
+  sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        acquirable.detect(&llama_worker(), &cuda).availability,
+        EngineAvailability::Incompatible
+    );
+}
+
+#[tokio::test]
+async fn llama_provision_prefers_compatible_path_and_release_failures_do_not_fallback() {
+    let runner = fixture_runner(Arc::new(Mutex::new(Vec::new())));
+    let path_source = llama_source(Some("/usr/bin/llama-server"), true);
+    let driver = LlamaCppDriver::new(runner.clone(), path_source.clone());
+    let provisioned = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+            worker: llama_worker(),
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect("PATH engine");
+    assert_eq!(
+        provisioned.executable,
+        PathBuf::from("/usr/bin/llama-server")
+    );
+    assert!(path_source.fetches.lock().unwrap().is_empty());
+
+    let failing_source = Arc::new(FixtureLlamaSource {
+        on_path: None,
+        executable: true,
+        fetched: Err("fixture release failure".to_string()),
+        fetches: Arc::new(Mutex::new(Vec::new())),
+    });
+    let driver = LlamaCppDriver::new(runner, failing_source);
+    let error = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+            worker: llama_worker(),
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect_err("release failure must surface");
+    assert_eq!(error.reason(), EngineFailureReason::EngineProvisionFailed);
+}
+
+#[tokio::test]
+async fn llama_launch_uses_one_verified_gguf_and_runtime_owned_network_and_devices() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let driver = LlamaCppDriver::new(
+        fixture_runner(commands.clone()),
+        llama_source(Some("/usr/bin/llama-server"), true),
+    );
+    let provisioned = ProvisionedEngine {
+        kind: EngineKind::LlamaCpp,
+        executable: PathBuf::from("/usr/bin/llama-server"),
+        version: Some("fixture".to_string()),
+        fingerprint: "fixture".to_string(),
+        provisioning: EngineProvisioning::default(),
+    };
+    let request = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 3,
+        artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+        fit: fit(),
+        port: 18080,
+        selected_devices: vec![2],
+        kv_quant: KvCacheQuant::Int4,
+        extra_args: vec!["--flash-attn".to_string()],
+        ready_timeout: Duration::from_secs(1),
+    };
+
+    let running = driver
+        .launch(&provisioned, &request)
+        .await
+        .expect("llama launch");
+    assert_eq!(running.port, 18080);
+    assert_eq!(driver.health(&running).await.unwrap(), EngineHealth::Ready);
+
+    let captured = commands.lock().unwrap();
+    let arguments = &captured[0].arguments;
+    let model_indices = arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == "--model").then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(model_indices.len(), 1);
+    assert_eq!(
+        arguments[model_indices[0] + 1],
+        "/verified/fixture/model.gguf"
+    );
+    assert!(!arguments.iter().any(|value| value == "--hf-repo"));
+    assert!(!arguments.iter().any(|value| value == "--hf-file"));
+    assert_eq!(flag_value(arguments, "--host"), "127.0.0.1");
+    assert_eq!(flag_value(arguments, "--port"), "18080");
+    assert_eq!(flag_value(arguments, "--ctx-size"), "4096");
+    assert_eq!(flag_value(arguments, "--n-gpu-layers"), "999");
+    assert_eq!(flag_value(arguments, "--cache-type-k"), "q4_0");
+    assert_eq!(flag_value(arguments, "--cache-type-v"), "q4_0");
+    assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "2");
+}
+
+fn flag_value<'a>(arguments: &'a [String], flag: &str) -> &'a str {
+    let index = arguments
+        .iter()
+        .position(|argument| argument == flag)
+        .unwrap_or_else(|| panic!("missing {flag}"));
+    arguments[index + 1].as_str()
 }

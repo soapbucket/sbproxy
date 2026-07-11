@@ -46,6 +46,7 @@ pub mod hybrid;
 pub mod jobs;
 pub mod kv_tiering;
 pub mod launch;
+pub mod llama_driver;
 pub mod llama_release;
 pub mod lora;
 pub mod manifest;
@@ -120,6 +121,9 @@ pub use jobs::{
 pub use kv_tiering::{KvTier, KvTieringPolicy, TierDecision};
 pub use launch::{
     build_launch_spec, chunk_size_for_ttft, serving_flags, should_speculate, ProcessEngineLauncher,
+};
+pub use llama_driver::{
+    LlamaBinarySource, LlamaCppDriver, LlamaDetection, LlamaProvisioned, SystemLlamaBinarySource,
 };
 pub use llama_release::{
     asset_url as llama_asset_url, asset_url_accel as llama_asset_url_accel, resolve_on_path,

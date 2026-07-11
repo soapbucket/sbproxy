@@ -156,6 +156,11 @@ impl EngineProcessRunner {
             tokio::time::sleep(self.poll_interval).await;
         }
     }
+
+    /// Perform one readiness probe through the injected health boundary.
+    pub async fn ready(&self, port: u16, path: &str) -> Result<bool, EngineDriverError> {
+        self.probe.ready(port, path).await
+    }
 }
 
 impl Default for EngineProcessRunner {

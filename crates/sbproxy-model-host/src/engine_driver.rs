@@ -104,6 +104,8 @@ pub struct LaunchRequest {
     pub port: u16,
     /// Worker-local device indices assigned to this replica.
     pub selected_devices: Vec<u32>,
+    /// Typed KV-cache precision selected for the engine.
+    pub kv_quant: crate::KvCacheQuant,
     /// Additional allowlisted engine arguments.
     pub extra_args: Vec<String>,
     /// Maximum wait for the engine's readiness endpoint.
