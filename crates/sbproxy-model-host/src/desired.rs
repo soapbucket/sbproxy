@@ -210,7 +210,9 @@ pub fn compile_desired_state(
     let mut public_routes = BTreeMap::<(String, String), String>::new();
     for provider in &input.managed_providers {
         validate_route_identity(&provider.origin, &provider.provider)?;
-        if !control.deployments.contains_key(&provider.deployment) {
+        if !control.deployments.contains_key(&provider.deployment)
+            && control.authority != ModelHostAuthority::AdminManaged
+        {
             return Err(DesiredStateError::UndeclaredDeployment {
                 provider: provider.provider.clone(),
                 deployment: provider.deployment.clone(),

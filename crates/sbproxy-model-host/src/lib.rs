@@ -61,6 +61,7 @@ pub mod pull;
 pub mod report;
 pub mod residency;
 pub mod runtime;
+pub mod runtime_manager;
 pub mod scheduling;
 pub mod sleep_wake;
 pub mod supervisor;
@@ -158,6 +159,11 @@ pub use residency::{Admission, ResidencyManager, Resident};
 pub use runtime::{
     parse_params, ConfigDirMetadataProvider, DeviceVram, ModelHostObserver, ModelHostRuntime,
     ModelHostStatus, ModelMetadataProvider, ModelStatus, NoopObserver, RuntimeError, VramStatus,
+};
+pub use runtime_manager::{
+    DeploymentPrepareRequest, DeploymentPreparer, DeploymentRuntimeState, DeploymentRuntimeStatus,
+    ModelRuntimeManager, PreparedDeploymentRuntime, PreparedRevision, ProductionDeploymentPreparer,
+    ReconcilePlan, ReconcileReport, RuntimeManagerError,
 };
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
 pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};
