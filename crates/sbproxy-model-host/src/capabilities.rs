@@ -234,6 +234,7 @@ impl ConsumerContract {
                 let protection = crate::CacheProtection {
                     resident: BTreeSet::from([resident.clone()]),
                     pinned: BTreeSet::from([pinned.clone()]),
+                    ..crate::CacheProtection::default()
                 };
                 let resident_reason =
                     crate::artifact::explicit_protection_reason(&protection, &resident);

@@ -174,6 +174,7 @@ async fn resident_and_pinned_artifacts_are_nonfatal_budget_constraints() {
     let protection = CacheProtection {
         resident: BTreeSet::from([resident.artifact_digest.clone()]),
         pinned: BTreeSet::from([pinned.artifact_digest.clone()]),
+        ..CacheProtection::default()
     };
 
     let report = manager.enforce_budget(0, &protection).unwrap();

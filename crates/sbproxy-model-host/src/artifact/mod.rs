@@ -18,7 +18,7 @@ use tokio::io::AsyncWriteExt;
 
 pub use cache::{ArtifactCacheMetadata, ArtifactCacheState, ReadyArtifact};
 pub(crate) use gc::explicit_protection_reason;
-pub use gc::{CacheProtection, GcReport};
+pub use gc::{CacheProtection, GcReport, RemoveArtifactReport};
 #[cfg(feature = "weights")]
 pub use http::HttpArtifactTransport;
 pub use http::{
@@ -145,6 +145,15 @@ pub enum ArtifactError {
     /// Blocking cache task panicked or was cancelled.
     #[error("artifact cache task failed: {0}")]
     Join(String),
+    /// Exact removal was blocked by a configured, resident, pinned, busy, or
+    /// nonterminal reference.
+    #[error("artifact '{digest}' cannot be removed: {reason}")]
+    RemovalBlocked {
+        /// Canonical artifact digest.
+        digest: String,
+        /// Stable bounded protection reason.
+        reason: String,
+    },
 }
 
 impl ArtifactError {

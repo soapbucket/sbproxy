@@ -13,6 +13,8 @@ use crate::{OperationKind, OperationProgress, OperationState};
 /// Artifact digests that collection must never remove.
 #[derive(Debug, Clone, Default)]
 pub struct CacheProtection {
+    /// Artifacts referenced by the active desired configuration.
+    pub configured: BTreeSet<String>,
     /// Artifacts currently attached to resident model processes.
     pub resident: BTreeSet<String>,
     /// Operator-pinned artifacts.
@@ -34,6 +36,19 @@ pub struct GcReport {
     pub skipped_artifacts: BTreeMap<String, String>,
     /// Bytes still above budget because remaining artifacts were protected.
     pub budget_unsatisfied_bytes: u64,
+}
+
+/// Result of one exact, protected artifact removal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoveArtifactReport {
+    /// Canonical artifact digest requested by the operator.
+    pub artifact_digest: String,
+    /// Whether a ready artifact existed and was removed.
+    pub removed: bool,
+    /// Physical blob bytes reclaimed after shared-blob reference checks.
+    pub reclaimed_bytes: u64,
+    /// Durable deletion operation ID, absent for an idempotent miss.
+    pub job_id: Option<String>,
 }
 
 impl ArtifactManager {
@@ -72,7 +87,7 @@ impl ArtifactManager {
             let Some(_metadata) = self.cache.verified_metadata(&digest)? else {
                 continue;
             };
-            if let Some(state) = active_state(self, &digest)? {
+            if let Some(state) = active_state(&self.jobs, &digest)? {
                 skipped_artifacts.insert(digest, state_name(state).to_string());
                 continue;
             }
@@ -115,6 +130,86 @@ impl ArtifactManager {
             budget_unsatisfied_bytes: after_bytes.saturating_sub(budget_bytes),
         })
     }
+
+    /// Remove one exact verified artifact after revalidating every protection.
+    ///
+    /// A missing artifact is an idempotent success. Configured, resident,
+    /// pinned, locked, or nonterminal artifacts fail closed with a stable
+    /// [`ArtifactError::RemovalBlocked`] reason.
+    pub async fn remove(
+        &self,
+        artifact_digest: &str,
+        protection: &CacheProtection,
+    ) -> Result<RemoveArtifactReport, ArtifactError> {
+        if let Some(reason) = explicit_protection_reason(protection, artifact_digest) {
+            return Err(removal_blocked(artifact_digest, reason));
+        }
+        let digest = artifact_digest.to_string();
+        let cache = self.cache.clone();
+        let jobs = self.jobs.clone();
+        let observer = self.observer.clone();
+        let protection = protection.clone();
+        tokio::task::spawn_blocking(move || {
+            let _mutation = cache.lock_exclusive_mutation()?;
+            let Some(_artifact_lock) = cache.try_lock_artifact(&digest)? else {
+                return Err(removal_blocked(&digest, "locked"));
+            };
+            if let Some(reason) = explicit_protection_reason(&protection, &digest) {
+                return Err(removal_blocked(&digest, reason));
+            }
+            if let Some(state) = active_state(&jobs, &digest)? {
+                return Err(removal_blocked(&digest, state_name(state)));
+            }
+            let Some(_metadata) = cache.verified_metadata(&digest)? else {
+                return Ok(RemoveArtifactReport {
+                    artifact_digest: digest,
+                    removed: false,
+                    reclaimed_bytes: 0,
+                    job_id: None,
+                });
+            };
+
+            cache.remove_unreferenced_blobs()?;
+            let before_bytes = cache.blob_bytes()?;
+            let job = jobs.create(OperationKind::Delete, format!("artifact:sha256:{digest}"))?;
+            observer.on_job(&job);
+            let deleting = jobs.transition(
+                &job.id,
+                OperationState::Deleting,
+                OperationProgress::default(),
+                None,
+            )?;
+            observer.on_job(&deleting);
+            if let Err(error) = cache.delete_ready_artifact(&digest) {
+                if let Ok(failed) = jobs.transition(
+                    &deleting.id,
+                    OperationState::Failed,
+                    OperationProgress::default(),
+                    Some(&error.to_string()),
+                ) {
+                    observer.on_job(&failed);
+                }
+                return Err(error);
+            }
+            cache.remove_unreferenced_blobs()?;
+            let deleted = jobs.transition(
+                &deleting.id,
+                OperationState::Deleted,
+                OperationProgress::default(),
+                None,
+            )?;
+            observer.on_job(&deleted);
+            let after_bytes = cache.blob_bytes()?;
+            Ok(RemoveArtifactReport {
+                artifact_digest: digest,
+                removed: true,
+                reclaimed_bytes: before_bytes.saturating_sub(after_bytes),
+                job_id: Some(deleted.id),
+            })
+        })
+        .await
+        .map_err(|error| ArtifactError::Join(error.to_string()))?
+    }
 }
 
 pub(crate) fn explicit_protection_reason(
@@ -123,6 +218,8 @@ pub(crate) fn explicit_protection_reason(
 ) -> Option<&'static str> {
     if protection.resident.contains(digest) {
         Some("resident")
+    } else if protection.configured.contains(digest) {
+        Some("configured")
     } else if protection.pinned.contains(digest) {
         Some("pinned")
     } else {
@@ -131,12 +228,11 @@ pub(crate) fn explicit_protection_reason(
 }
 
 fn active_state(
-    manager: &ArtifactManager,
+    jobs: &crate::FileJobStore,
     digest: &str,
 ) -> Result<Option<OperationState>, ArtifactError> {
     let subject = format!("artifact:sha256:{digest}");
-    Ok(manager
-        .jobs
+    Ok(jobs
         .list()?
         .into_iter()
         .filter(|job| job.subject == subject)
@@ -144,9 +240,19 @@ fn active_state(
         .find(|state| {
             matches!(
                 state,
-                OperationState::Downloading | OperationState::Verifying | OperationState::Deleting
+                OperationState::Queued
+                    | OperationState::Downloading
+                    | OperationState::Verifying
+                    | OperationState::Deleting
             )
         }))
+}
+
+fn removal_blocked(digest: &str, reason: &str) -> ArtifactError {
+    ArtifactError::RemovalBlocked {
+        digest: digest.to_string(),
+        reason: reason.to_string(),
+    }
 }
 
 const fn state_name(state: OperationState) -> &'static str {
