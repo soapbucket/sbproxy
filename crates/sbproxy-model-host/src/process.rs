@@ -63,6 +63,32 @@ pub trait CommandExecutor: Send + Sync {
         environment: &BTreeMap<String, String>,
         stderr_tail_lines: usize,
     ) -> Result<Arc<dyn EngineProcess>, EngineDriverError>;
+
+    /// Run one fixed command to completion with bounded output and timeout.
+    async fn output(
+        &self,
+        _executable: &Path,
+        _arguments: &[String],
+        _environment: &BTreeMap<String, String>,
+        _timeout: Duration,
+        _max_output_bytes: usize,
+    ) -> Result<CommandOutput, EngineDriverError> {
+        Err(EngineDriverError::blocked(
+            "bounded command output is unavailable from this executor",
+            "configure a command executor that supports compatibility probes",
+        ))
+    }
+}
+
+/// Bounded output from one fixed, shell-free compatibility command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutput {
+    /// Whether the process exited successfully.
+    pub success: bool,
+    /// Redacted and size-bounded standard output.
+    pub stdout: String,
+    /// Redacted and size-bounded standard error.
+    pub stderr: String,
 }
 
 /// Readiness probe injected into the process runner for deterministic tests.
@@ -160,6 +186,26 @@ impl EngineProcessRunner {
     /// Perform one readiness probe through the injected health boundary.
     pub async fn ready(&self, port: u16, path: &str) -> Result<bool, EngineDriverError> {
         self.probe.ready(port, path).await
+    }
+
+    /// Run one fixed compatibility command through the shared command boundary.
+    pub async fn output(
+        &self,
+        executable: &Path,
+        arguments: &[String],
+        environment: &BTreeMap<String, String>,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<CommandOutput, EngineDriverError> {
+        self.executor
+            .output(
+                executable,
+                arguments,
+                environment,
+                timeout,
+                max_output_bytes,
+            )
+            .await
     }
 }
 
@@ -261,6 +307,55 @@ impl CommandExecutor for TokioCommandExecutor {
             stderr_path,
             stderr_tail_lines,
         }))
+    }
+
+    async fn output(
+        &self,
+        executable: &Path,
+        arguments: &[String],
+        environment: &BTreeMap<String, String>,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<CommandOutput, EngineDriverError> {
+        if timeout.is_zero() || max_output_bytes == 0 || max_output_bytes > 1024 * 1024 {
+            return Err(EngineDriverError::new(
+                EngineFailureReason::EngineInternal,
+                "compatibility command bounds are invalid",
+                "use a positive timeout and an output limit no larger than 1 MiB",
+                false,
+            ));
+        }
+        let mut command = tokio::process::Command::new(executable);
+        command
+            .args(arguments)
+            .envs(environment)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| {
+                EngineDriverError::new(
+                    EngineFailureReason::EngineIncompatible,
+                    format!("compatibility command {:?} timed out", executable),
+                    "repair the engine environment or select another provisioning mode",
+                    false,
+                )
+            })?
+            .map_err(|error| {
+                EngineDriverError::new(
+                    EngineFailureReason::EngineIncompatible,
+                    format!("run compatibility command {:?}: {error}", executable),
+                    "install a compatible engine environment and retry doctor",
+                    false,
+                )
+            })?;
+        Ok(CommandOutput {
+            success: output.status.success(),
+            stdout: bounded_output(&output.stdout, max_output_bytes),
+            stderr: bounded_output(&output.stderr, max_output_bytes),
+        })
     }
 }
 
@@ -401,6 +496,11 @@ fn redact_engine_output(output: &str) -> String {
         }
     }
     redacted.join(" ")
+}
+
+fn bounded_output(output: &[u8], max_output_bytes: usize) -> String {
+    let end = output.len().min(max_output_bytes);
+    redact_engine_output(&String::from_utf8_lossy(&output[..end]))
 }
 
 #[cfg(unix)]

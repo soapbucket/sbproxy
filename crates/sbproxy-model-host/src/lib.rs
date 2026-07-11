@@ -67,6 +67,7 @@ pub mod supply_chain;
 #[cfg(feature = "tokenizer")]
 pub mod tokenize;
 pub mod uv_release;
+pub mod vllm_driver;
 pub mod weights;
 
 pub use acquire::{plan_binary_acquire, BinaryAcquirePlan};
@@ -142,8 +143,8 @@ pub use probe_metal::MetalGpuProbe;
 #[cfg(feature = "gpu-nvidia")]
 pub use probe_nvidia::NvmlGpuProbe;
 pub use process::{
-    CommandExecutor, EngineCommand, EngineProcess, EngineProcessRunner, EngineReadinessProbe,
-    LoopbackReadinessProbe, TokioCommandExecutor,
+    CommandExecutor, CommandOutput, EngineCommand, EngineProcess, EngineProcessRunner,
+    EngineReadinessProbe, LoopbackReadinessProbe, TokioCommandExecutor,
 };
 pub use pull::{pull_plan, PullItem, PullMode};
 pub use report::{ModelValue, ValueReport};
@@ -158,3 +159,8 @@ pub use supervisor::{EngineLauncher, EngineState, LaunchSpec, SupervisorError};
 pub use supply_chain::{scan_pickle, select_weight_file, SupplyChainError, WeightFormat};
 #[cfg(feature = "tokenizer")]
 pub use tokenize::{count_tokens, render_chat_template, ChatMessage};
+pub use vllm_driver::{
+    build_vllm_container_plan, ContainerRuntime, SystemVllmHost, VllmCompatibilityReport,
+    VllmComponentStatus, VllmContainerPlan, VllmDriver, VllmHost, VllmLaunchMode,
+    DEFAULT_VLLM_VERSION,
+};

@@ -142,6 +142,7 @@ pub enum EngineLaunchMethod {
     /// Run the engine from a pinned container image.
     Container,
     /// Run the engine from a managed uv/venv (vLLM's Python path).
+    #[serde(alias = "uv")]
     Venv,
 }
 
@@ -236,6 +237,9 @@ pub struct EngineProvisioning {
     /// `PATH` only.
     #[serde(default)]
     pub acquire: Option<EngineAcquire>,
+    /// Shared-memory allocation in GiB for container launch.
+    #[serde(default)]
+    pub shm_size_gib: Option<u64>,
 }
 
 impl EngineProvisioning {
@@ -255,6 +259,19 @@ impl EngineProvisioning {
                 }
             }
         }
+    }
+
+    /// Whether the image uses an immutable full SHA-256 digest.
+    pub fn image_is_digest_pinned(&self) -> bool {
+        let Some(image) = self.image.as_deref() else {
+            return false;
+        };
+        let Some((repository, digest)) = image.rsplit_once("@sha256:") else {
+            return false;
+        };
+        !repository.is_empty()
+            && digest.len() == 64
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
 }
 
@@ -685,6 +702,9 @@ impl ModelHostConfig {
                         "engine {kind:?} image is not pinned (avoid :latest / untagged): {:?}",
                         prov.image
                     ));
+                }
+                if matches!(prov.shm_size_gib, Some(0)) {
+                    return Err(format!("engine {kind:?} shm_size_gib must be positive"));
                 }
             }
             // Acquire-block coherence (WOR-1801): a `path` source needs a

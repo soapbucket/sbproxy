@@ -6,13 +6,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sbproxy_model_host::{
-    validate_engine_args, ArtifactCacheMetadata, ArtifactFile, ArtifactFormat, CommandExecutor,
-    EngineAccel, EngineAvailability, EngineCapabilities, EngineCommand, EngineDetection,
-    EngineDriver, EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineProcess,
+    build_vllm_container_plan, validate_engine_args, ArtifactCacheMetadata, ArtifactFile,
+    ArtifactFormat, CommandExecutor, CommandOutput, ContainerRuntime, EngineAccel,
+    EngineAvailability, EngineCapabilities, EngineCommand, EngineDetection, EngineDriver,
+    EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineProcess,
     EngineProcessRunner, EngineProvisioning, EngineReadinessProbe, FitPlan, KvCacheQuant,
     LaunchRequest, LlamaBinarySource, LlamaCppDriver, OperationJob, OperationKind,
     OperationProgress, OperationState, ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact,
-    ResolvedArtifact, RunningEngine, SupportLevel, WorkerProfile,
+    ResolvedArtifact, RunningEngine, SupportLevel, VllmDriver, VllmHost, VllmLaunchMode,
+    WorkerProfile,
 };
 
 #[derive(Debug)]
@@ -709,4 +711,448 @@ fn flag_value<'a>(arguments: &'a [String], flag: &str) -> &'a str {
         .position(|argument| argument == flag)
         .unwrap_or_else(|| panic!("missing {flag}"));
     arguments[index + 1].as_str()
+}
+
+#[derive(Clone)]
+struct FixtureVllmHost {
+    paths: Arc<BTreeMap<String, PathBuf>>,
+    executable: bool,
+    uv_result: Result<PathBuf, String>,
+    shared_memory_bytes: u64,
+}
+
+#[async_trait]
+impl VllmHost for FixtureVllmHost {
+    fn resolve_on_path(&self, name: &str) -> Option<PathBuf> {
+        self.paths.get(name).cloned()
+    }
+
+    fn is_executable(&self, _path: &std::path::Path) -> bool {
+        self.executable
+    }
+
+    async fn ensure_uv(
+        &self,
+        _cache_dir: &std::path::Path,
+        _version: &str,
+    ) -> Result<PathBuf, String> {
+        self.uv_result.clone()
+    }
+
+    fn available_shared_memory_bytes(&self) -> u64 {
+        self.shared_memory_bytes
+    }
+}
+
+#[derive(Clone)]
+struct ProbeCommandExecutor {
+    process: Arc<FixtureProcess>,
+    outputs: Arc<Mutex<Vec<CommandOutput>>>,
+    commands: Arc<Mutex<Vec<CapturedCommand>>>,
+}
+
+#[async_trait]
+impl CommandExecutor for ProbeCommandExecutor {
+    async fn spawn(
+        &self,
+        executable: &std::path::Path,
+        arguments: &[String],
+        environment: &BTreeMap<String, String>,
+        stderr_tail_lines: usize,
+    ) -> Result<Arc<dyn EngineProcess>, EngineDriverError> {
+        self.commands.lock().unwrap().push(CapturedCommand {
+            executable: executable.to_path_buf(),
+            arguments: arguments.to_vec(),
+            environment: environment.clone(),
+            stderr_tail_lines,
+        });
+        Ok(self.process.clone())
+    }
+
+    async fn output(
+        &self,
+        _executable: &std::path::Path,
+        _arguments: &[String],
+        _environment: &BTreeMap<String, String>,
+        _timeout: Duration,
+        _max_output_bytes: usize,
+    ) -> Result<CommandOutput, EngineDriverError> {
+        if self.outputs.lock().unwrap().is_empty() {
+            return Err(EngineDriverError::blocked(
+                "fixture output is unavailable",
+                "provide a fixture command result",
+            ));
+        }
+        Ok(self.outputs.lock().unwrap().remove(0))
+    }
+}
+
+fn vllm_host(paths: &[(&str, &str)]) -> Arc<FixtureVllmHost> {
+    Arc::new(FixtureVllmHost {
+        paths: Arc::new(
+            paths
+                .iter()
+                .map(|(name, path)| ((*name).to_string(), PathBuf::from(path)))
+                .collect(),
+        ),
+        executable: true,
+        uv_result: Ok(PathBuf::from("/engines/uv")),
+        shared_memory_bytes: 16 * 1024 * 1024 * 1024,
+    })
+}
+
+fn vllm_runner(outputs: Vec<CommandOutput>) -> EngineProcessRunner {
+    vllm_runner_with_commands(outputs).0
+}
+
+fn vllm_runner_with_commands(
+    outputs: Vec<CommandOutput>,
+) -> (EngineProcessRunner, Arc<Mutex<Vec<CapturedCommand>>>) {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let runner = EngineProcessRunner::new(
+        Arc::new(ProbeCommandExecutor {
+            process: Arc::new(FixtureProcess {
+                stopped: AtomicBool::new(false),
+            }),
+            outputs: Arc::new(Mutex::new(outputs)),
+            commands: commands.clone(),
+        }),
+        Arc::new(FixtureProbe { ready: true }),
+    );
+    (runner, commands)
+}
+
+fn cuda_worker() -> WorkerProfile {
+    WorkerProfile {
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
+        compute_capability: Some(sbproxy_model_host::ComputeCapability { major: 8, minor: 9 }),
+        memory_bytes: 24 * 1024 * 1024 * 1024,
+        engines: BTreeSet::from([EngineKind::Vllm]),
+    }
+}
+
+fn compatibility_output(compatible: bool) -> CommandOutput {
+    CommandOutput {
+        success: true,
+        stdout: format!(
+            r#"{{"python":"3.12.4","torch":"2.7.1","cuda":"12.8","vllm":"0.10.0","compatible":{compatible},"reason":{}}}"#,
+            if compatible {
+                "null"
+            } else {
+                "\"torch CUDA build cannot use the selected driver\""
+            }
+        ),
+        stderr: String::new(),
+    }
+}
+
+#[test]
+fn vllm_detection_covers_binary_uv_container_and_worker_blockers() {
+    let binary = VllmDriver::new(
+        vllm_runner(Vec::new()),
+        vllm_host(&[("vllm", "/usr/bin/vllm"), ("python3", "/usr/bin/python3")]),
+    );
+    assert_eq!(
+        binary
+            .detect(&cuda_worker(), &EngineProvisioning::default())
+            .availability,
+        EngineAvailability::Available
+    );
+    let missing_python = VllmDriver::new(
+        vllm_runner(Vec::new()),
+        vllm_host(&[("vllm", "/usr/bin/vllm")]),
+    );
+    let detection = missing_python.detect(&cuda_worker(), &EngineProvisioning::default());
+    assert_eq!(detection.availability, EngineAvailability::Incompatible);
+    assert!(detection.reason.contains("python3"));
+
+    let uv: EngineProvisioning = serde_yaml::from_str(
+        r#"
+launch: venv
+acquire:
+  source: uvx
+  version: 0.10.0
+"#,
+    )
+    .unwrap();
+    let uv_driver = VllmDriver::new(vllm_runner(Vec::new()), vllm_host(&[]));
+    assert_eq!(
+        uv_driver.detect(&cuda_worker(), &uv).availability,
+        EngineAvailability::Acquirable
+    );
+    let uv_alias: EngineProvisioning = serde_yaml::from_str(
+        r#"
+launch: uv
+acquire:
+  source: uvx
+  version: 0.10.0
+"#,
+    )
+    .expect("uv is the canonical spelling for the managed environment");
+    assert_eq!(
+        uv_driver.detect(&cuda_worker(), &uv_alias).availability,
+        EngineAvailability::Acquirable
+    );
+
+    let container: EngineProvisioning = serde_yaml::from_str(&format!(
+        "launch: container\nimage: ghcr.io/vllm-project/vllm-openai@sha256:{}\nshm_size_gib: 4\n",
+        "a".repeat(64)
+    ))
+    .unwrap();
+    let docker = VllmDriver::new(
+        vllm_runner(Vec::new()),
+        vllm_host(&[("docker", "/usr/bin/docker")]),
+    );
+    assert_eq!(
+        docker.detect(&cuda_worker(), &container).availability,
+        EngineAvailability::Acquirable
+    );
+    let podman = VllmDriver::new(
+        vllm_runner(Vec::new()),
+        vllm_host(&[("podman", "/usr/bin/podman")]),
+    );
+    assert_eq!(
+        podman.detect(&cuda_worker(), &container).availability,
+        EngineAvailability::Acquirable
+    );
+    let absent = VllmDriver::new(vllm_runner(Vec::new()), vllm_host(&[]));
+    assert_eq!(
+        absent.detect(&cuda_worker(), &container).availability,
+        EngineAvailability::Blocked
+    );
+
+    let mut old_gpu = cuda_worker();
+    old_gpu.compute_capability = Some(sbproxy_model_host::ComputeCapability { major: 6, minor: 1 });
+    assert_eq!(
+        binary
+            .detect(&old_gpu, &EngineProvisioning::default())
+            .availability,
+        EngineAvailability::Incompatible
+    );
+}
+
+#[tokio::test]
+async fn vllm_compatibility_reports_versions_or_bounded_unavailable_reasons() {
+    let driver = VllmDriver::new(
+        vllm_runner(vec![compatibility_output(true)]),
+        vllm_host(&[("python3", "/usr/bin/python3")]),
+    );
+    let report = driver
+        .compatibility_report(
+            &VllmLaunchMode::Binary {
+                executable: PathBuf::from("/usr/bin/vllm"),
+                python: PathBuf::from("/usr/bin/python3"),
+            },
+            &cuda_worker(),
+        )
+        .await;
+    assert!(report.compatible);
+    assert_eq!(report.python.version.as_deref(), Some("3.12.4"));
+    assert_eq!(report.torch.version.as_deref(), Some("2.7.1"));
+    assert_eq!(report.cuda.version.as_deref(), Some("12.8"));
+    assert_eq!(report.vllm.version.as_deref(), Some("0.10.0"));
+
+    let unavailable = VllmDriver::new(vllm_runner(Vec::new()), vllm_host(&[]));
+    let report = unavailable
+        .compatibility_report(
+            &VllmLaunchMode::Binary {
+                executable: PathBuf::from("/usr/bin/vllm"),
+                python: PathBuf::from("/usr/bin/python3"),
+            },
+            &cuda_worker(),
+        )
+        .await;
+    assert!(!report.compatible);
+    for component in [&report.python, &report.torch, &report.cuda, &report.vllm] {
+        assert!(component.version.is_none());
+        assert!(component
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.len() <= 256));
+    }
+}
+
+#[tokio::test]
+async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact() {
+    let incompatible = VllmDriver::new(
+        vllm_runner(vec![compatibility_output(false)]),
+        vllm_host(&[("vllm", "/usr/bin/vllm"), ("python3", "/usr/bin/python3")]),
+    );
+    let request = ProvisionRequest {
+        artifact: resolved(EngineKind::Vllm, ArtifactFormat::Safetensors),
+        worker: cuda_worker(),
+        provisioning: EngineProvisioning::default(),
+        engine_cache_dir: PathBuf::from("/engines"),
+        job_store: None,
+    };
+    let error = incompatible
+        .provision(&request)
+        .await
+        .expect_err("torch and CUDA mismatch");
+    assert_eq!(error.reason(), EngineFailureReason::EngineIncompatible);
+
+    let (runner, commands) = vllm_runner_with_commands(vec![compatibility_output(true)]);
+    let driver = VllmDriver::new(
+        runner,
+        vllm_host(&[("vllm", "/usr/bin/vllm"), ("python3", "/usr/bin/python3")]),
+    );
+    let provisioned = driver.provision(&request).await.expect("binary vLLM");
+    let launch = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 5,
+        artifact: ready(EngineKind::Vllm, ArtifactFormat::Safetensors),
+        fit: fit(),
+        port: 18124,
+        selected_devices: vec![3],
+        kv_quant: KvCacheQuant::Fp8,
+        extra_args: vec!["--enable-prefix-caching".to_string()],
+        ready_timeout: Duration::from_secs(1),
+    };
+    let running = driver
+        .launch(&provisioned, &launch)
+        .await
+        .expect("vLLM launch");
+    assert_eq!(running.port, 18124);
+    let captured = commands.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].executable, PathBuf::from("/usr/bin/vllm"));
+    assert_eq!(captured[0].arguments[0], "serve");
+    assert_eq!(captured[0].arguments[1], "/verified/fixture");
+    assert_eq!(flag_value(&captured[0].arguments, "--host"), "127.0.0.1");
+    assert_eq!(flag_value(&captured[0].arguments, "--port"), "18124");
+    assert_eq!(
+        flag_value(&captured[0].arguments, "--served-model-name"),
+        "coder"
+    );
+    assert_eq!(
+        flag_value(&captured[0].arguments, "--kv-cache-dtype"),
+        "fp8"
+    );
+    assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "3");
+}
+
+#[tokio::test]
+async fn vllm_uv_provision_and_launch_keep_the_package_pin() {
+    let provisioning: EngineProvisioning = serde_yaml::from_str(
+        r#"
+launch: venv
+acquire:
+  source: uvx
+  version: 0.10.0
+"#,
+    )
+    .unwrap();
+    let (runner, commands) = vllm_runner_with_commands(vec![compatibility_output(true)]);
+    let driver = VllmDriver::new(runner, vllm_host(&[]));
+    let provisioned = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::Vllm, ArtifactFormat::Safetensors),
+            worker: cuda_worker(),
+            provisioning,
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect("managed uv environment");
+    assert_eq!(provisioned.executable, PathBuf::from("/engines/uv"));
+    assert_eq!(provisioned.version.as_deref(), Some("0.10.0"));
+    driver
+        .launch(
+            &provisioned,
+            &LaunchRequest {
+                deployment: "coder".to_string(),
+                generation: 6,
+                artifact: ready(EngineKind::Vllm, ArtifactFormat::Safetensors),
+                fit: fit(),
+                port: 18125,
+                selected_devices: vec![0],
+                kv_quant: KvCacheQuant::Auto,
+                extra_args: Vec::new(),
+                ready_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("uv vLLM launch");
+
+    let captured = commands.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        &captured[0].arguments[..6],
+        &["tool", "run", "--from", "vllm==0.10.0", "vllm", "serve"]
+    );
+}
+
+#[test]
+fn vllm_container_launch_is_private_read_only_and_device_scoped() {
+    let request = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 4,
+        artifact: ready(EngineKind::Vllm, ArtifactFormat::Safetensors),
+        fit: fit(),
+        port: 18123,
+        selected_devices: vec![1],
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: vec!["--enable-prefix-caching".to_string()],
+        ready_timeout: Duration::from_secs(1),
+    };
+    let image = format!("ghcr.io/vllm-project/vllm-openai@sha256:{}", "a".repeat(64));
+    let plan = build_vllm_container_plan(
+        ContainerRuntime::Docker,
+        PathBuf::from("/usr/bin/docker"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("isolated container plan");
+
+    assert!(plan
+        .arguments
+        .windows(2)
+        .any(|window| window == ["--gpus", "device=1"]));
+    assert!(plan
+        .arguments
+        .iter()
+        .any(|value| value == "127.0.0.1:18123:8000"));
+    assert!(plan
+        .arguments
+        .iter()
+        .any(|value| { value.contains("dst=/models/model") && value.contains("readonly") }));
+    assert!(plan
+        .arguments
+        .windows(2)
+        .any(|window| window == ["--network", "sbproxy-model-host"]));
+    assert!(!plan.arguments.iter().any(|value| {
+        value == "--privileged"
+            || value == "host"
+            || value == "all"
+            || value.contains("readonly=false")
+    }));
+
+    let podman = build_vllm_container_plan(
+        ContainerRuntime::Podman,
+        PathBuf::from("/usr/bin/podman"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("Podman CDI plan");
+    assert!(podman
+        .arguments
+        .windows(2)
+        .any(|window| window == ["--device", "nvidia.com/gpu=1"]));
+    assert!(!podman.arguments.iter().any(|value| value == "--gpus"));
+
+    for invalid in [
+        "ghcr.io/vllm-project/vllm-openai:latest",
+        "ghcr.io/vllm-project/vllm-openai:v0.10.0",
+    ] {
+        assert!(build_vllm_container_plan(
+            ContainerRuntime::Docker,
+            PathBuf::from("/usr/bin/docker"),
+            invalid,
+            4,
+            &request,
+        )
+        .is_err());
+    }
 }
