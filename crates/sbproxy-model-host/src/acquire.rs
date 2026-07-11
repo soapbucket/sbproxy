@@ -7,16 +7,16 @@
 //! nothing else: a host without the binary failed at the first request.
 //! This module decides, from a serve entry's optional `acquire:` block
 //! and what is on `PATH`, how to obtain a *binary* engine (llama.cpp):
-//! use it from `PATH`, use an operator-provided path, or fetch a pinned
-//! prebuilt release. The decision is pure and unit-tested; the async
-//! fetch (behind the `weights` feature) is the runtime's job, driven by
-//! the [`BinaryAcquirePlan`] this returns.
+//! use it from `PATH`, use an operator-provided path, fetch a pinned
+//! prebuilt release, or build CUDA from pinned source. The decision is
+//! pure and unit-tested; async provisioning is the runtime's job, driven
+//! by the [`BinaryAcquirePlan`] this returns.
 //!
 //! Engine *identity* stays the allowlisted [`EngineKind`]; only the
 //! acquisition method is configurable, so the config-spawn security
 //! posture (no arbitrary `cmd:`) is unchanged: a plan can name a `PATH`
-//! program, an operator's own path, or a pinned ggml-org release, never
-//! an arbitrary command line.
+//! program, an operator's own path, a pinned ggml-org release, or a fixed
+//! source-build recipe, never an arbitrary command line.
 
 use std::path::PathBuf;
 
@@ -39,6 +39,13 @@ pub enum BinaryAcquirePlan {
         accel: EngineAccel,
         /// Expected sha256 hex, or `None` to fetch unverified (warned).
         sha256: Option<String>,
+    },
+    /// Build one CUDA-enabled llama.cpp binary from pinned source.
+    BuildCuda {
+        /// Pinned llama.cpp release tag.
+        tag: String,
+        /// Expected SHA-256 of the official source archive.
+        source_sha256: String,
     },
     /// Provision vLLM via `uvx` (`uv tool run`): fetch the `uv` binary,
     /// then run `uv tool run --from vllm[==version] vllm ...`. uv sets up
@@ -66,6 +73,22 @@ pub fn plan_binary_acquire(
     prov: Option<&EngineProvisioning>,
     on_path: Option<PathBuf>,
 ) -> BinaryAcquirePlan {
+    let prerequisites = crate::CudaBuildPrerequisites::detect_system();
+    plan_binary_acquire_with_cuda(engine, prov, on_path, Some(&prerequisites))
+}
+
+/// Decide binary acquisition with explicit CUDA build prerequisites.
+///
+/// This deterministic variant lets doctor and tests distinguish an acquirable
+/// CUDA source build from a blocked explicit CUDA request. `Auto` chooses the
+/// source build only when every prerequisite is ready; otherwise it keeps the
+/// ordinary release path.
+pub fn plan_binary_acquire_with_cuda(
+    engine: EngineKind,
+    prov: Option<&EngineProvisioning>,
+    on_path: Option<PathBuf>,
+    cuda: Option<&crate::CudaBuildPrerequisites>,
+) -> BinaryAcquirePlan {
     let acquire = prov.and_then(|p| p.acquire.as_ref());
 
     // An explicit path override wins over everything, so an air-gapped
@@ -81,10 +104,17 @@ pub fn plan_binary_acquire(
         }
     }
 
-    // PATH-first for the release path: a host-installed binary is
-    // preferred over a download.
-    if let Some(p) = on_path {
-        return BinaryAcquirePlan::OnPath(p);
+    // PATH-first for ordinary release acquisition. An explicit CUDA or
+    // source-build request cannot safely reuse an uninspected PATH binary:
+    // it may be CPU-only and it does not carry the requested source identity.
+    let requires_cuda_source = engine == EngineKind::LlamaCpp
+        && acquire.is_some_and(|acquire| {
+            acquire.source == AcquireSource::SourceBuild || acquire.accel == EngineAccel::Cuda
+        });
+    if !requires_cuda_source {
+        if let Some(p) = on_path {
+            return BinaryAcquirePlan::OnPath(p);
+        }
     }
 
     match engine {
@@ -102,6 +132,38 @@ pub fn plan_binary_acquire(
                 .unwrap_or_else(|| DEFAULT_LLAMA_RELEASE_TAG.to_string());
             let accel = acquire.map(|a| a.accel).unwrap_or_default();
             let sha256 = acquire.and_then(|a| a.sha256.clone());
+            let source_build_requested = acquire
+                .is_some_and(|acquire| acquire.source == AcquireSource::SourceBuild)
+                || accel == EngineAccel::Cuda;
+            let auto_cuda_ready = accel == EngineAccel::Auto
+                && cuda.is_some_and(crate::CudaBuildPrerequisites::is_ready);
+            if source_build_requested || auto_cuda_ready {
+                let Some(prerequisites) = cuda else {
+                    return BinaryAcquirePlan::Blocked(
+                        "CUDA llama.cpp build prerequisites were not detected".to_string(),
+                    );
+                };
+                if let Err(reason) = prerequisites.validate() {
+                    if source_build_requested {
+                        return BinaryAcquirePlan::Blocked(format!(
+                            "CUDA llama.cpp build is blocked: {reason}"
+                        ));
+                    }
+                } else {
+                    let source_sha256 = match sha256 {
+                        Some(sha256) => sha256,
+                        None if tag == DEFAULT_LLAMA_RELEASE_TAG => {
+                            crate::DEFAULT_LLAMA_SOURCE_SHA256.to_string()
+                        }
+                        None => {
+                            return BinaryAcquirePlan::Blocked(format!(
+                                "CUDA source build for custom tag {tag:?} requires acquire.sha256"
+                            ));
+                        }
+                    };
+                    return BinaryAcquirePlan::BuildCuda { tag, source_sha256 };
+                }
+            }
             BinaryAcquirePlan::FetchRelease { tag, accel, sha256 }
         }
         EngineKind::Vllm => match acquire.map(|a| a.source) {

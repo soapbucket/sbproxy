@@ -939,6 +939,21 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         crate::uv_release::ensure_uv(&cache_root, crate::uv_release::DEFAULT_UV_VERSION).await
     }
 
+    async fn acquire_cuda_llama(
+        &self,
+        tag: &str,
+        source_sha256: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        let cache_root =
+            crate::manifest::resolve_cache_dir_default(self.config.cache_dir.as_deref());
+        let plan = crate::CudaBuildPlan::official(&cache_root, tag, source_sha256)
+            .map_err(|error| error.to_string())?;
+        crate::CudaLlamaBuilder::default()
+            .build(&plan, &crate::CudaBuildPrerequisites::detect_system())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     #[cfg(not(feature = "weights"))]
     async fn acquire_uv(&self) -> Result<std::path::PathBuf, String> {
         Err(
@@ -1208,16 +1223,12 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         }
 
         // WOR-1801: acquire the engine binary rather than relying on
-        // PATH alone. The `acquire:` plan resolves it (PATH, an explicit
-        // operator path, or a pinned prebuilt release); a release fetch
-        // happens here so a box with no engine still serves. Best-effort:
-        // it only overrides `spec.program` on success and otherwise
-        // leaves the PATH name for the launcher to resolve (or fail
-        // cleanly on). That keeps a fake/embedded launcher and an on-box
-        // PATH install unaffected, and a genuinely blocked engine (e.g.
-        // vLLM, which is not a single binary) still spawns from PATH as
-        // before rather than aborting admission here. A misconfigured
-        // acquire block is caught earlier, at config validate/plan time.
+        // PATH alone. The `acquire:` plan resolves PATH, an explicit
+        // operator path, a pinned release, or the fixed CUDA source build.
+        // Legacy release and uv failures retain their PATH fallback for
+        // compatibility. An explicit CUDA build fails closed because an
+        // unknown PATH binary cannot prove CUDA support or source identity.
+        // Misconfigured acquisition is caught at config validate/plan time.
         // In-process engines have no binary to acquire.
         if !engine_kind.is_in_process() {
             let prov = self.config.engines.get(&engine_kind);
@@ -1238,6 +1249,13 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                             "engine release acquisition failed: {e}; falling back to PATH"
                         ),
                     }
+                }
+                crate::acquire::BinaryAcquirePlan::BuildCuda { tag, source_sha256 } => {
+                    let path = self
+                        .acquire_cuda_llama(&tag, &source_sha256)
+                        .await
+                        .map_err(RuntimeError::Launch)?;
+                    spec.program = path.to_string_lossy().into_owned();
                 }
                 crate::acquire::BinaryAcquirePlan::ProvisionUvx { vllm_version } => {
                     // Fetch uv, then run vLLM through `uv tool run`. uv sets

@@ -5,12 +5,12 @@
 //!
 //! The `serve:` argv template for `llama-server` already exists
 //! ([`crate::launch::build_launch_spec`]); this is how the binary is
-//! obtained. Resolution is PATH-first (document `brew install
-//! llama.cpp` / the distro package), with an optional pinned-release
-//! fallback: a specific ggml-org/llama.cpp release asset for the host
-//! platform, verified against a sha256 before use. The pin keeps the
-//! security posture (WOR-1663): no arbitrary binary, a known tag and a
-//! known digest.
+//! obtained. Ordinary release acquisition is PATH-first (document `brew
+//! install llama.cpp` / the distro package), with an optional pinned
+//! release fallback for the host platform. CUDA uses the separate fixed,
+//! digest-pinned source builder because upstream does not publish a CUDA
+//! Linux binary. The pins keep the security posture (WOR-1663): no
+//! arbitrary binary or command line.
 //!
 //! The platform detection, asset-URL construction, and PATH lookup are
 //! pure and unit-tested. The actual download + extract is behind the
@@ -53,17 +53,19 @@ impl Platform {
     }
 
     /// The asset infix for a requested acceleration flavour (WOR-1801).
-    /// macOS assets already carry Metal, so the accel is only meaningful
-    /// on Linux, where a GPU build means the Vulkan asset (ggml-org ships
-    /// no CUDA Linux prebuilt, so `cuda` maps to `vulkan`).
-    fn asset_infix_accel(self, accel: crate::config::EngineAccel) -> &'static str {
+    /// macOS assets already carry Metal. Linux Vulkan has a release asset,
+    /// while CUDA must use the separately verified source-build path.
+    fn asset_infix_accel(self, accel: crate::config::EngineAccel) -> Result<&'static str, String> {
         use crate::config::EngineAccel::*;
         match self {
-            Platform::MacOsArm64 => "macos-arm64",
-            Platform::MacOsX64 => "macos-x64",
+            Platform::MacOsArm64 => Ok("macos-arm64"),
+            Platform::MacOsX64 => Ok("macos-x64"),
             Platform::LinuxX64 => match accel {
-                Cuda | Vulkan => "ubuntu-vulkan-x64",
-                Auto | Cpu | Metal => "ubuntu-x64",
+                Cuda => {
+                    Err("llama.cpp CUDA acquisition requires the pinned source build".to_string())
+                }
+                Vulkan => Ok("ubuntu-vulkan-x64"),
+                Auto | Cpu | Metal => Ok("ubuntu-x64"),
             },
         }
     }
@@ -89,18 +91,16 @@ fn archive_ext(_platform: Platform) -> &'static str {
 
 /// The download URL for a pinned ggml-org/llama.cpp release binary asset
 /// for a requested acceleration flavour (WOR-1801). Like [`asset_url`]
-/// but accel-aware (Linux GPU builds use the Vulkan asset).
+/// but accel-aware. Linux CUDA is rejected because it uses source builds.
 pub fn asset_url_accel(
     tag: &str,
     platform: Platform,
     accel: crate::config::EngineAccel,
 ) -> Result<String, String> {
-    if tag.trim().is_empty() || tag == "latest" {
-        return Err(format!("llama.cpp release tag must be pinned, not '{tag}'"));
-    }
+    validate_pinned_tag(tag)?;
     Ok(format!(
         "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/llama-{tag}-bin-{}.{}",
-        platform.asset_infix_accel(accel),
+        platform.asset_infix_accel(accel)?,
         archive_ext(platform)
     ))
 }
@@ -109,14 +109,33 @@ pub fn asset_url_accel(
 /// asset. `tag` is a release tag (for example `b9905`); it must not be
 /// `latest`, so the acquisition stays pinned.
 pub fn asset_url(tag: &str, platform: Platform) -> Result<String, String> {
-    if tag.trim().is_empty() || tag == "latest" {
-        return Err(format!("llama.cpp release tag must be pinned, not '{tag}'"));
-    }
+    validate_pinned_tag(tag)?;
     Ok(format!(
         "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/llama-{tag}-bin-{}.{}",
         platform.asset_infix(),
         archive_ext(platform)
     ))
+}
+
+pub(crate) fn validate_pinned_tag(tag: &str) -> Result<(), String> {
+    let valid = tag.len() <= 128
+        && tag
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && tag
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if !valid || tag == "latest" {
+        return Err(format!(
+            "llama.cpp release tag must be a safe pinned identifier, not '{tag}'"
+        ));
+    }
+    Ok(())
 }
 
 /// Find `name` on `PATH`, returning its full path. This is the
@@ -302,17 +321,20 @@ mod tests {
     }
 
     #[test]
-    fn accel_url_uses_vulkan_asset_on_linux_gpu() {
+    fn accel_url_uses_vulkan_only_when_vulkan_is_requested() {
         use crate::config::EngineAccel;
-        // A Linux GPU acquisition must resolve to the Vulkan asset that
-        // actually ships (the CPU `ubuntu-x64` build has no GPU offload).
         assert_eq!(
-            asset_url_accel("b9905", Platform::LinuxX64, EngineAccel::Cuda).unwrap(),
+            asset_url_accel("b9905", Platform::LinuxX64, EngineAccel::Vulkan).unwrap(),
             "https://github.com/ggml-org/llama.cpp/releases/download/b9905/llama-b9905-bin-ubuntu-vulkan-x64.tar.gz"
         );
         assert_eq!(
             asset_url_accel("b9905", Platform::LinuxX64, EngineAccel::Cpu).unwrap(),
             "https://github.com/ggml-org/llama.cpp/releases/download/b9905/llama-b9905-bin-ubuntu-x64.tar.gz"
+        );
+        assert!(
+            asset_url_accel("b9905", Platform::LinuxX64, EngineAccel::Cuda)
+                .unwrap_err()
+                .contains("source build")
         );
     }
 

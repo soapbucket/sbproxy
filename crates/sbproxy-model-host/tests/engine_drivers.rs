@@ -7,9 +7,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sbproxy_model_host::{
     build_vllm_container_plan, validate_engine_args, ArtifactCacheMetadata, ArtifactFile,
-    ArtifactFormat, CommandExecutor, CommandOutput, ContainerRuntime, EngineAccel,
-    EngineAvailability, EngineCapabilities, EngineCommand, EngineDetection, EngineDriver,
-    EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineProcess,
+    ArtifactFormat, CommandExecutor, CommandOutput, ContainerRuntime, CudaBuildPrerequisites,
+    EngineAccel, EngineAvailability, EngineCapabilities, EngineCommand, EngineDetection,
+    EngineDriver, EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineProcess,
     EngineProcessRunner, EngineProvisioning, EngineReadinessProbe, FitPlan, KvCacheQuant,
     LaunchRequest, LlamaBinarySource, LlamaCppDriver, OperationJob, OperationKind,
     OperationProgress, OperationState, ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact,
@@ -538,6 +538,74 @@ fn llama_worker() -> WorkerProfile {
     }
 }
 
+type CudaBuildRecord = (PathBuf, String, String);
+
+#[derive(Clone)]
+struct FixtureCudaLlamaSource {
+    prerequisites: CudaBuildPrerequisites,
+    built: Result<PathBuf, String>,
+    builds: Arc<Mutex<Vec<CudaBuildRecord>>>,
+}
+
+#[async_trait]
+impl LlamaBinarySource for FixtureCudaLlamaSource {
+    fn resolve_on_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    fn is_executable(&self, _path: &std::path::Path) -> bool {
+        true
+    }
+
+    async fn fetch_release(
+        &self,
+        _cache_dir: &std::path::Path,
+        _version: &str,
+        _acceleration: EngineAccel,
+        _sha256: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        Err("release acquisition must not handle CUDA".to_string())
+    }
+
+    fn cuda_prerequisites(&self) -> CudaBuildPrerequisites {
+        self.prerequisites.clone()
+    }
+
+    async fn build_cuda(
+        &self,
+        cache_dir: &std::path::Path,
+        tag: &str,
+        source_sha256: &str,
+    ) -> Result<PathBuf, String> {
+        self.builds.lock().unwrap().push((
+            cache_dir.to_path_buf(),
+            tag.to_string(),
+            source_sha256.to_string(),
+        ));
+        self.built.clone()
+    }
+}
+
+fn cuda_prerequisites() -> CudaBuildPrerequisites {
+    CudaBuildPrerequisites {
+        linux_x86_64: true,
+        nvidia_gpu: true,
+        nvcc: Some(PathBuf::from("/usr/local/cuda/bin/nvcc")),
+        cmake: Some(PathBuf::from("/usr/bin/cmake")),
+        compiler: Some(PathBuf::from("/usr/bin/cc")),
+        tar: Some(PathBuf::from("/usr/bin/tar")),
+    }
+}
+
+fn llama_cuda_worker() -> WorkerProfile {
+    WorkerProfile {
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
+        compute_capability: Some(sbproxy_model_host::ComputeCapability { major: 8, minor: 9 }),
+        memory_bytes: 24 * 1024 * 1024 * 1024,
+        engines: BTreeSet::from([EngineKind::LlamaCpp]),
+    }
+}
+
 fn fixture_runner(commands: Arc<Mutex<Vec<CapturedCommand>>>) -> EngineProcessRunner {
     EngineProcessRunner::new(
         Arc::new(RecordingExecutor {
@@ -647,6 +715,73 @@ async fn llama_provision_prefers_compatible_path_and_release_failures_do_not_fal
         .await
         .expect_err("release failure must surface");
     assert_eq!(error.reason(), EngineFailureReason::EngineProvisionFailed);
+}
+
+#[tokio::test]
+async fn llama_cuda_source_build_is_detected_and_provisioned_with_the_exact_pin() {
+    let provisioning: EngineProvisioning = serde_yaml::from_str(
+        r#"
+acquire:
+  source: source_build
+  version: b9905
+  accel: cuda
+  sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+"#,
+    )
+    .unwrap();
+    let builds = Arc::new(Mutex::new(Vec::new()));
+    let source = Arc::new(FixtureCudaLlamaSource {
+        prerequisites: cuda_prerequisites(),
+        built: Ok(PathBuf::from("/engines/cuda/llama-server")),
+        builds: builds.clone(),
+    });
+    let driver = LlamaCppDriver::new(fixture_runner(Arc::new(Mutex::new(Vec::new()))), source);
+
+    let detection = driver.detect(&llama_cuda_worker(), &provisioning);
+    assert_eq!(detection.availability, EngineAvailability::Acquirable);
+    assert!(detection.reason.contains("digest-pinned CUDA"));
+    let provisioned = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+            worker: llama_cuda_worker(),
+            provisioning: provisioning.clone(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect("CUDA source build");
+    assert_eq!(
+        provisioned.executable,
+        PathBuf::from("/engines/cuda/llama-server")
+    );
+    assert_eq!(provisioned.version.as_deref(), Some("b9905"));
+    assert_eq!(
+        provisioned.fingerprint,
+        "source-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(
+        builds.lock().unwrap().as_slice(),
+        &[(
+            PathBuf::from("/engines"),
+            "b9905".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )]
+    );
+
+    let mut missing_nvcc = cuda_prerequisites();
+    missing_nvcc.nvcc = None;
+    let blocked = LlamaCppDriver::new(
+        fixture_runner(Arc::new(Mutex::new(Vec::new()))),
+        Arc::new(FixtureCudaLlamaSource {
+            prerequisites: missing_nvcc,
+            built: Ok(PathBuf::from("/engines/cuda/llama-server")),
+            builds: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .detect(&llama_cuda_worker(), &provisioning);
+    assert_eq!(blocked.availability, EngineAvailability::Blocked);
+    assert!(blocked.reason.contains("nvcc"));
+    assert!(blocked.remediation.is_some());
 }
 
 #[tokio::test]

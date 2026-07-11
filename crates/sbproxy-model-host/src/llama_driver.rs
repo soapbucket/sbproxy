@@ -11,11 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 
 use crate::{
-    plan_binary_acquire, AcceleratorKind, ArtifactFormat, BinaryAcquirePlan, EngineAccel,
-    EngineAvailability, EngineCapabilities, EngineCommand, EngineDetection, EngineDriver,
-    EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod,
-    EngineProcessRunner, EngineProvisioning, KvCacheQuant, LaunchRequest, ProvisionRequest,
-    ProvisionedEngine, RunningEngine, WorkerProfile,
+    AcceleratorKind, ArtifactFormat, BinaryAcquirePlan, EngineAccel, EngineAvailability,
+    EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
+    EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod, EngineProcessRunner,
+    EngineProvisioning, KvCacheQuant, LaunchRequest, ProvisionRequest, ProvisionedEngine,
+    RunningEngine, WorkerProfile,
 };
 
 const HEALTH_PATH: &str = "/health";
@@ -43,6 +43,22 @@ pub trait LlamaBinarySource: Send + Sync {
         acceleration: EngineAccel,
         sha256: Option<&str>,
     ) -> Result<PathBuf, String>;
+
+    /// Detect fixed CUDA source-build prerequisites.
+    fn cuda_prerequisites(&self) -> crate::CudaBuildPrerequisites {
+        crate::CudaBuildPrerequisites::detect_system()
+    }
+
+    /// Build or return a cached CUDA llama-server from pinned source.
+    async fn build_cuda(
+        &self,
+        cache_dir: &Path,
+        tag: &str,
+        source_sha256: &str,
+    ) -> Result<PathBuf, String> {
+        let _ = (cache_dir, tag, source_sha256);
+        Err("CUDA source building is unavailable from this binary source".to_string())
+    }
 }
 
 /// Production llama.cpp binary source.
@@ -80,6 +96,20 @@ impl LlamaBinarySource for SystemLlamaBinarySource {
             )
         }
     }
+
+    async fn build_cuda(
+        &self,
+        cache_dir: &Path,
+        tag: &str,
+        source_sha256: &str,
+    ) -> Result<PathBuf, String> {
+        let plan = crate::CudaBuildPlan::official(cache_dir, tag, source_sha256)
+            .map_err(|error| error.to_string())?;
+        crate::CudaLlamaBuilder::default()
+            .build(&plan, &crate::CudaBuildPrerequisites::detect_system())
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Managed llama.cpp lifecycle driver.
@@ -104,12 +134,23 @@ impl LlamaCppDriver {
         Self { runner, binaries }
     }
 
-    fn acquisition_plan(&self, provisioning: &EngineProvisioning) -> BinaryAcquirePlan {
+    fn acquisition_plan(
+        &self,
+        provisioning: &EngineProvisioning,
+        worker: &WorkerProfile,
+    ) -> BinaryAcquirePlan {
         let on_path = self
             .binaries
             .resolve_on_path()
             .filter(|path| self.binaries.is_executable(path));
-        plan_binary_acquire(EngineKind::LlamaCpp, Some(provisioning), on_path)
+        let mut cuda = self.binaries.cuda_prerequisites();
+        cuda.nvidia_gpu &= worker.accelerator == AcceleratorKind::Cuda;
+        crate::plan_binary_acquire_with_cuda(
+            EngineKind::LlamaCpp,
+            Some(provisioning),
+            on_path,
+            Some(&cuda),
+        )
     }
 
     fn incompatible_detection(reason: impl Into<String>) -> EngineDetection {
@@ -183,7 +224,7 @@ impl EngineDriver for LlamaCppDriver {
             ));
         }
 
-        match self.acquisition_plan(provisioning) {
+        match self.acquisition_plan(provisioning, worker) {
             BinaryAcquirePlan::OnPath(path) | BinaryAcquirePlan::Explicit(path) => {
                 if self.binaries.is_executable(&path) {
                     EngineDetection {
@@ -229,6 +270,16 @@ impl EngineDriver for LlamaCppDriver {
                     }),
                 }
             }
+            BinaryAcquirePlan::BuildCuda { tag, source_sha256 } => EngineDetection {
+                kind: EngineKind::LlamaCpp,
+                availability: EngineAvailability::Acquirable,
+                version: Some(tag),
+                reason: format!(
+                    "digest-pinned CUDA llama.cpp source build is acquirable ({})",
+                    &source_sha256[..8]
+                ),
+                remediation: None,
+            },
             BinaryAcquirePlan::Blocked(reason) => EngineDetection {
                 kind: EngineKind::LlamaCpp,
                 availability: if reason.contains("no prebuilt") {
@@ -285,7 +336,8 @@ impl EngineDriver for LlamaCppDriver {
             EngineAvailability::Available | EngineAvailability::Acquirable => {}
         }
 
-        let (executable, version, fingerprint) = match self.acquisition_plan(&request.provisioning)
+        let (executable, version, fingerprint) = match self
+            .acquisition_plan(&request.provisioning, &request.worker)
         {
             BinaryAcquirePlan::OnPath(path) => {
                 ensure_executable(self.binaries.as_ref(), &path)?;
@@ -318,6 +370,22 @@ impl EngineDriver for LlamaCppDriver {
                     .map(|digest| format!("sha256:{digest}"))
                     .unwrap_or_else(|| format!("release:{tag}:digest-unpinned"));
                 (path, Some(tag), fingerprint)
+            }
+            BinaryAcquirePlan::BuildCuda { tag, source_sha256 } => {
+                let path = self
+                    .binaries
+                    .build_cuda(&request.engine_cache_dir, &tag, &source_sha256)
+                    .await
+                    .map_err(|error| {
+                        EngineDriverError::new(
+                            EngineFailureReason::EngineProvisionFailed,
+                            format!("build CUDA llama.cpp {tag}: {error}"),
+                            "install nvcc, CMake, a compiler, and tar, then retry the pinned build",
+                            true,
+                        )
+                    })?;
+                ensure_executable(self.binaries.as_ref(), &path)?;
+                (path, Some(tag), format!("source-sha256:{source_sha256}"))
             }
             BinaryAcquirePlan::Blocked(reason) => {
                 return Err(EngineDriverError::blocked(

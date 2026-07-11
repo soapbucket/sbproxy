@@ -35,6 +35,7 @@ pub mod artifact_spec;
 pub mod capabilities;
 pub mod catalog;
 pub mod config;
+pub mod cuda_build;
 pub mod deployment;
 pub mod deployment_store;
 pub mod desired;
@@ -70,7 +71,7 @@ pub mod uv_release;
 pub mod vllm_driver;
 pub mod weights;
 
-pub use acquire::{plan_binary_acquire, BinaryAcquirePlan};
+pub use acquire::{plan_binary_acquire, plan_binary_acquire_with_cuda, BinaryAcquirePlan};
 #[cfg(feature = "weights")]
 pub use artifact::HttpArtifactTransport;
 pub use artifact::{
@@ -95,6 +96,11 @@ pub use config::{
     AcquireSource, ChunkedPrefill, EngineAccel, EngineAcquire, EngineChoice, EngineDoctor,
     EngineEnv, EngineKind, EngineLaunchMethod, EngineProvisioning, EvictionPolicy, KvCacheQuant,
     LoraAdapter, ModelHostConfig, ServeEntry, SpecMethod, SpeculativeConfig,
+};
+pub use cuda_build::{
+    CudaBuildPlan, CudaBuildPrerequisites, CudaLlamaBuilder, CudaSourceFetcher,
+    HttpCudaSourceFetcher, DEFAULT_LLAMA_SOURCE_COMMIT, DEFAULT_LLAMA_SOURCE_SHA256,
+    MAX_LLAMA_SOURCE_BYTES,
 };
 pub use deployment::{
     DeploymentError, DeploymentRevision, DeploymentRevisionDraft, DeploymentSourceMode,
@@ -127,8 +133,8 @@ pub use llama_driver::{
     LlamaBinarySource, LlamaCppDriver, LlamaDetection, LlamaProvisioned, SystemLlamaBinarySource,
 };
 pub use llama_release::{
-    asset_url as llama_asset_url, asset_url_accel as llama_asset_url_accel, resolve_on_path,
-    Platform, DEFAULT_LLAMA_RELEASE_TAG,
+    asset_url as llama_asset_url, asset_url_accel as llama_asset_url_accel, is_executable_file,
+    resolve_on_path, Platform, DEFAULT_LLAMA_RELEASE_TAG,
 };
 #[cfg(feature = "weights")]
 pub use llama_release::{ensure_llama_server, ensure_llama_server_blocking};
