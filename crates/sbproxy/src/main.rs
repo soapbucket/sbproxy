@@ -1951,11 +1951,97 @@ fn artifact_format_name(format: sbproxy_model_host::ArtifactFormat) -> &'static 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullSelection {
+    model: String,
+    variant: Option<String>,
+    engine: sbproxy_model_host::EngineChoice,
+    replicas: u32,
+    heterogeneous_variants: bool,
+    configured: bool,
+    pinned: bool,
+}
+
+impl PullSelection {
+    fn catalog(model: String, args: &ModelsPullArgs) -> Self {
+        Self {
+            model,
+            variant: args.variant.clone(),
+            engine: args.engine.into(),
+            replicas: 1,
+            heterogeneous_variants: false,
+            configured: false,
+            pinned: false,
+        }
+    }
+}
+
+fn managed_engine_choice(
+    engine: sbproxy_config::ManagedEngineChoice,
+) -> sbproxy_model_host::EngineChoice {
+    match engine {
+        sbproxy_config::ManagedEngineChoice::Auto => sbproxy_model_host::EngineChoice::Auto,
+        sbproxy_config::ManagedEngineChoice::Vllm => sbproxy_model_host::EngineChoice::Vllm,
+        sbproxy_config::ManagedEngineChoice::LlamaCpp => sbproxy_model_host::EngineChoice::LlamaCpp,
+    }
+}
+
+fn configured_pull_selections(
+    serve: Option<&sbproxy_model_host::ModelHostConfig>,
+    canonical: Option<&sbproxy_config::ModelHostControlConfig>,
+) -> Vec<PullSelection> {
+    let mut selections = Vec::new();
+    if let Some(canonical) = canonical {
+        selections.extend(
+            canonical
+                .deployments
+                .values()
+                .map(|deployment| PullSelection {
+                    model: deployment.model.clone(),
+                    variant: deployment.variant.clone(),
+                    engine: managed_engine_choice(deployment.engine),
+                    replicas: deployment.replicas,
+                    heterogeneous_variants: deployment.heterogeneous_variants,
+                    configured: true,
+                    pinned: false,
+                }),
+        );
+    }
+    if let Some(serve) = serve {
+        selections.extend(serve.models.iter().map(|entry| PullSelection {
+            model: entry.model.clone(),
+            variant: entry.variant.clone(),
+            engine: entry.engine,
+            replicas: 1,
+            heterogeneous_variants: false,
+            configured: true,
+            pinned: entry.pinned,
+        }));
+    }
+    selections
+}
+
+fn push_pull_selection(selections: &mut Vec<PullSelection>, candidate: PullSelection) {
+    if let Some(existing) = selections.iter_mut().find(|existing| {
+        existing.model == candidate.model
+            && existing.variant == candidate.variant
+            && existing.engine == candidate.engine
+            && existing.replicas == candidate.replicas
+            && existing.heterogeneous_variants == candidate.heterogeneous_variants
+    }) {
+        existing.configured |= candidate.configured;
+        existing.pinned |= candidate.pinned;
+    } else {
+        selections.push(candidate);
+    }
+}
+
 fn selected_pull_models(
     args: &ModelsPullArgs,
     catalog: &sbproxy_model_host::Catalog,
     serve: Option<&sbproxy_model_host::ModelHostConfig>,
-) -> anyhow::Result<Vec<String>> {
+    canonical: Option<&sbproxy_config::ModelHostControlConfig>,
+) -> anyhow::Result<Vec<PullSelection>> {
     if args.all && !args.models.is_empty() {
         anyhow::bail!("--all cannot be combined with positional model IDs");
     }
@@ -1967,27 +2053,43 @@ fn selected_pull_models(
             .models
             .iter()
             .filter(|(_, entry)| !entry.variants.is_empty())
-            .map(|(model, _)| model.clone())
+            .map(|(model, _)| PullSelection::catalog(model.clone(), args))
             .collect());
     }
-    if !args.models.is_empty() {
-        return Ok(args.models.clone());
-    }
+
+    let configured = configured_pull_selections(serve, canonical);
     let mut selected = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    if let Some(serve) = serve {
-        for entry in &serve.models {
-            if seen.insert(entry.model.clone()) {
-                selected.push(entry.model.clone());
+    if !args.models.is_empty() {
+        for model in &args.models {
+            if args.variant.is_some() {
+                push_pull_selection(&mut selected, PullSelection::catalog(model.clone(), args));
+                continue;
+            }
+            let mut matched = false;
+            for mut selection in configured
+                .iter()
+                .filter(|selection| selection.model == *model)
+                .cloned()
+            {
+                if args.engine != ModelEngineArg::Auto {
+                    selection.engine = args.engine.into();
+                }
+                push_pull_selection(&mut selected, selection);
+                matched = true;
+            }
+            if !matched {
+                push_pull_selection(&mut selected, PullSelection::catalog(model.clone(), args));
             }
         }
+        return Ok(selected);
+    }
+
+    for selection in configured {
+        push_pull_selection(&mut selected, selection);
     }
     for (model, entry) in &catalog.models {
-        if !entry.variants.is_empty()
-            && entry.pull == sbproxy_model_host::PullPolicy::OnBoot
-            && seen.insert(model.clone())
-        {
-            selected.push(model.clone());
+        if !entry.variants.is_empty() && entry.pull == sbproxy_model_host::PullPolicy::OnBoot {
+            push_pull_selection(&mut selected, PullSelection::catalog(model.clone(), args));
         }
     }
     Ok(selected)
@@ -1997,7 +2099,7 @@ fn handle_models_pull(
     args: &ModelsPullArgs,
     config_path: Option<&std::path::Path>,
 ) -> anyhow::Result<i32> {
-    let (serve, catalog) = match config_path {
+    let (serve, canonical, catalog) = match config_path {
         Some(config_path) => {
             if args.catalog_file.is_some() {
                 anyhow::bail!("--catalog-file cannot be combined with -f/--config");
@@ -2008,18 +2110,29 @@ fn handle_models_pull(
             let config_dir = config_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
-            let Some((serve, catalog)) = extract_serve_and_catalog(&yaml, config_dir)? else {
+            let compiled = sbproxy_config::compile_config(&yaml)?;
+            let canonical = compiled.server.model_host.clone();
+            let legacy = extract_serve_and_catalog(&yaml, config_dir)?;
+            if canonical.is_none() && legacy.is_none() {
                 anyhow::bail!(
-                    "config '{}' has no local serve block",
+                    "config '{}' has no proxy.model_host or local serve block",
                     config_path.display()
                 );
+            }
+            let (serve, catalog) = match legacy {
+                Some((serve, catalog)) => (Some(serve), catalog),
+                None => (None, sbproxy_model_host::Catalog::builtin()),
             };
-            (Some(serve), catalog)
+            (serve, canonical, catalog)
         }
-        None => (None, load_models_catalog(args.catalog_file.as_deref())?),
+        None => (
+            None,
+            None,
+            load_models_catalog(args.catalog_file.as_deref())?,
+        ),
     };
-    let models = selected_pull_models(args, &catalog, serve.as_ref())?;
-    if models.is_empty() {
+    let selections = selected_pull_models(args, &catalog, serve.as_ref(), canonical.as_ref())?;
+    if selections.is_empty() {
         eprintln!("sbproxy models pull: no catalog v2 artifacts selected");
         return Ok(0);
     }
@@ -2027,11 +2140,16 @@ fn handle_models_pull(
     let report = sbproxy_core::doctor::DoctorReport::collect();
     let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&report.gpus)
         .map_err(|error| anyhow::anyhow!("resolve pull worker: {error}"))?;
-    let configured_cache = serve
+    let canonical_cache = canonical
+        .as_ref()
+        .and_then(|control| control.cache.directory.as_deref())
+        .map(PathBuf::from);
+    let legacy_cache = serve
         .as_ref()
         .and_then(|serve| serve.cache_dir.as_deref())
         .map(PathBuf::from);
-    let root = model_cache_root(args.cache_dir.as_deref().or(configured_cache.as_deref()));
+    let configured_cache = canonical_cache.as_deref().or(legacy_cache.as_deref());
+    let root = model_cache_root(args.cache_dir.as_deref().or(configured_cache));
     let manager = sbproxy_model_host::ArtifactManager::new(root, models_pull_transport()?)?
         .with_observer(std::sync::Arc::new(ModelsPullProgress));
     let network = if args.offline {
@@ -2040,73 +2158,49 @@ fn handle_models_pull(
         sbproxy_model_host::NetworkPolicy::Allowed
     };
 
-    let mut configured_protection = sbproxy_model_host::CacheProtection::default();
-    if let Some(serve) = &serve {
-        for configured in serve.models.iter().filter(|configured| configured.pinned) {
-            let artifact = catalog
-                .resolve_artifact(
-                    &sbproxy_model_host::ResolveArtifactRequest {
-                        model: configured.model.clone(),
-                        variant: configured.variant.clone(),
-                        engine: configured.engine,
-                        replicas: 1,
-                        heterogeneous_variants: false,
-                    },
-                    &worker,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "resolve pinned model '{}' for cache protection: {error}",
-                        configured.model
-                    )
-                })?;
-            configured_protection
-                .pinned
-                .insert(artifact.artifact_digest);
-        }
-    }
+    let configured_protection = match config_path {
+        Some(path) => configured_artifact_protection(path, &catalog, &worker)?,
+        None => sbproxy_model_host::CacheProtection::default(),
+    };
 
-    let mut requests = Vec::with_capacity(models.len());
-    for model in models {
+    let mut requests: Vec<(
+        sbproxy_model_host::ResolvedArtifact,
+        sbproxy_model_host::PullPolicy,
+        bool,
+        Option<sbproxy_model_host::SourceCredential>,
+    )> = Vec::with_capacity(selections.len());
+    for selection in selections {
+        let model = &selection.model;
         let entry = catalog
-            .get(&model)
+            .get(model)
             .ok_or_else(|| anyhow::anyhow!("model '{model}' is not in the catalog"))?;
         if entry.variants.is_empty() {
             anyhow::bail!(
                 "model '{model}' has no exact catalog v2 variant; migrate its files, sizes, digests, and revision before pulling"
             );
         }
-        let configured = serve.as_ref().and_then(|serve| {
-            serve
-                .models
-                .iter()
-                .find(|configured| configured.model == model)
-        });
-        let engine = if args.engine == ModelEngineArg::Auto {
-            configured
-                .map(|configured| configured.engine)
-                .unwrap_or(sbproxy_model_host::EngineChoice::Auto)
-        } else {
-            args.engine.into()
-        };
-        let variant = args
-            .variant
-            .clone()
-            .or_else(|| configured.and_then(|configured| configured.variant.clone()));
         let request = sbproxy_model_host::ResolveArtifactRequest {
-            model: model.clone(),
-            variant,
-            engine,
-            replicas: 1,
-            heterogeneous_variants: false,
+            model: selection.model.clone(),
+            variant: selection.variant,
+            engine: selection.engine,
+            replicas: selection.replicas,
+            heterogeneous_variants: selection.heterogeneous_variants,
         };
         match catalog.resolve_artifact(&request, &worker) {
-            Ok(artifact) => requests.push((
-                artifact,
-                entry.pull,
-                models_pull_credential(entry.hf_token.as_deref())?,
-                configured.is_some_and(|configured| configured.pinned),
-            )),
+            Ok(artifact) => {
+                if let Some(existing) = requests.iter().position(|(existing, _, _, _)| {
+                    existing.artifact_digest == artifact.artifact_digest
+                }) {
+                    requests[existing].2 |= selection.pinned;
+                } else {
+                    requests.push((
+                        artifact,
+                        entry.pull,
+                        selection.pinned,
+                        models_pull_credential(entry.hf_token.as_deref())?,
+                    ));
+                }
+            }
             Err(error) if args.all => {
                 eprintln!("sbproxy models pull: skip {model}: {error}");
             }
@@ -2121,7 +2215,7 @@ fn handle_models_pull(
     let (results, protection) = executor.block_on(async {
         let mut results = Vec::with_capacity(requests.len());
         let mut protection = configured_protection;
-        for (artifact, pull_policy, credential, pinned) in requests {
+        for (artifact, pull_policy, pinned, credential) in requests {
             let ready = manager
                 .ensure(
                     &artifact,
@@ -2149,9 +2243,11 @@ fn handle_models_pull(
         Ok::<_, sbproxy_model_host::ArtifactError>((results, protection))
     })?;
 
-    let gc = serve
+    let budget_gib = canonical
         .as_ref()
-        .and_then(|serve| serve.cache_budget_gib)
+        .and_then(|control| control.cache.budget_gib)
+        .or_else(|| serve.as_ref().and_then(|serve| serve.cache_budget_gib));
+    let gc = budget_gib
         .map(|gib| {
             if !gib.is_finite() || gib < 0.0 {
                 anyhow::bail!("serve.cache_budget_gib must be a finite nonnegative number");
@@ -3731,34 +3827,57 @@ mod tests {
         }
     }
 
+    fn selected_models(selections: Vec<PullSelection>) -> Vec<String> {
+        selections
+            .into_iter()
+            .map(|selection| selection.model)
+            .collect()
+    }
+
     #[test]
     fn models_pull_defaults_to_boot_and_supports_explicit_or_all_selection() {
         let catalog = pull_catalog();
         assert_eq!(
-            selected_pull_models(&pull_args(), &catalog, None).unwrap(),
+            selected_models(selected_pull_models(&pull_args(), &catalog, None, None).unwrap()),
             ["boot"]
         );
 
         let mut explicit = pull_args();
         explicit.models = vec!["demand".to_string()];
         assert_eq!(
-            selected_pull_models(&explicit, &catalog, None).unwrap(),
+            selected_models(selected_pull_models(&explicit, &catalog, None, None).unwrap()),
             ["demand"]
         );
 
         let mut all = pull_args();
         all.all = true;
         assert_eq!(
-            selected_pull_models(&all, &catalog, None).unwrap(),
+            selected_models(selected_pull_models(&all, &catalog, None, None).unwrap()),
             ["boot", "demand"]
         );
 
         let configured: sbproxy_model_host::ModelHostConfig =
             serde_yaml::from_str("models:\n  - model: demand\n").unwrap();
         assert_eq!(
-            selected_pull_models(&pull_args(), &catalog, Some(&configured)).unwrap(),
+            selected_models(
+                selected_pull_models(&pull_args(), &catalog, Some(&configured), None).unwrap()
+            ),
             ["demand", "boot"]
         );
+
+        let canonical: sbproxy_config::ModelHostControlConfig = serde_yaml::from_str(
+            "deployments:\n  coder:\n    model: demand\n    variant: cpu\n    engine: llama_cpp\n",
+        )
+        .unwrap();
+        let selected = selected_pull_models(&pull_args(), &catalog, None, Some(&canonical))
+            .expect("canonical deployment selection");
+        assert_eq!(selected_models(selected.clone()), ["demand", "boot"]);
+        assert_eq!(selected[0].variant.as_deref(), Some("cpu"));
+        assert_eq!(
+            selected[0].engine,
+            sbproxy_model_host::EngineChoice::LlamaCpp
+        );
+        assert!(selected[0].configured);
     }
 
     #[test]
@@ -3766,7 +3885,7 @@ mod tests {
         let catalog = pull_catalog();
         let mut args = pull_args();
         args.variant = Some("cpu".to_string());
-        assert!(selected_pull_models(&args, &catalog, None)
+        assert!(selected_pull_models(&args, &catalog, None, None)
             .unwrap_err()
             .to_string()
             .contains("exactly one"));
@@ -3811,7 +3930,7 @@ mod tests {
         ));
         let catalog_filename = catalog_path.file_name().unwrap().to_string_lossy();
         let config_path = temp_config(&format!(
-            "origins:\n  ai.local:\n    action:\n      providers:\n        - name: local\n          serve:\n            catalog_file: {catalog_filename}\n            cache_dir: {}\n            cache_budget_gib: 0\n            models:\n              - model: offline\n                variant: demo\n                engine: llama_cpp\n                pinned: true\n",
+            "origins:\n  ai.local:\n    action:\n      type: ai_proxy\n      providers:\n        - name: local\n          serve:\n            catalog_file: {catalog_filename}\n            cache_dir: {}\n            cache_budget_gib: 0\n            models:\n              - model: offline\n                variant: demo\n                engine: llama_cpp\n                pinned: true\n",
             cache.display()
         ));
         let args = ModelsPullArgs {
