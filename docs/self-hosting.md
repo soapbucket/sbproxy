@@ -1,6 +1,6 @@
 # Self-hosting SBproxy
 
-*Last modified: 2026-07-07*
+*Last modified: 2026-07-10*
 
 One binary to self-host your AI gateway, and the same binary runs the
 models. OpenRouter proved that teams want unified routing, fallbacks,
@@ -10,10 +10,10 @@ hosts the model. SBproxy brings the same feature surface inside your
 network and adds the half a hosted router cannot: the weights run on
 your GPUs, and the tokens never leave the box.
 
-If you only take one thing from this page: a provider whose entire body
-is a `serve:` block with one model line boots to a first token, and
-then every plane you already rely on (keys, budgets, guardrails, the
-usage ledger) applies to that local model unchanged.
+The stable single-node shape is `proxy.model_host` plus a
+`provider_type: managed_model` provider. Every plane you already rely on
+(keys, budgets, guardrails, and the usage ledger) applies to that local model.
+Provider `serve:` blocks remain a compatibility path for the migration window.
 
 ## Install
 
@@ -36,38 +36,47 @@ Binary downloads and the rest of the install matrix are in the
 
 ## Serve a model
 
-The model host runs an inference engine (vLLM or llama.cpp) as a
-supervised subprocess and registers it as a local provider. You name a
-model; sbproxy resolves it, fits an engine and quant to the GPU, spawns
-it, and routes to it.
+The model host runs llama.cpp or vLLM as a supervised process and registers a
+configured deployment as a local provider.
 
 ```yaml
+proxy:
+  http_bind_port: 8080
+  model_host:
+    cache:
+      directory: /var/lib/sbproxy/models
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+        pull: on_boot
+        warm: true
+        engine: llama_cpp
+
 origins:
   "gateway.internal":
     action:
       type: ai_proxy
       providers:
         - name: local
-          serve:
-            models:
-              - model: qwen3-14b
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
 ```
 
-That is the whole provider. The engine defaults to `auto`, which reads
-the weights and the box: a GGUF model picks llama.cpp, a safetensors
-model picks vLLM. sbproxy acquires either one for you, so a bare box
-serves without a manual install: it fetches a pinned llama.cpp binary,
-or fetches `uv` and runs vLLM through `uv tool run`. The fit planner
-picks the quant the card can run, so an L4 takes FP8 and a T4 falls back
-to an int4 GGUF instead of a kernel the hardware lacks. See
-[model-host.md](model-host.md#inference-engines) for the two engines and
-their prerequisites.
+The deployment owns artifact, engine, admission, and lifecycle policy. The
+provider owns the public model name and normal gateway policy. Engine `auto`
+chooses a compatible managed driver from the exact artifact format. See
+[model-host.md](model-host.md#managed-engines) for availability states,
+acquisition, and the current hardware evidence boundary.
 
 ## The model manifest
 
-For more than a throwaway model, keep a manifest: one reviewable file
-that says which models exist, where their weights come from, and the
-digests to verify them against. Point `serve.catalog_file` at it. See
+Catalog v2 is the reviewable file that says which models exist, where their
+weights come from, and which digests must match. Canonical deployments in this
+PR use the built-in catalog. An operator catalog is available through the
+compatibility `serve.catalog_file` path; moving custom catalog selection into
+the managed admin plane is later work. See
 [`examples/model-manifest`](../examples/model-manifest). A manifest
 entry carries the source (`hf:` or an air-gapped `file:` path), a
 pinned revision, per-file sha256 digests, a gated-repo token as a
@@ -75,20 +84,15 @@ secret reference, the default engine, and a pull policy (`on_boot`,
 `on_demand`, or `manual`). A curated manifest with digests doubles as a
 supply-chain allowlist.
 
-Weight acquisition happens under the serve lifecycle, driven by each
-entry's pull policy. To warm the cache ahead of a first request (or
-bake weights into a container image), set `pull: on_boot` on the entry
-and boot the proxy once; the download runs at startup instead of on
-the first call. `on_demand` pays the download when the first request
-arrives, and `manual` never downloads: it expects the weights already
-present in the cache directory, which is the right setting for
-air-gapped hosts.
+Weight acquisition follows each canonical deployment's `pull` policy. Use
+`on_boot` to verify during candidate preparation, `on_demand` to defer the work
+to the first request, or `manual` to require a prior `sbproxy models pull`.
 
 ## Check the box before it serves
 
 `sbproxy doctor` answers "can this host serve models" with no config
-at all: build capabilities, visible GPUs, engines on PATH, container
-runtime, the model cache, and a serve-readiness verdict with every
+at all: build capabilities, visible devices, engines on PATH, container
+runtime, the model cache, and a local-runtime verdict with every
 blocker listed. For each engine it names the acquisition options viable
 here (a pinned llama.cpp release, or vLLM via uvx), and the runtime then
 acquires the engine on first use. What doctor still cannot supply is a
@@ -105,10 +109,8 @@ changes, and 3 on semantic errors. Wire that exit code into CI so a
 rollout that touches more origins than you expected stops before it
 ships.
 
-The proxy also re-checks the doctor's prerequisites every time a
-config with `serve:` loads, and logs a warning per missing piece, so a
-freshly-imaged box that lost its engine or driver tells you at boot,
-not at the first request.
+The proxy rechecks those prerequisites during startup and reload preparation.
+A bad candidate never replaces the last good runtime.
 
 ## Point Claude Code at your own GPU
 
@@ -118,17 +120,23 @@ so an alias maps a hosted model name to a local one. Map
 runs against your hardware with a one-line change.
 
 ```yaml
-serve:
-  models:
-    - model: glm-4-flash
-      name: claude-sonnet-4-5
+proxy:
+  model_host:
+    deployments:
+      local-coder:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+
+providers:
+  - name: local
+    provider_type: managed_model
+    deployment: local-coder
+    models: [claude-sonnet-4-5]
 ```
 
-One caveat before you bet a workflow on this: the serving path is
-landing in phases, and real-GPU engine bring-up is certified per
-hardware target, so check the
-[model host status](model-host.md#status) for what is proven on your
-card today.
+Check the [model host boundary](model-host.md#current-boundary) before choosing
+hardware. Apple Metal is the live gate for this PR; NVIDIA remains pending the
+final GCP integration run.
 
 ## Spill to cloud, with policy attached
 
@@ -145,8 +153,9 @@ request gets a 400 rather than landing somewhere you did not approve.
 ```yaml
 providers:
   - name: local
-    serve:
-      models: [{ model: qwen3-14b }]
+    provider_type: managed_model
+    deployment: local-qwen
+    models: [qwen]
   - name: openai
     api_key: ${OPENAI_API_KEY}
     default_model: gpt-4o-mini
@@ -178,6 +187,11 @@ proxy:
   acme:
     enabled: true
     email: ops@example.com
+  model_host:
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
 
 origins:
   "ai.example.com":
@@ -186,9 +200,9 @@ origins:
       type: ai_proxy
       providers:
         - name: local
-          serve:
-            models:
-              - model: qwen3-14b
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
 ```
 
 That is a governed, OpenAI-compatible endpoint on your own GPU with
@@ -222,6 +236,6 @@ your own GPUs.
 - [model-host.md](model-host.md) - the reference: catalog, fit planner,
   supervisor, engine matrix.
 - [model-host-certification.md](model-host-certification.md) -
-  provisioning a cloud GPU and running the certification.
+  the hardware evidence ledger and final GCP procedure.
 - [ai-gateway.md](ai-gateway.md) - the routing, guardrail, budget, and
   ledger planes local models plug into.

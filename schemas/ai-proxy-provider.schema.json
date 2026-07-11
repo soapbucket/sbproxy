@@ -19,6 +19,14 @@
         "null"
       ]
     },
+    "deployment": {
+      "description": "Canonical model-host deployment ID. This is required when `provider_type` is `managed_model` and rejected for every other provider.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "api_key": {
       "description": "API key used to authenticate with the upstream provider.",
       "type": [
@@ -217,7 +225,7 @@
           "minimum": 0.0
         },
         "queue_timeout_ms": {
-          "description": "Support: preview. How long a queued request waits for a served-lane slot before the attempt fails over to the next provider (or errors when no fallback exists). Milliseconds; defaults to 30000. Read only when `max_concurrent_requests` is set.",
+          "description": "How long a queued request waits for a served-lane slot before the attempt fails over to the next provider (or errors when no fallback exists). Milliseconds; defaults to 30000. Read only when `max_concurrent_requests` is set.",
           "default": null,
           "type": [
             "integer",
@@ -265,7 +273,7 @@
           ]
         },
         "keep_alive": {
-          "description": "Support: preview. Idle time before the engine is unloaded to free VRAM. Go duration syntax (`10m`, `1h`); `None` means never auto-unload.",
+          "description": "Idle time before the engine is unloaded to free VRAM. Go duration syntax (`10m`, `1h`); `None` means never auto-unload.",
           "default": null,
           "type": [
             "string",
@@ -601,6 +609,16 @@
               "type": "null"
             }
           ]
+        },
+        "shm_size_gib": {
+          "description": "Shared-memory allocation in GiB for container launch.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
         }
       }
     },
@@ -644,7 +662,7 @@
           ]
         },
         "version": {
-          "description": "Release tag to pin (for `release`); `None` uses the built-in default pin. Never `latest`.",
+          "description": "Release or source tag to pin; `None` uses the built-in default. Never `latest`.",
           "default": null,
           "type": [
             "string",
@@ -652,7 +670,7 @@
           ]
         },
         "accel": {
-          "description": "Acceleration flavour to fetch (for `release`).",
+          "description": "Acceleration flavour to acquire.",
           "default": "auto",
           "allOf": [
             {
@@ -669,7 +687,7 @@
           ]
         },
         "sha256": {
-          "description": "Expected sha256 hex of the release asset. Verifies the download when set; a `release` fetch without it logs a warning.",
+          "description": "Expected SHA-256 of the release asset or source archive. A `release` fetch without it logs a warning; CUDA source builds require it unless using the built-in source pin.",
           "default": null,
           "type": [
             "string",
@@ -701,11 +719,18 @@
           "enum": [
             "uvx"
           ]
+        },
+        {
+          "description": "Build a digest-pinned llama.cpp source archive with fixed CMake CUDA flags.",
+          "type": "string",
+          "enum": [
+            "source_build"
+          ]
         }
       ]
     },
     "EngineAccel": {
-      "description": "Hardware-acceleration flavour to acquire a binary engine build for (WOR-1801). `Auto` picks from the host GPU: Apple gets the Metal build (built into the macOS asset), an NVIDIA Linux box gets the Vulkan build (ggml-org ships no CUDA Linux prebuilt), everything else gets the CPU build.",
+      "description": "Hardware-acceleration flavour to acquire a binary engine build for (WOR-1801). `Auto` picks from the host: Apple gets the Metal build, a compatible NVIDIA Linux host may build CUDA from pinned source, and other hosts use the platform release.",
       "oneOf": [
         {
           "description": "Detect from the host GPU.",
@@ -715,7 +740,7 @@
           ]
         },
         {
-          "description": "CUDA. For llama.cpp on Linux this resolves to the Vulkan prebuilt (no upstream CUDA Linux asset); a CUDA container or source build is the alternative.",
+          "description": "CUDA. llama.cpp uses the digest-pinned Linux source-build path because upstream does not publish a CUDA Linux release asset.",
           "type": "string",
           "enum": [
             "cuda"

@@ -104,6 +104,16 @@ pub enum ConsumerContract {
     EvictionChangesAdmission,
     /// The concurrency cap changes request scheduling.
     PriorityGateChangesDispatch,
+    /// Canonical desired state commits atomically and failed preparation preserves it.
+    CanonicalDesiredStateReconcilesAtomically,
+    /// Managed engine kinds expose one typed capability contract.
+    ManagedDriversExposeTypedCapabilities,
+    /// Keep-alive starts only after the last active permit completes.
+    KeepAliveStartsAfterLastPermit,
+    /// Exact artifact removal honors configured, resident, and pinned protection.
+    ExactRemovalProtectsReferences,
+    /// Runtime status and admission failures serialize bounded stable labels.
+    StatusReportsStableLifecycle,
 }
 
 impl ConsumerContract {
@@ -126,6 +136,15 @@ impl ConsumerContract {
             }
             Self::EvictionChangesAdmission => "contract.eviction_changes_admission",
             Self::PriorityGateChangesDispatch => "contract.priority_gate_changes_dispatch",
+            Self::CanonicalDesiredStateReconcilesAtomically => {
+                "contract.canonical_desired_state_reconciles_atomically"
+            }
+            Self::ManagedDriversExposeTypedCapabilities => {
+                "contract.managed_drivers_expose_typed_capabilities"
+            }
+            Self::KeepAliveStartsAfterLastPermit => "contract.keep_alive_starts_after_last_permit",
+            Self::ExactRemovalProtectsReferences => "contract.exact_removal_protects_references",
+            Self::StatusReportsStableLifecycle => "contract.status_reports_stable_lifecycle",
         }
     }
 
@@ -285,33 +304,292 @@ impl ConsumerContract {
                     .expect_err("never policy must reject instead of evicting");
                 Ok(())
             }
-            Self::PriorityGateChangesDispatch => {
-                use crate::scheduling::{admit, PriorityClass, SchedulingDecision};
-
-                let capped_config: ModelHostConfig =
-                    serde_yaml::from_str("max_concurrent_requests: 1\nmodels: []\n")
-                        .map_err(|error| error.to_string())?;
-                let roomy_config: ModelHostConfig =
-                    serde_yaml::from_str("max_concurrent_requests: 2\nmodels: []\n")
-                        .map_err(|error| error.to_string())?;
-                let running = [PriorityClass::Standard];
-                let capped = admit(
-                    PriorityClass::Standard,
-                    &running,
-                    capped_config.max_concurrent_requests.unwrap_or_default(),
-                );
-                let roomy = admit(
-                    PriorityClass::Standard,
-                    &running,
-                    roomy_config.max_concurrent_requests.unwrap_or_default(),
-                );
-                if capped != SchedulingDecision::Queue || roomy != SchedulingDecision::Admit {
-                    return Err(format!("capacity decisions were {capped:?} and {roomy:?}"));
-                }
-                Ok(())
-            }
+            Self::PriorityGateChangesDispatch => assert_priority_gate_changes_dispatch(),
+            Self::CanonicalDesiredStateReconcilesAtomically => assert_canonical_reconciliation(),
+            Self::ManagedDriversExposeTypedCapabilities => assert_managed_driver_capabilities(),
+            Self::KeepAliveStartsAfterLastPermit => assert_keep_alive_lifecycle(),
+            Self::ExactRemovalProtectsReferences => assert_exact_removal_protection(),
+            Self::StatusReportsStableLifecycle => assert_stable_status_shape(),
         }
     }
+}
+
+fn assert_managed_driver_capabilities() -> Result<(), String> {
+    let llama = crate::LlamaCppDriver::default();
+    let vllm = crate::VllmDriver::default();
+    let llama_capabilities = crate::EngineDriver::capabilities(&llama);
+    let vllm_capabilities = crate::EngineDriver::capabilities(&vllm);
+    if llama_capabilities.artifact_formats != [crate::ArtifactFormat::Gguf]
+        || llama_capabilities.supports_container
+        || llama_capabilities.supports_uv
+    {
+        return Err(format!(
+            "unexpected llama.cpp capabilities: {llama_capabilities:?}"
+        ));
+    }
+    if !vllm_capabilities
+        .artifact_formats
+        .contains(&crate::ArtifactFormat::Safetensors)
+        || !vllm_capabilities.supports_container
+        || !vllm_capabilities.supports_uv
+    {
+        return Err(format!(
+            "unexpected vLLM capabilities: {vllm_capabilities:?}"
+        ));
+    }
+    Ok(())
+}
+
+struct CapabilityPreparer;
+
+#[async_trait::async_trait]
+impl crate::DeploymentPreparer for CapabilityPreparer {
+    async fn prepare(
+        &self,
+        request: crate::DeploymentPrepareRequest,
+    ) -> Result<std::sync::Arc<dyn crate::PreparedDeploymentRuntime>, crate::RuntimeManagerError>
+    {
+        if request.deployment_id == "broken" {
+            return Err(crate::RuntimeManagerError::Prepare(
+                "capability fixture rejected broken deployment".to_string(),
+            ));
+        }
+        Ok(std::sync::Arc::new(CapabilityPreparedRuntime))
+    }
+}
+
+struct CapabilityPreparedRuntime;
+
+#[async_trait::async_trait]
+impl crate::PreparedDeploymentRuntime for CapabilityPreparedRuntime {
+    async fn memory_estimate(
+        &self,
+        _intent: crate::PullIntent,
+    ) -> Result<crate::MemoryEstimate, crate::RuntimeManagerError> {
+        Err(crate::RuntimeManagerError::Prepare(
+            "capability fixture is cold only".to_string(),
+        ))
+    }
+
+    async fn start(
+        &self,
+        _intent: crate::PullIntent,
+    ) -> Result<crate::RunningEngine, crate::RuntimeManagerError> {
+        Err(crate::RuntimeManagerError::Prepare(
+            "capability fixture does not launch".to_string(),
+        ))
+    }
+
+    async fn stop(&self, _grace: std::time::Duration) -> Result<(), crate::RuntimeManagerError> {
+        Ok(())
+    }
+
+    async fn reset(&self) -> Result<Option<crate::OperationJob>, crate::RuntimeManagerError> {
+        Ok(None)
+    }
+}
+
+fn capability_desired_state(
+    source_revision: &str,
+    deployments: &[&str],
+) -> Result<crate::RuntimeDesiredState, String> {
+    let mut control = sbproxy_config::ModelHostControlConfig::default();
+    for deployment in deployments {
+        control.deployments.insert(
+            (*deployment).to_string(),
+            serde_yaml::from_str("model: qwen2.5-0.5b-instruct\nvariant: q4_k_m\nwarm: false\n")
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    crate::compile_desired_state(
+        crate::RuntimeDesiredInput {
+            source_revision: source_revision.to_string(),
+            canonical: Some(control),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &crate::Catalog::builtin(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn assert_canonical_reconciliation() -> Result<(), String> {
+    let catalog = crate::Catalog::builtin();
+    let manager = crate::ModelRuntimeManager::new(
+        catalog.catalog_revision.clone(),
+        std::sync::Arc::new(CapabilityPreparer),
+    )
+    .map_err(|error| error.to_string())?;
+    let first = futures::executor::block_on(
+        manager.reconcile(capability_desired_state("first", &["coder"])?),
+    )
+    .map_err(|error| error.to_string())?;
+    if first.plan.added != ["coder".to_string()] || manager.current_revision() != 1 {
+        return Err(format!("unexpected first reconcile report: {first:?}"));
+    }
+
+    let revision = manager.current_revision();
+    let error = futures::executor::block_on(
+        manager.reconcile(capability_desired_state("broken", &["coder", "broken"])?),
+    )
+    .expect_err("broken fixture preparation must fail");
+    if !matches!(error, crate::RuntimeManagerError::Prepare(_))
+        || manager.current_revision() != revision
+        || !manager.current_desired().deployments.contains_key("coder")
+        || manager.current_desired().deployments.contains_key("broken")
+    {
+        return Err(format!(
+            "failed reconciliation changed the last good state: {error}"
+        ));
+    }
+    Ok(())
+}
+
+fn assert_keep_alive_lifecycle() -> Result<(), String> {
+    let gate = crate::AdmissionGate::new(1, 1, std::time::Duration::from_secs(30))?;
+    gate.mark_ready_idle();
+    if !gate.is_idle_expired_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(31),
+        std::time::Duration::from_secs(30),
+    ) {
+        return Err("ready idle deployment did not expire".to_string());
+    }
+    let permit = futures::executor::block_on(gate.admit(crate::PriorityClass::Standard))
+        .map_err(|error| error.to_string())?;
+    if gate.is_idle_expired_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(30),
+    ) {
+        return Err("active permit was treated as idle".to_string());
+    }
+    drop(permit);
+    if !gate.is_idle_expired_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(31),
+        std::time::Duration::from_secs(30),
+    ) {
+        return Err("keep-alive did not restart after permit completion".to_string());
+    }
+    Ok(())
+}
+
+fn assert_priority_gate_changes_dispatch() -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        let gate = crate::AdmissionGate::new(1, 2, std::time::Duration::from_secs(30))?;
+        let active = gate
+            .admit(crate::PriorityClass::Standard)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let batch_gate = gate.clone();
+        let batch_sender = sender.clone();
+        let batch = tokio::spawn(async move {
+            let permit = batch_gate.admit(crate::PriorityClass::Batch).await?;
+            let _ = batch_sender.send("batch");
+            drop(permit);
+            Ok::<_, crate::AdmissionRejection>(())
+        });
+        tokio::task::yield_now().await;
+        let interactive_gate = gate.clone();
+        let interactive = tokio::spawn(async move {
+            let permit = interactive_gate
+                .admit(crate::PriorityClass::Interactive)
+                .await?;
+            let _ = sender.send("interactive");
+            drop(permit);
+            Ok::<_, crate::AdmissionRejection>(())
+        });
+        tokio::task::yield_now().await;
+        if gate.counts().queued != 2 {
+            return Err(format!(
+                "expected two queued requests, got {:?}",
+                gate.counts()
+            ));
+        }
+        drop(active);
+        if receiver.recv().await != Some("interactive") || receiver.recv().await != Some("batch") {
+            return Err("priority admission did not prefer interactive over batch".to_string());
+        }
+        batch
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        interactive
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+}
+
+fn assert_exact_removal_protection() -> Result<(), String> {
+    for (reason, protection) in [
+        (
+            "configured",
+            crate::CacheProtection {
+                configured: BTreeSet::from(["a".repeat(64)]),
+                ..crate::CacheProtection::default()
+            },
+        ),
+        (
+            "resident",
+            crate::CacheProtection {
+                resident: BTreeSet::from(["a".repeat(64)]),
+                ..crate::CacheProtection::default()
+            },
+        ),
+        (
+            "pinned",
+            crate::CacheProtection {
+                pinned: BTreeSet::from(["a".repeat(64)]),
+                ..crate::CacheProtection::default()
+            },
+        ),
+    ] {
+        let actual = crate::artifact::explicit_protection_reason(&protection, &"a".repeat(64));
+        if actual != Some(reason) {
+            return Err(format!("expected {reason} protection, got {actual:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn assert_stable_status_shape() -> Result<(), String> {
+    let status = crate::DeploymentRuntimeStatus {
+        deployment: "coder".to_string(),
+        generation: 7,
+        state: crate::DeploymentRuntimeState::Ready,
+        active_requests: 1,
+        queued_requests: 2,
+        engine: Some(crate::EngineKind::LlamaCpp),
+        driver_availability: Some(crate::EngineAvailability::Available),
+        artifact_digest: Some("a".repeat(64)),
+        selected_devices: vec![0],
+        memory: None,
+        port: Some(41000),
+        reason_code: None,
+        job_id: Some("01CAPABILITY".to_string()),
+        last_error: None,
+    };
+    let json = serde_json::to_value(status).map_err(|error| error.to_string())?;
+    if json["deployment"] != "coder" || json["state"] != "ready" || json["port"] != 41000 {
+        return Err(format!("unexpected lifecycle status shape: {json}"));
+    }
+    let reasons = [
+        crate::AdmissionReason::InsufficientCapacity,
+        crate::AdmissionReason::QueueFull,
+        crate::AdmissionReason::QueueTimeout,
+        crate::AdmissionReason::EngineUnhealthy,
+        crate::AdmissionReason::CrashLoop,
+        crate::AdmissionReason::Draining,
+    ];
+    if reasons.iter().any(|reason| reason.as_str().contains(' ')) {
+        return Err("admission reason codes must be bounded snake case".to_string());
+    }
+    Ok(())
 }
 
 /// One serializable product capability.
@@ -675,6 +953,18 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         consumer: Some(ConsumerContract::ServeModelsChangeDesiredDeployments),
     },
     CapabilityEntry {
+        id: "manifest.canonical_desired_state",
+        domain: CapabilityDomain::Manifest,
+        status: SupportLevel::Stable,
+        summary: "Canonical proxy.model_host deployments compile into one atomic runtime revision.",
+        evidence: &[
+            "contract.canonical_desired_state_reconciles_atomically",
+            "test.runtime_reconcile",
+            "test.model_host_reload",
+        ],
+        consumer: Some(ConsumerContract::CanonicalDesiredStateReconcilesAtomically),
+    },
+    CapabilityEntry {
         id: "manifest.legacy_catalog_resolution",
         domain: CapabilityDomain::Manifest,
         status: SupportLevel::Stable,
@@ -733,20 +1023,63 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         consumer: Some(ConsumerContract::CacheBudgetProtectsActiveArtifacts),
     },
     CapabilityEntry {
-        id: "engine.managed_launch",
+        id: "artifact.exact_removal",
+        domain: CapabilityDomain::Artifact,
+        status: SupportLevel::Stable,
+        summary: "Exact cache removal is idempotent and rejects configured, resident, pinned, locked, or active artifacts.",
+        evidence: &[
+            "contract.exact_removal_protects_references",
+            "test.artifact_manager",
+            "test.models_lifecycle_cli",
+        ],
+        consumer: Some(ConsumerContract::ExactRemovalProtectsReferences),
+    },
+    CapabilityEntry {
+        id: "engine.typed_managed_drivers",
+        domain: CapabilityDomain::Engine,
+        status: SupportLevel::Stable,
+        summary: "Managed engines share typed detect, provision, launch, health, and shutdown contracts over verified local artifacts.",
+        evidence: &[
+            "contract.managed_drivers_expose_typed_capabilities",
+            "test.engine_drivers",
+        ],
+        consumer: Some(ConsumerContract::ManagedDriversExposeTypedCapabilities),
+    },
+    CapabilityEntry {
+        id: "engine.llama_cpp_managed",
         domain: CapabilityDomain::Engine,
         status: SupportLevel::Preview,
-        summary: "Managed v2 launches consume only verified local artifacts; final platform validation remains.",
-        evidence: &[],
+        summary: "Managed llama.cpp supports pinned binary acquisition and Linux CUDA source builds; live Mac certification is pending the PR gate.",
+        evidence: &["test.engine_drivers", "test.cuda_build"],
         consumer: None,
     },
     CapabilityEntry {
-        id: "engine.container_launch",
+        id: "engine.vllm_uv",
         domain: CapabilityDomain::Engine,
-        status: SupportLevel::ConfigOnly,
-        summary: "Container launch configuration is not an executable stable path.",
-        evidence: &[],
+        status: SupportLevel::Preview,
+        summary: "Managed vLLM can use a pinned uv environment; live NVIDIA certification remains deferred.",
+        evidence: &["test.engine_drivers"],
         consumer: None,
+    },
+    CapabilityEntry {
+        id: "engine.vllm_container",
+        domain: CapabilityDomain::Engine,
+        status: SupportLevel::Preview,
+        summary: "Digest-pinned private container plans use read-only artifacts and selected devices; live NVIDIA certification remains deferred.",
+        evidence: &["test.engine_drivers"],
+        consumer: None,
+    },
+    CapabilityEntry {
+        id: "lifecycle.atomic_reconciliation",
+        domain: CapabilityDomain::Lifecycle,
+        status: SupportLevel::Stable,
+        summary: "Startup, file reload, SIGHUP, and admin reload prepare a complete revision before swapping the last good runtime.",
+        evidence: &[
+            "contract.canonical_desired_state_reconciles_atomically",
+            "test.runtime_reconcile",
+            "test.model_host_reload",
+        ],
+        consumer: Some(ConsumerContract::CanonicalDesiredStateReconcilesAtomically),
     },
     CapabilityEntry {
         id: "lifecycle.single_node_residency",
@@ -759,16 +1092,20 @@ const CAPABILITIES: &[CapabilityEntry] = &[
     CapabilityEntry {
         id: "lifecycle.keep_alive",
         domain: CapabilityDomain::Lifecycle,
-        status: SupportLevel::Preview,
-        summary: "Keep-alive is visible in status but idle unload is not complete.",
-        evidence: &[],
-        consumer: None,
+        status: SupportLevel::Stable,
+        summary: "Keep-alive starts after the last completed request and never expires active or queued work.",
+        evidence: &[
+            "contract.keep_alive_starts_after_last_permit",
+            "test.local_admission",
+            "test.runtime_reconcile",
+        ],
+        consumer: Some(ConsumerContract::KeepAliveStartsAfterLastPermit),
     },
     CapabilityEntry {
         id: "cluster.managed_replicas",
         domain: CapabilityDomain::Cluster,
         status: SupportLevel::Unsupported,
-        summary: "Managed multi-node placement and dispatch are not available in PR 1.",
+        summary: "Managed multi-node placement and dispatch are reserved for later PR groups.",
         evidence: &[],
         consumer: None,
     },
@@ -783,25 +1120,37 @@ const CAPABILITIES: &[CapabilityEntry] = &[
     CapabilityEntry {
         id: "admin.model_status",
         domain: CapabilityDomain::Admin,
-        status: SupportLevel::Preview,
-        summary: "Read-only local model status is available.",
-        evidence: &[],
-        consumer: None,
+        status: SupportLevel::Stable,
+        summary: "Authenticated admin status, load, stop, drain, and reset adapt the shared runtime lifecycle.",
+        evidence: &[
+            "contract.status_reports_stable_lifecycle",
+            "test.models_lifecycle_cli",
+            "test.admin_model_host",
+        ],
+        consumer: Some(ConsumerContract::StatusReportsStableLifecycle),
     },
     CapabilityEntry {
         id: "admin.model_management",
         domain: CapabilityDomain::Admin,
         status: SupportLevel::Unsupported,
-        summary: "Model mutation API and UI land in the operator-product PR.",
+        summary: "Persistent desired-state mutation and model-management UI land in the operator-product PR.",
         evidence: &[],
         consumer: None,
     },
     CapabilityEntry {
-        id: "platform.host_probe",
+        id: "platform.apple_metal",
         domain: CapabilityDomain::Platform,
         status: SupportLevel::Preview,
-        summary: "CPU, Apple, and NVIDIA probes require final platform certification.",
-        evidence: &[],
+        summary: "Apple Metal discovery and managed llama.cpp are implemented; the real completion gate runs before PR publication.",
+        evidence: &["test.catalog_v2", "test.engine_drivers"],
+        consumer: None,
+    },
+    CapabilityEntry {
+        id: "platform.nvidia_cuda",
+        domain: CapabilityDomain::Platform,
+        status: SupportLevel::Preview,
+        summary: "NVIDIA discovery, vLLM, and CUDA llama.cpp have deterministic coverage; live GCP certification is reserved for the final PR group.",
+        evidence: &["test.cuda_build", "test.local_admission"],
         consumer: None,
     },
     CapabilityEntry {
@@ -811,6 +1160,17 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         summary: "Configured local concurrency changes request admission.",
         evidence: &["contract.priority_gate_changes_dispatch"],
         consumer: Some(ConsumerContract::PriorityGateChangesDispatch),
+    },
+    CapabilityEntry {
+        id: "lifecycle.model_cli",
+        domain: CapabilityDomain::Lifecycle,
+        status: SupportLevel::Stable,
+        summary: "Pull, list, show, remove, process status, and stop commands use versioned JSON and shared artifact or runtime contracts.",
+        evidence: &[
+            "contract.exact_removal_protects_references",
+            "test.models_lifecycle_cli",
+        ],
+        consumer: Some(ConsumerContract::ExactRemovalProtectsReferences),
     },
 ];
 
@@ -848,7 +1208,7 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
     ConfigFieldCapability {
         path: "serve.engines",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
@@ -859,9 +1219,9 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
     },
     ConfigFieldCapability {
         path: "serve.queue_timeout_ms",
-        status: SupportLevel::Preview,
+        status: SupportLevel::Stable,
         capability_id: "lifecycle.priority_admission",
-        consumer: None,
+        consumer: Some(ConsumerContract::PriorityGateChangesDispatch),
     },
     ConfigFieldCapability {
         path: "serve.models[].model",
@@ -884,49 +1244,49 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
     ConfigFieldCapability {
         path: "serve.models[].engine",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.models[].keep_alive",
-        status: SupportLevel::Preview,
+        status: SupportLevel::Stable,
         capability_id: "lifecycle.keep_alive",
-        consumer: None,
+        consumer: Some(ConsumerContract::KeepAliveStartsAfterLastPermit),
     },
     ConfigFieldCapability {
         path: "serve.models[].max_context",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.models[].extra_args",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.models[].kv_quant",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.models[].speculative",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.models[].chunked_prefill",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.models[].lora_adapters",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
@@ -938,25 +1298,25 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
     ConfigFieldCapability {
         path: "serve.models[].tool_call_parser",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.models[].swap_space_gib",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.models[].cpu_offload_gib",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.models[].max_loras",
         status: SupportLevel::Preview,
-        capability_id: "engine.managed_launch",
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
     ConfigFieldCapability {

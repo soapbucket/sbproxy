@@ -1,6 +1,6 @@
 # AI gateway that hosts the model locally
 
-*Last modified: 2026-07-04*
+*Last modified: 2026-07-10*
 
 Most AI-gateway examples proxy to a model server you already run. This
 one turns the gateway into the host: a provider's `serve:` block names
@@ -11,13 +11,11 @@ fallback. It is the local-inference wedge from the model-host work
 
 ## Status
 
-This example exercises the model-host **config surface and catalog**:
-the `serve:` block, catalog-id resolution, the engine allowlist, and
-the eviction policy. The engine-spawn and GPU-fit **lifecycle** ships
-in later phases of the epic and needs a GPU to run. On a CPU-only or
-engine-less host the block parses and validates but starts no engine,
-so this config is for reading and validation, not an end-to-end local
-completion yet.
+This example preserves the provider-level `serve:` compatibility form. The
+runtime lowers it into the same process-wide deployment manager, but new files
+should start from [`examples/model-host-managed`](../model-host-managed). That
+example uses stable `proxy.model_host` desired state and a
+`provider_type: managed_model` reference.
 
 ## Run
 

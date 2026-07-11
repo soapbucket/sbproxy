@@ -7,11 +7,10 @@
 # GPU, spawns and supervises it, and registers it as a local provider
 # ahead of any cloud fallback.
 #
-# NOTE ON STATUS: this config exercises the model-host CONFIG surface
-# and catalog. The engine-spawn + GPU-fit lifecycle ships in later
-# phases of the epic and needs a GPU to run; on a CPU-only or
-# engine-less host the serve block parses and validates but starts no
-# engine. See docs/model-host.md.
+# NOTE ON STATUS: this is the legacy provider-level compatibility form.
+# New deployments should use examples/model-host-managed, where
+# proxy.model_host is authoritative and the provider references a
+# managed deployment. See docs/model-host.md for migration guidance.
 #
 # Run:
 #   make run CONFIG=examples/ai-local-serving/sb.yml

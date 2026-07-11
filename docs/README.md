@@ -50,11 +50,11 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [ai-gateway.md](ai-gateway.md) - providers, routing strategies, guardrails, budgets, streaming.
 - [quickstart-serve.md](quickstart-serve.md) - run your first model in 60 seconds: `curl | sh`, then `sbproxy run <model>`, on a Linux GPU, a Mac, or a CPU box.
 - [self-hosting.md](self-hosting.md) - single binary to self-host: install, the serve-only quickstart, the model manifest, aliases, spill-to-cloud, and the OpenRouter parity map.
-- [model-host.md](model-host.md) - the gateway hosts the LLM itself: catalog, the `serve:` block, the GPU fit planner, and the engine supervisor (single-node local serving).
+- [model-host.md](model-host.md) - canonical `proxy.model_host` deployments, verified artifacts, managed engines, admission, reload, and lifecycle CLI for one node.
 - [model-host-capabilities.md](model-host-capabilities.md) - generated stable, preview, config-only, and unsupported contracts for model-host features and configuration fields.
 - [gpu-fit-planning.md](gpu-fit-planning.md) - how the fit planner picks a quant for your GPU: capability tiers, the weights + KV math, throughput, and why it refuses an impossible config.
-- [model-host-certification.md](model-host-certification.md) - provisioning a cloud L4 GPU and running the model-host Definition-of-Done certification (the `gpu-nvidia` / `weights` features).
-- [security-model-host.md](security-model-host.md) - the config-spawn attack surface: engine allowlist (no cmd:), sha256 weights, PATH/pinned binaries, and what the spawn phase must enforce.
+- [model-host-certification.md](model-host-certification.md) - the hardware evidence ledger and the GCP NVIDIA procedure reserved for the final integration PR.
+- [security-model-host.md](security-model-host.md) - trusted config, verified artifacts, typed process launch, engine acquisition, containers, credentials, and remaining isolation work.
 - [ai-usage-ledger.md](ai-usage-ledger.md) - the verifiable usage ledger: hash-chained, Ed25519-signed spend receipts you can re-derive and verify.
 - [key-management.md](key-management.md) - dynamic virtual keys: mint, revoke, and rotate at runtime through the admin API, hashed at rest, with a fail-closed policy cache.
 - [ai-policy-cel.md](ai-policy-cel.md) - the unified CEL policy plane: one sandboxed expression over guardrails, budgets, routing, and principal that emits a closed action set.

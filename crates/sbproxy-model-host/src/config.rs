@@ -419,7 +419,6 @@ pub struct ServeEntry {
     /// at boot from the weight format and what is installed).
     #[serde(default)]
     pub engine: EngineChoice,
-    /// Support: preview.
     /// Idle time before the engine is unloaded to free VRAM. Go
     /// duration syntax (`10m`, `1h`); `None` means never auto-unload.
     #[serde(default)]
@@ -543,7 +542,6 @@ pub struct ModelHostConfig {
     /// the only limit, exactly as before.
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
-    /// Support: preview.
     /// How long a queued request waits for a served-lane slot before
     /// the attempt fails over to the next provider (or errors when no
     /// fallback exists). Milliseconds; defaults to 30000. Read only

@@ -47,6 +47,7 @@
         "l2_cache_settings": null,
         "messenger_settings": null,
         "metrics": null,
+        "model_host": null,
         "mtls": null,
         "observability": null,
         "scripting": {
@@ -339,6 +340,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/AdminConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_host": {
+          "description": "Canonical desired state and lifecycle policy for models hosted by SBproxy.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelHostControlConfig"
             },
             {
               "type": "null"
@@ -1355,6 +1368,447 @@
           "type": "string",
           "enum": [
             "admin"
+          ]
+        }
+      ]
+    },
+    "ModelHostControlConfig": {
+      "description": "Canonical model-host desired state under `proxy.model_host`.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "description": "System authoritative for desired-state mutations.",
+          "default": "file_managed",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelHostAuthority"
+            }
+          ]
+        },
+        "store_path": {
+          "description": "Revision store path required by admin-managed authority.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_parallel_prepares": {
+          "description": "Maximum artifact and engine preparations that may run concurrently.",
+          "default": 2,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "safety_margin": {
+          "description": "Fraction of each device's usable memory reserved as headroom.",
+          "default": 0.1,
+          "type": "number",
+          "format": "double"
+        },
+        "shutdown_deadline_ms": {
+          "description": "Maximum graceful drain time during shutdown.",
+          "default": 30000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache": {
+          "description": "Artifact cache and residency policy.",
+          "default": {
+            "budget_gib": null,
+            "directory": null,
+            "max_resident_models": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelHostCacheConfig"
+            }
+          ]
+        },
+        "engines": {
+          "description": "Per-engine provisioning policy.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/ManagedEngineConfig"
+          }
+        },
+        "deployments": {
+          "description": "Deployment ID to desired local model.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/ManagedDeploymentConfig"
+          }
+        }
+      }
+    },
+    "ModelHostAuthority": {
+      "description": "System that owns the model-host desired state.",
+      "oneOf": [
+        {
+          "description": "The active `sb.yml` file is authoritative.",
+          "type": "string",
+          "enum": [
+            "file_managed"
+          ]
+        },
+        {
+          "description": "The authenticated admin API and its revision store are authoritative.",
+          "type": "string",
+          "enum": [
+            "admin_managed"
+          ]
+        },
+        {
+          "description": "A configured cluster authority publishes the desired-state revision.",
+          "type": "string",
+          "enum": [
+            "cluster_authority"
+          ]
+        }
+      ]
+    },
+    "ModelHostCacheConfig": {
+      "description": "Content-addressed model cache policy.",
+      "type": "object",
+      "properties": {
+        "directory": {
+          "description": "Cache directory. Omission uses the platform default.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "budget_gib": {
+          "description": "Disk budget in GiB. Omission leaves capacity operator-managed.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "max_resident_models": {
+          "description": "Maximum simultaneously resident models.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ManagedEngineConfig": {
+      "description": "Provisioning policy for one managed inference engine.",
+      "type": "object",
+      "properties": {
+        "launch": {
+          "description": "Launch mechanism.",
+          "default": "binary",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ManagedEngineLaunch"
+            }
+          ]
+        },
+        "image": {
+          "description": "Immutable OCI image reference for container launch.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Explicit allowlisted engine binary path.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "Pinned engine or release version.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha256": {
+          "description": "Expected SHA-256 for a downloaded binary or source archive.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "acceleration": {
+          "description": "Requested acceleration backend.",
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ManagedEngineAcceleration"
+            }
+          ]
+        },
+        "shm_size_gib": {
+          "description": "Shared-memory size in GiB for container launch.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ManagedEngineLaunch": {
+      "description": "How a managed engine process is provisioned and launched.",
+      "oneOf": [
+        {
+          "description": "Resolve an installed binary or acquire a pinned binary release.",
+          "type": "string",
+          "enum": [
+            "binary"
+          ]
+        },
+        {
+          "description": "Run a digest-pinned OCI container.",
+          "type": "string",
+          "enum": [
+            "container"
+          ]
+        },
+        {
+          "description": "Run vLLM from a managed, version-pinned uv environment.",
+          "type": "string",
+          "enum": [
+            "uv"
+          ]
+        }
+      ]
+    },
+    "ManagedEngineAcceleration": {
+      "description": "Hardware acceleration requested for a managed engine.",
+      "oneOf": [
+        {
+          "description": "Select from the detected worker hardware.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "NVIDIA CUDA.",
+          "type": "string",
+          "enum": [
+            "cuda"
+          ]
+        },
+        {
+          "description": "Apple Metal.",
+          "type": "string",
+          "enum": [
+            "metal"
+          ]
+        },
+        {
+          "description": "Vulkan.",
+          "type": "string",
+          "enum": [
+            "vulkan"
+          ]
+        },
+        {
+          "description": "CPU-only execution.",
+          "type": "string",
+          "enum": [
+            "cpu"
+          ]
+        }
+      ]
+    },
+    "ManagedDeploymentConfig": {
+      "description": "One desired local model deployment.",
+      "type": "object",
+      "required": [
+        "model"
+      ],
+      "properties": {
+        "model": {
+          "description": "Logical ID from the certified model catalog.",
+          "type": "string"
+        },
+        "variant": {
+          "description": "Exact artifact variant pin. Omission enables worker-compatible selection.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "heterogeneous_variants": {
+          "description": "Allow replicas to choose different compatible artifact variants.",
+          "default": false,
+          "type": "boolean"
+        },
+        "replicas": {
+          "description": "Desired local replica count.",
+          "default": 1,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "required_labels": {
+          "description": "Worker labels required by this deployment.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "pull": {
+          "description": "Artifact download policy.",
+          "default": "on_demand",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ManagedPullPolicy"
+            }
+          ]
+        },
+        "warm": {
+          "description": "Prepare the deployment during startup or reload.",
+          "default": false,
+          "type": "boolean"
+        },
+        "keep_alive_secs": {
+          "description": "Idle lifetime in seconds after the last completed request.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_concurrency": {
+          "description": "Per-replica in-flight request cap.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_queue_depth": {
+          "description": "Maximum requests waiting behind active capacity.",
+          "default": 128,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "queue_timeout_ms": {
+          "description": "Maximum queue wait in milliseconds.",
+          "default": 30000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "engine": {
+          "description": "Inference engine selection.",
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ManagedEngineChoice"
+            }
+          ]
+        },
+        "rollout": {
+          "description": "Replica replacement behavior.",
+          "default": "rolling",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ManagedRolloutPolicy"
+            }
+          ]
+        }
+      }
+    },
+    "ManagedPullPolicy": {
+      "description": "Model artifact download policy.",
+      "oneOf": [
+        {
+          "description": "Pull and verify artifacts during startup reconciliation.",
+          "type": "string",
+          "enum": [
+            "on_boot"
+          ]
+        },
+        {
+          "description": "Pull and verify artifacts when the first request needs them.",
+          "type": "string",
+          "enum": [
+            "on_demand"
+          ]
+        },
+        {
+          "description": "Never pull automatically; require an explicit lifecycle command.",
+          "type": "string",
+          "enum": [
+            "manual"
+          ]
+        }
+      ]
+    },
+    "ManagedEngineChoice": {
+      "description": "Engine selection for one managed deployment.",
+      "oneOf": [
+        {
+          "description": "Select a compatible engine from the artifact format and worker.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "Use vLLM.",
+          "type": "string",
+          "enum": [
+            "vllm"
+          ]
+        },
+        {
+          "description": "Use llama.cpp.",
+          "type": "string",
+          "enum": [
+            "llama_cpp"
+          ]
+        }
+      ]
+    },
+    "ManagedRolloutPolicy": {
+      "description": "Replacement behavior when a deployment changes.",
+      "oneOf": [
+        {
+          "description": "Prepare the replacement before draining the prior generation.",
+          "type": "string",
+          "enum": [
+            "rolling"
+          ]
+        },
+        {
+          "description": "Drain the prior generation before preparing the replacement.",
+          "type": "string",
+          "enum": [
+            "recreate"
           ]
         }
       ]

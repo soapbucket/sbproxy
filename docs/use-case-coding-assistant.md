@@ -1,6 +1,6 @@
 # Point your coding assistant at your own GPU
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-10*
 
 ![The Anthropic wire answered by local Qwen3 weights behind the claude-sonnet-4-5 alias, the OpenAI wire answering the same, then the one-line base-URL change](assets/use-case-coding-assistant.gif)
 
@@ -8,7 +8,7 @@
 
 Your coding assistant streams your source code to somebody else's cloud, and the meter runs the whole session. Meanwhile the GPU in your workstation sits idle. SBproxy closes that gap with one Apache-2.0 binary that routes to 66 providers or serves the weights on your own hardware: "Call any model. Serve your own. Govern both." This page sets up the serving half and points Claude Code, Cline, and Continue at it.
 
-One honest note up front. The released binary ships GPU discovery and Hugging Face weight download, acquires a missing inference engine on first use (a pinned llama.cpp release binary, or vLLM run through `uv tool run`), and the real engine bring-up is certified on hardware: a GGUF model serves on Metal on an Apple Silicon Mac, and a safetensors model serves on an NVIDIA L4 through vLLM. Hosts still differ. `sbproxy doctor` reports what your box can do; trust its verdict over any doc, this one included. See [model-host.md](model-host.md) for the details.
+One status note up front. The managed runtime, verified artifact path, typed engines, admission, and reload transaction are implemented. Apple Metal runs the live gate before this local-runtime PR is published. NVIDIA vLLM and CUDA paths have deterministic coverage, but their live GCP certification is reserved for the final integration PR. `sbproxy doctor` reports what your current box can do; [model-host.md](model-host.md) keeps the exact boundary.
 
 ## What you will build
 
