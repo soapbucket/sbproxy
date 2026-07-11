@@ -633,6 +633,9 @@ impl AiHandlerConfig {
         // SSRF target (file://, link-local metadata, loopback, ...) fails
         // fast here rather than being dispatched at request time.
         for provider in &config.providers {
+            provider.validate_managed_model().map_err(|error| {
+                anyhow::anyhow!("ai provider {:?} managed model: {error}", provider.name)
+            })?;
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
@@ -710,6 +713,9 @@ impl AiHandlerConfig {
                 // box; its name is a free-form label and the gateway
                 // resolves the engine's loopback port itself, so the
                 // localhost-fallback warning below does not apply.
+                continue;
+            }
+            if provider.is_managed_model() {
                 continue;
             }
             // When `provider_type` is set it is the catalog key and `name`

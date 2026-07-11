@@ -13,6 +13,7 @@ pub mod compiler;
 pub mod duration;
 pub mod listing;
 pub mod litellm;
+pub mod model_host;
 pub mod plan;
 pub mod raw;
 pub mod snapshot;
@@ -28,6 +29,7 @@ pub use listing::{
     ListingSpec, LoadedListing, NoopRevisionResolver, Revision, RevisionMode, RevisionResolver,
     StaticRevisionResolver, LISTINGS_DIRNAME, LISTING_API_VERSION, LISTING_KIND,
 };
+pub use model_host::*;
 pub use plan::{
     compute_baseline_revision, plan, plan_with_options, render_text, BlastRadius, BlastRadiusRule,
     PlanEntry, PlanFile, PlanKind, PlanReport, PlanSummary, BLAST_RADIUS_MATRIX,

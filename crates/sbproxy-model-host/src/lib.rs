@@ -37,6 +37,7 @@ pub mod catalog;
 pub mod config;
 pub mod deployment;
 pub mod deployment_store;
+pub mod desired;
 #[cfg(feature = "embedded")]
 pub mod embedded;
 pub mod fit;
@@ -96,6 +97,11 @@ pub use deployment::{
     ModelDeployment, RolloutPolicy, DEPLOYMENT_SCHEMA_VERSION,
 };
 pub use deployment_store::{DeploymentStoreError, FileDeploymentRevisionStore};
+pub use desired::{
+    compile_desired_state, CompiledDeployment, DeploymentRoute, DesiredDeploymentOrigin,
+    DesiredStateError, LegacyHostPolicy, LegacyServeInput, ManagedProviderInput,
+    RuntimeDesiredInput, RuntimeDesiredState,
+};
 pub use fit::{
     estimate_throughput, fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
     ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,

@@ -925,6 +925,7 @@ mod tests {
         ProviderConfig {
             name: name.into(),
             provider_type: None,
+            deployment: None,
             api_key: None,
             base_url: None,
             models: Vec::new(),

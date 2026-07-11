@@ -150,6 +150,7 @@ mod tests {
         let mut p = ProviderConfig {
             name: "local".into(),
             provider_type: None,
+            deployment: None,
             api_key: None,
             base_url: None,
             models: Vec::new(),
