@@ -263,6 +263,8 @@ pub fn compile_desired_state(
         }
 
         for entry in &legacy.config.models {
+            validate_legacy_managed_compatibility(entry, None)
+                .map_err(DesiredStateError::Invalid)?;
             validate_legacy_catalog_entry(entry, catalog)?;
             let public_model = entry.effective_name().map_err(DesiredStateError::Invalid)?;
             let deployment_id = legacy_deployment_id(&legacy.provider, &public_model, entry)?;
@@ -425,6 +427,55 @@ fn validate_legacy_catalog_entry(
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_legacy_managed_compatibility(
+    entry: &ServeEntry,
+    resolved_engine: Option<EngineKind>,
+) -> Result<(), String> {
+    let mut unsupported = Vec::new();
+    if entry.speculative.is_some() {
+        unsupported.push("speculative");
+    }
+    if entry.chunked_prefill.is_some() {
+        unsupported.push("chunked_prefill");
+    }
+    if !entry.lora_adapters.is_empty() || entry.max_loras.is_some() {
+        unsupported.push("lora_adapters/max_loras");
+    }
+    if entry.tool_call_parser.is_some() {
+        unsupported.push("tool_call_parser");
+    }
+    if entry.swap_space_gib.is_some() {
+        unsupported.push("swap_space_gib");
+    }
+    if entry.cpu_offload_gib.is_some() {
+        unsupported.push("cpu_offload_gib");
+    }
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "legacy serve model {:?} uses fields not yet available through the verified managed driver: {}; remove them during migration instead of allowing the runtime to ignore them",
+            entry.model,
+            unsupported.join(", "),
+        ));
+    }
+
+    if entry.engine == EngineChoice::Auto && !entry.extra_args.is_empty() {
+        for engine in [EngineKind::LlamaCpp, EngineKind::Vllm] {
+            crate::validate_engine_args(engine, &entry.extra_args).map_err(|error| {
+                format!(
+                    "legacy serve model {:?} uses engine: auto with arguments that are not valid for every possible managed engine; pin engine explicitly: {error}",
+                    entry.model
+                )
+            })?;
+        }
+        return Ok(());
+    }
+
+    let engine = resolved_engine.unwrap_or_else(|| entry.engine.resolve(false, false));
+    crate::validate_engine_args(engine, &entry.extra_args)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployment {

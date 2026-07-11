@@ -193,6 +193,36 @@ fn desired_rejects_conflicting_legacy_host_policies() {
     ));
 }
 
+#[test]
+fn desired_rejects_legacy_fields_the_managed_driver_cannot_honor() {
+    let config: ModelHostConfig = serde_yaml::from_str(
+        r#"
+models:
+  - model: qwen3-14b
+    speculative: {}
+"#,
+    )
+    .unwrap();
+    let error = compile_desired_state(
+        input(
+            None,
+            Vec::new(),
+            vec![LegacyServeInput {
+                origin: "origin-a".to_string(),
+                provider: "local".to_string(),
+                config,
+            }],
+        ),
+        &Catalog::builtin(),
+    )
+    .expect_err("validate and boot must reject unsupported legacy fields equally");
+
+    assert!(matches!(
+        error,
+        DesiredStateError::Invalid(ref message) if message.contains("speculative")
+    ));
+}
+
 fn manager_desired(
     source_revision: &str,
     deployments: &[(&str, bool, u64)],
@@ -300,6 +330,9 @@ struct FixtureRuntimeFacts {
     block_start: AtomicBool,
     start_entered: tokio::sync::Notify,
     start_release: tokio::sync::Notify,
+    block_stop: AtomicBool,
+    stop_entered: tokio::sync::Notify,
+    stop_release: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -435,6 +468,10 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
             .lock()
             .unwrap()
             .push(format!("stop:{}:{}", self.id, self.generation));
+        if self.facts.block_stop.load(Ordering::SeqCst) {
+            self.facts.stop_entered.notify_one();
+            self.facts.stop_release.notified().await;
+        }
         if self.facts.fail_stop.lock().unwrap().contains(&self.id) {
             return Err(RuntimeManagerError::Engine(EngineDriverError::new(
                 EngineFailureReason::EngineInternal,
@@ -841,6 +878,125 @@ async fn explicit_stop_invalidates_a_cold_request_waiting_for_placement() {
         preparer.facts.starts.lock().unwrap().get("a").copied(),
         None,
         "a permit issued before stop must not restart the stopped engine"
+    );
+}
+
+#[tokio::test]
+async fn explicit_stop_invalidates_a_permit_issued_while_stopped() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    let mut desired = manager_desired("stopped-permit-race", &[("a", false, 30)], 1);
+    desired.control.shutdown_deadline_ms = 20;
+    manager.reconcile(desired).await.unwrap();
+    manager.stop("a").await.unwrap();
+
+    let permit = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .unwrap();
+    manager.stop("a").await.unwrap();
+    let result = manager
+        .ensure_ready_for_generation(
+            "a",
+            permit.generation(),
+            permit.start_epoch(),
+            sbproxy_model_host::PriorityClass::Standard,
+        )
+        .await;
+    drop(permit);
+
+    assert!(matches!(result, Err(RuntimeManagerError::Draining(_))));
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        None,
+        "a stop after stopped-slot admission must invalidate that permit"
+    );
+}
+
+#[tokio::test]
+async fn stop_releases_a_reservation_created_by_an_inflight_activation() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired(
+            "activation-reservation-stop",
+            &[("a", false, 30)],
+            1,
+        ))
+        .await
+        .unwrap();
+    preparer.facts.block_start.store(true, Ordering::SeqCst);
+
+    let request_manager = manager.clone();
+    let request = tokio::spawn(async move { request_manager.ensure_ready("a").await });
+    preparer.facts.start_entered.notified().await;
+    assert_eq!(manager.residency_reservations().await.len(), 1);
+
+    let stop_manager = manager.clone();
+    let stop = tokio::spawn(async move { stop_manager.stop("a").await });
+    tokio::task::yield_now().await;
+    preparer.facts.start_release.notify_one();
+
+    stop.await.unwrap().unwrap();
+    assert!(matches!(
+        request.await.unwrap(),
+        Err(RuntimeManagerError::Draining(_))
+    ));
+    assert!(manager.residency_reservations().await.is_empty());
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn explicit_stop_supersedes_recreate_rollback() {
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(rollout_desired(
+            "recreate-stop-old",
+            ManagedRolloutPolicy::Rolling,
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        Some(1)
+    );
+    preparer
+        .facts
+        .fail_start_once
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+    preparer.facts.block_stop.store(true, Ordering::SeqCst);
+
+    let reconcile_manager = manager.clone();
+    let replacement = rollout_desired("recreate-stop-new", ManagedRolloutPolicy::Recreate, 2);
+    let reconcile = tokio::spawn(async move { reconcile_manager.reconcile(replacement).await });
+    preparer.facts.stop_entered.notified().await;
+
+    let stop_manager = manager.clone();
+    let stop = tokio::spawn(async move { stop_manager.stop("a").await });
+    preparer.facts.stop_entered.notified().await;
+    preparer.facts.block_stop.store(false, Ordering::SeqCst);
+    preparer.facts.stop_release.notify_waiters();
+
+    stop.await.unwrap().unwrap();
+    assert!(matches!(
+        reconcile.await.unwrap(),
+        Err(RuntimeManagerError::Draining(_))
+    ));
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Stopped
+    );
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        Some(1),
+        "a superseded recreate must neither launch nor roll back over explicit stop"
     );
 }
 

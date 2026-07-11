@@ -4793,6 +4793,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_unsupported_legacy_managed_fields() {
+        let path = temp_config(
+            "origins:\n  ai.local:\n    action:\n      type: ai_proxy\n      providers:\n        - name: local\n          serve:\n            models:\n              - model: qwen3-14b\n                speculative: {}\n",
+        );
+        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn validate_missing_path_is_a_usage_error() {
         let args = ValidateArgs {
             config_path: None,
