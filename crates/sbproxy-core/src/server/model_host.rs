@@ -164,6 +164,18 @@ impl sbproxy_model_host::DeploymentPreparer for EmptyDeploymentPreparer {
 
 static MODEL_RUNTIME: OnceLock<Arc<ProductionModelRuntime>> = OnceLock::new();
 
+fn empty_runtime_manager(
+    catalog_revision: String,
+) -> Result<Arc<sbproxy_model_host::ModelRuntimeManager>, sbproxy_model_host::RuntimeManagerError> {
+    Ok(Arc::new(
+        sbproxy_model_host::ModelRuntimeManager::new(
+            catalog_revision,
+            Arc::new(EmptyDeploymentPreparer),
+        )?
+        .with_observer(Arc::new(MetricsObserver)),
+    ))
+}
+
 fn load_catalog_from_dir(
     config: &ModelHostConfig,
     config_dir: &Path,
@@ -330,13 +342,9 @@ fn build_model_maintenance_runtime() -> std::io::Result<tokio::runtime::Runtime>
 impl ProductionModelRuntime {
     fn empty() -> Result<Self, sbproxy_model_host::RuntimeManagerError> {
         let catalog = Catalog::builtin();
-        let manager = sbproxy_model_host::ModelRuntimeManager::new(
-            catalog.catalog_revision,
-            Arc::new(EmptyDeploymentPreparer),
-        )?
-        .with_observer(Arc::new(MetricsObserver));
+        let manager = empty_runtime_manager(catalog.catalog_revision)?;
         Ok(Self {
-            active: ArcSwap::from_pointee(manager),
+            active: ArcSwap::from(manager),
             foundation: RwLock::new(None),
             snapshot_preparer: RwLock::new(None),
             cluster_state: RwLock::new(None),
@@ -923,7 +931,17 @@ impl ProductionModelRuntime {
                     .is_some_and(|state| !state.placement.global().deployments.is_empty()))
             || candidate.desired.control.authority
                 != sbproxy_config::ModelHostAuthority::FileManaged;
-        let (manager, foundation, snapshot_preparer) = if !needs_production_manager {
+        let active_catalog_matches = active_manager.current_desired().revision.catalog_revision
+            == candidate.desired.revision.catalog_revision;
+        let (manager, foundation, snapshot_preparer) = if !needs_production_manager
+            && !active_catalog_matches
+        {
+            (
+                empty_runtime_manager(candidate.desired.revision.catalog_revision.clone())?,
+                None,
+                None,
+            )
+        } else if !needs_production_manager {
             (
                 active_manager.clone(),
                 current_foundation,
@@ -1809,6 +1827,39 @@ mod tests {
             lane_class_for(Some(sbproxy_ai::identity::KeyPriority::Batch)),
             PriorityClass::Batch
         );
+    }
+
+    #[tokio::test]
+    async fn control_only_empty_manager_accepts_the_global_custom_catalog() {
+        let mut catalog = Catalog::builtin();
+        catalog.catalog_revision = "control-only-catalog-v2".to_string();
+        let desired = sbproxy_model_host::compile_desired_state(
+            sbproxy_model_host::RuntimeDesiredInput {
+                source_revision: "control-only-config".to_string(),
+                canonical: None,
+                managed_providers: Vec::new(),
+                legacy_providers: Vec::new(),
+            },
+            &catalog,
+        )
+        .expect("empty control-only projection");
+        let manager = empty_runtime_manager(catalog.catalog_revision.clone())
+            .expect("catalog-aligned empty manager");
+
+        let prepared = manager
+            .prepare_revision(desired)
+            .await
+            .expect("custom catalog projection prepares");
+        manager
+            .commit_revision(prepared)
+            .await
+            .expect("custom catalog projection commits");
+
+        assert_eq!(
+            manager.current_desired().revision.catalog_revision,
+            "control-only-catalog-v2"
+        );
+        assert!(manager.current_desired().deployments.is_empty());
     }
 
     #[tokio::test]

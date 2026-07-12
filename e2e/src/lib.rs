@@ -196,6 +196,9 @@ pub struct ProxyHarness {
     /// proxy child is reaped, so listings and other workspace files
     /// stay readable for the full life of the proxy.
     _workspace: Option<tempfile::TempDir>,
+    /// Captured child stderr, retained for startup-failure diagnostics while
+    /// successful harnesses remain quiet.
+    _stderr: NamedTempFile,
     /// Lazy-initialised so harness construction does not invoke
     /// `reqwest::blocking::Client::builder().build()` at the call site.
     /// Building the blocking client spins up an internal tokio
@@ -269,11 +272,12 @@ impl ProxyHarness {
         file.write_all(yaml.as_bytes())?;
         file.flush()?;
 
+        let stderr = NamedTempFile::new()?;
         let child = Command::new(&bin)
             .arg("--config")
             .arg(file.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr.reopen()?))
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {}: {}", bin.display(), e))?;
 
@@ -282,9 +286,10 @@ impl ProxyHarness {
             port,
             _config: Some(file),
             _workspace: None,
+            _stderr: stderr,
             client: std::sync::OnceLock::new(),
         };
-        harness.wait_for_ready(startup_timeout())?;
+        harness.wait_for_ready_with_diagnostics(startup_timeout())?;
         Ok(harness)
     }
 
@@ -321,11 +326,12 @@ impl ProxyHarness {
         let cfg_path = tmp.path().join("sb.yml");
         std::fs::write(&cfg_path, final_yaml.as_bytes())?;
 
+        let stderr = NamedTempFile::new()?;
         let child = Command::new(&bin)
             .arg("--config")
             .arg(&cfg_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr.reopen()?))
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {}: {}", bin.display(), e))?;
 
@@ -334,10 +340,19 @@ impl ProxyHarness {
             port,
             _config: None,
             _workspace: Some(tmp),
+            _stderr: stderr,
             client: std::sync::OnceLock::new(),
         };
-        harness.wait_for_ready(startup_timeout())?;
+        harness.wait_for_ready_with_diagnostics(startup_timeout())?;
         Ok(harness)
+    }
+
+    fn wait_for_ready_with_diagnostics(&self, timeout: Duration) -> anyhow::Result<()> {
+        self.wait_for_ready(timeout).map_err(|error| {
+            let stderr = std::fs::read_to_string(self._stderr.path())
+                .unwrap_or_else(|read_error| format!("<read child stderr: {read_error}>"));
+            anyhow::anyhow!("{error:#}\nchild stderr:\n{stderr}")
+        })
     }
 
     /// Build (or return) the lazy-initialised blocking HTTP client.
