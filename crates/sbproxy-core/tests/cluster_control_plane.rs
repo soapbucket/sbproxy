@@ -485,3 +485,132 @@ cluster:
     assert!(error.to_string().contains("certificate"), "{error:#}");
     assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn deployment_authority_signs_content_addressed_state_and_workers_are_read_only() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority_dir = temp.path().join("authority");
+    EnrollmentAuthority::initialize(
+        &authority_dir,
+        sbproxy_mesh::enrollment::AuthorityInit {
+            cluster_id: "cluster-a".to_string(),
+            node_id: "authority-a".to_string(),
+            roles: BTreeSet::from([ClusterNodeRole::Authority, ClusterNodeRole::Worker]),
+            labels: BTreeMap::new(),
+            server_name: "sbproxy-mesh".to_string(),
+        },
+    )
+    .expect("authority keys");
+    let signing_key = authority_dir.join("authority-signing.key");
+    let verifying_key = authority_dir.join("authority-verifying.key");
+    let server = parse(&format!(
+        r#"
+cluster:
+  cluster_id: cluster-a
+  node_id: authority-a
+  roles: [authority, worker]
+  state_dir: {}
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+  deployment_authority:
+    signing_key_file: {}
+    verifying_key_file: {}
+"#,
+        temp.path().join("authority-state").display(),
+        signing_key.display(),
+        verifying_key.display(),
+    ));
+    let owner = ClusterOwner::new(Arc::new(FakeBootstrap::default()));
+    owner.reconcile(&server).expect("authority cluster");
+    let authority = owner.deployment_authority().expect("deployment authority");
+    assert!(authority.can_publish());
+    let bundle = sbproxy_model_host::RestrictedDeploymentBundle::new(
+        "builtin-2026-07-10",
+        7,
+        BTreeMap::from([(
+            "coder".to_string(),
+            serde_yaml::from_str("model: qwen2.5-0.5b-instruct\nvariant: q4_k_m\nreplicas: 1\n")
+                .expect("deployment"),
+        )]),
+    )
+    .expect("bundle");
+    let signed = authority
+        .publish(bundle)
+        .await
+        .expect("publish signed bundle");
+    assert_eq!(signed.bundle.revision, 7);
+    let verified = authority
+        .read_candidate()
+        .await
+        .expect("read candidate")
+        .expect("new candidate");
+    assert_eq!(
+        verified.bundle().content_digest,
+        signed.bundle.content_digest
+    );
+    authority.commit(verified).expect("commit authority cursor");
+    assert!(authority
+        .read_candidate()
+        .await
+        .expect("idempotent current read")
+        .is_none());
+    let restarted_owner = ClusterOwner::new(Arc::new(FakeBootstrap::default()));
+    restarted_owner
+        .reconcile(&server)
+        .expect("restart loads durable cursor");
+    let rollback = restarted_owner
+        .deployment_authority()
+        .unwrap()
+        .publish(
+            sbproxy_model_host::RestrictedDeploymentBundle::new(
+                "builtin-2026-07-10",
+                6,
+                BTreeMap::new(),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect_err("durable cursor rejects rollback after restart");
+    assert!(rollback.to_string().contains("stale"), "{rollback}");
+
+    let worker = parse(&format!(
+        r#"
+cluster:
+  cluster_id: cluster-a
+  node_id: worker-a
+  roles: [worker]
+  state_dir: {}
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+  deployment_authority:
+    verifying_key_file: {}
+"#,
+        temp.path().join("worker-state").display(),
+        verifying_key.display(),
+    ));
+    let worker_owner = ClusterOwner::new(Arc::new(FakeBootstrap::default()));
+    worker_owner.reconcile(&worker).expect("worker cluster");
+    let worker_authority = worker_owner
+        .deployment_authority()
+        .expect("worker verifier");
+    assert!(!worker_authority.can_publish());
+    let error = worker_authority
+        .publish(
+            sbproxy_model_host::RestrictedDeploymentBundle::new(
+                "builtin-2026-07-10",
+                8,
+                BTreeMap::new(),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect_err("worker cannot publish");
+    assert!(matches!(
+        error,
+        sbproxy_core::cluster::ClusterDeploymentAuthorityError::ReadOnly
+    ));
+}

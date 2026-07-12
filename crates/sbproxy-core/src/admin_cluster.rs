@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const ENROLL_PATH: &str = "/admin/cluster/enroll";
 /// Authenticated cluster and node health endpoint.
 pub const STATUS_PATH: &str = "/admin/cluster/status";
+/// Authenticated signed cluster deployment read and publication endpoint.
+pub const DEPLOYMENTS_PATH: &str = "/admin/cluster/deployments";
 const METRICS_PATH: &str = "/admin/cluster/metrics";
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,9 +28,20 @@ struct ClusterStatusResponse {
     directory_collected_at_unix_ms: Option<u64>,
     directory_age_ms: Option<u64>,
     summary: ClusterStatusSummary,
+    deployment_authority: ClusterDeploymentAuthorityStatus,
     deployments: Vec<ClusterDeploymentStatus>,
     nodes: Vec<ClusterStatusNode>,
     unhealthy_nodes: Vec<ClusterNodeAlert>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ClusterDeploymentAuthorityStatus {
+    configured: bool,
+    read_only: bool,
+    verifying_key_id: Option<String>,
+    active_revision: Option<u64>,
+    active_content_digest: Option<String>,
+    signer_node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -116,9 +129,124 @@ pub fn dispatch(
     let path = path.split('?').next().unwrap_or(path);
     match path {
         STATUS_PATH => Some(dispatch_status(method)),
+        DEPLOYMENTS_PATH => Some(dispatch_deployments(method, body)),
         METRICS_PATH => Some(dispatch_metrics(method)),
         ENROLL_PATH => Some(dispatch_enrollment(method, body)),
         _ => None,
+    }
+}
+
+fn dispatch_deployments(method: &str, body: Option<&str>) -> (u16, &'static str, String) {
+    let authority = crate::cluster::current_deployment_authority();
+    dispatch_deployments_with(method, body, authority.as_ref())
+}
+
+fn dispatch_deployments_with(
+    method: &str,
+    body: Option<&str>,
+    authority: Option<&crate::cluster::ClusterDeploymentAuthority>,
+) -> (u16, &'static str, String) {
+    if method.eq_ignore_ascii_case("GET") {
+        let Some(active) = authority.and_then(|authority| authority.active()) else {
+            return json(
+                404,
+                serde_json::json!({"error": "no active cluster deployment bundle", "code": "deployment_bundle_missing"}),
+            );
+        };
+        let bundle = match active.bundle().to_json().and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|source| {
+                sbproxy_model_host::DeploymentAuthorityError::Json {
+                    operation: "render admin response",
+                    source,
+                }
+            })
+        }) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                tracing::error!(%error, "render active cluster deployment bundle");
+                return json(
+                    500,
+                    serde_json::json!({"error": "cluster deployment read failed", "code": "internal"}),
+                );
+            }
+        };
+        return json(
+            200,
+            serde_json::json!({
+                "schema_version": 1,
+                "bundle": bundle,
+                "signer_node_id": active.signer_node_id(),
+                "signer_key_id": active.signer_key_id(),
+                "read_only": authority.is_none_or(|authority| !authority.can_publish()),
+            }),
+        );
+    }
+    if !method.eq_ignore_ascii_case("POST") {
+        return json(405, serde_json::json!({"error": "method not allowed"}));
+    }
+    let Some(authority) = authority.filter(|authority| authority.can_publish()) else {
+        return json(
+            403,
+            serde_json::json!({"error": "cluster deployment authority is read-only on this node", "code": "deployment_authority_read_only"}),
+        );
+    };
+    let Some(body) = body.filter(|body| !body.is_empty()) else {
+        return json(
+            400,
+            serde_json::json!({"error": "deployment bundle body is required", "code": "invalid_bundle"}),
+        );
+    };
+    let bundle =
+        match sbproxy_model_host::RestrictedDeploymentBundleDraft::from_json(body.as_bytes())
+            .and_then(sbproxy_model_host::RestrictedDeploymentBundleDraft::into_bundle)
+        {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                return json(
+                    400,
+                    serde_json::json!({"error": error.to_string(), "code": "invalid_bundle"}),
+                )
+            }
+        };
+    if let Some(active) = authority.active() {
+        if bundle.revision < active.bundle().revision {
+            return json(
+                409,
+                serde_json::json!({"error": "deployment revision is stale", "code": "stale_revision"}),
+            );
+        }
+        if bundle.revision == active.bundle().revision
+            && bundle.content_digest != active.bundle().content_digest
+        {
+            return json(
+                409,
+                serde_json::json!({"error": "deployment revision conflicts with active content", "code": "revision_conflict"}),
+            );
+        }
+    }
+    match authority.publish_blocking(bundle) {
+        Ok(signed) => json(
+            202,
+            serde_json::json!({
+                "schema_version": 1,
+                "revision": signed.bundle.revision,
+                "content_digest": signed.bundle.content_digest,
+                "signer_node_id": signed.signer_node_id,
+                "signer_key_id": signed.signer_key_id,
+                "status": "published",
+            }),
+        ),
+        Err(crate::cluster::ClusterDeploymentAuthorityError::ReadOnly) => json(
+            403,
+            serde_json::json!({"error": "cluster deployment authority is read-only on this node", "code": "deployment_authority_read_only"}),
+        ),
+        Err(error) => {
+            tracing::error!(%error, "publish signed cluster deployment bundle");
+            json(
+                500,
+                serde_json::json!({"error": "cluster deployment publication failed", "code": "internal"}),
+            )
+        }
     }
 }
 
@@ -141,12 +269,14 @@ fn dispatch_status(method: &str) -> (u16, &'static str, String) {
         });
     let view = crate::cluster::current_model_directory().map(|directory| directory.load());
     let placement = crate::server::model_host::model_runtime_manager().cluster_placement_state();
+    let authority = crate::cluster::current_deployment_authority();
     dispatch_status_with_placement(
         method,
         handle,
         settings,
         view,
         placement.as_ref(),
+        authority.as_ref(),
         unix_time_ms(),
     )
 }
@@ -159,7 +289,7 @@ fn dispatch_status_with(
     view: Option<Arc<sbproxy_ai::model_directory::ModelDirectoryView>>,
     now: u64,
 ) -> (u16, &'static str, String) {
-    dispatch_status_with_placement(method, handle, settings, view, None, now)
+    dispatch_status_with_placement(method, handle, settings, view, None, None, now)
 }
 
 fn dispatch_status_with_placement(
@@ -168,12 +298,20 @@ fn dispatch_status_with_placement(
     settings: crate::cluster::ClusterSettings,
     view: Option<Arc<sbproxy_ai::model_directory::ModelDirectoryView>>,
     placement: Option<&sbproxy_model_host::ClusterPlacementState>,
+    authority: Option<&crate::cluster::ClusterDeploymentAuthority>,
     now: u64,
 ) -> (u16, &'static str, String) {
     if !method.eq_ignore_ascii_case("GET") {
         return json(405, serde_json::json!({"error": "method not allowed"}));
     }
-    let response = cluster_status_response(&handle, settings, view.as_deref(), placement, now);
+    let response = cluster_status_response(
+        &handle,
+        settings,
+        view.as_deref(),
+        placement,
+        authority,
+        now,
+    );
     match serde_json::to_string(&response) {
         Ok(body) => (200, "application/json", body),
         Err(error) => {
@@ -188,6 +326,7 @@ fn cluster_status_response(
     settings: crate::cluster::ClusterSettings,
     view: Option<&sbproxy_ai::model_directory::ModelDirectoryView>,
     placement: Option<&sbproxy_model_host::ClusterPlacementState>,
+    authority: Option<&crate::cluster::ClusterDeploymentAuthority>,
     now: u64,
 ) -> ClusterStatusResponse {
     let configured = settings.distributed_requested;
@@ -276,6 +415,22 @@ fn cluster_status_response(
             model_endpoint: node.model_endpoint.clone(),
         })
         .collect();
+    let deployment_authority =
+        authority.map_or_else(ClusterDeploymentAuthorityStatus::default, |authority| {
+            let active = authority.active();
+            ClusterDeploymentAuthorityStatus {
+                configured: true,
+                read_only: !authority.can_publish(),
+                verifying_key_id: Some(authority.verifying_key_id().to_string()),
+                active_revision: active.as_ref().map(|active| active.bundle().revision),
+                active_content_digest: active
+                    .as_ref()
+                    .map(|active| active.bundle().content_digest.clone()),
+                signer_node_id: active
+                    .as_ref()
+                    .map(|active| active.signer_node_id().to_string()),
+            }
+        });
     ClusterStatusResponse {
         schema_version: 1,
         configured,
@@ -286,6 +441,7 @@ fn cluster_status_response(
         directory_collected_at_unix_ms,
         directory_age_ms,
         summary,
+        deployment_authority,
         deployments,
         nodes,
         unhealthy_nodes,
@@ -727,8 +883,15 @@ deployments:
             model_control_enabled: true,
         };
 
-        let (status, _, body) =
-            dispatch_status_with_placement("GET", handle, settings, None, Some(&placement), 1_200);
+        let (status, _, body) = dispatch_status_with_placement(
+            "GET",
+            handle,
+            settings,
+            None,
+            Some(&placement),
+            None,
+            1_200,
+        );
 
         assert_eq!(status, 200);
         let body: serde_json::Value = serde_json::from_str(&body).expect("status JSON");
@@ -752,6 +915,17 @@ deployments:
                 .0,
             400
         );
+    }
+
+    #[test]
+    fn deployment_writes_are_explicitly_read_only_without_authority_material() {
+        let (status, _, body) = dispatch_deployments_with("POST", Some("{}"), None);
+        assert_eq!(status, 403);
+        let body: serde_json::Value = serde_json::from_str(&body).expect("error JSON");
+        assert_eq!(body["code"], "deployment_authority_read_only");
+        assert_eq!(dispatch_deployments_with("GET", None, None).0, 404);
+        assert_eq!(dispatch_deployments_with("DELETE", None, None).0, 405);
+        assert!(!is_public_enrollment_path(DEPLOYMENTS_PATH));
     }
 
     #[test]

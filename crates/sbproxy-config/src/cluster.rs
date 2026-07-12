@@ -264,7 +264,16 @@ impl ClusterConfig {
             }
         }
         if let Some(authority) = &self.deployment_authority {
+            if self.state_dir.is_none() {
+                return Err(ClusterConfigError::invalid(
+                    "deployment_authority requires state_dir for monotonic cursor storage",
+                ));
+            }
             validate_nonempty(
+                "deployment_authority.verifying_key_file",
+                &authority.verifying_key_file,
+            )?;
+            validate_bounded_path(
                 "deployment_authority.verifying_key_file",
                 &authority.verifying_key_file,
             )?;
@@ -275,10 +284,20 @@ impl ClusterConfig {
                     ));
                 }
                 validate_nonempty("deployment_authority.signing_key_file", signing_key)?;
+                validate_bounded_path("deployment_authority.signing_key_file", signing_key)?;
             }
         }
         Ok(())
     }
+}
+
+fn validate_bounded_path(field: &str, value: &str) -> Result<(), ClusterConfigError> {
+    if value.len() > 4_096 || value.chars().any(char::is_control) {
+        return Err(ClusterConfigError::invalid(format!(
+            "{field} must be a bounded path without control characters"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_identity(field: &str, value: &str) -> Result<(), ClusterConfigError> {

@@ -20,6 +20,10 @@ const LOCAL_CLUSTER_ID: &str = "local";
 const DEFAULT_SNAPSHOT_TTL_SECS: u64 = 30;
 const DEFAULT_PUBLISH_INTERVAL_SECS: u64 = 5;
 const DIRECTORY_COLLECT_INTERVAL_MS: u64 = 1_000;
+const DEPLOYMENT_BUNDLE_NAMESPACE: &str = "model-deployments";
+const DEPLOYMENT_BUNDLE_CURRENT_KEY: &str = "current";
+const DEPLOYMENT_BUNDLE_SCHEMA_VERSION: u32 = 1;
+const DEPLOYMENT_BUNDLE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Injectable boundary used to construct the one distributed handle.
 pub trait ClusterBootstrap: Send + Sync {
@@ -125,6 +129,307 @@ struct InstalledCluster {
     restart_fingerprint: Option<ClusterRestartFingerprint>,
     settings: Arc<ReloadableClusterSettings>,
     snapshot_publication: Arc<SnapshotPublicationState>,
+    deployment_authority: Option<ClusterDeploymentAuthority>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeploymentBundlePointer {
+    revision: u64,
+    content_digest: String,
+    signer_node_id: String,
+    signer_key_id: String,
+}
+
+struct DeploymentAuthorityState {
+    verifying_key: sbproxy_model_host::DeploymentVerifyingKey,
+    signing_key: Option<sbproxy_model_host::DeploymentSigningKey>,
+    cursor_store: Option<sbproxy_model_host::FileDeploymentBundleCursorStore>,
+    cursor: Mutex<Option<sbproxy_model_host::DeploymentBundleCursor>>,
+    active: Mutex<Option<sbproxy_model_host::VerifiedDeploymentBundle>>,
+    last_publication_unix_ms: AtomicU64,
+}
+
+/// Installed signed deployment-authority adapter over the shared cluster state.
+#[derive(Clone)]
+pub struct ClusterDeploymentAuthority {
+    handle: ClusterHandle,
+    state: Arc<DeploymentAuthorityState>,
+}
+
+impl std::fmt::Debug for ClusterDeploymentAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClusterDeploymentAuthority")
+            .field("node_id", &self.handle.identity().node_id)
+            .field("key_id", &self.state.verifying_key.key_id())
+            .field("can_publish", &self.can_publish())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Signed deployment publication or read failure.
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterDeploymentAuthorityError {
+    /// This node has no configured authority role and private signing key.
+    #[error("cluster deployment authority is read-only on this node")]
+    ReadOnly,
+    /// Bundle construction, signing, or verification failed.
+    #[error(transparent)]
+    Bundle(#[from] sbproxy_model_host::DeploymentAuthorityError),
+    /// Typed cluster-state publication or lookup failed.
+    #[error("cluster deployment authority state failed: {0}")]
+    State(String),
+    /// Pointer publisher or content did not match the signed authority.
+    #[error("cluster deployment authority identity failed: {0}")]
+    Identity(String),
+}
+
+impl ClusterDeploymentAuthority {
+    /// Whether this installed node can sign and publish persistent desired state.
+    pub fn can_publish(&self) -> bool {
+        self.handle
+            .identity()
+            .roles
+            .contains(&ClusterNodeRole::Authority)
+            && self.state.signing_key.is_some()
+    }
+
+    /// Configured verification-key ID shared by every node.
+    pub fn verifying_key_id(&self) -> &str {
+        self.state.verifying_key.key_id()
+    }
+
+    /// Last bundle committed by the local runtime.
+    pub fn active(&self) -> Option<sbproxy_model_host::VerifiedDeploymentBundle> {
+        self.state
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Sign and publish content first, followed by its current pointer.
+    pub async fn publish(
+        &self,
+        bundle: sbproxy_model_host::RestrictedDeploymentBundle,
+    ) -> Result<sbproxy_model_host::SignedDeploymentBundle, ClusterDeploymentAuthorityError> {
+        let signing_key = self
+            .state
+            .signing_key
+            .as_ref()
+            .ok_or(ClusterDeploymentAuthorityError::ReadOnly)?;
+        if !self
+            .handle
+            .identity()
+            .roles
+            .contains(&ClusterNodeRole::Authority)
+        {
+            return Err(ClusterDeploymentAuthorityError::ReadOnly);
+        }
+        let signed = sbproxy_model_host::SignedDeploymentBundle::sign(
+            bundle,
+            &self.handle.identity().node_id,
+            signing_key,
+        )?;
+        let current = self
+            .state
+            .cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        signed.verify(&self.state.verifying_key, current.as_ref())?;
+        let pointer = DeploymentBundlePointer {
+            revision: signed.bundle.revision,
+            content_digest: signed.bundle.content_digest.clone(),
+            signer_node_id: signed.signer_node_id.clone(),
+            signer_key_id: signed.signer_key_id.clone(),
+        };
+        self.handle
+            .publish_state(
+                DEPLOYMENT_BUNDLE_NAMESPACE,
+                &signed.bundle.content_key(),
+                DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
+                signed.bundle.revision,
+                DEPLOYMENT_BUNDLE_TTL,
+                &signed,
+            )
+            .await
+            .map_err(|error| ClusterDeploymentAuthorityError::State(error.to_string()))?;
+        self.handle
+            .publish_state(
+                DEPLOYMENT_BUNDLE_NAMESPACE,
+                DEPLOYMENT_BUNDLE_CURRENT_KEY,
+                DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
+                signed.bundle.revision,
+                DEPLOYMENT_BUNDLE_TTL,
+                &pointer,
+            )
+            .await
+            .map_err(|error| ClusterDeploymentAuthorityError::State(error.to_string()))?;
+        self.state
+            .last_publication_unix_ms
+            .store(unix_time_ms().unwrap_or(0), Ordering::SeqCst);
+        Ok(signed)
+    }
+
+    /// Refresh the active pointer and content before their bounded TTL expires.
+    pub async fn republish_active_if_due(
+        &self,
+        interval: Duration,
+    ) -> Result<bool, ClusterDeploymentAuthorityError> {
+        if !self.can_publish() || interval.is_zero() {
+            return Ok(false);
+        }
+        let Some(active) = self.active() else {
+            return Ok(false);
+        };
+        let now = unix_time_ms()
+            .map_err(|error| ClusterDeploymentAuthorityError::State(error.to_string()))?;
+        let interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+        let last = self.state.last_publication_unix_ms.load(Ordering::SeqCst);
+        if last != 0 && now.saturating_sub(last) < interval_ms {
+            return Ok(false);
+        }
+        self.publish(active.bundle().clone()).await?;
+        Ok(true)
+    }
+
+    /// Synchronous adapter for the hand-written admin listener.
+    pub fn publish_blocking(
+        &self,
+        bundle: sbproxy_model_host::RestrictedDeploymentBundle,
+    ) -> Result<sbproxy_model_host::SignedDeploymentBundle, ClusterDeploymentAuthorityError> {
+        let authority = self.clone();
+        block_on_cluster(async move { authority.publish(bundle).await })
+    }
+
+    /// Fetch and verify a newer current bundle without advancing local state.
+    pub async fn read_candidate(
+        &self,
+    ) -> Result<Option<sbproxy_model_host::VerifiedDeploymentBundle>, ClusterDeploymentAuthorityError>
+    {
+        let pointer_record = match self
+            .handle
+            .read_state::<DeploymentBundlePointer>(
+                DEPLOYMENT_BUNDLE_NAMESPACE,
+                DEPLOYMENT_BUNDLE_CURRENT_KEY,
+                DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
+            )
+            .await
+        {
+            sbproxy_mesh::ClusterStateRead::Present(record) => record,
+            sbproxy_mesh::ClusterStateRead::Missing => return Ok(None),
+            other => {
+                return Err(ClusterDeploymentAuthorityError::State(format!(
+                    "current pointer is unavailable: {other:?}"
+                )))
+            }
+        };
+        let pointer = pointer_record.payload;
+        if pointer.revision == 0
+            || pointer_record.generation != pointer.revision
+            || pointer.content_digest.len() != 64
+            || !pointer
+                .content_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(ClusterDeploymentAuthorityError::Identity(
+                "current pointer identity or generation is invalid".to_string(),
+            ));
+        }
+        if pointer_record.publisher_node_id != pointer.signer_node_id {
+            return Err(ClusterDeploymentAuthorityError::Identity(
+                "current pointer publisher differs from signer node".to_string(),
+            ));
+        }
+        if pointer.signer_key_id != self.state.verifying_key.key_id() {
+            return Err(ClusterDeploymentAuthorityError::Identity(
+                "current pointer key differs from configured authority".to_string(),
+            ));
+        }
+        let current = self
+            .state
+            .cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if self.active().is_some()
+            && current.as_ref().is_some_and(|current| {
+                current.revision == pointer.revision
+                    && current.content_digest == pointer.content_digest
+            })
+        {
+            return Ok(None);
+        }
+        let bundle_record = match self
+            .handle
+            .read_state::<sbproxy_model_host::SignedDeploymentBundle>(
+                DEPLOYMENT_BUNDLE_NAMESPACE,
+                &pointer.content_digest,
+                DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
+            )
+            .await
+        {
+            sbproxy_mesh::ClusterStateRead::Present(record) => record,
+            other => {
+                return Err(ClusterDeploymentAuthorityError::State(format!(
+                    "content bundle is unavailable: {other:?}"
+                )))
+            }
+        };
+        let signed = bundle_record.payload;
+        if bundle_record.generation != pointer.revision
+            || bundle_record.publisher_node_id != pointer.signer_node_id
+            || signed.signer_node_id != pointer.signer_node_id
+            || signed.signer_key_id != pointer.signer_key_id
+            || signed.bundle.revision != pointer.revision
+            || signed.bundle.content_digest != pointer.content_digest
+        {
+            return Err(ClusterDeploymentAuthorityError::Identity(
+                "current pointer does not match its signed content".to_string(),
+            ));
+        }
+        Ok(Some(
+            signed.verify(&self.state.verifying_key, current.as_ref())?,
+        ))
+    }
+
+    /// Synchronous candidate read for startup and file-watch reconciliation.
+    pub fn read_candidate_blocking(
+        &self,
+    ) -> Result<Option<sbproxy_model_host::VerifiedDeploymentBundle>, ClusterDeploymentAuthorityError>
+    {
+        let authority = self.clone();
+        block_on_cluster(async move { authority.read_candidate().await })
+    }
+
+    /// Advance active state only after the model runtime commit succeeds.
+    pub fn commit(
+        &self,
+        verified: sbproxy_model_host::VerifiedDeploymentBundle,
+    ) -> Result<(), ClusterDeploymentAuthorityError> {
+        let cursor = verified.cursor();
+        let durable = self
+            .state
+            .cursor_store
+            .as_ref()
+            .map(|store| store.commit(&cursor))
+            .transpose();
+        *self
+            .state
+            .cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cursor);
+        *self
+            .state
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(verified);
+        durable?;
+        Ok(())
+    }
 }
 
 /// Exclusive publication reservation for one node model snapshot.
@@ -289,12 +594,23 @@ impl ClusterOwner {
             model_snapshot_publication_enabled(effective.as_ref()),
             snapshot_generation_directory(effective.as_ref()),
         ));
+        let deployment_authority = effective
+            .as_ref()
+            .and_then(|effective| {
+                effective
+                    .deployment_authority
+                    .as_ref()
+                    .map(|authority| (authority, effective.state_dir.as_deref()))
+            })
+            .map(|(config, state_dir)| load_deployment_authority(&handle, config, state_dir))
+            .transpose()?;
         *installed = Some(InstalledCluster {
             handle: handle.clone(),
             enrollment_authority,
             restart_fingerprint: fingerprint,
             settings: Arc::new(ReloadableClusterSettings::new(settings)),
             snapshot_publication,
+            deployment_authority,
         });
         Ok(handle)
     }
@@ -324,6 +640,15 @@ impl ClusterOwner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .and_then(|installed| installed.enrollment_authority.clone())
+    }
+
+    /// Configured signed deployment authority reader and optional publisher.
+    pub fn deployment_authority(&self) -> Option<ClusterDeploymentAuthority> {
+        self.installed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|installed| installed.deployment_authority.clone())
     }
 
     /// Reserve a due node-snapshot generation and hold publication serialization.
@@ -513,6 +838,55 @@ fn directory_snapshot_read(
 
 fn model_snapshot_publication_enabled(config: Option<&EffectiveClusterConfig>) -> bool {
     config.is_some_and(|config| config.source != ClusterConfigSource::LegacyMesh)
+}
+
+fn load_deployment_authority(
+    handle: &ClusterHandle,
+    config: &sbproxy_config::ClusterDeploymentAuthorityConfig,
+    state_dir: Option<&str>,
+) -> Result<ClusterDeploymentAuthority> {
+    let verifying_key =
+        sbproxy_model_host::DeploymentVerifyingKey::from_file(&config.verifying_key_file)
+            .context("load cluster deployment verification key")?;
+    let signing_key = config
+        .signing_key_file
+        .as_ref()
+        .map(|path| {
+            sbproxy_model_host::DeploymentSigningKey::from_file(path)
+                .context("load cluster deployment signing key")
+        })
+        .transpose()?;
+    if signing_key
+        .as_ref()
+        .is_some_and(|signing| signing.verifying_key().key_id() != verifying_key.key_id())
+    {
+        anyhow::bail!("cluster deployment signing and verification keys do not match");
+    }
+    let cursor_store = state_dir
+        .map(|directory| {
+            sbproxy_model_host::FileDeploymentBundleCursorStore::open(
+                Path::new(directory).join("deployment-authority-cursor.json"),
+            )
+            .context("open cluster deployment authority cursor")
+        })
+        .transpose()?;
+    let cursor = cursor_store
+        .as_ref()
+        .map(sbproxy_model_host::FileDeploymentBundleCursorStore::load)
+        .transpose()
+        .context("load cluster deployment authority cursor")?
+        .flatten();
+    Ok(ClusterDeploymentAuthority {
+        handle: handle.clone(),
+        state: Arc::new(DeploymentAuthorityState {
+            verifying_key,
+            signing_key,
+            cursor_store,
+            cursor: Mutex::new(cursor),
+            active: Mutex::new(None),
+            last_publication_unix_ms: AtomicU64::new(0),
+        }),
+    })
 }
 
 fn snapshot_generation_directory(config: Option<&EffectiveClusterConfig>) -> Option<PathBuf> {
@@ -824,6 +1198,11 @@ pub fn current_model_directory() -> Option<Arc<sbproxy_ai::model_directory::Mode
 /// Configured process enrollment authority, if this node owns one.
 pub fn current_enrollment_authority() -> Option<Arc<EnrollmentAuthority>> {
     process_owner().enrollment_authority()
+}
+
+/// Configured signed deployment authority adapter, if installed.
+pub fn current_deployment_authority() -> Option<ClusterDeploymentAuthority> {
+    process_owner().deployment_authority()
 }
 
 fn start_cluster_metrics(handle: &ClusterHandle) {

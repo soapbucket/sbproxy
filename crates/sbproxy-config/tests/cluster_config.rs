@@ -211,6 +211,37 @@ security:
 "#,
         ),
         (
+            "deployment authority without durable state",
+            r#"
+cluster_id: dev-a
+node_id: authority-a
+roles: [authority]
+security:
+  mode: shared_key
+  development: true
+  shared_key: local-development-secret
+deployment_authority:
+  signing_key_file: authority-signing.key
+  verifying_key_file: authority-verifying.key
+"#,
+        ),
+        (
+            "deployment signing key without authority role",
+            r#"
+cluster_id: dev-a
+node_id: worker-a
+roles: [worker]
+state_dir: /var/lib/sbproxy/cluster
+security:
+  mode: shared_key
+  development: true
+  shared_key: local-development-secret
+deployment_authority:
+  signing_key_file: authority-signing.key
+  verifying_key_file: authority-verifying.key
+"#,
+        ),
+        (
             "short inline shared key",
             r#"
 cluster_id: dev-a

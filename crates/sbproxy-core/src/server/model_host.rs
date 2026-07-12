@@ -87,6 +87,7 @@ pub struct PreparedModelRuntime {
     foundation: Option<RuntimeFoundation>,
     replace_manager: bool,
     cluster_state: Option<ClusterRuntimeState>,
+    authority_bundle: Option<sbproxy_model_host::VerifiedDeploymentBundle>,
 }
 
 impl std::fmt::Debug for PreparedModelRuntime {
@@ -98,6 +99,7 @@ impl std::fmt::Debug for PreparedModelRuntime {
             .field("foundation", &self.foundation)
             .field("replace_manager", &self.replace_manager)
             .field("cluster_model_control", &self.cluster_state.is_some())
+            .field("authority_bundle", &self.authority_bundle.is_some())
             .field("has_snapshot_preparer", &self.snapshot_preparer.is_some())
             .finish_non_exhaustive()
     }
@@ -391,6 +393,9 @@ impl ProductionModelRuntime {
                                 tracing::warn!(%error, "collect live cluster model directory");
                             }
                         }
+                        if let Err(error) = refresh_cluster_deployment_bundle(&runtime).await {
+                            tracing::warn!(%error, "refresh signed cluster deployment bundle");
+                        }
                     }
                 });
             })
@@ -482,6 +487,72 @@ impl ProductionModelRuntime {
         });
         self.epoch.store(next_epoch, Ordering::SeqCst);
         Ok(true)
+    }
+
+    /// Verify and atomically apply one newer signed authority bundle.
+    pub async fn apply_cluster_authority_bundle(
+        &self,
+        verified: &sbproxy_model_host::VerifiedDeploymentBundle,
+    ) -> anyhow::Result<bool> {
+        let Some(context) = crate::cluster_models::current_cluster_model_context() else {
+            anyhow::bail!("signed cluster deployment bundle requires canonical cluster mode");
+        };
+        let _guard = self.commit_lock.lock().await;
+        let Some(current_cluster) = self
+            .cluster_state
+            .read()
+            .expect("cluster model state lock")
+            .clone()
+        else {
+            anyhow::bail!("cluster model controller is not initialized");
+        };
+        if current_cluster.placement.global().control.authority
+            != sbproxy_config::ModelHostAuthority::ClusterAuthority
+        {
+            anyhow::bail!("model host is not configured for cluster_authority");
+        }
+        if verified.bundle().catalog_revision != current_cluster.catalog.catalog_revision {
+            anyhow::bail!(
+                "signed deployment catalog revision {:?} differs from active {:?}",
+                verified.bundle().catalog_revision,
+                current_cluster.catalog.catalog_revision
+            );
+        }
+        let global = desired_from_verified_bundle(current_cluster.placement.global(), verified)?;
+        let view = crate::cluster::current_model_directory()
+            .map(|directory| directory.load())
+            .unwrap_or_else(
+                || Arc::new(sbproxy_ai::model_directory::ModelDirectoryView::default()),
+            );
+        let input = crate::cluster_models::placement_input_from_directory(&view)?;
+        let next_placement = sbproxy_model_host::reconcile_cluster_placement(
+            &current_cluster.catalog,
+            Some(&current_cluster.placement),
+            global,
+            input.nodes,
+            &input.observations,
+            current_unix_time_ms()?,
+        )?;
+        let local_desired = next_placement.local_desired(&context.node_id)?;
+        let current_epoch = self.epoch.load(Ordering::SeqCst);
+        let next_epoch = current_epoch
+            .checked_add(1)
+            .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
+        let manager = self.active_manager();
+        let runtime_changed = local_desired != *manager.current_desired();
+        if runtime_changed {
+            let prepared = manager.prepare_revision(local_desired).await?;
+            manager.commit_revision(prepared).await?;
+        }
+        *self
+            .cluster_state
+            .write()
+            .expect("cluster model state lock") = Some(ClusterRuntimeState {
+            placement: next_placement,
+            catalog: current_cluster.catalog,
+        });
+        self.epoch.store(next_epoch, Ordering::SeqCst);
+        Ok(runtime_changed)
     }
 
     /// Snapshot every configured deployment in deterministic ID order.
@@ -897,6 +968,7 @@ impl ProductionModelRuntime {
             foundation,
             replace_manager,
             cluster_state: proposed_cluster_state,
+            authority_bundle: candidate.authority_bundle,
         })
     }
 
@@ -935,6 +1007,13 @@ impl ProductionModelRuntime {
             .cluster_state
             .write()
             .expect("cluster model state lock") = candidate.cluster_state;
+        if let Some(verified) = candidate.authority_bundle {
+            if let Some(authority) = crate::cluster::current_deployment_authority() {
+                if let Err(error) = authority.commit(verified) {
+                    tracing::error!(%error, "persist cluster deployment authority cursor");
+                }
+            }
+        }
         self.epoch.store(next_epoch, Ordering::SeqCst);
         Ok(report)
     }
@@ -946,6 +1025,75 @@ fn current_unix_time_ms() -> anyhow::Result<u64> {
         .map_err(|error| anyhow::anyhow!("system time before Unix epoch: {error}"))?;
     u64::try_from(duration.as_millis())
         .map_err(|_| anyhow::anyhow!("Unix time milliseconds overflowed"))
+}
+
+fn desired_from_verified_bundle(
+    current: &sbproxy_model_host::RuntimeDesiredState,
+    verified: &sbproxy_model_host::VerifiedDeploymentBundle,
+) -> anyhow::Result<sbproxy_model_host::RuntimeDesiredState> {
+    if current.legacy_host_policy.is_some() {
+        anyhow::bail!("cluster_authority cannot replace legacy serve desired state");
+    }
+    let revision = verified.revision_draft();
+    let deployments = revision
+        .deployments
+        .iter()
+        .map(|(id, deployment)| {
+            (
+                id.clone(),
+                sbproxy_model_host::CompiledDeployment {
+                    desired: deployment.clone(),
+                    origin: sbproxy_model_host::DesiredDeploymentOrigin::Canonical,
+                    legacy_entry: None,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for route in &current.routes {
+        if !deployments.contains_key(&route.deployment) {
+            anyhow::bail!(
+                "signed deployment bundle omits routed deployment {:?}",
+                route.deployment
+            );
+        }
+    }
+    let mut control = current.control.clone();
+    control.deployments = revision
+        .deployments
+        .iter()
+        .map(|(id, deployment)| {
+            managed_deployment_from_model(deployment.clone())
+                .map(|deployment| (id.clone(), deployment))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(sbproxy_model_host::RuntimeDesiredState {
+        revision,
+        deployments,
+        routes: current.routes.clone(),
+        control,
+        legacy_host_policy: None,
+    })
+}
+
+async fn refresh_cluster_deployment_bundle(runtime: &ProductionModelRuntime) -> anyhow::Result<()> {
+    let Some(state) = runtime.cluster_placement_state() else {
+        return Ok(());
+    };
+    if state.global().control.authority != sbproxy_config::ModelHostAuthority::ClusterAuthority {
+        return Ok(());
+    }
+    let authority = crate::cluster::current_deployment_authority()
+        .ok_or_else(|| anyhow::anyhow!("cluster deployment authority is not installed"))?;
+    if let Some(verified) = authority.read_candidate().await? {
+        runtime.apply_cluster_authority_bundle(&verified).await?;
+        if let Err(error) = authority.commit(verified) {
+            tracing::error!(%error, "persist cluster deployment authority cursor");
+        }
+    }
+    authority
+        .republish_active_if_due(std::time::Duration::from_secs(24 * 60 * 60))
+        .await?;
+    Ok(())
 }
 
 async fn publish_cluster_node_snapshot(runtime: &ProductionModelRuntime) -> anyhow::Result<()> {
@@ -968,6 +1116,7 @@ struct RuntimeCandidate {
     desired: sbproxy_model_host::RuntimeDesiredState,
     catalog: Arc<Catalog>,
     cache_root: PathBuf,
+    authority_bundle: Option<sbproxy_model_host::VerifiedDeploymentBundle>,
 }
 
 const fn snapshot_role(
@@ -1028,10 +1177,55 @@ fn compile_runtime_candidate(
         }
         None => Arc::new(Catalog::builtin()),
     };
+    let mut canonical = pipeline.config.server.model_host.clone();
+    let mut authority_bundle = None;
+    if canonical.as_ref().is_some_and(|control| {
+        control.authority == sbproxy_config::ModelHostAuthority::ClusterAuthority
+    }) {
+        let authority = crate::cluster::current_deployment_authority().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cluster_authority model host requires proxy.cluster.deployment_authority"
+            )
+        })?;
+        let verified = authority
+            .read_candidate_blocking()
+            .map_err(anyhow::Error::from)?
+            .or_else(|| authority.active());
+        let control = canonical
+            .as_mut()
+            .expect("cluster authority control exists");
+        control.deployments.clear();
+        if let Some(verified) = verified {
+            if verified.bundle().catalog_revision != catalog.catalog_revision {
+                anyhow::bail!(
+                    "signed deployment catalog revision {:?} differs from active {:?}",
+                    verified.bundle().catalog_revision,
+                    catalog.catalog_revision
+                );
+            }
+            control.deployments = verified
+                .bundle()
+                .deployments()
+                .into_iter()
+                .map(|(id, deployment)| {
+                    managed_deployment_from_model(deployment).map(|deployment| (id, deployment))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            authority_bundle = Some(verified);
+        } else if !managed_providers.is_empty() {
+            anyhow::bail!(
+                "cluster_authority model providers require an active signed deployment bundle"
+            );
+        }
+    }
+    let desired_source_revision = authority_bundle.as_ref().map_or_else(
+        || pipeline.config_revision.clone(),
+        |verified| verified.revision_draft().source_revision,
+    );
     let desired = sbproxy_model_host::compile_desired_state(
         sbproxy_model_host::RuntimeDesiredInput {
-            source_revision: pipeline.config_revision.clone(),
-            canonical: pipeline.config.server.model_host.clone(),
+            source_revision: desired_source_revision,
+            canonical,
             managed_providers,
             legacy_providers,
         },
@@ -1048,6 +1242,47 @@ fn compile_runtime_candidate(
         desired,
         catalog,
         cache_root,
+        authority_bundle,
+    })
+}
+
+fn managed_deployment_from_model(
+    deployment: sbproxy_model_host::ModelDeployment,
+) -> anyhow::Result<sbproxy_config::ManagedDeploymentConfig> {
+    let engine = match deployment.engine {
+        sbproxy_model_host::EngineChoice::Auto => sbproxy_config::ManagedEngineChoice::Auto,
+        sbproxy_model_host::EngineChoice::Vllm => sbproxy_config::ManagedEngineChoice::Vllm,
+        sbproxy_model_host::EngineChoice::LlamaCpp => sbproxy_config::ManagedEngineChoice::LlamaCpp,
+        sbproxy_model_host::EngineChoice::Embedded => {
+            anyhow::bail!("signed cluster deployments do not support the embedded engine")
+        }
+    };
+    Ok(sbproxy_config::ManagedDeploymentConfig {
+        model: deployment.model,
+        variant: deployment.variant,
+        heterogeneous_variants: deployment.heterogeneous_variants,
+        replicas: deployment.replicas,
+        required_labels: deployment.required_labels,
+        spread_by: deployment.spread_by,
+        pull: match deployment.pull {
+            sbproxy_model_host::PullPolicy::OnBoot => sbproxy_config::ManagedPullPolicy::OnBoot,
+            sbproxy_model_host::PullPolicy::OnDemand => sbproxy_config::ManagedPullPolicy::OnDemand,
+            sbproxy_model_host::PullPolicy::Manual => sbproxy_config::ManagedPullPolicy::Manual,
+        },
+        warm: deployment.warm,
+        keep_alive_secs: deployment.keep_alive_secs,
+        max_concurrency: deployment.max_concurrency,
+        max_queue_depth: deployment.max_queue_depth,
+        queue_timeout_ms: deployment.queue_timeout_ms,
+        engine,
+        rollout: match deployment.rollout {
+            sbproxy_model_host::RolloutPolicy::Rolling => {
+                sbproxy_config::ManagedRolloutPolicy::Rolling
+            }
+            sbproxy_model_host::RolloutPolicy::Recreate => {
+                sbproxy_config::ManagedRolloutPolicy::Recreate
+            }
+        },
     })
 }
 

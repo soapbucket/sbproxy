@@ -152,6 +152,7 @@ tracing.workspace = true
 
 # Error handling
 anyhow.workspace = true
+thiserror.workspace = true
 
 # Serialization (for action_config access)
 serde_json.workspace = true

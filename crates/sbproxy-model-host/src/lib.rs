@@ -35,6 +35,7 @@ pub mod artifact;
 pub mod artifact_spec;
 pub mod capabilities;
 pub mod catalog;
+pub mod cluster_authority;
 pub mod cluster_placement;
 pub mod config;
 pub mod cuda_build;
@@ -102,6 +103,11 @@ pub use capabilities::{
 pub use catalog::{
     ArtifactResolveError, Catalog, CatalogDiagnostic, CatalogEntry, CatalogError, CatalogLoad,
     ModelRef, PullPolicy, ResolveError,
+};
+pub use cluster_authority::{
+    DeploymentAuthorityError, DeploymentBundleCursor, DeploymentSigningKey, DeploymentVerifyingKey,
+    FileDeploymentBundleCursorStore, RestrictedDeploymentBundle, RestrictedDeploymentBundleDraft,
+    SignedDeploymentBundle, VerifiedDeploymentBundle, RESTRICTED_DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
 };
 pub use cluster_placement::{
     reconcile_cluster_placement, ClusterDeploymentPlacement, ClusterPlacementError,
