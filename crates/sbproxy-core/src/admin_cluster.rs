@@ -26,6 +26,7 @@ struct ClusterStatusResponse {
     directory_collected_at_unix_ms: Option<u64>,
     directory_age_ms: Option<u64>,
     summary: ClusterStatusSummary,
+    deployments: Vec<ClusterDeploymentStatus>,
     nodes: Vec<ClusterStatusNode>,
     unhealthy_nodes: Vec<ClusterNodeAlert>,
 }
@@ -39,6 +40,28 @@ struct ClusterStatusSummary {
     eligible_workers: usize,
     eligible_replicas: usize,
     deployment_digest_mismatch: bool,
+    deployments: usize,
+    ready_deployments: usize,
+    rollouts_in_progress: usize,
+    unplaced_replicas: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterDeploymentStatus {
+    deployment_id: String,
+    model: String,
+    generation: u64,
+    desired_replicas: u32,
+    placed_replicas: usize,
+    unplaced_replicas: u32,
+    phase: sbproxy_model_host::RolloutPhase,
+    target_ready: bool,
+    timed_out: bool,
+    handoff_deadline_unix_ms: u64,
+    assignments: Vec<sbproxy_model_host::PlacementAssignment>,
+    retained: Vec<sbproxy_model_host::VersionedPlacementAssignment>,
+    draining: Vec<sbproxy_model_host::VersionedPlacementAssignment>,
+    rejections: BTreeMap<String, sbproxy_model_host::PlacementRejectionReason>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,11 +137,21 @@ fn dispatch_status(method: &str) -> (u16, &'static str, String) {
             snapshot_ttl_secs: 30,
             publish_interval_secs: 5,
             distributed_requested: false,
+            model_control_enabled: false,
         });
     let view = crate::cluster::current_model_directory().map(|directory| directory.load());
-    dispatch_status_with(method, handle, settings, view, unix_time_ms())
+    let placement = crate::server::model_host::model_runtime_manager().cluster_placement_state();
+    dispatch_status_with_placement(
+        method,
+        handle,
+        settings,
+        view,
+        placement.as_ref(),
+        unix_time_ms(),
+    )
 }
 
+#[cfg(test)]
 fn dispatch_status_with(
     method: &str,
     handle: sbproxy_mesh::ClusterHandle,
@@ -126,10 +159,21 @@ fn dispatch_status_with(
     view: Option<Arc<sbproxy_ai::model_directory::ModelDirectoryView>>,
     now: u64,
 ) -> (u16, &'static str, String) {
+    dispatch_status_with_placement(method, handle, settings, view, None, now)
+}
+
+fn dispatch_status_with_placement(
+    method: &str,
+    handle: sbproxy_mesh::ClusterHandle,
+    settings: crate::cluster::ClusterSettings,
+    view: Option<Arc<sbproxy_ai::model_directory::ModelDirectoryView>>,
+    placement: Option<&sbproxy_model_host::ClusterPlacementState>,
+    now: u64,
+) -> (u16, &'static str, String) {
     if !method.eq_ignore_ascii_case("GET") {
         return json(405, serde_json::json!({"error": "method not allowed"}));
     }
-    let response = cluster_status_response(&handle, settings, view.as_deref(), now);
+    let response = cluster_status_response(&handle, settings, view.as_deref(), placement, now);
     match serde_json::to_string(&response) {
         Ok(body) => (200, "application/json", body),
         Err(error) => {
@@ -143,6 +187,7 @@ fn cluster_status_response(
     handle: &sbproxy_mesh::ClusterHandle,
     settings: crate::cluster::ClusterSettings,
     view: Option<&sbproxy_ai::model_directory::ModelDirectoryView>,
+    placement: Option<&sbproxy_model_host::ClusterPlacementState>,
     now: u64,
 ) -> ClusterStatusResponse {
     let configured = settings.distributed_requested;
@@ -191,6 +236,7 @@ fn cluster_status_response(
                 .count()
         })
         .sum();
+    let deployments = placement.map_or_else(Vec::new, deployment_statuses);
     let summary = ClusterStatusSummary {
         total_nodes: nodes.len(),
         healthy_nodes: nodes.iter().filter(|node| node.health == "healthy").count(),
@@ -203,6 +249,19 @@ fn cluster_status_response(
         eligible_replicas,
         deployment_digest_mismatch: view
             .is_some_and(|view| view.summary.deployment_digest_mismatch),
+        deployments: deployments.len(),
+        ready_deployments: deployments
+            .iter()
+            .filter(|deployment| deployment.target_ready)
+            .count(),
+        rollouts_in_progress: deployments
+            .iter()
+            .filter(|deployment| deployment.phase != sbproxy_model_host::RolloutPhase::Stable)
+            .count(),
+        unplaced_replicas: deployments
+            .iter()
+            .map(|deployment| u64::from(deployment.unplaced_replicas))
+            .sum(),
     };
     let unhealthy_nodes = nodes
         .iter()
@@ -227,9 +286,35 @@ fn cluster_status_response(
         directory_collected_at_unix_ms,
         directory_age_ms,
         summary,
+        deployments,
         nodes,
         unhealthy_nodes,
     }
+}
+
+fn deployment_statuses(
+    placement: &sbproxy_model_host::ClusterPlacementState,
+) -> Vec<ClusterDeploymentStatus> {
+    placement
+        .deployments()
+        .iter()
+        .map(|(deployment_id, deployment)| ClusterDeploymentStatus {
+            deployment_id: deployment_id.clone(),
+            model: deployment.deployment.desired.model.clone(),
+            generation: deployment.target.deployment_generation,
+            desired_replicas: deployment.target.desired_replicas,
+            placed_replicas: deployment.target.assignments.len(),
+            unplaced_replicas: deployment.target.unplaced_replicas,
+            phase: deployment.rollout.phase,
+            target_ready: deployment.rollout.target_ready,
+            timed_out: deployment.rollout.timed_out,
+            handoff_deadline_unix_ms: deployment.rollout.handoff_deadline_unix_ms,
+            assignments: deployment.target.assignments.clone(),
+            retained: deployment.rollout.retain.clone(),
+            draining: deployment.rollout.drain.clone(),
+            rejections: deployment.target.rejections.clone(),
+        })
+        .collect()
 }
 
 fn status_node_from_directory(
@@ -572,6 +657,7 @@ mod tests {
             snapshot_ttl_secs: 30,
             publish_interval_secs: 5,
             distributed_requested: true,
+            model_control_enabled: true,
         };
 
         let (status, _, body) =
@@ -592,6 +678,65 @@ mod tests {
             dispatch_status_with("POST", handle, settings, None, 1_200).0,
             405
         );
+    }
+
+    #[test]
+    fn status_contract_exposes_placement_and_unplaced_replica_state() {
+        let global = sbproxy_model_host::compile_desired_state(
+            sbproxy_model_host::RuntimeDesiredInput {
+                source_revision: "admin-placement-1".to_string(),
+                canonical: Some(
+                    serde_yaml::from_str(
+                        r#"
+deployments:
+  coder:
+    model: qwen2.5-0.5b-instruct
+    variant: q4_k_m
+"#,
+                    )
+                    .expect("model-host config"),
+                ),
+                managed_providers: Vec::new(),
+                legacy_providers: Vec::new(),
+            },
+            &sbproxy_model_host::Catalog::builtin(),
+        )
+        .expect("global desired");
+        let placement = sbproxy_model_host::reconcile_cluster_placement(
+            &sbproxy_model_host::Catalog::builtin(),
+            None,
+            global,
+            Vec::new(),
+            &BTreeMap::new(),
+            1_000,
+        )
+        .expect("unplaced status remains valid");
+        let identity = ClusterIdentity {
+            cluster_id: "cluster-a".to_string(),
+            node_id: "gateway-a".to_string(),
+            roles: BTreeSet::from([ClusterNodeRole::Gateway]),
+            labels: BTreeMap::new(),
+            peer_address: None,
+            model_endpoint: None,
+        };
+        let handle = ClusterHandle::local(identity).expect("cluster handle");
+        let settings = crate::cluster::ClusterSettings {
+            snapshot_ttl_secs: 30,
+            publish_interval_secs: 5,
+            distributed_requested: true,
+            model_control_enabled: true,
+        };
+
+        let (status, _, body) =
+            dispatch_status_with_placement("GET", handle, settings, None, Some(&placement), 1_200);
+
+        assert_eq!(status, 200);
+        let body: serde_json::Value = serde_json::from_str(&body).expect("status JSON");
+        assert_eq!(body["summary"]["deployments"], 1);
+        assert_eq!(body["summary"]["unplaced_replicas"], 1);
+        assert_eq!(body["deployments"][0]["deployment_id"], "coder");
+        assert_eq!(body["deployments"][0]["phase"], "starting");
+        assert_eq!(body["deployments"][0]["unplaced_replicas"], 1);
     }
 
     #[test]

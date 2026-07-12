@@ -5,11 +5,17 @@ use sbproxy_model_host::node_snapshot::{
     NodeEngineSnapshot, NodeHealthState, NodeRole,
 };
 use sbproxy_model_host::placement::{
-    plan_placement, PlacementNode, PlacementRejectionReason, PlacementRequest,
+    plan_placement, PlacementAssignment, PlacementNode, PlacementPlan, PlacementRejectionReason,
+    PlacementRequest,
+};
+use sbproxy_model_host::rollout::{
+    filter_desired_state_for_assignments, plan_rollout, AssignedModelDeployment, RolloutPhase,
+    RolloutReplicaObservation, RolloutRequest,
 };
 use sbproxy_model_host::{
-    AcceleratorKind, ArtifactFormat, Catalog, EngineAvailability, EngineChoice, EngineKind,
-    GpuVendor, ModelDeployment, PullPolicy, RolloutPolicy,
+    compile_desired_state, reconcile_cluster_placement, AcceleratorKind, ArtifactFormat, Catalog,
+    DeploymentRuntimeState, EngineAvailability, EngineChoice, EngineKind, GpuVendor,
+    ManagedProviderInput, ModelDeployment, PullPolicy, RolloutPolicy, RuntimeDesiredInput,
 };
 
 fn catalog() -> Catalog {
@@ -426,4 +432,323 @@ fn partitioned_directories_never_assign_an_unreachable_peer() {
 
     assert_eq!(left.assignments[0].node_id, "left");
     assert_eq!(right.assignments[0].node_id, "right");
+}
+
+fn rollout_assignment(node_id: &str, variant_id: &str) -> PlacementAssignment {
+    PlacementAssignment {
+        node_id: node_id.to_string(),
+        model_endpoint: format!("https://{node_id}.internal:9443"),
+        variant_id: variant_id.to_string(),
+        artifact_digest: if variant_id == "cuda-fp8" {
+            "a".repeat(64)
+        } else {
+            "b".repeat(64)
+        },
+        engine: if variant_id == "cuda-fp8" {
+            EngineKind::Vllm
+        } else {
+            EngineKind::LlamaCpp
+        },
+        accelerator: if variant_id == "cuda-fp8" {
+            AcceleratorKind::Cuda
+        } else {
+            AcceleratorKind::Cpu
+        },
+        device_index: 0,
+        required_memory_bytes: 1,
+        available_memory_bytes: 2,
+        artifact_cached: true,
+        failure_domains: BTreeMap::new(),
+    }
+}
+
+fn rollout_plan(generation: u64, nodes: &[&str]) -> PlacementPlan {
+    PlacementPlan {
+        deployment_id: "coder".to_string(),
+        deployment_generation: generation,
+        desired_replicas: u32::try_from(nodes.len()).unwrap(),
+        assignments: nodes
+            .iter()
+            .map(|node| rollout_assignment(node, "cuda-fp8"))
+            .collect(),
+        unplaced_replicas: 0,
+        rejections: BTreeMap::new(),
+    }
+}
+
+fn ready(node_id: &str, generation: u64) -> RolloutReplicaObservation {
+    RolloutReplicaObservation {
+        node_id: node_id.to_string(),
+        deployment_generation: generation,
+        variant_id: Some("cuda-fp8".to_string()),
+        artifact_digest: Some("a".repeat(64)),
+        state: DeploymentRuntimeState::Ready,
+    }
+}
+
+#[test]
+fn rollout_rolling_starts_replacements_before_readiness_and_then_drains_losers() {
+    let target = rollout_plan(2, &["b", "c"]);
+    let previous = rollout_plan(1, &["a", "b"]);
+    let waiting = plan_rollout(RolloutRequest {
+        policy: RolloutPolicy::Rolling,
+        target: target.clone(),
+        previous: Some(previous.clone()),
+        observations: vec![ready("b", 2)],
+        prior_drain_issued: false,
+        now_unix_ms: 1_000,
+        handoff_deadline_unix_ms: 2_000,
+    })
+    .unwrap();
+    assert_eq!(waiting.phase, RolloutPhase::WaitingForReadiness);
+    assert_eq!(
+        waiting
+            .start
+            .iter()
+            .map(|assignment| assignment.assignment.node_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["b", "c"])
+    );
+    assert_eq!(waiting.retain[0].assignment.node_id, "a");
+    assert!(waiting.drain.is_empty());
+
+    let ready = plan_rollout(RolloutRequest {
+        policy: RolloutPolicy::Rolling,
+        target,
+        previous: Some(previous),
+        observations: vec![ready("b", 2), ready("c", 2)],
+        prior_drain_issued: false,
+        now_unix_ms: 1_500,
+        handoff_deadline_unix_ms: 2_000,
+    })
+    .unwrap();
+    assert_eq!(ready.phase, RolloutPhase::Stable);
+    assert!(ready.retain.is_empty());
+    assert_eq!(ready.drain[0].assignment.node_id, "a");
+}
+
+#[test]
+fn rollout_rolling_deadline_bounds_unready_retention() {
+    let decision = plan_rollout(RolloutRequest {
+        policy: RolloutPolicy::Rolling,
+        target: rollout_plan(2, &["b"]),
+        previous: Some(rollout_plan(1, &["a"])),
+        observations: Vec::new(),
+        prior_drain_issued: false,
+        now_unix_ms: 2_000,
+        handoff_deadline_unix_ms: 2_000,
+    })
+    .unwrap();
+
+    assert_eq!(decision.phase, RolloutPhase::TimedOut);
+    assert!(decision.timed_out);
+    assert!(decision.retain.is_empty());
+    assert_eq!(decision.drain[0].assignment.node_id, "a");
+}
+
+#[test]
+fn rollout_recreate_drains_the_prior_generation_before_starting_target() {
+    let target = rollout_plan(2, &["b"]);
+    let previous = rollout_plan(1, &["a"]);
+    let draining = plan_rollout(RolloutRequest {
+        policy: RolloutPolicy::Recreate,
+        target: target.clone(),
+        previous: Some(previous.clone()),
+        observations: vec![ready("a", 1)],
+        prior_drain_issued: false,
+        now_unix_ms: 1_000,
+        handoff_deadline_unix_ms: 2_000,
+    })
+    .unwrap();
+    assert_eq!(draining.phase, RolloutPhase::DrainingPrior);
+    assert!(draining.start.is_empty());
+    assert_eq!(draining.drain[0].assignment.node_id, "a");
+
+    let starting = plan_rollout(RolloutRequest {
+        policy: RolloutPolicy::Recreate,
+        target,
+        previous: Some(previous),
+        observations: Vec::new(),
+        prior_drain_issued: true,
+        now_unix_ms: 1_500,
+        handoff_deadline_unix_ms: 2_000,
+    })
+    .unwrap();
+    assert_eq!(starting.phase, RolloutPhase::Starting);
+    assert_eq!(starting.start[0].assignment.node_id, "b");
+}
+
+#[test]
+fn rollout_assignment_filter_pins_one_warm_local_replica_and_drops_remote_routes() {
+    let host = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    heterogeneous_variants: true
+    replicas: 2
+  spare:
+    model: coder
+    variant: cpu-q4
+"#,
+    )
+    .unwrap();
+    let global = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "cluster-revision-1".to_string(),
+            canonical: Some(host),
+            managed_providers: vec![
+                ManagedProviderInput {
+                    origin: "api".to_string(),
+                    provider: "local".to_string(),
+                    deployment: "coder".to_string(),
+                    models: vec!["coder".to_string()],
+                },
+                ManagedProviderInput {
+                    origin: "api".to_string(),
+                    provider: "spare".to_string(),
+                    deployment: "spare".to_string(),
+                    models: vec!["spare".to_string()],
+                },
+            ],
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let assignments = BTreeMap::from([(
+        "coder".to_string(),
+        AssignedModelDeployment {
+            deployment_generation: 9,
+            assignment: rollout_assignment("worker-a", "cuda-fp8"),
+            deployment: global.deployments["coder"].clone(),
+        },
+    )]);
+
+    let local = filter_desired_state_for_assignments(&global, &assignments).unwrap();
+
+    assert_eq!(local.deployments.keys().collect::<Vec<_>>(), ["coder"]);
+    assert_eq!(
+        local.revision.deployments.keys().collect::<Vec<_>>(),
+        ["coder"]
+    );
+    assert_eq!(local.routes.len(), 1);
+    assert_eq!(local.routes[0].deployment, "coder");
+    let coder = &local.deployments["coder"].desired;
+    assert_eq!(coder.variant.as_deref(), Some("cuda-fp8"));
+    assert!(!coder.heterogeneous_variants);
+    assert_eq!(coder.replicas, 1);
+    assert!(coder.warm);
+    assert_eq!(coder.engine, EngineChoice::Vllm);
+}
+
+#[test]
+fn rollout_cluster_state_retains_a_loser_then_removes_it_after_replacement_readiness() {
+    let host = serde_yaml::from_str(
+        r#"
+handoff_timeout_ms: 1000
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+    replicas: 1
+"#,
+    )
+    .unwrap();
+    let global = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "cluster-state-1".to_string(),
+            canonical: Some(host),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let initial = reconcile_cluster_placement(
+        &catalog(),
+        None,
+        global.clone(),
+        vec![
+            cuda_node("worker-a", "a", 24_000_000_000),
+            cuda_node("worker-b", "b", 24_000_000_000),
+        ],
+        &BTreeMap::new(),
+        1_000,
+    )
+    .unwrap();
+    let initial_placement = &initial.deployments()["coder"];
+    let old = initial_placement.target.assignments[0].clone();
+    let replacement_node = if old.node_id == "worker-a" {
+        "worker-b"
+    } else {
+        "worker-a"
+    };
+    let old_ready = RolloutReplicaObservation {
+        node_id: old.node_id.clone(),
+        deployment_generation: initial_placement.target.deployment_generation,
+        variant_id: Some(old.variant_id.clone()),
+        artifact_digest: Some(old.artifact_digest.clone()),
+        state: DeploymentRuntimeState::Ready,
+    };
+    let moving = reconcile_cluster_placement(
+        &catalog(),
+        Some(&initial),
+        global,
+        vec![cuda_node(replacement_node, "b", 24_000_000_000)],
+        &BTreeMap::from([("coder".to_string(), vec![old_ready.clone()])]),
+        1_100,
+    )
+    .unwrap();
+    let moving_placement = &moving.deployments()["coder"];
+    assert_eq!(
+        moving_placement.target.deployment_generation,
+        initial_placement.target.deployment_generation
+    );
+    assert_eq!(
+        moving_placement.rollout.phase,
+        RolloutPhase::WaitingForReadiness
+    );
+    assert!(moving
+        .local_desired(&old.node_id)
+        .unwrap()
+        .deployments
+        .contains_key("coder"));
+    assert!(moving
+        .local_desired(replacement_node)
+        .unwrap()
+        .deployments
+        .contains_key("coder"));
+
+    let replacement = moving_placement.target.assignments[0].clone();
+    let replacement_ready = RolloutReplicaObservation {
+        node_id: replacement.node_id.clone(),
+        deployment_generation: moving_placement.target.deployment_generation,
+        variant_id: Some(replacement.variant_id.clone()),
+        artifact_digest: Some(replacement.artifact_digest.clone()),
+        state: DeploymentRuntimeState::Ready,
+    };
+    let draining = reconcile_cluster_placement(
+        &catalog(),
+        Some(&moving),
+        moving.global().clone(),
+        vec![cuda_node(replacement_node, "b", 24_000_000_000)],
+        &BTreeMap::from([("coder".to_string(), vec![old_ready, replacement_ready])]),
+        1_200,
+    )
+    .unwrap();
+    assert_eq!(
+        draining.deployments()["coder"].rollout.phase,
+        RolloutPhase::Stable
+    );
+    assert!(!draining
+        .local_desired(&old.node_id)
+        .unwrap()
+        .deployments
+        .contains_key("coder"));
+    assert!(draining
+        .local_desired(replacement_node)
+        .unwrap()
+        .deployments
+        .contains_key("coder"));
 }

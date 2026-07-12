@@ -217,6 +217,9 @@ pub struct ModelHostControlConfig {
     /// Maximum graceful drain time during shutdown.
     #[serde(default = "default_shutdown_deadline_ms")]
     pub shutdown_deadline_ms: u64,
+    /// Maximum rolling placement handoff time while prior replicas are retained.
+    #[serde(default = "default_handoff_timeout_ms")]
+    pub handoff_timeout_ms: u64,
     /// Artifact cache and residency policy.
     #[serde(default)]
     pub cache: ModelHostCacheConfig,
@@ -236,6 +239,7 @@ impl Default for ModelHostControlConfig {
             max_parallel_prepares: default_max_parallel_prepares(),
             safety_margin: default_safety_margin(),
             shutdown_deadline_ms: default_shutdown_deadline_ms(),
+            handoff_timeout_ms: default_handoff_timeout_ms(),
             cache: ModelHostCacheConfig::default(),
             engines: BTreeMap::new(),
             deployments: BTreeMap::new(),
@@ -253,6 +257,10 @@ const fn default_safety_margin() -> f64 {
 
 const fn default_shutdown_deadline_ms() -> u64 {
     30_000
+}
+
+const fn default_handoff_timeout_ms() -> u64 {
+    60_000
 }
 
 /// Validation failure for canonical model-host configuration.
@@ -287,6 +295,11 @@ impl ModelHostControlConfig {
         if self.shutdown_deadline_ms == 0 {
             return Err(ModelHostConfigError::new(
                 "shutdown_deadline_ms must be positive",
+            ));
+        }
+        if self.handoff_timeout_ms == 0 || self.handoff_timeout_ms > 24 * 60 * 60 * 1_000 {
+            return Err(ModelHostConfigError::new(
+                "handoff_timeout_ms must be between 1 and 86400000",
             ));
         }
         if self.authority == ModelHostAuthority::AdminManaged

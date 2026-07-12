@@ -35,6 +35,7 @@ pub mod artifact;
 pub mod artifact_spec;
 pub mod capabilities;
 pub mod catalog;
+pub mod cluster_placement;
 pub mod config;
 pub mod cuda_build;
 pub mod deployment;
@@ -64,6 +65,7 @@ pub mod process;
 pub mod pull;
 pub mod report;
 pub mod residency;
+pub mod rollout;
 pub mod runtime;
 pub mod runtime_manager;
 pub mod scheduling;
@@ -100,6 +102,10 @@ pub use capabilities::{
 pub use catalog::{
     ArtifactResolveError, Catalog, CatalogDiagnostic, CatalogEntry, CatalogError, CatalogLoad,
     ModelRef, PullPolicy, ResolveError,
+};
+pub use cluster_placement::{
+    reconcile_cluster_placement, ClusterDeploymentPlacement, ClusterPlacementError,
+    ClusterPlacementState, PriorDeploymentPlacement,
 };
 pub use config::{
     AcquireSource, ChunkedPrefill, EngineAccel, EngineAcquire, EngineChoice, EngineDoctor,
@@ -174,6 +180,11 @@ pub use process::{
 pub use pull::{pull_plan, PullItem, PullMode};
 pub use report::{ModelValue, ValueReport};
 pub use residency::{Admission, ResidencyManager, Resident};
+pub use rollout::{
+    filter_desired_state_for_assignments, plan_rollout, AssignedModelDeployment, RolloutDecision,
+    RolloutError, RolloutPhase, RolloutReplicaObservation, RolloutRequest,
+    VersionedPlacementAssignment,
+};
 pub use runtime::{
     parse_params, ConfigDirMetadataProvider, DeviceVram, ModelHostObserver, ModelHostRuntime,
     ModelHostStatus, ModelMetadataProvider, ModelStatus, NoopObserver, RuntimeError, VramStatus,

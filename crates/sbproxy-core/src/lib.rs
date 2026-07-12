@@ -52,6 +52,8 @@ pub mod capture_envelope;
 pub mod cluster;
 /// WOR-1721: fleet-wide metric aggregation over the mesh.
 pub mod cluster_metrics;
+#[doc(hidden)]
+pub mod cluster_models;
 pub mod context;
 pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.

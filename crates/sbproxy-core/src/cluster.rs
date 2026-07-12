@@ -40,12 +40,15 @@ pub struct ClusterSettings {
     pub publish_interval_secs: u64,
     /// Whether configuration requested a distributed cluster.
     pub distributed_requested: bool,
+    /// Whether canonical cluster model publication and placement are enabled.
+    pub model_control_enabled: bool,
 }
 
 struct ReloadableClusterSettings {
     snapshot_ttl_secs: AtomicU64,
     publish_interval_secs: AtomicU64,
     distributed_requested: bool,
+    model_control_enabled: bool,
 }
 
 struct SnapshotPublicationState {
@@ -95,6 +98,7 @@ impl ReloadableClusterSettings {
             snapshot_ttl_secs: AtomicU64::new(settings.snapshot_ttl_secs),
             publish_interval_secs: AtomicU64::new(settings.publish_interval_secs),
             distributed_requested: settings.distributed_requested,
+            model_control_enabled: settings.model_control_enabled,
         }
     }
 
@@ -110,6 +114,7 @@ impl ReloadableClusterSettings {
             snapshot_ttl_secs: self.snapshot_ttl_secs.load(Ordering::SeqCst),
             publish_interval_secs: self.publish_interval_secs.load(Ordering::SeqCst),
             distributed_requested: self.distributed_requested,
+            model_control_enabled: self.model_control_enabled,
         }
     }
 }
@@ -601,6 +606,7 @@ fn desired_installation(
                 snapshot_ttl_secs: DEFAULT_SNAPSHOT_TTL_SECS,
                 publish_interval_secs: DEFAULT_PUBLISH_INTERVAL_SECS,
                 distributed_requested: false,
+                model_control_enabled: false,
             },
         ));
     };
@@ -624,6 +630,7 @@ fn desired_installation(
             snapshot_ttl_secs: effective.snapshot_ttl_secs,
             publish_interval_secs: effective.publish_interval_secs,
             distributed_requested: true,
+            model_control_enabled: effective.source != ClusterConfigSource::LegacyMesh,
         },
     ))
 }

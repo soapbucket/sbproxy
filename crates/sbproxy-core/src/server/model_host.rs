@@ -43,6 +43,7 @@ pub struct ProductionModelRuntime {
     active: ArcSwap<sbproxy_model_host::ModelRuntimeManager>,
     foundation: RwLock<Option<RuntimeFoundation>>,
     snapshot_preparer: RwLock<Option<Arc<sbproxy_model_host::ProductionDeploymentPreparer>>>,
+    cluster_state: RwLock<Option<ClusterRuntimeState>>,
     epoch: AtomicU64,
     commit_lock: tokio::sync::Mutex<()>,
 }
@@ -70,6 +71,12 @@ struct RuntimeFoundation {
     cache_root: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct ClusterRuntimeState {
+    placement: sbproxy_model_host::ClusterPlacementState,
+    catalog: Arc<Catalog>,
+}
+
 /// A complete model-runtime candidate prepared without changing live routes.
 pub struct PreparedModelRuntime {
     owner: Arc<ProductionModelRuntime>,
@@ -79,6 +86,7 @@ pub struct PreparedModelRuntime {
     base_epoch: u64,
     foundation: Option<RuntimeFoundation>,
     replace_manager: bool,
+    cluster_state: Option<ClusterRuntimeState>,
 }
 
 impl std::fmt::Debug for PreparedModelRuntime {
@@ -89,6 +97,7 @@ impl std::fmt::Debug for PreparedModelRuntime {
             .field("base_epoch", &self.base_epoch)
             .field("foundation", &self.foundation)
             .field("replace_manager", &self.replace_manager)
+            .field("cluster_model_control", &self.cluster_state.is_some())
             .field("has_snapshot_preparer", &self.snapshot_preparer.is_some())
             .finish_non_exhaustive()
     }
@@ -328,6 +337,7 @@ impl ProductionModelRuntime {
             active: ArcSwap::from_pointee(manager),
             foundation: RwLock::new(None),
             snapshot_preparer: RwLock::new(None),
+            cluster_state: RwLock::new(None),
             epoch: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
         })
@@ -369,10 +379,17 @@ impl ProductionModelRuntime {
                         if let Err(error) = publish_cluster_node_snapshot(&runtime).await {
                             tracing::warn!(%error, "publish cluster node model snapshot");
                         }
-                        if let Err(error) =
-                            crate::cluster::collect_process_model_directory(false).await
-                        {
-                            tracing::warn!(%error, "collect live cluster model directory");
+                        match crate::cluster::collect_process_model_directory(false).await {
+                            Ok(Some(view)) => {
+                                if let Err(error) = runtime.reconcile_cluster_directory(view).await
+                                {
+                                    tracing::warn!(%error, "reconcile cluster model placement");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "collect live cluster model directory");
+                            }
                         }
                     }
                 });
@@ -390,6 +407,81 @@ impl ProductionModelRuntime {
     /// Current atomic managed-model desired state.
     pub fn current_desired(&self) -> Arc<sbproxy_model_host::RuntimeDesiredState> {
         self.active_manager().current_desired()
+    }
+
+    /// Current committed fleet placement status, when canonical cluster control is active.
+    pub fn cluster_placement_state(&self) -> Option<sbproxy_model_host::ClusterPlacementState> {
+        self.cluster_state
+            .read()
+            .expect("cluster model state lock")
+            .as_ref()
+            .map(|state| state.placement.clone())
+    }
+
+    /// Recompute and atomically reconcile assignments from one directory publication.
+    pub async fn reconcile_cluster_directory(
+        &self,
+        view: Arc<sbproxy_ai::model_directory::ModelDirectoryView>,
+    ) -> anyhow::Result<bool> {
+        let Some(context) = crate::cluster_models::current_cluster_model_context() else {
+            return Ok(false);
+        };
+        let input = crate::cluster_models::placement_input_from_directory(&view)?;
+        self.reconcile_cluster_input(context, input, current_unix_time_ms()?)
+            .await
+    }
+
+    async fn reconcile_cluster_input(
+        &self,
+        context: crate::cluster_models::ClusterModelContext,
+        input: crate::cluster_models::DirectoryPlacementInput,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.commit_lock.lock().await;
+        let Some(current_cluster) = self
+            .cluster_state
+            .read()
+            .expect("cluster model state lock")
+            .clone()
+        else {
+            return Ok(false);
+        };
+        let next_placement = sbproxy_model_host::reconcile_cluster_placement(
+            &current_cluster.catalog,
+            Some(&current_cluster.placement),
+            current_cluster.placement.global().clone(),
+            input.nodes,
+            &input.observations,
+            now_unix_ms,
+        )?;
+        let local_desired = next_placement.local_desired(&context.node_id)?;
+        let manager = self.active_manager();
+        if local_desired == *manager.current_desired() {
+            *self
+                .cluster_state
+                .write()
+                .expect("cluster model state lock") = Some(ClusterRuntimeState {
+                placement: next_placement,
+                catalog: current_cluster.catalog,
+            });
+            return Ok(false);
+        }
+
+        let current_epoch = self.epoch.load(Ordering::SeqCst);
+        let next_epoch = current_epoch
+            .checked_add(1)
+            .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
+        let prepared = manager.prepare_revision(local_desired).await?;
+        manager.commit_revision(prepared).await?;
+        *self
+            .cluster_state
+            .write()
+            .expect("cluster model state lock") = Some(ClusterRuntimeState {
+            placement: next_placement,
+            catalog: current_cluster.catalog,
+        });
+        self.epoch.store(next_epoch, Ordering::SeqCst);
+        Ok(true)
     }
 
     /// Snapshot every configured deployment in deterministic ID order.
@@ -439,6 +531,15 @@ impl ProductionModelRuntime {
             (NodeSnapshotInventory::default(), true)
         };
         let desired = self.current_desired();
+        let cluster_state = self
+            .cluster_state
+            .read()
+            .expect("cluster model state lock")
+            .clone();
+        let cluster_assignments = cluster_state
+            .as_ref()
+            .map(|state| state.placement.local_assignments(&identity.node_id))
+            .unwrap_or_default();
         let statuses = self.statuses().await;
         let mut health_reasons = BTreeSet::new();
         let mut unhealthy = false;
@@ -538,8 +639,14 @@ impl ProductionModelRuntime {
                 })
                 .unwrap_or_default();
             adapters.sort();
-            replicas.push(NodeReplicaSnapshot::from_runtime(
+            let deployment_generation = cluster_assignments
+                .get(&status.deployment)
+                .map_or(status.generation, |assignment| {
+                    assignment.deployment_generation
+                });
+            replicas.push(NodeReplicaSnapshot::from_runtime_at_generation(
                 status,
+                deployment_generation,
                 RuntimeReplicaIdentity {
                     model: &compiled.desired.model,
                     variant: variant.as_deref(),
@@ -570,7 +677,10 @@ impl ProductionModelRuntime {
         } else {
             0
         };
-        let digest_material = serde_json::to_vec(&desired.revision).map_err(|error| {
+        let active_revision = cluster_state.as_ref().map_or(&desired.revision, |state| {
+            &state.placement.global().revision
+        });
+        let digest_material = serde_json::to_vec(active_revision).map_err(|error| {
             NodeSnapshotError::Invalid(format!("encode active deployment digest: {error}"))
         })?;
         let active_deployment_digest = hex::encode(Sha256::digest(digest_material));
@@ -689,9 +799,40 @@ impl ProductionModelRuntime {
 
     async fn prepare_candidate(
         self: &Arc<Self>,
-        candidate: RuntimeCandidate,
+        mut candidate: RuntimeCandidate,
     ) -> anyhow::Result<PreparedModelRuntime> {
         let base_epoch = self.epoch.load(Ordering::SeqCst);
+        let cluster_context = crate::cluster_models::current_cluster_model_context();
+        let mut proposed_cluster_state = None;
+        let mut cluster_worker = false;
+        if let Some(context) = cluster_context {
+            let view = crate::cluster::current_model_directory()
+                .map(|directory| directory.load())
+                .unwrap_or_else(|| {
+                    Arc::new(sbproxy_ai::model_directory::ModelDirectoryView::default())
+                });
+            let input = crate::cluster_models::placement_input_from_directory(&view)?;
+            let previous = self
+                .cluster_state
+                .read()
+                .expect("cluster model state lock")
+                .clone();
+            let now_unix_ms = current_unix_time_ms()?;
+            let placement = sbproxy_model_host::reconcile_cluster_placement(
+                &candidate.catalog,
+                previous.as_ref().map(|state| &state.placement),
+                candidate.desired.clone(),
+                input.nodes,
+                &input.observations,
+                now_unix_ms,
+            )?;
+            candidate.desired = placement.local_desired(&context.node_id)?;
+            cluster_worker = context.is_worker;
+            proposed_cluster_state = Some(ClusterRuntimeState {
+                placement,
+                catalog: Arc::clone(&candidate.catalog),
+            });
+        }
         let current_foundation = self
             .foundation
             .read()
@@ -705,6 +846,10 @@ impl ProductionModelRuntime {
         let active_manager = self.active_manager();
 
         let needs_production_manager = !candidate.desired.deployments.is_empty()
+            || (cluster_worker
+                && proposed_cluster_state
+                    .as_ref()
+                    .is_some_and(|state| !state.placement.global().deployments.is_empty()))
             || candidate.desired.control.authority
                 != sbproxy_config::ModelHostAuthority::FileManaged;
         let (manager, foundation, snapshot_preparer) = if !needs_production_manager {
@@ -751,6 +896,7 @@ impl ProductionModelRuntime {
             base_epoch,
             foundation,
             replace_manager,
+            cluster_state: proposed_cluster_state,
         })
     }
 
@@ -785,9 +931,21 @@ impl ProductionModelRuntime {
             .foundation
             .write()
             .expect("model runtime foundation lock") = candidate.foundation;
+        *self
+            .cluster_state
+            .write()
+            .expect("cluster model state lock") = candidate.cluster_state;
         self.epoch.store(next_epoch, Ordering::SeqCst);
         Ok(report)
     }
+}
+
+fn current_unix_time_ms() -> anyhow::Result<u64> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| anyhow::anyhow!("system time before Unix epoch: {error}"))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| anyhow::anyhow!("Unix time milliseconds overflowed"))
 }
 
 async fn publish_cluster_node_snapshot(runtime: &ProductionModelRuntime) -> anyhow::Result<()> {
@@ -898,7 +1056,20 @@ pub fn validate_model_runtime(
     pipeline: &crate::pipeline::CompiledPipeline,
     config_dir: &Path,
 ) -> anyhow::Result<()> {
-    compile_runtime_candidate(pipeline, config_dir).map(|_| ())
+    let candidate = compile_runtime_candidate(pipeline, config_dir)?;
+    if pipeline.config.server.cluster.is_none() {
+        if let Some((deployment, _)) = candidate
+            .desired
+            .deployments
+            .iter()
+            .find(|(_, deployment)| deployment.desired.replicas != 1)
+        {
+            anyhow::bail!(
+                "single-node runtime requires deployment {deployment:?} to use replicas: 1"
+            );
+        }
+    }
+    Ok(())
 }
 
 struct BuiltProductionManager {
@@ -1217,6 +1388,143 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Debug, Default)]
+    struct ClusterFixtureProcess;
+
+    #[async_trait::async_trait]
+    impl sbproxy_model_host::EngineProcess for ClusterFixtureProcess {
+        fn id(&self) -> Option<u32> {
+            Some(17)
+        }
+
+        async fn has_exited(&self) -> Result<bool, sbproxy_model_host::EngineDriverError> {
+            Ok(false)
+        }
+
+        async fn shutdown(
+            &self,
+            _grace: std::time::Duration,
+        ) -> Result<(), sbproxy_model_host::EngineDriverError> {
+            Ok(())
+        }
+
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+    }
+
+    struct ClusterFixtureRuntime {
+        deployment: String,
+        generation: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_model_host::PreparedDeploymentRuntime for ClusterFixtureRuntime {
+        async fn memory_estimate(
+            &self,
+            _intent: sbproxy_model_host::PullIntent,
+        ) -> Result<sbproxy_model_host::MemoryEstimate, sbproxy_model_host::RuntimeManagerError>
+        {
+            Ok(sbproxy_model_host::MemoryEstimate::from_total(0, 1))
+        }
+
+        async fn start(
+            &self,
+            _intent: sbproxy_model_host::PullIntent,
+        ) -> Result<sbproxy_model_host::RunningEngine, sbproxy_model_host::RuntimeManagerError>
+        {
+            Ok(sbproxy_model_host::RunningEngine {
+                deployment: self.deployment.clone(),
+                generation: self.generation,
+                kind: sbproxy_model_host::EngineKind::LlamaCpp,
+                port: 20_017,
+                selected_devices: vec![0],
+                accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+                started_at_ms: 1,
+                artifact_digest: "a".repeat(64),
+                memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1),
+                process: Arc::new(ClusterFixtureProcess),
+            })
+        }
+
+        async fn stop(
+            &self,
+            _grace: std::time::Duration,
+        ) -> Result<(), sbproxy_model_host::RuntimeManagerError> {
+            Ok(())
+        }
+
+        async fn reset(
+            &self,
+        ) -> Result<Option<sbproxy_model_host::OperationJob>, sbproxy_model_host::RuntimeManagerError>
+        {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct ClusterFixturePreparer {
+        fail: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_model_host::DeploymentPreparer for ClusterFixturePreparer {
+        async fn prepare(
+            &self,
+            request: sbproxy_model_host::DeploymentPrepareRequest,
+        ) -> Result<
+            Arc<dyn sbproxy_model_host::PreparedDeploymentRuntime>,
+            sbproxy_model_host::RuntimeManagerError,
+        > {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(sbproxy_model_host::RuntimeManagerError::Prepare(
+                    "injected cluster prepare failure".to_string(),
+                ));
+            }
+            Ok(Arc::new(ClusterFixtureRuntime {
+                deployment: request.deployment_id,
+                generation: request.generation,
+            }))
+        }
+    }
+
+    fn cluster_fixture_node() -> sbproxy_model_host::PlacementNode {
+        use sbproxy_model_host::node_snapshot::{
+            NodeDeviceSnapshot, NodeEngineSnapshot, NodeHealthState, NodeRole,
+        };
+
+        sbproxy_model_host::PlacementNode {
+            node_id: "worker-a".to_string(),
+            roles: BTreeSet::from([NodeRole::Worker]),
+            health: NodeHealthState::Ready,
+            labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
+            model_endpoint: Some("https://worker-a.internal:9443".to_string()),
+            placement_weight: 64_000,
+            engines: vec![NodeEngineSnapshot {
+                engine: sbproxy_model_host::EngineKind::LlamaCpp,
+                availability: sbproxy_model_host::EngineAvailability::Available,
+                version: Some("fixture".to_string()),
+                artifact_formats: vec![sbproxy_model_host::ArtifactFormat::Gguf],
+                accelerators: BTreeSet::from([sbproxy_model_host::AcceleratorKind::Cpu]),
+                supports_container: false,
+                supports_uv: false,
+                reason_code: None,
+            }],
+            devices: vec![NodeDeviceSnapshot {
+                index: 0,
+                vendor: sbproxy_model_host::GpuVendor::Cpu,
+                accelerator: Some(sbproxy_model_host::AcceleratorKind::Cpu),
+                name: "host RAM".to_string(),
+                total_memory_bytes: 64_000_000_000,
+                available_memory_bytes: 64_000_000_000,
+                compute_capability: None,
+                supports_fp8: false,
+            }],
+            artifacts: Vec::new(),
+        }
+    }
 
     fn config_with_serve(serve_yaml: Option<&str>) -> AiHandlerConfig {
         let providers = match serve_yaml {
@@ -1315,6 +1623,102 @@ mod tests {
         );
         assert!(snapshot.health.reason_codes.is_empty());
         assert_eq!(snapshot.placement_weight, 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_assignment_prepare_failure_preserves_prior_plan_and_runtime() {
+        let catalog = Arc::new(Catalog::builtin());
+        let global = sbproxy_model_host::compile_desired_state(
+            sbproxy_model_host::RuntimeDesiredInput {
+                source_revision: "cluster-fixture-1".to_string(),
+                canonical: Some(
+                    serde_yaml::from_str(
+                        r#"
+deployments:
+  coder:
+    model: qwen2.5-0.5b-instruct
+    variant: q4_k_m
+"#,
+                    )
+                    .expect("model host config"),
+                ),
+                managed_providers: Vec::new(),
+                legacy_providers: Vec::new(),
+            },
+            &catalog,
+        )
+        .expect("global desired");
+        let placement = sbproxy_model_host::reconcile_cluster_placement(
+            &catalog,
+            None,
+            global,
+            Vec::new(),
+            &BTreeMap::new(),
+            1_000,
+        )
+        .expect("initial unplaced state");
+        let preparer = Arc::new(ClusterFixturePreparer::default());
+        preparer.fail.store(true, Ordering::SeqCst);
+        let manager = Arc::new(
+            sbproxy_model_host::ModelRuntimeManager::new(
+                catalog.catalog_revision.clone(),
+                preparer.clone(),
+            )
+            .expect("fixture manager"),
+        );
+        let runtime = ProductionModelRuntime {
+            active: ArcSwap::from(manager),
+            foundation: RwLock::new(None),
+            snapshot_preparer: RwLock::new(None),
+            cluster_state: RwLock::new(Some(ClusterRuntimeState { placement, catalog })),
+            epoch: AtomicU64::new(0),
+            commit_lock: tokio::sync::Mutex::new(()),
+        };
+        let context = crate::cluster_models::ClusterModelContext {
+            node_id: "worker-a".to_string(),
+            is_worker: true,
+        };
+        let input = crate::cluster_models::DirectoryPlacementInput {
+            nodes: vec![cluster_fixture_node()],
+            observations: BTreeMap::new(),
+        };
+
+        let error = runtime
+            .reconcile_cluster_input(context.clone(), input.clone(), 1_100)
+            .await
+            .expect_err("injected prepare must abort the placement commit");
+        assert!(error
+            .to_string()
+            .contains("injected cluster prepare failure"));
+        assert!(runtime.current_desired().deployments.is_empty());
+        assert!(runtime
+            .cluster_placement_state()
+            .expect("prior placement")
+            .deployments()["coder"]
+            .target
+            .assignments
+            .is_empty());
+
+        preparer.fail.store(false, Ordering::SeqCst);
+        assert!(runtime
+            .reconcile_cluster_input(context, input, 1_200)
+            .await
+            .expect("retry succeeds"));
+        assert!(runtime.current_desired().deployments.contains_key("coder"));
+        assert_eq!(
+            runtime.status("coder").await.expect("status").state,
+            sbproxy_model_host::DeploymentRuntimeState::Ready
+        );
+        assert_eq!(
+            runtime
+                .cluster_placement_state()
+                .expect("placement")
+                .deployments()["coder"]
+                .target
+                .assignments[0]
+                .node_id,
+            "worker-a"
+        );
     }
 
     #[test]

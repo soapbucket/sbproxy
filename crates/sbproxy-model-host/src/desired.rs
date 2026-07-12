@@ -193,11 +193,6 @@ pub fn compile_desired_state(
     let mut revision_deployments = BTreeMap::new();
     let mut compiled_deployments = BTreeMap::new();
     for (id, deployment) in &control.deployments {
-        if deployment.replicas != 1 {
-            return Err(DesiredStateError::Invalid(format!(
-                "single-node runtime requires deployment {id:?} to use replicas: 1"
-            )));
-        }
         validate_catalog_deployment(id, deployment, catalog)?;
         let desired = lower_canonical_deployment(deployment);
         revision_deployments.insert(id.clone(), desired.clone());

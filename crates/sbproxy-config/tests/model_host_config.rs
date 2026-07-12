@@ -12,6 +12,7 @@ model_host:
   authority: file_managed
   max_parallel_prepares: 2
   safety_margin: 0.10
+  handoff_timeout_ms: 45000
   cache:
     directory: /var/lib/sbproxy/models
     budget_gib: 200
@@ -33,6 +34,7 @@ model_host:
     let host = proxy.model_host.expect("typed model host");
     assert_eq!(host.authority, ModelHostAuthority::FileManaged);
     assert_eq!(host.max_parallel_prepares, 2);
+    assert_eq!(host.handoff_timeout_ms, 45_000);
     assert_eq!(host.deployments["coder"].max_concurrency, Some(4));
     assert_eq!(host.deployments["coder"].spread_by, ["zone", "rack"]);
     host.validate().expect("complete canonical config");

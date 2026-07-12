@@ -478,9 +478,18 @@ impl NodeReplicaSnapshot {
         status: &DeploymentRuntimeStatus,
         identity: RuntimeReplicaIdentity<'_>,
     ) -> Result<Self, NodeSnapshotError> {
+        Self::from_runtime_at_generation(status, status.generation, identity)
+    }
+
+    /// Project runtime truth with an explicit cluster deployment generation.
+    pub fn from_runtime_at_generation(
+        status: &DeploymentRuntimeStatus,
+        deployment_generation: u64,
+        identity: RuntimeReplicaIdentity<'_>,
+    ) -> Result<Self, NodeSnapshotError> {
         let snapshot = Self {
             deployment: status.deployment.clone(),
-            deployment_generation: status.generation,
+            deployment_generation,
             model: identity.model.to_string(),
             variant: identity.variant.map(str::to_string),
             engine: status.engine,
