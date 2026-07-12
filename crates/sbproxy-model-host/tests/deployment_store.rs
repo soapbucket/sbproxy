@@ -18,6 +18,7 @@ fn deployment(model: &str) -> ModelDeployment {
         heterogeneous_variants: false,
         replicas: 1,
         required_labels: BTreeMap::new(),
+        spread_by: Vec::new(),
         pull: PullPolicy::OnDemand,
         warm: false,
         keep_alive_secs: None,
@@ -137,6 +138,12 @@ fn invalid_deployments_and_unpinned_replicas_are_rejected() {
         ("blank variant", {
             let mut value = draft(DeploymentSourceMode::AdminManaged);
             value.deployments.get_mut("assistant").unwrap().variant = Some(" ".to_string());
+            value
+        }),
+        ("duplicate spread label", {
+            let mut value = draft(DeploymentSourceMode::AdminManaged);
+            value.deployments.get_mut("assistant").unwrap().spread_by =
+                vec!["zone".to_string(), "zone".to_string()];
             value
         }),
         ("unpinned replicas", {

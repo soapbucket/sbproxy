@@ -485,6 +485,7 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
         heterogeneous_variants: config.heterogeneous_variants,
         replicas: config.replicas,
         required_labels: config.required_labels.clone(),
+        spread_by: config.spread_by.clone(),
         pull: match config.pull {
             ManagedPullPolicy::OnBoot => PullPolicy::OnBoot,
             ManagedPullPolicy::OnDemand => PullPolicy::OnDemand,
@@ -531,6 +532,7 @@ fn lower_legacy_deployment(
         heterogeneous_variants: false,
         replicas: 1,
         required_labels: BTreeMap::new(),
+        spread_by: Vec::new(),
         pull,
         warm: pull == PullPolicy::OnBoot,
         keep_alive_secs: entry

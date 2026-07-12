@@ -54,6 +54,7 @@ pub mod llama_release;
 pub mod lora;
 pub mod manifest;
 pub mod node_snapshot;
+pub mod placement;
 pub mod probe_cpu;
 #[cfg(all(target_os = "macos", feature = "gpu-apple"))]
 pub mod probe_metal;
@@ -156,6 +157,10 @@ pub use lora::{AdapterRoute, LoraCache};
 pub use manifest::{
     resolve_cache_dir, resolve_cache_dir_default, validate_serve_against_manifest, SourceScheme,
     SERVICE_CACHE_DIR,
+};
+pub use placement::{
+    plan_placement, PlacementAssignment, PlacementError, PlacementNode, PlacementPlan,
+    PlacementRejectionReason, PlacementRequest,
 };
 pub use probe_cpu::{detect_total_memory_bytes, CpuProbe};
 #[cfg(all(target_os = "macos", feature = "gpu-apple"))]

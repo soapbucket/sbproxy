@@ -23,6 +23,7 @@ model_host:
     coder:
       model: qwen2.5-0.5b-instruct
       variant: q4_k_m
+      spread_by: [zone, rack]
       warm: true
       max_concurrency: 4
       queue_timeout_ms: 30000
@@ -33,6 +34,7 @@ model_host:
     assert_eq!(host.authority, ModelHostAuthority::FileManaged);
     assert_eq!(host.max_parallel_prepares, 2);
     assert_eq!(host.deployments["coder"].max_concurrency, Some(4));
+    assert_eq!(host.deployments["coder"].spread_by, ["zone", "rack"]);
     host.validate().expect("complete canonical config");
 
     let encoded = serde_yaml::to_string(&host).expect("serialize model-host config");
@@ -47,6 +49,7 @@ fn generated_proxy_schema_exposes_model_host_deployments() {
 
     assert!(json.contains("\"model_host\""));
     assert!(json.contains("\"deployments\""));
+    assert!(json.contains("\"spread_by\""));
     assert!(json.contains("\"max_parallel_prepares\""));
 }
 
@@ -73,6 +76,17 @@ model_host:
       max_concurrency: 0
 "#,
             "max_concurrency must be positive",
+        ),
+        (
+            "duplicate spread label",
+            r#"
+model_host:
+  deployments:
+    broken:
+      model: qwen2.5-0.5b-instruct
+      spread_by: [zone, zone]
+"#,
+            "spread_by contains an invalid or duplicate label key",
         ),
         (
             "tagged container",

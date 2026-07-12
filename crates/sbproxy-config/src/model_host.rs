@@ -76,6 +76,9 @@ pub struct ManagedDeploymentConfig {
     /// Worker labels required by this deployment.
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,
+    /// Ordered failure-domain label keys used to spread replicas.
+    #[serde(default)]
+    pub spread_by: Vec<String>,
     /// Artifact download policy.
     #[serde(default)]
     pub pull: ManagedPullPolicy,
@@ -412,6 +415,25 @@ fn validate_deployment(
         return Err(ModelHostConfigError::new(format!(
             "deployment {id:?} required labels must have nonempty keys and values"
         )));
+    }
+    if deployment.spread_by.len() > 8 {
+        return Err(ModelHostConfigError::new(format!(
+            "deployment {id:?} spread_by may contain at most 8 label keys"
+        )));
+    }
+    let mut spread_keys = std::collections::BTreeSet::new();
+    for key in &deployment.spread_by {
+        if key.is_empty()
+            || key.len() > 128
+            || !key.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/')
+            })
+            || !spread_keys.insert(key)
+        {
+            return Err(ModelHostConfigError::new(format!(
+                "deployment {id:?} spread_by contains an invalid or duplicate label key"
+            )));
+        }
     }
     Ok(())
 }
