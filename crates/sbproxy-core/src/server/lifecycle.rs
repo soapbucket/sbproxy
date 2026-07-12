@@ -234,6 +234,11 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
         log_capture_header_warnings(al);
     }
 
+    // Reconcile process-owned cluster identity and listeners before any
+    // dependent subsystem observes this candidate configuration. Restart-only
+    // changes reject the reload and leave the installed handle untouched.
+    crate::cluster::reconcile_process_cluster(&compiled.server)?;
+
     // WOR-594: refresh the operator-configured Lua sandbox limits on
     // reload so SIGHUP / hot-reload pick up changes to
     // `proxy.scripting.lua.sandbox:` without restarting the process.
@@ -775,6 +780,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // at-rest crypto, seeds config records, and (for the redis backend/tier)
     // starts the cross-replica invalidation subscriber. Inert when the block is
     // absent or `enabled: false`.
+    // Install the one process-owned cluster before the key plane so the mesh
+    // cache tier consumes this handle instead of opening duplicate listeners.
+    crate::cluster::reconcile_process_cluster(&server_config)?;
+
     if let Some(km) = server_config.key_management.as_ref() {
         if let Err(e) = crate::key_plane::init_key_plane(km) {
             tracing::error!(error = %e, "failed to install dynamic key plane");
@@ -1394,7 +1403,8 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             .health_registry
             .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
                 "mesh_quorum",
-                || match crate::key_plane::current_mesh_node().and_then(|n| n.isolation_observer())
+                || match crate::cluster::current_cluster_handle()
+                    .and_then(|handle| handle.isolation_observer())
                 {
                     None => (
                         sbproxy_observe::ComponentStatus::NotConfigured,

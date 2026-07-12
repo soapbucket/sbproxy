@@ -116,6 +116,7 @@ use probe::{complete_pending_direct, run_probe, sweep_dead_for_gc, sweep_suspect
 /// outgoing PING or ACK. Keeps encrypted UDP datagrams comfortably under
 /// the default 1500-byte MTU even after AEAD overhead and string ids.
 pub const MAX_UPDATES_PER_MSG: usize = 16;
+const MAX_PEER_ENTRIES: usize = 1024;
 
 // --- Wire format ---
 
@@ -143,12 +144,14 @@ pub enum GossipMsg {
         /// Send time in epoch milliseconds.
         ts_ms: u64,
     },
-    /// Reserved for future dynamic-membership join.
+    /// Authenticated dynamic-membership join and routing advertisement.
     Join {
         /// Id of the joining node.
         node_id: String,
-        /// Address the joining node advertises to peers.
+        /// Gossip address the joining node advertises to peers.
         advertise_addr: String,
+        /// Typed-state transport address, when the node accepts routed state.
+        transport_addr: Option<String>,
     },
     /// SWIM direct probe. Carries piggybacked state deltas (L1).
     Ping {
@@ -478,6 +481,10 @@ pub struct GossipLoopConfig {
     pub node_id: String,
     /// UDP port to bind. `0` requests an ephemeral port (tests).
     pub gossip_port: u16,
+    /// Gossip address announced to peers, or the observed source when absent.
+    pub gossip_advertise_addr: Option<String>,
+    /// Typed-state transport address announced to peers.
+    pub transport_advertise_addr: Option<String>,
     /// Legacy MVP knob. Retained so existing callers still compile;
     /// not read by the SWIM loop. Use `swim_protocol_period_ms`.
     pub heartbeat_interval_secs: u64,
@@ -623,18 +630,18 @@ impl GossipLoop {
     /// Bind the UDP socket and spawn the SWIM protocol + receive tasks.
     ///
     /// `peer_addr_map` is the shared `node_id -> host:port` table also
-    /// consumed by the transport layer. The recv task writes back into
-    /// this map every time it learns a new `(node_id, addr)` pair from
-    /// an inbound PING (L3 address refresh). Passing the same `Arc` that
-    /// [`crate::node_handle::MeshNode`] uses for `peer_addr_lookup` means
-    /// `TransportClientPool` routing sees gossip-learned mappings without
-    /// any extra wiring.
+    /// consumed by the transport layer. When `routing_cache` is present,
+    /// authenticated join advertisements promote temporary seed aliases to
+    /// stable node IDs and keep UDP gossip addresses separate from TCP routes.
+    /// Without a routing cache, the legacy observed-UDP behavior remains for
+    /// compatibility callers and focused gossip tests.
     pub async fn start(
         cfg: GossipLoopConfig,
         peers: Arc<RwLock<PeerTable>>,
         evictor: Arc<PeerEvictor>,
         isolation: Arc<IsolationObserver>,
         peer_addr_map: Arc<RwLock<HashMap<String, String>>>,
+        routing_cache: Option<Arc<crate::state::distributed_cache::DistributedCache<bytes::Bytes>>>,
     ) -> Result<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", cfg.gossip_port)).await?;
         let local_port = socket.local_addr()?.port();
@@ -663,6 +670,8 @@ impl GossipLoop {
         // address map, inserting new mappings on first observation and
         // rewriting them when a peer's address changes mid-run.
         let peer_addr_map_recv = peer_addr_map.clone();
+        let routing_cache_recv = routing_cache.clone();
+        let join_routes_are_authoritative = routing_cache.is_some();
         let recv_task: JoinHandle<()> = tokio::spawn(async move {
             let mut buf = [0u8; 1500];
             loop {
@@ -694,7 +703,15 @@ impl GossipLoop {
                                 // Any Ping is implicit evidence that the
                                 // peer is alive; refresh last_ack before
                                 // responding.
-                                record_ack(&peers_recv, &peer_id, from, Some(&peer_addr_map_recv));
+                                record_ack(
+                                    &peers_recv,
+                                    &peer_id,
+                                    from,
+                                    ack_route_map(
+                                        join_routes_are_authoritative,
+                                        &peer_addr_map_recv,
+                                    ),
+                                );
                                 // Apply piggybacked state deltas before
                                 // responding so our ACK can carry fresh
                                 // news back.
@@ -729,7 +746,15 @@ impl GossipLoop {
                                 from: peer_id,
                                 updates,
                             }) => {
-                                record_ack(&peers_recv, &peer_id, from, Some(&peer_addr_map_recv));
+                                record_ack(
+                                    &peers_recv,
+                                    &peer_id,
+                                    from,
+                                    ack_route_map(
+                                        join_routes_are_authoritative,
+                                        &peer_addr_map_recv,
+                                    ),
+                                );
                                 apply_updates(
                                     &updates,
                                     &peers_recv,
@@ -823,7 +848,10 @@ impl GossipLoop {
                                     &peers_recv,
                                     &requester_id,
                                     from,
-                                    Some(&peer_addr_map_recv),
+                                    ack_route_map(
+                                        join_routes_are_authoritative,
+                                        &peer_addr_map_recv,
+                                    ),
                                 );
                             }
                             Ok(GossipMsg::IndirectAck {
@@ -836,17 +864,61 @@ impl GossipLoop {
                                     &peers_recv,
                                     &witness_id,
                                     from,
-                                    Some(&peer_addr_map_recv),
+                                    ack_route_map(
+                                        join_routes_are_authoritative,
+                                        &peer_addr_map_recv,
+                                    ),
                                 );
                                 complete_pending_indirect(&pending_recv, seq, alive).await;
                             }
                             Ok(GossipMsg::Heartbeat { node_id, .. }) => {
                                 // Legacy: count as an ACK so pre-K4
                                 // peers still keep their entry fresh.
-                                record_ack(&peers_recv, &node_id, from, Some(&peer_addr_map_recv));
+                                record_ack(
+                                    &peers_recv,
+                                    &node_id,
+                                    from,
+                                    ack_route_map(
+                                        join_routes_are_authoritative,
+                                        &peer_addr_map_recv,
+                                    ),
+                                );
                             }
-                            Ok(GossipMsg::Join { .. }) => {
-                                // Reserved for future phase.
+                            Ok(GossipMsg::Join {
+                                node_id,
+                                advertise_addr,
+                                transport_addr,
+                            }) => {
+                                let changed = record_join(
+                                    &peers_recv,
+                                    &peer_addr_map_recv,
+                                    routing_cache_recv.as_ref(),
+                                    &node_id_recv,
+                                    JoinAdvertisement {
+                                        node_id: &node_id,
+                                        gossip_addr: &advertise_addr,
+                                        transport_addr: transport_addr.as_deref(),
+                                    },
+                                    from,
+                                );
+                                if changed {
+                                    let join = GossipMsg::Join {
+                                        node_id: node_id.clone(),
+                                        advertise_addr,
+                                        transport_addr,
+                                    };
+                                    for target in live_peer_addresses(&peers_recv, &node_id) {
+                                        if let Ok(target) = target.parse::<SocketAddr>() {
+                                            send_msg(
+                                                &socket_recv,
+                                                cipher_recv.as_ref(),
+                                                &join,
+                                                target,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::debug!(
@@ -918,6 +990,25 @@ impl GossipLoop {
                         // Select a random Alive peer to probe.
                         let candidate = pick_random_alive_peer(&peers_proto);
                         if let Some((target_id, target_addr)) = candidate {
+                            if let Ok(target) = target_addr.parse::<SocketAddr>() {
+                                let join = GossipMsg::Join {
+                                    node_id: protocol_cfg.node_id.clone(),
+                                    advertise_addr: protocol_cfg
+                                        .gossip_advertise_addr
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    transport_addr: protocol_cfg
+                                        .transport_advertise_addr
+                                        .clone(),
+                                };
+                                send_msg(
+                                    &socket_proto,
+                                    cipher_proto.as_ref(),
+                                    &join,
+                                    target,
+                                )
+                                .await;
+                            }
                             run_probe(
                                 target_id,
                                 target_addr,
@@ -1025,6 +1116,148 @@ impl Drop for GossipLoop {
 }
 
 // --- Receive-side helpers ---
+
+fn ack_route_map(
+    join_routes_are_authoritative: bool,
+    map: &Arc<RwLock<HashMap<String, String>>>,
+) -> Option<&Arc<RwLock<HashMap<String, String>>>> {
+    (!join_routes_are_authoritative).then_some(map)
+}
+
+struct JoinAdvertisement<'a> {
+    node_id: &'a str,
+    gossip_addr: &'a str,
+    transport_addr: Option<&'a str>,
+}
+
+fn record_join(
+    peers: &Arc<RwLock<PeerTable>>,
+    peer_addr_map: &Arc<RwLock<HashMap<String, String>>>,
+    routing_cache: Option<&Arc<crate::state::distributed_cache::DistributedCache<bytes::Bytes>>>,
+    local_node_id: &str,
+    join: JoinAdvertisement<'_>,
+    from: SocketAddr,
+) -> bool {
+    let JoinAdvertisement {
+        node_id,
+        gossip_addr: advertised_gossip_addr,
+        transport_addr: advertised_transport_addr,
+    } = join;
+    if node_id == local_node_id || !valid_join_node_id(node_id) {
+        tracing::debug!(node_id, from = %from, "gossip: rejecting invalid join identity");
+        return false;
+    }
+    let gossip_addr =
+        normalize_join_address(advertised_gossip_addr, from).unwrap_or_else(|| from.to_string());
+    let transport_addr = advertised_transport_addr
+        .and_then(|address| normalize_join_address(address, from))
+        .or_else(|| routing_cache.is_none().then(|| gossip_addr.clone()));
+    let route_changed = transport_addr.as_ref().is_some_and(|address| {
+        peer_addr_map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(node_id)
+            != Some(address)
+    });
+    let now = Instant::now();
+
+    let (changed, old_ring_key) = {
+        let mut table = peers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = table.get_mut_by_node_id(node_id) {
+            let old_ring_key = entry.addr.clone();
+            let changed = entry.addr != gossip_addr
+                || !matches!(entry.state, PeerState::Alive)
+                || route_changed;
+            entry.addr.clone_from(&gossip_addr);
+            entry.state = PeerState::Alive;
+            entry.last_ack = now;
+            entry.last_heartbeat = now;
+            entry.last_transition = now;
+            (changed, Some(old_ring_key))
+        } else if let Some((index, entry)) = table.find_unknown_by_addr_mut(from) {
+            let old_ring_key = entry.addr.clone();
+            entry.node_id = node_id.to_string();
+            entry.addr.clone_from(&gossip_addr);
+            entry.state = PeerState::Alive;
+            entry.last_ack = now;
+            entry.last_heartbeat = now;
+            entry.last_transition = now;
+            table.promote_unknown(index);
+            (true, Some(old_ring_key))
+        } else {
+            if table.len() >= MAX_PEER_ENTRIES {
+                tracing::warn!(
+                    node_id,
+                    maximum = MAX_PEER_ENTRIES,
+                    "gossip: rejecting join because the peer table is full"
+                );
+                return false;
+            }
+            table.insert(PeerEntry::new(node_id, &gossip_addr, now));
+            (true, None)
+        }
+    };
+
+    if let Some(old_ring_key) = old_ring_key.as_deref() {
+        if let Some(cache) = routing_cache {
+            cache.remove_node(old_ring_key);
+        }
+        let mut routes = peer_addr_map
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        routes.remove(old_ring_key);
+    }
+    if let Some(transport_addr) = transport_addr.as_deref() {
+        if let Some(cache) = routing_cache {
+            cache.add_node(node_id);
+        }
+        refresh_addr_map(
+            Some(peer_addr_map),
+            node_id,
+            transport_addr,
+            ADDR_MAP_KIND_LEARNED,
+        );
+    }
+    changed
+}
+
+fn valid_join_node_id(node_id: &str) -> bool {
+    !node_id.is_empty()
+        && node_id.len() <= 128
+        && node_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn normalize_join_address(address: &str, from: SocketAddr) -> Option<String> {
+    if address.is_empty() || address.len() > 512 || address.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let (host, port) = address.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok().filter(|port| *port > 0)?;
+    if host.is_empty() {
+        return None;
+    }
+    let host = match host {
+        "0.0.0.0" | "::" | "[::]" => from.ip().to_string(),
+        host => host.to_string(),
+    };
+    Some(format!("{host}:{port}"))
+}
+
+fn live_peer_addresses(peers: &Arc<RwLock<PeerTable>>, excluded_node_id: &str) -> Vec<String> {
+    peers
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|entry| {
+            entry.node_id != excluded_node_id && matches!(entry.state, PeerState::Alive)
+        })
+        .map(|entry| entry.addr.clone())
+        .collect()
+}
 
 /// Apply an inbound ACK (direct, indirect, or legacy heartbeat) to the
 /// peer table. Bumps `last_ack` and, if the peer was Suspect, refutes
@@ -1309,6 +1542,8 @@ mod tests {
         GossipLoopConfig {
             node_id: node_id.to_string(),
             gossip_port: 0,
+            gossip_advertise_addr: None,
+            transport_advertise_addr: None,
             heartbeat_interval_secs: 1,
             failure_check_interval_secs: 1,
             failure_timeout_secs: 5,
@@ -1365,6 +1600,7 @@ mod tests {
             evictor.clone(),
             isolation.clone(),
             peer_addr_map.clone(),
+            None,
         )
         .await
         .expect("bind");
@@ -1379,6 +1615,15 @@ mod tests {
             seq: 42,
             from: "node-a".to_string(),
             updates: Vec::new(),
+        };
+        let bytes = crate::transport::wire::encode(&m).unwrap();
+        let back: GossipMsg = crate::transport::wire::decode(&bytes).unwrap();
+        assert_eq!(back, m);
+
+        let m = GossipMsg::Join {
+            node_id: "node-b".to_string(),
+            advertise_addr: "10.0.0.2:7946".to_string(),
+            transport_addr: Some("10.0.0.2:8946".to_string()),
         };
         let bytes = crate::transport::wire::encode(&m).unwrap();
         let back: GossipMsg = crate::transport::wire::decode(&bytes).unwrap();
@@ -1426,6 +1671,36 @@ mod tests {
         let guard = peers.read().unwrap();
         let entry = guard.get_by_node_id("peer-a").expect("peer-a present");
         assert!(matches!(entry.state, PeerState::Alive));
+    }
+
+    #[test]
+    fn record_join_bounds_dynamic_peer_table() {
+        let now = Instant::now();
+        let entries = (0..MAX_PEER_ENTRIES)
+            .map(|index| {
+                PeerEntry::new(
+                    format!("peer-{index}"),
+                    format!("127.0.0.1:{}", index + 1),
+                    now,
+                )
+            })
+            .collect();
+        let peers = Arc::new(RwLock::new(PeerTable::from_entries(entries)));
+        let routes = Arc::new(RwLock::new(HashMap::new()));
+
+        assert!(!record_join(
+            &peers,
+            &routes,
+            None,
+            "local",
+            JoinAdvertisement {
+                node_id: "overflow",
+                gossip_addr: "127.0.0.1:12000",
+                transport_addr: Some("127.0.0.1:13000"),
+            },
+            "127.0.0.1:12000".parse().unwrap(),
+        ));
+        assert_eq!(peers.read().unwrap().len(), MAX_PEER_ENTRIES);
     }
 
     #[test]
@@ -2608,6 +2883,7 @@ mod tests {
             evictor.clone(),
             isolation.clone(),
             peer_addr_map.clone(),
+            None,
         )
         .await
         .expect("bind");

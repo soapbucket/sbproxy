@@ -4,7 +4,7 @@
 //! aggregates per-node metrics into cluster-wide sums and averages for
 //! monitoring, autoscaling, and alerting.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 /// Aggregates metrics reported by each node in the cluster.
@@ -25,6 +25,12 @@ impl ClusterMetrics {
     pub fn update_node(&self, node_id: &str, metrics: HashMap<String, f64>) {
         let mut guard = self.per_node.lock().expect("mutex poisoned");
         guard.insert(node_id.to_string(), metrics);
+    }
+
+    /// Drop snapshots for nodes no longer present in the caller's live view.
+    pub fn retain_nodes(&self, live_node_ids: &BTreeSet<String>) {
+        let mut guard = self.per_node.lock().expect("mutex poisoned");
+        guard.retain(|node_id, _| live_node_ids.contains(node_id));
     }
 
     /// Sum `metric_name` across all nodes that have reported it.
@@ -133,6 +139,18 @@ mod tests {
         cm.update_node("node-a", metrics(&[("rps", 999.0)]));
 
         assert_eq!(cm.aggregate("rps"), 999.0);
+        assert_eq!(cm.node_count(), 1);
+    }
+
+    #[test]
+    fn retain_nodes_drops_departed_snapshots() {
+        let cm = ClusterMetrics::new();
+        cm.update_node("node-a", metrics(&[("rps", 100.0)]));
+        cm.update_node("node-b", metrics(&[("rps", 200.0)]));
+
+        cm.retain_nodes(&BTreeSet::from(["node-b".to_string()]));
+
+        assert_eq!(cm.aggregate("rps"), 200.0);
         assert_eq!(cm.node_count(), 1);
     }
 

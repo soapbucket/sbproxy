@@ -48,6 +48,8 @@ pub mod agent_class;
 pub mod builtin_enforcers;
 /// P0 edge capture wired into the request pipeline.
 pub mod capture_envelope;
+/// Process owner for the shared local or distributed cluster handle.
+pub mod cluster;
 /// WOR-1721: fleet-wide metric aggregation over the mesh.
 pub mod cluster_metrics;
 pub mod context;

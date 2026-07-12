@@ -1,0 +1,245 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use sbproxy_config::ProxyServerConfig;
+use sbproxy_core::cluster::{ClusterBootstrap, ClusterOwner, SystemClusterBootstrap};
+use sbproxy_mesh::{ClusterHandle, ClusterIdentity, ClusterMode, MeshNode};
+
+fn parse(yaml: &str) -> ProxyServerConfig {
+    serde_yaml::from_str(yaml).expect("proxy config")
+}
+
+fn canonical() -> ProxyServerConfig {
+    parse(
+        r#"
+cluster:
+  cluster_id: cluster-a
+  node_id: worker-a
+  roles: [gateway, worker]
+  labels: {zone: a}
+  gossip_port: 17946
+  transport_port: 18946
+  security:
+    mode: mtls
+    shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
+    cert_file: node.pem
+    key_file: node-key.pem
+    ca_file: ca.pem
+  snapshot_ttl_secs: 30
+  publish_interval_secs: 5
+"#,
+    )
+}
+
+#[derive(Default)]
+struct FakeBootstrap {
+    calls: AtomicUsize,
+    fail: bool,
+}
+
+impl ClusterBootstrap for FakeBootstrap {
+    fn bootstrap(
+        &self,
+        identity: ClusterIdentity,
+        _config: &sbproxy_config::EffectiveClusterConfig,
+    ) -> anyhow::Result<ClusterHandle> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            anyhow::bail!("injected bootstrap failure");
+        }
+        let node_id = identity.node_id.clone();
+        ClusterHandle::distributed(identity, Arc::new(MeshNode::new(node_id, Vec::new(), 32)))
+            .map_err(anyhow::Error::from)
+    }
+}
+
+#[test]
+fn absent_cluster_installs_one_zero_network_local_handle() {
+    let bootstrap = Arc::new(FakeBootstrap::default());
+    let owner = ClusterOwner::new(bootstrap.clone());
+    let first = owner
+        .reconcile(&ProxyServerConfig::default())
+        .expect("local handle");
+    let again = owner
+        .reconcile(&ProxyServerConfig::default())
+        .expect("same local handle");
+
+    assert_eq!(first.mode(), ClusterMode::Local);
+    assert!(ClusterHandle::ptr_eq(&first, &again));
+    assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(owner.settings().expect("settings").snapshot_ttl_secs, 30);
+}
+
+#[test]
+fn canonical_cluster_bootstraps_once_without_key_management() {
+    let bootstrap = Arc::new(FakeBootstrap::default());
+    let owner = ClusterOwner::new(bootstrap.clone());
+    let server = canonical();
+    assert!(server.key_management.is_none());
+
+    let first = owner.reconcile(&server).expect("distributed handle");
+    let again = owner.reconcile(&server).expect("same distributed handle");
+    assert_eq!(first.mode(), ClusterMode::Distributed);
+    assert!(ClusterHandle::ptr_eq(&first, &again));
+    assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first.identity().cluster_id, "cluster-a");
+    assert_eq!(first.identity().node_id, "worker-a");
+}
+
+#[test]
+fn snapshot_cadence_reloads_but_identity_change_requires_restart() {
+    let bootstrap = Arc::new(FakeBootstrap::default());
+    let owner = ClusterOwner::new(bootstrap.clone());
+    let server = canonical();
+    let handle = owner.reconcile(&server).expect("initial handle");
+
+    let mut cadence = server.clone();
+    let cluster = cadence.cluster.as_mut().expect("cluster");
+    cluster.snapshot_ttl_secs = 60;
+    cluster.publish_interval_secs = 10;
+    let reloaded = owner.reconcile(&cadence).expect("cadence reload");
+    assert!(ClusterHandle::ptr_eq(&handle, &reloaded));
+    let settings = owner.settings().expect("settings");
+    assert_eq!(settings.snapshot_ttl_secs, 60);
+    assert_eq!(settings.publish_interval_secs, 10);
+
+    let mut identity = cadence;
+    identity
+        .cluster
+        .as_mut()
+        .expect("cluster")
+        .labels
+        .insert("zone".to_string(), "b".to_string());
+    let error = owner
+        .reconcile(&identity)
+        .expect_err("identity reload must fail");
+    assert!(error.to_string().contains("restart"));
+    assert!(ClusterHandle::ptr_eq(
+        &handle,
+        &owner.current().expect("last good handle")
+    ));
+    assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn enabling_cluster_after_local_start_requires_restart() {
+    let bootstrap = Arc::new(FakeBootstrap::default());
+    let owner = ClusterOwner::new(bootstrap.clone());
+    let local = owner
+        .reconcile(&ProxyServerConfig::default())
+        .expect("local start");
+    let error = owner
+        .reconcile(&canonical())
+        .expect_err("enable requires restart");
+    assert!(error.to_string().contains("restart"));
+    assert!(ClusterHandle::ptr_eq(
+        &local,
+        &owner.current().expect("local remains")
+    ));
+    assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn legacy_mesh_uses_shared_owner_and_retains_local_fallback() {
+    let legacy = parse(
+        r#"
+key_management:
+  enabled: true
+  cache:
+    tier: mesh
+    mesh_node_id: legacy-a
+    mesh:
+      gossip_port: 17947
+      transport_port: 18947
+      shared_key: local-development-secret
+"#,
+    );
+    let successful = Arc::new(FakeBootstrap::default());
+    let owner = ClusterOwner::new(successful.clone());
+    assert_eq!(
+        owner.reconcile(&legacy).expect("legacy distributed").mode(),
+        ClusterMode::Distributed
+    );
+    assert_eq!(successful.calls.load(Ordering::SeqCst), 1);
+
+    let failing = Arc::new(FakeBootstrap {
+        calls: AtomicUsize::new(0),
+        fail: true,
+    });
+    let owner = ClusterOwner::new(failing.clone());
+    let fallback = owner.reconcile(&legacy).expect("legacy fallback");
+    assert_eq!(fallback.mode(), ClusterMode::Local);
+    assert_eq!(fallback.identity().node_id, "legacy-a");
+    assert_eq!(failing.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn canonical_bootstrap_failure_is_fatal_and_not_installed() {
+    let bootstrap = Arc::new(FakeBootstrap {
+        calls: AtomicUsize::new(0),
+        fail: true,
+    });
+    let owner = ClusterOwner::new(bootstrap.clone());
+    let error = owner
+        .reconcile(&canonical())
+        .expect_err("canonical bootstrap fails closed");
+    assert!(error.to_string().contains("injected bootstrap failure"));
+    assert!(owner.current().is_none());
+    assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn production_bootstrap_rejects_missing_mtls_material_before_network_start() {
+    let owner = ClusterOwner::new(Arc::new(SystemClusterBootstrap));
+    let mut server = canonical();
+    let security = &mut server.cluster.as_mut().expect("cluster").security;
+    security.shared_key = Some("local-development-secret".to_string());
+    security.cert_file = Some("/missing/sbproxy-node.pem".to_string());
+    security.key_file = Some("/missing/sbproxy-node-key.pem".to_string());
+    security.ca_file = Some("/missing/sbproxy-ca.pem".to_string());
+
+    let error = owner
+        .reconcile(&server)
+        .expect_err("missing mTLS files must fail closed");
+    let message = format!("{error:#}");
+    assert!(message.contains("read cluster certificate"), "{message}");
+    assert!(owner.current().is_none());
+}
+
+#[test]
+fn canonical_listener_bind_failure_is_fatal_and_uninstalled() {
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("occupy UDP port");
+    let gossip_port = occupied.local_addr().expect("occupied address").port();
+    let transport_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve TCP port")
+        .local_addr()
+        .expect("TCP address")
+        .port();
+    let server = parse(&format!(
+        r#"
+cluster:
+  cluster_id: cluster-a
+  node_id: worker-a
+  roles: [worker]
+  gossip_port: {gossip_port}
+  transport_port: {transport_port}
+  advertise_addr: 127.0.0.1:{gossip_port}
+  transport_advertise_addr: 127.0.0.1:{transport_port}
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+"#
+    ));
+    let owner = ClusterOwner::new(Arc::new(SystemClusterBootstrap));
+
+    let error = owner
+        .reconcile(&server)
+        .expect_err("occupied gossip port must fail closed");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("gossip listener failed to bind"),
+        "{message}"
+    );
+    assert!(owner.current().is_none());
+}

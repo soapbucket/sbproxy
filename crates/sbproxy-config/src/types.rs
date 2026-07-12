@@ -914,6 +914,10 @@ pub struct MeshClusterConfig {
     /// gossip bind when unset.
     #[serde(default)]
     pub advertise_addr: Option<String>,
+    /// Address this node advertises for typed-state transport (`host:port`).
+    /// Defaults to the gossip-advertised host and `transport_port`.
+    #[serde(default)]
+    pub transport_advertise_addr: Option<String>,
     /// Optional cluster-wide shared secret (AES-256-GCM) for the gossip and
     /// transport wire. Accepts an inline value or `env:NAME`. Plaintext when
     /// unset.
@@ -955,6 +959,7 @@ impl Default for MeshClusterConfig {
             gossip_port: default_gossip_port(),
             transport_port: default_transport_port(),
             advertise_addr: None,
+            transport_advertise_addr: None,
             shared_key: None,
             peer_tls: None,
         }

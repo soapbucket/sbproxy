@@ -8,10 +8,9 @@
 //! an external Prometheus scraping every instance and summing with PromQL
 //! (the bundled Grafana dashboards already do this). This module is the
 //! optional in-app alternative for deployments without a Prometheus: when
-//! the mesh key tier is on, each node periodically publishes a compact
-//! snapshot of a curated set of `sbproxy_*` totals into the mesh's
-//! owner-routed distributed cache under `cluster-metrics:{node_id}`, and
-//! collects every live node's snapshot into a process-global
+//! distributed clustering is on, each node periodically publishes a compact
+//! snapshot of a curated set of `sbproxy_*` totals through the process-wide
+//! cluster handle, and collects every live node's snapshot into a process-global
 //! `ClusterMetrics`. The admin endpoint `GET /admin/cluster/metrics`
 //! then reports the fleet sum and node count from one node.
 //!
@@ -19,13 +18,15 @@
 //! a small allow-list, the cadence is coarse, and a node that has not been
 //! seen recently keeps its last snapshot until the mesh drops it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use sbproxy_mesh::cluster_metrics::ClusterMetrics;
-use sbproxy_mesh::gossip_loop::PeerState;
-use sbproxy_mesh::MeshNode;
+use sbproxy_mesh::{ClusterHandle, ClusterMemberState, ClusterStateRead};
+
+const STATE_NAMESPACE: &str = "cluster-metrics";
+const STATE_SCHEMA_VERSION: u32 = 1;
 
 /// The `sbproxy_*` metric families published to the fleet snapshot. Kept
 /// small and additive (counters / gauges that sum meaningfully across
@@ -75,27 +76,29 @@ pub(crate) fn fleet_metrics_json() -> Option<String> {
 
 /// The producer + collector loop: publish this node's snapshot and pull
 /// every live node's snapshot into the aggregator, forever, on the given
-/// cadence. Spawned on the key runtime by `key_plane` when the mesh tier
-/// is on. Failures (a peer briefly unreachable) are skipped; the next
-/// tick re-publishes and re-collects.
-pub(crate) async fn run_loop(node: &'static MeshNode, interval_secs: u64) {
-    let cache = node.distributed_cache();
-    let pool = node.transport_pool();
-    let lookup = node.peer_addr_lookup();
-    let my_id = node.node_id().to_string();
+/// cadence. Spawned on the process-owned cluster runtime whenever distributed
+/// clustering is active. Failures are skipped; the next tick re-publishes and
+/// re-collects.
+pub(crate) async fn run_loop(handle: ClusterHandle, interval_secs: u64) {
+    let my_id = handle.identity().node_id.clone();
+    let mut generation = generation_seed();
     let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     loop {
         tick.tick().await;
 
-        // Publish this node's snapshot to its owner-routed key.
-        if let Ok(bytes) = serde_json::to_vec(&local_snapshot()) {
-            let key = format!("cluster-metrics:{my_id}");
-            if let Err(e) = cache
-                .put_routed(&key, bytes::Bytes::from(bytes), &pool, &lookup)
-                .await
-            {
-                tracing::debug!(error = %e, "cluster-metrics: publish failed (retry next tick)");
-            }
+        generation = generation.saturating_add(1);
+        if let Err(error) = handle
+            .publish_state(
+                STATE_NAMESPACE,
+                &my_id,
+                STATE_SCHEMA_VERSION,
+                generation,
+                Duration::from_secs(interval_secs.max(1).saturating_mul(3)),
+                &local_snapshot(),
+            )
+            .await
+        {
+            tracing::debug!(%error, "cluster-metrics: publish failed (retry next tick)");
         }
 
         let cm = match cluster_metrics() {
@@ -103,31 +106,40 @@ pub(crate) async fn run_loop(node: &'static MeshNode, interval_secs: u64) {
             None => continue,
         };
 
-        // Collect every live node's snapshot (this node plus alive peers).
-        let mut node_ids = vec![my_id.clone()];
-        if let Some(pt) = node.peer_table() {
-            let guard = match pt.read() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            for p in guard.iter() {
-                if matches!(p.state, PeerState::Alive)
-                    && !p.node_id.is_empty()
-                    && p.node_id != my_id
-                {
-                    node_ids.push(p.node_id.clone());
-                }
-            }
-        }
-        for id in node_ids {
-            let key = format!("cluster-metrics:{id}");
-            if let Some(bytes) = cache.get_routed(&key, &pool, &lookup).await {
-                if let Ok(map) = serde_json::from_slice::<HashMap<String, f64>>(&bytes) {
-                    cm.update_node(&id, map);
-                }
+        // Collect every live node's snapshot (this node plus alive peers) and
+        // remove departed nodes from the aggregate.
+        let live_members = handle
+            .membership()
+            .into_iter()
+            .filter(|member| member.node_id == my_id || member.state == ClusterMemberState::Alive)
+            .collect::<Vec<_>>();
+        cm.retain_nodes(
+            &live_members
+                .iter()
+                .map(|member| member.node_id.clone())
+                .collect::<BTreeSet<_>>(),
+        );
+        for member in live_members {
+            if let ClusterStateRead::Present(record) = handle
+                .read_state::<HashMap<String, f64>>(
+                    STATE_NAMESPACE,
+                    &member.node_id,
+                    STATE_SCHEMA_VERSION,
+                )
+                .await
+            {
+                cm.update_node(&member.node_id, record.payload);
             }
         }
     }
+}
+
+fn generation_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

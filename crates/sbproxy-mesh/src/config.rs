@@ -473,6 +473,13 @@ impl MeshConfig {
                 .unwrap_or_else(default_bootstrap_timeout_secs),
             gossip_port: self.gossip_port,
             transport_port: self.transport_port,
+            gossip_advertise_addr: (!self.advertise_addr.is_empty())
+                .then(|| self.advertise_addr.clone()),
+            transport_advertise_addr: self
+                .advertise_addr
+                .rsplit_once(':')
+                .filter(|(host, _)| !host.is_empty() && self.transport_port > 0)
+                .map(|(host, _)| format!("{host}:{}", self.transport_port)),
             heartbeat_interval_secs: self.heartbeat_interval_secs,
             failure_check_interval_secs: self.failure_check_interval_secs,
             failure_timeout_secs: self.failure_timeout_secs,

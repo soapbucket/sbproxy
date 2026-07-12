@@ -60,6 +60,7 @@ proxy:
     gossip_port: 7946
     transport_port: 8946
     advertise_addr: 10.0.0.12:7946
+    transport_advertise_addr: 10.0.0.12:8946
     model_endpoint: https://10.0.0.12:9443
     security:
       mode: mtls
@@ -80,6 +81,11 @@ also requires `shared_key` to authenticate and encrypt UDP SWIM traffic, while
 certificates authenticate the TCP peer transport. Plaintext is not accepted by
 canonical configuration.
 
+`advertise_addr` is the UDP gossip address. `transport_advertise_addr` is the
+TCP typed-state address. The latter defaults to the gossip-advertised host and
+`transport_port`, which is sufficient for GCP private-address deployments; set
+it explicitly when NAT or port translation makes those addresses differ.
+
 An authority node may additionally configure an enrollment store and a
 deployment signing key. A non-authority node may configure only the
 corresponding public verification key. Secret material remains a file or
@@ -93,7 +99,7 @@ seed, advertised address, and security values must agree. The key cache only
 consumes the shared handle and can no longer bootstrap a second mesh.
 
 Node identity, roles, labels, gossip listener, peer transport listener,
-advertised address, and security material are restart-required fields.
+advertised addresses, and security material are restart-required fields.
 Snapshot cadence and deployment content are reloadable. Config planning marks
 restart fields explicitly, and the live reload path refuses an in-process
 identity or listener replacement while retaining the last-good pipeline.
@@ -122,6 +128,12 @@ configuration, reads secret and TLS material, bootstraps the handle once, and
 retains a restart fingerprint. Startup orders cluster installation before key
 plane and model runtime construction. The key cache, mesh counters, and fleet
 metrics receive clones from this owner.
+
+Authenticated join messages carry the stable node ID plus distinct gossip and
+typed-state addresses. Joining promotes bootstrap seed addresses to stable
+ring identities, floods new membership to known peers, and leaves routed state
+unavailable until a valid transport address is known. UDP observations never
+overwrite the TCP route table.
 
 ## Identity and enrollment
 

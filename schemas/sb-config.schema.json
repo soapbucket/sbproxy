@@ -1890,6 +1890,14 @@
             "null"
           ]
         },
+        "transport_advertise_addr": {
+          "description": "Typed-state transport address advertised to peers in `host:port` form. Defaults to the gossip-advertised host and `transport_port`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "model_endpoint": {
           "description": "Private model-plane endpoint advertised by worker nodes.",
           "default": null,
@@ -3199,6 +3207,14 @@
         },
         "advertise_addr": {
           "description": "Address this node advertises to peers (`host:port`). Defaults to the gossip bind when unset.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transport_advertise_addr": {
+          "description": "Address this node advertises for typed-state transport (`host:port`). Defaults to the gossip-advertised host and `transport_port`.",
           "default": null,
           "type": [
             "string",

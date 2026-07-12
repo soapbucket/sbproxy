@@ -135,6 +135,10 @@ pub struct ClusterConfig {
     /// Address advertised to peers in `host:port` form.
     #[serde(default)]
     pub advertise_addr: Option<String>,
+    /// Typed-state transport address advertised to peers in `host:port` form.
+    /// Defaults to the gossip-advertised host and `transport_port`.
+    #[serde(default)]
+    pub transport_advertise_addr: Option<String>,
     /// Private model-plane endpoint advertised by worker nodes.
     #[serde(default)]
     pub model_endpoint: Option<String>,
@@ -215,6 +219,9 @@ impl ClusterConfig {
         }
         if let Some(address) = self.advertise_addr.as_deref() {
             validate_host_port("advertise_addr", address)?;
+        }
+        if let Some(address) = self.transport_advertise_addr.as_deref() {
+            validate_host_port("transport_advertise_addr", address)?;
         }
         if let Some(endpoint) = self.model_endpoint.as_deref() {
             validate_model_endpoint(endpoint, self.security.mode == ClusterSecurityMode::Mtls)?;
@@ -378,10 +385,12 @@ fn validate_shared_key_reference(reference: &str) -> Result<(), ClusterConfigErr
             "security.shared_key contains an unresolved environment reference",
         ));
     }
-    if reference.starts_with("env:")
-        || reference.starts_with("file:")
-        || reference.starts_with("vault://")
-    {
+    if reference.starts_with("vault://") {
+        return Err(ClusterConfigError::invalid(
+            "security.shared_key does not resolve vault:// directly; inject it with env: or file:",
+        ));
+    }
+    if reference.starts_with("env:") || reference.starts_with("file:") {
         return Ok(());
     }
     if reference.len() < 16 {
@@ -482,6 +491,8 @@ pub struct EffectiveClusterConfig {
     pub transport_port: u16,
     /// Advertised peer address.
     pub advertise_addr: Option<String>,
+    /// Advertised typed-state transport address.
+    pub transport_advertise_addr: Option<String>,
     /// Private model-plane endpoint.
     pub model_endpoint: Option<String>,
     /// Peer-security source material.
@@ -517,6 +528,8 @@ pub struct ClusterRestartFingerprint {
     pub transport_port: u16,
     /// Advertised peer address.
     pub advertise_addr: Option<String>,
+    /// Advertised typed-state transport address.
+    pub transport_advertise_addr: Option<String>,
     /// Advertised private model endpoint.
     pub model_endpoint: Option<String>,
     /// Peer-security source material.
@@ -539,6 +552,7 @@ impl EffectiveClusterConfig {
             gossip_port: self.gossip_port,
             transport_port: self.transport_port,
             advertise_addr: self.advertise_addr.clone(),
+            transport_advertise_addr: self.transport_advertise_addr.clone(),
             model_endpoint: self.model_endpoint.clone(),
             security: self.security.clone(),
             enrollment: self.enrollment.clone(),
@@ -589,6 +603,7 @@ fn lower_canonical(config: &ClusterConfig, source: ClusterConfigSource) -> Effec
         gossip_port: config.gossip_port,
         transport_port: config.transport_port,
         advertise_addr: config.advertise_addr.clone(),
+        transport_advertise_addr: config.transport_advertise_addr.clone(),
         model_endpoint: config.model_endpoint.clone(),
         security: lower_canonical_security(&config.security),
         snapshot_ttl_secs: config.snapshot_ttl_secs,
@@ -626,6 +641,7 @@ fn lower_legacy(node_id: Option<&str>, mesh: &MeshClusterConfig) -> EffectiveClu
         gossip_port: mesh.gossip_port,
         transport_port: mesh.transport_port,
         advertise_addr: mesh.advertise_addr.clone(),
+        transport_advertise_addr: mesh.transport_advertise_addr.clone(),
         model_endpoint: None,
         security: lower_legacy_security(mesh),
         snapshot_ttl_secs: DEFAULT_SNAPSHOT_TTL_SECS,
@@ -687,6 +703,11 @@ fn ensure_legacy_matches(
         "advertise_addr",
         &canonical.advertise_addr,
         &mesh.advertise_addr,
+    )?;
+    compare(
+        "transport_advertise_addr",
+        &canonical.transport_advertise_addr,
+        &mesh.transport_advertise_addr,
     )?;
     if mesh.peer_tls.is_some() || mesh.shared_key.is_some() {
         let legacy_security = lower_legacy_security(mesh);

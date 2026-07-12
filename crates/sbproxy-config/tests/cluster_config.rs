@@ -22,6 +22,7 @@ cluster:
   gossip_port: 7946
   transport_port: 8946
   advertise_addr: 10.0.0.12:7946
+  transport_advertise_addr: 10.0.0.12:8946
   model_endpoint: https://10.0.0.12:9443
   security:
     mode: mtls
@@ -47,6 +48,10 @@ cluster:
     assert_eq!(effective.cluster_id, "prod-a");
     assert_eq!(effective.node_id.as_deref(), Some("worker-a"));
     assert_eq!(
+        effective.transport_advertise_addr.as_deref(),
+        Some("10.0.0.12:8946")
+    );
+    assert_eq!(
         effective.security.mode(),
         EffectiveClusterSecurityMode::Mtls
     );
@@ -67,6 +72,7 @@ fn generated_proxy_schema_exposes_cluster_contract() {
         "node_id",
         "roles",
         "labels",
+        "transport_advertise_addr",
         "security",
         "snapshot_ttl_secs",
         "publish_interval_secs",
@@ -155,6 +161,21 @@ security:
 "#,
         ),
         (
+            "invalid transport advertise address",
+            r#"
+cluster_id: prod-a
+node_id: worker-a
+roles: [worker]
+transport_advertise_addr: missing-port
+security:
+  mode: mtls
+  shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
+  cert_file: node.pem
+  key_file: node-key.pem
+  ca_file: ca.pem
+"#,
+        ),
+        (
             "expiry shorter than two publishes",
             r#"
 cluster_id: prod-a
@@ -193,6 +214,18 @@ security:
   mode: shared_key
   development: true
   shared_key: too-short
+"#,
+        ),
+        (
+            "unresolved vault shared key",
+            r#"
+cluster_id: dev-a
+node_id: worker-a
+roles: [worker]
+security:
+  mode: shared_key
+  development: true
+  shared_key: vault://secret/data/sbproxy#cluster
 "#,
         ),
     ];
@@ -256,6 +289,7 @@ key_management:
       gossip_port: 7947
       transport_port: 8947
       advertise_addr: 10.0.0.12:7947
+      transport_advertise_addr: 10.0.0.12:8947
       shared_key: env:SBPROXY_CLUSTER_KEY
 "#,
     );
@@ -267,6 +301,10 @@ key_management:
     assert_eq!(effective.node_id.as_deref(), Some("legacy-worker"));
     assert_eq!(effective.gossip_port, 7947);
     assert_eq!(effective.transport_port, 8947);
+    assert_eq!(
+        effective.transport_advertise_addr.as_deref(),
+        Some("10.0.0.12:8947")
+    );
     assert_eq!(
         effective.security,
         EffectiveClusterSecurity::SharedKey {
@@ -291,6 +329,7 @@ cluster:
   gossip_port: 7947
   transport_port: 8947
   advertise_addr: 10.0.0.12:7947
+  transport_advertise_addr: 10.0.0.12:8947
   security:
     mode: shared_key
     development: true
@@ -305,6 +344,7 @@ key_management:
       gossip_port: 7947
       transport_port: 8947
       advertise_addr: 10.0.0.12:7947
+      transport_advertise_addr: 10.0.0.12:8947
       shared_key: env:SBPROXY_CLUSTER_KEY
 "#,
     );
@@ -394,6 +434,20 @@ cluster:
     assert_ne!(
         base_effective.restart_fingerprint(),
         identity_effective.restart_fingerprint()
+    );
+
+    let mut routing = base;
+    routing
+        .cluster
+        .as_mut()
+        .expect("cluster")
+        .transport_advertise_addr = Some("10.0.0.12:8946".to_string());
+    let routing_effective = resolve_effective_cluster(&routing)
+        .expect("routing")
+        .expect("enabled");
+    assert_ne!(
+        base_effective.restart_fingerprint(),
+        routing_effective.restart_fingerprint()
     );
 }
 

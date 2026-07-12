@@ -1520,6 +1520,7 @@ origins:
             "proxy.cluster.gossip_port",
             "proxy.cluster.transport_port",
             "proxy.cluster.advertise_addr",
+            "proxy.cluster.transport_advertise_addr",
             "proxy.cluster.model_endpoint",
             "proxy.cluster.security.mode",
             "proxy.cluster.security.cert_file",
