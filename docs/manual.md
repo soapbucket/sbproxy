@@ -131,6 +131,7 @@ sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
                            [--port <port>] [--admin-port <port>]
                            [--cache-dir <path>] [--dry-run]
 sbproxy models [list|show <id>|pull [<id>...]|remove <id>|ps|stop <deployment>]
+sbproxy cluster {init|token create|enroll|status}
 sbproxy update [--self]
 sbproxy ai ledger <subcommand>
 sbproxy doctor [--format text|json]
@@ -152,6 +153,7 @@ The full subcommand set, one line each:
 | `projections` | Render projection documents (robots.txt, llms.txt, ...) for an origin without starting the proxy. |
 | `run` | Resolve a certified artifact, generate local admin auth, warm a canonical managed deployment, then print an OpenAI-compatible endpoint. |
 | `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, or drain and stop one. |
+| `cluster` | Initialize cluster identity, create one-time enrollment tokens, enroll nodes, or inspect the complete roster, placement, and unhealthy-node alerts. |
 | `update` | Check the engine release feed and cached models for freshness; `--self` also checks the sbproxy binary. Report-only. |
 | `ai` | AI gateway tools; `ai ledger` verifies the usage ledger. |
 | `doctor` | Diagnose what this binary can do on the current host. |
@@ -167,6 +169,25 @@ deployments and compatibility `serve:` entries plus the catalog's `on_boot`
 set. It inherits exact variant and engine pins, cache location, budget, and
 protection, verifies artifacts, and starts no engine. See
 [model-host.md](model-host.md).
+
+For a cluster authority and worker:
+
+```bash
+sbproxy cluster init --dir /var/lib/sbproxy/cluster \
+  --cluster-id production-models --node-id authority-a
+sbproxy cluster token create --dir /var/lib/sbproxy/cluster \
+  --role worker --label zone=us-central1-b
+sbproxy cluster enroll --url https://authority.internal:9090 \
+  --node-id worker-b --role worker --label zone=us-central1-b \
+  --out /var/lib/sbproxy/cluster
+sbproxy cluster status --format json
+```
+
+Enrollment tokens are one-time and secret. Prefer
+`SBPROXY_CLUSTER_TOKEN` to a command-line value. `cluster status` uses
+`SB_ADMIN_URL`, `SB_ADMIN_USERNAME`, and `SB_ADMIN_PASSWORD` by default and
+preserves every unhealthy member in the node list while also returning a
+dedicated alert collection. See [model-host.md](model-host.md#cluster-configuration).
 
 ### `serve` - start the proxy
 

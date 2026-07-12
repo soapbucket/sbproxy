@@ -15,10 +15,47 @@ certification.
 | Apple Silicon Metal | passed 2026-07-11 | Real managed GGUF completion, status and stop truth, cache reuse, maintenance health, and ready-engine Ctrl-C shutdown on Apple M4 Max. |
 | NVIDIA CUDA single node | pending final GCP PR | Deterministic T4/L4 descriptors, vLLM plans, container isolation, and CUDA llama.cpp source-build tests exist. No live claim is made in this PR. |
 | NVIDIA multi-GPU | pending final GCP PR | Placement and device-scoping tests only. |
-| Three-node GCP runtime | pending final GCP PR | Cluster membership, placement, peer transport, and fleet operations land in later PR groups. |
+| Local multi-process cluster control | passed 2026-07-11 | Four real processes, encrypted gossip, mTLS typed state, shared key/model mesh, verified fake artifact and engine, placement convergence, worker loss, replacement, unhealthy-node admin callout, and cleanup. |
+| Three-node GCP runtime | pending final GCP PR | Local control-plane convergence is complete. Live GCP membership, remote inference dispatch, streaming failure drills, and hardware evidence remain pending. |
 
 The generated [capability matrix](model-host-capabilities.md) records Apple
-Metal as stable. NVIDIA stays at `preview` until the final GCP gate is recorded.
+Metal and the deterministic cluster control plane as stable. NVIDIA stays at
+`preview`, and remote dispatch stays `unsupported`, until their owning gates are
+recorded.
+
+### Local multi-process evidence from 2026-07-11
+
+The hermetic fixture runs one authority, one gateway, and two workers as real
+`sbproxy` child processes. It creates an ephemeral CA, per-node certificates,
+an authenticated gossip key, distinct state and model caches, and temporary
+UDP, transport, proxy, admin, and engine ports. A tiny local catalog artifact is
+verified through the production artifact manager and launched through the typed
+llama.cpp driver into an e2e-only health server.
+
+```bash
+cargo build -p sbproxy
+SBPROXY_E2E_BIN=target/debug/sbproxy \
+  cargo test -p sbproxy-e2e --test model_cluster_control -- --nocapture
+```
+
+The gate proves:
+
+- every process converges on the same eligible directory and exact assignment;
+- the key cache and model controller reuse one gossip and transport mesh;
+- a control-only node can retain a non-builtin global catalog without creating
+  an engine;
+- removing the assigned worker keeps it in the full node roster, excludes it
+  from model eligibility, and adds a nonempty `unhealthy_nodes` alert;
+- the remaining worker takes the deterministic replacement assignment and
+  reports exact readiness before every surviving admin view converges;
+- dropping all children releases gossip, transport, admin, and fake-engine
+  resources.
+
+Pure placement, directory, and rollout suites additionally prove suspect,
+dead, unreachable, stale, malformed, and incompatible exclusion; minimal
+movement; partition-local routing; digest mismatch and recovery; and rolling
+versus recreate ordering. This is local control-plane certification, not GCP or
+remote inference certification.
 
 ### Apple Metal evidence from 2026-07-11
 
@@ -48,6 +85,9 @@ cargo test -p sbproxy-model-host --test runtime_reconcile
 cargo test -p sbproxy-model-host --test local_admission
 cargo test -p sbproxy-core --test model_host_reload
 cargo test -p sbproxy --test models_lifecycle_cli
+cargo test -p sbproxy-model-host --test placement
+cargo test -p sbproxy-core --test cluster_control_plane
+cargo test -p sbproxy-e2e --test model_cluster_control -- --nocapture
 ```
 
 They prove immutable artifact selection, process argv, container isolation,
@@ -94,8 +134,9 @@ to `stable`; regenerate the matrix whenever this record changes.
 
 ## Final GCP NVIDIA gate
 
-The user explicitly reserved NVIDIA and multi-node validation for the final PR
-group. Run this procedure only after the cluster and fleet slices have landed.
+The user explicitly reserved NVIDIA and live GCP multi-node validation for the
+final PR group. Run this procedure only after the distributed data plane,
+governance, and operator-product slices have landed.
 
 ### Provision an L4 worker
 
@@ -172,12 +213,13 @@ selected. A generic engine error is not acceptable evidence.
 
 ### Multi-node gate
 
-After cluster authority exists, provision three GCP nodes with mixed labels or
-devices. Record membership convergence, deterministic placement, peer identity,
-revision propagation, request dispatch, node loss, replacement, and fleet CLI
+Provision three GCP nodes with mixed labels or devices. Record membership
+convergence, deterministic placement, peer identity, signed revision
+propagation, request dispatch, node loss, replacement, and fleet CLI and admin
 status. A worker must never select a variant outside the catalog or receive an
 artifact path from another node without passing the peer and artifact trust
-boundaries.
+boundaries. Capture the complete roster and unhealthy-node alert before and
+after recovery.
 
 ## Evidence retention
 

@@ -25,7 +25,8 @@ Registry version: `1`
 | `lifecycle.atomic_reconciliation` | `lifecycle` | `stable` | contract.canonical_desired_state_reconciles_atomically<br>test.runtime_reconcile<br>test.model_host_reload | Startup, file reload, SIGHUP, and admin reload prepare a complete revision before swapping the last good runtime. |
 | `lifecycle.single_node_residency` | `lifecycle` | `stable` | contract.eviction_changes_admission | Single-node residency honors the global resident limit and configured eviction policy across devices. |
 | `lifecycle.keep_alive` | `lifecycle` | `stable` | contract.keep_alive_starts_after_last_permit<br>test.local_admission<br>test.runtime_reconcile | Keep-alive starts after the last completed request and never expires active or queued work. |
-| `cluster.managed_replicas` | `cluster` | `unsupported` | none | Managed multi-node placement and dispatch are reserved for later PR groups. |
+| `cluster.managed_replicas` | `cluster` | `stable` | contract.cluster_placement_converges<br>test.placement<br>test.runtime_reconcile<br>test.cluster_control_plane<br>test.model_cluster_control | Managed replicas use versioned worker snapshots, deterministic placement and spread, readiness-gated rollout, and authenticated cluster health status. |
+| `cluster.remote_dispatch` | `cluster` | `unsupported` | none | Remote inference dispatch and streaming over the private model plane land in the distributed data-plane PR. |
 | `policy.local_provider_governance` | `policy` | `preview` | none | Local providers remain behind the existing gateway policy path. |
 | `admin.model_status` | `admin` | `stable` | contract.status_reports_stable_lifecycle<br>test.models_lifecycle_cli<br>test.admin_model_host | Authenticated admin status, load, stop, drain, and reset adapt the shared runtime lifecycle. |
 | `admin.model_management` | `admin` | `unsupported` | none | Persistent desired-state mutation and model-management UI land in the operator-product PR. |

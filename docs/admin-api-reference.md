@@ -1,10 +1,11 @@
 # Admin API reference
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-11*
 
 The embedded admin server publishes a small set of HTTP routes for
-operator tooling: liveness probes, request log, per-target health,
-hot reload, drift detection, and the emitted OpenAPI document.
+operator tooling: liveness probes, request log, per-target health, managed
+model and cluster state, hot reload, drift detection, and the emitted OpenAPI
+document.
 
 This page is the per-route reference. For the operator workflow
 (enabling the server, picking a port, IP allowlisting), see
@@ -359,6 +360,119 @@ someone hand-edited the file out of band.
 
 ---
 
+## Cluster control plane
+
+### `GET /admin/cluster/status`
+
+Returns one versioned snapshot for the complete cluster view. This is an
+authenticated read route and returns `405` for other methods.
+
+```json
+{
+  "schema_version": 1,
+  "configured": true,
+  "mode": "distributed",
+  "cluster_id": "production-models",
+  "local_node_id": "gateway-a",
+  "generated_at_unix_ms": 1783790000000,
+  "directory_collected_at_unix_ms": 1783789999500,
+  "directory_age_ms": 500,
+  "summary": {
+    "total_nodes": 4,
+    "healthy_nodes": 3,
+    "degraded_nodes": 0,
+    "unhealthy_nodes": 1,
+    "eligible_workers": 1,
+    "eligible_replicas": 1,
+    "deployment_digest_mismatch": false,
+    "deployments": 1,
+    "ready_deployments": 1,
+    "rollouts_in_progress": 0,
+    "unplaced_replicas": 0
+  },
+  "deployment_authority": {
+    "configured": true,
+    "read_only": true,
+    "verifying_key_id": "<key-id>",
+    "active_revision": 7,
+    "active_content_digest": "<sha256>",
+    "signer_node_id": "authority-a"
+  },
+  "deployments": [],
+  "nodes": [],
+  "unhealthy_nodes": [
+    {
+      "node_id": "worker-b",
+      "health": "unhealthy",
+      "reasons": ["membership_dead"],
+      "membership_state": "dead",
+      "last_ack_age_ms": 8200,
+      "snapshot_age_ms": 8400,
+      "model_endpoint": "https://worker-b.internal:9443"
+    }
+  ]
+}
+```
+
+`nodes` always contains every current membership record, including failed and
+excluded members. A node row carries `membership_state`, `last_ack_age_ms`,
+`incarnation`, `health`, `unhealthy`, `unhealthy_reasons`, roles, labels,
+endpoint, `model_eligible`, exclusion reason, snapshot age/generation/schema,
+reported health, engine/device/ready-artifact counts, and replica observations.
+The smaller `unhealthy_nodes` array is the alert feed for operator consoles; it
+does not replace the complete table.
+
+Each deployment row includes the desired and placed counts, generation, phase,
+readiness, timeout and handoff deadline, target assignments, retained and
+draining assignments, unplaced count, and per-node rejection reasons. Suspect,
+dead, unreachable, stale, incompatible, and unhealthy workers are visible but
+ineligible.
+
+### `GET`, `POST /admin/cluster/deployments`
+
+`GET` returns the locally active verified restricted bundle, signer node and
+key, and whether this process is read-only. It returns `404` with code
+`deployment_bundle_missing` before any bundle is active.
+
+`POST` accepts a strict draft on the configured signing authority only:
+
+```json
+{
+  "catalog_revision": "builtin-2026-07-10",
+  "revision": 8,
+  "deployments": {
+    "local-qwen": {
+      "model": "qwen2.5-0.5b-instruct",
+      "variant": "q4_k_m",
+      "replicas": 2,
+      "spread_by": ["zone"],
+      "pull": "on_boot",
+      "warm": true,
+      "engine": "llama_cpp",
+      "rollout": "rolling"
+    }
+  }
+}
+```
+
+Success is `202` with revision, content digest, signer node/key, and
+`status: "published"`. Unknown or secret-bearing fields return
+`400 invalid_bundle`; stale revisions return `409 stale_revision`; equal revision
+with different content returns `409 revision_conflict`; a non-authority returns
+`403 deployment_authority_read_only`.
+
+### `POST /admin/cluster/enroll`
+
+This is the only `/admin/cluster/*` route that does not use an existing admin
+credential. It accepts a bounded CSR request carrying an expiring one-time
+enrollment token. Successful token consumption is atomic and returns the
+CA-signed node identity material. Token replay, role or label escalation,
+authority-role escalation, malformed CSRs, and oversized requests fail closed.
+Use `sbproxy cluster enroll` instead of constructing this wire document by
+hand.
+
+---
+
 ## Admin UI (`GET /admin/ui`, `GET /`)
 
 The admin server serves a browser dashboard at `/admin/ui` for
@@ -373,6 +487,12 @@ embedded: build the UI assets first (`cd ui && pnpm install && pnpm
 build`), then compile the proxy with `--features embed-admin-ui`.
 Default builds skip the embed and `/admin/ui` returns a `404` whose
 body spells out those two steps.
+
+The current UI does not yet render the cluster roster or mutate model desired
+state. The operator-product PR will consume `GET /admin/cluster/status` for a
+cluster summary, complete node table, and prominent unhealthy-node callouts,
+then add mode-aware model selection and deployment management. The API and CLI
+contracts above are available before that UI lands.
 
 ---
 
@@ -431,6 +551,11 @@ curl -s -u admin:secret \
 # Watch per-target health.
 curl -s -u admin:secret \
   http://127.0.0.1:9090/api/health/targets | jq '.origins[].targets'
+
+# Show the full cluster roster and unhealthy-node alerts.
+curl -s -u admin:secret \
+  http://127.0.0.1:9090/admin/cluster/status \
+  | jq '{summary,nodes,unhealthy_nodes}'
 
 # Inspect the last 50 requests.
 curl -s -u admin:secret \

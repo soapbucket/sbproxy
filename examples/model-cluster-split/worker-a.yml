@@ -1,0 +1,57 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+
+proxy:
+  http_bind_port: 18082
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 19092
+    username: admin
+    password: ${SB_ADMIN_PASSWORD:-change-this-before-running}
+  cluster:
+    cluster_id: model-cluster-split
+    node_id: worker-a
+    roles: [worker]
+    labels: {zone: local-a}
+    seeds: [127.0.0.1:17946]
+    gossip_port: 17948
+    transport_port: 18948
+    advertise_addr: 127.0.0.1:17948
+    transport_advertise_addr: 127.0.0.1:18948
+    model_endpoint: https://127.0.0.1:19443
+    state_dir: ./state/worker-a
+    security:
+      mode: mtls
+      shared_key: file:./state/worker-a/gossip.key
+      cert_file: ./state/worker-a/node.pem
+      key_file: ./state/worker-a/node-key.pem
+      ca_file: ./state/worker-a/ca.pem
+      server_name: sbproxy-mesh
+    snapshot_ttl_secs: 10
+    publish_interval_secs: 2
+  model_host:
+    authority: file_managed
+    handoff_timeout_ms: 15000
+    cache:
+      directory: ./state/worker-a/models
+      budget_gib: 4
+      max_resident_models: 1
+    engines:
+      llama_cpp:
+        launch: binary
+        version: b9905
+        acceleration: auto
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+        replicas: 2
+        spread_by: [zone]
+        pull: on_boot
+        warm: true
+        engine: llama_cpp
+        rollout: rolling
+
+origins:
+  "worker-a.local":
+    action: {type: static, status_code: 200, body: worker-a}

@@ -1426,6 +1426,13 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "handoff_timeout_ms": {
+          "description": "Maximum rolling placement handoff time while prior replicas are retained.",
+          "default": 60000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "cache": {
           "description": "Artifact cache and residency policy.",
           "default": {
@@ -1687,6 +1694,14 @@
             "type": "string"
           }
         },
+        "spread_by": {
+          "description": "Ordered failure-domain label keys used to spread replicas.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "pull": {
           "description": "Artifact download policy.",
           "default": "on_demand",
@@ -1900,6 +1915,14 @@
         },
         "model_endpoint": {
           "description": "Private model-plane endpoint advertised by worker nodes.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state_dir": {
+          "description": "Writable durable state stored with this installed node identity.",
           "default": null,
           "type": [
             "string",

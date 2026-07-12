@@ -2,11 +2,11 @@
 
 *Last modified: 2026-07-11*
 
-SBproxy can own a model process on the same node as the gateway. The stable
-single-node configuration lives under `proxy.model_host`; an AI provider with
+SBproxy can own model processes on one worker or place them across a managed
+cluster. Desired models live under `proxy.model_host`; an AI provider with
 `provider_type: managed_model` exposes a deployment to clients. Requests still
 pass through the normal key, policy, budget, routing, and usage planes before
-they reach the engine.
+they reach a local engine.
 
 Use this page for the managed runtime. Provider-level `serve:` blocks still
 load during the compatibility window, but new configurations should use the
@@ -27,12 +27,22 @@ The worker-local runtime is complete enough to operate as one coherent system:
 - Startup and every reload path prepare the full candidate before changing
   routes. A bad candidate leaves the last good runtime in place.
 - The CLI can pull, inspect, remove, list running deployments, and stop one.
+- One process-owned cluster handle carries key-cache and model-control state.
+  Versioned worker snapshots feed a lock-free directory, deterministic
+  placement, failure-domain spread, and readiness-gated rollout.
+- An authenticated admin status contract lists every member and separates
+  unhealthy-node alerts from the complete node roster.
+- File-managed clusters report deployment digest drift. Cluster-authority mode
+  verifies an Ed25519-signed, content-addressed desired-state bundle before the
+  same atomic runtime commit used by file reload.
 
-This PR is a single-node runtime. Persistent desired-state editing in the admin
-UI, cluster membership, placement, peer dispatch, and fleet commands are later
-work. Apple Metal receives a real completion test before this PR is published.
-Live NVIDIA and multi-node certification on GCP is deliberately reserved for
-the final integration PR. The generated
+This PR completes the cluster control plane, not the distributed inference data
+plane. A gateway can inspect placement and operate a co-located assigned
+replica, but it does not dispatch a request to a remote worker until the next
+data-plane PR. Persistent model selection and desired-state editing in the
+admin UI remain in the operator-product PR. Live NVIDIA and multi-node
+certification on GCP is deliberately reserved for the final integration PR.
+The generated
 [capability matrix](model-host-capabilities.md) records this boundary.
 
 ## Canonical configuration
@@ -106,19 +116,176 @@ engine process.
 The complete runnable example is
 [`examples/model-host-managed`](../examples/model-host-managed).
 
+## Cluster configuration
+
+`proxy.cluster` is the canonical cluster surface. Every process owns exactly
+one local or distributed handle. When `key_management.cache.tier: mesh` is also
+configured, its legacy mesh fields must match and the key cache reuses this
+handle instead of opening a second gossip or transport listener.
+
+The node-specific portion of a production worker looks like this:
+
+```yaml
+proxy:
+  cluster:
+    cluster_id: production-models
+    node_id: worker-a
+    roles: [worker]
+    labels: {region: us-central1, zone: us-central1-a, accelerator: l4}
+    seeds: [10.10.0.10:7946]
+    gossip_port: 7946
+    transport_port: 8946
+    advertise_addr: 10.10.0.21:7946
+    transport_advertise_addr: 10.10.0.21:8946
+    model_endpoint: https://10.10.0.21:9443
+    state_dir: /var/lib/sbproxy/cluster
+    snapshot_ttl_secs: 30
+    publish_interval_secs: 5
+    security:
+      mode: mtls
+      shared_key: file:/var/lib/sbproxy/cluster/gossip.key
+      cert_file: /var/lib/sbproxy/cluster/node.pem
+      key_file: /var/lib/sbproxy/cluster/node-key.pem
+      ca_file: /var/lib/sbproxy/cluster/ca.pem
+      server_name: sbproxy-mesh
+```
+
+Roles are independent and may be combined:
+
+- `gateway` accepts public traffic and applies caller policy;
+- `worker` publishes model capacity and owns assigned replicas;
+- `authority` enrolls nodes or signs deployment revisions.
+
+`advertise_addr` is the authenticated UDP gossip address.
+`transport_advertise_addr` is the mTLS typed-state address. A worker also needs
+an HTTPS `model_endpoint`; PR 3 records it for placement, while PR 4 will use it
+for remote inference. Identity, roles, labels, listeners, seeds, endpoints,
+security material, state directory, enrollment authority, and signing authority
+are restart-required fields. Snapshot cadence can reload in place.
+
+Production mode requires mTLS plus a separate authenticated gossip key. Shared
+key mode must set `development: true` and is for local fixtures only. Manual PKI
+is supported when every peer certificate has the configured server-name SAN
+and both client-auth and server-auth usage. Enrollment is the safer default.
+
+### Initialize and enroll
+
+Create the authority identity once on a trusted host:
+
+```bash
+sbproxy cluster init \
+  --dir /var/lib/sbproxy/cluster \
+  --cluster-id production-models \
+  --node-id authority-a \
+  --role gateway \
+  --role authority \
+  --label region=us-central1 \
+  --label zone=us-central1-a
+```
+
+Configure that process with `roles: [gateway, authority]` and:
+
+```yaml
+enrollment:
+  authority_dir: /var/lib/sbproxy/cluster
+```
+
+The enrollment admin listener must use HTTPS. Create a bounded, one-time token
+whose roles and exact labels match the new node:
+
+```bash
+export SBPROXY_CLUSTER_TOKEN="$(sbproxy cluster token create \
+  --dir /var/lib/sbproxy/cluster \
+  --role worker \
+  --label region=us-central1 \
+  --label zone=us-central1-b \
+  --ttl-secs 900)"
+
+sbproxy cluster enroll \
+  --url https://authority.internal:9090 \
+  --ca-cert admin-ca.pem \
+  --node-id worker-b \
+  --role worker \
+  --label region=us-central1 \
+  --label zone=us-central1-b \
+  --out /var/lib/sbproxy/cluster
+```
+
+The token store keeps only token hashes. Successful consumption is atomic, so
+replay and concurrent reuse fail. The installed directory contains the node
+certificate and key, cluster CA, gossip key, identity document, and deployment
+authority verification key. Certificate rotation uses a new enrollment and a
+controlled process restart; identity changes are never partially hot-reloaded.
+
+Runnable templates are in
+[`examples/model-cluster-symmetric`](../examples/model-cluster-symmetric) and
+[`examples/model-cluster-split`](../examples/model-cluster-split).
+
 ## Desired-state authority
 
 `authority` says which system owns deployment definitions:
 
 | Value | Behavior |
 |---|---|
-| `file_managed` | `sb.yml` is authoritative. This is the recommended and stable mode for this PR. |
+| `file_managed` | `sb.yml` is authoritative. Every node computes placement from the same desired state and reports a digest mismatch when files differ. |
 | `admin_managed` | A revision store at `store_path` is authoritative. The runtime and restart-safe store contract exist, but public desired-state CRUD and the management UI ship in a later PR. |
-| `cluster_authority` | A cluster controller will publish revisions. Multi-node membership and placement are not available yet. |
+| `cluster_authority` | One authority signs and publishes strict deployment bundles. Every node verifies the signer, digest, schema, monotonic revision, and expiry before applying it. Non-authority writes return `deployment_authority_read_only`. |
 
 `file_managed` participates in ordinary config reload. Editing the file,
 `sbproxy apply`, the file watcher, and `POST /admin/reload` all use the same
 prepare-and-commit transaction.
+
+Cluster-authority bundles contain only the catalog revision, numbered desired
+revision, deployments, and placement rules. Unknown fields and duplicate
+deployment IDs are rejected. The current pointer and content are published
+separately through the authenticated cluster state store, and readers retain
+their last good revision after signature, identity, rollback, or runtime
+prepare failure.
+
+Every node configures the public verification key and durable cursor state. The
+authority alone also configures the private signing key:
+
+```yaml
+proxy:
+  cluster:
+    state_dir: /var/lib/sbproxy/cluster
+    deployment_authority:
+      verifying_key_file: /var/lib/sbproxy/cluster/authority-verifying.key
+      # Authority node only:
+      signing_key_file: /var/lib/sbproxy/cluster/authority-signing.key
+  model_host:
+    authority: cluster_authority
+```
+
+Publish a strict draft to the authority admin listener:
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  -H 'content-type: application/json' \
+  -d '{
+    "catalog_revision":"builtin-2026-07-10",
+    "revision":1,
+    "deployments":{
+      "local-qwen":{
+        "model":"qwen2.5-0.5b-instruct",
+        "variant":"q4_k_m",
+        "replicas":2,
+        "spread_by":["zone"],
+        "pull":"on_boot",
+        "warm":true,
+        "engine":"llama_cpp",
+        "rollout":"rolling"
+      }
+    }
+  }' \
+  "${SB_ADMIN_URL}/admin/cluster/deployments"
+```
+
+The authority returns `202` with the revision, content digest, signer node, and
+signer key. `GET /admin/cluster/deployments` returns the locally active verified
+bundle. A revision lower than the durable cursor is rejected after restart;
+equal revision with different content returns `revision_conflict`. The active
+bundle is republished before its bounded seven-day state lifetime expires.
 
 ## Deployment fields
 
@@ -137,16 +304,25 @@ Pull policy controls cache misses:
 revision becomes active. Use it when readiness must mean the first token path is
 available. A warm failure aborts the candidate revision.
 
-`rollout: rolling` proves that both generations fit before it starts the
-replacement, then drains the old one after the route swap. It fails without
-launching the replacement when overlap capacity is unavailable. `recreate`
-drains and stops the old generation first. If a warm replacement fails, the
-runtime restarts the old generation and keeps the prior revision active.
-`recreate` is usually the safer choice on a single full GPU.
+`rollout: rolling` starts target assignments before draining losing
+assignments. The old generation remains retained until every target reports the
+exact generation, variant, artifact digest, and ready state, or until
+`handoff_timeout_ms` expires. `recreate` emits a drain-only step before it may
+start the target. A failed placement or worker-local prepare preserves the
+prior committed plan and runtime.
 
-`required_labels` and replicas are part of the desired-state contract, but this
-PR has no multi-node placement service. Keep replicas at one for a real
-single-node deployment.
+`required_labels` filters workers before ranking. `spread_by` is an ordered set
+of failure-domain labels, such as `[zone, rack]`; placement prefers a new value
+at each level before comparing the weighted rendezvous score. A missing label
+is an explicit `unknown` domain. Input order never affects the result, and
+adding or removing one worker moves only assignments whose ranking changes.
+
+Replicas greater than one must pin `variant` unless
+`heterogeneous_variants: true` is explicit. A manual-pull deployment can be
+assigned only to workers that already report the exact verified artifact.
+`on_boot` and `on_demand` assignments may acquire the artifact locally after
+placement. Each worker projection is exact-variant pinned, warm, single-replica,
+and fenced to the cluster deployment generation.
 
 ## Artifacts and cache safety
 
@@ -339,6 +515,33 @@ POST /admin/model-host/reset
 Load, stop, drain, and reset accept `{"deployment":"local-qwen"}`. The legacy
 `model` request field remains an input alias during the compatibility window.
 
+Cluster operators use the same admin credentials:
+
+```bash
+sbproxy cluster status --admin-url "${SB_ADMIN_URL}" --format text
+sbproxy cluster status --admin-url "${SB_ADMIN_URL}" --format json
+```
+
+`GET /admin/cluster/status` is the stable cluster-view backend. It always lists
+the complete membership roster, including unhealthy and excluded nodes. Each
+node includes membership state, acknowledgement age, health, stable reasons,
+roles, labels, model endpoint, snapshot age and generation, engine/device and
+artifact counts, replica truth, model eligibility, and exclusion reason. The
+top-level `unhealthy_nodes` array repeats only actionable nodes so an admin UI
+can render a prominent alert without hiding them from the main table.
+
+The response also includes healthy/degraded/unhealthy counts, eligible workers
+and replicas, deployment digest consistency, exact target assignments,
+unplaced replicas and rejection reasons, retained and draining assignments,
+rollout phase and deadline, and signed-authority state. Suspect, dead,
+unreachable, stale, incompatible, and explicitly unhealthy workers remain
+visible but receive no new assignments.
+
+The built-in model-management UI consumes this contract in the operator-product
+PR. That view will show the node table and unhealthy callouts alongside model
+selection and deployment mutation. PR 3 deliberately ships the authenticated
+backend and CLI first; it does not claim that persistent UI mutation is ready.
+
 Useful metrics include `sbproxy_model_host_active_requests`,
 `sbproxy_model_host_queued_requests`, `sbproxy_model_host_deployment_state`,
 `sbproxy_model_host_admission_rejections_total`, GPU VRAM, compute utilization,
@@ -359,6 +562,14 @@ A cache root, catalog revision, or engine foundation cannot change under a
 resident deployment. Reconcile to an empty desired state first, then apply the
 new foundation. This rule prevents two incompatible artifact stores or engine
 sets from living in one worker process.
+
+Cluster reconciliation shares that commit lock. Every process computes the
+same global target from one immutable directory view, then filters it to exact
+assignments for its stable node ID. The worker prepares that local projection
+before publishing the new plan. A failed artifact, engine, or runtime prepare
+therefore leaves both the previous local runtime and previous cluster plan
+active. Control-only nodes keep a catalog-aligned empty runtime and never create
+an engine merely to participate in placement.
 
 ## One-command local run
 

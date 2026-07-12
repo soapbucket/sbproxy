@@ -36,7 +36,7 @@ fn registry_covers_every_domain_and_validates() {
 }
 
 #[test]
-fn local_runtime_capabilities_match_the_pr2_support_boundary() {
+fn model_host_capabilities_match_the_cluster_control_plane_boundary() {
     let registry = capability_registry();
     let status = |id: &str| {
         registry
@@ -55,6 +55,7 @@ fn local_runtime_capabilities_match_the_pr2_support_boundary() {
         "lifecycle.keep_alive",
         "lifecycle.priority_admission",
         "lifecycle.model_cli",
+        "cluster.managed_replicas",
         "admin.model_status",
         "platform.apple_metal",
     ] {
@@ -67,7 +68,7 @@ fn local_runtime_capabilities_match_the_pr2_support_boundary() {
     ] {
         assert_eq!(status(id), SupportLevel::Preview, "{id}");
     }
-    for id in ["cluster.managed_replicas", "admin.model_management"] {
+    for id in ["cluster.remote_dispatch", "admin.model_management"] {
         assert_eq!(status(id), SupportLevel::Unsupported, "{id}");
     }
 }
