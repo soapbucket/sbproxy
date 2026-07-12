@@ -462,6 +462,9 @@ pub struct ProxyServerConfig {
     /// Canonical desired state and lifecycle policy for models hosted by SBproxy.
     #[serde(default)]
     pub model_host: Option<crate::model_host::ModelHostControlConfig>,
+    /// Optional shared cluster substrate for keys, metrics, and managed models.
+    #[serde(default)]
+    pub cluster: Option<crate::cluster::ClusterConfig>,
     /// Secrets management configuration.
     #[serde(default)]
     pub secrets: Option<SecretsConfig>,
@@ -647,6 +650,7 @@ impl Default for ProxyServerConfig {
             alerting: None,
             admin: None,
             model_host: None,
+            cluster: None,
             secrets: None,
             key_management: None,
             l2_cache: None,

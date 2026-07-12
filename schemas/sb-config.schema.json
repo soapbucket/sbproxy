@@ -24,6 +24,7 @@
         "ai_providers_file": null,
         "alerting": null,
         "cache_reserve": null,
+        "cluster": null,
         "correlation_id": {
           "echo_response": true,
           "enabled": true,
@@ -352,6 +353,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/ModelHostControlConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cluster": {
+          "description": "Optional shared cluster substrate for keys, metrics, and managed models.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClusterConfig"
             },
             {
               "type": "null"
@@ -1812,6 +1825,269 @@
           ]
         }
       ]
+    },
+    "ClusterConfig": {
+      "description": "Stable `proxy.cluster` configuration.",
+      "type": "object",
+      "required": [
+        "cluster_id",
+        "security"
+      ],
+      "properties": {
+        "cluster_id": {
+          "description": "Logical cluster identity. Every member must use the same value.",
+          "type": "string"
+        },
+        "node_id": {
+          "description": "Stable unique node identity.",
+          "default": "",
+          "type": "string"
+        },
+        "roles": {
+          "description": "Roles this process performs.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ClusterRole"
+          },
+          "uniqueItems": true
+        },
+        "labels": {
+          "description": "Bounded labels used by placement and failure-domain spreading.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "seeds": {
+          "description": "Static gossip seed addresses in `host:port` form.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "gossip_port": {
+          "description": "UDP SWIM gossip listener port.",
+          "default": 7946,
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "transport_port": {
+          "description": "TCP typed-state and cache transport port.",
+          "default": 8946,
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "advertise_addr": {
+          "description": "Address advertised to peers in `host:port` form.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_endpoint": {
+          "description": "Private model-plane endpoint advertised by worker nodes.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "security": {
+          "description": "Explicit peer-security policy.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClusterSecurityConfig"
+            }
+          ]
+        },
+        "snapshot_ttl_secs": {
+          "description": "Lifetime of a published node model snapshot.",
+          "default": 30,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "publish_interval_secs": {
+          "description": "Worker snapshot publication cadence.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "enrollment": {
+          "description": "Optional one-time enrollment authority.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClusterEnrollmentConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deployment_authority": {
+          "description": "Optional signed model deployment authority.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClusterDeploymentAuthorityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ClusterRole": {
+      "description": "Stable role assigned to one cluster node.",
+      "oneOf": [
+        {
+          "description": "Accept public gateway traffic and apply caller policy.",
+          "type": "string",
+          "enum": [
+            "gateway"
+          ]
+        },
+        {
+          "description": "Host managed model replicas.",
+          "type": "string",
+          "enum": [
+            "worker"
+          ]
+        },
+        {
+          "description": "Enroll nodes or publish signed deployment revisions.",
+          "type": "string",
+          "enum": [
+            "authority"
+          ]
+        }
+      ]
+    },
+    "ClusterSecurityConfig": {
+      "description": "Canonical peer-security configuration.",
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "description": "Selected peer-security mode.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClusterSecurityMode"
+            }
+          ]
+        },
+        "development": {
+          "description": "Explicitly acknowledge that shared-key mode is for development.",
+          "default": false,
+          "type": "boolean"
+        },
+        "shared_key": {
+          "description": "Shared secret reference for development encryption.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cert_file": {
+          "description": "This node's PEM certificate chain for mTLS.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_file": {
+          "description": "This node's PEM private key for mTLS.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ca_file": {
+          "description": "PEM CA certificate used to verify every peer.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_name": {
+          "description": "Certificate SAN expected on every peer.",
+          "default": "sbproxy-mesh",
+          "type": "string"
+        }
+      }
+    },
+    "ClusterSecurityMode": {
+      "description": "Peer-security mode for the cluster substrate.",
+      "oneOf": [
+        {
+          "description": "Mutually authenticated TLS with operator or enrollment-issued material.",
+          "type": "string",
+          "enum": [
+            "mtls"
+          ]
+        },
+        {
+          "description": "AES-GCM wire encryption using one shared development secret.",
+          "type": "string",
+          "enum": [
+            "shared_key"
+          ]
+        }
+      ]
+    },
+    "ClusterEnrollmentConfig": {
+      "description": "Optional one-time enrollment authority configuration.",
+      "type": "object",
+      "required": [
+        "authority_dir"
+      ],
+      "properties": {
+        "authority_dir": {
+          "description": "Durable authority directory created by `sbproxy cluster init`.",
+          "type": "string"
+        },
+        "allow_insecure_http": {
+          "description": "Permit plaintext HTTP enrollment for local development only.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "ClusterDeploymentAuthorityConfig": {
+      "description": "Signed deployment-authority configuration.",
+      "type": "object",
+      "required": [
+        "verifying_key_file"
+      ],
+      "properties": {
+        "signing_key_file": {
+          "description": "Ed25519 private signing-key file, valid only on an authority node.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verifying_key_file": {
+          "description": "Ed25519 public verification-key file installed on every node.",
+          "type": "string"
+        }
+      }
     },
     "SecretsConfig": {
       "description": "Top-level secrets management configuration.\n\nControls which vault backend is used to resolve `secret:` references in config values and how secret rotation is handled.",

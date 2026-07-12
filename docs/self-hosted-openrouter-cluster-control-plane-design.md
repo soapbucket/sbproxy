@@ -50,6 +50,7 @@ The stable configuration lives under `proxy.cluster`:
 ```yaml
 proxy:
   cluster:
+    cluster_id: production-a
     node_id: worker-a
     roles: [gateway, worker]
     labels:
@@ -324,4 +325,3 @@ convergence, stale and dead exclusion, local deployment hash mismatch, safe
 drain, and no second mesh when the key cache is enabled. These tests use local
 CPU fixtures and fake engines. GCP T4, L4, and three-node live evidence remains
 PR 7.
-

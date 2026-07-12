@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cluster;
 pub mod compiler;
 pub mod duration;
 pub mod listing;
@@ -21,6 +22,7 @@ pub mod source;
 pub mod types;
 pub mod validate;
 
+pub use cluster::*;
 pub use compiler::*;
 pub use listing::{
     is_well_placed_skill_url, load_listing_file, load_listings_from_repo, validate_listings,

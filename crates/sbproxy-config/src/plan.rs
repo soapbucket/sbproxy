@@ -303,6 +303,30 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Reload,
         reason: "mTLS handshake config reloads via arc-swap",
     },
+    // --- Shared cluster handle. Snapshot cadence is reloadable, while
+    //     every field that changes process identity, discovery, sockets,
+    //     advertised endpoints, or peer security requires restart. ---
+    BlastRadiusRule {
+        pattern: "proxy.cluster.snapshot_ttl_secs",
+        radius: BlastRadius::Reload,
+        reason: "cluster snapshot expiry is read by the publisher and collector",
+    },
+    BlastRadiusRule {
+        pattern: "proxy.cluster.publish_interval_secs",
+        radius: BlastRadius::Reload,
+        reason: "cluster snapshot cadence is read by the publisher",
+    },
+    BlastRadiusRule {
+        pattern: "proxy.cluster.**",
+        radius: BlastRadius::Restart,
+        reason:
+            "cluster identity, discovery, listeners, endpoints, and peer security are process-owned",
+    },
+    BlastRadiusRule {
+        pattern: "proxy.cluster",
+        radius: BlastRadius::Restart,
+        reason: "enabling or disabling the process-owned cluster requires restart",
+    },
     // --- L2 cache: driver swap rebuilds the KV handle (restart);
     //     param tuning is hot-swappable. ---
     BlastRadiusRule {
@@ -1483,6 +1507,40 @@ origins:
     fn matrix_lookup_admin_other_field_is_reload() {
         let (r, _) = lookup_blast_radius("proxy.admin.basic_auth_users");
         assert_eq!(r, BlastRadius::Reload);
+    }
+
+    #[test]
+    fn matrix_lookup_cluster_identity_and_listeners_are_restart() {
+        for path in [
+            "proxy.cluster.cluster_id",
+            "proxy.cluster.node_id",
+            "proxy.cluster.roles.*",
+            "proxy.cluster.labels.zone",
+            "proxy.cluster.seeds.*",
+            "proxy.cluster.gossip_port",
+            "proxy.cluster.transport_port",
+            "proxy.cluster.advertise_addr",
+            "proxy.cluster.model_endpoint",
+            "proxy.cluster.security.mode",
+            "proxy.cluster.security.cert_file",
+            "proxy.cluster.security.key_file",
+            "proxy.cluster.security.ca_file",
+            "proxy.cluster.security.shared_key",
+        ] {
+            let (radius, _) = lookup_blast_radius(path);
+            assert_eq!(radius, BlastRadius::Restart, "{path}");
+        }
+    }
+
+    #[test]
+    fn matrix_lookup_cluster_snapshot_cadence_is_reload() {
+        for path in [
+            "proxy.cluster.snapshot_ttl_secs",
+            "proxy.cluster.publish_interval_secs",
+        ] {
+            let (radius, _) = lookup_blast_radius(path);
+            assert_eq!(radius, BlastRadius::Reload, "{path}");
+        }
     }
 
     #[test]
