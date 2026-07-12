@@ -4,11 +4,11 @@
 
 <h1 align="center">SBproxy</h1>
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-12*
 
-<h3 align="center">Call any model. Serve your own. Govern both.</h3>
+<h3 align="center">Take control of your AI traffic.</h3>
 
-<p align="center">The open-source OpenRouter alternative: one Apache-2.0 binary that routes to 66 providers or serves the weights on your GPUs.</p>
+<p align="center">One open-source binary for the AI you call and the AI that calls you: route 200+ models across 66 providers, serve the weights on your own GPUs, and govern both. <a href="https://sbproxy.dev">sbproxy.dev</a></p>
 
 <p align="center">
   <a href="https://github.com/soapbucket/sbproxy/releases"><img src="https://img.shields.io/github/v/release/soapbucket/sbproxy" alt="Release"></a>
@@ -23,7 +23,8 @@
   <a href="#serve-your-own-model">Serve your own model</a> &middot;
   <a href="#solve-a-problem">Solve a problem</a> &middot;
   <a href="examples/">Examples</a> &middot;
-  <a href="docs/README.md">Docs</a>
+  <a href="docs/README.md">Docs</a> &middot;
+  <a href="https://sbproxy.dev">Website</a>
 </p>
 
 <p align="center">
@@ -34,17 +35,17 @@
 
 ## Why SBproxy
 
-Most teams stitch AI infrastructure together from an LLM proxy, a local inference server, an API gateway, a key store, a guardrail service, and a dashboard they have to trust for spend. SBproxy is one process that does the three jobs that stack was hired for.
+Cloudflare's AI Gateway and Vercel's AI Gateway got a lot right: one endpoint in front of every model, caching, budgets, analytics, failover. SBproxy takes that idea and hands you the whole thing. It runs in your VPC or air-gapped, on your provider keys at your providers' prices, and it does the two things a hosted edge can't: serve the weights on your own GPUs, and gate the AI traffic coming *into* your APIs. One Rust binary, Apache 2.0, no vendor edge in the request path.
 
-**Call any model.** 66 providers behind one endpoint that speaks both the OpenAI and Anthropic wire formats, with fallback chains, outcome-aware routing, predictive budgets, and per-error retry policies. A local semantic cache replays near-duplicate prompts with no per-call cost, and the prompt never leaves your network. Coming from LiteLLM? `sbproxy config import-litellm` [converts your config](docs/migration-litellm.md).
+**Call any model.** 200+ models across 66 providers behind one endpoint that speaks both the OpenAI and Anthropic wire formats. Bring your own keys; nothing sits between you and your providers' pricing. Sixteen routing strategies, from fallback chains and weighted spreads to cost-optimized and outcome-aware routing that learns from realized cost-per-success, plus per-error retry policies and predictive budgets that warn, then downgrade, then block. A semantic cache replays near-duplicate prompts, and embeddings can run on-box, so the repeat prompt costs nothing and never has to leave your network. Coming from LiteLLM? `sbproxy config import-litellm` [converts your config](docs/migration-litellm.md).
 
-**Serve your own.** The same binary runs the models. `proxy.model_host` declares verified local deployments; `provider_type: managed_model` exposes them through the same OpenAI-compatible gateway as hosted providers. SBproxy resolves immutable artifacts, fits the selected device, supervises llama.cpp or vLLM, and keeps request admission and reload atomic. Provider-level `serve:` remains a migration path. Apple Metal is validated before the local-runtime PR ships, while live NVIDIA and multi-node GCP certification is reserved for the final integration PR.
+**Serve your own.** The same binary runs the models. A `serve:` block resolves the weights, fits an engine and quantization to your card (`sbproxy doctor` tells you what the host can serve), and supervises vLLM or llama.cpp to a governed OpenAI-compatible endpoint. Local models get the same keys, budgets, guardrails, and failover as hosted ones, so "test open-weight against hosted" is a one-line swap.
 
-**Govern both.** Govern the AI you call, the AI that calls you, and the AI you run, with one policy plane. Virtual keys are minted, rotated, and revoked at runtime, hashed at rest, and carry their own budgets and model pins. The guardrail mesh screens prompts and responses for every provider type, local or hosted, and can redact a streaming completion mid-flight. Inbound AI is governed too: charge crawlers per request with Pay Per Crawl, verify signed agents (RFC 9421), negotiate Markdown so agents stop paying for HTML. Every request can emit a hash-chained, Ed25519-signed usage receipt you can verify offline.
+**Govern both.** One policy plane for the AI you call, the AI you run, and the AI that calls you. Virtual keys mint, rotate, and revoke at runtime, hashed at rest, each carrying its own budget and model pins. The guardrail mesh screens prompts and completions (PII, injection, jailbreak, and six more types) and can redact a streaming response mid-flight under per-guardrail streaming policies. Inbound, the gateway federates your MCP tools behind OAuth2 (DPoP, PKCE, DCR), turns OpenAPI services into MCP tools, verifies signed agents (RFC 9421 Web Bot Auth), meters AI crawlers with HTTP 402 Pay Per Crawl, and generates `robots.txt`, `llms.txt`, and RSL license manifests from the same policy. Every request can emit a hash-chained, Ed25519-signed usage receipt you can verify offline.
 
-Under it all sits a real reverse proxy built on Pingora: auth (JWT, OIDC, mTLS), automatic TLS via ACME, WAF, DDoS, CSRF, SSRF guards, rate limiting, caching, and hot reload with no dropped connections. Sub-millisecond p99 overhead, idle RSS in single-digit megabytes. Run one binary or point a fleet of replicas at a shared store; the mesh that keeps keys, budgets, and spend counters coherent is open source here, no external Redis and no vendor control plane required.
+Under it all sits a real reverse proxy built on Pingora: auth (JWT, OIDC, mTLS), automatic TLS via ACME, WAF, DDoS, CSRF, SSRF guards, rate limiting, caching, and hot reload with no dropped connections. [50,713 rps through the full policy chain at 0.6 ms p99](docs/performance.md). The admin console ships in the binary (keys, spend, provider health, live traffic at `/admin/ui`), metrics land on a Prometheus endpoint, OTLP traces carry per-request LLM cost, and nine Grafana dashboards plus a ClickHouse attribution schema ship in the repo. Run one node or a fleet: a built-in gossip mesh keeps keys, budgets, and rate counters coherent across replicas, no external Redis and no vendor control plane.
 
-New here and weighing the options? See [how SBproxy compares](docs/comparison.md).
+Weighing the options? See [how SBproxy compares](docs/comparison.md) and the [benchmark methodology](https://sbproxy.dev/benchmark).
 
 ---
 
@@ -126,7 +127,7 @@ Each of these walks one problem end to end: a story doc, a runnable example, a `
 
 | Your problem | Walkthrough |
 |---|---|
-| API keys scattered across teams, no accounting | [Stand up your own OpenRouter](docs/use-case-own-openrouter.md) |
+| API keys scattered across teams, no accounting | [One endpoint for every provider, on your keys](docs/use-case-own-openrouter.md) |
 | You want your coding assistant on hardware you control | [Point Claude Code at your own GPU](docs/use-case-coding-assistant.md) |
 | GCP credits and an afternoon | [Serve Qwen, GLM, or Gemma on a cloud L4](docs/use-case-serve-on-l4.md) |
 | A GPU that has to pay for itself | [Local first, spill to cloud](docs/use-case-local-first.md) |
@@ -134,6 +135,7 @@ Each of these walks one problem end to end: a story doc, a runnable example, a `
 | A LiteLLM proxy you want off of | [Migrate off LiteLLM in an afternoon](docs/migration-litellm.md) |
 | Shadow Ollama under someone's desk | [Guardrails on every prompt, local or hosted](docs/use-case-guardrails-everywhere.md) |
 | AI crawlers eating your content for free | [Meter and monetize the AI that calls you](docs/use-case-meter-crawlers.md) |
+| Internal MCP servers multiplying without an owner | [Federate your MCP tools behind one gateway](docs/mcp.md) |
 | It works on your laptop and on-call starts Monday | [Run it in production](docs/use-case-production-ops.md) |
 
 ---
@@ -201,7 +203,7 @@ curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys/<key_id>/revoke
 
 ## Documentation
 
-The full documentation lives in [`docs/README.md`](docs/README.md): manual, configuration reference, AI gateway guide, self-hosting, scripting reference, performance, troubleshooting, architecture, and more. Running the operator for the first time? Start with [`docs/quickstart-operator.md`](docs/quickstart-operator.md).
+The full documentation lives in [`docs/README.md`](docs/README.md): manual, configuration reference, AI gateway guide, self-hosting, scripting reference, performance, troubleshooting, architecture, and more. The same guides are browsable at [sbproxy.dev/docs](https://sbproxy.dev/docs). Running the operator for the first time? Start with [`docs/quickstart-operator.md`](docs/quickstart-operator.md).
 
 For contributors: [CONTRIBUTING.md](CONTRIBUTING.md).
 
