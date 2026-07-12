@@ -8,7 +8,7 @@
 //! same model placement, then removes one worker and proves every surviving
 //! view retains the full roster while calling out the unhealthy node.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -16,8 +16,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use sbproxy_e2e::ProxyHarness;
+use sbproxy_mesh::enrollment::{
+    install_worker_enrollment, AuthorityInit, EnrollmentAuthority, EnrollmentTokenConstraints,
+    WorkerEnrollment,
+};
+use sbproxy_mesh::ClusterNodeRole;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -56,40 +60,45 @@ fn reserve_udp_port() -> u16 {
         .port()
 }
 
-fn write_test_pki(root: &Path, node_ids: &[&str]) -> Result<(PathBuf, PathBuf)> {
-    let ca_key = KeyPair::generate().context("generate cluster CA key")?;
-    let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca = ca_params
-        .self_signed(&ca_key)
-        .context("self-sign cluster CA")?;
-    let ca_path = root.join("ca.pem");
-    fs::write(&ca_path, ca.pem()).context("write cluster CA")?;
-
-    let gossip_key_path = root.join("gossip.key");
-    fs::write(&gossip_key_path, "model-control-e2e-gossip-key-32-bytes")
-        .context("write gossip key")?;
-
-    for node_id in node_ids {
-        let node_dir = root.join(node_id);
-        fs::create_dir_all(&node_dir).context("create node identity directory")?;
-        let key = KeyPair::generate().context("generate node key")?;
-        let mut params =
-            CertificateParams::new(vec!["sbproxy-mesh".to_string(), (*node_id).to_string()])?;
-        params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
-        let certificate = params
-            .signed_by(&key, &ca, &ca_key)
-            .context("sign node certificate")?;
-        fs::write(node_dir.join("node.pem"), certificate.pem())
-            .context("write node certificate")?;
-        fs::write(node_dir.join("node-key.pem"), key.serialize_pem())
-            .context("write node private key")?;
+fn provision_test_identities(nodes: &[NodeSpec]) -> Result<()> {
+    let authority_node = &nodes[0];
+    let authority = EnrollmentAuthority::initialize(
+        &authority_node.state_dir,
+        AuthorityInit {
+            cluster_id: CLUSTER_ID.to_string(),
+            node_id: authority_node.node_id.to_string(),
+            roles: BTreeSet::from([ClusterNodeRole::Authority]),
+            labels: BTreeMap::from([("zone".to_string(), authority_node.zone.to_string())]),
+            server_name: "sbproxy-mesh".to_string(),
+        },
+    )
+    .context("initialize test enrollment authority")?;
+    for node in &nodes[1..] {
+        let role = match node.role {
+            "gateway" => ClusterNodeRole::Gateway,
+            "worker" => ClusterNodeRole::Worker,
+            other => anyhow::bail!("unsupported test cluster role {other:?}"),
+        };
+        let roles = BTreeSet::from([role]);
+        let labels = BTreeMap::from([("zone".to_string(), node.zone.to_string())]);
+        let token = authority
+            .create_token(
+                EnrollmentTokenConstraints {
+                    allowed_roles: roles.clone(),
+                    labels: labels.clone(),
+                },
+                Duration::from_secs(60),
+            )
+            .context("create test enrollment token")?;
+        let worker = WorkerEnrollment::generate(node.node_id, "sbproxy-mesh")
+            .context("generate test enrollment CSR")?;
+        let response = authority
+            .enroll(worker.request(token.into_token(), roles, labels))
+            .context("enroll test cluster node")?;
+        install_worker_enrollment(&node.state_dir, worker, response)
+            .context("install test cluster identity")?;
     }
-
-    Ok((ca_path, gossip_key_path))
+    Ok(())
 }
 
 fn write_model_fixture(root: &Path) -> Result<PathBuf> {
@@ -148,6 +157,7 @@ fn node_spec(
     zone: &'static str,
 ) -> NodeSpec {
     let identity = root.join(node_id);
+    let state_dir = identity.join("state");
     NodeSpec {
         node_id,
         role,
@@ -155,22 +165,35 @@ fn node_spec(
         gossip_port: reserve_udp_port(),
         transport_port: reserve_tcp_port(),
         admin_port: reserve_tcp_port(),
-        certificate: identity.join("node.pem"),
-        private_key: identity.join("node-key.pem"),
-        state_dir: identity.join("state"),
+        certificate: state_dir.join("node.pem"),
+        private_key: state_dir.join("node-key.pem"),
+        state_dir,
         cache_dir: identity.join("models"),
         keystore: identity.join("keys.redb"),
     }
 }
 
+#[derive(Clone, Copy)]
+struct NodeConfigScenario<'a> {
+    max_concurrency: u32,
+    required_zone: &'a str,
+    rollout: &'a str,
+    advertised_gossip_port: Option<u16>,
+}
+
 fn node_config(
     node: &NodeSpec,
     authority_gossip_port: u16,
-    ca_path: &Path,
-    gossip_key_path: &Path,
     catalog_path: &Path,
     fake_engine_path: &Path,
+    scenario: NodeConfigScenario<'_>,
 ) -> String {
+    let NodeConfigScenario {
+        max_concurrency,
+        required_zone,
+        rollout,
+        advertised_gossip_port,
+    } = scenario;
     let seeds = if node.node_id == "authority-a" {
         "[]".to_string()
     } else {
@@ -184,6 +207,14 @@ fn node_config(
     } else {
         String::new()
     };
+    let advertised_gossip_port = advertised_gossip_port.unwrap_or(node.gossip_port);
+    let required_labels = if required_zone.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{zone: {required_zone}}}")
+    };
+    let ca_path = node.state_dir.join("ca.pem");
+    let gossip_key_path = node.state_dir.join("gossip.key");
     format!(
         r#"
 proxy:
@@ -202,7 +233,7 @@ proxy:
     seeds: {seeds}
     gossip_port: {gossip_port}
     transport_port: {transport_port}
-    advertise_addr: 127.0.0.1:{gossip_port}
+    advertise_addr: 127.0.0.1:{advertised_gossip_port}
     transport_advertise_addr: 127.0.0.1:{transport_port}{model_endpoint}
     state_dir: "{state_dir}"
     security:
@@ -214,6 +245,28 @@ proxy:
       server_name: sbproxy-mesh
     snapshot_ttl_secs: 10
     publish_interval_secs: 1
+    dead_peer_gc_secs: 2
+  model_host:
+    authority: file_managed
+    catalog_file: "{catalog_path}"
+    handoff_timeout_ms: 10000
+    cache:
+      directory: "{cache_dir}"
+    engines:
+      llama_cpp:
+        launch: binary
+        path: "{fake_engine_path}"
+    deployments:
+      fixture:
+        model: fixture-model
+        variant: q4
+        replicas: 1
+        required_labels: {required_labels}
+        pull: on_demand
+        warm: true
+        max_concurrency: {max_concurrency}
+        engine: llama_cpp
+        rollout: {rollout}
   key_management:
     enabled: true
     store:
@@ -226,7 +279,7 @@ proxy:
         seeds: {seeds}
         gossip_port: {gossip_port}
         transport_port: {transport_port}
-        advertise_addr: 127.0.0.1:{gossip_port}
+        advertise_addr: 127.0.0.1:{advertised_gossip_port}
         transport_advertise_addr: 127.0.0.1:{transport_port}
         shared_key: "file:{gossip_key}"
         peer_tls:
@@ -243,27 +296,17 @@ origins:
       type: ai_proxy
       providers:
         - name: local
+          provider_type: managed_model
+          deployment: fixture
           default_model: fixture-model
           models: [fixture-model]
-          serve:
-            catalog_file: "{catalog_path}"
-            cache_dir: "{cache_dir}"
-            engines:
-              llama_cpp:
-                launch: binary
-                acquire:
-                  source: path
-                  path: "{fake_engine_path}"
-            models:
-              - model: fixture-model
-                variant: q4
-                engine: llama_cpp
 "#,
         admin_port = node.admin_port,
         node_id = node.node_id,
         role = node.role,
         zone = node.zone,
         gossip_port = node.gossip_port,
+        advertised_gossip_port = advertised_gossip_port,
         transport_port = node.transport_port,
         state_dir = node.state_dir.display(),
         gossip_key = gossip_key_path.display(),
@@ -274,6 +317,9 @@ origins:
         cache_dir = node.cache_dir.display(),
         catalog_path = catalog_path.display(),
         fake_engine_path = fake_engine_path.display(),
+        max_concurrency = max_concurrency,
+        required_labels = required_labels,
+        rollout = rollout,
     )
 }
 
@@ -289,6 +335,29 @@ fn read_status(client: &reqwest::blocking::Client, admin_port: u16) -> Result<Va
     let body = response.text().context("read cluster status")?;
     anyhow::ensure!(status.is_success(), "cluster status {status}: {body}");
     serde_json::from_str(&body).context("decode cluster status")
+}
+
+fn read_model_host_status(client: &reqwest::blocking::Client, admin_port: u16) -> Result<Value> {
+    let response = client
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/admin/model-host/status"
+        ))
+        .basic_auth(ADMIN_USER, Some(ADMIN_PASSWORD))
+        .send()
+        .context("request model-host status")?;
+    let status = response.status();
+    let body = response.text().context("read model-host status")?;
+    anyhow::ensure!(status.is_success(), "model-host status {status}: {body}");
+    serde_json::from_str(&body).context("decode model-host status")
+}
+
+fn ready_engine_port(client: &reqwest::blocking::Client, node: &NodeSpec) -> Result<u16> {
+    let status = read_model_host_status(client, node.admin_port)?;
+    let port = status["deployments"]
+        .as_array()
+        .and_then(|deployments| deployments.iter().find_map(|item| item["port"].as_u64()))
+        .context("assigned worker has no ready engine port")?;
+    u16::try_from(port).context("engine port exceeds u16")
 }
 
 fn validate_config(root: &Path, index: usize, config: &str) -> Result<()> {
@@ -341,6 +410,76 @@ where
     panic!("cluster status did not converge within {timeout:?}; last observation:\n{last}");
 }
 
+fn wait_for_one_status<F>(
+    client: &reqwest::blocking::Client,
+    admin_port: u16,
+    timeout: Duration,
+    predicate: F,
+) -> Value
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match read_status(client, admin_port) {
+            Ok(status) if predicate(&status) => return status,
+            Ok(status) => {
+                last = serde_json::to_string_pretty(&status)
+                    .unwrap_or_else(|error| format!("status serialization failed: {error}"));
+            }
+            Err(error) => last = format!("{error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("cluster status did not reach the expected transition within {timeout:?}; last observation:\n{last}");
+}
+
+fn reload_cluster_configs(
+    client: &reqwest::blocking::Client,
+    nodes: &[NodeSpec],
+    processes: &BTreeMap<&'static str, ProxyHarness>,
+    configs: &[String],
+) -> Result<()> {
+    for (node, config) in nodes.iter().zip(configs) {
+        let process = processes
+            .get(node.node_id)
+            .unwrap_or_else(|| panic!("missing process {}", node.node_id));
+        process
+            .rewrite_config(config)
+            .with_context(|| format!("rewrite {} config", node.node_id))?;
+        let response = client
+            .post(format!("http://127.0.0.1:{}/admin/reload", node.admin_port))
+            .basic_auth(ADMIN_USER, Some(ADMIN_PASSWORD))
+            .send()
+            .with_context(|| format!("reload {}", node.node_id))?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "reload {} returned {}: {}",
+            node.node_id,
+            response.status(),
+            response.text().unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn deployment_generation(status: &Value) -> u64 {
+    status["deployments"][0]["generation"]
+        .as_u64()
+        .expect("deployment generation")
+}
+
+fn versioned_assignment_nodes(status: &Value, field: &str) -> BTreeSet<String> {
+    status["deployments"][0][field]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|assignment| assignment["assignment"]["node_id"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
 fn assignment_nodes(status: &Value) -> BTreeSet<String> {
     status["deployments"][0]["assignments"]
         .as_array()
@@ -360,6 +499,7 @@ fn converged(statuses: &[Value]) -> bool {
         return false;
     }
     let first_assignments = &statuses[0]["deployments"][0]["assignments"];
+    let first_generation = &statuses[0]["deployments"][0]["generation"];
     statuses.iter().all(|status| {
         status["configured"] == true
             && status["mode"] == "distributed"
@@ -378,8 +518,58 @@ fn converged(statuses: &[Value]) -> bool {
                 .as_array()
                 .is_some_and(|assignments| assignments.len() == 1)
             && status["deployments"][0]["target_ready"] == true
+            && status["deployments"][0]["phase"] == "stable"
+            && status["deployments"][0]["generation"] == *first_generation
             && status["deployments"][0]["assignments"] == *first_assignments
     })
+}
+
+fn rolling_handoff_is_waiting(
+    status: &Value,
+    generation: u64,
+    prior_node: &str,
+    target_node: &str,
+) -> bool {
+    deployment_generation(status) == generation
+        && status["deployments"][0]["phase"] == "waiting_for_readiness"
+        && assignment_nodes(status) == BTreeSet::from([target_node.to_string()])
+        && versioned_assignment_nodes(status, "retained")
+            == BTreeSet::from([prior_node.to_string()])
+        && status["nodes"].as_array().is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node["node_id"] == prior_node
+                    && node["replicas"].as_array().is_some_and(|replicas| {
+                        replicas.iter().any(|replica| {
+                            replica["deployment_generation"] == generation.saturating_sub(1)
+                                && replica["state"] == "ready"
+                        })
+                    })
+            })
+        })
+}
+
+fn recreate_is_draining_before_start(
+    status: &Value,
+    generation: u64,
+    prior_node: &str,
+    target_node: &str,
+) -> bool {
+    deployment_generation(status) == generation
+        && status["deployments"][0]["phase"] == "draining_prior"
+        && assignment_nodes(status) == BTreeSet::from([target_node.to_string()])
+        && versioned_assignment_nodes(status, "draining")
+            == BTreeSet::from([prior_node.to_string()])
+        && status["nodes"].as_array().is_some_and(|nodes| {
+            nodes
+                .iter()
+                .find(|node| node["node_id"] == target_node)
+                .and_then(|node| node["replicas"].as_array())
+                .is_none_or(|replicas| {
+                    replicas
+                        .iter()
+                        .all(|replica| replica["deployment_generation"] != generation)
+                })
+        })
 }
 
 fn failed_worker_is_called_out(statuses: &[Value], failed_node_id: &str) -> bool {
@@ -412,6 +602,54 @@ fn failed_worker_is_called_out(statuses: &[Value], failed_node_id: &str) -> bool
     })
 }
 
+fn deployment_digest_mismatch_is_called_out(statuses: &[Value]) -> bool {
+    !statuses.is_empty()
+        && statuses.iter().all(|status| {
+            status["summary"]["total_nodes"] == 4
+                && status["summary"]["deployment_digest_mismatch"] == true
+                && status["summary"]["unhealthy_nodes"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 1)
+                && status["unhealthy_nodes"]
+                    .as_array()
+                    .is_some_and(|nodes| !nodes.is_empty())
+        })
+}
+
+fn partitioned_worker_is_called_out(
+    statuses: &[Value],
+    node_id: &str,
+    advertised_port: u16,
+) -> bool {
+    let advertised = format!("127.0.0.1:{advertised_port}");
+    !statuses.is_empty()
+        && statuses.iter().all(|status| {
+            status["nodes"].as_array().is_some_and(|nodes| {
+                nodes.iter().any(|node| {
+                    node["node_id"] == node_id
+                        && node["address"] == advertised
+                        && node["unhealthy"] == true
+                })
+            }) && status["unhealthy_nodes"]
+                .as_array()
+                .is_some_and(|nodes| nodes.iter().any(|node| node["node_id"] == node_id))
+        })
+}
+
+fn wait_for_tcp_port_to_release(port: u16, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} TCP port {port} did not release"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_for_ports_to_release(nodes: &[NodeSpec]) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -430,9 +668,8 @@ fn wait_for_ports_to_release(nodes: &[NodeSpec]) {
 
 #[test]
 fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
+    std::env::set_var("SBPROXY_FAKE_ENGINE_READY_AFTER_PROBES", "20");
     let root = tempfile::tempdir().context("create cluster fixture")?;
-    let node_ids = ["authority-a", "gateway-a", "worker-a", "worker-b"];
-    let (ca_path, gossip_key_path) = write_test_pki(root.path(), &node_ids)?;
     let catalog_path = write_model_fixture(root.path())?;
     let fake_engine_path = Path::new(env!("CARGO_BIN_EXE_fake_model_engine"));
     let nodes = vec![
@@ -441,6 +678,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         node_spec(root.path(), "worker-a", "worker", "zone-a"),
         node_spec(root.path(), "worker-b", "worker", "zone-b"),
     ];
+    provision_test_identities(&nodes)?;
     let authority_gossip_port = nodes[0].gossip_port;
     let configs = nodes
         .iter()
@@ -448,10 +686,14 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
             node_config(
                 node,
                 authority_gossip_port,
-                &ca_path,
-                &gossip_key_path,
                 &catalog_path,
                 fake_engine_path,
+                NodeConfigScenario {
+                    max_concurrency: 1,
+                    required_zone: "zone-a",
+                    rollout: "rolling",
+                    advertised_gossip_port: None,
+                },
             )
         })
         .collect::<Vec<_>>();
@@ -459,34 +701,210 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         validate_config(root.path(), index, config)?;
     }
 
-    let authority = ProxyHarness::start_with_yaml(&configs[0]).context("start authority")?;
-    let gateway = ProxyHarness::start_with_yaml(&configs[1]).context("start gateway")?;
-    let mut worker_a = Some(ProxyHarness::start_with_yaml(&configs[2]).context("start worker A")?);
-    let mut worker_b = Some(ProxyHarness::start_with_yaml(&configs[3]).context("start worker B")?);
+    let mut processes = BTreeMap::new();
+    for (node, config) in nodes.iter().zip(&configs) {
+        processes.insert(
+            node.node_id,
+            ProxyHarness::start_with_workspace_and_shutdown_grace(config, &[], 1_000)
+                .with_context(|| format!("start {}", node.node_id))?,
+        );
+    }
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .context("build admin client")?;
     let all_admin_ports = nodes.iter().map(|node| node.admin_port).collect::<Vec<_>>();
-    let statuses = wait_for_statuses(
+    let initial_convergence = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_statuses(
+            &client,
+            &all_admin_ports,
+            Duration::from_secs(30),
+            converged,
+        )
+    }));
+    let mut statuses = match initial_convergence {
+        Ok(statuses) => statuses,
+        Err(panic) => {
+            for (node_id, process) in &processes {
+                eprintln!("\n--- {node_id} stdout ---\n{}", process.stdout_contents());
+                eprintln!("\n--- {node_id} stderr ---\n{}", process.stderr_contents());
+            }
+            for process in processes.values_mut() {
+                let _ = process.terminate_gracefully(Duration::from_secs(5));
+            }
+            std::panic::resume_unwind(panic);
+        }
+    };
+    let initial_generation = deployment_generation(&statuses[0]);
+    assert_eq!(
+        assignment_nodes(&statuses[0]),
+        BTreeSet::from(["worker-a".to_string()])
+    );
+
+    // Restart one controller without changing desired state. It must recover
+    // generation and assignment identity from authenticated replica fences,
+    // rather than incrementing away from the still-live controllers.
+    let mut gateway = processes
+        .remove("gateway-a")
+        .context("gateway process is absent")?;
+    gateway
+        .terminate_gracefully(Duration::from_secs(5))
+        .context("stop gateway controller")?;
+    drop(gateway);
+    let restarted_gateway =
+        ProxyHarness::start_with_workspace_and_shutdown_grace(&configs[1], &[], 1_000)
+            .context("restart gateway controller")?;
+    processes.insert("gateway-a", restarted_gateway);
+    statuses = wait_for_statuses(
         &client,
         &all_admin_ports,
         Duration::from_secs(30),
         converged,
     );
+    let restarted_gateway_status = statuses
+        .iter()
+        .find(|status| status["local_node_id"] == "gateway-a")
+        .expect("restarted gateway status");
+    assert_eq!(
+        deployment_generation(restarted_gateway_status),
+        initial_generation
+    );
+    assert_eq!(
+        assignment_nodes(&statuses[0]),
+        BTreeSet::from(["worker-a".to_string()])
+    );
+
+    // Rolling moves the replica to worker-b. The replacement is started and
+    // observed before worker-a is removed from the retained set.
+    let rolling_configs = nodes
+        .iter()
+        .map(|node| {
+            node_config(
+                node,
+                authority_gossip_port,
+                &catalog_path,
+                fake_engine_path,
+                NodeConfigScenario {
+                    max_concurrency: 1,
+                    required_zone: "zone-b",
+                    rollout: "rolling",
+                    advertised_gossip_port: None,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    reload_cluster_configs(&client, &nodes, &processes, &rolling_configs)?;
+    let rolling_generation = initial_generation + 1;
+    wait_for_one_status(
+        &client,
+        nodes[1].admin_port,
+        Duration::from_secs(15),
+        |status| rolling_handoff_is_waiting(status, rolling_generation, "worker-a", "worker-b"),
+    );
+    statuses = wait_for_statuses(
+        &client,
+        &all_admin_ports,
+        Duration::from_secs(30),
+        converged,
+    );
+    assert_eq!(deployment_generation(&statuses[0]), rolling_generation);
+    assert_eq!(
+        assignment_nodes(&statuses[0]),
+        BTreeSet::from(["worker-b".to_string()])
+    );
+
+    // Recreate moves back to worker-a, but first emits a drain-only phase in
+    // which the target generation is absent from worker-a's replica truth.
+    let recreate_configs = nodes
+        .iter()
+        .map(|node| {
+            node_config(
+                node,
+                authority_gossip_port,
+                &catalog_path,
+                fake_engine_path,
+                NodeConfigScenario {
+                    max_concurrency: 1,
+                    required_zone: "zone-a",
+                    rollout: "recreate",
+                    advertised_gossip_port: None,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    reload_cluster_configs(&client, &nodes, &processes, &recreate_configs)?;
+    let recreate_generation = rolling_generation + 1;
+    wait_for_one_status(
+        &client,
+        nodes[1].admin_port,
+        Duration::from_secs(15),
+        |status| {
+            recreate_is_draining_before_start(status, recreate_generation, "worker-b", "worker-a")
+        },
+    );
+    statuses = wait_for_statuses(
+        &client,
+        &all_admin_ports,
+        Duration::from_secs(30),
+        converged,
+    );
+    assert_eq!(deployment_generation(&statuses[0]), recreate_generation);
+    assert_eq!(
+        assignment_nodes(&statuses[0]),
+        BTreeSet::from(["worker-a".to_string()])
+    );
+
+    // Return to an unconstrained steady policy so the subsequent worker loss
+    // can prove deterministic failover to the remaining worker.
+    let steady_configs = nodes
+        .iter()
+        .map(|node| {
+            node_config(
+                node,
+                authority_gossip_port,
+                &catalog_path,
+                fake_engine_path,
+                NodeConfigScenario {
+                    max_concurrency: 1,
+                    required_zone: "",
+                    rollout: "rolling",
+                    advertised_gossip_port: None,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    reload_cluster_configs(&client, &nodes, &processes, &steady_configs)?;
+    statuses = wait_for_statuses(
+        &client,
+        &all_admin_ports,
+        Duration::from_secs(30),
+        converged,
+    );
+
     let initial_assignments = assignment_nodes(&statuses[0]);
     assert_eq!(initial_assignments.len(), 1);
     let failed_node_id = initial_assignments
         .first()
         .expect("one initial assignment")
         .clone();
-
-    match failed_node_id.as_str() {
-        "worker-a" => drop(worker_a.take()),
-        "worker-b" => drop(worker_b.take()),
-        other => panic!("placement selected non-worker {other:?}"),
-    }
+    let failed_index = nodes
+        .iter()
+        .position(|node| node.node_id == failed_node_id)
+        .context("placement selected an unknown node")?;
+    anyhow::ensure!(
+        nodes[failed_index].role == "worker",
+        "placement selected non-worker"
+    );
+    let engine_port = ready_engine_port(&client, &nodes[failed_index])?;
+    let mut failed_process = processes
+        .remove(failed_node_id.as_str())
+        .context("failed worker process is absent")?;
+    failed_process
+        .terminate_gracefully(Duration::from_secs(5))
+        .context("gracefully stop assigned worker")?;
+    drop(failed_process);
+    wait_for_tcp_port_to_release(engine_port, "managed engine child");
     let surviving_admin_ports = nodes
         .iter()
         .filter(|node| node.node_id != failed_node_id)
@@ -502,10 +920,118 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     assert_eq!(surviving_assignments.len(), 1);
     assert!(!surviving_assignments.contains(&failed_node_id));
 
-    drop(worker_a);
-    drop(worker_b);
-    drop(gateway);
-    drop(authority);
+    // Routing membership GCs the dead peer after two seconds, while every
+    // admin directory must retain its tombstone and operator callout.
+    std::thread::sleep(Duration::from_secs(3));
+    let retained = wait_for_statuses(
+        &client,
+        &surviving_admin_ports,
+        Duration::from_secs(10),
+        |statuses| failed_worker_is_called_out(statuses, &failed_node_id),
+    );
+    assert!(retained.iter().all(|status| {
+        status["nodes"]
+            .as_array()
+            .is_some_and(|nodes| nodes.iter().any(|node| node["node_id"] == failed_node_id))
+    }));
+
+    // Rejoin with a signed but unreachable gossip advertisement. Peers retain
+    // the same enrolled identity yet must call out the partitioned node.
+    let bad_gossip_port = reserve_udp_port();
+    let partitioned_config = node_config(
+        &nodes[failed_index],
+        authority_gossip_port,
+        &catalog_path,
+        fake_engine_path,
+        NodeConfigScenario {
+            max_concurrency: 1,
+            required_zone: "",
+            rollout: "rolling",
+            advertised_gossip_port: Some(bad_gossip_port),
+        },
+    );
+    validate_config(root.path(), 100, &partitioned_config)?;
+    let mut partitioned =
+        ProxyHarness::start_with_workspace_and_shutdown_grace(&partitioned_config, &[], 1_000)
+            .context("start partitioned worker")?;
+    wait_for_statuses(
+        &client,
+        &surviving_admin_ports,
+        Duration::from_secs(20),
+        |statuses| partitioned_worker_is_called_out(statuses, &failed_node_id, bad_gossip_port),
+    );
+    partitioned
+        .terminate_gracefully(Duration::from_secs(5))
+        .context("stop partitioned worker")?;
+    drop(partitioned);
+
+    // A different concurrency policy changes the deployment digest. Every
+    // surviving admin view must surface the mismatch, then clear it after the
+    // node returns to the fleet's rolling policy.
+    let mismatch_config = node_config(
+        &nodes[failed_index],
+        authority_gossip_port,
+        &catalog_path,
+        fake_engine_path,
+        NodeConfigScenario {
+            max_concurrency: 2,
+            required_zone: "",
+            rollout: "rolling",
+            advertised_gossip_port: None,
+        },
+    );
+    validate_config(root.path(), 101, &mismatch_config)?;
+    let mut mismatched =
+        ProxyHarness::start_with_workspace_and_shutdown_grace(&mismatch_config, &[], 1_000)
+            .context("start digest-mismatched worker")?;
+    let mismatch_ports = nodes
+        .iter()
+        .filter(|node| node.node_id != failed_node_id)
+        .map(|node| node.admin_port)
+        .collect::<Vec<_>>();
+    wait_for_statuses(
+        &client,
+        &mismatch_ports,
+        Duration::from_secs(20),
+        deployment_digest_mismatch_is_called_out,
+    );
+    mismatched
+        .terminate_gracefully(Duration::from_secs(5))
+        .context("stop digest-mismatched worker")?;
+    drop(mismatched);
+
+    let recovered = ProxyHarness::start_with_workspace_and_shutdown_grace(
+        &steady_configs[failed_index],
+        &[],
+        1_000,
+    )
+    .context("restart worker with matching deployment policy")?;
+    processes.insert(nodes[failed_index].node_id, recovered);
+    let recovery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_statuses(
+            &client,
+            &all_admin_ports,
+            Duration::from_secs(30),
+            converged,
+        )
+    }));
+    if let Err(panic) = recovery {
+        for (node_id, process) in &processes {
+            eprintln!("\n--- {node_id} stdout ---\n{}", process.stdout_contents());
+            eprintln!("\n--- {node_id} stderr ---\n{}", process.stderr_contents());
+        }
+        for process in processes.values_mut() {
+            let _ = process.terminate_gracefully(Duration::from_secs(5));
+        }
+        std::panic::resume_unwind(panic);
+    }
+
+    for process in processes.values_mut() {
+        process
+            .terminate_gracefully(Duration::from_secs(5))
+            .context("gracefully stop cluster process")?;
+    }
+    drop(processes);
     wait_for_ports_to_release(&nodes);
     Ok(())
 }

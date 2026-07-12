@@ -55,6 +55,7 @@ pub mod node;
 pub mod node_handle;
 pub mod peer_auth;
 pub mod peer_eviction;
+pub mod peer_identity;
 pub mod persistence;
 pub mod split_brain;
 pub mod state;

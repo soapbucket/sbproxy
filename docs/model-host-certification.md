@@ -15,7 +15,7 @@ certification.
 | Apple Silicon Metal | passed 2026-07-11 | Real managed GGUF completion, status and stop truth, cache reuse, maintenance health, and ready-engine Ctrl-C shutdown on Apple M4 Max. |
 | NVIDIA CUDA single node | pending final GCP PR | Deterministic T4/L4 descriptors, vLLM plans, container isolation, and CUDA llama.cpp source-build tests exist. No live claim is made in this PR. |
 | NVIDIA multi-GPU | pending final GCP PR | Placement and device-scoping tests only. |
-| Local multi-process cluster control | passed 2026-07-11 | Four real processes, encrypted gossip, mTLS typed state, shared key/model mesh, verified fake artifact and engine, placement convergence, worker loss, replacement, unhealthy-node admin callout, and cleanup. |
+| Local multi-process cluster control | passed 2026-07-11 | Four real processes, enrolled identities, signed gossip and state, node-specific mTLS, controller restart fencing, rolling and recreate transitions, worker loss, post-GC tombstone, partition callout, digest mismatch and recovery, and child cleanup. |
 | Three-node GCP runtime | pending final GCP PR | Local control-plane convergence is complete. Live GCP membership, remote inference dispatch, streaming failure drills, and hardware evidence remain pending. |
 
 The generated [capability matrix](model-host-capabilities.md) records Apple
@@ -26,8 +26,9 @@ recorded.
 ### Local multi-process evidence from 2026-07-11
 
 The hermetic fixture runs one authority, one gateway, and two workers as real
-`sbproxy` child processes. It creates an ephemeral CA, per-node certificates,
-an authenticated gossip key, distinct state and model caches, and temporary
+`sbproxy` child processes. It uses the production enrollment authority to
+create signed per-node identities, unique keys and certificates, an
+authenticated gossip key, distinct state and model caches, and temporary
 UDP, transport, proxy, admin, and engine ports. A tiny local catalog artifact is
 verified through the production artifact manager and launched through the typed
 llama.cpp driver into an e2e-only health server.
@@ -41,21 +42,32 @@ SBPROXY_E2E_BIN=target/debug/sbproxy \
 The gate proves:
 
 - every process converges on the same eligible directory and exact assignment;
+- restarting a controller with unchanged desired state preserves deployment
+  generation and assignment identity;
+- rolling replacement starts and observes the target before removing the prior
+  replica, while recreate publishes a drain-only phase before starting the
+  target generation;
 - the key cache and model controller reuse one gossip and transport mesh;
 - a control-only node can retain a non-builtin global catalog without creating
   an engine;
 - removing the assigned worker keeps it in the full node roster, excludes it
   from model eligibility, and adds a nonempty `unhealthy_nodes` alert;
+- the tombstone and callout remain after the two-second routing-membership GC;
 - the remaining worker takes the deterministic replacement assignment and
   reports exact readiness before every surviving admin view converges;
-- dropping all children releases gossip, transport, admin, and fake-engine
-  resources.
+- a signed restart with an unreachable gossip advertisement is called out as a
+  partition, while a correct replacement receives the full authenticated
+  roster and fences stale dead gossip;
+- a file-managed desired-state mismatch excludes unsafe workers, then clears
+  when the replacement returns with matching content;
+- graceful proxy shutdown releases gossip, transport, admin, and fake-engine
+  resources, and the test verifies no child process remains.
 
 Pure placement, directory, and rollout suites additionally prove suspect,
 dead, unreachable, stale, malformed, and incompatible exclusion; minimal
-movement; partition-local routing; digest mismatch and recovery; and rolling
-versus recreate ordering. This is local control-plane certification, not GCP or
-remote inference certification.
+movement; partition-local routing; per-deployment generation fencing; and
+rolling versus recreate ordering. This is local control-plane certification,
+not GCP or remote inference certification.
 
 ### Apple Metal evidence from 2026-07-11
 

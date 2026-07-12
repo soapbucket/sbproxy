@@ -12,6 +12,7 @@ const DEFAULT_GOSSIP_PORT: u16 = 7946;
 const DEFAULT_TRANSPORT_PORT: u16 = 8946;
 const DEFAULT_SNAPSHOT_TTL_SECS: u64 = 30;
 const DEFAULT_PUBLISH_INTERVAL_SECS: u64 = 5;
+const DEFAULT_DEAD_PEER_GC_SECS: u64 = 300;
 const DEFAULT_TLS_SERVER_NAME: &str = "sbproxy-mesh";
 const MAX_CLUSTER_ROLES: usize = 3;
 const MAX_CLUSTER_LABELS: usize = 64;
@@ -34,6 +35,10 @@ const fn default_snapshot_ttl_secs() -> u64 {
 
 const fn default_publish_interval_secs() -> u64 {
     DEFAULT_PUBLISH_INTERVAL_SECS
+}
+
+const fn default_dead_peer_gc_secs() -> u64 {
+    DEFAULT_DEAD_PEER_GC_SECS
 }
 
 fn default_tls_server_name() -> String {
@@ -84,7 +89,7 @@ pub struct ClusterSecurityConfig {
     /// PEM CA certificate used to verify every peer.
     #[serde(default)]
     pub ca_file: Option<String>,
-    /// Certificate SAN expected on every peer.
+    /// Cluster SAN bound into every enrolled peer identity.
     #[serde(default = "default_tls_server_name")]
     pub server_name: String,
 }
@@ -153,6 +158,10 @@ pub struct ClusterConfig {
     /// Worker snapshot publication cadence.
     #[serde(default = "default_publish_interval_secs")]
     pub publish_interval_secs: u64,
+    /// Time to retain dead peers in the routing membership table before GC.
+    /// The operator model directory retains a longer-lived tombstone.
+    #[serde(default = "default_dead_peer_gc_secs")]
+    pub dead_peer_gc_secs: u64,
     /// Optional one-time enrollment authority.
     #[serde(default)]
     pub enrollment: Option<ClusterEnrollmentConfig>,
@@ -229,13 +238,16 @@ impl ClusterConfig {
         if let Some(endpoint) = self.model_endpoint.as_deref() {
             validate_model_endpoint(endpoint, self.security.mode == ClusterSecurityMode::Mtls)?;
         }
-        if let Some(state_dir) = self.state_dir.as_deref() {
-            validate_nonempty("state_dir", state_dir)?;
-            if state_dir.len() > 4_096 || state_dir.chars().any(char::is_control) {
-                return Err(ClusterConfigError::invalid(
-                    "state_dir must be a bounded path without control characters",
-                ));
-            }
+        let state_dir = self.state_dir.as_deref().ok_or_else(|| {
+            ClusterConfigError::invalid(
+                "state_dir is required for durable cluster identity and snapshot generations",
+            )
+        })?;
+        validate_nonempty("state_dir", state_dir)?;
+        if state_dir.len() > 4_096 || state_dir.chars().any(char::is_control) {
+            return Err(ClusterConfigError::invalid(
+                "state_dir must be a bounded path without control characters",
+            ));
         }
         if self.publish_interval_secs == 0 {
             return Err(ClusterConfigError::invalid(
@@ -245,6 +257,11 @@ impl ClusterConfig {
         if self.snapshot_ttl_secs < self.publish_interval_secs.saturating_mul(2) {
             return Err(ClusterConfigError::invalid(
                 "snapshot_ttl_secs must cover at least two publish intervals",
+            ));
+        }
+        if self.dead_peer_gc_secs == 0 || self.dead_peer_gc_secs > 86_400 {
+            return Err(ClusterConfigError::invalid(
+                "dead_peer_gc_secs must be between 1 and 86400 seconds",
             ));
         }
         validate_security(&self.security)?;
@@ -469,7 +486,7 @@ pub enum EffectiveClusterSecurity {
         key_file: String,
         /// Peer CA file.
         ca_file: String,
-        /// Expected peer certificate SAN.
+        /// Cluster SAN bound into every enrolled peer identity.
         server_name: String,
         /// Optional shared-key reference retained for legacy defense in depth.
         shared_key: Option<String>,
@@ -540,6 +557,8 @@ pub struct EffectiveClusterConfig {
     pub snapshot_ttl_secs: u64,
     /// Snapshot cadence.
     pub publish_interval_secs: u64,
+    /// Dead routing-member retention before SWIM GC.
+    pub dead_peer_gc_secs: u64,
     /// Optional enrollment authority.
     pub enrollment: Option<ClusterEnrollmentConfig>,
     /// Optional deployment authority.
@@ -573,6 +592,8 @@ pub struct ClusterRestartFingerprint {
     pub model_endpoint: Option<String>,
     /// Writable node-identity state directory.
     pub state_dir: Option<String>,
+    /// Dead routing-member retention before SWIM GC.
+    pub dead_peer_gc_secs: u64,
     /// Peer-security source material.
     pub security: EffectiveClusterSecurity,
     /// Enrollment authority loaded at startup.
@@ -596,6 +617,7 @@ impl EffectiveClusterConfig {
             transport_advertise_addr: self.transport_advertise_addr.clone(),
             model_endpoint: self.model_endpoint.clone(),
             state_dir: self.state_dir.clone(),
+            dead_peer_gc_secs: self.dead_peer_gc_secs,
             security: self.security.clone(),
             enrollment: self.enrollment.clone(),
             deployment_authority: self.deployment_authority.clone(),
@@ -674,6 +696,7 @@ fn lower_canonical(config: &ClusterConfig, source: ClusterConfigSource) -> Effec
         security: lower_canonical_security(&config.security),
         snapshot_ttl_secs: config.snapshot_ttl_secs,
         publish_interval_secs: config.publish_interval_secs,
+        dead_peer_gc_secs: config.dead_peer_gc_secs,
         enrollment: config.enrollment.clone(),
         deployment_authority: config.deployment_authority.clone(),
         diagnostics: Vec::new(),
@@ -713,6 +736,7 @@ fn lower_legacy(node_id: Option<&str>, mesh: &MeshClusterConfig) -> EffectiveClu
         security: lower_legacy_security(mesh),
         snapshot_ttl_secs: DEFAULT_SNAPSHOT_TTL_SECS,
         publish_interval_secs: DEFAULT_PUBLISH_INTERVAL_SECS,
+        dead_peer_gc_secs: DEFAULT_DEAD_PEER_GC_SECS,
         enrollment: None,
         deployment_authority: None,
         diagnostics: vec![legacy_diagnostic()],

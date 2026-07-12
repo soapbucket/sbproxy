@@ -42,6 +42,39 @@ pub struct ClusterPlacementState {
     deployments: BTreeMap<String, ClusterDeploymentPlacement>,
 }
 
+/// Generation fences grouped by where this controller learned them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeploymentGenerationFences {
+    observed: BTreeMap<String, crate::DeploymentGenerationFence>,
+    local: BTreeMap<String, crate::DeploymentGenerationFence>,
+}
+
+impl DeploymentGenerationFences {
+    /// Build fences from authenticated fleet observations and local reservations.
+    pub fn from_sources(
+        observed: BTreeMap<String, crate::DeploymentGenerationFence>,
+        local: BTreeMap<String, crate::DeploymentGenerationFence>,
+    ) -> Self {
+        Self { observed, local }
+    }
+
+    /// Build fences learned only from authenticated fleet observations.
+    pub fn observed(observed: BTreeMap<String, crate::DeploymentGenerationFence>) -> Self {
+        Self {
+            observed,
+            local: BTreeMap::new(),
+        }
+    }
+
+    /// Build fences reserved only by this controller.
+    pub fn local(local: BTreeMap<String, crate::DeploymentGenerationFence>) -> Self {
+        Self {
+            observed: BTreeMap::new(),
+            local,
+        }
+    }
+}
+
 impl ClusterPlacementState {
     /// Global desired state from which every worker projection is derived.
     pub const fn global(&self) -> &RuntimeDesiredState {
@@ -111,6 +144,9 @@ impl ClusterPlacementState {
 /// Invalid catalog, placement, rollout, or generation transition.
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterPlacementError {
+    /// Global desired-state identity could not be encoded.
+    #[error("cluster desired-state identity failed: {0}")]
+    DesiredIdentity(String),
     /// Deterministic placement failed.
     #[error("cluster placement failed: {0}")]
     Placement(#[from] crate::PlacementError),
@@ -123,17 +159,33 @@ pub enum ClusterPlacementError {
 }
 
 /// Recompute every deployment from one immutable reachable-directory view.
+///
+/// Observed fences come from authenticated fleet snapshots, while local fences
+/// are pre-commit reservations made by this controller. Keeping their
+/// provenance separate prevents another controller's in-progress revision from
+/// being mistaken for a locally failed commit.
 pub fn reconcile_cluster_placement(
     catalog: &Catalog,
     previous: Option<&ClusterPlacementState>,
     global: RuntimeDesiredState,
     nodes: Vec<PlacementNode>,
     observations: &BTreeMap<String, Vec<RolloutReplicaObservation>>,
+    generation_fences: &DeploymentGenerationFences,
     now_unix_ms: u64,
 ) -> Result<ClusterPlacementState, ClusterPlacementError> {
     let handoff_deadline = now_unix_ms
         .checked_add(global.control.handoff_timeout_ms)
         .ok_or(ClusterPlacementError::CounterOverflow)?;
+    let desired_revision_digest = global
+        .revision_digest()
+        .map_err(|error| ClusterPlacementError::DesiredIdentity(error.to_string()))?;
+    let previous_revision_digest = previous
+        .map(|state| state.global.revision_digest())
+        .transpose()
+        .map_err(|error| ClusterPlacementError::DesiredIdentity(error.to_string()))?;
+    let global_changed = previous_revision_digest
+        .as_deref()
+        .is_some_and(|digest| digest != desired_revision_digest);
     let mut deployments = BTreeMap::new();
     for (deployment_id, deployment) in &global.deployments {
         let prior_state = previous.and_then(|state| state.deployments.get(deployment_id));
@@ -141,23 +193,65 @@ pub fn reconcile_cluster_placement(
             .get(deployment_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let observed_generation = observed
+        let replica_generation = observed
             .iter()
             .map(|observation| observation.deployment_generation)
             .max()
             .unwrap_or(0);
-        let config_changed =
-            prior_state.is_some_and(|prior| prior.deployment.desired != deployment.desired);
-        let deployment_generation = match prior_state {
-            Some(prior) if !config_changed => prior.target.deployment_generation,
-            Some(prior) => prior
+        let observed_fence = generation_fences.observed.get(deployment_id);
+        let local_fence = generation_fences.local.get(deployment_id);
+        let high_water_generation = replica_generation
+            .max(
+                observed_fence
+                    .map(|fence| fence.deployment_generation)
+                    .unwrap_or(0),
+            )
+            .max(
+                local_fence
+                    .map(|fence| fence.deployment_generation)
+                    .unwrap_or(0),
+            );
+        let current_observed_generation = [observed_fence, local_fence]
+            .into_iter()
+            .flatten()
+            .filter(|fence| {
+                fence.desired_revision_digest.as_deref() == Some(desired_revision_digest.as_str())
+            })
+            .map(|fence| fence.deployment_generation)
+            .max();
+        let local_failed_reservation = local_fence
+            .filter(|fence| {
+                fence.desired_revision_digest.as_deref() != Some(desired_revision_digest.as_str())
+            })
+            .map(|fence| fence.deployment_generation);
+        let config_changed = prior_state.is_some_and(|_| global_changed);
+        let deployment_generation = match (prior_state, current_observed_generation) {
+            (Some(prior), observed) if !config_changed => {
+                let current = prior
+                    .target
+                    .deployment_generation
+                    .max(observed.unwrap_or(0));
+                match local_failed_reservation.filter(|reserved| *reserved >= current) {
+                    Some(reserved) => reserved
+                        .checked_add(1)
+                        .ok_or(ClusterPlacementError::CounterOverflow)?,
+                    None => current,
+                }
+            }
+            (None, Some(observed)) => observed,
+            (Some(prior), Some(observed)) if observed > prior.target.deployment_generation => {
+                observed
+            }
+            (Some(prior), _) => prior
                 .target
                 .deployment_generation
-                .max(observed_generation)
+                .max(high_water_generation)
                 .checked_add(1)
                 .ok_or(ClusterPlacementError::CounterOverflow)?,
-            None if observed_generation > 0 => observed_generation,
-            None => 1,
+            (None, None) if high_water_generation > 0 => high_water_generation
+                .checked_add(1)
+                .ok_or(ClusterPlacementError::CounterOverflow)?,
+            (None, None) => 1,
         };
         let target = plan_placement(
             catalog,

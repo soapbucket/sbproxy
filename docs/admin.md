@@ -242,6 +242,8 @@ reason.
 
 The separate `unhealthy_nodes` array is intentionally redundant. It gives the
 UI a direct alert feed while the same nodes remain visible in the full table.
+The directory retains bounded dead-node tombstones after SWIM routing GC, so a
+failed node does not disappear merely because it is no longer a routing owner.
 The summary includes total, healthy, degraded, and unhealthy nodes, eligible
 workers and replicas, deployment digest mismatch, rollout count, and unplaced
 replicas. Deployment rows include exact assignments, rejection reasons,

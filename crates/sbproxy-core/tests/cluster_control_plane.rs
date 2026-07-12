@@ -24,6 +24,7 @@ cluster:
   labels: {zone: a}
   gossip_port: 17946
   transport_port: 18946
+  state_dir: target/test-cluster-control-state
   security:
     mode: mtls
     shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
@@ -203,6 +204,35 @@ fn canonical_cluster_bootstraps_once_without_key_management() {
 }
 
 #[test]
+fn canonical_cluster_rejects_an_unwritable_generation_path_before_installing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let not_a_directory = temp.path().join("generation-state");
+    std::fs::write(&not_a_directory, b"not a directory").expect("state fixture");
+    let server = parse(&format!(
+        r#"
+cluster:
+  cluster_id: cluster-a
+  node_id: worker-a
+  roles: [worker]
+  state_dir: {}
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+"#,
+        not_a_directory.display()
+    ));
+    let owner = ClusterOwner::new(Arc::new(FakeBootstrap::default()));
+
+    let error = owner
+        .reconcile(&server)
+        .expect_err("generation state must be writable at startup");
+
+    assert!(format!("{error:#}").contains("snapshot generation"));
+    assert!(owner.current().is_none());
+}
+
+#[test]
 fn snapshot_cadence_reloads_but_identity_change_requires_restart() {
     let bootstrap = Arc::new(FakeBootstrap::default());
     let owner = ClusterOwner::new(bootstrap.clone());
@@ -341,6 +371,7 @@ cluster:
   transport_port: {transport_port}
   advertise_addr: 127.0.0.1:{gossip_port}
   transport_advertise_addr: 127.0.0.1:{transport_port}
+  state_dir: target/test-cluster-listener-state
   security:
     mode: shared_key
     development: true
@@ -384,6 +415,7 @@ cluster:
   node_id: authority-a
   roles: [gateway, authority]
   labels: {{zone: a}}
+  state_dir: {}
   enrollment:
     authority_dir: {}
     allow_insecure_http: true
@@ -392,6 +424,7 @@ cluster:
     development: true
     shared_key: local-development-secret
 "#,
+        authority_dir.display(),
         authority_dir.display()
     ));
     let bootstrap = Arc::new(FakeBootstrap::default());
@@ -427,6 +460,7 @@ cluster:
   node_id: authority-a
   roles: [gateway, authority]
   labels: {{zone: a}}
+  state_dir: {}
   enrollment:
     authority_dir: {}
   security:
@@ -437,6 +471,7 @@ cluster:
     ca_file: {}/ca.pem
     server_name: wrong-mesh-name
 "#,
+        authority_dir.display(),
         authority_dir.display(),
         authority_dir.display(),
         authority_dir.display(),
@@ -462,6 +497,7 @@ cluster:
   node_id: authority-a
   roles: [gateway, authority]
   labels: {{zone: a}}
+  state_dir: {}
   enrollment:
     authority_dir: {}
   security:
@@ -472,6 +508,7 @@ cluster:
     ca_file: {}/ca.pem
     server_name: sbproxy-mesh
 "#,
+        authority_dir.display(),
         authority_dir.display(),
         authority_dir.display(),
         authority_dir.display(),
@@ -613,4 +650,74 @@ cluster:
         error,
         sbproxy_core::cluster::ClusterDeploymentAuthorityError::ReadOnly
     ));
+}
+
+#[tokio::test]
+async fn failed_authority_cursor_write_does_not_activate_or_suppress_retry() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority_dir = temp.path().join("authority");
+    EnrollmentAuthority::initialize(
+        &authority_dir,
+        sbproxy_mesh::enrollment::AuthorityInit {
+            cluster_id: "cluster-a".to_string(),
+            node_id: "authority-a".to_string(),
+            roles: BTreeSet::from([ClusterNodeRole::Authority]),
+            labels: BTreeMap::new(),
+            server_name: "sbproxy-mesh".to_string(),
+        },
+    )
+    .expect("authority keys");
+    let state_dir = temp.path().join("state");
+    let server = parse(&format!(
+        r#"
+cluster:
+  cluster_id: cluster-a
+  node_id: authority-a
+  roles: [authority]
+  state_dir: {}
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+  deployment_authority:
+    signing_key_file: {}
+    verifying_key_file: {}
+"#,
+        state_dir.display(),
+        authority_dir.join("authority-signing.key").display(),
+        authority_dir.join("authority-verifying.key").display(),
+    ));
+    let owner = ClusterOwner::new(Arc::new(FakeBootstrap::default()));
+    owner.reconcile(&server).expect("authority cluster");
+    let authority = owner.deployment_authority().expect("deployment authority");
+    let signed = authority
+        .publish(
+            sbproxy_model_host::RestrictedDeploymentBundle::new(
+                "builtin-2026-07-10",
+                7,
+                BTreeMap::new(),
+            )
+            .expect("bundle"),
+        )
+        .await
+        .expect("publish");
+    let verified = authority
+        .read_candidate()
+        .await
+        .expect("candidate read")
+        .expect("candidate");
+    std::fs::create_dir(state_dir.join("deployment-authority-cursor.json"))
+        .expect("block cursor file creation");
+
+    authority
+        .commit(verified)
+        .expect_err("durability failure must abort activation");
+
+    assert!(authority.active().is_none());
+    let retry = authority
+        .read_candidate()
+        .await
+        .expect("retry read")
+        .expect("failed cursor write must not suppress retry");
+    assert_eq!(retry.bundle().content_digest, signed.bundle.content_digest);
 }

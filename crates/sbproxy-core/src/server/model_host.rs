@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
+use anyhow::Context;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use sbproxy_ai::local_host::pick_local_model_name;
@@ -180,7 +181,11 @@ fn load_catalog_from_dir(
     config: &ModelHostConfig,
     config_dir: &Path,
 ) -> Result<Arc<Catalog>, String> {
-    let Some(configured) = config.catalog_file.as_deref() else {
+    load_catalog_path(config.catalog_file.as_deref(), config_dir)
+}
+
+fn load_catalog_path(configured: Option<&str>, config_dir: &Path) -> Result<Arc<Catalog>, String> {
+    let Some(configured) = configured else {
         return Ok(Arc::new(Catalog::builtin()));
     };
     let configured = PathBuf::from(configured);
@@ -465,8 +470,11 @@ impl ProductionModelRuntime {
             current_cluster.placement.global().clone(),
             input.nodes,
             &input.observations,
+            &input.generation_fences,
             now_unix_ms,
         )?;
+        crate::cluster_models::persist_deployment_generations(&next_placement)
+            .context("persist cluster deployment generations before placement commit")?;
         let local_desired = next_placement.local_desired(&context.node_id)?;
         let manager = self.active_manager();
         if local_desired == *manager.current_desired() {
@@ -539,8 +547,11 @@ impl ProductionModelRuntime {
             global,
             input.nodes,
             &input.observations,
+            &input.generation_fences,
             current_unix_time_ms()?,
         )?;
+        crate::cluster_models::persist_deployment_generations(&next_placement)
+            .context("persist cluster deployment generations before authority commit")?;
         let local_desired = next_placement.local_desired(&context.node_id)?;
         let current_epoch = self.epoch.load(Ordering::SeqCst);
         let next_epoch = current_epoch
@@ -548,6 +559,11 @@ impl ProductionModelRuntime {
             .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
         let manager = self.active_manager();
         let runtime_changed = local_desired != *manager.current_desired();
+        let authority = crate::cluster::current_deployment_authority()
+            .ok_or_else(|| anyhow::anyhow!("cluster deployment authority is not installed"))?;
+        authority
+            .persist(verified)
+            .context("persist cluster deployment authority cursor before runtime commit")?;
         if runtime_changed {
             let prepared = manager.prepare_revision(local_desired).await?;
             manager.commit_revision(prepared).await?;
@@ -559,6 +575,7 @@ impl ProductionModelRuntime {
             placement: next_placement,
             catalog: current_cluster.catalog,
         });
+        authority.activate(verified.clone());
         self.epoch.store(next_epoch, Ordering::SeqCst);
         Ok(runtime_changed)
     }
@@ -903,6 +920,7 @@ impl ProductionModelRuntime {
                 candidate.desired.clone(),
                 input.nodes,
                 &input.observations,
+                &input.generation_fences,
                 now_unix_ms,
             )?;
             candidate.desired = placement.local_desired(&context.node_id)?;
@@ -1006,6 +1024,30 @@ impl ProductionModelRuntime {
         let next_epoch = current_epoch
             .checked_add(1)
             .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
+        if let Some(cluster) = candidate.cluster_state.as_ref() {
+            crate::cluster_models::persist_deployment_generations(&cluster.placement).map_err(
+                |error| {
+                    sbproxy_model_host::RuntimeManagerError::Prepare(format!(
+                        "persist cluster deployment generations before runtime commit: {error}"
+                    ))
+                },
+            )?;
+        }
+        let authority_activation = if let Some(verified) = candidate.authority_bundle.as_ref() {
+            let authority = crate::cluster::current_deployment_authority().ok_or_else(|| {
+                sbproxy_model_host::RuntimeManagerError::Prepare(
+                    "cluster deployment authority is not installed".to_string(),
+                )
+            })?;
+            authority.persist(verified).map_err(|error| {
+                sbproxy_model_host::RuntimeManagerError::Prepare(format!(
+                    "persist cluster deployment authority cursor before runtime commit: {error}"
+                ))
+            })?;
+            Some((authority, verified.clone()))
+        } else {
+            None
+        };
         let report = candidate
             .manager
             .commit_revision(candidate.prepared)
@@ -1025,12 +1067,8 @@ impl ProductionModelRuntime {
             .cluster_state
             .write()
             .expect("cluster model state lock") = candidate.cluster_state;
-        if let Some(verified) = candidate.authority_bundle {
-            if let Some(authority) = crate::cluster::current_deployment_authority() {
-                if let Err(error) = authority.commit(verified) {
-                    tracing::error!(%error, "persist cluster deployment authority cursor");
-                }
-            }
+        if let Some((authority, verified)) = authority_activation {
+            authority.activate(verified);
         }
         self.epoch.store(next_epoch, Ordering::SeqCst);
         Ok(report)
@@ -1104,9 +1142,6 @@ async fn refresh_cluster_deployment_bundle(runtime: &ProductionModelRuntime) -> 
         .ok_or_else(|| anyhow::anyhow!("cluster deployment authority is not installed"))?;
     if let Some(verified) = authority.read_candidate().await? {
         runtime.apply_cluster_authority_bundle(&verified).await?;
-        if let Err(error) = authority.commit(verified) {
-            tracing::error!(%error, "persist cluster deployment authority cursor");
-        }
     }
     authority
         .republish_active_if_due(std::time::Duration::from_secs(24 * 60 * 60))
@@ -1189,8 +1224,18 @@ fn compile_runtime_candidate(
         }
     }
 
-    let catalog = match legacy_providers.first() {
-        Some(legacy) => {
+    let catalog = match pipeline
+        .config
+        .server
+        .model_host
+        .as_ref()
+        .and_then(|control| control.catalog_file.as_deref())
+    {
+        Some(catalog_file) => {
+            load_catalog_path(Some(catalog_file), config_dir).map_err(anyhow::Error::msg)?
+        }
+        None if !legacy_providers.is_empty() => {
+            let legacy = &legacy_providers[0];
             load_catalog_from_dir(&legacy.config, config_dir).map_err(anyhow::Error::msg)?
         }
         None => Arc::new(Catalog::builtin()),
@@ -1940,6 +1985,7 @@ deployments:
             global,
             Vec::new(),
             &BTreeMap::new(),
+            &sbproxy_model_host::DeploymentGenerationFences::default(),
             1_000,
         )
         .expect("initial unplaced state");
@@ -1967,6 +2013,7 @@ deployments:
         let input = crate::cluster_models::DirectoryPlacementInput {
             nodes: vec![cluster_fixture_node()],
             observations: BTreeMap::new(),
+            generation_fences: sbproxy_model_host::DeploymentGenerationFences::default(),
         };
 
         let error = runtime

@@ -804,6 +804,7 @@ mod tests {
                         generation: 4,
                         published_at_unix_ms: 1_000,
                         expires_at_unix_ms: 31_000,
+                        authenticated_identity: None,
                         payload: serde_json::to_value(snapshot).expect("snapshot JSON"),
                     }),
                 )]),
@@ -864,6 +865,7 @@ deployments:
             global,
             Vec::new(),
             &BTreeMap::new(),
+            &sbproxy_model_host::DeploymentGenerationFences::default(),
             1_000,
         )
         .expect("unplaced status remains valid");

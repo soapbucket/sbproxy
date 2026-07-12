@@ -12,11 +12,12 @@ use sbproxy_model_host::node_snapshot::{
     NodeHealthState, NodeIdentitySnapshot, NodeModelSnapshot, NodeReplicaSnapshot, NodeRole,
     NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
 };
-use sbproxy_model_host::DeploymentRuntimeState;
+use sbproxy_model_host::{DeploymentGenerationFence, DeploymentRuntimeState};
 use serde::{Deserialize, Serialize};
 
 const DIRECTORY_SCHEMA_VERSION: u32 = 1;
 const MAX_DIRECTORY_MEMBERS: usize = 1_024;
+const MAX_DIRECTORY_ROSTER: usize = 4_096;
 const MAX_NODE_ID_BYTES: usize = 128;
 const MAX_MEMBER_ADDRESS_BYTES: usize = 512;
 
@@ -62,8 +63,21 @@ pub struct DirectorySnapshotEnvelope {
     pub published_at_unix_ms: u64,
     /// Envelope expiry time.
     pub expires_at_unix_ms: u64,
+    /// Authority-signed publisher claims verified by the cluster substrate.
+    pub authenticated_identity: Option<DirectoryAuthenticatedIdentity>,
     /// Strict payload JSON.
     pub payload: serde_json::Value,
+}
+
+/// Enrolled claims authenticated by the publisher's certificate key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryAuthenticatedIdentity {
+    /// Enrolled node ID.
+    pub node_id: String,
+    /// Enrolled node roles.
+    pub roles: BTreeSet<NodeRole>,
+    /// Enrolled placement and failure-domain labels.
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Result of collecting one member snapshot.
@@ -278,6 +292,8 @@ pub struct ModelDirectoryView {
     pub nodes: Vec<ModelDirectoryNode>,
     /// Ready current-generation replicas by deployment.
     pub eligible_replicas: BTreeMap<String, Vec<ModelDirectoryReplica>>,
+    /// Monotonic generation fences retained even when the newest replica is unavailable.
+    pub deployment_generation_fences: BTreeMap<String, DeploymentGenerationFence>,
 }
 
 impl Default for ModelDirectoryView {
@@ -288,6 +304,7 @@ impl Default for ModelDirectoryView {
             summary: ModelDirectorySummary::default(),
             nodes: Vec::new(),
             eligible_replicas: BTreeMap::new(),
+            deployment_generation_fences: BTreeMap::new(),
         }
     }
 }
@@ -320,6 +337,14 @@ struct ModelDirectoryWriter {
     highest_generation: BTreeMap<String, u64>,
     last_snapshot: BTreeMap<String, NodeModelSnapshot>,
     last_schema: BTreeMap<String, u32>,
+    roster: BTreeMap<String, RosterEntry>,
+    deployment_generation_fences: BTreeMap<String, DeploymentGenerationFence>,
+}
+
+#[derive(Clone)]
+struct RosterEntry {
+    member: DirectoryMember,
+    last_seen_unix_ms: u64,
 }
 
 /// One serialized writer with lock-free immutable readers.
@@ -365,7 +390,6 @@ impl ModelDirectory {
         mut reads: BTreeMap<String, DirectorySnapshotRead>,
     ) -> Result<Arc<ModelDirectoryView>, ModelDirectoryError> {
         validate_members(&members)?;
-        members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let current_members = members
             .iter()
             .map(|member| member.node_id.clone())
@@ -374,15 +398,41 @@ impl ModelDirectory {
             .writer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for member in &members {
+            writer.roster.insert(
+                member.node_id.clone(),
+                RosterEntry {
+                    member: member.clone(),
+                    last_seen_unix_ms: collected_at_unix_ms,
+                },
+            );
+        }
+        trim_roster(&mut writer, &current_members);
+        members.extend(
+            writer
+                .roster
+                .iter()
+                .filter(|(node_id, _)| !current_members.contains(*node_id))
+                .map(|(_, entry)| {
+                    let mut member = entry.member.clone();
+                    member.state = DirectoryMemberState::Dead;
+                    member.last_ack_age_ms = member.last_ack_age_ms.saturating_add(
+                        collected_at_unix_ms.saturating_sub(entry.last_seen_unix_ms),
+                    );
+                    member
+                }),
+        );
+        members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let roster_members = writer.roster.keys().cloned().collect::<BTreeSet<_>>();
         writer
             .highest_generation
-            .retain(|node_id, _| current_members.contains(node_id));
+            .retain(|node_id, _| roster_members.contains(node_id));
         writer
             .last_snapshot
-            .retain(|node_id, _| current_members.contains(node_id));
+            .retain(|node_id, _| roster_members.contains(node_id));
         writer
             .last_schema
-            .retain(|node_id, _| current_members.contains(node_id));
+            .retain(|node_id, _| roster_members.contains(node_id));
 
         let mut nodes = members
             .into_iter()
@@ -396,6 +446,7 @@ impl ModelDirectory {
 
         let digests = nodes
             .iter()
+            .filter(|node| node.model_eligible)
             .filter_map(|node| node.active_deployment_digest.as_deref())
             .collect::<BTreeSet<_>>();
         let deployment_digest_mismatch = digests.len() > 1;
@@ -410,10 +461,14 @@ impl ModelDirectory {
                     ModelDirectoryHealth::Unhealthy,
                 );
             }
-        } else {
-            fence_replica_generations(&mut nodes);
         }
-        let eligible_replicas = build_replica_index(&nodes);
+        update_deployment_generation_fences(&mut writer, &nodes);
+        let active_generations = if deployment_digest_mismatch {
+            BTreeMap::new()
+        } else {
+            fence_replica_generations(&mut nodes, &writer.deployment_generation_fences)
+        };
+        let eligible_replicas = build_replica_index(&nodes, &active_generations);
         let summary = summarize(&nodes, &eligible_replicas, deployment_digest_mismatch);
         let view = Arc::new(ModelDirectoryView {
             schema_version: DIRECTORY_SCHEMA_VERSION,
@@ -421,9 +476,27 @@ impl ModelDirectory {
             summary,
             nodes,
             eligible_replicas,
+            deployment_generation_fences: writer.deployment_generation_fences.clone(),
         });
         self.view.store(Arc::clone(&view));
         Ok(view)
+    }
+}
+
+fn trim_roster(writer: &mut ModelDirectoryWriter, current_members: &BTreeSet<String>) {
+    if writer.roster.len() <= MAX_DIRECTORY_ROSTER {
+        return;
+    }
+    let mut removable = writer
+        .roster
+        .iter()
+        .filter(|(node_id, _)| !current_members.contains(*node_id))
+        .map(|(node_id, entry)| (entry.last_seen_unix_ms, node_id.clone()))
+        .collect::<Vec<_>>();
+    removable.sort();
+    let remove = writer.roster.len().saturating_sub(MAX_DIRECTORY_ROSTER);
+    for (_, node_id) in removable.into_iter().take(remove) {
+        writer.roster.remove(&node_id);
     }
 }
 
@@ -599,6 +672,23 @@ fn ingest_present(
         }
     };
     if snapshot.node.node_id != node.node_id {
+        exclude_node(
+            node,
+            ModelDirectoryExclusionReason::IdentityMismatch,
+            ModelDirectoryHealth::Unhealthy,
+        );
+        retain_last_snapshot(writer, node, now);
+        return;
+    }
+    if envelope
+        .authenticated_identity
+        .as_ref()
+        .is_some_and(|identity| {
+            identity.node_id != snapshot.node.node_id
+                || identity.roles != snapshot.node.roles
+                || identity.labels != snapshot.node.labels
+        })
+    {
         exclude_node(
             node,
             ModelDirectoryExclusionReason::IdentityMismatch,
@@ -792,19 +882,48 @@ fn exclude_node(
     }
 }
 
-fn fence_replica_generations(nodes: &mut [ModelDirectoryNode]) {
-    let mut active = BTreeMap::<String, u64>::new();
-    for replica in nodes
-        .iter()
-        .filter(|node| node.model_eligible)
-        .flat_map(|node| node.replicas.iter())
-        .filter(|replica| replica.state == DeploymentRuntimeState::Ready)
-    {
-        active
-            .entry(replica.deployment.clone())
-            .and_modify(|generation| *generation = (*generation).max(replica.deployment_generation))
-            .or_insert(replica.deployment_generation);
+fn update_deployment_generation_fences(
+    writer: &mut ModelDirectoryWriter,
+    nodes: &[ModelDirectoryNode],
+) {
+    for node in nodes.iter().filter(|node| node.snapshot.is_some()) {
+        for replica in &node.replicas {
+            let candidate = DeploymentGenerationFence {
+                deployment_generation: replica.deployment_generation,
+                desired_revision_digest: node.active_deployment_digest.clone(),
+            };
+            match writer
+                .deployment_generation_fences
+                .entry(replica.deployment.clone())
+            {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if candidate.deployment_generation > entry.get().deployment_generation =>
+                {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if candidate.deployment_generation == entry.get().deployment_generation
+                        && entry.get().desired_revision_digest.is_none() =>
+                {
+                    entry.insert(candidate);
+                }
+                _ => {}
+            }
+        }
     }
+}
+
+fn fence_replica_generations(
+    nodes: &mut [ModelDirectoryNode],
+    fences: &BTreeMap<String, DeploymentGenerationFence>,
+) -> BTreeMap<String, u64> {
+    let active = fences
+        .iter()
+        .map(|(deployment, fence)| (deployment.clone(), fence.deployment_generation))
+        .collect::<BTreeMap<_, _>>();
     for node in nodes.iter_mut().filter(|node| node.model_eligible) {
         let behind = node.replicas.iter().any(|replica| {
             replica.state == DeploymentRuntimeState::Ready
@@ -813,25 +932,31 @@ fn fence_replica_generations(nodes: &mut [ModelDirectoryNode]) {
                     .is_some_and(|active| replica.deployment_generation < *active)
         });
         if behind {
-            exclude_node(
-                node,
-                ModelDirectoryExclusionReason::BehindActiveGeneration,
-                ModelDirectoryHealth::Degraded,
-            );
+            node.health = ModelDirectoryHealth::Degraded;
+            let reason = ModelDirectoryExclusionReason::BehindActiveGeneration
+                .as_str()
+                .to_string();
+            if !node.unhealthy_reasons.contains(&reason) {
+                node.unhealthy_reasons.push(reason);
+                node.unhealthy_reasons.sort();
+            }
         }
     }
+    active
 }
 
 fn build_replica_index(
     nodes: &[ModelDirectoryNode],
+    active_generations: &BTreeMap<String, u64>,
 ) -> BTreeMap<String, Vec<ModelDirectoryReplica>> {
     let mut index = BTreeMap::<String, Vec<ModelDirectoryReplica>>::new();
     for node in nodes.iter().filter(|node| node.model_eligible) {
-        for replica in node
-            .replicas
-            .iter()
-            .filter(|replica| replica.state == DeploymentRuntimeState::Ready)
-        {
+        for replica in node.replicas.iter().filter(|replica| {
+            replica.state == DeploymentRuntimeState::Ready
+                && active_generations
+                    .get(&replica.deployment)
+                    .is_some_and(|active| replica.deployment_generation == *active)
+        }) {
             index
                 .entry(replica.deployment.clone())
                 .or_default()

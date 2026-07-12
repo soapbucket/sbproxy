@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
 use sbproxy_ai::model_directory::{
-    DirectoryMember, DirectoryMemberState, DirectorySnapshotEnvelope, DirectorySnapshotRead,
-    ModelDirectory, ModelDirectoryExclusionReason, ModelDirectoryHealth,
+    DirectoryAuthenticatedIdentity, DirectoryMember, DirectoryMemberState,
+    DirectorySnapshotEnvelope, DirectorySnapshotRead, ModelDirectory,
+    ModelDirectoryExclusionReason, ModelDirectoryHealth,
 };
 use sbproxy_model_host::node_snapshot::{
     NodeArtifactSnapshot, NodeEngineSnapshot, NodeHealthSnapshot, NodeHealthState,
@@ -244,6 +245,7 @@ fn observed(snapshot: &NodeModelSnapshot) -> DirectorySnapshotRead {
         generation: snapshot.generation,
         published_at_unix_ms: snapshot.published_at_unix_ms,
         expires_at_unix_ms: snapshot.expires_at_unix_ms,
+        authenticated_identity: None,
         payload: serde_json::to_value(snapshot).expect("snapshot value"),
     })
 }
@@ -351,6 +353,35 @@ fn directory_reports_snapshot_failure_classes_without_raw_details() {
 }
 
 #[test]
+fn directory_rejects_snapshot_roles_or_labels_outside_enrolled_claims() {
+    let directory = ModelDirectory::new();
+    let snapshot = snapshot_for("worker-a", 10);
+    let mut read = observed(&snapshot);
+    let DirectorySnapshotRead::Present(envelope) = &mut read else {
+        unreachable!();
+    };
+    envelope.authenticated_identity = Some(DirectoryAuthenticatedIdentity {
+        node_id: "worker-a".to_string(),
+        roles: BTreeSet::from([NodeRole::Gateway]),
+        labels: snapshot.node.labels.clone(),
+    });
+    let view = directory
+        .refresh(
+            snapshot.published_at_unix_ms + 100,
+            vec![member("worker-a", DirectoryMemberState::Alive)],
+            BTreeMap::from([("worker-a".to_string(), read)]),
+        )
+        .expect("identity mismatch view");
+    let node = view.node("worker-a").unwrap();
+    assert_eq!(
+        node.exclusion_reason,
+        Some(ModelDirectoryExclusionReason::IdentityMismatch)
+    );
+    assert_eq!(node.health, ModelDirectoryHealth::Unhealthy);
+    assert!(!node.model_eligible);
+}
+
+#[test]
 fn older_snapshot_generation_never_replaces_last_observed_truth() {
     let directory = ModelDirectory::new();
     let newer = snapshot_for("worker-a", 12);
@@ -407,6 +438,7 @@ fn schema_zero_normalizes_and_readers_hold_immutable_views() {
                     generation: snapshot.generation,
                     published_at_unix_ms: snapshot.published_at_unix_ms,
                     expires_at_unix_ms: snapshot.expires_at_unix_ms,
+                    authenticated_identity: None,
                     payload,
                 }),
             )]),
@@ -429,6 +461,11 @@ fn directory_fences_old_replica_generations_and_deployment_digest_drift() {
     worker_a.replicas[0].deployment_generation = 20;
     let mut worker_b = snapshot_for("worker-b", 10);
     worker_b.replicas[0].deployment_generation = 19;
+    let mut unrelated = worker_b.replicas[0].clone();
+    unrelated.deployment = "embed".to_string();
+    unrelated.deployment_generation = 3;
+    unrelated.model = "embedding-model".to_string();
+    worker_b.replicas.push(unrelated);
     let now = worker_a.published_at_unix_ms + 100;
     let view = directory
         .refresh(
@@ -445,10 +482,15 @@ fn directory_fences_old_replica_generations_and_deployment_digest_drift() {
         .expect("generation view");
     assert_eq!(view.eligible_replicas["coder"].len(), 1);
     assert_eq!(view.eligible_replicas["coder"][0].node_id, "worker-a");
-    assert_eq!(
-        view.node("worker-b").unwrap().exclusion_reason,
-        Some(ModelDirectoryExclusionReason::BehindActiveGeneration)
-    );
+    assert_eq!(view.eligible_replicas["embed"].len(), 1);
+    let worker_b_view = view.node("worker-b").unwrap();
+    assert!(worker_b_view.model_eligible);
+    assert_eq!(worker_b_view.exclusion_reason, None);
+    assert_eq!(worker_b_view.health, ModelDirectoryHealth::Degraded);
+    assert!(worker_b_view
+        .unhealthy_reasons
+        .iter()
+        .any(|reason| reason == "behind_active_generation"));
 
     worker_b.generation = 11;
     worker_b.active_deployment_digest = Some("d".repeat(64));
@@ -469,4 +511,110 @@ fn directory_fences_old_replica_generations_and_deployment_digest_drift() {
     assert!(drift.eligible_replicas.is_empty());
     assert!(drift.nodes.iter().all(|node| node.exclusion_reason
         == Some(ModelDirectoryExclusionReason::DeploymentDigestMismatch)));
+
+    let recovered = directory
+        .refresh(
+            now + 2,
+            vec![
+                member("worker-a", DirectoryMemberState::Alive),
+                member("worker-b", DirectoryMemberState::Alive),
+            ],
+            BTreeMap::from([
+                ("worker-a".to_string(), observed(&worker_a)),
+                ("worker-b".to_string(), DirectorySnapshotRead::Missing),
+            ]),
+        )
+        .expect("digest recovery view");
+    assert!(!recovered.summary.deployment_digest_mismatch);
+    assert!(recovered.node("worker-a").unwrap().model_eligible);
+    assert_eq!(
+        recovered.node("worker-b").unwrap().exclusion_reason,
+        Some(ModelDirectoryExclusionReason::SnapshotMissing)
+    );
+}
+
+#[test]
+fn directory_never_regresses_when_the_newest_replica_becomes_unreachable() {
+    let directory = ModelDirectory::new();
+    let mut newest = snapshot_for("worker-a", 10);
+    newest.replicas[0].deployment_generation = 20;
+    let mut older = snapshot_for("worker-b", 10);
+    older.replicas[0].deployment_generation = 19;
+    let now = newest.published_at_unix_ms + 100;
+
+    directory
+        .refresh(
+            now,
+            vec![
+                member("worker-a", DirectoryMemberState::Alive),
+                member("worker-b", DirectoryMemberState::Alive),
+            ],
+            BTreeMap::from([
+                ("worker-a".to_string(), observed(&newest)),
+                ("worker-b".to_string(), observed(&older)),
+            ]),
+        )
+        .expect("observe generation 20");
+
+    let after_failure = directory
+        .refresh(
+            now + 1,
+            vec![
+                member("worker-a", DirectoryMemberState::Unreachable),
+                member("worker-b", DirectoryMemberState::Alive),
+            ],
+            BTreeMap::from([
+                ("worker-a".to_string(), DirectorySnapshotRead::Unreachable),
+                ("worker-b".to_string(), observed(&older)),
+            ]),
+        )
+        .expect("retain generation fence");
+
+    assert!(
+        after_failure
+            .eligible_replicas
+            .get("coder")
+            .is_none_or(Vec::is_empty),
+        "generation 19 must not become routable again after generation 20 disappears"
+    );
+    let older = after_failure.node("worker-b").expect("older worker");
+    assert_eq!(older.health, ModelDirectoryHealth::Degraded);
+    assert!(older
+        .unhealthy_reasons
+        .iter()
+        .any(|reason| reason == "behind_active_generation"));
+}
+
+#[test]
+fn directory_retains_a_dead_tombstone_after_routing_membership_gc() {
+    let directory = ModelDirectory::new();
+    let snapshot = snapshot_for("worker-a", 12);
+    let first = directory
+        .refresh(
+            snapshot.published_at_unix_ms + 100,
+            vec![member("worker-a", DirectoryMemberState::Alive)],
+            BTreeMap::from([("worker-a".to_string(), observed(&snapshot))]),
+        )
+        .expect("initial roster");
+    assert_eq!(first.summary.total_nodes, 1);
+
+    let after_mesh_gc = directory
+        .refresh(
+            snapshot.published_at_unix_ms + 6 * 60 * 1_000,
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("roster after routing GC");
+    let tombstone = after_mesh_gc
+        .node("worker-a")
+        .expect("known worker remains in operator roster");
+
+    assert_eq!(after_mesh_gc.summary.total_nodes, 1);
+    assert_eq!(tombstone.membership_state, DirectoryMemberState::Dead);
+    assert_eq!(tombstone.health, ModelDirectoryHealth::Unhealthy);
+    assert!(!tombstone.model_eligible);
+    assert!(tombstone
+        .unhealthy_reasons
+        .iter()
+        .any(|reason| reason == "membership_dead"));
 }

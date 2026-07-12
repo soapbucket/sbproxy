@@ -14,8 +14,9 @@ use sbproxy_model_host::rollout::{
 };
 use sbproxy_model_host::{
     compile_desired_state, reconcile_cluster_placement, AcceleratorKind, ArtifactFormat, Catalog,
-    DeploymentRuntimeState, EngineAvailability, EngineChoice, EngineKind, GpuVendor,
-    ManagedProviderInput, ModelDeployment, PullPolicy, RolloutPolicy, RuntimeDesiredInput,
+    DeploymentGenerationFences, DeploymentRuntimeState, EngineAvailability, EngineChoice,
+    EngineKind, FileDeploymentGenerationStore, GpuVendor, ManagedProviderInput, ModelDeployment,
+    PullPolicy, RolloutPolicy, RuntimeDesiredInput,
 };
 
 fn catalog() -> Catalog {
@@ -674,6 +675,7 @@ deployments:
             cuda_node("worker-b", "b", 24_000_000_000),
         ],
         &BTreeMap::new(),
+        &DeploymentGenerationFences::default(),
         1_000,
     )
     .unwrap();
@@ -697,6 +699,7 @@ deployments:
         global,
         vec![cuda_node(replacement_node, "b", 24_000_000_000)],
         &BTreeMap::from([("coder".to_string(), vec![old_ready.clone()])]),
+        &DeploymentGenerationFences::default(),
         1_100,
     )
     .unwrap();
@@ -734,6 +737,7 @@ deployments:
         moving.global().clone(),
         vec![cuda_node(replacement_node, "b", 24_000_000_000)],
         &BTreeMap::from([("coder".to_string(), vec![old_ready, replacement_ready])]),
+        &DeploymentGenerationFences::default(),
         1_200,
     )
     .unwrap();
@@ -751,4 +755,430 @@ deployments:
         .unwrap()
         .deployments
         .contains_key("coder"));
+}
+
+#[test]
+fn restarted_controller_reuses_the_generation_of_the_same_observed_desired_state() {
+    let host = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+    replicas: 1
+"#,
+    )
+    .unwrap();
+    let global = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "controller-restart".to_string(),
+            canonical: Some(host),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let observed = RolloutReplicaObservation {
+        node_id: "worker-a".to_string(),
+        deployment_generation: 9,
+        variant_id: Some("cuda-fp8".to_string()),
+        artifact_digest: Some("a".repeat(64)),
+        state: DeploymentRuntimeState::Ready,
+    };
+
+    let desired_digest = global.revision_digest().expect("desired digest");
+    let restarted = reconcile_cluster_placement(
+        &catalog(),
+        None,
+        global,
+        vec![cuda_node("worker-a", "a", 24_000_000_000)],
+        &BTreeMap::from([("coder".to_string(), vec![observed])]),
+        &DeploymentGenerationFences::observed(BTreeMap::from([(
+            "coder".to_string(),
+            sbproxy_model_host::DeploymentGenerationFence {
+                deployment_generation: 9,
+                desired_revision_digest: Some(desired_digest.clone()),
+            },
+        )])),
+        10_000,
+    )
+    .unwrap();
+
+    assert_eq!(
+        restarted.deployments()["coder"]
+            .target
+            .deployment_generation,
+        9,
+        "a restarted controller must converge with live controllers on the same desired state"
+    );
+
+    let changed_host = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+    replicas: 1
+    max_concurrency: 16
+"#,
+    )
+    .unwrap();
+    let changed = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "controller-restart".to_string(),
+            canonical: Some(changed_host),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let changed_digest = changed.revision_digest().expect("changed desired digest");
+    let advanced = reconcile_cluster_placement(
+        &catalog(),
+        None,
+        changed.clone(),
+        vec![cuda_node("worker-a", "a", 24_000_000_000)],
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::observed(BTreeMap::from([(
+            "coder".to_string(),
+            sbproxy_model_host::DeploymentGenerationFence {
+                deployment_generation: 9,
+                desired_revision_digest: Some(desired_digest),
+            },
+        )])),
+        10_100,
+    )
+    .unwrap();
+    assert_eq!(
+        advanced.deployments()["coder"].target.deployment_generation,
+        10
+    );
+
+    let converged = reconcile_cluster_placement(
+        &catalog(),
+        None,
+        changed,
+        vec![cuda_node("worker-a", "a", 24_000_000_000)],
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::observed(BTreeMap::from([(
+            "coder".to_string(),
+            sbproxy_model_host::DeploymentGenerationFence {
+                deployment_generation: 10,
+                desired_revision_digest: Some(changed_digest),
+            },
+        )])),
+        10_200,
+    )
+    .unwrap();
+    assert_eq!(
+        converged.deployments()["coder"]
+            .target
+            .deployment_generation,
+        10,
+        "controllers joining an in-progress desired revision must not increment it again"
+    );
+}
+
+#[test]
+fn global_revision_changes_advance_every_deployment_generation() {
+    let initial_host = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+  spare:
+    model: coder
+    variant: cuda-fp8
+"#,
+    )
+    .unwrap();
+    let initial_global = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "global-1".to_string(),
+            canonical: Some(initial_host),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let initial = reconcile_cluster_placement(
+        &catalog(),
+        None,
+        initial_global,
+        vec![cuda_node("worker-a", "a", 24_000_000_000)],
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::default(),
+        1_000,
+    )
+    .unwrap();
+
+    let changed_host = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+  spare:
+    model: coder
+    variant: cuda-fp8
+    max_concurrency: 16
+"#,
+    )
+    .unwrap();
+    let changed_global = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "global-2".to_string(),
+            canonical: Some(changed_host),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let changed = reconcile_cluster_placement(
+        &catalog(),
+        Some(&initial),
+        changed_global,
+        vec![cuda_node("worker-a", "a", 24_000_000_000)],
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::default(),
+        1_100,
+    )
+    .unwrap();
+
+    assert_eq!(
+        changed.deployments()["coder"].target.deployment_generation,
+        2
+    );
+    assert_eq!(
+        changed.deployments()["spare"].target.deployment_generation,
+        2
+    );
+}
+
+#[test]
+fn durable_generation_store_survives_restart_without_replica_observations() {
+    let host = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+"#,
+    )
+    .unwrap();
+    let global = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "durable-unplaced".to_string(),
+            canonical: Some(host),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let initial = reconcile_cluster_placement(
+        &catalog(),
+        None,
+        global.clone(),
+        Vec::new(),
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::default(),
+        1_000,
+    )
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store = FileDeploymentGenerationStore::open(temp.path()).unwrap();
+    store.persist(&initial).unwrap();
+
+    let restarted = reconcile_cluster_placement(
+        &catalog(),
+        None,
+        global,
+        Vec::new(),
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::local(store.load().unwrap()),
+        2_000,
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.deployments()["coder"]
+            .target
+            .deployment_generation,
+        1
+    );
+}
+
+#[test]
+fn failed_generation_reservation_allows_last_good_config_to_return() {
+    let host_a = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+    max_concurrency: 4
+"#,
+    )
+    .unwrap();
+    let global_a = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "rollback-a".to_string(),
+            canonical: Some(host_a),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let active = reconcile_cluster_placement(
+        &catalog(),
+        None,
+        global_a.clone(),
+        Vec::new(),
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::default(),
+        1_000,
+    )
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store = FileDeploymentGenerationStore::open(temp.path()).unwrap();
+    store.persist(&active).unwrap();
+
+    let host_b = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+    max_concurrency: 8
+"#,
+    )
+    .unwrap();
+    let global_b = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "rollback-b".to_string(),
+            canonical: Some(host_b),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let failed_candidate = reconcile_cluster_placement(
+        &catalog(),
+        Some(&active),
+        global_b,
+        Vec::new(),
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::local(store.load().unwrap()),
+        1_100,
+    )
+    .unwrap();
+    assert_eq!(
+        failed_candidate.deployments()["coder"]
+            .target
+            .deployment_generation,
+        2
+    );
+    store.persist(&failed_candidate).unwrap();
+
+    let reverted = reconcile_cluster_placement(
+        &catalog(),
+        Some(&active),
+        global_a,
+        Vec::new(),
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::local(store.load().unwrap()),
+        1_200,
+    )
+    .unwrap();
+    assert_eq!(
+        reverted.deployments()["coder"].target.deployment_generation,
+        3,
+        "reverting after a failed reserved revision must skip the consumed generation"
+    );
+    store.persist(&reverted).unwrap();
+}
+
+#[test]
+fn remote_mismatched_revision_does_not_advance_unchanged_local_state() {
+    let host_a = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+    max_concurrency: 4
+"#,
+    )
+    .unwrap();
+    let global_a = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "rolling-a".to_string(),
+            canonical: Some(host_a),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let active = reconcile_cluster_placement(
+        &catalog(),
+        None,
+        global_a.clone(),
+        Vec::new(),
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::default(),
+        1_000,
+    )
+    .unwrap();
+
+    let host_b = serde_yaml::from_str(
+        r#"
+deployments:
+  coder:
+    model: coder
+    variant: cuda-fp8
+    max_concurrency: 8
+"#,
+    )
+    .unwrap();
+    let global_b = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "rolling-b".to_string(),
+            canonical: Some(host_b),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog(),
+    )
+    .unwrap();
+    let remote_digest = global_b.revision_digest().unwrap();
+    let stable = reconcile_cluster_placement(
+        &catalog(),
+        Some(&active),
+        global_a,
+        Vec::new(),
+        &BTreeMap::new(),
+        &DeploymentGenerationFences::observed(BTreeMap::from([(
+            "coder".to_string(),
+            sbproxy_model_host::DeploymentGenerationFence {
+                deployment_generation: 2,
+                desired_revision_digest: Some(remote_digest),
+            },
+        )])),
+        1_100,
+    )
+    .unwrap();
+
+    assert_eq!(
+        stable.deployments()["coder"].target.deployment_generation,
+        1,
+        "a remote rolling-update fence must not consume a local generation"
+    );
 }

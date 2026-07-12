@@ -376,6 +376,7 @@ mod tests {
             Some(MeshTlsClient {
                 connector,
                 server_name: ServerName::try_from("localhost").unwrap(),
+                verify_node_id: false,
             }),
         );
 

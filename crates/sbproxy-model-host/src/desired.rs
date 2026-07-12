@@ -143,6 +143,13 @@ impl RuntimeDesiredState {
             route.origin == origin && route.provider == provider && route.model == model
         })
     }
+
+    /// Stable SHA-256 identity of the complete global desired revision.
+    pub fn revision_digest(&self) -> Result<String, DesiredStateError> {
+        let bytes = serde_json::to_vec(&self.revision)
+            .map_err(|error| DesiredStateError::Invalid(error.to_string()))?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    }
 }
 
 /// Complete-revision validation or normalization failure.

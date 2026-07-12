@@ -62,6 +62,7 @@ proxy:
     advertise_addr: 10.0.0.12:7946
     transport_advertise_addr: 10.0.0.12:8946
     model_endpoint: https://10.0.0.12:9443
+    state_dir: /var/lib/sbproxy/cluster
     security:
       mode: mtls
       shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
@@ -71,6 +72,7 @@ proxy:
       server_name: sbproxy-mesh
     snapshot_ttl_secs: 30
     publish_interval_secs: 5
+    dead_peer_gc_secs: 300
 ```
 
 `roles` accepts `gateway`, `worker`, and `authority`. A canonical distributed
@@ -81,10 +83,11 @@ also requires `shared_key` to authenticate and encrypt UDP SWIM traffic, while
 certificates authenticate the TCP peer transport. Plaintext is not accepted by
 canonical configuration.
 
-`advertise_addr` is the UDP gossip address. `transport_advertise_addr` is the
-TCP typed-state address. The latter defaults to the gossip-advertised host and
-`transport_port`, which is sufficient for GCP private-address deployments; set
-it explicitly when NAT or port translation makes those addresses differ.
+`advertise_addr` is the UDP gossip address. Enrolled mTLS requires an explicit
+routable IP and port so the signed join can bind later datagrams to their
+source. `transport_advertise_addr` is the TCP typed-state address. The latter
+defaults to the gossip-advertised host and `transport_port`; set it explicitly
+when NAT or port translation makes those addresses differ.
 
 An authority node may additionally configure an enrollment store and a
 deployment signing key. A non-authority node may configure only the
@@ -99,7 +102,8 @@ seed, advertised address, and security values must agree. The key cache only
 consumes the shared handle and can no longer bootstrap a second mesh.
 
 Node identity, roles, labels, gossip listener, peer transport listener,
-advertised addresses, and security material are restart-required fields.
+advertised addresses, durable state, dead-peer GC, and security material are
+restart-required fields.
 Snapshot cadence and deployment content are reloadable. Config planning marks
 restart fields explicitly, and the live reload path refuses an in-process
 identity or listener replacement while retaining the last-good pipeline.
@@ -129,11 +133,19 @@ retains a restart fingerprint. Startup orders cluster installation before key
 plane and model runtime construction. The key cache, mesh counters, and fleet
 metrics receive clones from this owner.
 
-Authenticated join messages carry the stable node ID plus distinct gossip and
-typed-state addresses. Joining promotes bootstrap seed addresses to stable
-ring identities, floods new membership to known peers, and leaves routed state
-unavailable until a valid transport address is known. UDP observations never
-overwrite the TCP route table.
+Authenticated join messages carry the stable node ID, distinct gossip and
+typed-state addresses, certificate attestation, durable boot epoch, a bounded
+issue and expiry window, and a certificate-key signature over the complete
+advertisement. Joining promotes bootstrap seed addresses to stable ring
+identities, rejects an expired or replayed proof, and leaves routed state
+unavailable until a valid transport address is known. A higher boot epoch
+fences dead-process gossip; a higher identity epoch permits deliberate
+certificate rotation, while same-epoch certificate substitution is rejected.
+Direct joins replay only the bounded live authenticated roster. Later
+datagrams must match the signed gossip source. UDP observations never
+overwrite the TCP route table. Each verifier persists peer identity and boot
+high-water marks before accepting them, so its own restart cannot reopen an old
+credential or join proof.
 
 ## Identity and enrollment
 
@@ -159,21 +171,33 @@ The workflow is:
 6. The worker atomically installs its key, certificate, CA, and identity
    manifest. The private key never leaves the worker.
 
-Manual PKI remains supported. An operator supplies the same certificate, key,
-CA, node ID, roles, and labels directly in `proxy.cluster`; runtime identity is
-the same `ClusterIdentity` value regardless of how the files were produced.
+Canonical mTLS accepts one identity mode for the entire cluster. Built-in
+enrollment installs a signed identity manifest and authority verification key
+in `state_dir`. Operator-managed PKI instead embeds strict versioned identity
+claims in exactly one `urn:sbproxy:identity:v1:<base64url-json>` URI SAN. In
+both modes the CA-signed leaf must carry the node ID as a DNS SAN and the
+certificate key signs joins and typed state. Claims include cluster ID, node
+ID, roles, labels, cluster server name, and a positive identity epoch. The two
+attestation modes cannot mix. Manual certificate rotation must increase the
+identity epoch.
 
 ## Typed cluster state
 
 Typed state uses a versioned `ClusterStateEnvelope` containing namespace, key,
 schema version, publisher node ID, generation, published time, expiry time,
-and payload bytes. The distributed backend stores it through the existing
-encrypted and optionally mTLS-authenticated mesh transport. The local backend
-keeps the same semantics without network tasks.
+payload bytes, and an enrolled certificate-key proof in canonical mTLS mode.
+Readers verify the authority-signed cluster, node ID, roles, labels,
+certificate fingerprint, node-specific SAN, and payload signature. The
+distributed backend stores it through the encrypted mTLS mesh transport. The
+local backend keeps the same generation and expiry semantics without network
+tasks.
 
 Writes fail when the selected remote owner is unreachable. Reads distinguish
 missing, expired, malformed, incompatible-schema, and unreachable results.
 Consumers apply their own monotonic generation checks before publication.
+Model controllers additionally persist every target generation and global
+desired-state digest before commit. That durable high-water state covers
+unplaced deployments and recreate drain gaps where no replica snapshot exists.
 
 ## Node model snapshots
 
@@ -329,15 +353,18 @@ contract that UI will consume.
 
 Focused unit and property tests cover config lowering, restart classification,
 local-handle zero-network behavior, one process bootstrap, membership mapping,
-typed-state expiry, enrollment replay, CSR signing, role and label constraints,
-manual PKI normalization, bundle restrictions, signature tampering, snapshot
-generation, schema compatibility, directory exclusion, weighted rendezvous,
-minimal movement, spread, pinned and heterogeneous variants, partition
-overprovision, and rollout handoff.
+typed-state expiry, enrollment replay, join expiry, durable boot epochs,
+certificate rotation, CSR signing, role and label constraints, manual PKI
+normalization, bundle restrictions, signature tampering, snapshot generation,
+schema compatibility, directory exclusion, weighted rendezvous, minimal
+movement, spread, pinned and heterogeneous variants, partition overprovision,
+and rollout handoff.
 
-Multi-process integration tests start ephemeral authority, gateway, and worker
-processes with temporary certificates and ports. They prove assignment
-convergence, stale and dead exclusion, local deployment hash mismatch, safe
-drain, and no second mesh when the key cache is enabled. These tests use local
-CPU fixtures and fake engines. GCP T4, L4, and three-node live evidence remains
-PR 7.
+Multi-process integration tests start an ephemeral authority, gateway, and two
+workers with temporary certificates and ports. They prove assignment
+convergence, controller restart without generation drift, real rolling
+start-before-stop and recreate stop-before-start transitions, stale and dead
+exclusion, unhealthy-node callouts, partition detection, local deployment hash
+mismatch, recovery, and child cleanup. These tests use local CPU fixtures and
+fake engines. GCP L4 and three-node live evidence remains the final validation
+group.

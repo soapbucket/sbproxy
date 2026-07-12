@@ -420,7 +420,9 @@ excluded members. A node row carries `membership_state`, `last_ack_age_ms`,
 endpoint, `model_eligible`, exclusion reason, snapshot age/generation/schema,
 reported health, engine/device/ready-artifact counts, and replica observations.
 The smaller `unhealthy_nodes` array is the alert feed for operator consoles; it
-does not replace the complete table.
+does not replace the complete table. `nodes` retains a bounded tombstone after
+dead-peer routing GC, including the last safe snapshot and current stable
+reason code.
 
 Each deployment row includes the desired and placed counts, generation, phase,
 readiness, timeout and handoff deadline, target assignments, retained and

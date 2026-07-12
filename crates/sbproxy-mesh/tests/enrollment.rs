@@ -204,6 +204,40 @@ fn enrollment_rejects_replay_widened_roles_changed_labels_and_bad_csr() {
 }
 
 #[test]
+fn reenrollment_advances_a_durable_node_identity_epoch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority =
+        EnrollmentAuthority::initialize(temp.path().join("authority"), authority_init())
+            .expect("authority");
+    let constraints = worker_constraints();
+
+    let enroll_once = || {
+        let token = authority
+            .create_token(constraints.clone(), Duration::from_secs(300))
+            .expect("rotation token");
+        let worker = WorkerEnrollment::generate("worker-b", "sbproxy-mesh").expect("rotation CSR");
+        authority
+            .enroll(worker_request(token.into_token(), &worker, &constraints))
+            .expect("rotation enrollment")
+    };
+
+    let first = enroll_once();
+    let second = enroll_once();
+    assert_eq!(first.identity.document.identity_epoch, 1);
+    assert_eq!(second.identity.document.identity_epoch, 2);
+
+    let reopened = EnrollmentAuthority::open(authority.directory()).expect("reopen authority");
+    let token = reopened
+        .create_token(constraints.clone(), Duration::from_secs(300))
+        .expect("post-restart token");
+    let worker = WorkerEnrollment::generate("worker-b", "sbproxy-mesh").expect("post-restart CSR");
+    let third = reopened
+        .enroll(worker_request(token.into_token(), &worker, &constraints))
+        .expect("post-restart enrollment");
+    assert_eq!(third.identity.document.identity_epoch, 3);
+}
+
+#[test]
 fn expired_token_is_rejected() {
     let temp = tempfile::tempdir().expect("temp dir");
     let authority =

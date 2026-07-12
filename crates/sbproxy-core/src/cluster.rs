@@ -58,6 +58,7 @@ struct ReloadableClusterSettings {
 struct SnapshotPublicationState {
     enabled: bool,
     generation_directory: Option<PathBuf>,
+    reserved_generation: Mutex<Option<u64>>,
     ephemeral_generation: AtomicU64,
     last_success_unix_ms: AtomicU64,
     publish_lock: Arc<tokio::sync::Mutex<()>>,
@@ -67,20 +68,42 @@ struct SnapshotPublicationState {
 }
 
 impl SnapshotPublicationState {
-    fn new(enabled: bool, generation_directory: Option<PathBuf>) -> Self {
-        Self {
+    fn new(enabled: bool, generation_directory: Option<PathBuf>) -> Result<Self> {
+        let reserved_generation = if enabled {
+            let directory = generation_directory.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("canonical cluster model publication requires a durable state_dir")
+            })?;
+            Some(
+                sbproxy_model_host::node_snapshot::NodeSnapshotGeneration::open(directory)
+                    .context("open durable node snapshot generation at startup")?
+                    .next()
+                    .context("validate durable node snapshot generation at startup")?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
             enabled,
             generation_directory,
+            reserved_generation: Mutex::new(reserved_generation),
             ephemeral_generation: AtomicU64::new(0),
             last_success_unix_ms: AtomicU64::new(0),
             publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             directory: Arc::new(sbproxy_ai::model_directory::ModelDirectory::new()),
             last_collect_unix_ms: AtomicU64::new(0),
             collect_lock: Arc::new(tokio::sync::Mutex::new(())),
-        }
+        })
     }
 
     fn next_generation(&self) -> Result<u64> {
+        if let Some(generation) = self
+            .reserved_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return Ok(generation);
+        }
         if let Some(directory) = self.generation_directory.as_ref() {
             return sbproxy_model_host::node_snapshot::NodeSnapshotGeneration::open(directory)
                 .context("open durable node snapshot generation")?
@@ -326,6 +349,8 @@ impl ClusterDeploymentAuthority {
                 )))
             }
         };
+        validate_enrolled_authority_publisher(&pointer_record)
+            .map_err(ClusterDeploymentAuthorityError::Identity)?;
         let pointer = pointer_record.payload;
         if pointer.revision == 0
             || pointer_record.generation != pointer.revision
@@ -355,12 +380,10 @@ impl ClusterDeploymentAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if self.active().is_some()
-            && current.as_ref().is_some_and(|current| {
-                current.revision == pointer.revision
-                    && current.content_digest == pointer.content_digest
-            })
-        {
+        if self.active().as_ref().is_some_and(|active| {
+            active.bundle().revision == pointer.revision
+                && active.bundle().content_digest == pointer.content_digest
+        }) {
             return Ok(None);
         }
         let bundle_record = match self
@@ -379,6 +402,8 @@ impl ClusterDeploymentAuthority {
                 )))
             }
         };
+        validate_enrolled_authority_publisher(&bundle_record)
+            .map_err(ClusterDeploymentAuthorityError::Identity)?;
         let signed = bundle_record.payload;
         if bundle_record.generation != pointer.revision
             || bundle_record.publisher_node_id != pointer.signer_node_id
@@ -405,31 +430,57 @@ impl ClusterDeploymentAuthority {
         block_on_cluster(async move { authority.read_candidate().await })
     }
 
-    /// Advance active state only after the model runtime commit succeeds.
-    pub fn commit(
+    /// Durably fence a verified candidate before the prepared runtime is committed.
+    pub(crate) fn persist(
         &self,
-        verified: sbproxy_model_host::VerifiedDeploymentBundle,
+        verified: &sbproxy_model_host::VerifiedDeploymentBundle,
     ) -> Result<(), ClusterDeploymentAuthorityError> {
         let cursor = verified.cursor();
-        let durable = self
-            .state
-            .cursor_store
-            .as_ref()
-            .map(|store| store.commit(&cursor))
-            .transpose();
+        if let Some(store) = self.state.cursor_store.as_ref() {
+            store.commit(&cursor)?;
+        }
         *self
             .state
             .cursor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cursor);
+        Ok(())
+    }
+
+    /// Mark a durably fenced candidate active after the runtime commit succeeds.
+    pub(crate) fn activate(&self, verified: sbproxy_model_host::VerifiedDeploymentBundle) {
         *self
             .state
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(verified);
-        durable?;
+    }
+
+    /// Durably fence and activate a candidate whose runtime is already committed.
+    pub fn commit(
+        &self,
+        verified: sbproxy_model_host::VerifiedDeploymentBundle,
+    ) -> Result<(), ClusterDeploymentAuthorityError> {
+        self.persist(&verified)?;
+        self.activate(verified);
         Ok(())
     }
+}
+
+fn validate_enrolled_authority_publisher<T>(
+    record: &sbproxy_mesh::ClusterStateRecord<T>,
+) -> Result<(), String> {
+    if record
+        .authenticated_identity
+        .as_ref()
+        .is_some_and(|identity| {
+            identity.node_id != record.publisher_node_id
+                || !identity.roles.contains(&ClusterNodeRole::Authority)
+        })
+    {
+        return Err("deployment state publisher lacks its enrolled authority role".to_string());
+    }
+    Ok(())
 }
 
 /// Exclusive publication reservation for one node model snapshot.
@@ -593,7 +644,7 @@ impl ClusterOwner {
         let snapshot_publication = Arc::new(SnapshotPublicationState::new(
             model_snapshot_publication_enabled(effective.as_ref()),
             snapshot_generation_directory(effective.as_ref()),
-        ));
+        )?);
         let deployment_authority = effective
             .as_ref()
             .and_then(|effective| {
@@ -622,6 +673,14 @@ impl ClusterOwner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|installed| installed.handle.clone())
+    }
+
+    fn state_directory(&self) -> Option<PathBuf> {
+        self.installed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|installed| installed.snapshot_publication.generation_directory.clone())
     }
 
     /// Current reloadable settings, if installed.
@@ -804,7 +863,9 @@ impl ClusterOwner {
 fn directory_snapshot_read(
     read: sbproxy_mesh::ClusterStateRead<serde_json::Value>,
 ) -> sbproxy_ai::model_directory::DirectorySnapshotRead {
-    use sbproxy_ai::model_directory::{DirectorySnapshotEnvelope, DirectorySnapshotRead};
+    use sbproxy_ai::model_directory::{
+        DirectoryAuthenticatedIdentity, DirectorySnapshotEnvelope, DirectorySnapshotRead,
+    };
 
     match read {
         sbproxy_mesh::ClusterStateRead::Present(record) => {
@@ -814,6 +875,18 @@ fn directory_snapshot_read(
                 generation: record.generation,
                 published_at_unix_ms: record.published_at_unix_ms,
                 expires_at_unix_ms: record.expires_at_unix_ms,
+                authenticated_identity: record.authenticated_identity.map(|identity| {
+                    let identity = *identity;
+                    DirectoryAuthenticatedIdentity {
+                        node_id: identity.node_id,
+                        roles: identity
+                            .roles
+                            .into_iter()
+                            .map(lower_snapshot_role)
+                            .collect(),
+                        labels: identity.labels,
+                    }
+                }),
                 payload: record.payload,
             })
         }
@@ -833,6 +906,22 @@ fn directory_snapshot_read(
             schema_version: actual,
             generation,
         },
+    }
+}
+
+const fn lower_snapshot_role(
+    role: sbproxy_mesh::ClusterNodeRole,
+) -> sbproxy_model_host::node_snapshot::NodeRole {
+    match role {
+        sbproxy_mesh::ClusterNodeRole::Gateway => {
+            sbproxy_model_host::node_snapshot::NodeRole::Gateway
+        }
+        sbproxy_mesh::ClusterNodeRole::Worker => {
+            sbproxy_model_host::node_snapshot::NodeRole::Worker
+        }
+        sbproxy_mesh::ClusterNodeRole::Authority => {
+            sbproxy_model_host::node_snapshot::NodeRole::Authority
+        }
     }
 }
 
@@ -890,25 +979,7 @@ fn load_deployment_authority(
 }
 
 fn snapshot_generation_directory(config: Option<&EffectiveClusterConfig>) -> Option<PathBuf> {
-    let config = config?;
-    if let Some(state_dir) = config.state_dir.as_ref() {
-        return Some(PathBuf::from(state_dir));
-    }
-    if let Some(enrollment) = config.enrollment.as_ref() {
-        return Some(PathBuf::from(&enrollment.authority_dir));
-    }
-    match &config.security {
-        EffectiveClusterSecurity::Mtls { cert_file, .. } => Some(
-            Path::new(cert_file)
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-        ),
-        EffectiveClusterSecurity::SharedKey { .. } | EffectiveClusterSecurity::LegacyPlaintext => {
-            None
-        }
-    }
+    config?.state_dir.as_ref().map(PathBuf::from)
 }
 
 fn validate_authority_identity(
@@ -1042,7 +1113,7 @@ impl ClusterBootstrap for SystemClusterBootstrap {
         identity: ClusterIdentity,
         config: &EffectiveClusterConfig,
     ) -> Result<ClusterHandle> {
-        let (shared_key, peer_tls) = resolve_security(&config.security)?;
+        let (shared_key, peer_tls) = resolve_security(config, &identity)?;
         let discoveries: Vec<Box<dyn Discovery>> =
             vec![Box::new(SeedDiscovery::new(config.seeds.clone()))];
         let bootstrap = BootstrapConfig {
@@ -1050,6 +1121,7 @@ impl ClusterBootstrap for SystemClusterBootstrap {
             transport_port: config.transport_port,
             gossip_advertise_addr: config.advertise_addr.clone(),
             transport_advertise_addr: config.transport_advertise_addr.clone(),
+            dead_peer_gc_secs: config.dead_peer_gc_secs,
             shared_key,
             peer_tls,
             ..Default::default()
@@ -1074,9 +1146,10 @@ impl ClusterBootstrap for SystemClusterBootstrap {
 }
 
 fn resolve_security(
-    security: &EffectiveClusterSecurity,
+    config: &EffectiveClusterConfig,
+    identity: &ClusterIdentity,
 ) -> Result<(Option<String>, Option<PeerTlsParams>)> {
-    match security {
+    match &config.security {
         EffectiveClusterSecurity::Mtls {
             cert_file,
             key_file,
@@ -1089,16 +1162,51 @@ fn resolve_security(
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("mTLS cluster has no UDP gossip key"))?,
             )?;
+            let tls = sbproxy_mesh::transport::tls::MeshTlsConfig {
+                cert_pem: std::fs::read_to_string(cert_file)
+                    .with_context(|| format!("read cluster certificate {cert_file:?}"))?,
+                key_pem: std::fs::read_to_string(key_file)
+                    .with_context(|| format!("read cluster private key {key_file:?}"))?,
+                ca_pem: std::fs::read_to_string(ca_file)
+                    .with_context(|| format!("read cluster CA {ca_file:?}"))?,
+            };
+            let identity_authenticator = if config.source == ClusterConfigSource::LegacyMesh {
+                None
+            } else {
+                let state_dir = config.state_dir.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("canonical mTLS cluster has no durable identity state_dir")
+                })?;
+                let identity_file = std::path::Path::new(state_dir).join("identity.json");
+                let authority_key = std::path::Path::new(state_dir).join("authority-verifying.key");
+                let authenticator = match (identity_file.is_file(), authority_key.is_file()) {
+                    (true, true) => {
+                        sbproxy_mesh::peer_identity::PeerIdentityAuthenticator::load_installed(
+                            state_dir,
+                            identity,
+                            server_name,
+                            &tls,
+                        )
+                        .context("load enrolled cluster identity")?
+                    }
+                    (false, false) => {
+                        sbproxy_mesh::peer_identity::PeerIdentityAuthenticator::load_manual(
+                            state_dir,
+                            identity,
+                            server_name,
+                            &tls,
+                        )
+                        .context("load manual PKI cluster identity")?
+                    }
+                    _ => anyhow::bail!(
+                        "canonical mTLS state_dir has an incomplete enrolled identity installation"
+                    ),
+                };
+                Some(Arc::new(authenticator))
+            };
             let peer_tls = PeerTlsParams {
-                tls: sbproxy_mesh::transport::tls::MeshTlsConfig {
-                    cert_pem: std::fs::read_to_string(cert_file)
-                        .with_context(|| format!("read cluster certificate {cert_file:?}"))?,
-                    key_pem: std::fs::read_to_string(key_file)
-                        .with_context(|| format!("read cluster private key {key_file:?}"))?,
-                    ca_pem: std::fs::read_to_string(ca_file)
-                        .with_context(|| format!("read cluster CA {ca_file:?}"))?,
-                },
+                tls,
                 server_name: server_name.clone(),
+                identity_authenticator,
             };
             Ok((Some(shared_key), Some(peer_tls)))
         }
@@ -1174,6 +1282,11 @@ pub fn current_cluster_handle() -> Option<ClusterHandle> {
 /// Current reloadable process cluster settings.
 pub fn current_cluster_settings() -> Option<ClusterSettings> {
     process_owner().settings()
+}
+
+/// Durable state directory for canonical cluster model control.
+pub(crate) fn current_cluster_state_directory() -> Option<PathBuf> {
+    process_owner().state_directory()
 }
 
 /// Reserve a due process node-snapshot publication.

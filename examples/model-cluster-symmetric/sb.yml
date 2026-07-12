@@ -27,6 +27,7 @@ proxy:
     state_dir: "${SB_STATE_DIR:-./state/node-a}"
     snapshot_ttl_secs: 10
     publish_interval_secs: 2
+    dead_peer_gc_secs: 300
     security:
       mode: shared_key
       development: true

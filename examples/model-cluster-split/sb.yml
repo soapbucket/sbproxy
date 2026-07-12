@@ -9,6 +9,9 @@ proxy:
     port: 19090
     username: admin
     password: ${SB_ADMIN_PASSWORD:-change-this-before-running}
+    tls:
+      cert: ./state/authority/admin.pem
+      key: ./state/authority/admin-key.pem
   cluster:
     cluster_id: model-cluster-split
     node_id: authority-a
@@ -29,6 +32,9 @@ proxy:
       server_name: sbproxy-mesh
     snapshot_ttl_secs: 10
     publish_interval_secs: 2
+    dead_peer_gc_secs: 300
+    enrollment:
+      authority_dir: ./state/authority
   model_host:
     authority: file_managed
     handoff_timeout_ms: 15000

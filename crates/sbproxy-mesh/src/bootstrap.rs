@@ -110,10 +110,13 @@ pub struct BootstrapConfig {
 pub struct PeerTlsParams {
     /// This node's certificate, private key, and the shared CA (PEM).
     pub tls: crate::transport::tls::MeshTlsConfig,
-    /// Logical server name every peer certificate is issued for (its SAN).
-    /// Outbound connections verify the peer certificate against this name,
-    /// so the mesh can dial peers by address while pinning one identity.
+    /// Cluster server-name SAN installed by the authority. Compatibility mTLS
+    /// verifies this shared name; enrolled canonical transport verifies the
+    /// target node-ID SAN instead.
     pub server_name: String,
+    /// Enrolled identity proof issuer for canonical clusters. Compatibility
+    /// mTLS may omit this and retain shared-SAN behavior.
+    pub identity_authenticator: Option<Arc<crate::peer_identity::PeerIdentityAuthenticator>>,
 }
 
 impl Default for BootstrapConfig {
@@ -303,6 +306,10 @@ pub async fn bootstrap(
         // the next sweep tick" so tests can exercise the path without
         // waiting several seconds.
         dead_peer_gc_secs: config.dead_peer_gc_secs,
+        identity_authenticator: config
+            .peer_tls
+            .as_ref()
+            .and_then(|params| params.identity_authenticator.clone()),
     };
 
     match GossipLoop::start(
@@ -365,6 +372,7 @@ pub async fn bootstrap(
                 Some(crate::transport::client::MeshTlsClient {
                     connector,
                     server_name,
+                    verify_node_id: p.identity_authenticator.is_some(),
                 }),
             )
         }
@@ -398,7 +406,14 @@ pub async fn bootstrap(
         }
     };
 
-    node = node.with_transport(transport_server, transport_pool, peer_addr_map);
+    node = node
+        .with_transport(transport_server, transport_pool, peer_addr_map)
+        .with_identity_authenticator(
+            config
+                .peer_tls
+                .as_ref()
+                .and_then(|params| params.identity_authenticator.clone()),
+        );
 
     Ok(node)
 }

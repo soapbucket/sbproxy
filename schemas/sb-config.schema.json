@@ -1406,6 +1406,14 @@
             "null"
           ]
         },
+        "catalog_file": {
+          "description": "Optional operator catalog file replacing the built-in model catalog.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_parallel_prepares": {
           "description": "Maximum artifact and engine preparations that may run concurrently.",
           "default": 2,
@@ -1951,6 +1959,13 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "dead_peer_gc_secs": {
+          "description": "Time to retain dead peers in the routing membership table before GC. The operator model directory retains a longer-lived tombstone.",
+          "default": 300,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "enrollment": {
           "description": "Optional one-time enrollment authority.",
           "default": null,
@@ -2056,7 +2071,7 @@
           ]
         },
         "server_name": {
-          "description": "Certificate SAN expected on every peer.",
+          "description": "Cluster SAN bound into every enrolled peer identity.",
           "default": "sbproxy-mesh",
           "type": "string"
         }

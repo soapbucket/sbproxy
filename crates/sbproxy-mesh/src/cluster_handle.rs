@@ -216,6 +216,8 @@ pub struct ClusterStateRecord<T> {
     pub published_at_unix_ms: u64,
     /// Unix expiry time in milliseconds.
     pub expires_at_unix_ms: u64,
+    /// Authority-signed enrolled publisher claims when canonical mTLS is active.
+    pub authenticated_identity: Option<Box<crate::peer_identity::AuthenticatedPeerIdentity>>,
     /// Decoded typed payload.
     pub payload: T,
 }
@@ -266,6 +268,35 @@ struct ClusterStateEnvelope {
     published_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     payload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_proof: Option<crate::peer_identity::PeerIdentityProof>,
+}
+
+const CLUSTER_STATE_PROOF_CONTEXT: &str = "sbproxy.cluster-state.v1";
+
+#[derive(Serialize)]
+struct ClusterStateSigningPayload<'a> {
+    namespace: &'a str,
+    key: &'a str,
+    publisher_node_id: &'a str,
+    schema_version: u32,
+    generation: u64,
+    published_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    payload: &'a serde_json::Value,
+}
+
+fn cluster_state_signing_bytes(envelope: &ClusterStateEnvelope) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&ClusterStateSigningPayload {
+        namespace: &envelope.namespace,
+        key: &envelope.key,
+        publisher_node_id: &envelope.publisher_node_id,
+        schema_version: envelope.schema_version,
+        generation: envelope.generation,
+        published_at_unix_ms: envelope.published_at_unix_ms,
+        expires_at_unix_ms: envelope.expires_at_unix_ms,
+        payload: &envelope.payload,
+    })
 }
 
 enum ClusterBackend {
@@ -434,13 +465,21 @@ impl ClusterHandle {
 
         if let RawStateRead::Present(bytes) = self.read_raw(&storage_key).await {
             if let Ok(current) = serde_json::from_slice::<ClusterStateEnvelope>(&bytes) {
-                if current.generation > generation && current.expires_at_unix_ms > now {
+                let current_is_ours = current.publisher_node_id == self.inner.identity.node_id;
+                let current_is_authenticated = self.verify_envelope_identity(&current).is_ok();
+                if current_is_ours
+                    && current_is_authenticated
+                    && current.generation > generation
+                    && current.expires_at_unix_ms > now
+                {
                     return Err(ClusterStateError::StaleGeneration {
                         current: current.generation,
                         attempted: generation,
                     });
                 }
-                if current.generation == generation
+                if current_is_ours
+                    && current_is_authenticated
+                    && current.generation == generation
                     && current.expires_at_unix_ms > now
                     && (current.namespace != namespace
                         || current.key != key
@@ -453,7 +492,7 @@ impl ClusterHandle {
             }
         }
 
-        let envelope = ClusterStateEnvelope {
+        let mut envelope = ClusterStateEnvelope {
             namespace: namespace.to_string(),
             key: key.to_string(),
             publisher_node_id: self.inner.identity.node_id.clone(),
@@ -462,7 +501,17 @@ impl ClusterHandle {
             published_at_unix_ms: now,
             expires_at_unix_ms,
             payload,
+            identity_proof: None,
         };
+        if let Some(authenticator) = self.identity_authenticator() {
+            let signing_bytes = cluster_state_signing_bytes(&envelope)
+                .map_err(|error| ClusterStateError::Serialize(error.to_string()))?;
+            envelope.identity_proof = Some(
+                authenticator
+                    .sign(CLUSTER_STATE_PROOF_CONTEXT, &signing_bytes)
+                    .map_err(|error| ClusterStateError::Serialize(error.to_string()))?,
+            );
+        }
         let bytes = serde_json::to_vec(&envelope)
             .map_err(|error| ClusterStateError::Serialize(error.to_string()))?;
         if bytes.len() > MAX_STATE_BYTES {
@@ -510,6 +559,7 @@ impl ClusterHandle {
                     generation: record.generation,
                     published_at_unix_ms: record.published_at_unix_ms,
                     expires_at_unix_ms: record.expires_at_unix_ms,
+                    authenticated_identity: record.authenticated_identity,
                     payload,
                 })
             }
@@ -578,6 +628,10 @@ impl ClusterHandle {
                 reason: "publisher node ID is empty or oversized".to_string(),
             };
         }
+        let authenticated_identity = match self.verify_envelope_identity(&envelope) {
+            Ok(identity) => identity.map(Box::new),
+            Err(reason) => return ClusterStateRead::Malformed { reason },
+        };
         let now = match unix_time_ms() {
             Ok(now) => now,
             Err(error) => {
@@ -603,8 +657,39 @@ impl ClusterHandle {
             generation: envelope.generation,
             published_at_unix_ms: envelope.published_at_unix_ms,
             expires_at_unix_ms: envelope.expires_at_unix_ms,
+            authenticated_identity,
             payload: envelope.payload,
         })
+    }
+
+    fn identity_authenticator(
+        &self,
+    ) -> Option<Arc<crate::peer_identity::PeerIdentityAuthenticator>> {
+        self.mesh_node()
+            .and_then(|mesh| mesh.identity_authenticator())
+    }
+
+    fn verify_envelope_identity(
+        &self,
+        envelope: &ClusterStateEnvelope,
+    ) -> Result<Option<crate::peer_identity::AuthenticatedPeerIdentity>, String> {
+        let Some(authenticator) = self.identity_authenticator() else {
+            return Ok(None);
+        };
+        let proof = envelope.identity_proof.as_ref().ok_or_else(|| {
+            "canonical mTLS state is missing its enrolled identity proof".to_string()
+        })?;
+        let signing_bytes = cluster_state_signing_bytes(envelope)
+            .map_err(|_| "encode state identity proof payload failed".to_string())?;
+        authenticator
+            .verify(
+                CLUSTER_STATE_PROOF_CONTEXT,
+                &signing_bytes,
+                Some(&envelope.publisher_node_id),
+                proof,
+            )
+            .map(Some)
+            .map_err(|error| format!("verify enrolled state publisher failed: {error}"))
     }
 
     fn state_cache(&self) -> Arc<DistributedCache<Bytes>> {
@@ -637,12 +722,10 @@ impl ClusterHandle {
         let Some(address) = address else {
             return RawStateRead::Unreachable(owner);
         };
-        match mesh
-            .transport_pool()
-            .client_for(&address)
-            .get(storage_key.to_string())
-            .await
-        {
+        let Some(client) = mesh.transport_pool().try_client_for_node(&owner, &address) else {
+            return RawStateRead::Unreachable(owner);
+        };
+        match client.get(storage_key.to_string()).await {
             Ok(Some(bytes)) => RawStateRead::Present(bytes),
             Ok(None) => RawStateRead::Missing,
             Err(_) => RawStateRead::Unreachable(owner),
@@ -725,9 +808,46 @@ fn unix_time_ms() -> Result<u64, ClusterStateError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::Instant;
 
     use super::*;
+
+    fn enrolled_handle() -> (tempfile::TempDir, ClusterHandle) {
+        use crate::enrollment::{AuthorityInit, EnrollmentAuthority};
+        use crate::transport::tls::MeshTlsConfig;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("authority");
+        let authority = EnrollmentAuthority::initialize(
+            &directory,
+            AuthorityInit {
+                cluster_id: "cluster-a".to_string(),
+                node_id: "authority-a".to_string(),
+                roles: BTreeSet::from([ClusterNodeRole::Authority, ClusterNodeRole::Gateway]),
+                labels: BTreeMap::from([("zone".to_string(), "west-a".to_string())]),
+                server_name: "sbproxy-mesh".to_string(),
+            },
+        )
+        .unwrap();
+        let identity = authority.identity().document.to_cluster_identity().unwrap();
+        let tls = MeshTlsConfig {
+            cert_pem: std::fs::read_to_string(directory.join("node.pem")).unwrap(),
+            key_pem: std::fs::read_to_string(directory.join("node-key.pem")).unwrap(),
+            ca_pem: std::fs::read_to_string(directory.join("ca.pem")).unwrap(),
+        };
+        let authenticator = crate::peer_identity::PeerIdentityAuthenticator::load_installed(
+            &directory,
+            &identity,
+            "sbproxy-mesh",
+            &tls,
+        )
+        .unwrap();
+        let mesh = MeshNode::new(identity.node_id.clone(), Vec::new(), 16)
+            .with_identity_authenticator(Some(Arc::new(authenticator)));
+        let handle = ClusterHandle::distributed(identity, Arc::new(mesh)).unwrap();
+        (temp, handle)
+    }
 
     #[test]
     fn peer_membership_maps_every_liveness_state() {
@@ -776,5 +896,61 @@ mod tests {
         };
         assert_eq!(reason, "decode envelope failed");
         assert!(!reason.contains("not-json"));
+    }
+
+    #[tokio::test]
+    async fn canonical_state_binds_payload_and_publisher_to_enrolled_identity() {
+        let (_temp, handle) = enrolled_handle();
+        handle
+            .publish_state(
+                "model-snapshots",
+                "authority-a",
+                1,
+                7,
+                Duration::from_secs(30),
+                &serde_json::json!({"health": "ready"}),
+            )
+            .await
+            .unwrap();
+        let present = handle
+            .read_state::<serde_json::Value>("model-snapshots", "authority-a", 1)
+            .await;
+        let ClusterStateRead::Present(record) = present else {
+            panic!("expected authenticated state");
+        };
+        let identity = record.authenticated_identity.expect("enrolled claims");
+        assert_eq!(identity.node_id, "authority-a");
+        assert!(identity.roles.contains(&ClusterNodeRole::Authority));
+
+        let key = storage_key("model-snapshots", "authority-a");
+        let bytes = handle.state_cache().get_local(&key).unwrap();
+        let mut envelope: ClusterStateEnvelope = serde_json::from_slice(&bytes).unwrap();
+        envelope.payload = serde_json::json!({"health": "forged"});
+        envelope.generation = 100;
+        handle
+            .state_cache()
+            .put_local(&key, Bytes::from(serde_json::to_vec(&envelope).unwrap()));
+        let tampered = handle
+            .read_state::<serde_json::Value>("model-snapshots", "authority-a", 1)
+            .await;
+        assert!(matches!(tampered, ClusterStateRead::Malformed { .. }));
+        handle
+            .publish_state(
+                "model-snapshots",
+                "authority-a",
+                1,
+                8,
+                Duration::from_secs(30),
+                &serde_json::json!({"health": "recovered"}),
+            )
+            .await
+            .expect("invalid higher generation cannot suppress an authenticated retry");
+        let recovered = handle
+            .read_state::<serde_json::Value>("model-snapshots", "authority-a", 1)
+            .await;
+        assert!(matches!(
+            recovered,
+            ClusterStateRead::Present(ClusterStateRecord { generation: 8, .. })
+        ));
     }
 }

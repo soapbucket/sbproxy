@@ -7,7 +7,7 @@
 //! operations without a breaking change to either peer.
 //!
 //! [`TransportClientPool`] caches `Arc<PeerClient>` instances keyed by
-//! `host:port`. Callers (the [`crate::state::distributed_cache::DistributedCache`]
+//! target identity plus `host:port` when enrolled mTLS is active. Callers (the [`crate::state::distributed_cache::DistributedCache`]
 //! routing layer and the enterprise-AI semantic cache adapter) ask the pool
 //! for a client instead of constructing one directly, so every outbound
 //! request for a given peer reuses the same TCP connection.
@@ -38,14 +38,16 @@ use tokio_rustls::TlsConnector;
 // --- Connection security ---
 
 /// The TLS client side for a [`PeerClient`]: a connector plus the logical
-/// `ServerName` every peer certificate is issued for. The mesh dials peers by
-/// address but verifies one fixed identity, so all peers share a name.
+/// certificate name to verify while dialing a peer by address.
 #[derive(Clone)]
 pub struct MeshTlsClient {
     /// rustls connector that presents this node's cert and verifies the peer's.
     pub connector: TlsConnector,
     /// Logical server name to verify the peer certificate against.
     pub server_name: ServerName<'static>,
+    /// Replace the shared server name with the target node ID for canonical
+    /// enrolled clusters.
+    pub verify_node_id: bool,
 }
 
 /// A live mesh connection: a plain TCP stream, or a mutually-authenticated
@@ -402,9 +404,40 @@ impl TransportClientPool {
     /// the first request for that address. The returned `Arc` can be cloned
     /// freely; callers share the same underlying TCP connection.
     pub fn client_for(&self, peer_addr: &str) -> Arc<PeerClient> {
+        self.client_for_key(peer_addr, peer_addr, None)
+    }
+
+    /// Return a client for one stable node identity and transport address.
+    /// Canonical enrolled clusters verify the target node ID as a certificate
+    /// SAN; compatibility transports retain their configured shared SAN.
+    pub fn client_for_node(&self, node_id: &str, peer_addr: &str) -> Arc<PeerClient> {
+        self.try_client_for_node(node_id, peer_addr)
+            .expect("validated cluster node ID is a DNS-compatible certificate SAN")
+    }
+
+    /// Return a node-specific client, or `None` while the ring still contains a seed alias.
+    pub fn try_client_for_node(&self, node_id: &str, peer_addr: &str) -> Option<Arc<PeerClient>> {
+        let node_specific = self.tls.as_ref().is_some_and(|tls| tls.verify_node_id);
+        let cache_key = if node_specific {
+            format!("{node_id}\0{peer_addr}")
+        } else {
+            peer_addr.to_string()
+        };
+        if node_specific && ServerName::try_from(node_id.to_string()).is_err() {
+            return None;
+        }
+        Some(self.client_for_key(&cache_key, peer_addr, node_specific.then_some(node_id)))
+    }
+
+    fn client_for_key(
+        &self,
+        cache_key: &str,
+        peer_addr: &str,
+        node_id: Option<&str>,
+    ) -> Arc<PeerClient> {
         // Fast path: read lock, cheap clone of the `Arc`.
         if let Ok(guard) = self.clients.read() {
-            if let Some(c) = guard.get(peer_addr) {
+            if let Some(c) = guard.get(cache_key) {
                 return c.clone();
             }
         }
@@ -414,9 +447,15 @@ impl TransportClientPool {
             Err(p) => p.into_inner(),
         };
         let cipher = self.cipher.clone();
-        let tls = self.tls.clone();
+        let tls = self.tls.clone().map(|mut tls| {
+            if let Some(node_id) = node_id {
+                tls.server_name = ServerName::try_from(node_id.to_string())
+                    .expect("validated cluster node ID is a DNS-compatible certificate SAN");
+            }
+            tls
+        });
         guard
-            .entry(peer_addr.to_string())
+            .entry(cache_key.to_string())
             .or_insert_with(|| {
                 Arc::new(PeerClient::with_security(
                     peer_addr.to_string(),
@@ -571,6 +610,48 @@ mod tests {
         let b = pool.client_for("10.0.0.2:8946");
         assert!(!Arc::ptr_eq(&a, &b));
         assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn canonical_pool_pins_each_client_to_its_target_node_san() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca = CertificateParams::new(Vec::new()).unwrap();
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca.self_signed(&ca_key).unwrap();
+        let peer_key = KeyPair::generate().unwrap();
+        let peer = CertificateParams::new(vec!["local-node".to_string()]).unwrap();
+        let peer_cert = peer.signed_by(&peer_key, &ca_cert, &ca_key).unwrap();
+        let connector =
+            crate::transport::tls::build_connector(&crate::transport::tls::MeshTlsConfig {
+                cert_pem: peer_cert.pem(),
+                key_pem: peer_key.serialize_pem(),
+                ca_pem: ca_cert.pem(),
+            })
+            .unwrap();
+        let pool = TransportClientPool::with_security(
+            None,
+            Some(MeshTlsClient {
+                connector,
+                server_name: ServerName::try_from("shared-name").unwrap(),
+                verify_node_id: true,
+            }),
+        );
+        let worker_a = pool.client_for_node("worker-a", "10.0.0.2:8946");
+        let worker_b = pool.client_for_node("worker-b", "10.0.0.2:8946");
+        assert!(pool
+            .try_client_for_node("127.0.0.1:7946", "127.0.0.1:8946")
+            .is_none());
+        assert!(!Arc::ptr_eq(&worker_a, &worker_b));
+        assert_eq!(
+            worker_a.tls.as_ref().unwrap().server_name,
+            ServerName::try_from("worker-a").unwrap()
+        );
+        assert_eq!(
+            worker_b.tls.as_ref().unwrap().server_name,
+            ServerName::try_from("worker-b").unwrap()
+        );
     }
 
     #[tokio::test]

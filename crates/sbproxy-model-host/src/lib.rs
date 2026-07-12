@@ -47,6 +47,7 @@ pub mod device_residency;
 pub mod embedded;
 pub mod engine_driver;
 pub mod fit;
+pub mod generation_store;
 pub mod hybrid;
 pub mod jobs;
 pub mod kv_tiering;
@@ -111,7 +112,7 @@ pub use cluster_authority::{
 };
 pub use cluster_placement::{
     reconcile_cluster_placement, ClusterDeploymentPlacement, ClusterPlacementError,
-    ClusterPlacementState, PriorDeploymentPlacement,
+    ClusterPlacementState, DeploymentGenerationFences, PriorDeploymentPlacement,
 };
 pub use config::{
     AcquireSource, ChunkedPrefill, EngineAccel, EngineAcquire, EngineChoice, EngineDoctor,
@@ -148,6 +149,7 @@ pub use fit::{
     plan_fit_kv_with_margin_and_concurrency, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
     MemoryEstimate, ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
 };
+pub use generation_store::{DeploymentGenerationStoreError, FileDeploymentGenerationStore};
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
 pub use jobs::{
     FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
@@ -187,9 +189,9 @@ pub use pull::{pull_plan, PullItem, PullMode};
 pub use report::{ModelValue, ValueReport};
 pub use residency::{Admission, ResidencyManager, Resident};
 pub use rollout::{
-    filter_desired_state_for_assignments, plan_rollout, AssignedModelDeployment, RolloutDecision,
-    RolloutError, RolloutPhase, RolloutReplicaObservation, RolloutRequest,
-    VersionedPlacementAssignment,
+    filter_desired_state_for_assignments, plan_rollout, AssignedModelDeployment,
+    DeploymentGenerationFence, RolloutDecision, RolloutError, RolloutPhase,
+    RolloutReplicaObservation, RolloutRequest, VersionedPlacementAssignment,
 };
 pub use runtime::{
     parse_params, ConfigDirMetadataProvider, DeviceVram, ModelHostObserver, ModelHostRuntime,

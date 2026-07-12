@@ -259,7 +259,9 @@ Check in this order:
 
 - If the process fails at startup, verify unique local gossip and transport
   ports, reachable advertised addresses, and matching `cluster_id`, seeds, CA,
-  server name, and gossip key. Canonical cluster bind and security failures are
+  server name, gossip key, and enrolled files under `state_dir`. The signed
+  identity must match the configured node ID, roles, labels, server name, and
+  certificate fingerprint. Canonical cluster bind and security failures are
   fatal. A legacy key-cache mesh may fall back locally, but `proxy.cluster`
   never does.
 - If key-cache mesh fields are still present, they must exactly match
@@ -267,14 +269,17 @@ Check in this order:
   and mTLS fields. Mismatch is rejected so one process cannot split into two
   clusters.
 - Inspect `unhealthy_nodes[].reasons` and the matching full `nodes` row.
-  `membership_suspect`, `membership_dead`, `snapshot_stale`,
-  `snapshot_unreachable`, incompatible schema, reported health, missing model
+  `membership_suspect`, `membership_dead`, `snapshot_missing`,
+  `snapshot_expired`, `snapshot_unreachable`, incompatible schema, reported health, missing model
   endpoint, engine incompatibility, and zero capacity all make a worker
   ineligible without removing it from the roster.
 - Compare `directory_age_ms`, `snapshot_age_ms`, and `last_ack_age_ms` with
   `publish_interval_secs` and `snapshot_ttl_secs`. The snapshot lifetime must
   cover at least two publish intervals. Persistent age growth usually means
   transport reachability or the worker maintenance thread is failing.
+- A dead node remains in the admin roster after `dead_peer_gc_secs` removes it
+  from routing membership. That retained tombstone is expected; restart the
+  same enrolled identity or remove it through a future explicit roster action.
 - When `deployment_digest_mismatch` is true in file-managed mode, compare the
   normalized `proxy.model_host` deployment revision on every node. The cluster
   reports drift; it never overwrites a local file.
@@ -285,6 +290,10 @@ Check in this order:
 - During rolling replacement, `retained` is expected until all targets report
   exact generation, variant, artifact digest, and ready state. `timed_out: true`
   means `handoff_timeout_ms` elapsed; inspect the target workers before retrying.
+- If a generation changes unexpectedly after restart, inspect
+  `state_dir/model-deployment-generations.json` and directory permissions. Do
+  not delete or copy this file between nodes; it is the local controller's
+  monotonic high-water record.
 - In cluster-authority mode, verify `deployment_authority.configured`, key ID,
   active revision, signer node, and cursor state. `invalid_bundle`,
   `stale_revision`, `revision_conflict`, and

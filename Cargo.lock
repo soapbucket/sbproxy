@@ -8502,6 +8502,7 @@ dependencies = [
  "hmac",
  "http 1.4.0",
  "jsonwebtoken",
+ "libc",
  "opentelemetry-proto",
  "prost 0.13.5",
  "rand 0.8.6",
@@ -8512,6 +8513,7 @@ dependencies = [
  "sbproxy-cache",
  "sbproxy-config",
  "sbproxy-extension",
+ "sbproxy-mesh",
  "sbproxy-middleware",
  "sbproxy-modules",
  "sbproxy-observe",
@@ -8657,6 +8659,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "url",
+ "x509-parser",
  "yaml_serde",
 ]
 

@@ -36,11 +36,11 @@ pub struct MeshTlsConfig {
 
 /// The pinned `ring` crypto provider, so config building never depends on a
 /// process-global default being installed.
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn load_chain(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn load_chain(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
     let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<std::result::Result<_, _>>()
         .context("parse certificate PEM")?;
@@ -50,11 +50,11 @@ fn load_chain(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
     Ok(chain)
 }
 
-fn load_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
+pub(crate) fn load_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
     PrivateKeyDer::from_pem_slice(pem.as_bytes()).context("parse private key PEM")
 }
 
-fn load_roots(ca_pem: &str) -> Result<RootCertStore> {
+pub(crate) fn load_roots(ca_pem: &str) -> Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     let mut count = 0usize;
     for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {

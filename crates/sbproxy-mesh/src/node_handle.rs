@@ -68,6 +68,9 @@ pub struct MeshNode {
     /// persistent connection per peer.
     transport_pool: Arc<TransportClientPool>,
 
+    /// Enrolled identity proof issuer/verifier for canonical mTLS state.
+    identity_authenticator: Option<Arc<crate::peer_identity::PeerIdentityAuthenticator>>,
+
     /// `node_id -> host:port` mapping used by routed cache ops to resolve
     /// the consistent-hash owner into a transport address. Populated from
     /// config (seed peers) at bootstrap; gossip-driven updates would
@@ -122,6 +125,7 @@ impl MeshNode {
             isolation_observer: None,
             transport_server: None,
             transport_pool: Arc::new(TransportClientPool::new()),
+            identity_authenticator: None,
             peer_addr_map: Arc::new(RwLock::new(HashMap::new())),
             persistence_task: None,
             federation_task: None,
@@ -167,6 +171,15 @@ impl MeshNode {
         self
     }
 
+    /// Attach the enrolled identity proof issuer used by typed cluster state.
+    pub fn with_identity_authenticator(
+        mut self,
+        authenticator: Option<Arc<crate::peer_identity::PeerIdentityAuthenticator>>,
+    ) -> Self {
+        self.identity_authenticator = authenticator;
+        self
+    }
+
     /// Returns a cheap `Arc` clone of the distributed cache suitable for
     /// passing to consumer crates (semantic cache, rate-limit, etc).
     pub fn distributed_cache(&self) -> Arc<DistributedCache<Bytes>> {
@@ -205,6 +218,13 @@ impl MeshNode {
     /// TCP connection per peer.
     pub fn transport_pool(&self) -> Arc<TransportClientPool> {
         self.transport_pool.clone()
+    }
+
+    /// Enrolled identity proof issuer/verifier for canonical mTLS state.
+    pub fn identity_authenticator(
+        &self,
+    ) -> Option<Arc<crate::peer_identity::PeerIdentityAuthenticator>> {
+        self.identity_authenticator.clone()
     }
 
     /// Attach a periodic Redis-backed snapshot task. Called by the

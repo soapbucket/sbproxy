@@ -175,8 +175,9 @@ For a cluster authority and worker:
 ```bash
 sbproxy cluster init --dir /var/lib/sbproxy/cluster \
   --cluster-id production-models --node-id authority-a
-sbproxy cluster token create --dir /var/lib/sbproxy/cluster \
-  --role worker --label zone=us-central1-b
+export SBPROXY_CLUSTER_TOKEN="$(sbproxy cluster token create \
+  --dir /var/lib/sbproxy/cluster \
+  --role worker --label zone=us-central1-b)"
 sbproxy cluster enroll --url https://authority.internal:9090 \
   --node-id worker-b --role worker --label zone=us-central1-b \
   --out /var/lib/sbproxy/cluster

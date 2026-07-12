@@ -48,6 +48,7 @@ tokio-rustls = { workspace = true }
 url = { workspace = true }
 fs2 = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
+x509-parser.workspace = true
 ed25519-dalek = "2"
 time = "0.3"
 subtle = "2"

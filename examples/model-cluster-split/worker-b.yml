@@ -29,6 +29,7 @@ proxy:
       server_name: sbproxy-mesh
     snapshot_ttl_secs: 10
     publish_interval_secs: 2
+    dead_peer_gc_secs: 300
   model_host:
     authority: file_managed
     handoff_timeout_ms: 15000

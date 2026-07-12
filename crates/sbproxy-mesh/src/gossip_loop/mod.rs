@@ -84,13 +84,13 @@ mod encryption;
 mod ping_req;
 mod probe;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -152,6 +152,14 @@ pub enum GossipMsg {
         advertise_addr: String,
         /// Typed-state transport address, when the node accepts routed state.
         transport_addr: Option<String>,
+        /// Durable local process boot epoch.
+        boot_epoch: u64,
+        /// Join proof issue time in Unix milliseconds.
+        issued_at_unix_ms: u64,
+        /// Join proof expiry time in Unix milliseconds.
+        expires_at_unix_ms: u64,
+        /// Enrolled certificate-key proof in canonical mTLS clusters.
+        proof: Option<Box<crate::peer_identity::PeerIdentityProof>>,
     },
     /// SWIM direct probe. Carries piggybacked state deltas (L1).
     Ping {
@@ -198,6 +206,105 @@ pub enum GossipMsg {
         /// Whether the witness got an ACK from `target`.
         alive: bool,
     },
+}
+
+impl GossipMsg {
+    fn authenticated_sender(&self) -> Option<&str> {
+        match self {
+            Self::Heartbeat { node_id, .. } => Some(node_id),
+            Self::Join { .. } => None,
+            Self::Ping { from, .. }
+            | Self::Ack { from, .. }
+            | Self::PingReq { from, .. }
+            | Self::IndirectAck { from, .. } => Some(from),
+        }
+    }
+}
+
+const JOIN_PROOF_CONTEXT: &str = "sbproxy.gossip.join.v1";
+const JOIN_PROOF_TTL_MS: u64 = 120_000;
+const JOIN_PROOF_CLOCK_SKEW_MS: u64 = 5_000;
+
+#[derive(Serialize)]
+struct JoinProofPayload<'a> {
+    node_id: &'a str,
+    advertise_addr: &'a str,
+    transport_addr: Option<&'a str>,
+    boot_epoch: u64,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+}
+
+fn join_proof_payload(
+    node_id: &str,
+    advertise_addr: &str,
+    transport_addr: Option<&str>,
+    boot_epoch: u64,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+) -> Result<Vec<u8>> {
+    serde_json::to_vec(&JoinProofPayload {
+        node_id,
+        advertise_addr,
+        transport_addr,
+        boot_epoch,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    })
+    .map_err(anyhow::Error::from)
+}
+
+fn build_local_join(cfg: &GossipLoopConfig) -> Result<GossipMsg> {
+    let advertise_addr = cfg.gossip_advertise_addr.clone().unwrap_or_default();
+    if cfg.identity_authenticator.is_some() {
+        let parsed = advertise_addr.parse::<SocketAddr>().map_err(|_| {
+            anyhow::anyhow!(
+                "enrolled gossip identity requires an explicit IP:port advertise address"
+            )
+        })?;
+        if parsed.ip().is_unspecified() {
+            anyhow::bail!("enrolled gossip identity requires a routable IP:port advertise address");
+        }
+    }
+    let (boot_epoch, issued_at_unix_ms, expires_at_unix_ms) = cfg
+        .identity_authenticator
+        .as_ref()
+        .map(|authenticator| {
+            let issued_at_unix_ms = ts_ms_now();
+            let expires_at_unix_ms = issued_at_unix_ms
+                .checked_add(JOIN_PROOF_TTL_MS)
+                .context("gossip join proof expiry overflowed")?;
+            Ok::<_, anyhow::Error>((
+                authenticator.boot_epoch(),
+                issued_at_unix_ms,
+                expires_at_unix_ms,
+            ))
+        })
+        .transpose()?
+        .unwrap_or((0, 0, 0));
+    let payload = join_proof_payload(
+        &cfg.node_id,
+        &advertise_addr,
+        cfg.transport_advertise_addr.as_deref(),
+        boot_epoch,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    )?;
+    let proof = cfg
+        .identity_authenticator
+        .as_ref()
+        .map(|authenticator| authenticator.sign(JOIN_PROOF_CONTEXT, &payload))
+        .transpose()?
+        .map(Box::new);
+    Ok(GossipMsg::Join {
+        node_id: cfg.node_id.clone(),
+        advertise_addr,
+        transport_addr: cfg.transport_advertise_addr.clone(),
+        boot_epoch,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+        proof,
+    })
 }
 
 /// Membership state enumeration used on the wire. Mirrors [`PeerState`]
@@ -511,6 +618,9 @@ pub struct GossipLoopConfig {
     /// entry from the peer table. A value of `0` means "GC on the next
     /// sweep tick", handy for tests.
     pub dead_peer_gc_secs: u64,
+    /// Authority-signed identity proof issuer and verifier for canonical
+    /// enrolled clusters.
+    pub identity_authenticator: Option<Arc<crate::peer_identity::PeerIdentityAuthenticator>>,
 }
 
 // --- Pending-probe bookkeeping ---
@@ -643,6 +753,7 @@ impl GossipLoop {
         peer_addr_map: Arc<RwLock<HashMap<String, String>>>,
         routing_cache: Option<Arc<crate::state::distributed_cache::DistributedCache<bytes::Bytes>>>,
     ) -> Result<Self> {
+        build_local_join(&cfg)?;
         let socket = UdpSocket::bind(("0.0.0.0", cfg.gossip_port)).await?;
         let local_port = socket.local_addr()?.port();
         let socket = Arc::new(socket);
@@ -654,6 +765,11 @@ impl GossipLoop {
         // L1: monotonic per-node incarnation + update queue.
         let self_incarnation = Arc::new(AtomicU64::new(0));
         let disseminator = Arc::new(Disseminator::new());
+        let authenticated_peers = Arc::new(RwLock::new(
+            HashMap::<String, AuthenticatedPeerRecord>::new(),
+        ));
+        let join_registry = Arc::new(RwLock::new(HashMap::<String, GossipMsg>::new()));
+        let directly_synced_joiners = Arc::new(RwLock::new(HashSet::<String>::new()));
 
         // --- Receive task ---
         let peers_recv = peers.clone();
@@ -672,6 +788,11 @@ impl GossipLoop {
         let peer_addr_map_recv = peer_addr_map.clone();
         let routing_cache_recv = routing_cache.clone();
         let join_routes_are_authoritative = routing_cache.is_some();
+        let identity_authenticator_recv = cfg.identity_authenticator.clone();
+        let authenticated_peers_recv = authenticated_peers.clone();
+        let join_registry_recv = join_registry.clone();
+        let directly_synced_joiners_recv = directly_synced_joiners.clone();
+        let local_join_cfg_recv = cfg.clone();
         let recv_task: JoinHandle<()> = tokio::spawn(async move {
             let mut buf = [0u8; 1500];
             loop {
@@ -694,12 +815,37 @@ impl GossipLoop {
                             None => buf[..n].to_vec(),
                         };
 
-                        match crate::transport::wire::decode::<GossipMsg>(&plaintext) {
-                            Ok(GossipMsg::Ping {
+                        let message = match crate::transport::wire::decode::<GossipMsg>(&plaintext)
+                        {
+                            Ok(message) => message,
+                            Err(error) => {
+                                tracing::debug!(
+                                    error = %error,
+                                    from = %from,
+                                    "gossip: dropping malformed datagram"
+                                );
+                                continue;
+                            }
+                        };
+                        if identity_authenticator_recv.is_some()
+                            && message.authenticated_sender().is_some_and(|node_id| {
+                                !authenticated_source_matches(&peers_recv, node_id, from)
+                            })
+                        {
+                            tracing::warn!(
+                                from = %from,
+                                node_id = message.authenticated_sender().unwrap_or_default(),
+                                "gossip: dropping message whose source does not match its enrolled join"
+                            );
+                            continue;
+                        }
+
+                        match message {
+                            GossipMsg::Ping {
                                 seq,
                                 from: peer_id,
                                 updates,
-                            }) => {
+                            } => {
                                 // Any Ping is implicit evidence that the
                                 // peer is alive; refresh last_ack before
                                 // responding.
@@ -741,11 +887,11 @@ impl GossipLoop {
                                 };
                                 send_msg(&socket_recv, cipher_recv.as_ref(), &ack, from).await;
                             }
-                            Ok(GossipMsg::Ack {
+                            GossipMsg::Ack {
                                 seq,
                                 from: peer_id,
                                 updates,
-                            }) => {
+                            } => {
                                 record_ack(
                                     &peers_recv,
                                     &peer_id,
@@ -765,12 +911,12 @@ impl GossipLoop {
                                 );
                                 complete_pending_direct(&pending_recv, seq).await;
                             }
-                            Ok(GossipMsg::PingReq {
+                            GossipMsg::PingReq {
                                 seq,
                                 from: requester_id,
                                 target,
                                 target_addr,
-                            }) => {
+                            } => {
                                 // We are a witness. Proxy-ping `target`
                                 // on behalf of the requester. Reply
                                 // with IndirectAck directly to `from`
@@ -854,12 +1000,12 @@ impl GossipLoop {
                                     ),
                                 );
                             }
-                            Ok(GossipMsg::IndirectAck {
+                            GossipMsg::IndirectAck {
                                 seq,
                                 from: witness_id,
                                 target: _,
                                 alive,
-                            }) => {
+                            } => {
                                 record_ack(
                                     &peers_recv,
                                     &witness_id,
@@ -871,7 +1017,7 @@ impl GossipLoop {
                                 );
                                 complete_pending_indirect(&pending_recv, seq, alive).await;
                             }
-                            Ok(GossipMsg::Heartbeat { node_id, .. }) => {
+                            GossipMsg::Heartbeat { node_id, .. } => {
                                 // Legacy: count as an ACK so pre-K4
                                 // peers still keep their entry fresh.
                                 record_ack(
@@ -884,29 +1030,80 @@ impl GossipLoop {
                                     ),
                                 );
                             }
-                            Ok(GossipMsg::Join {
+                            GossipMsg::Join {
                                 node_id,
                                 advertise_addr,
                                 transport_addr,
-                            }) => {
-                                let changed = record_join(
-                                    &peers_recv,
-                                    &peer_addr_map_recv,
-                                    routing_cache_recv.as_ref(),
-                                    &node_id_recv,
+                                boot_epoch,
+                                issued_at_unix_ms,
+                                expires_at_unix_ms,
+                                proof,
+                            } => {
+                                let authenticated_join = match verify_join_proof(
+                                    identity_authenticator_recv.as_deref(),
+                                    JoinProofAdvertisement {
+                                        node_id: &node_id,
+                                        gossip_addr: &advertise_addr,
+                                        transport_addr: transport_addr.as_deref(),
+                                        boot_epoch,
+                                        issued_at_unix_ms,
+                                        expires_at_unix_ms,
+                                        proof: proof.as_deref(),
+                                    },
+                                ) {
+                                    Ok(fingerprint) => fingerprint,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            error = %error,
+                                            node_id,
+                                            from = %from,
+                                            "gossip: rejecting unauthenticated join"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let Some(changed) = record_join(
+                                    JoinContext {
+                                        peers: &peers_recv,
+                                        peer_addr_map: &peer_addr_map_recv,
+                                        routing_cache: routing_cache_recv.as_ref(),
+                                        authenticated_peers: &authenticated_peers_recv,
+                                        local_node_id: &node_id_recv,
+                                    },
                                     JoinAdvertisement {
                                         node_id: &node_id,
                                         gossip_addr: &advertise_addr,
                                         transport_addr: transport_addr.as_deref(),
                                     },
+                                    authenticated_join.as_ref(),
                                     from,
-                                );
+                                ) else {
+                                    continue;
+                                };
+                                let join = GossipMsg::Join {
+                                    node_id: node_id.clone(),
+                                    advertise_addr: advertise_addr.clone(),
+                                    transport_addr: transport_addr.clone(),
+                                    boot_epoch,
+                                    issued_at_unix_ms,
+                                    expires_at_unix_ms,
+                                    proof: proof.clone(),
+                                };
+                                let prior_joins = {
+                                    let live_ids = live_peer_node_ids(&peers_recv);
+                                    let mut registry = join_registry_recv
+                                        .write()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    registry.retain(|known_id, _| live_ids.contains(known_id));
+                                    let prior = registry
+                                        .iter()
+                                        .filter(|(known_id, _)| known_id.as_str() != node_id)
+                                        .map(|(_, join)| join.clone())
+                                        .collect::<Vec<_>>();
+                                    registry.insert(node_id.clone(), join.clone());
+                                    prior
+                                };
                                 if changed {
-                                    let join = GossipMsg::Join {
-                                        node_id: node_id.clone(),
-                                        advertise_addr,
-                                        transport_addr,
-                                    };
                                     for target in live_peer_addresses(&peers_recv, &node_id) {
                                         if let Ok(target) = target.parse::<SocketAddr>() {
                                             send_msg(
@@ -919,13 +1116,43 @@ impl GossipLoop {
                                         }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    error = %e,
-                                    from = %from,
-                                    "gossip: dropping malformed datagram"
-                                );
+                                let direct_join = advertise_addr
+                                    .parse::<SocketAddr>()
+                                    .is_ok_and(|advertised| advertised == from);
+                                let first_direct_sync = if direct_join {
+                                    directly_synced_joiners_recv
+                                        .write()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .insert(node_id.clone())
+                                } else {
+                                    false
+                                };
+                                if direct_join && (changed || first_direct_sync) {
+                                    match build_local_join(&local_join_cfg_recv) {
+                                        Ok(local_join) => {
+                                            send_msg(
+                                                &socket_recv,
+                                                cipher_recv.as_ref(),
+                                                &local_join,
+                                                from,
+                                            )
+                                            .await;
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(%error, "gossip: could not refresh local join proof");
+                                            continue;
+                                        }
+                                    }
+                                    for known_join in prior_joins {
+                                        send_msg(
+                                            &socket_recv,
+                                            cipher_recv.as_ref(),
+                                            &known_join,
+                                            from,
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
                         }
                     }
@@ -952,6 +1179,7 @@ impl GossipLoop {
         let seq_proto = seq_gen.clone();
         let cipher_proto = cfg.cipher.clone();
         let disseminator_proto = disseminator.clone();
+        let join_registry_proto = join_registry.clone();
         let _self_incarnation_proto = self_incarnation.clone();
         let protocol_join: JoinHandle<()> = tokio::spawn(async move {
             let protocol_period =
@@ -991,23 +1219,20 @@ impl GossipLoop {
                         let candidate = pick_random_alive_peer(&peers_proto);
                         if let Some((target_id, target_addr)) = candidate {
                             if let Ok(target) = target_addr.parse::<SocketAddr>() {
-                                let join = GossipMsg::Join {
-                                    node_id: protocol_cfg.node_id.clone(),
-                                    advertise_addr: protocol_cfg
-                                        .gossip_advertise_addr
-                                        .clone()
-                                        .unwrap_or_default(),
-                                    transport_addr: protocol_cfg
-                                        .transport_advertise_addr
-                                        .clone(),
-                                };
-                                send_msg(
-                                    &socket_proto,
-                                    cipher_proto.as_ref(),
-                                    &join,
-                                    target,
-                                )
-                                .await;
+                                match build_local_join(&protocol_cfg) {
+                                    Ok(local_join) => {
+                                        send_msg(
+                                            &socket_proto,
+                                            cipher_proto.as_ref(),
+                                            &local_join,
+                                            target,
+                                        )
+                                        .await;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(%error, "gossip: could not refresh local join proof");
+                                    }
+                                }
                             }
                             run_probe(
                                 target_id,
@@ -1044,6 +1269,10 @@ impl GossipLoop {
                             now,
                         );
                         for (peer_key, incarnation) in transitions {
+                            join_registry_proto
+                                .write()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .remove(&peer_key);
                             // Fire the evictor callback once per
                             // transition. The evictor takes care of
                             // hash-ring removal + metric bookkeeping.
@@ -1075,6 +1304,10 @@ impl GossipLoop {
                             gc_now,
                         );
                         for (node_id, addr) in removed {
+                            join_registry_proto
+                                .write()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .remove(&node_id);
                             MESH_DEAD_PEERS_GC.inc();
                             tracing::info!(
                                 node_id = %node_id,
@@ -1124,20 +1357,124 @@ fn ack_route_map(
     (!join_routes_are_authoritative).then_some(map)
 }
 
+#[derive(Clone, Copy)]
 struct JoinAdvertisement<'a> {
     node_id: &'a str,
     gossip_addr: &'a str,
     transport_addr: Option<&'a str>,
 }
 
-fn record_join(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedJoin {
+    certificate_fingerprint: String,
+    identity_epoch: u64,
+    boot_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedPeerRecord {
+    certificate_fingerprint: String,
+    identity_epoch: u64,
+    boot_epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct JoinProofAdvertisement<'a> {
+    node_id: &'a str,
+    gossip_addr: &'a str,
+    transport_addr: Option<&'a str>,
+    boot_epoch: u64,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    proof: Option<&'a crate::peer_identity::PeerIdentityProof>,
+}
+
+fn verify_join_proof(
+    authenticator: Option<&crate::peer_identity::PeerIdentityAuthenticator>,
+    advertisement: JoinProofAdvertisement<'_>,
+) -> Result<Option<AuthenticatedJoin>> {
+    let Some(authenticator) = authenticator else {
+        return Ok(None);
+    };
+    let JoinProofAdvertisement {
+        node_id,
+        gossip_addr,
+        transport_addr,
+        boot_epoch,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+        proof,
+    } = advertisement;
+    let now = ts_ms_now();
+    validate_join_freshness(now, boot_epoch, issued_at_unix_ms, expires_at_unix_ms)?;
+    let proof = proof.context("enrolled cluster join is missing its identity proof")?;
+    let payload = join_proof_payload(
+        node_id,
+        gossip_addr,
+        transport_addr,
+        boot_epoch,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    )?;
+    let document = authenticator.verify(JOIN_PROOF_CONTEXT, &payload, Some(node_id), proof)?;
+    authenticator.observe_join(&document, boot_epoch)?;
+    Ok(Some(AuthenticatedJoin {
+        certificate_fingerprint: document.certificate_sha256,
+        identity_epoch: document.identity_epoch,
+        boot_epoch,
+    }))
+}
+
+fn validate_join_freshness(
+    now: u64,
+    boot_epoch: u64,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+) -> Result<()> {
+    if boot_epoch == 0
+        || issued_at_unix_ms > now.saturating_add(JOIN_PROOF_CLOCK_SKEW_MS)
+        || expires_at_unix_ms <= now
+        || expires_at_unix_ms.saturating_sub(issued_at_unix_ms) > JOIN_PROOF_TTL_MS
+    {
+        anyhow::bail!("enrolled cluster join proof is stale or has an invalid boot epoch");
+    }
+    Ok(())
+}
+
+fn authenticated_source_matches(
     peers: &Arc<RwLock<PeerTable>>,
-    peer_addr_map: &Arc<RwLock<HashMap<String, String>>>,
-    routing_cache: Option<&Arc<crate::state::distributed_cache::DistributedCache<bytes::Bytes>>>,
-    local_node_id: &str,
-    join: JoinAdvertisement<'_>,
-    from: SocketAddr,
+    node_id: &str,
+    source: SocketAddr,
 ) -> bool {
+    peers
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_by_node_id(node_id)
+        .and_then(|entry| entry.addr.parse::<SocketAddr>().ok())
+        == Some(source)
+}
+
+struct JoinContext<'a> {
+    peers: &'a Arc<RwLock<PeerTable>>,
+    peer_addr_map: &'a Arc<RwLock<HashMap<String, String>>>,
+    routing_cache: Option<&'a Arc<crate::state::distributed_cache::DistributedCache<bytes::Bytes>>>,
+    authenticated_peers: &'a Arc<RwLock<HashMap<String, AuthenticatedPeerRecord>>>,
+    local_node_id: &'a str,
+}
+
+fn record_join(
+    context: JoinContext<'_>,
+    join: JoinAdvertisement<'_>,
+    authenticated_join: Option<&AuthenticatedJoin>,
+    from: SocketAddr,
+) -> Option<bool> {
+    let JoinContext {
+        peers,
+        peer_addr_map,
+        routing_cache,
+        authenticated_peers,
+        local_node_id,
+    } = context;
     let JoinAdvertisement {
         node_id,
         gossip_addr: advertised_gossip_addr,
@@ -1145,10 +1482,44 @@ fn record_join(
     } = join;
     if node_id == local_node_id || !valid_join_node_id(node_id) {
         tracing::debug!(node_id, from = %from, "gossip: rejecting invalid join identity");
-        return false;
+        return None;
     }
     let gossip_addr =
         normalize_join_address(advertised_gossip_addr, from).unwrap_or_else(|| from.to_string());
+    if let Some(incoming) = authenticated_join {
+        let known = authenticated_peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(node_id)
+            .cloned();
+        if let Some(known) = known {
+            if incoming.identity_epoch < known.identity_epoch
+                || (incoming.identity_epoch == known.identity_epoch
+                    && incoming.certificate_fingerprint != known.certificate_fingerprint)
+                || (incoming.identity_epoch == known.identity_epoch
+                    && incoming.boot_epoch < known.boot_epoch)
+            {
+                tracing::warn!(
+                    node_id,
+                    from = %from,
+                    "gossip: rejecting stale or conflicting enrolled join"
+                );
+                return None;
+            }
+            if incoming.identity_epoch == known.identity_epoch
+                && incoming.boot_epoch == known.boot_epoch
+            {
+                let current_is_alive_at_same_address = peers
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get_by_node_id(node_id)
+                    .is_some_and(|entry| {
+                        matches!(entry.state, PeerState::Alive) && entry.addr == gossip_addr
+                    });
+                return current_is_alive_at_same_address.then_some(false);
+            }
+        }
+    }
     let transport_addr = advertised_transport_addr
         .and_then(|address| normalize_join_address(address, from))
         .or_else(|| routing_cache.is_none().then(|| gossip_addr.clone()));
@@ -1170,6 +1541,12 @@ fn record_join(
             let changed = entry.addr != gossip_addr
                 || !matches!(entry.state, PeerState::Alive)
                 || route_changed;
+            if changed {
+                // A signed rejoin after failure is a new incarnation. Fence
+                // delayed Suspect/Dead dissemination from the prior process
+                // before advertising the replacement as Alive.
+                entry.incarnation = entry.incarnation.saturating_add(1);
+            }
             entry.addr.clone_from(&gossip_addr);
             entry.state = PeerState::Alive;
             entry.last_ack = now;
@@ -1193,7 +1570,7 @@ fn record_join(
                     maximum = MAX_PEER_ENTRIES,
                     "gossip: rejecting join because the peer table is full"
                 );
-                return false;
+                return None;
             }
             table.insert(PeerEntry::new(node_id, &gossip_addr, now));
             (true, None)
@@ -1220,7 +1597,20 @@ fn record_join(
             ADDR_MAP_KIND_LEARNED,
         );
     }
-    changed
+    if let Some(join) = authenticated_join {
+        authenticated_peers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                node_id.to_string(),
+                AuthenticatedPeerRecord {
+                    certificate_fingerprint: join.certificate_fingerprint.clone(),
+                    identity_epoch: join.identity_epoch,
+                    boot_epoch: join.boot_epoch,
+                },
+            );
+    }
+    Some(changed)
 }
 
 fn valid_join_node_id(node_id: &str) -> bool {
@@ -1256,6 +1646,16 @@ fn live_peer_addresses(peers: &Arc<RwLock<PeerTable>>, excluded_node_id: &str) -
             entry.node_id != excluded_node_id && matches!(entry.state, PeerState::Alive)
         })
         .map(|entry| entry.addr.clone())
+        .collect()
+}
+
+fn live_peer_node_ids(peers: &Arc<RwLock<PeerTable>>) -> HashSet<String> {
+    peers
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|entry| matches!(entry.state, PeerState::Alive))
+        .map(|entry| entry.node_id.clone())
         .collect()
 }
 
@@ -1556,6 +1956,7 @@ mod tests {
             // observing Dead state are not surprised by a sudden
             // removal mid-assertion. GC-specific tests override this.
             dead_peer_gc_secs: 60,
+            identity_authenticator: None,
         }
     }
 
@@ -1624,6 +2025,10 @@ mod tests {
             node_id: "node-b".to_string(),
             advertise_addr: "10.0.0.2:7946".to_string(),
             transport_addr: Some("10.0.0.2:8946".to_string()),
+            boot_epoch: 0,
+            issued_at_unix_ms: 0,
+            expires_at_unix_ms: 0,
+            proof: None,
         };
         let bytes = crate::transport::wire::encode(&m).unwrap();
         let back: GossipMsg = crate::transport::wire::decode(&bytes).unwrap();
@@ -1648,6 +2053,23 @@ mod tests {
         let bytes = crate::transport::wire::encode(&m).unwrap();
         let back: GossipMsg = crate::transport::wire::decode(&bytes).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn authenticated_join_freshness_rejects_replay_windows() {
+        let now = 1_000_000;
+        assert!(validate_join_freshness(now, 1, now - 10, now).is_err());
+        assert!(validate_join_freshness(
+            now,
+            1,
+            now + JOIN_PROOF_CLOCK_SKEW_MS + 1,
+            now + JOIN_PROOF_TTL_MS,
+        )
+        .is_err());
+        assert!(validate_join_freshness(now, 1, now - 1, now + JOIN_PROOF_TTL_MS).is_err());
+        assert!(validate_join_freshness(now, 0, now - 1, now + 1).is_err());
+        validate_join_freshness(now, 2, now - 1, now + JOIN_PROOF_TTL_MS - 1)
+            .expect("fresh proof from a positive boot epoch");
     }
 
     #[test]
@@ -1687,20 +2109,193 @@ mod tests {
             .collect();
         let peers = Arc::new(RwLock::new(PeerTable::from_entries(entries)));
         let routes = Arc::new(RwLock::new(HashMap::new()));
+        let authenticated = Arc::new(RwLock::new(HashMap::new()));
 
-        assert!(!record_join(
-            &peers,
-            &routes,
-            None,
-            "local",
-            JoinAdvertisement {
-                node_id: "overflow",
-                gossip_addr: "127.0.0.1:12000",
-                transport_addr: Some("127.0.0.1:13000"),
-            },
-            "127.0.0.1:12000".parse().unwrap(),
-        ));
+        assert_eq!(
+            record_join(
+                JoinContext {
+                    peers: &peers,
+                    peer_addr_map: &routes,
+                    routing_cache: None,
+                    authenticated_peers: &authenticated,
+                    local_node_id: "local",
+                },
+                JoinAdvertisement {
+                    node_id: "overflow",
+                    gossip_addr: "127.0.0.1:12000",
+                    transport_addr: Some("127.0.0.1:13000"),
+                },
+                None,
+                "127.0.0.1:12000".parse().unwrap(),
+            ),
+            None
+        );
         assert_eq!(peers.read().unwrap().len(), MAX_PEER_ENTRIES);
+    }
+
+    #[test]
+    fn record_join_rejects_same_epoch_certificate_substitution_and_accepts_rotation() {
+        let peers = Arc::new(RwLock::new(PeerTable::default()));
+        let routes = Arc::new(RwLock::new(HashMap::new()));
+        let authenticated = Arc::new(RwLock::new(HashMap::new()));
+        let first = JoinAdvertisement {
+            node_id: "worker-a",
+            gossip_addr: "127.0.0.1:12000",
+            transport_addr: Some("127.0.0.1:13000"),
+        };
+        assert_eq!(
+            record_join(
+                JoinContext {
+                    peers: &peers,
+                    peer_addr_map: &routes,
+                    routing_cache: None,
+                    authenticated_peers: &authenticated,
+                    local_node_id: "local",
+                },
+                first,
+                Some(&AuthenticatedJoin {
+                    certificate_fingerprint: "certificate-a".to_string(),
+                    identity_epoch: 1,
+                    boot_epoch: 1,
+                }),
+                "127.0.0.1:12000".parse().unwrap(),
+            ),
+            Some(true)
+        );
+        let replacement = JoinAdvertisement {
+            node_id: "worker-a",
+            gossip_addr: "127.0.0.1:12001",
+            transport_addr: Some("127.0.0.1:13001"),
+        };
+        assert_eq!(
+            record_join(
+                JoinContext {
+                    peers: &peers,
+                    peer_addr_map: &routes,
+                    routing_cache: None,
+                    authenticated_peers: &authenticated,
+                    local_node_id: "local",
+                },
+                replacement,
+                Some(&AuthenticatedJoin {
+                    certificate_fingerprint: "certificate-b".to_string(),
+                    identity_epoch: 1,
+                    boot_epoch: 2,
+                }),
+                "127.0.0.1:12001".parse().unwrap(),
+            ),
+            None
+        );
+        let entry = peers
+            .read()
+            .unwrap()
+            .get_by_node_id("worker-a")
+            .unwrap()
+            .clone();
+        assert_eq!(entry.addr, "127.0.0.1:12000");
+
+        assert_eq!(
+            record_join(
+                JoinContext {
+                    peers: &peers,
+                    peer_addr_map: &routes,
+                    routing_cache: None,
+                    authenticated_peers: &authenticated,
+                    local_node_id: "local",
+                },
+                replacement,
+                Some(&AuthenticatedJoin {
+                    certificate_fingerprint: "certificate-b".to_string(),
+                    identity_epoch: 2,
+                    boot_epoch: 1,
+                }),
+                "127.0.0.1:12001".parse().unwrap(),
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            peers
+                .read()
+                .unwrap()
+                .get_by_node_id("worker-a")
+                .unwrap()
+                .addr,
+            "127.0.0.1:12001"
+        );
+    }
+
+    #[test]
+    fn signed_rejoin_advances_incarnation_past_stale_dead_updates() {
+        let now = Instant::now();
+        let mut dead = PeerEntry::new("worker-a", "127.0.0.1:12000", now);
+        dead.state = PeerState::Dead;
+        dead.incarnation = 7;
+        let peers = Arc::new(RwLock::new(PeerTable::from_entries(vec![dead])));
+        let routes = Arc::new(RwLock::new(HashMap::new()));
+        let authenticated = Arc::new(RwLock::new(HashMap::from([(
+            "worker-a".to_string(),
+            AuthenticatedPeerRecord {
+                certificate_fingerprint: "certificate-a".to_string(),
+                identity_epoch: 1,
+                boot_epoch: 1,
+            },
+        )])));
+        let join = JoinAdvertisement {
+            node_id: "worker-a",
+            gossip_addr: "127.0.0.1:12000",
+            transport_addr: Some("127.0.0.1:13000"),
+        };
+        assert_eq!(
+            record_join(
+                JoinContext {
+                    peers: &peers,
+                    peer_addr_map: &routes,
+                    routing_cache: None,
+                    authenticated_peers: &authenticated,
+                    local_node_id: "local",
+                },
+                join,
+                Some(&AuthenticatedJoin {
+                    certificate_fingerprint: "certificate-a".to_string(),
+                    identity_epoch: 1,
+                    boot_epoch: 1,
+                }),
+                "127.0.0.1:12000".parse().unwrap(),
+            ),
+            None,
+            "a captured join from the dead boot must not resurrect it"
+        );
+        assert_eq!(
+            record_join(
+                JoinContext {
+                    peers: &peers,
+                    peer_addr_map: &routes,
+                    routing_cache: None,
+                    authenticated_peers: &authenticated,
+                    local_node_id: "local",
+                },
+                JoinAdvertisement {
+                    node_id: "worker-a",
+                    gossip_addr: "127.0.0.1:12000",
+                    transport_addr: Some("127.0.0.1:13000"),
+                },
+                Some(&AuthenticatedJoin {
+                    certificate_fingerprint: "certificate-a".to_string(),
+                    identity_epoch: 1,
+                    boot_epoch: 2,
+                }),
+                "127.0.0.1:12000".parse().unwrap(),
+            ),
+            Some(true)
+        );
+        let entry = peers
+            .read()
+            .unwrap()
+            .get_by_node_id("worker-a")
+            .unwrap()
+            .clone();
+        assert!(matches!(entry.state, PeerState::Alive));
+        assert_eq!(entry.incarnation, 8);
     }
 
     #[test]

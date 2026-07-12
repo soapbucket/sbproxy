@@ -68,6 +68,30 @@ cluster:
 }
 
 #[test]
+fn canonical_cluster_requires_durable_identity_state() {
+    let proxy = parse(
+        r#"
+cluster:
+  cluster_id: durable-cluster
+  node_id: worker-a
+  roles: [worker]
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-cluster-key
+"#,
+    );
+
+    let error = proxy
+        .cluster
+        .as_ref()
+        .expect("cluster")
+        .validate()
+        .expect_err("canonical snapshot publisher needs durable state");
+    assert!(error.to_string().contains("state_dir"));
+}
+
+#[test]
 fn generated_proxy_schema_exposes_cluster_contract() {
     let schema = schemars::schema_for!(ProxyServerConfig);
     let json = serde_json::to_string(&schema).expect("serialize schema");
@@ -302,6 +326,7 @@ fn development_shared_key_is_explicit_and_valid() {
 cluster_id: dev-a
 node_id: dev-worker
 roles: [gateway, worker]
+state_dir: ./cluster-state
 security:
   mode: shared_key
   development: true
@@ -313,6 +338,49 @@ security:
 }
 
 #[test]
+fn canonical_dead_peer_gc_is_bounded_and_part_of_restart_identity() {
+    let mut cluster: sbproxy_config::ClusterConfig = serde_yaml::from_str(
+        r#"
+cluster_id: dev-a
+node_id: worker-a
+roles: [worker]
+state_dir: ./cluster-state
+dead_peer_gc_secs: 2
+security:
+  mode: shared_key
+  development: true
+  shared_key: local-development-secret
+"#,
+    )
+    .expect("cluster");
+    cluster.validate().expect("short test GC is valid");
+    let proxy = parse(&format!(
+        "cluster:\n{}",
+        indent_yaml(&serde_yaml::to_string(&cluster).unwrap())
+    ));
+    let before = resolve_effective_cluster(&proxy)
+        .expect("resolve")
+        .expect("enabled")
+        .restart_fingerprint();
+    cluster.dead_peer_gc_secs = 3;
+    let proxy = parse(&format!(
+        "cluster:\n{}",
+        indent_yaml(&serde_yaml::to_string(&cluster).unwrap())
+    ));
+    let after = resolve_effective_cluster(&proxy)
+        .expect("resolve")
+        .expect("enabled")
+        .restart_fingerprint();
+    assert_ne!(before, after);
+    cluster.dead_peer_gc_secs = 0;
+    assert!(cluster.validate().is_err());
+}
+
+fn indent_yaml(yaml: &str) -> String {
+    yaml.lines().map(|line| format!("  {line}\n")).collect()
+}
+
+#[test]
 fn enrollment_requires_enabled_https_admin_except_explicit_development() {
     let production = parse(
         r#"
@@ -320,6 +388,7 @@ cluster:
   cluster_id: prod-a
   node_id: authority-a
   roles: [authority]
+  state_dir: /var/lib/sbproxy/cluster
   enrollment:
     authority_dir: /var/lib/sbproxy/cluster
   security:
@@ -344,6 +413,7 @@ cluster:
   cluster_id: prod-a
   node_id: authority-a
   roles: [authority]
+  state_dir: /var/lib/sbproxy/cluster
   enrollment:
     authority_dir: /var/lib/sbproxy/cluster
   security:
@@ -364,6 +434,7 @@ cluster:
   cluster_id: dev-a
   node_id: authority-a
   roles: [authority]
+  state_dir: ./cluster-state
   enrollment:
     authority_dir: ./cluster
     allow_insecure_http: true
@@ -444,6 +515,7 @@ cluster:
   transport_port: 8947
   advertise_addr: 10.0.0.12:7947
   transport_advertise_addr: 10.0.0.12:8947
+  state_dir: /var/lib/sbproxy/cluster
   security:
     mode: shared_key
     development: true
@@ -480,6 +552,7 @@ cluster:
   node_id: worker-a
   roles: [worker]
   gossip_port: 7946
+  state_dir: /var/lib/sbproxy/cluster
   security:
     mode: shared_key
     development: true
@@ -511,6 +584,7 @@ cluster:
   node_id: worker-a
   roles: [worker]
   labels: {zone: a}
+  state_dir: /var/lib/sbproxy/cluster
   security:
     mode: mtls
     shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
@@ -580,6 +654,7 @@ proxy:
     cluster_id: prod-a
     node_id: worker-a
     roles: [worker]
+    state_dir: /var/lib/sbproxy/cluster
     security:
       mode: shared_key
       shared_key: unsafe-inline
@@ -603,6 +678,7 @@ proxy:
     node_id: worker-a
     roles: [worker]
     gossip_port: 7946
+    state_dir: /var/lib/sbproxy/cluster
     security:
       mode: shared_key
       development: true

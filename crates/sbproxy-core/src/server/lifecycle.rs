@@ -576,7 +576,7 @@ pub struct GraceConfig {
 /// events at each transition. WOR-636.
 ///
 /// Pingora handles SIGINT (fast shutdown) and SIGTERM (graceful
-/// shutdown) inside [`pingora_core::server::Server::run_forever`].
+/// shutdown) inside [`pingora_core::server::Server::run`].
 /// The phase broadcast is the documented surface for observing those
 /// transitions from outside the Pingora runtime; emitting our own
 /// `tracing` events here means operators see a clear "shutdown
@@ -584,7 +584,7 @@ pub struct GraceConfig {
 /// and the `shutdown.kind` / `shutdown.grace_seconds` fields make the
 /// event filterable by structured-log consumers.
 ///
-/// The subscriber must be acquired **before** `Server::run_forever`
+/// The subscriber must be acquired **before** `Server::run`
 /// consumes the `Server` value; this function is a no-op when called
 /// after that point because the broadcast sender is dropped.
 pub(super) fn spawn_shutdown_phase_logger(
@@ -676,7 +676,7 @@ pub(super) fn spawn_shutdown_phase_logger(
 /// 6. Starts the server (blocks forever)
 ///
 /// Pingora handles SIGTERM (graceful shutdown) and SIGINT (fast
-/// shutdown) internally inside `Server::run_forever`. We subscribe
+/// shutdown) internally inside `Server::run`. We subscribe
 /// to Pingora's execution-phase broadcast (see
 /// `spawn_shutdown_phase_logger`) so a structured tracing event is
 /// emitted when a shutdown signal arrives; operators can grep for
@@ -1521,13 +1521,19 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     server.bootstrap();
 
     // WOR-636: subscribe to Pingora's execution-phase broadcast
-    // before `run_forever` consumes the server so an explicit
+    // before `run` consumes the server so an explicit
     // structured tracing event lands when SIGINT or SIGTERM is
     // received. Pingora handles the signal itself; this just makes
     // the shutdown visible to operator-facing logs.
     spawn_shutdown_phase_logger(server.watch_execution_phase(), grace_seconds);
 
-    server.run_forever();
+    // `run_forever()` calls `std::process::exit(0)` after Pingora drains,
+    // which skips Rust destructors and used to orphan managed engine
+    // subprocesses. `run()` returns after the same signal-driven lifecycle,
+    // allowing the model-runtime guard below to stop every engine first.
+    server.run(pingora_core::server::RunArgs::default());
+    drop(_model_runtime_shutdown);
+    Ok(())
 }
 
 struct ModelRuntimeShutdownGuard;

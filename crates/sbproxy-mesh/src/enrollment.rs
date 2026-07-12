@@ -123,10 +123,12 @@ pub struct ClusterIdentityDocument {
     pub roles: BTreeSet<ClusterNodeRole>,
     /// Labels granted by the enrollment token.
     pub labels: BTreeMap<String, String>,
-    /// Shared certificate SAN used for peer verification.
+    /// Cluster certificate SAN bound into every enrolled identity.
     pub server_name: String,
     /// SHA-256 fingerprint of the issued leaf certificate DER.
     pub certificate_sha256: String,
+    /// Authority-monotonic identity issuance epoch for this stable node ID.
+    pub identity_epoch: u64,
     /// Unix issue time in seconds.
     pub issued_at_unix_secs: u64,
     /// Unix certificate expiry time in seconds.
@@ -306,6 +308,8 @@ struct EnrollmentTokenStore {
     schema_version: u32,
     hash_algorithm: String,
     tokens: BTreeMap<String, EnrollmentTokenRecord>,
+    #[serde(default)]
+    identity_epochs: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +408,7 @@ impl EnrollmentAuthority {
             labels: init.labels,
             server_name: init.server_name,
             certificate_sha256: certificate_fingerprint(node_cert.der()),
+            identity_epoch: 1,
             issued_at_unix_secs: now,
             expires_at_unix_secs: certificate_expiry(now)?,
             authority_key_id,
@@ -414,6 +419,7 @@ impl EnrollmentAuthority {
             schema_version: TOKEN_STORE_SCHEMA_VERSION,
             hash_algorithm: "sha256".to_string(),
             tokens: BTreeMap::new(),
+            identity_epochs: BTreeMap::from([(identity.document.node_id.clone(), 1)]),
         };
 
         write_new_secure(&stage.join(CA_CERT_FILE), ca_cert.pem().as_bytes())?;
@@ -627,7 +633,7 @@ impl EnrollmentAuthority {
         }
 
         let now = unix_time_secs()?;
-        self.consume_token(&request, now)?;
+        let identity_epoch = self.consume_token(&request, now)?;
 
         csr.params = leaf_params(&request.node_id, &self.identity.document.server_name, now)?;
         let certificate = csr.signed_by(&ca_cert, &ca_key).map_err(crypto_error)?;
@@ -639,6 +645,7 @@ impl EnrollmentAuthority {
             labels: request.labels,
             server_name: self.identity.document.server_name.clone(),
             certificate_sha256: certificate_fingerprint(certificate.der()),
+            identity_epoch,
             issued_at_unix_secs: now,
             expires_at_unix_secs: certificate_expiry(now)?,
             authority_key_id: key_id(&authority_signing_key.verifying_key().to_bytes()),
@@ -653,7 +660,7 @@ impl EnrollmentAuthority {
         })
     }
 
-    fn consume_token(&self, request: &EnrollmentRequest, now: u64) -> Result<(), EnrollmentError> {
+    fn consume_token(&self, request: &EnrollmentRequest, now: u64) -> Result<u64, EnrollmentError> {
         let token_id = parse_token_id(&request.token)?;
         let actual_hash = Sha256::digest(request.token.as_bytes());
         self.mutate_token_store(|store| {
@@ -690,7 +697,19 @@ impl EnrollmentAuthority {
                 ));
             }
             record.consumed_at_unix_secs = Some(now);
-            Ok(())
+            let identity_epoch = store
+                .identity_epochs
+                .get(&request.node_id)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    EnrollmentError::Corrupt("node identity epoch overflowed".to_string())
+                })?;
+            store
+                .identity_epochs
+                .insert(request.node_id.clone(), identity_epoch);
+            Ok(identity_epoch)
         })
     }
 
@@ -946,6 +965,11 @@ fn validate_identity_document(document: &ClusterIdentityDocument) -> Result<(), 
             "identity fingerprints must be URL-safe base64 SHA-256 values".to_string(),
         ));
     }
+    if document.identity_epoch == 0 {
+        return Err(EnrollmentError::Corrupt(
+            "identity epoch must be positive".to_string(),
+        ));
+    }
     if document.issued_at_unix_secs >= document.expires_at_unix_secs {
         return Err(EnrollmentError::Corrupt(
             "identity issue time must precede expiry".to_string(),
@@ -963,6 +987,20 @@ fn validate_token_store(store: &EnrollmentTokenStore) -> Result<(), EnrollmentEr
     if store.tokens.len() > 100_000 {
         return Err(EnrollmentError::Corrupt(
             "token store exceeds 100000 entries".to_string(),
+        ));
+    }
+    if store.identity_epochs.len() > 100_000
+        || store.identity_epochs.iter().any(|(node_id, epoch)| {
+            node_id.is_empty()
+                || node_id.len() > 128
+                || !node_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+                || *epoch == 0
+        })
+    {
+        return Err(EnrollmentError::Corrupt(
+            "identity epoch store is invalid or oversized".to_string(),
         ));
     }
     for (token_id, record) in &store.tokens {

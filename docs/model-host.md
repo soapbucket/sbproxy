@@ -141,6 +141,7 @@ proxy:
     state_dir: /var/lib/sbproxy/cluster
     snapshot_ttl_secs: 30
     publish_interval_secs: 5
+    dead_peer_gc_secs: 300
     security:
       mode: mtls
       shared_key: file:/var/lib/sbproxy/cluster/gossip.key
@@ -156,7 +157,9 @@ Roles are independent and may be combined:
 - `worker` publishes model capacity and owns assigned replicas;
 - `authority` enrolls nodes or signs deployment revisions.
 
-`advertise_addr` is the authenticated UDP gossip address.
+`advertise_addr` is the authenticated UDP gossip address. Enrolled mTLS nodes
+must advertise an explicit routable IP and port so later SWIM traffic can be
+matched to the signed join.
 `transport_advertise_addr` is the mTLS typed-state address. A worker also needs
 an HTTPS `model_endpoint`; PR 3 records it for placement, while PR 4 will use it
 for remote inference. Identity, roles, labels, listeners, seeds, endpoints,
@@ -164,9 +167,12 @@ security material, state directory, enrollment authority, and signing authority
 are restart-required fields. Snapshot cadence can reload in place.
 
 Production mode requires mTLS plus a separate authenticated gossip key. Shared
-key mode must set `development: true` and is for local fixtures only. Manual PKI
-is supported when every peer certificate has the configured server-name SAN
-and both client-auth and server-auth usage. Enrollment is the safer default.
+key mode must set `development: true` and is for local fixtures only. Canonical
+mTLS supports built-in enrollment and operator-managed PKI. Enrolled identities
+carry an authority-signed manifest; manual-PKI identities carry the same strict
+claims in an SBproxy URI SAN. Every leaf carries its unique node ID as a DNS
+SAN, and outbound transport verifies that node ID. A cluster must use one
+attestation mode consistently.
 
 ### Initialize and enroll
 
@@ -214,12 +220,57 @@ sbproxy cluster enroll \
 The token store keeps only token hashes. Successful consumption is atomic, so
 replay and concurrent reuse fail. The installed directory contains the node
 certificate and key, cluster CA, gossip key, identity document, and deployment
-authority verification key. Certificate rotation uses a new enrollment and a
-controlled process restart; identity changes are never partially hot-reloaded.
+authority verification key. Every successful enrollment for a stable node ID
+advances its durable identity epoch. Certificate rotation uses a new enrollment
+and a controlled process restart; identity changes are never partially
+hot-reloaded.
+
+Signed joins bind node ID, advertised gossip and typed-state addresses, a
+durable boot epoch, and a two-minute proof lifetime to the certificate key. A
+captured join cannot resurrect a dead process. A restarted node advances its
+boot epoch and incarnation beyond stale dead gossip. A higher identity epoch
+permits certificate rotation; the same epoch with a different certificate is
+rejected. Receivers persist these peer high-water marks, so restart does not
+re-enable an older certificate or boot. Direct joins replay only the bounded
+live authenticated roster. Typed cluster-state envelopes are signed by the
+same key and pass the same durable identity-epoch fence; snapshot roles and
+labels must exactly match the authenticated identity before placement can use
+them.
+
+### Operator-managed PKI
+
+Manual PKI is a production canonical-cluster option when an external CA owns
+issuance. The leaf certificate must have a DNS SAN equal to `node_id` and
+exactly one SBproxy identity URI SAN:
+
+```text
+urn:sbproxy:identity:v1:<base64url-without-padding-of-json>
+```
+
+The decoded JSON is strict and versioned:
+
+```json
+{"schema_version":1,"cluster_id":"production-models","node_id":"worker-a","roles":["worker"],"labels":{"region":"us-central1","zone":"us-central1-a"},"server_name":"sbproxy-mesh","identity_epoch":1}
+```
+
+Encode those exact claims as URL-safe base64 without padding, add the resulting
+URI and `DNS:worker-a` to the CA-signed leaf, and configure the certificate,
+key, and CA paths normally. Leave `identity.json` and
+`authority-verifying.key` absent from `state_dir`; having only one is a startup
+error. All nodes must use manual PKI, and rotation for the same node ID must
+increment `identity_epoch`. SBproxy verifies the CA chain, expiry, node DNS
+SAN, identity URI, configured claims, and proof of key possession.
 
 Runnable templates are in
 [`examples/model-cluster-symmetric`](../examples/model-cluster-symmetric) and
 [`examples/model-cluster-split`](../examples/model-cluster-split).
+
+Controllers write `model-deployment-generations.json` under `state_dir` before
+publishing a placement commit. It retains every deployment high-water mark,
+including deployments with no surviving replica snapshot. Do not copy this
+file between node identities or delete it during an ordinary restart. A failed
+prepared revision may consume a generation number; gaps are expected and let a
+last-good configuration return without reusing the failed identity.
 
 ## Desired-state authority
 
@@ -530,6 +581,11 @@ artifact counts, replica truth, model eligibility, and exclusion reason. The
 top-level `unhealthy_nodes` array repeats only actionable nodes so an admin UI
 can render a prominent alert without hiding them from the main table.
 
+Routing membership may remove a dead peer after `dead_peer_gc_secs`. The model
+directory separately retains a bounded long-lived tombstone with the last safe
+snapshot and current exclusion reason, so the admin roster and unhealthy alert
+do not silently lose failed nodes after routing GC.
+
 The response also includes healthy/degraded/unhealthy counts, eligible workers
 and replicas, deployment digest consistency, exact target assignments,
 unplaced replicas and rejection reasons, retained and draining assignments,
@@ -588,9 +644,9 @@ The owner-only temporary config is removed when the command returns, including
 startup and readiness failures.
 
 Raw `hf:` references are deliberately rejected by this command because they
-bypass the catalog v2 identity. Operator catalog selection remains available
-through compatibility `serve.catalog_file` in this PR. Canonical custom-catalog
-selection moves into the later model-management plane.
+bypass the catalog v2 identity. Set `proxy.model_host.catalog_file` to select a
+catalog v2 document for canonical managed deployments. Relative paths resolve
+from the directory containing `sb.yml`; omission uses the built-in catalog.
 
 ## Migrating from provider `serve:`
 

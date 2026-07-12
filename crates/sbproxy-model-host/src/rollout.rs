@@ -14,6 +14,15 @@ use crate::{
 
 const MAX_ROLLOUT_OBSERVATIONS: usize = 4_096;
 
+/// Highest accepted generation and desired-state identity for one deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentGenerationFence {
+    /// Monotonic cluster deployment generation.
+    pub deployment_generation: u64,
+    /// Global desired-state digest published with that generation.
+    pub desired_revision_digest: Option<String>,
+}
+
 /// One exact replica observation from the immutable model directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutReplicaObservation {

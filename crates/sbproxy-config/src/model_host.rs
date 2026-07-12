@@ -208,6 +208,9 @@ pub struct ModelHostControlConfig {
     /// Revision store path required by admin-managed authority.
     #[serde(default)]
     pub store_path: Option<String>,
+    /// Optional operator catalog file replacing the built-in model catalog.
+    #[serde(default)]
+    pub catalog_file: Option<String>,
     /// Maximum artifact and engine preparations that may run concurrently.
     #[serde(default = "default_max_parallel_prepares")]
     pub max_parallel_prepares: usize,
@@ -236,6 +239,7 @@ impl Default for ModelHostControlConfig {
         Self {
             authority: ModelHostAuthority::default(),
             store_path: None,
+            catalog_file: None,
             max_parallel_prepares: default_max_parallel_prepares(),
             safety_margin: default_safety_margin(),
             shutdown_deadline_ms: default_shutdown_deadline_ms(),
@@ -284,6 +288,13 @@ impl ModelHostControlConfig {
         if self.max_parallel_prepares == 0 {
             return Err(ModelHostConfigError::new(
                 "max_parallel_prepares must be positive",
+            ));
+        }
+        if self.catalog_file.as_ref().is_some_and(|path| {
+            path.trim().is_empty() || path.len() > 4_096 || path.chars().any(char::is_control)
+        }) {
+            return Err(ModelHostConfigError::new(
+                "catalog_file must be a bounded nonempty path without control characters",
             ));
         }
         if !self.safety_margin.is_finite() || self.safety_margin < 0.0 || self.safety_margin >= 1.0
