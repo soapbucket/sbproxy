@@ -8708,6 +8708,7 @@ dependencies = [
  "mistralrs",
  "nvml-wrapper",
  "reqwest 0.12.28",
+ "sbproxy-ai",
  "sbproxy-config",
  "sbproxy-util",
  "schemars 0.8.22",

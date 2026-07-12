@@ -487,6 +487,54 @@ impl ClusterHandle {
         key: &str,
         expected_schema: u32,
     ) -> ClusterStateRead<T> {
+        match self.read_state_value(namespace, key).await {
+            ClusterStateRead::Present(record) if record.schema_version != expected_schema => {
+                ClusterStateRead::IncompatibleSchema {
+                    expected: expected_schema,
+                    actual: record.schema_version,
+                    generation: record.generation,
+                }
+            }
+            ClusterStateRead::Present(record) => {
+                let payload = match serde_json::from_value(record.payload) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return ClusterStateRead::Malformed {
+                            reason: "decode typed payload failed".to_string(),
+                        };
+                    }
+                };
+                ClusterStateRead::Present(ClusterStateRecord {
+                    publisher_node_id: record.publisher_node_id,
+                    schema_version: record.schema_version,
+                    generation: record.generation,
+                    published_at_unix_ms: record.published_at_unix_ms,
+                    expires_at_unix_ms: record.expires_at_unix_ms,
+                    payload,
+                })
+            }
+            ClusterStateRead::Missing => ClusterStateRead::Missing,
+            ClusterStateRead::Expired {
+                generation,
+                expires_at_unix_ms,
+            } => ClusterStateRead::Expired {
+                generation,
+                expires_at_unix_ms,
+            },
+            ClusterStateRead::Unreachable { owner } => ClusterStateRead::Unreachable { owner },
+            ClusterStateRead::Malformed { reason } => ClusterStateRead::Malformed { reason },
+            ClusterStateRead::IncompatibleSchema { .. } => {
+                unreachable!("schema-agnostic cluster state reads never return an incompatibility")
+            }
+        }
+    }
+
+    /// Read one current state envelope without imposing a payload schema.
+    pub async fn read_state_value(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> ClusterStateRead<serde_json::Value> {
         if let Err(error) = validate_state_component("namespace", namespace)
             .and_then(|_| validate_state_component("key", key))
         {
@@ -530,13 +578,6 @@ impl ClusterHandle {
                 reason: "publisher node ID is empty or oversized".to_string(),
             };
         }
-        if envelope.schema_version != expected_schema {
-            return ClusterStateRead::IncompatibleSchema {
-                expected: expected_schema,
-                actual: envelope.schema_version,
-                generation: envelope.generation,
-            };
-        }
         let now = match unix_time_ms() {
             Ok(now) => now,
             Err(error) => {
@@ -556,21 +597,13 @@ impl ClusterHandle {
                 reason: "publication time is after expiry".to_string(),
             };
         }
-        let payload = match serde_json::from_value(envelope.payload) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ClusterStateRead::Malformed {
-                    reason: "decode typed payload failed".to_string(),
-                };
-            }
-        };
         ClusterStateRead::Present(ClusterStateRecord {
             publisher_node_id: envelope.publisher_node_id,
             schema_version: envelope.schema_version,
             generation: envelope.generation,
             published_at_unix_ms: envelope.published_at_unix_ms,
             expires_at_unix_ms: envelope.expires_at_unix_ms,
-            payload,
+            payload: envelope.payload,
         })
     }
 

@@ -34,6 +34,7 @@ pub mod judge;
 pub mod key_scoping;
 pub mod local_host;
 pub mod model_alias;
+pub mod model_directory;
 pub mod multimodal;
 pub mod prompt_cache;
 pub mod prompt_fingerprint;

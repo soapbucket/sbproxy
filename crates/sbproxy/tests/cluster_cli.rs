@@ -105,6 +105,64 @@ fn enrollment_fixture(
     (format!("http://{address}"), handle)
 }
 
+fn status_fixture() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept status");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = [0u8; 8192];
+        let read = stream.read(&mut request).expect("read status request");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(
+            request.starts_with("GET /admin/cluster/status "),
+            "{request}"
+        );
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Basic YWRtaW46c2VjcmV0")),
+            "{request}"
+        );
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "configured": true,
+            "mode": "distributed",
+            "cluster_id": "prod-a",
+            "local_node_id": "gateway-a",
+            "summary": {
+                "total_nodes": 2,
+                "healthy_nodes": 1,
+                "degraded_nodes": 0,
+                "unhealthy_nodes": 1,
+                "eligible_workers": 1
+            },
+            "nodes": [{
+                "node_id": "worker-b",
+                "health": "unhealthy",
+                "membership_state": "suspect",
+                "model_eligible": false,
+                "unhealthy_reasons": ["membership_suspect"]
+            }],
+            "unhealthy_nodes": [{
+                "node_id": "worker-b",
+                "reasons": ["membership_suspect"]
+            }]
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("status response");
+    });
+    (format!("http://{address}"), handle)
+}
+
 #[test]
 fn cluster_init_token_and_http_development_enroll_work_end_to_end() {
     let root = temp_dir("enroll");
@@ -198,4 +256,27 @@ fn cluster_enroll_rejects_plaintext_without_explicit_development_flag() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-insecure-http"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("not-a-real-token"));
+}
+
+#[test]
+fn cluster_status_prints_the_authenticated_admin_contract() {
+    let (url, server) = status_fixture();
+    let output = run(&[
+        "cluster",
+        "status",
+        "--admin-url",
+        &url,
+        "--username",
+        "admin",
+        "--password",
+        "secret",
+        "--format",
+        "json",
+    ]);
+    server.join().expect("status fixture");
+    let status = json_stdout(&output);
+    assert_eq!(status["cluster_id"], "prod-a");
+    assert_eq!(status["summary"]["unhealthy_nodes"], 1);
+    assert_eq!(status["unhealthy_nodes"][0]["node_id"], "worker-b");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret"));
 }

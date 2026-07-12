@@ -192,6 +192,14 @@ async fn typed_state_distinguishes_missing_incompatible_and_expired() {
         }
     ));
 
+    let ClusterStateRead::Present(versioned) =
+        handle.read_state_value("model-snapshots", "local-a").await
+    else {
+        panic!("raw versioned state should remain readable");
+    };
+    assert_eq!(versioned.schema_version, 2);
+    assert_eq!(versioned.payload["value"], "brief");
+
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert!(matches!(
         handle

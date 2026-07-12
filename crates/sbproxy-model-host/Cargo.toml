@@ -80,5 +80,6 @@ axum = { version = "0.8", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+sbproxy-ai.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

@@ -2,6 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
+use sbproxy_ai::model_directory::{
+    DirectoryMember, DirectoryMemberState, DirectorySnapshotEnvelope, DirectorySnapshotRead,
+    ModelDirectory, ModelDirectoryExclusionReason, ModelDirectoryHealth,
+};
 use sbproxy_model_host::node_snapshot::{
     NodeArtifactSnapshot, NodeEngineSnapshot, NodeHealthSnapshot, NodeHealthState,
     NodeIdentitySnapshot, NodeModelSnapshot, NodeReplicaSnapshot, NodeRole, NodeSnapshotGeneration,
@@ -221,4 +225,248 @@ fn snapshot_generation_survives_reopen_and_is_unique_across_writers() {
         .map(|writer| writer.join().expect("writer"))
         .collect::<BTreeSet<_>>();
     assert_eq!(generations, BTreeSet::from_iter(4..=11));
+}
+
+fn member(node_id: &str, state: DirectoryMemberState) -> DirectoryMember {
+    DirectoryMember {
+        node_id: node_id.to_string(),
+        address: Some(format!("10.0.0.{}:7946", node_id.len())),
+        state,
+        last_ack_age_ms: 250,
+        incarnation: 4,
+    }
+}
+
+fn observed(snapshot: &NodeModelSnapshot) -> DirectorySnapshotRead {
+    DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+        publisher_node_id: snapshot.node.node_id.clone(),
+        schema_version: snapshot.schema_version,
+        generation: snapshot.generation,
+        published_at_unix_ms: snapshot.published_at_unix_ms,
+        expires_at_unix_ms: snapshot.expires_at_unix_ms,
+        payload: serde_json::to_value(snapshot).expect("snapshot value"),
+    })
+}
+
+fn snapshot_for(node_id: &str, generation: u64) -> NodeModelSnapshot {
+    let mut snapshot = fixture();
+    snapshot.node.node_id = node_id.to_string();
+    snapshot.node.model_endpoint = Some(format!("https://{node_id}.internal:9443"));
+    snapshot.replicas[0].endpoint = snapshot.node.model_endpoint.clone();
+    snapshot.generation = generation;
+    snapshot.validate().expect("directory snapshot fixture");
+    snapshot
+}
+
+#[test]
+fn directory_joins_every_member_and_calls_out_unhealthy_nodes() {
+    let directory = ModelDirectory::new();
+    let worker_a = snapshot_for("worker-a", 10);
+    let worker_b = snapshot_for("worker-b", 8);
+    let view = directory
+        .refresh(
+            worker_a.published_at_unix_ms + 1_000,
+            vec![
+                member("worker-a", DirectoryMemberState::Alive),
+                member("worker-b", DirectoryMemberState::Suspect),
+                member("worker-c", DirectoryMemberState::Dead),
+                member("worker-d", DirectoryMemberState::Unreachable),
+            ],
+            BTreeMap::from([
+                ("worker-a".to_string(), observed(&worker_a)),
+                ("worker-b".to_string(), observed(&worker_b)),
+                (
+                    "worker-c".to_string(),
+                    DirectorySnapshotRead::Expired {
+                        generation: 7,
+                        expires_at_unix_ms: worker_a.published_at_unix_ms - 1,
+                    },
+                ),
+                ("worker-d".to_string(), DirectorySnapshotRead::Unreachable),
+            ]),
+        )
+        .expect("directory refresh");
+
+    assert_eq!(view.nodes.len(), 4);
+    assert_eq!(view.summary.total_nodes, 4);
+    assert_eq!(view.summary.healthy_nodes, 1);
+    assert_eq!(view.summary.unhealthy_nodes, 3);
+    assert_eq!(view.unhealthy_nodes().len(), 3);
+    assert_eq!(
+        view.node("worker-b").expect("worker b").exclusion_reason,
+        Some(ModelDirectoryExclusionReason::MembershipSuspect)
+    );
+    assert_eq!(
+        view.node("worker-c").expect("worker c").exclusion_reason,
+        Some(ModelDirectoryExclusionReason::MembershipDead)
+    );
+    assert_eq!(
+        view.node("worker-d").expect("worker d").exclusion_reason,
+        Some(ModelDirectoryExclusionReason::MembershipUnreachable)
+    );
+    assert_eq!(view.eligible_replicas["coder"].len(), 1);
+}
+
+#[test]
+fn directory_reports_snapshot_failure_classes_without_raw_details() {
+    let directory = ModelDirectory::new();
+    let now = fixture().published_at_unix_ms + 1_000;
+    let view = directory
+        .refresh(
+            now,
+            vec![
+                member("missing", DirectoryMemberState::Alive),
+                member("malformed", DirectoryMemberState::Alive),
+                member("future", DirectoryMemberState::Alive),
+            ],
+            BTreeMap::from([
+                ("missing".to_string(), DirectorySnapshotRead::Missing),
+                ("malformed".to_string(), DirectorySnapshotRead::Malformed),
+                (
+                    "future".to_string(),
+                    DirectorySnapshotRead::IncompatibleSchema {
+                        schema_version: 99,
+                        generation: 2,
+                    },
+                ),
+            ]),
+        )
+        .expect("failure view");
+
+    assert_eq!(
+        view.node("missing").expect("missing").exclusion_reason,
+        Some(ModelDirectoryExclusionReason::SnapshotMissing)
+    );
+    assert_eq!(
+        view.node("malformed").expect("malformed").exclusion_reason,
+        Some(ModelDirectoryExclusionReason::SnapshotMalformed)
+    );
+    assert_eq!(
+        view.node("future").expect("future").exclusion_reason,
+        Some(ModelDirectoryExclusionReason::SchemaIncompatible)
+    );
+    let json = serde_json::to_string(&*view).expect("admin-safe JSON");
+    assert!(!json.contains("raw"));
+    assert!(!json.contains("private"));
+}
+
+#[test]
+fn older_snapshot_generation_never_replaces_last_observed_truth() {
+    let directory = ModelDirectory::new();
+    let newer = snapshot_for("worker-a", 12);
+    let first = directory
+        .refresh(
+            newer.published_at_unix_ms + 100,
+            vec![member("worker-a", DirectoryMemberState::Alive)],
+            BTreeMap::from([("worker-a".to_string(), observed(&newer))]),
+        )
+        .expect("newer refresh");
+    assert_eq!(
+        first.node("worker-a").unwrap().snapshot_generation,
+        Some(12)
+    );
+
+    let older = snapshot_for("worker-a", 11);
+    let second = directory
+        .refresh(
+            older.published_at_unix_ms + 200,
+            vec![member("worker-a", DirectoryMemberState::Alive)],
+            BTreeMap::from([("worker-a".to_string(), observed(&older))]),
+        )
+        .expect("older refresh");
+    let node = second.node("worker-a").expect("worker a");
+    assert_eq!(node.snapshot_generation, Some(12));
+    assert_eq!(
+        node.exclusion_reason,
+        Some(ModelDirectoryExclusionReason::OldSnapshotGeneration)
+    );
+    assert_eq!(node.health, ModelDirectoryHealth::Unhealthy);
+}
+
+#[test]
+fn schema_zero_normalizes_and_readers_hold_immutable_views() {
+    let directory = ModelDirectory::new();
+    let snapshot = snapshot_for("worker-a", 5);
+    let mut payload = serde_json::to_value(&snapshot).expect("snapshot value");
+    payload["schema_version"] = serde_json::json!(0);
+    payload.as_object_mut().unwrap().remove("health");
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("active_deployment_digest");
+    let old = directory.load();
+    let current = directory
+        .refresh(
+            snapshot.published_at_unix_ms + 100,
+            vec![member("worker-a", DirectoryMemberState::Alive)],
+            BTreeMap::from([(
+                "worker-a".to_string(),
+                DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+                    publisher_node_id: "worker-a".to_string(),
+                    schema_version: 0,
+                    generation: snapshot.generation,
+                    published_at_unix_ms: snapshot.published_at_unix_ms,
+                    expires_at_unix_ms: snapshot.expires_at_unix_ms,
+                    payload,
+                }),
+            )]),
+        )
+        .expect("v0 refresh");
+
+    assert!(old.nodes.is_empty());
+    assert_eq!(current.nodes.len(), 1);
+    assert!(!Arc::ptr_eq(&old, &current));
+    assert_eq!(
+        current.node("worker-a").unwrap().normalized_schema_version,
+        Some(NODE_MODEL_SNAPSHOT_SCHEMA_VERSION)
+    );
+}
+
+#[test]
+fn directory_fences_old_replica_generations_and_deployment_digest_drift() {
+    let directory = ModelDirectory::new();
+    let mut worker_a = snapshot_for("worker-a", 10);
+    worker_a.replicas[0].deployment_generation = 20;
+    let mut worker_b = snapshot_for("worker-b", 10);
+    worker_b.replicas[0].deployment_generation = 19;
+    let now = worker_a.published_at_unix_ms + 100;
+    let view = directory
+        .refresh(
+            now,
+            vec![
+                member("worker-a", DirectoryMemberState::Alive),
+                member("worker-b", DirectoryMemberState::Alive),
+            ],
+            BTreeMap::from([
+                ("worker-a".to_string(), observed(&worker_a)),
+                ("worker-b".to_string(), observed(&worker_b)),
+            ]),
+        )
+        .expect("generation view");
+    assert_eq!(view.eligible_replicas["coder"].len(), 1);
+    assert_eq!(view.eligible_replicas["coder"][0].node_id, "worker-a");
+    assert_eq!(
+        view.node("worker-b").unwrap().exclusion_reason,
+        Some(ModelDirectoryExclusionReason::BehindActiveGeneration)
+    );
+
+    worker_b.generation = 11;
+    worker_b.active_deployment_digest = Some("d".repeat(64));
+    let drift = directory
+        .refresh(
+            now + 1,
+            vec![
+                member("worker-a", DirectoryMemberState::Alive),
+                member("worker-b", DirectoryMemberState::Alive),
+            ],
+            BTreeMap::from([
+                ("worker-a".to_string(), observed(&worker_a)),
+                ("worker-b".to_string(), observed(&worker_b)),
+            ]),
+        )
+        .expect("digest drift view");
+    assert!(drift.summary.deployment_digest_mismatch);
+    assert!(drift.eligible_replicas.is_empty());
+    assert!(drift.nodes.iter().all(|node| node.exclusion_reason
+        == Some(ModelDirectoryExclusionReason::DeploymentDigestMismatch)));
 }

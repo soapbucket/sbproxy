@@ -369,6 +369,11 @@ impl ProductionModelRuntime {
                         if let Err(error) = publish_cluster_node_snapshot(&runtime).await {
                             tracing::warn!(%error, "publish cluster node model snapshot");
                         }
+                        if let Err(error) =
+                            crate::cluster::collect_process_model_directory(false).await
+                        {
+                            tracing::warn!(%error, "collect live cluster model directory");
+                        }
                     }
                 });
             })
@@ -411,33 +416,37 @@ impl ProductionModelRuntime {
         use sbproxy_model_host::{DeploymentRuntimeState, EngineAvailability};
         use sha2::{Digest as _, Sha256};
 
+        let is_worker = identity
+            .roles
+            .contains(&sbproxy_mesh::ClusterNodeRole::Worker);
         let snapshot_preparer = self
             .snapshot_preparer
             .read()
             .expect("model runtime snapshot-preparer lock")
             .clone();
-        let (mut inventory, inventory_available) = match snapshot_preparer {
-            Some(preparer) => match preparer.node_snapshot_inventory() {
-                Ok(inventory) => (inventory, true),
-                Err(error) => {
-                    tracing::warn!(%error, "build cluster model inventory");
-                    (NodeSnapshotInventory::default(), false)
-                }
-            },
-            None => (NodeSnapshotInventory::default(), false),
+        let (mut inventory, inventory_available) = if is_worker {
+            match snapshot_preparer {
+                Some(preparer) => match preparer.node_snapshot_inventory() {
+                    Ok(inventory) => (inventory, true),
+                    Err(error) => {
+                        tracing::warn!(%error, "build cluster model inventory");
+                        (NodeSnapshotInventory::default(), false)
+                    }
+                },
+                None => (NodeSnapshotInventory::default(), false),
+            }
+        } else {
+            (NodeSnapshotInventory::default(), true)
         };
         let desired = self.current_desired();
         let statuses = self.statuses().await;
         let mut health_reasons = BTreeSet::new();
         let mut unhealthy = false;
-        if !inventory_available {
+        if is_worker && !inventory_available {
             health_reasons.insert("model_inventory_unavailable".to_string());
             unhealthy = true;
         }
 
-        let is_worker = identity
-            .roles
-            .contains(&sbproxy_mesh::ClusterNodeRole::Worker);
         if is_worker {
             if !inventory
                 .devices
@@ -1287,6 +1296,25 @@ mod tests {
         assert_eq!(snapshot.placement_weight, 0);
         assert!(snapshot.replicas.is_empty());
         snapshot.validate().expect("snapshot remains publishable");
+
+        let gateway = sbproxy_mesh::ClusterIdentity {
+            cluster_id: "cluster-a".to_string(),
+            node_id: "gateway-a".to_string(),
+            roles: BTreeSet::from([sbproxy_mesh::ClusterNodeRole::Gateway]),
+            labels: BTreeMap::new(),
+            peer_address: Some("127.0.0.1:7947".to_string()),
+            model_endpoint: None,
+        };
+        let snapshot = runtime
+            .node_model_snapshot(&gateway, 4, 2_000, 32_000)
+            .await
+            .expect("gateway snapshot");
+        assert_eq!(
+            snapshot.health.state,
+            sbproxy_model_host::node_snapshot::NodeHealthState::Ready
+        );
+        assert!(snapshot.health.reason_codes.is_empty());
+        assert_eq!(snapshot.placement_weight, 0);
     }
 
     #[test]

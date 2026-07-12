@@ -293,6 +293,8 @@ enum ClusterSub {
     Token(ClusterTokenCmd),
     /// Generate a local worker key, enroll it, and install returned material.
     Enroll(ClusterEnrollArgs),
+    /// Show cluster membership, model eligibility, and unhealthy-node callouts.
+    Status(ClusterStatusArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -401,6 +403,16 @@ impl std::fmt::Debug for ClusterEnrollArgs {
             .field("format", &self.format)
             .finish()
     }
+}
+
+#[derive(clap::Args, Debug)]
+struct ClusterStatusArgs {
+    /// Admin endpoint and Basic Auth credentials.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -628,7 +640,7 @@ struct ModelsShowArgs {
     cache_dir: Option<PathBuf>,
 }
 
-#[derive(clap::Args, Debug, Clone, Default)]
+#[derive(clap::Args, Clone, Default)]
 struct ModelsAdminArgs {
     /// Local admin API base URL. Defaults to `http://127.0.0.1:9090` for
     /// `ps` and `stop`; removal queries live protection only when supplied.
@@ -640,6 +652,17 @@ struct ModelsAdminArgs {
     /// Admin Basic Auth password. Never printed.
     #[arg(long = "password", env = "SB_ADMIN_PASSWORD")]
     password: Option<String>,
+}
+
+impl std::fmt::Debug for ModelsAdminArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelsAdminArgs")
+            .field("admin_url", &self.admin_url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -3415,6 +3438,7 @@ fn handle_cluster_subcommand(cmd: &ClusterCmd) -> anyhow::Result<i32> {
             ClusterTokenSub::Create(args) => handle_cluster_token_create(args),
         },
         ClusterSub::Enroll(args) => handle_cluster_enroll(args),
+        ClusterSub::Status(args) => handle_cluster_status(args),
     }
 }
 
@@ -3584,6 +3608,87 @@ fn handle_cluster_enroll(args: &ClusterEnrollArgs) -> anyhow::Result<i32> {
         ),
     }
     Ok(0)
+}
+
+fn handle_cluster_status(args: &ClusterStatusArgs) -> anyhow::Result<i32> {
+    let status = admin_request_json(
+        &args.admin,
+        Some("http://127.0.0.1:9090"),
+        reqwest::Method::GET,
+        sbproxy_core::admin_cluster::STATUS_PATH,
+        None,
+    )?;
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&status)?),
+        OutputFormat::Text => {
+            let cluster_id = status
+                .get("cluster_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let mode = status
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let summary = status.get("summary").unwrap_or(&serde_json::Value::Null);
+            println!(
+                "cluster {cluster_id} ({mode}): {} nodes, {} healthy, {} degraded, {} unhealthy, {} eligible workers",
+                json_u64(summary, "total_nodes"),
+                json_u64(summary, "healthy_nodes"),
+                json_u64(summary, "degraded_nodes"),
+                json_u64(summary, "unhealthy_nodes"),
+                json_u64(summary, "eligible_workers"),
+            );
+            if let Some(nodes) = status.get("nodes").and_then(serde_json::Value::as_array) {
+                for node in nodes {
+                    let node_id = node
+                        .get("node_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let health = node
+                        .get("health")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let membership = node
+                        .get("membership_state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let eligibility = if node
+                        .get("model_eligible")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        "eligible"
+                    } else {
+                        "excluded"
+                    };
+                    let reasons = node
+                        .get("unhealthy_reasons")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|reasons| {
+                            reasons
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .filter(|reasons| !reasons.is_empty())
+                        .map(|reasons| format!(" [{reasons}]"))
+                        .unwrap_or_default();
+                    println!(
+                        "{node_id}\thealth={health}\tmembership={membership}\tmodel={eligibility}{reasons}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn json_u64(value: &serde_json::Value, field: &str) -> u64 {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }
 
 fn cluster_roles(
@@ -4925,6 +5030,29 @@ mod tests {
         };
         assert_eq!(enroll.node_id, "worker-a");
         assert!(!format!("{enroll:?}").contains("secret-token"));
+
+        let cli = parse(&[
+            "sbproxy",
+            "cluster",
+            "status",
+            "--admin-url",
+            "https://authority.example:9090",
+            "--username",
+            "operator",
+            "--password",
+            "secret-password",
+            "--format",
+            "json",
+        ]);
+        let Some(Cmd::Cluster(ClusterCmd {
+            sub: ClusterSub::Status(status),
+        })) = cli.cmd
+        else {
+            panic!("expected cluster status");
+        };
+        assert_eq!(status.admin.username.as_deref(), Some("operator"));
+        assert!(matches!(status.format, OutputFormat::Json));
+        assert!(!format!("{status:?}").contains("secret-password"));
     }
 
     #[test]

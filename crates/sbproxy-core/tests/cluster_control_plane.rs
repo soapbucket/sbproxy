@@ -148,6 +148,18 @@ cluster:
     };
     assert_eq!(record.generation, generation);
     assert_eq!(record.payload, snapshot);
+    let directory = owner
+        .collect_model_directory(true)
+        .await
+        .expect("collect directory")
+        .expect("canonical directory enabled");
+    assert_eq!(directory.nodes.len(), 1);
+    assert_eq!(directory.summary.unhealthy_nodes, 1);
+    assert_eq!(directory.nodes[0].node_id, "worker-a");
+    assert_eq!(
+        directory.nodes[0].unhealthy_reasons,
+        vec!["fixture_unhealthy".to_string()]
+    );
     assert!(owner
         .begin_node_snapshot_publication(false)
         .await

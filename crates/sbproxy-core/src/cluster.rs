@@ -19,6 +19,7 @@ use sbproxy_mesh::{ClusterHandle, ClusterIdentity, ClusterNodeRole};
 const LOCAL_CLUSTER_ID: &str = "local";
 const DEFAULT_SNAPSHOT_TTL_SECS: u64 = 30;
 const DEFAULT_PUBLISH_INTERVAL_SECS: u64 = 5;
+const DIRECTORY_COLLECT_INTERVAL_MS: u64 = 1_000;
 
 /// Injectable boundary used to construct the one distributed handle.
 pub trait ClusterBootstrap: Send + Sync {
@@ -53,6 +54,9 @@ struct SnapshotPublicationState {
     ephemeral_generation: AtomicU64,
     last_success_unix_ms: AtomicU64,
     publish_lock: Arc<tokio::sync::Mutex<()>>,
+    directory: Arc<sbproxy_ai::model_directory::ModelDirectory>,
+    last_collect_unix_ms: AtomicU64,
+    collect_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SnapshotPublicationState {
@@ -63,6 +67,9 @@ impl SnapshotPublicationState {
             ephemeral_generation: AtomicU64::new(0),
             last_success_unix_ms: AtomicU64::new(0),
             publish_lock: Arc::new(tokio::sync::Mutex::new(())),
+            directory: Arc::new(sbproxy_ai::model_directory::ModelDirectory::new()),
+            last_collect_unix_ms: AtomicU64::new(0),
+            collect_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -366,13 +373,141 @@ impl ClusterOwner {
             expires_at_unix_ms,
         }))
     }
+
+    /// Collect membership and schema-agnostic snapshots into the immutable directory.
+    pub async fn collect_model_directory(
+        &self,
+        force: bool,
+    ) -> Result<Option<Arc<sbproxy_ai::model_directory::ModelDirectoryView>>> {
+        use sbproxy_ai::model_directory::{
+            DirectoryMember, DirectoryMemberState, DirectorySnapshotRead,
+        };
+
+        let Some((handle, state)) = self
+            .installed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|installed| {
+                (
+                    installed.handle.clone(),
+                    Arc::clone(&installed.snapshot_publication),
+                )
+            })
+        else {
+            return Ok(None);
+        };
+        if !state.enabled {
+            return Ok(None);
+        }
+        let _guard = Arc::clone(&state.collect_lock).lock_owned().await;
+        let now = unix_time_ms()?;
+        let last_collect = state.last_collect_unix_ms.load(Ordering::SeqCst);
+        if !force
+            && last_collect != 0
+            && now.saturating_sub(last_collect) < DIRECTORY_COLLECT_INTERVAL_MS
+        {
+            return Ok(None);
+        }
+        let membership = handle.membership();
+        let mut members = Vec::with_capacity(membership.len());
+        let mut reads = BTreeMap::new();
+        let mut alive_node_ids = Vec::new();
+        for member in membership {
+            let state = match member.state {
+                sbproxy_mesh::ClusterMemberState::Alive => DirectoryMemberState::Alive,
+                sbproxy_mesh::ClusterMemberState::Suspect => DirectoryMemberState::Suspect,
+                sbproxy_mesh::ClusterMemberState::Dead => DirectoryMemberState::Dead,
+                sbproxy_mesh::ClusterMemberState::Unreachable => DirectoryMemberState::Unreachable,
+            };
+            let node_id = member.node_id.clone();
+            members.push(DirectoryMember {
+                node_id: node_id.clone(),
+                address: member.address,
+                state,
+                last_ack_age_ms: u64::try_from(member.last_ack_age.as_millis()).unwrap_or(u64::MAX),
+                incarnation: member.incarnation,
+            });
+            if state == DirectoryMemberState::Alive {
+                alive_node_ids.push(node_id);
+            } else {
+                reads.insert(node_id, DirectorySnapshotRead::Missing);
+            }
+        }
+        use futures::StreamExt as _;
+        let observations = futures::stream::iter(alive_node_ids.into_iter().map(|node_id| {
+            let handle = handle.clone();
+            async move {
+                let read = handle
+                    .read_state_value(
+                        sbproxy_model_host::node_snapshot::NODE_MODEL_SNAPSHOT_NAMESPACE,
+                        &node_id,
+                    )
+                    .await;
+                (node_id, directory_snapshot_read(read))
+            }
+        }))
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+        for (node_id, read) in observations {
+            reads.insert(node_id, read);
+        }
+        let view = state
+            .directory
+            .refresh(now, members, reads)
+            .context("refresh live model directory")?;
+        state.last_collect_unix_ms.store(now, Ordering::SeqCst);
+        Ok(Some(view))
+    }
+
+    /// Current lock-free live model directory.
+    pub fn model_directory(&self) -> Option<Arc<sbproxy_ai::model_directory::ModelDirectory>> {
+        self.installed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|installed| Arc::clone(&installed.snapshot_publication.directory))
+    }
+}
+
+fn directory_snapshot_read(
+    read: sbproxy_mesh::ClusterStateRead<serde_json::Value>,
+) -> sbproxy_ai::model_directory::DirectorySnapshotRead {
+    use sbproxy_ai::model_directory::{DirectorySnapshotEnvelope, DirectorySnapshotRead};
+
+    match read {
+        sbproxy_mesh::ClusterStateRead::Present(record) => {
+            DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+                publisher_node_id: record.publisher_node_id,
+                schema_version: record.schema_version,
+                generation: record.generation,
+                published_at_unix_ms: record.published_at_unix_ms,
+                expires_at_unix_ms: record.expires_at_unix_ms,
+                payload: record.payload,
+            })
+        }
+        sbproxy_mesh::ClusterStateRead::Missing => DirectorySnapshotRead::Missing,
+        sbproxy_mesh::ClusterStateRead::Expired {
+            generation,
+            expires_at_unix_ms,
+        } => DirectorySnapshotRead::Expired {
+            generation,
+            expires_at_unix_ms,
+        },
+        sbproxy_mesh::ClusterStateRead::Unreachable { .. } => DirectorySnapshotRead::Unreachable,
+        sbproxy_mesh::ClusterStateRead::Malformed { .. } => DirectorySnapshotRead::Malformed,
+        sbproxy_mesh::ClusterStateRead::IncompatibleSchema {
+            actual, generation, ..
+        } => DirectorySnapshotRead::IncompatibleSchema {
+            schema_version: actual,
+            generation,
+        },
+    }
 }
 
 fn model_snapshot_publication_enabled(config: Option<&EffectiveClusterConfig>) -> bool {
-    config.is_some_and(|config| {
-        config.source != ClusterConfigSource::LegacyMesh
-            && config.roles.contains(&ClusterRole::Worker)
-    })
+    config.is_some_and(|config| config.source != ClusterConfigSource::LegacyMesh)
 }
 
 fn snapshot_generation_directory(config: Option<&EffectiveClusterConfig>) -> Option<PathBuf> {
@@ -665,6 +800,18 @@ pub async fn begin_process_node_snapshot_publication(
     force: bool,
 ) -> Result<Option<NodeSnapshotPublication>> {
     process_owner().begin_node_snapshot_publication(force).await
+}
+
+/// Refresh the process live model directory when its collector cadence is due.
+pub async fn collect_process_model_directory(
+    force: bool,
+) -> Result<Option<Arc<sbproxy_ai::model_directory::ModelDirectoryView>>> {
+    process_owner().collect_model_directory(force).await
+}
+
+/// Current process live model directory.
+pub fn current_model_directory() -> Option<Arc<sbproxy_ai::model_directory::ModelDirectory>> {
+    process_owner().model_directory()
 }
 
 /// Configured process enrollment authority, if this node owns one.
