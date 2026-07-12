@@ -25,6 +25,7 @@ cluster:
   model_endpoint: https://10.0.0.12:9443
   security:
     mode: mtls
+    shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
     cert_file: /var/lib/sbproxy/cluster/node.pem
     key_file: /var/lib/sbproxy/cluster/node-key.pem
     ca_file: /var/lib/sbproxy/cluster/ca.pem
@@ -85,6 +86,7 @@ cluster_id: prod-a
 roles: [worker]
 security:
   mode: mtls
+  shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
   cert_file: node.pem
   key_file: node-key.pem
   ca_file: ca.pem
@@ -123,6 +125,19 @@ security:
   mode: mtls
   cert_file: node.pem
   key_file: node-key.pem
+"#,
+        ),
+        (
+            "mtls without authenticated gossip",
+            r#"
+cluster_id: prod-a
+node_id: worker-a
+roles: [worker]
+security:
+  mode: mtls
+  cert_file: node.pem
+  key_file: node-key.pem
+  ca_file: ca.pem
 "#,
         ),
         (
@@ -195,6 +210,7 @@ node_id: worker-a
 roles: [worker]
 security:
   mode: mtls
+  shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
   cert_file: node.pem
   key_file: node-key.pem
   ca_file: ca.pem
@@ -343,6 +359,7 @@ cluster:
   labels: {zone: a}
   security:
     mode: mtls
+    shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
     cert_file: node.pem
     key_file: node-key.pem
     ca_file: ca.pem

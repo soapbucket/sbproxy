@@ -1993,7 +1993,7 @@
           "type": "boolean"
         },
         "shared_key": {
-          "description": "Shared secret reference for development encryption.",
+          "description": "Shared secret reference for authenticated UDP gossip and development transport.",
           "default": null,
           "type": [
             "string",

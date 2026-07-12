@@ -1,12 +1,14 @@
 //! Distributed clustering layer for sbproxy.
 //!
 //! This crate turns a pool of sbproxy instances into a single logical mesh
-//! with shared state (rate-limit counters, session tracking, cache entries)
-//! replicated via gossip + CRDTs. It backs the dynamic key plane's clusterwide
-//! cache tier and cross-replica spend counters. High-level components:
+//! with shared identity, membership, liveness, and typed state. Keys, fleet
+//! metrics, and managed models consume one [`ClusterHandle`] instead of
+//! bootstrapping separate meshes. High-level components:
 //!
 //! * [`bootstrap`] wires everything together and returns a [`MeshNode`]
-//!   handle. Most callers only need this entry point.
+//!   owned by the distributed [`ClusterHandle`] implementation.
+//! * [`cluster_handle`] exposes the shared local or distributed substrate and
+//!   its generation-fenced typed state.
 //! * [`node`] / [`node_handle`] model the local node and expose the
 //!   runtime handle that the rest of sbproxy holds.
 //! * [`config`] defines the typed configuration the node consumes.
@@ -25,14 +27,15 @@
 //!   Kubernetes, on-disk snapshots, and pluggable storage backends.
 //! * [`metrics`] / [`cluster_metrics`] expose Prometheus counters.
 //!
-//! The single public re-export is [`MeshNode`], a lightweight handle
-//! returned from [`bootstrap::bootstrap`].
+//! Most consumers use a clone of [`ClusterHandle`]. Direct [`MeshNode`] access
+//! remains available to compatibility adapters during the ownership migration.
 
 #![deny(missing_docs)]
 
 pub mod backend;
 pub mod bootstrap;
 pub mod bridge;
+pub mod cluster_handle;
 pub mod cluster_metrics;
 pub mod config;
 pub mod consistency;
@@ -58,4 +61,8 @@ pub mod transport;
 
 // --- Re-exports ---
 
+pub use cluster_handle::{
+    ClusterHandle, ClusterIdentity, ClusterMember, ClusterMemberState, ClusterMode,
+    ClusterNodeRole, ClusterStateError, ClusterStateRead, ClusterStateRecord,
+};
 pub use node_handle::MeshNode;

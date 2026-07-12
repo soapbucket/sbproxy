@@ -72,7 +72,7 @@ pub struct ClusterSecurityConfig {
     /// Explicitly acknowledge that shared-key mode is for development.
     #[serde(default)]
     pub development: bool,
-    /// Shared secret reference for development encryption.
+    /// Shared secret reference for authenticated UDP gossip and development transport.
     #[serde(default)]
     pub shared_key: Option<String>,
     /// This node's PEM certificate chain for mTLS.
@@ -341,6 +341,11 @@ fn validate_security(security: &ClusterSecurityConfig) -> Result<(), ClusterConf
                 validate_nonempty(field, value.unwrap_or_default())?;
             }
             validate_nonempty("security.server_name", &security.server_name)?;
+            validate_nonempty(
+                "security.shared_key",
+                security.shared_key.as_deref().unwrap_or_default(),
+            )?;
+            validate_shared_key_reference(security.shared_key.as_deref().unwrap_or_default())?;
         }
         ClusterSecurityMode::SharedKey => {
             if !security.development {

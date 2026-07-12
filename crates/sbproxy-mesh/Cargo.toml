@@ -10,10 +10,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Distributed clustering layer for sbproxy: SWIM gossip, CRDTs, and a consistent-hash distributed cache. Backs the dynamic key plane's clusterwide cache tier and cross-replica counters."
+description = "Shared local or distributed cluster substrate for sbproxy identity, SWIM liveness, typed state, caches, metrics, and managed models."
 
 [dependencies]
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

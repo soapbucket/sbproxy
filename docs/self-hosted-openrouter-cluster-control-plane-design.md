@@ -63,6 +63,7 @@ proxy:
     model_endpoint: https://10.0.0.12:9443
     security:
       mode: mtls
+      shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
       cert_file: /var/lib/sbproxy/cluster/node.pem
       key_file: /var/lib/sbproxy/cluster/node-key.pem
       ca_file: /var/lib/sbproxy/cluster/ca.pem
@@ -74,8 +75,10 @@ proxy:
 `roles` accepts `gateway`, `worker`, and `authority`. A canonical distributed
 cluster requires a nonempty node ID, at least one role, bounded labels, and an
 explicit security mode. `mtls` is the production mode. `shared_key` is an
-explicit development mode and requires `development: true`. Plaintext is not
-accepted by canonical configuration.
+explicit development mode and requires `development: true`. Production mTLS
+also requires `shared_key` to authenticate and encrypt UDP SWIM traffic, while
+certificates authenticate the TCP peer transport. Plaintext is not accepted by
+canonical configuration.
 
 An authority node may additionally configure an enrollment store and a
 deployment signing key. A non-authority node may configure only the
@@ -129,9 +132,9 @@ session.
 
 The workflow is:
 
-1. `sbproxy cluster init` creates a cluster CA, authority signing identity,
-   authority node identity, and an atomic token store with owner-only file
-   permissions.
+1. `sbproxy cluster init` creates a cluster CA, UDP gossip key, authority
+   signing identity, authority node identity, and an atomic token store with
+   owner-only file permissions.
 2. `sbproxy cluster token create` records a random, hashed, expiring token with
    allowed roles and label constraints.
 3. `sbproxy cluster enroll` generates the worker private key locally, creates a
@@ -292,7 +295,8 @@ contract that UI will consume.
 
 ## Failure and security rules
 
-- Canonical production clustering fails closed without valid mTLS material.
+- Canonical production clustering fails closed without valid mTLS material and
+  authenticated UDP gossip key material.
 - Shared-key mode is explicit development configuration and never advertised
   as production peer identity.
 - Token files store token hashes, not bearer values.
