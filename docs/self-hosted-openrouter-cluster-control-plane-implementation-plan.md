@@ -431,4 +431,3 @@ delivery contract. Fix all Critical and Important findings, rerun affected
 focused gates and the full exact-head gate, then push and open PR 3 with an
 acceptance-to-evidence table. Monitor CI, fix failures, and merge only when all
 required checks are green.
-
