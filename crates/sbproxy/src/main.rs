@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::PathBuf;
 
@@ -161,6 +162,8 @@ enum Cmd {
     Apply(ApplyArgs),
     /// Config maintenance commands.
     Config(ConfigCmd),
+    /// Initialize and enroll nodes in a self-hosted cluster.
+    Cluster(ClusterCmd),
     /// Render projection documents (robots.txt, llms.txt, ...) for an
     /// origin without starting the proxy.
     Projections(ProjectionsCmd),
@@ -274,6 +277,147 @@ struct ConfigMigrateArgs {
     /// Write migrated YAML to this path. Defaults to stdout.
     #[arg(short = 'o', long = "out")]
     out: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct ClusterCmd {
+    #[command(subcommand)]
+    sub: ClusterSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterSub {
+    /// Atomically create a CA, authority identity, gossip key, and token store.
+    Init(ClusterInitArgs),
+    /// Manage one-time enrollment tokens.
+    Token(ClusterTokenCmd),
+    /// Generate a local worker key, enroll it, and install returned material.
+    Enroll(ClusterEnrollArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ClusterInitArgs {
+    /// New authority directory. It must not already exist.
+    #[arg(long = "dir")]
+    directory: PathBuf,
+    /// Logical cluster ID shared by every node.
+    #[arg(long = "cluster-id")]
+    cluster_id: String,
+    /// Stable authority node ID.
+    #[arg(long = "node-id")]
+    node_id: String,
+    /// Authority roles. Defaults to gateway plus authority.
+    #[arg(long = "role", value_enum)]
+    roles: Vec<ClusterRoleArg>,
+    /// Exact identity label in `key=value` form. Repeatable.
+    #[arg(long = "label")]
+    labels: Vec<String>,
+    /// DNS SAN expected on every peer certificate.
+    #[arg(long = "server-name", default_value = "sbproxy-mesh")]
+    server_name: String,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ClusterTokenCmd {
+    #[command(subcommand)]
+    sub: ClusterTokenSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterTokenSub {
+    /// Create a hash-only, expiring, one-time enrollment token.
+    Create(ClusterTokenCreateArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ClusterTokenCreateArgs {
+    /// Existing authority directory.
+    #[arg(long = "dir")]
+    directory: PathBuf,
+    /// Maximum role set. Defaults to worker.
+    #[arg(long = "role", value_enum)]
+    roles: Vec<ClusterRoleArg>,
+    /// Exact labels granted to the enrolled identity in `key=value` form.
+    #[arg(long = "label")]
+    labels: Vec<String>,
+    /// Token lifetime in seconds.
+    #[arg(long = "ttl-secs", default_value_t = 900)]
+    ttl_secs: u64,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args)]
+struct ClusterEnrollArgs {
+    /// Authority admin URL. The path is replaced with the enrollment endpoint.
+    #[arg(long = "url")]
+    url: String,
+    /// One-time token. Prefer `SBPROXY_CLUSTER_TOKEN` over shell history.
+    #[arg(long = "token", env = "SBPROXY_CLUSTER_TOKEN", hide_env_values = true)]
+    token: String,
+    /// Stable worker node ID.
+    #[arg(long = "node-id")]
+    node_id: String,
+    /// Requested role subset. Defaults to worker.
+    #[arg(long = "role", value_enum)]
+    roles: Vec<ClusterRoleArg>,
+    /// Exact token-granted label in `key=value` form. Repeatable.
+    #[arg(long = "label")]
+    labels: Vec<String>,
+    /// New local identity directory. It must not already exist.
+    #[arg(long = "out")]
+    output: PathBuf,
+    /// DNS SAN expected on every peer certificate.
+    #[arg(long = "server-name", default_value = "sbproxy-mesh")]
+    server_name: String,
+    /// Additional PEM CA used to verify the authority HTTPS endpoint.
+    #[arg(long = "ca-cert")]
+    ca_cert: Option<PathBuf>,
+    /// Permit plaintext HTTP for an explicitly development authority.
+    #[arg(long = "allow-insecure-http", action = ArgAction::SetTrue)]
+    allow_insecure_http: bool,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+impl std::fmt::Debug for ClusterEnrollArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClusterEnrollArgs")
+            .field("url", &self.url)
+            .field("token", &"<redacted>")
+            .field("node_id", &self.node_id)
+            .field("roles", &self.roles)
+            .field("labels", &self.labels)
+            .field("output", &self.output)
+            .field("server_name", &self.server_name)
+            .field("ca_cert", &self.ca_cert)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("format", &self.format)
+            .finish()
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ClusterRoleArg {
+    Gateway,
+    Worker,
+    Authority,
+}
+
+impl From<ClusterRoleArg> for sbproxy_mesh::ClusterNodeRole {
+    fn from(value: ClusterRoleArg) -> Self {
+        match value {
+            ClusterRoleArg::Gateway => Self::Gateway,
+            ClusterRoleArg::Worker => Self::Worker,
+            ClusterRoleArg::Authority => Self::Authority,
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -728,6 +872,9 @@ fn main() {
         }
         Some(Cmd::Config(cmd)) => {
             run_subcommand("config", 2, handle_config_subcommand(&cmd));
+        }
+        Some(Cmd::Cluster(cmd)) => {
+            run_subcommand("cluster", 2, handle_cluster_subcommand(&cmd));
         }
         Some(Cmd::Projections(cmd)) => {
             run_subcommand("error", 2, handle_projections_subcommand(&cmd).map(|()| 0));
@@ -3261,6 +3408,212 @@ fn handle_config_subcommand(cmd: &ConfigCmd) -> anyhow::Result<i32> {
     }
 }
 
+fn handle_cluster_subcommand(cmd: &ClusterCmd) -> anyhow::Result<i32> {
+    match &cmd.sub {
+        ClusterSub::Init(args) => handle_cluster_init(args),
+        ClusterSub::Token(token) => match &token.sub {
+            ClusterTokenSub::Create(args) => handle_cluster_token_create(args),
+        },
+        ClusterSub::Enroll(args) => handle_cluster_enroll(args),
+    }
+}
+
+fn handle_cluster_init(args: &ClusterInitArgs) -> anyhow::Result<i32> {
+    let roles = cluster_roles(
+        &args.roles,
+        &[ClusterRoleArg::Gateway, ClusterRoleArg::Authority],
+    );
+    let labels = parse_cluster_labels(&args.labels)?;
+    let authority = sbproxy_mesh::enrollment::EnrollmentAuthority::initialize(
+        &args.directory,
+        sbproxy_mesh::enrollment::AuthorityInit {
+            cluster_id: args.cluster_id.clone(),
+            node_id: args.node_id.clone(),
+            roles,
+            labels,
+            server_name: args.server_name.clone(),
+        },
+    )?;
+    match args.format {
+        OutputFormat::Text => {
+            println!(
+                "cluster authority initialized at {}",
+                authority.directory().display()
+            );
+            println!("node id: {}", authority.identity().document.node_id);
+            println!("CA: {}", authority.directory().join("ca.pem").display());
+            println!(
+                "gossip key: {}",
+                authority.directory().join("gossip.key").display()
+            );
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "command": "cluster.init",
+                "directory": authority.directory(),
+                "cluster_id": authority.identity().document.cluster_id,
+                "node_id": authority.identity().document.node_id,
+                "ca_file": authority.directory().join("ca.pem"),
+                "node_cert_file": authority.directory().join("node.pem"),
+                "node_key_file": authority.directory().join("node-key.pem"),
+                "gossip_key_file": authority.directory().join("gossip.key"),
+                "identity_file": authority.directory().join("identity.json"),
+            }))?
+        ),
+    }
+    Ok(0)
+}
+
+fn handle_cluster_token_create(args: &ClusterTokenCreateArgs) -> anyhow::Result<i32> {
+    let authority = sbproxy_mesh::enrollment::EnrollmentAuthority::open(&args.directory)?;
+    let roles = cluster_roles(&args.roles, &[ClusterRoleArg::Worker]);
+    let labels = parse_cluster_labels(&args.labels)?;
+    let issued = authority.create_token(
+        sbproxy_mesh::enrollment::EnrollmentTokenConstraints {
+            allowed_roles: roles,
+            labels,
+        },
+        std::time::Duration::from_secs(args.ttl_secs),
+    )?;
+    match args.format {
+        OutputFormat::Text => println!("{}", issued.token()),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "command": "cluster.token.create",
+                "token": issued.token(),
+                "token_id": issued.token_id(),
+                "expires_at_unix_secs": issued.expires_at_unix_secs(),
+                "constraints": issued.constraints(),
+            }))?
+        ),
+    }
+    Ok(0)
+}
+
+fn handle_cluster_enroll(args: &ClusterEnrollArgs) -> anyhow::Result<i32> {
+    let mut endpoint = reqwest::Url::parse(&args.url)
+        .map_err(|error| anyhow::anyhow!("invalid cluster authority URL: {error}"))?;
+    match endpoint.scheme() {
+        "https" => {}
+        "http" if args.allow_insecure_http => {}
+        "http" => anyhow::bail!(
+            "plaintext enrollment requires --allow-insecure-http and a development authority"
+        ),
+        scheme => anyhow::bail!("cluster authority URL must use https, not {scheme:?}"),
+    }
+    endpoint.set_path(sbproxy_core::admin_cluster::ENROLL_PATH);
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+
+    let roles = cluster_roles(&args.roles, &[ClusterRoleArg::Worker]);
+    let labels = parse_cluster_labels(&args.labels)?;
+    let worker =
+        sbproxy_mesh::enrollment::WorkerEnrollment::generate(&args.node_id, &args.server_name)?;
+    let request = worker.request(args.token.clone(), roles, labels);
+    let mut client = reqwest::Client::builder();
+    if let Some(path) = args.ca_cert.as_ref() {
+        let pem = std::fs::read(path)
+            .map_err(|error| anyhow::anyhow!("read enrollment CA certificate {path:?}: {error}"))?;
+        let certificate = reqwest::Certificate::from_pem(&pem)
+            .map_err(|error| anyhow::anyhow!("parse enrollment CA certificate: {error}"))?;
+        client = client.add_root_certificate(certificate);
+    }
+    let client = client.build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let response = runtime.block_on(async {
+        let response = client.post(endpoint).json(&request).send().await?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > 256 * 1024)
+        {
+            anyhow::bail!("cluster authority returned an oversized response");
+        }
+        let body = response.bytes().await?;
+        if body.len() > 256 * 1024 {
+            anyhow::bail!("cluster authority returned an oversized response");
+        }
+        if !status.is_success() {
+            let code = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("code")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "request_failed".to_string());
+            anyhow::bail!("cluster enrollment failed with HTTP {status} ({code})");
+        }
+        serde_json::from_slice::<sbproxy_mesh::enrollment::EnrollmentResponse>(&body)
+            .map_err(anyhow::Error::from)
+    })?;
+    let installed =
+        sbproxy_mesh::enrollment::install_worker_enrollment(&args.output, worker, response)?;
+    match args.format {
+        OutputFormat::Text => {
+            println!("cluster identity installed at {}", args.output.display());
+            println!("node id: {}", installed.identity.node_id);
+            println!("certificate: {}", installed.node_cert_file.display());
+            println!("private key: {}", installed.node_key_file.display());
+            println!("CA: {}", installed.ca_file.display());
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "command": "cluster.enroll",
+                "directory": args.output,
+                "cluster_id": installed.identity.cluster_id,
+                "node_id": installed.identity.node_id,
+                "roles": installed.identity.roles,
+                "labels": installed.identity.labels,
+                "node_cert_file": installed.node_cert_file,
+                "node_key_file": installed.node_key_file,
+                "ca_file": installed.ca_file,
+                "gossip_key_file": installed.gossip_key_file,
+                "identity_file": installed.identity_file,
+                "authority_verifying_key_file": installed.authority_verifying_key_file,
+            }))?
+        ),
+    }
+    Ok(0)
+}
+
+fn cluster_roles(
+    configured: &[ClusterRoleArg],
+    defaults: &[ClusterRoleArg],
+) -> BTreeSet<sbproxy_mesh::ClusterNodeRole> {
+    let roles = if configured.is_empty() {
+        defaults
+    } else {
+        configured
+    };
+    roles.iter().copied().map(Into::into).collect()
+}
+
+fn parse_cluster_labels(labels: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut parsed = BTreeMap::new();
+    for label in labels {
+        let (key, value) = label
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("cluster label {label:?} must use key=value form"))?;
+        if key.is_empty() || value.is_empty() {
+            anyhow::bail!("cluster label {label:?} must have a nonempty key and value");
+        }
+        if parsed.insert(key.to_string(), value.to_string()).is_some() {
+            anyhow::bail!("cluster label key {key:?} was provided more than once");
+        }
+    }
+    Ok(parsed)
+}
+
 /// `sbproxy config print`: the effective config after built-in defaults +
 /// the file + `${ENV}` interpolation, with secret values masked. Makes
 /// it obvious what a box will actually do (WOR-1805).
@@ -4502,6 +4855,88 @@ mod tests {
         };
         assert_eq!(args.config_path, std::path::PathBuf::from("sb.yml"));
         assert_eq!(args.out, Some(std::path::PathBuf::from("migrated.yml")));
+    }
+
+    #[test]
+    fn parses_cluster_init_token_and_enroll_commands() {
+        let cli = parse(&[
+            "sbproxy",
+            "cluster",
+            "init",
+            "--dir",
+            "/var/lib/sbproxy/cluster",
+            "--cluster-id",
+            "prod-a",
+            "--node-id",
+            "authority-a",
+            "--role",
+            "authority",
+            "--label",
+            "zone=a",
+        ]);
+        let Some(Cmd::Cluster(ClusterCmd {
+            sub: ClusterSub::Init(init),
+        })) = cli.cmd
+        else {
+            panic!("expected cluster init");
+        };
+        assert_eq!(init.cluster_id, "prod-a");
+        assert_eq!(init.roles, vec![ClusterRoleArg::Authority]);
+
+        let cli = parse(&[
+            "sbproxy",
+            "cluster",
+            "token",
+            "create",
+            "--dir",
+            "/var/lib/sbproxy/cluster",
+            "--ttl-secs",
+            "60",
+        ]);
+        let Some(Cmd::Cluster(ClusterCmd {
+            sub:
+                ClusterSub::Token(ClusterTokenCmd {
+                    sub: ClusterTokenSub::Create(token),
+                }),
+        })) = cli.cmd
+        else {
+            panic!("expected cluster token create");
+        };
+        assert_eq!(token.ttl_secs, 60);
+
+        let cli = parse(&[
+            "sbproxy",
+            "cluster",
+            "enroll",
+            "--url",
+            "https://authority.example:9090",
+            "--token",
+            "secret-token",
+            "--node-id",
+            "worker-a",
+            "--out",
+            "/var/lib/sbproxy/cluster",
+        ]);
+        let Some(Cmd::Cluster(ClusterCmd {
+            sub: ClusterSub::Enroll(enroll),
+        })) = cli.cmd
+        else {
+            panic!("expected cluster enroll");
+        };
+        assert_eq!(enroll.node_id, "worker-a");
+        assert!(!format!("{enroll:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn cluster_labels_are_exact_and_duplicate_safe() {
+        assert_eq!(
+            parse_cluster_labels(&["zone=a".to_string(), "gpu=l4".to_string()])
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(parse_cluster_labels(&["zone".to_string()]).is_err());
+        assert!(parse_cluster_labels(&["zone=a".to_string(), "zone=b".to_string()]).is_err());
     }
 
     #[test]

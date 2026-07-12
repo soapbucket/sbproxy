@@ -276,6 +276,83 @@ security:
 }
 
 #[test]
+fn enrollment_requires_enabled_https_admin_except_explicit_development() {
+    let production = parse(
+        r#"
+cluster:
+  cluster_id: prod-a
+  node_id: authority-a
+  roles: [authority]
+  enrollment:
+    authority_dir: /var/lib/sbproxy/cluster
+  security:
+    mode: mtls
+    shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
+    cert_file: node.pem
+    key_file: node-key.pem
+    ca_file: ca.pem
+"#,
+    );
+    let error = resolve_effective_cluster(&production).expect_err("admin is required");
+    assert!(error.to_string().contains("proxy.admin.enabled"));
+
+    let production_https = parse(
+        r#"
+admin:
+  enabled: true
+  tls:
+    cert: admin.pem
+    key: admin-key.pem
+cluster:
+  cluster_id: prod-a
+  node_id: authority-a
+  roles: [authority]
+  enrollment:
+    authority_dir: /var/lib/sbproxy/cluster
+  security:
+    mode: mtls
+    shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
+    cert_file: node.pem
+    key_file: node-key.pem
+    ca_file: ca.pem
+"#,
+    );
+    resolve_effective_cluster(&production_https).expect("HTTPS enrollment");
+
+    let development = parse(
+        r#"
+admin:
+  enabled: true
+cluster:
+  cluster_id: dev-a
+  node_id: authority-a
+  roles: [authority]
+  enrollment:
+    authority_dir: ./cluster
+    allow_insecure_http: true
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+"#,
+    );
+    resolve_effective_cluster(&development).expect("explicit insecure development");
+
+    let mut unsafe_production = production_https;
+    unsafe_production
+        .cluster
+        .as_mut()
+        .expect("cluster")
+        .enrollment
+        .as_mut()
+        .expect("enrollment")
+        .allow_insecure_http = true;
+    let error = resolve_effective_cluster(&unsafe_production)
+        .expect_err("production insecure enrollment denied");
+    assert!(error.to_string().contains("development shared_key"));
+}
+
+#[test]
 fn legacy_key_cache_mesh_lowers_to_the_shared_cluster() {
     let proxy = parse(
         r#"

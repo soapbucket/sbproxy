@@ -11,6 +11,7 @@ use sbproxy_config::{
 };
 use sbproxy_mesh::bootstrap::{BootstrapConfig, PeerTlsParams};
 use sbproxy_mesh::discovery::{seeds::SeedDiscovery, Discovery};
+use sbproxy_mesh::enrollment::EnrollmentAuthority;
 use sbproxy_mesh::{ClusterHandle, ClusterIdentity, ClusterNodeRole};
 
 const LOCAL_CLUSTER_ID: &str = "local";
@@ -71,6 +72,7 @@ impl ReloadableClusterSettings {
 
 struct InstalledCluster {
     handle: ClusterHandle,
+    enrollment_authority: Option<Arc<EnrollmentAuthority>>,
     restart_fingerprint: Option<ClusterRestartFingerprint>,
     settings: ReloadableClusterSettings,
 }
@@ -119,6 +121,21 @@ impl ClusterOwner {
             return Ok(current.handle.clone());
         }
 
+        let enrollment_authority = effective
+            .as_ref()
+            .and_then(|config| {
+                config
+                    .enrollment
+                    .as_ref()
+                    .map(|enrollment| (config, enrollment))
+            })
+            .map(|(config, enrollment)| {
+                let authority = EnrollmentAuthority::open(&enrollment.authority_dir)
+                    .context("open configured cluster enrollment authority")?;
+                validate_authority_identity(&authority, &identity, &config.security)?;
+                Ok::<_, anyhow::Error>(Arc::new(authority))
+            })
+            .transpose()?;
         let handle = match effective.as_ref() {
             None => ClusterHandle::local(identity).map_err(anyhow::Error::from)?,
             Some(config) => match self.bootstrap.bootstrap(identity.clone(), config) {
@@ -137,6 +154,7 @@ impl ClusterOwner {
         };
         *installed = Some(InstalledCluster {
             handle: handle.clone(),
+            enrollment_authority,
             restart_fingerprint: fingerprint,
             settings: ReloadableClusterSettings::new(settings),
         });
@@ -160,6 +178,55 @@ impl ClusterOwner {
             .as_ref()
             .map(|installed| installed.settings.snapshot())
     }
+
+    /// Configured enrollment authority, only on an authority node.
+    pub fn enrollment_authority(&self) -> Option<Arc<EnrollmentAuthority>> {
+        self.installed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|installed| installed.enrollment_authority.clone())
+    }
+}
+
+fn validate_authority_identity(
+    authority: &EnrollmentAuthority,
+    installed: &ClusterIdentity,
+    security: &EffectiveClusterSecurity,
+) -> Result<()> {
+    let authority = &authority.identity().document;
+    if authority.cluster_id != installed.cluster_id
+        || authority.node_id != installed.node_id
+        || authority.roles != installed.roles
+        || authority.labels != installed.labels
+    {
+        anyhow::bail!(
+            "configured cluster identity does not match the signed enrollment authority identity"
+        );
+    }
+    if let EffectiveClusterSecurity::Mtls {
+        cert_file,
+        server_name,
+        ..
+    } = security
+    {
+        if authority.server_name != *server_name {
+            anyhow::bail!(
+                "configured cluster mTLS server name does not match the signed enrollment authority identity"
+            );
+        }
+        let certificate_pem = std::fs::read_to_string(cert_file)
+            .with_context(|| format!("read configured authority certificate {cert_file:?}"))?;
+        let certificate_sha256 =
+            sbproxy_mesh::enrollment::certificate_sha256_from_pem(&certificate_pem)
+                .context("fingerprint configured authority certificate")?;
+        if authority.certificate_sha256 != certificate_sha256 {
+            anyhow::bail!(
+                "configured cluster mTLS certificate does not match the signed enrollment authority identity"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve_legacy_node_id(mut config: EffectiveClusterConfig) -> EffectiveClusterConfig {
@@ -375,6 +442,11 @@ pub fn current_cluster_handle() -> Option<ClusterHandle> {
 /// Current reloadable process cluster settings.
 pub fn current_cluster_settings() -> Option<ClusterSettings> {
     process_owner().settings()
+}
+
+/// Configured process enrollment authority, if this node owns one.
+pub fn current_enrollment_authority() -> Option<Arc<EnrollmentAuthority>> {
+    process_owner().enrollment_authority()
 }
 
 fn start_cluster_metrics(handle: &ClusterHandle) {

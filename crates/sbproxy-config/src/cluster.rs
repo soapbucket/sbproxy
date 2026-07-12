@@ -244,6 +244,13 @@ impl ClusterConfig {
                 ));
             }
             validate_nonempty("enrollment.authority_dir", &enrollment.authority_dir)?;
+            if enrollment.allow_insecure_http
+                && self.security.mode != ClusterSecurityMode::SharedKey
+            {
+                return Err(ClusterConfigError::invalid(
+                    "enrollment.allow_insecure_http is valid only in development shared_key mode",
+                ));
+            }
         }
         if let Some(authority) = &self.deployment_authority {
             validate_nonempty(
@@ -575,6 +582,7 @@ pub fn resolve_effective_cluster(
         (None, None) => Ok(None),
         (Some(canonical), None) => {
             canonical.validate()?;
+            validate_enrollment_admin(proxy, canonical)?;
             Ok(Some(lower_canonical(
                 canonical,
                 ClusterConfigSource::Canonical,
@@ -583,6 +591,7 @@ pub fn resolve_effective_cluster(
         (None, Some((node_id, mesh))) => Ok(Some(lower_legacy(node_id, mesh))),
         (Some(canonical), Some((legacy_node_id, mesh))) => {
             canonical.validate()?;
+            validate_enrollment_admin(proxy, canonical)?;
             let mut effective =
                 lower_canonical(canonical, ClusterConfigSource::CanonicalWithLegacy);
             ensure_legacy_matches(&effective, legacy_node_id, mesh)?;
@@ -590,6 +599,27 @@ pub fn resolve_effective_cluster(
             Ok(Some(effective))
         }
     }
+}
+
+fn validate_enrollment_admin(
+    proxy: &ProxyServerConfig,
+    cluster: &ClusterConfig,
+) -> Result<(), ClusterConfigError> {
+    let Some(enrollment) = cluster.enrollment.as_ref() else {
+        return Ok(());
+    };
+    let admin = proxy.admin.as_ref().filter(|admin| admin.enabled);
+    if admin.is_none() {
+        return Err(ClusterConfigError::invalid(
+            "cluster enrollment requires proxy.admin.enabled: true",
+        ));
+    }
+    if !enrollment.allow_insecure_http && admin.and_then(|admin| admin.tls.as_ref()).is_none() {
+        return Err(ClusterConfigError::invalid(
+            "production cluster enrollment requires proxy.admin.tls or explicit development allow_insecure_http",
+        ));
+    }
+    Ok(())
 }
 
 fn lower_canonical(config: &ClusterConfig, source: ClusterConfigSource) -> EffectiveClusterConfig {

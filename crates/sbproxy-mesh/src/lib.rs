@@ -42,6 +42,7 @@ pub mod consistency;
 pub mod crypto;
 pub mod discovery;
 pub mod encryption;
+pub mod enrollment;
 pub mod federation;
 pub mod gossip;
 pub mod gossip_loop;

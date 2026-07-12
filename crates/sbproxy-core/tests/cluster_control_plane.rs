@@ -3,7 +3,12 @@ use std::sync::Arc;
 
 use sbproxy_config::ProxyServerConfig;
 use sbproxy_core::cluster::{ClusterBootstrap, ClusterOwner, SystemClusterBootstrap};
+use sbproxy_mesh::{
+    enrollment::{AuthorityInit, EnrollmentAuthority},
+    ClusterNodeRole,
+};
 use sbproxy_mesh::{ClusterHandle, ClusterIdentity, ClusterMode, MeshNode};
+use std::collections::{BTreeMap, BTreeSet};
 
 fn parse(yaml: &str) -> ProxyServerConfig {
     serde_yaml::from_str(yaml).expect("proxy config")
@@ -242,4 +247,130 @@ cluster:
         "{message}"
     );
     assert!(owner.current().is_none());
+}
+
+#[test]
+fn configured_authority_is_loaded_before_bootstrap_and_must_match_identity() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority_dir = temp.path().join("authority");
+    EnrollmentAuthority::initialize(
+        &authority_dir,
+        AuthorityInit {
+            cluster_id: "dev-a".to_string(),
+            node_id: "authority-a".to_string(),
+            roles: BTreeSet::from([ClusterNodeRole::Gateway, ClusterNodeRole::Authority]),
+            labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
+            server_name: "sbproxy-mesh".to_string(),
+        },
+    )
+    .expect("authority");
+    let server = parse(&format!(
+        r#"
+admin:
+  enabled: true
+cluster:
+  cluster_id: dev-a
+  node_id: authority-a
+  roles: [gateway, authority]
+  labels: {{zone: a}}
+  enrollment:
+    authority_dir: {}
+    allow_insecure_http: true
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+"#,
+        authority_dir.display()
+    ));
+    let bootstrap = Arc::new(FakeBootstrap::default());
+    let owner = ClusterOwner::new(bootstrap.clone());
+    owner.reconcile(&server).expect("matching authority");
+    assert!(owner.enrollment_authority().is_some());
+    assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 1);
+
+    let mut mismatch = server;
+    mismatch
+        .cluster
+        .as_mut()
+        .expect("cluster")
+        .labels
+        .insert("zone".to_string(), "b".to_string());
+    let bootstrap = Arc::new(FakeBootstrap::default());
+    let owner = ClusterOwner::new(bootstrap.clone());
+    let error = owner
+        .reconcile(&mismatch)
+        .expect_err("signed identity mismatch");
+    assert!(error.to_string().contains("signed enrollment authority"));
+    assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 0);
+
+    let mismatched_transport_identity = parse(&format!(
+        r#"
+admin:
+  enabled: true
+  tls:
+    cert: admin.pem
+    key: admin-key.pem
+cluster:
+  cluster_id: dev-a
+  node_id: authority-a
+  roles: [gateway, authority]
+  labels: {{zone: a}}
+  enrollment:
+    authority_dir: {}
+  security:
+    mode: mtls
+    shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
+    cert_file: {}/node.pem
+    key_file: {}/node-key.pem
+    ca_file: {}/ca.pem
+    server_name: wrong-mesh-name
+"#,
+        authority_dir.display(),
+        authority_dir.display(),
+        authority_dir.display(),
+        authority_dir.display()
+    ));
+    let bootstrap = Arc::new(FakeBootstrap::default());
+    let owner = ClusterOwner::new(bootstrap.clone());
+    let error = owner
+        .reconcile(&mismatched_transport_identity)
+        .expect_err("transport identity mismatch");
+    assert!(error.to_string().contains("server name"), "{error:#}");
+    assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 0);
+
+    let mismatched_transport_certificate = parse(&format!(
+        r#"
+admin:
+  enabled: true
+  tls:
+    cert: admin.pem
+    key: admin-key.pem
+cluster:
+  cluster_id: dev-a
+  node_id: authority-a
+  roles: [gateway, authority]
+  labels: {{zone: a}}
+  enrollment:
+    authority_dir: {}
+  security:
+    mode: mtls
+    shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
+    cert_file: {}/ca.pem
+    key_file: {}/node-key.pem
+    ca_file: {}/ca.pem
+    server_name: sbproxy-mesh
+"#,
+        authority_dir.display(),
+        authority_dir.display(),
+        authority_dir.display(),
+        authority_dir.display()
+    ));
+    let bootstrap = Arc::new(FakeBootstrap::default());
+    let owner = ClusterOwner::new(bootstrap.clone());
+    let error = owner
+        .reconcile(&mismatched_transport_certificate)
+        .expect_err("transport certificate mismatch");
+    assert!(error.to_string().contains("certificate"), "{error:#}");
+    assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 0);
 }

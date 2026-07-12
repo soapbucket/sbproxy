@@ -1505,6 +1505,17 @@ pub fn handle_admin_request(
     auth_header: Option<&str>,
     body: Option<&str>,
 ) -> (u16, &'static str, String) {
+    // The one-time enrollment token is the credential for this narrowly
+    // scoped route, so it is dispatched before the operator-auth gate.
+    if crate::admin_cluster::is_public_enrollment_path(path) {
+        return crate::admin_cluster::dispatch(method, path, body).unwrap_or_else(|| {
+            (
+                404,
+                "application/json",
+                r#"{"error":"not found"}"#.to_string(),
+            )
+        });
+    }
     // --- Unauthenticated probe routes ---
     //
     // `/healthz` and `/readyz` are reached by load balancers that
@@ -1582,7 +1593,7 @@ pub fn handle_admin_request(
         return response;
     }
     // WOR-1721: fleet metrics aggregated over the mesh.
-    if let Some(response) = crate::admin_cluster::dispatch(method, path) {
+    if let Some(response) = crate::admin_cluster::dispatch(method, path, body) {
         return response;
     }
     // WOR-1754 / WOR-1755: response-cache + key-policy-cache management.
@@ -3113,6 +3124,24 @@ mod tests {
     fn unauthorized_returns_401() {
         let state = make_state();
         let (status, _, _) = handle_admin_request("GET", "/api/stats", &state, None, None);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn enrollment_token_route_bypasses_operator_auth_only_for_its_exact_path() {
+        let state = make_state();
+        let (status, _, body) = handle_admin_request(
+            "POST",
+            crate::admin_cluster::ENROLL_PATH,
+            &state,
+            None,
+            Some("{}"),
+        );
+        assert_eq!(status, 400);
+        assert!(body.contains("invalid_request"));
+
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/cluster/metrics", &state, None, None);
         assert_eq!(status, 401);
     }
 
