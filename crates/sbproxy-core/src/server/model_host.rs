@@ -18,7 +18,7 @@
 //! `serve:` provider fails admission with a clear residency error
 //! rather than pretending to serve.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -42,6 +42,7 @@ use sbproxy_model_host::{
 pub struct ProductionModelRuntime {
     active: ArcSwap<sbproxy_model_host::ModelRuntimeManager>,
     foundation: RwLock<Option<RuntimeFoundation>>,
+    snapshot_preparer: RwLock<Option<Arc<sbproxy_model_host::ProductionDeploymentPreparer>>>,
     epoch: AtomicU64,
     commit_lock: tokio::sync::Mutex<()>,
 }
@@ -73,6 +74,7 @@ struct RuntimeFoundation {
 pub struct PreparedModelRuntime {
     owner: Arc<ProductionModelRuntime>,
     manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
+    snapshot_preparer: Option<Arc<sbproxy_model_host::ProductionDeploymentPreparer>>,
     prepared: sbproxy_model_host::PreparedRevision,
     base_epoch: u64,
     foundation: Option<RuntimeFoundation>,
@@ -87,6 +89,7 @@ impl std::fmt::Debug for PreparedModelRuntime {
             .field("base_epoch", &self.base_epoch)
             .field("foundation", &self.foundation)
             .field("replace_manager", &self.replace_manager)
+            .field("has_snapshot_preparer", &self.snapshot_preparer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -324,6 +327,7 @@ impl ProductionModelRuntime {
         Ok(Self {
             active: ArcSwap::from_pointee(manager),
             foundation: RwLock::new(None),
+            snapshot_preparer: RwLock::new(None),
             epoch: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
         })
@@ -347,6 +351,9 @@ impl ProductionModelRuntime {
                 };
                 executor.block_on(async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                    // Let initial cluster and model-runtime reconciliation commit before
+                    // publishing the first worker snapshot.
+                    interval.tick().await;
                     loop {
                         interval.tick().await;
                         let Some(runtime) = weak.upgrade() else {
@@ -358,6 +365,9 @@ impl ProductionModelRuntime {
                             .await;
                         for deployment in stopped {
                             tracing::info!(%deployment, "managed model keep-alive elapsed");
+                        }
+                        if let Err(error) = publish_cluster_node_snapshot(&runtime).await {
+                            tracing::warn!(%error, "publish cluster node model snapshot");
                         }
                     }
                 });
@@ -380,6 +390,205 @@ impl ProductionModelRuntime {
     /// Snapshot every configured deployment in deterministic ID order.
     pub async fn statuses(&self) -> Vec<sbproxy_model_host::DeploymentRuntimeStatus> {
         self.active_manager().statuses().await
+    }
+
+    /// Build one bounded, path-free cluster snapshot from current runtime truth.
+    pub async fn node_model_snapshot(
+        &self,
+        identity: &sbproxy_mesh::ClusterIdentity,
+        generation: u64,
+        published_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> Result<
+        sbproxy_model_host::node_snapshot::NodeModelSnapshot,
+        sbproxy_model_host::node_snapshot::NodeSnapshotError,
+    > {
+        use sbproxy_model_host::node_snapshot::{
+            NodeArtifactSnapshot, NodeArtifactState, NodeHealthSnapshot, NodeHealthState,
+            NodeIdentitySnapshot, NodeModelSnapshot, NodeReplicaSnapshot, NodeSnapshotError,
+            NodeSnapshotInventory, RuntimeReplicaIdentity, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        };
+        use sbproxy_model_host::{DeploymentRuntimeState, EngineAvailability};
+        use sha2::{Digest as _, Sha256};
+
+        let snapshot_preparer = self
+            .snapshot_preparer
+            .read()
+            .expect("model runtime snapshot-preparer lock")
+            .clone();
+        let (mut inventory, inventory_available) = match snapshot_preparer {
+            Some(preparer) => match preparer.node_snapshot_inventory() {
+                Ok(inventory) => (inventory, true),
+                Err(error) => {
+                    tracing::warn!(%error, "build cluster model inventory");
+                    (NodeSnapshotInventory::default(), false)
+                }
+            },
+            None => (NodeSnapshotInventory::default(), false),
+        };
+        let desired = self.current_desired();
+        let statuses = self.statuses().await;
+        let mut health_reasons = BTreeSet::new();
+        let mut unhealthy = false;
+        if !inventory_available {
+            health_reasons.insert("model_inventory_unavailable".to_string());
+            unhealthy = true;
+        }
+
+        let is_worker = identity
+            .roles
+            .contains(&sbproxy_mesh::ClusterNodeRole::Worker);
+        if is_worker {
+            if !inventory
+                .devices
+                .iter()
+                .any(|device| device.accelerator.is_some())
+            {
+                health_reasons.insert("no_compatible_model_device".to_string());
+                unhealthy = true;
+            }
+            if !inventory.engines.iter().any(|engine| {
+                matches!(
+                    engine.availability,
+                    EngineAvailability::Available | EngineAvailability::Acquirable
+                )
+            }) {
+                health_reasons.insert("no_usable_model_engine".to_string());
+                unhealthy = true;
+            }
+            if identity.model_endpoint.is_none() {
+                health_reasons.insert("model_endpoint_missing".to_string());
+                unhealthy = true;
+            }
+        }
+
+        let failed_count = statuses
+            .iter()
+            .filter(|status| status.state == DeploymentRuntimeState::Failed)
+            .count();
+        for status in statuses
+            .iter()
+            .filter(|status| status.state == DeploymentRuntimeState::Failed)
+        {
+            health_reasons.insert(
+                status
+                    .reason_code
+                    .clone()
+                    .unwrap_or_else(|| "deployment_failed".to_string()),
+            );
+        }
+        if !statuses.is_empty() && failed_count == statuses.len() {
+            unhealthy = true;
+        }
+
+        let mut replicas = Vec::with_capacity(statuses.len());
+        for status in &statuses {
+            let Some(compiled) = desired.deployments.get(&status.deployment) else {
+                tracing::warn!(
+                    deployment = %status.deployment,
+                    "runtime status has no current desired deployment"
+                );
+                health_reasons.insert("runtime_desired_mismatch".to_string());
+                unhealthy = true;
+                continue;
+            };
+            let matching_artifact = status.artifact_digest.as_deref().and_then(|digest| {
+                inventory
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.artifact_digest == digest)
+            });
+            let artifact_was_in_inventory = matching_artifact.is_some();
+            let variant = matching_artifact
+                .map(|artifact| artifact.variant.clone())
+                .or_else(|| compiled.desired.variant.clone());
+            if let Some(digest) = status.artifact_digest.as_deref() {
+                if !artifact_was_in_inventory {
+                    inventory.artifacts.push(NodeArtifactSnapshot {
+                        artifact_digest: digest.to_string(),
+                        model: compiled.desired.model.clone(),
+                        variant: variant.clone().unwrap_or_else(|| "unresolved".to_string()),
+                        state: NodeArtifactState::Missing,
+                        completed_bytes: 0,
+                        total_bytes: None,
+                        last_accessed_unix_ms: None,
+                        reason_code: None,
+                    });
+                    health_reasons.insert("artifact_inventory_missing".to_string());
+                }
+            }
+            let mut adapters = compiled
+                .legacy_entry
+                .as_ref()
+                .map(|entry| {
+                    entry
+                        .lora_adapters
+                        .iter()
+                        .map(|adapter| adapter.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            adapters.sort();
+            replicas.push(NodeReplicaSnapshot::from_runtime(
+                status,
+                RuntimeReplicaIdentity {
+                    model: &compiled.desired.model,
+                    variant: variant.as_deref(),
+                    endpoint: identity.model_endpoint.as_deref(),
+                    adapters: &adapters,
+                },
+            )?);
+        }
+        inventory
+            .artifacts
+            .sort_by(|left, right| left.artifact_digest.cmp(&right.artifact_digest));
+        replicas.sort_by(|left, right| left.deployment.cmp(&right.deployment));
+
+        let health_state = if unhealthy {
+            NodeHealthState::Unhealthy
+        } else if !health_reasons.is_empty() {
+            NodeHealthState::Degraded
+        } else {
+            NodeHealthState::Ready
+        };
+        let placement_weight = if is_worker && health_state != NodeHealthState::Unhealthy {
+            let available_mib = inventory.devices.iter().fold(0u64, |total, device| {
+                total.saturating_add(device.available_memory_bytes / (1024 * 1024))
+            });
+            u32::try_from(available_mib.clamp(1, u64::from(u32::MAX)))
+                .unwrap_or(u32::MAX)
+                .min(1_000_000)
+        } else {
+            0
+        };
+        let digest_material = serde_json::to_vec(&desired.revision).map_err(|error| {
+            NodeSnapshotError::Invalid(format!("encode active deployment digest: {error}"))
+        })?;
+        let active_deployment_digest = hex::encode(Sha256::digest(digest_material));
+        let snapshot = NodeModelSnapshot {
+            schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+            node: NodeIdentitySnapshot {
+                node_id: identity.node_id.clone(),
+                roles: identity.roles.iter().copied().map(snapshot_role).collect(),
+                labels: identity.labels.clone(),
+                model_endpoint: identity.model_endpoint.clone(),
+            },
+            health: NodeHealthSnapshot {
+                state: health_state,
+                reason_codes: health_reasons.into_iter().collect(),
+            },
+            engines: inventory.engines,
+            devices: inventory.devices,
+            artifacts: inventory.artifacts,
+            replicas,
+            placement_weight,
+            active_deployment_digest: Some(active_deployment_digest),
+            generation,
+            published_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 
     /// Snapshot one configured deployment.
@@ -479,32 +688,47 @@ impl ProductionModelRuntime {
             .read()
             .expect("model runtime foundation lock")
             .clone();
+        let current_snapshot_preparer = self
+            .snapshot_preparer
+            .read()
+            .expect("model runtime snapshot-preparer lock")
+            .clone();
         let active_manager = self.active_manager();
 
         let needs_production_manager = !candidate.desired.deployments.is_empty()
             || candidate.desired.control.authority
-                == sbproxy_config::ModelHostAuthority::AdminManaged;
-        let (manager, foundation) = if !needs_production_manager {
-            (active_manager.clone(), current_foundation)
+                != sbproxy_config::ModelHostAuthority::FileManaged;
+        let (manager, foundation, snapshot_preparer) = if !needs_production_manager {
+            (
+                active_manager.clone(),
+                current_foundation,
+                current_snapshot_preparer,
+            )
         } else {
             let foundation = RuntimeFoundation {
                 catalog_revision: candidate.catalog.catalog_revision.clone(),
                 cache_root: candidate.cache_root.clone(),
             };
             if current_foundation.as_ref() == Some(&foundation) {
-                (active_manager.clone(), Some(foundation))
+                (
+                    active_manager.clone(),
+                    Some(foundation),
+                    current_snapshot_preparer,
+                )
             } else {
                 if !active_manager.current_desired().deployments.is_empty() {
                     anyhow::bail!(
                         "model runtime catalog or cache foundation changed while deployments are configured; reload an empty model_host revision first so the prior engines drain before replacing the foundation"
                     );
                 }
+                let built = build_production_manager(
+                    candidate.catalog.clone(),
+                    candidate.cache_root.clone(),
+                )?;
                 (
-                    build_production_manager(
-                        candidate.catalog.clone(),
-                        candidate.cache_root.clone(),
-                    )?,
+                    built.manager,
                     Some(foundation),
+                    Some(built.snapshot_preparer),
                 )
             }
         };
@@ -513,6 +737,7 @@ impl ProductionModelRuntime {
         Ok(PreparedModelRuntime {
             owner: Arc::clone(self),
             manager,
+            snapshot_preparer,
             prepared,
             base_epoch,
             foundation,
@@ -544,6 +769,10 @@ impl ProductionModelRuntime {
             self.active.store(candidate.manager);
         }
         *self
+            .snapshot_preparer
+            .write()
+            .expect("model runtime snapshot-preparer lock") = candidate.snapshot_preparer;
+        *self
             .foundation
             .write()
             .expect("model runtime foundation lock") = candidate.foundation;
@@ -552,10 +781,42 @@ impl ProductionModelRuntime {
     }
 }
 
+async fn publish_cluster_node_snapshot(runtime: &ProductionModelRuntime) -> anyhow::Result<()> {
+    let Some(publication) = crate::cluster::begin_process_node_snapshot_publication(false).await?
+    else {
+        return Ok(());
+    };
+    let snapshot = runtime
+        .node_model_snapshot(
+            publication.identity(),
+            publication.generation(),
+            publication.published_at_unix_ms(),
+            publication.expires_at_unix_ms(),
+        )
+        .await?;
+    publication.publish(snapshot).await
+}
+
 struct RuntimeCandidate {
     desired: sbproxy_model_host::RuntimeDesiredState,
     catalog: Arc<Catalog>,
     cache_root: PathBuf,
+}
+
+const fn snapshot_role(
+    role: sbproxy_mesh::ClusterNodeRole,
+) -> sbproxy_model_host::node_snapshot::NodeRole {
+    match role {
+        sbproxy_mesh::ClusterNodeRole::Gateway => {
+            sbproxy_model_host::node_snapshot::NodeRole::Gateway
+        }
+        sbproxy_mesh::ClusterNodeRole::Worker => {
+            sbproxy_model_host::node_snapshot::NodeRole::Worker
+        }
+        sbproxy_mesh::ClusterNodeRole::Authority => {
+            sbproxy_model_host::node_snapshot::NodeRole::Authority
+        }
+    }
 }
 
 fn compile_runtime_candidate(
@@ -631,10 +892,15 @@ pub fn validate_model_runtime(
     compile_runtime_candidate(pipeline, config_dir).map(|_| ())
 }
 
+struct BuiltProductionManager {
+    manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
+    snapshot_preparer: Arc<sbproxy_model_host::ProductionDeploymentPreparer>,
+}
+
 fn build_production_manager(
     catalog: Arc<Catalog>,
     cache_root: PathBuf,
-) -> anyhow::Result<Arc<sbproxy_model_host::ModelRuntimeManager>> {
+) -> anyhow::Result<BuiltProductionManager> {
     let transport = artifact_transport().map_err(anyhow::Error::msg)?;
     let artifacts = Arc::new(
         ArtifactManager::new(cache_root.clone(), transport)
@@ -664,11 +930,14 @@ fn build_production_manager(
     ));
     let manager = sbproxy_model_host::ModelRuntimeManager::new_with_device_capacities(
         catalog.catalog_revision.clone(),
-        preparer,
+        preparer.clone(),
         capacities,
     )?
     .with_observer(Arc::new(MetricsObserver));
-    Ok(Arc::new(manager))
+    Ok(BuiltProductionManager {
+        manager: Arc::new(manager),
+        snapshot_preparer: preparer,
+    })
 }
 
 /// Return the permanent process-wide managed-model runtime handle.
@@ -988,6 +1257,36 @@ mod tests {
             lane_class_for(Some(sbproxy_ai::identity::KeyPriority::Batch)),
             PriorityClass::Batch
         );
+    }
+
+    #[tokio::test]
+    async fn cluster_snapshot_reports_inventory_failure_as_stable_unhealthy_state() {
+        let runtime = ProductionModelRuntime::empty().expect("empty runtime");
+        let identity = sbproxy_mesh::ClusterIdentity {
+            cluster_id: "cluster-a".to_string(),
+            node_id: "worker-a".to_string(),
+            roles: BTreeSet::from([sbproxy_mesh::ClusterNodeRole::Worker]),
+            labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
+            peer_address: Some("127.0.0.1:7946".to_string()),
+            model_endpoint: Some("https://127.0.0.1:9443".to_string()),
+        };
+
+        let snapshot = runtime
+            .node_model_snapshot(&identity, 3, 1_000, 31_000)
+            .await
+            .expect("bounded unhealthy snapshot");
+
+        assert_eq!(
+            snapshot.health.state,
+            sbproxy_model_host::node_snapshot::NodeHealthState::Unhealthy
+        );
+        assert!(snapshot
+            .health
+            .reason_codes
+            .contains(&"model_inventory_unavailable".to_string()));
+        assert_eq!(snapshot.placement_weight, 0);
+        assert!(snapshot.replicas.is_empty());
+        snapshot.validate().expect("snapshot remains publishable");
     }
 
     #[test]

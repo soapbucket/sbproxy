@@ -57,6 +57,7 @@ futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
+url = { workspace = true }
 nvml-wrapper = { version = "0.10", optional = true }
 # Weight download is a plain HTTP GET that follows HF's redirect to the
 # resolve-cache/Xet backend; reqwest's default redirect policy resolves

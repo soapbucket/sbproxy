@@ -7,7 +7,7 @@ use sbproxy_mesh::{
     enrollment::{AuthorityInit, EnrollmentAuthority},
     ClusterNodeRole,
 };
-use sbproxy_mesh::{ClusterHandle, ClusterIdentity, ClusterMode, MeshNode};
+use sbproxy_mesh::{ClusterHandle, ClusterIdentity, ClusterMode, ClusterStateRead, MeshNode};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn parse(yaml: &str) -> ProxyServerConfig {
@@ -73,6 +73,105 @@ fn absent_cluster_installs_one_zero_network_local_handle() {
     assert!(ClusterHandle::ptr_eq(&first, &again));
     assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 0);
     assert_eq!(owner.settings().expect("settings").snapshot_ttl_secs, 30);
+}
+
+#[tokio::test]
+async fn canonical_worker_publishes_one_fenced_snapshot_and_honors_cadence() {
+    use sbproxy_model_host::node_snapshot::{
+        NodeHealthSnapshot, NodeHealthState, NodeIdentitySnapshot, NodeModelSnapshot, NodeRole,
+        NODE_MODEL_SNAPSHOT_NAMESPACE, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+    };
+
+    let temp = tempfile::tempdir().expect("snapshot state");
+    let server = parse(&format!(
+        r#"
+cluster:
+  cluster_id: cluster-a
+  node_id: worker-a
+  roles: [worker]
+  labels: {{zone: a}}
+  model_endpoint: https://127.0.0.1:9443
+  state_dir: {}
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+  snapshot_ttl_secs: 30
+  publish_interval_secs: 5
+"#,
+        temp.path().display()
+    ));
+    let owner = ClusterOwner::new(Arc::new(FakeBootstrap::default()));
+    let handle = owner.reconcile(&server).expect("cluster handle");
+    let publication = owner
+        .begin_node_snapshot_publication(true)
+        .await
+        .expect("publication reservation")
+        .expect("worker publication enabled");
+    let snapshot = NodeModelSnapshot {
+        schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        node: NodeIdentitySnapshot {
+            node_id: publication.identity().node_id.clone(),
+            roles: BTreeSet::from([NodeRole::Worker]),
+            labels: publication.identity().labels.clone(),
+            model_endpoint: publication.identity().model_endpoint.clone(),
+        },
+        health: NodeHealthSnapshot {
+            state: NodeHealthState::Unhealthy,
+            reason_codes: vec!["fixture_unhealthy".to_string()],
+        },
+        engines: Vec::new(),
+        devices: Vec::new(),
+        artifacts: Vec::new(),
+        replicas: Vec::new(),
+        placement_weight: 0,
+        active_deployment_digest: None,
+        generation: publication.generation(),
+        published_at_unix_ms: publication.published_at_unix_ms(),
+        expires_at_unix_ms: publication.expires_at_unix_ms(),
+    };
+    let generation = snapshot.generation;
+    publication
+        .publish(snapshot.clone())
+        .await
+        .expect("publish");
+
+    let ClusterStateRead::Present(record) = handle
+        .read_state::<NodeModelSnapshot>(
+            NODE_MODEL_SNAPSHOT_NAMESPACE,
+            "worker-a",
+            NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        )
+        .await
+    else {
+        panic!("published node snapshot is absent");
+    };
+    assert_eq!(record.generation, generation);
+    assert_eq!(record.payload, snapshot);
+    assert!(owner
+        .begin_node_snapshot_publication(false)
+        .await
+        .expect("cadence check")
+        .is_none());
+
+    let restarted = ClusterOwner::new(Arc::new(FakeBootstrap::default()));
+    restarted.reconcile(&server).expect("restarted cluster");
+    let restarted_publication = restarted
+        .begin_node_snapshot_publication(true)
+        .await
+        .expect("restarted publication")
+        .expect("restarted worker publication enabled");
+    assert!(restarted_publication.generation() > generation);
+
+    let local = ClusterOwner::new(Arc::new(FakeBootstrap::default()));
+    local
+        .reconcile(&ProxyServerConfig::default())
+        .expect("local handle");
+    assert!(local
+        .begin_node_snapshot_publication(true)
+        .await
+        .expect("local publication check")
+        .is_none());
 }
 
 #[test]

@@ -8721,6 +8721,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "url",
  "yaml_serde",
  "zeroize",
 ]

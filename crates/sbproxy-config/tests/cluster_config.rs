@@ -24,6 +24,7 @@ cluster:
   advertise_addr: 10.0.0.12:7946
   transport_advertise_addr: 10.0.0.12:8946
   model_endpoint: https://10.0.0.12:9443
+  state_dir: /var/lib/sbproxy/cluster
   security:
     mode: mtls
     shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
@@ -40,6 +41,10 @@ cluster:
     configured.validate().expect("valid canonical cluster");
     assert!(configured.roles.contains(&ClusterRole::Gateway));
     assert!(configured.roles.contains(&ClusterRole::Worker));
+    assert_eq!(
+        configured.state_dir.as_deref(),
+        Some("/var/lib/sbproxy/cluster")
+    );
 
     let effective = resolve_effective_cluster(&proxy)
         .expect("effective cluster")
@@ -73,6 +78,7 @@ fn generated_proxy_schema_exposes_cluster_contract() {
         "roles",
         "labels",
         "transport_advertise_addr",
+        "state_dir",
         "security",
         "snapshot_ttl_secs",
         "publish_interval_secs",
@@ -525,6 +531,13 @@ cluster:
     assert_ne!(
         base_effective.restart_fingerprint(),
         routing_effective.restart_fingerprint()
+    );
+
+    let mut state = base_effective.clone();
+    state.state_dir = Some("/var/lib/sbproxy/other-cluster".to_string());
+    assert_ne!(
+        base_effective.restart_fingerprint(),
+        state.restart_fingerprint()
     );
 }
 

@@ -142,6 +142,9 @@ pub struct ClusterConfig {
     /// Private model-plane endpoint advertised by worker nodes.
     #[serde(default)]
     pub model_endpoint: Option<String>,
+    /// Writable durable state stored with this installed node identity.
+    #[serde(default)]
+    pub state_dir: Option<String>,
     /// Explicit peer-security policy.
     pub security: ClusterSecurityConfig,
     /// Lifetime of a published node model snapshot.
@@ -225,6 +228,14 @@ impl ClusterConfig {
         }
         if let Some(endpoint) = self.model_endpoint.as_deref() {
             validate_model_endpoint(endpoint, self.security.mode == ClusterSecurityMode::Mtls)?;
+        }
+        if let Some(state_dir) = self.state_dir.as_deref() {
+            validate_nonempty("state_dir", state_dir)?;
+            if state_dir.len() > 4_096 || state_dir.chars().any(char::is_control) {
+                return Err(ClusterConfigError::invalid(
+                    "state_dir must be a bounded path without control characters",
+                ));
+            }
         }
         if self.publish_interval_secs == 0 {
             return Err(ClusterConfigError::invalid(
@@ -502,6 +513,8 @@ pub struct EffectiveClusterConfig {
     pub transport_advertise_addr: Option<String>,
     /// Private model-plane endpoint.
     pub model_endpoint: Option<String>,
+    /// Writable node-identity state directory.
+    pub state_dir: Option<String>,
     /// Peer-security source material.
     pub security: EffectiveClusterSecurity,
     /// Snapshot lifetime.
@@ -539,6 +552,8 @@ pub struct ClusterRestartFingerprint {
     pub transport_advertise_addr: Option<String>,
     /// Advertised private model endpoint.
     pub model_endpoint: Option<String>,
+    /// Writable node-identity state directory.
+    pub state_dir: Option<String>,
     /// Peer-security source material.
     pub security: EffectiveClusterSecurity,
     /// Enrollment authority loaded at startup.
@@ -561,6 +576,7 @@ impl EffectiveClusterConfig {
             advertise_addr: self.advertise_addr.clone(),
             transport_advertise_addr: self.transport_advertise_addr.clone(),
             model_endpoint: self.model_endpoint.clone(),
+            state_dir: self.state_dir.clone(),
             security: self.security.clone(),
             enrollment: self.enrollment.clone(),
             deployment_authority: self.deployment_authority.clone(),
@@ -635,6 +651,7 @@ fn lower_canonical(config: &ClusterConfig, source: ClusterConfigSource) -> Effec
         advertise_addr: config.advertise_addr.clone(),
         transport_advertise_addr: config.transport_advertise_addr.clone(),
         model_endpoint: config.model_endpoint.clone(),
+        state_dir: config.state_dir.clone(),
         security: lower_canonical_security(&config.security),
         snapshot_ttl_secs: config.snapshot_ttl_secs,
         publish_interval_secs: config.publish_interval_secs,
@@ -673,6 +690,7 @@ fn lower_legacy(node_id: Option<&str>, mesh: &MeshClusterConfig) -> EffectiveClu
         advertise_addr: mesh.advertise_addr.clone(),
         transport_advertise_addr: mesh.transport_advertise_addr.clone(),
         model_endpoint: None,
+        state_dir: None,
         security: lower_legacy_security(mesh),
         snapshot_ttl_secs: DEFAULT_SNAPSHOT_TTL_SECS,
         publish_interval_secs: DEFAULT_PUBLISH_INTERVAL_SECS,

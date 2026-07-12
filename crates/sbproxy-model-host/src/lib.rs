@@ -53,6 +53,7 @@ pub mod llama_driver;
 pub mod llama_release;
 pub mod lora;
 pub mod manifest;
+pub mod node_snapshot;
 pub mod probe_cpu;
 #[cfg(all(target_os = "macos", feature = "gpu-apple"))]
 pub mod probe_metal;

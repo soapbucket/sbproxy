@@ -2540,6 +2540,96 @@ impl ProductionDeploymentPreparer {
         self.backoff = backoff;
         self
     }
+
+    /// Snapshot path-free worker hardware, engine, and verified-cache truth.
+    pub fn node_snapshot_inventory(
+        &self,
+    ) -> Result<crate::node_snapshot::NodeSnapshotInventory, crate::node_snapshot::NodeSnapshotError>
+    {
+        use crate::node_snapshot::{
+            NodeArtifactSnapshot, NodeEngineSnapshot, NodeSnapshotError, NodeSnapshotInventory,
+        };
+
+        let descriptors = self.probe.probe();
+        let mut devices = descriptors
+            .iter()
+            .map(crate::node_snapshot::NodeDeviceSnapshot::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        devices.sort_by_key(|device| device.index);
+
+        let worker = crate::WorkerProfile::from_descriptors(&descriptors).ok();
+        let mut engines = Vec::with_capacity(self.drivers.len());
+        for driver in self.drivers.values() {
+            let capabilities = driver.capabilities();
+            let (detection, reason_code) = match worker.as_ref() {
+                Some(worker) => {
+                    let detection = driver.detect(worker, &crate::EngineProvisioning::default());
+                    let reason_code = match detection.availability {
+                        crate::EngineAvailability::Available => None,
+                        crate::EngineAvailability::Acquirable => {
+                            Some("engine_acquirable".to_string())
+                        }
+                        crate::EngineAvailability::Incompatible => {
+                            Some("engine_incompatible".to_string())
+                        }
+                        crate::EngineAvailability::Blocked => Some("engine_blocked".to_string()),
+                    };
+                    (detection, reason_code)
+                }
+                None => (
+                    crate::EngineDetection {
+                        kind: driver.kind(),
+                        availability: crate::EngineAvailability::Incompatible,
+                        version: None,
+                        reason: String::new(),
+                        remediation: None,
+                    },
+                    Some("no_compatible_device".to_string()),
+                ),
+            };
+            engines.push(NodeEngineSnapshot::from_runtime(
+                &detection,
+                &capabilities,
+                reason_code,
+            )?);
+        }
+        engines.sort_by_key(|engine| engine.engine);
+
+        let metadata = self.artifacts.cached_artifacts().map_err(|error| {
+            tracing::warn!(%error, "inspect node artifact inventory");
+            NodeSnapshotError::Invalid("artifact inventory is unavailable".to_string())
+        })?;
+        let mut artifacts = Vec::with_capacity(metadata.len());
+        for artifact in metadata {
+            let cache = self
+                .artifacts
+                .inspect(&artifact.artifact_digest)
+                .map_err(|error| {
+                    tracing::warn!(
+                        artifact_digest = %artifact.artifact_digest,
+                        %error,
+                        "inspect node artifact for cluster snapshot"
+                    );
+                    NodeSnapshotError::Invalid(format!(
+                        "artifact {} inventory is unavailable",
+                        artifact.artifact_digest
+                    ))
+                })?;
+            artifacts.push(NodeArtifactSnapshot::from_cache(
+                &artifact.artifact_digest,
+                &artifact.logical_model,
+                &artifact.variant_id,
+                &cache,
+            )?);
+        }
+        artifacts.sort_by(|left, right| left.artifact_digest.cmp(&right.artifact_digest));
+
+        Ok(NodeSnapshotInventory {
+            engines,
+            devices,
+            artifacts,
+        })
+    }
 }
 
 #[async_trait]
