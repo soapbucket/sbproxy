@@ -1620,7 +1620,7 @@ describe("useModelManagement orchestration", () => {
     expect(management.authorityDescription.value).toMatch(/configured authority node signs/i);
   });
 
-  it("catches mutation failures without rejecting the returned operation", async () => {
+  it("reloads possibly advanced authority and runtime state after a mutation failure", async () => {
     mockReads();
     vi.spyOn(api, "replaceModelHostDeployments").mockRejectedValueOnce(
       new ApiError(500, "save failed"),
@@ -1628,8 +1628,63 @@ describe("useModelManagement orchestration", () => {
     const management = useModelManagement();
     await loadProof(management);
     management.openAddDeployment();
+    const advanced = document(
+      "admin_managed",
+      false,
+      2,
+      ownRecord([["new-deployment", deploymentDefaults("model", "q4")]]),
+    );
+    vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(advanced);
+    vi.mocked(api.modelHostStatus).mockResolvedValueOnce(
+      status([runtime("new-deployment", "failed")]),
+    );
 
     await expect(management.saveDeployment(formValue())).resolves.toBeUndefined();
     expect(management.mutationError.value).toMatch(/server returned an error/i);
+    expect(management.deploymentDocument.value).toEqual(advanced);
+    expect(management.runtimeDeployments.value).toEqual([
+      runtime("new-deployment", "failed"),
+    ]);
+    expect(management.editor.value).not.toBeNull();
+    expect(api.modelHostDeployments).toHaveBeenCalledTimes(2);
+    expect(api.modelHostStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("reloads every signed authority proof after a publication failure", async () => {
+    mockReads({
+      document: document("cluster_authority", true, 7),
+      clusterStatus: clusterStatus(authority(7)),
+      bundle: bundle(7),
+    });
+    vi.spyOn(api, "publishClusterDeployments").mockRejectedValueOnce(
+      new ApiError(500, "publication failed"),
+    );
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openAddDeployment();
+
+    const advanced = ownRecord([
+      ["new-deployment", deploymentDefaults("model", "q4")],
+    ]);
+    vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+      document("cluster_authority", true, 8),
+    );
+    vi.mocked(api.modelHostStatus).mockResolvedValueOnce(
+      status([runtime("new-deployment", "failed")]),
+    );
+    vi.mocked(api.clusterStatus).mockResolvedValueOnce(
+      clusterStatus(authority(8)),
+    );
+    vi.mocked(api.clusterDeployments).mockResolvedValueOnce(bundle(8, advanced));
+
+    await management.saveDeployment(formValue());
+
+    expect(management.canonicalDesiredDeployments.value).toEqual(advanced);
+    expect(management.clusterAuthority.value?.active_revision).toBe(8);
+    expect(management.editor.value).not.toBeNull();
+    expect(api.modelHostDeployments).toHaveBeenCalledTimes(2);
+    expect(api.modelHostStatus).toHaveBeenCalledTimes(2);
+    expect(api.clusterStatus).toHaveBeenCalledTimes(2);
+    expect(api.clusterDeployments).toHaveBeenCalledTimes(2);
   });
 });

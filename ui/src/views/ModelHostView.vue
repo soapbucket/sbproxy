@@ -176,6 +176,7 @@ function confirmRemove(row: ModelDeploymentRow) {
     :can-save="canMutate && (!conflict || conflictRetryAllowed)"
     :submit-error="mutationError"
     :conflict="conflict"
+    :mode="editor.openingMode"
     @close="closeEditor"
     @save="saveDeployment"
     @reload-conflict="reloadConflict"

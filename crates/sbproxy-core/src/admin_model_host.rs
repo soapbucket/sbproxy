@@ -79,6 +79,7 @@ struct CatalogModelMetadata {
     license: String,
     family: String,
     context_length: u64,
+    allow_pickle: bool,
     variants: Vec<CatalogVariantMetadata>,
 }
 
@@ -296,6 +297,7 @@ fn catalog_response(runtime: &impl ModelManagementRuntime) -> Resp {
                     license: bounded_metadata(&entry.license),
                     family: bounded_metadata(&entry.family),
                     context_length: entry.context_length,
+                    allow_pickle: entry.allow_pickle,
                     variants,
                 },
             ))
@@ -392,6 +394,9 @@ fn deployments_put_response(runtime: &impl ModelManagementRuntime, body: Option<
     if let Err(error) = draft.validate() {
         return error_response(400, "invalid_desired", error.to_string());
     }
+    if let Err(error) = validate_local_admin_deployments(&draft.deployments) {
+        return error_response(400, "invalid_desired", error);
+    }
     for (deployment_id, deployment) in &draft.deployments {
         let Some(entry) = catalog.get(&deployment.model) else {
             return error_response(
@@ -444,6 +449,46 @@ fn deployments_put_response(runtime: &impl ModelManagementRuntime, body: Option<
         }
         Err(error) => admin_revision_error_response(error),
     }
+}
+
+fn validate_local_admin_deployments(
+    deployments: &BTreeMap<String, sbproxy_model_host::ModelDeployment>,
+) -> Result<(), String> {
+    if deployments.len() > 1_024 {
+        return Err("admin deployment state may contain at most 1024 deployments".to_string());
+    }
+    for (id, deployment) in deployments {
+        if deployment.replicas != 1 {
+            return Err(format!(
+                "deployment {id:?} must use exactly one replica in local admin mode"
+            ));
+        }
+        if deployment.heterogeneous_variants
+            || !deployment.required_labels.is_empty()
+            || !deployment.spread_by.is_empty()
+        {
+            return Err(format!(
+                "deployment {id:?} contains cluster-only placement intent"
+            ));
+        }
+        if deployment
+            .max_concurrency
+            .is_some_and(|value| value > 1_000_000)
+            || deployment.max_queue_depth > 1_000_000
+        {
+            return Err(format!("deployment {id:?} admission bounds exceed 1000000"));
+        }
+        if deployment.queue_timeout_ms > 24 * 60 * 60 * 1_000 {
+            return Err(format!("deployment {id:?} queue timeout exceeds 24 hours"));
+        }
+        if deployment
+            .keep_alive_secs
+            .is_some_and(|seconds| seconds > 365 * 24 * 60 * 60)
+        {
+            return Err(format!("deployment {id:?} keep-alive exceeds one year"));
+        }
+    }
+    Ok(())
 }
 
 fn admin_revision_error_response(error: AdminDeploymentRevisionError) -> Resp {
@@ -1019,6 +1064,7 @@ models:
             response["models"]["admin-fixture"]["variants"][0]["id"],
             "q4_k_m"
         );
+        assert_eq!(response["models"]["admin-fixture"]["allow_pickle"], false);
         let variant = &response["models"]["admin-fixture"]["variants"][0];
         assert_eq!(variant["download_size_bytes"], 42);
         assert_eq!(variant["certification"], "fixture-certification-2026-07-12");
@@ -1242,6 +1288,56 @@ models:
             .lock()
             .expect("applied revisions lock")
             .is_empty());
+    }
+
+    #[test]
+    fn deployment_put_rejects_cluster_only_and_unbounded_local_intent() {
+        let cases = [
+            ("replicas", serde_json::json!(2)),
+            ("heterogeneous_variants", serde_json::json!(true)),
+            ("required_labels", serde_json::json!({"pool": "gpu"})),
+            ("spread_by", serde_json::json!(["zone"])),
+            ("max_concurrency", serde_json::json!(1_000_001)),
+            ("max_queue_depth", serde_json::json!(1_000_001)),
+            ("queue_timeout_ms", serde_json::json!(86_400_001)),
+            ("keep_alive_secs", serde_json::json!(31_536_001)),
+        ];
+
+        for (field, value) in cases {
+            let runtime = fake_runtime(
+                sbproxy_config::ModelHostAuthority::AdminManaged,
+                Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+            );
+            let mut deployment = serde_json::json!({
+                "model": "qwen2.5-0.5b-instruct",
+                "variant": "q4_k_m",
+                "replicas": 1,
+            });
+            deployment[field] = value;
+            let body = serde_json::json!({
+                "expected_revision": null,
+                "deployments": {"local-qwen": deployment},
+            })
+            .to_string();
+
+            let (status, _, response_body) = dispatch_with_runtime(
+                &runtime,
+                "PUT",
+                "/admin/model-host/deployments",
+                Some(&body),
+            )
+            .expect("deployments route");
+            let response: serde_json::Value =
+                serde_json::from_str(&response_body).expect("error response");
+
+            assert_eq!(status, 400, "{field}: {response_body}");
+            assert_eq!(response["code"], "invalid_desired", "{field}");
+            assert!(runtime
+                .applied
+                .lock()
+                .expect("applied revisions lock")
+                .is_empty());
+        }
     }
 
     #[test]

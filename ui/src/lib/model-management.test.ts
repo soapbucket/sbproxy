@@ -219,6 +219,24 @@ describe("model management presentation", () => {
     expect(catalogVariantSupportLabel(variants[5])).toBe("Incomplete");
   });
 
+  it("fails closed for pickle variants unless the catalog model opts in", () => {
+    const pickle: CatalogVariant = {
+      ...catalogEntry().variants[0],
+      id: "pickle",
+      format: "pickle",
+      stability: "stable",
+    };
+    const refused = catalogEntry({ allow_pickle: false, variants: [pickle] });
+    const allowed = catalogEntry({ allow_pickle: true, variants: [pickle] });
+
+    expect(deployableCatalogVariants(refused)).toEqual([]);
+    expect(catalogVariantDisabledReason(pickle, refused.allow_pickle)).toMatch(
+      /pickle.*opt-in/i,
+    );
+    expect(deployableCatalogVariants(allowed)).toEqual([pickle]);
+    expect(catalogVariantDisabledReason(pickle, allowed.allow_pickle)).toBeNull();
+  });
+
   it("keeps a missing exact variant pin unavailable instead of falling back to current evidence", () => {
     const entry = catalogEntry();
     expect(catalogEvidenceSelection(entry, "removed-pin")).toEqual({
@@ -360,6 +378,30 @@ describe("model management presentation", () => {
         },
       },
     });
+  });
+
+  it("rejects cluster-only placement intent in local admin mode", () => {
+    const draft = deploymentFormDefaults("local", "model", "q4_k_m");
+    draft.replicas = "2";
+    draft.heterogeneousVariants = true;
+    draft.requiredLabels = "pool=gpu";
+    draft.spreadBy = "zone";
+
+    const result = parseDeploymentForm(draft, {
+      mode: "local_put",
+      requireLicenseAcknowledgement: false,
+      existingDeploymentIds: [],
+      catalog: {
+        schema_version: 1,
+        catalog_revision: "catalog-v2",
+        models: { model: catalogEntry() },
+      },
+    });
+
+    expect(result.value).toBeNull();
+    expect(result.errors.replicas).toMatch(/exactly one/i);
+    expect(result.errors.requiredLabels).toMatch(/cluster authority/i);
+    expect(result.errors.spreadBy).toMatch(/cluster authority/i);
   });
 
   it("preserves valid zero and null parser boundaries", () => {

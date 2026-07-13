@@ -617,6 +617,44 @@ export function useModelManagement() {
     return true;
   }
 
+  async function reloadAfterMutationFailure(
+    mode: WritableDeploymentMutationMode,
+  ): Promise<string | null> {
+    const requests = [
+      catalogReq.run(),
+      deploymentsReq.run(),
+      statusReq.run(),
+    ];
+    if (mode === "signed_cluster_post") {
+      requests.push(clusterStatusReq.run(), clusterBundleReq.run());
+    }
+    await Promise.all(requests);
+
+    const failures: string[] = [];
+    if (!catalogProofCurrent.value) {
+      failures.push(proofFailure("catalog", catalogReq.error.value));
+    }
+    if (!managementProofCurrent.value) {
+      failures.push(proofFailure("desired state", deploymentsReq.error.value));
+    }
+    if (!runtimeStatusCurrent.value) {
+      failures.push(proofFailure("runtime status", statusReq.error.value));
+    }
+    if (mode === "signed_cluster_post") {
+      if (!clusterAuthorityProofCurrent.value) {
+        failures.push(
+          proofFailure("cluster authority", clusterStatusReq.error.value),
+        );
+      }
+      if (!clusterBundleProofCurrent.value) {
+        failures.push(
+          proofFailure("signed bundle", clusterBundleReq.error.value),
+        );
+      }
+    }
+    return failures.length > 0 ? failures.join(" ") : null;
+  }
+
   async function mutateDesiredState(change: DeploymentChange) {
     if (mutationBusy.value) return;
     const document = deploymentDocument.value;
@@ -695,7 +733,11 @@ export function useModelManagement() {
           `Revision conflict ${error.status}. The raw response and your draft are preserved while current authority state reloads.`;
         await reloadConflictProof();
       } else {
-        mutationError.value = errorText(error);
+        const failure = errorText(error);
+        const reloadFailure = await reloadAfterMutationFailure(command.kind);
+        mutationError.value = reloadFailure
+          ? `${failure} Your draft is preserved, but current state could not be fully reloaded: ${reloadFailure}`
+          : `${failure} Current desired state and runtime status were reloaded because authority state may have advanced. Your draft is preserved.`;
       }
     } finally {
       mutationBusy.value = false;

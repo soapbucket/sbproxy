@@ -20,6 +20,7 @@ import {
   type DeploymentFormDraft,
   type DeploymentFormField,
   type DeploymentFormValue,
+  type WritableDeploymentMutationMode,
 } from "../lib/model-management";
 import ModelCatalogEvidence from "./ModelCatalogEvidence.vue";
 import ModalDialog from "./ModalDialog.vue";
@@ -33,6 +34,7 @@ const props = defineProps<{
   canSave?: boolean;
   submitError?: string | null;
   conflict?: DeploymentConflictState | null;
+  mode?: WritableDeploymentMutationMode;
 }>();
 
 const emit = defineEmits<{
@@ -66,6 +68,13 @@ const originalDeploymentId = props.initialDeploymentId ?? null;
 const initialDraft = props.initialDeployment && originalDeploymentId
   ? deploymentFormFromDeployment(originalDeploymentId, props.initialDeployment)
   : deploymentFormDefaults(uniqueDeploymentId(firstModel), firstModel, null);
+const localMode = computed(() => props.mode === "local_put");
+if (localMode.value) {
+  initialDraft.replicas = "1";
+  initialDraft.heterogeneousVariants = false;
+  initialDraft.requiredLabels = "";
+  initialDraft.spreadBy = "";
+}
 const draft = reactive<DeploymentFormDraft>(initialDraft);
 const errors = reactive<Partial<Record<DeploymentFormField, string>>>({});
 const deploymentIdTouched = ref(Boolean(originalDeploymentId));
@@ -91,7 +100,7 @@ const evidenceSelection = computed(() =>
 );
 const availableEngines = computed(() => {
   const variants = selectedVariant.value
-    ? catalogVariantDisabledReason(selectedVariant.value) === null
+    ? variantDisabledReason(selectedVariant.value) === null
       ? [selectedVariant.value]
       : []
     : selectedRunnableVariants.value;
@@ -126,9 +135,16 @@ function onVariantChange() {
   }
 }
 
+function variantDisabledReason(variant: CatalogVariant): string | null {
+  return catalogVariantDisabledReason(
+    variant,
+    selectedEntry.value?.allow_pickle === true,
+  );
+}
+
 function variantLabel(variant: CatalogVariant): string {
-  const reason = catalogVariantDisabledReason(variant);
-  return `${variant.id} · ${variant.quant} · ${catalogVariantSupportLabel(variant)}${reason ? ` · ${reason}` : ""}`;
+  const reason = variantDisabledReason(variant);
+  return `${variant.id} · ${variant.quant} · ${catalogVariantSupportLabel(variant, selectedEntry.value?.allow_pickle === true)}${reason ? ` · ${reason}` : ""}`;
 }
 
 function modelDisabledReason(entry: CatalogEntry): string | null {
@@ -207,6 +223,7 @@ async function submit() {
     delete errors[field];
   }
   const parsed = parseDeploymentForm(draft, {
+    mode: props.mode,
     requireLicenseAcknowledgement: requiresLicenseAcknowledgement.value,
     existingDeploymentIds: props.existingDeploymentIds,
     originalDeploymentId,
@@ -335,7 +352,7 @@ function comparisonCue(conflict: DeploymentConflictState): string {
                   v-for="variant in selectedVariants"
                   :key="variant.id"
                   :value="variant.id"
-                  :disabled="Boolean(catalogVariantDisabledReason(variant))"
+                  :disabled="Boolean(variantDisabledReason(variant))"
                 >
                   {{ variantLabel(variant) }}
                 </option>
@@ -353,6 +370,7 @@ function comparisonCue(conflict: DeploymentConflictState): string {
                 type="number"
                 min="1"
                 max="1024"
+                :disabled="localMode"
                 inputmode="numeric"
                 :aria-invalid="Boolean(errorFor('replicas'))"
                 :aria-describedby="describedBy('replicas')"
@@ -361,7 +379,7 @@ function comparisonCue(conflict: DeploymentConflictState): string {
             </label>
           </div>
 
-          <label class="check-row">
+          <label v-if="!localMode" class="check-row">
             <input v-model="draft.heterogeneousVariants" type="checkbox" />
             <span>
               <strong>Allow heterogeneous variants</strong>
@@ -370,7 +388,7 @@ function comparisonCue(conflict: DeploymentConflictState): string {
           </label>
         </section>
 
-        <section class="form-section" aria-labelledby="placement-heading">
+        <section v-if="!localMode" class="form-section" aria-labelledby="placement-heading">
           <div class="section-heading">
             <p class="sb-eyebrow">Placement</p>
             <h3 id="placement-heading">Worker constraints</h3>

@@ -60,6 +60,7 @@ export interface CatalogEvidenceSelection {
 }
 
 export interface DeploymentFormParseOptions {
+  mode?: WritableDeploymentMutationMode;
   requireLicenseAcknowledgement: boolean;
   existingDeploymentIds: readonly string[];
   originalDeploymentId?: string | null;
@@ -172,7 +173,8 @@ export function deployableCatalogVariants(
   entry: CatalogEntry,
 ): CatalogVariant[] {
   return entry.variants.filter(
-    (variant) => catalogVariantDisabledReason(variant) === null,
+    (variant) =>
+      catalogVariantDisabledReason(variant, entry.allow_pickle === true) === null,
   );
 }
 
@@ -197,12 +199,16 @@ export function catalogEvidenceSelection(
 
 export function catalogVariantDisabledReason(
   variant: CatalogVariant,
+  allowPickle = false,
 ): string | null {
   if (variant.stability === "config_only") {
     return "Configuration only; this variant is not runnable.";
   }
   if (variant.stability === "unsupported") {
     return "Unsupported by the model host runtime.";
+  }
+  if (variant.format === "pickle" && !allowPickle) {
+    return "Pickle requires an explicit catalog allow_pickle opt-in.";
   }
   if (variant.engines.length === 0 && variant.accelerators.length === 0) {
     return "No executable engine or accelerator evidence is available.";
@@ -216,10 +222,13 @@ export function catalogVariantDisabledReason(
   return null;
 }
 
-export function catalogVariantSupportLabel(variant: CatalogVariant): string {
+export function catalogVariantSupportLabel(
+  variant: CatalogVariant,
+  allowPickle = false,
+): string {
   if (variant.stability === "config_only") return "Config only";
   if (variant.stability === "unsupported") return "Unsupported";
-  if (catalogVariantDisabledReason(variant)) return "Incomplete";
+  if (catalogVariantDisabledReason(variant, allowPickle)) return "Incomplete";
   return variant.stability === "stable" ? "Stable" : "Preview";
 }
 
@@ -439,7 +448,10 @@ export function parseDeploymentForm(
       errors.variant =
         "The selected exact variant is no longer in the active catalog.";
     } else {
-      const disabledReason = catalogVariantDisabledReason(selectedVariant);
+      const disabledReason = catalogVariantDisabledReason(
+        selectedVariant,
+        selectedEntry.allow_pickle === true,
+      );
       if (disabledReason) errors.variant = disabledReason;
     }
   }
@@ -492,6 +504,22 @@ export function parseDeploymentForm(
 
   const requiredLabels = parseRequiredLabels(draft.requiredLabels, errors);
   const spreadBy = parseSpreadKeys(draft.spreadBy, errors);
+  if (options.mode === "local_put") {
+    if (replicas !== null && replicas !== 1) {
+      errors.replicas = "Local admin deployments must use exactly one replica.";
+    }
+    if (draft.heterogeneousVariants) {
+      errors.heterogeneousVariants =
+        "Heterogeneous variants require cluster authority placement.";
+    }
+    if (Object.keys(requiredLabels).length > 0) {
+      errors.requiredLabels =
+        "Required labels require cluster authority placement.";
+    }
+    if (spreadBy.length > 0) {
+      errors.spreadBy = "Spread keys require cluster authority placement.";
+    }
+  }
   if (Object.keys(errors).length > 0) return { value: null, errors };
 
   return {

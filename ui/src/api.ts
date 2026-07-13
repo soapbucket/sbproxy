@@ -695,6 +695,8 @@ export interface CatalogEntry {
   license: string;
   family: string;
   context_length: number;
+  /** Pickle variants stay unavailable unless the logical model opts in. */
+  allow_pickle?: boolean;
   variants: CatalogVariant[];
 }
 

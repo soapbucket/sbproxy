@@ -30,7 +30,7 @@ const evidenceSummary = computed(() => {
     return { label: "Evidence unavailable", tone: "neutral" };
   }
   const runnable = props.variants.filter(
-    (variant) => catalogVariantDisabledReason(variant) === null,
+    (variant) => variantDisabledReason(variant) === null,
   );
   if (runnable.length === 0) {
     return { label: "Not runnable", tone: "unsupported" };
@@ -50,8 +50,22 @@ function engineLabel(engine: EngineKind): string {
   return "Embedded";
 }
 
+function variantDisabledReason(variant: CatalogVariant): string | null {
+  return catalogVariantDisabledReason(
+    variant,
+    props.entry?.allow_pickle === true,
+  );
+}
+
+function variantSupportLabel(variant: CatalogVariant): string {
+  return catalogVariantSupportLabel(
+    variant,
+    props.entry?.allow_pickle === true,
+  );
+}
+
 function variantSupportTone(variant: CatalogVariant): string {
-  return catalogVariantSupportLabel(variant) === "Incomplete"
+  return variantSupportLabel(variant) === "Incomplete"
     ? "unsupported"
     : variant.stability;
 }
@@ -105,21 +119,21 @@ function updateAcknowledgement(event: Event) {
           v-for="variant in variants"
           :key="variant.id"
           class="variant-card"
-          :class="{ 'variant-card--disabled': catalogVariantDisabledReason(variant) }"
+          :class="{ 'variant-card--disabled': variantDisabledReason(variant) }"
         >
           <div class="variant-card__head">
             <strong class="sb-mono variant-id">{{ variant.id }}</strong>
             <span class="stability" :class="`stability--${variantSupportTone(variant)}`">
-              {{ catalogVariantSupportLabel(variant) }}
+              {{ variantSupportLabel(variant) }}
             </span>
           </div>
           <p>{{ variant.quant }} · {{ variant.format.toUpperCase() }}</p>
           <p
-            v-if="catalogVariantDisabledReason(variant)"
+            v-if="variantDisabledReason(variant)"
             class="variant-disabled-reason"
             role="status"
           >
-            {{ catalogVariantDisabledReason(variant) }}
+            {{ variantDisabledReason(variant) }}
           </p>
           <dl>
             <div><dt>Min memory</dt><dd>{{ formatBytes(variant.min_memory_bytes) }}</dd></div>
