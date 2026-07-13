@@ -144,8 +144,8 @@ pub async fn assert_complete_ai_span_exports(
     // WOR-1877: the MCP execute_tool span arrives with the pinned
     // agent vocabulary and parents under the ai.request span, so the
     // agent request and its tool dispatch render as one trace.
-    let tool_attrs = find_span_attrs(&collector.received, "mcp.execute_tool")
-        .unwrap_or_else(|| {
+    let tool_attrs =
+        find_span_attrs(&collector.received, "mcp.execute_tool").unwrap_or_else(|| {
             let names = observed_span_names(&collector.received);
             panic!("mcp.execute_tool span did not arrive over {transport:?}; saw names {names:?}");
         });
