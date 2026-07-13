@@ -2908,14 +2908,19 @@ pub struct ObservabilityTelemetryConfig {
 /// Configuration for a single alert notification channel.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AlertChannelConfig {
-    /// Channel type: `"webhook"` or `"log"`.
+    /// Channel type: `"webhook"`, `"slack"`, `"pagerduty"`, or `"log"`.
     #[serde(rename = "type")]
     pub channel_type: String,
-    /// Webhook URL (required when `channel_type == "webhook"`).
+    /// Webhook URL. Required for `webhook` (any receiver) and `slack`
+    /// (the incoming-webhook URL); unused by `pagerduty` and `log`.
     pub url: Option<String>,
     /// Additional HTTP headers for webhook delivery.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// PagerDuty Events API v2 routing key (required when
+    /// `channel_type == "pagerduty"`). Accepts secret references.
+    #[serde(default)]
+    pub routing_key: Option<String>,
 }
 
 // --- HTTP/3 Config ---

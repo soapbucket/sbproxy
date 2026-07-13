@@ -1267,11 +1267,11 @@
       ],
       "properties": {
         "type": {
-          "description": "Channel type: `\"webhook\"` or `\"log\"`.",
+          "description": "Channel type: `\"webhook\"`, `\"slack\"`, `\"pagerduty\"`, or `\"log\"`.",
           "type": "string"
         },
         "url": {
-          "description": "Webhook URL (required when `channel_type == \"webhook\"`).",
+          "description": "Webhook URL. Required for `webhook` (any receiver) and `slack` (the incoming-webhook URL); unused by `pagerduty` and `log`.",
           "type": [
             "string",
             "null"
@@ -1284,6 +1284,14 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "routing_key": {
+          "description": "PagerDuty Events API v2 routing key (required when `channel_type == \"pagerduty\"`). Accepts secret references.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

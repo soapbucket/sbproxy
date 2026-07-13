@@ -27,6 +27,7 @@ fn make_alert(
         message,
         timestamp: now_rfc3339(),
         labels,
+        resolved: false,
     }
 }
 

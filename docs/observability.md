@@ -990,6 +990,25 @@ For a full LLM-native smoke test, enable `trace_content: true` on the AI origin 
 
 `docker compose down -v` drops the named volumes for Prometheus, Grafana, Tempo, Loki, and Langfuse's Postgres, ClickHouse, MinIO, and Redis storage for a fresh start.
 
+## Alert notification channels
+
+The alert dispatcher fans fired alerts out to every channel declared under `proxy.alerting.channels`. Four channel types ship: `log` (a warn-level line), `webhook` (JSON envelope POST with optional HMAC signing), `slack`, and `pagerduty`. The Slack and PagerDuty channels are formatters over the same delivery transport as `webhook`: a failed delivery increments `sbproxy_telemetry_dropped_total{kind="alert_slack"|"alert_pagerduty"}` and never blocks the data plane, and the alert still reaches any configured `log` channel.
+
+```yaml
+proxy:
+  alerting:
+    channels:
+      - type: slack
+        url: "${SLACK_ALERTS_WEBHOOK_URL}"
+      - type: pagerduty
+        routing_key: "${PAGERDUTY_ROUTING_KEY}"
+      - type: log
+```
+
+The Slack message carries the rule, severity, firing or recovered state, the message, and the alert labels. The PagerDuty channel sends Events API v2 events with a deduplication key derived from the rule name plus its labels, so repeated fires of the same rule group into a single incident, and a recovery notification for the same rule resolves it. Severities map onto PagerDuty's vocabulary (`critical` stays `critical`; everything else arrives as `warning`).
+
+Prometheus-side alerting is independent of these channels: `dashboards/prometheus/alerts.yml` ships alert rules for an external Prometheus, including AI budget utilization above 90%, per-provider error burn above 20%, and spend velocity above a dollar-per-hour threshold you should tune to your budget.
+
 ## See also
 
 - [audit-log.md](audit-log.md) - admin-action audit envelope.

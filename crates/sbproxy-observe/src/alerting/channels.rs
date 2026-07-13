@@ -2,7 +2,14 @@
 //!
 //! An [`AlertDispatcher`] holds a list of [`AlertChannelConfig`] entries and
 //! fans out fired alerts to every channel concurrently. Supported channel
-//! types are `"webhook"` and `"log"`.
+//! types are `"webhook"`, `"slack"`, `"pagerduty"`, and `"log"`.
+//!
+//! The `slack` and `pagerduty` channels (WOR-1876) are formatters over
+//! the same delivery transport as `webhook`, not new engines: `slack`
+//! posts a Blocks-formatted message to an incoming-webhook URL, and
+//! `pagerduty` sends an Events API v2 event with a deduplication key
+//! derived from the rule identity plus labels, so repeated fires of the
+//! same rule group into one incident and a `resolved` alert closes it.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -13,10 +20,11 @@ use std::time::Duration;
 /// Configuration for a single alert notification channel.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AlertChannelConfig {
-    /// Channel type: `"webhook"` or `"log"`.
+    /// Channel type: `"webhook"`, `"slack"`, `"pagerduty"`, or `"log"`.
     #[serde(rename = "type")]
     pub channel_type: String,
-    /// Webhook URL (required when `channel_type == "webhook"`).
+    /// Webhook URL. Required for `webhook` (any receiver) and `slack`
+    /// (the incoming-webhook URL); unused by `pagerduty` and `log`.
     pub url: Option<String>,
     /// Additional HTTP headers to include with webhook delivery.
     #[serde(default)]
@@ -26,6 +34,10 @@ pub struct AlertChannelConfig {
     /// v1=<hex>` so the receiver can verify the message wasn't forged.
     #[serde(default)]
     pub secret: Option<String>,
+    /// PagerDuty Events API v2 routing key (required when
+    /// `channel_type == "pagerduty"`).
+    #[serde(default)]
+    pub routing_key: Option<String>,
 }
 
 /// A fired alert payload sent to notification channels.
@@ -41,6 +53,14 @@ pub struct Alert {
     pub timestamp: String,
     /// Arbitrary key/value labels for routing and grouping.
     pub labels: HashMap<String, String>,
+    /// WOR-1876: `true` when this is a recovery notification for a
+    /// previously fired rule. The `pagerduty` channel maps it to an
+    /// Events API `resolve` (closing the incident opened by the
+    /// trigger with the same deduplication key) and `slack` renders a
+    /// recovered variant. Evaluators that do not track recovery keep
+    /// the default `false`.
+    #[serde(default)]
+    pub resolved: bool,
 }
 
 // --- Dispatcher ---
@@ -152,6 +172,65 @@ impl AlertDispatcher {
                         );
                     }
                 }
+                // WOR-1876: Slack incoming webhook. Same SSRF-guarded
+                // delivery loop as `webhook`, Blocks-formatted payload.
+                "slack" => {
+                    if let Some(url) = &channel.url {
+                        let client = self.client.clone();
+                        let url = url.clone();
+                        let body = slack_payload(&alert);
+                        self.tasks.spawn(async move {
+                            let to_check = url.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                webhook_url_allowed(&to_check)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    deliver_json(client, url, body, "alert_slack").await;
+                                }
+                                _ => {
+                                    crate::metrics::record_telemetry_dropped(
+                                        "alert_slack",
+                                        "ssrf_rejected",
+                                    );
+                                    tracing::error!(
+                                        target: "alerting",
+                                        url = %url,
+                                        "slack webhook url failed SSRF validation - skipping"
+                                    );
+                                }
+                            }
+                        });
+                    } else {
+                        tracing::error!(
+                            target: "alerting",
+                            "slack channel has no url configured"
+                        );
+                    }
+                }
+                // WOR-1876: PagerDuty Events API v2. Trigger / resolve
+                // keyed on the rule identity so recovery auto-resolves.
+                "pagerduty" => {
+                    if let Some(routing_key) = &channel.routing_key {
+                        let client = self.client.clone();
+                        let body = pagerduty_payload(&alert, routing_key);
+                        self.tasks.spawn(async move {
+                            deliver_json(
+                                client,
+                                "https://events.pagerduty.com/v2/enqueue".to_string(),
+                                body,
+                                "alert_pagerduty",
+                            )
+                            .await;
+                        });
+                    } else {
+                        tracing::error!(
+                            target: "alerting",
+                            "pagerduty channel has no routing_key configured"
+                        );
+                    }
+                }
                 unknown => {
                     tracing::warn!(
                         target: "alerting",
@@ -160,6 +239,141 @@ impl AlertDispatcher {
                     );
                 }
             }
+        }
+    }
+}
+
+// --- Slack / PagerDuty formatting (WOR-1876) ---
+
+/// Stable per-rule deduplication key: the rule name plus its sorted
+/// labels. Repeated fires of the same rule instance carry the same
+/// key, so PagerDuty groups them into one incident and a later
+/// `resolve` with the key closes it.
+fn alert_dedup_key(alert: &Alert) -> String {
+    let mut labels: Vec<(&String, &String)> = alert.labels.iter().collect();
+    labels.sort();
+    let mut key = format!("sbproxy:{}", alert.rule);
+    for (k, v) in labels {
+        key.push(':');
+        key.push_str(k);
+        key.push('=');
+        key.push_str(v);
+    }
+    key
+}
+
+/// Slack incoming-webhook payload (Blocks formatting): rule, severity,
+/// current condition, labels, and the fired / recovered state.
+fn slack_payload(alert: &Alert) -> serde_json::Value {
+    let state = if alert.resolved {
+        "Recovered"
+    } else {
+        "Firing"
+    };
+    let mut labels: Vec<(&String, &String)> = alert.labels.iter().collect();
+    labels.sort();
+    let label_text = if labels.is_empty() {
+        "(no labels)".to_string()
+    } else {
+        labels
+            .iter()
+            .map(|(k, v)| format!("`{k}={v}`"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let headline = format!("{state}: {} ({})", alert.rule, alert.severity);
+    serde_json::json!({
+        "text": format!("{headline}: {}", alert.message),
+        "blocks": [
+            {
+                "type": "header",
+                "text": { "type": "plain_text", "text": headline, "emoji": false }
+            },
+            {
+                "type": "section",
+                "text": { "type": "mrkdwn", "text": alert.message }
+            },
+            {
+                "type": "context",
+                "elements": [
+                    { "type": "mrkdwn", "text": label_text },
+                    { "type": "mrkdwn", "text": format!("fired {}", alert.timestamp) }
+                ]
+            }
+        ]
+    })
+}
+
+/// PagerDuty Events API v2 payload. `trigger` opens (or re-groups
+/// into) the incident keyed by [`alert_dedup_key`]; a resolved alert
+/// sends `resolve` for the same key.
+fn pagerduty_payload(alert: &Alert, routing_key: &str) -> serde_json::Value {
+    if alert.resolved {
+        return serde_json::json!({
+            "routing_key": routing_key,
+            "event_action": "resolve",
+            "dedup_key": alert_dedup_key(alert),
+        });
+    }
+    // PagerDuty accepts critical | warning | error | info; anything
+    // outside our two-value vocabulary maps to warning.
+    let severity = match alert.severity.as_str() {
+        "critical" => "critical",
+        _ => "warning",
+    };
+    serde_json::json!({
+        "routing_key": routing_key,
+        "event_action": "trigger",
+        "dedup_key": alert_dedup_key(alert),
+        "payload": {
+            "summary": format!("{}: {}", alert.rule, alert.message),
+            "source": instance_id(),
+            "severity": severity,
+            "timestamp": alert.timestamp,
+            "custom_details": alert.labels,
+        }
+    })
+}
+
+/// POST a JSON payload for the slack / pagerduty channels. Best-effort
+/// single attempt; a failed delivery increments the dropped-telemetry
+/// counter under `kind` and never blocks the data plane (the alert
+/// still reached any configured `log` channel).
+async fn deliver_json(
+    client: reqwest::Client,
+    url: String,
+    body: serde_json::Value,
+    kind: &'static str,
+) {
+    let req = client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", format!("sbproxy/{}", version()))
+        .json(&body);
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::debug!(target: "alerting", url = %url, kind = %kind, "alert delivered");
+        }
+        Ok(resp) => {
+            crate::metrics::record_telemetry_dropped(kind, "http_error");
+            tracing::warn!(
+                target: "alerting",
+                url = %url,
+                kind = %kind,
+                status = %resp.status(),
+                "alert delivery non-success"
+            );
+        }
+        Err(e) => {
+            crate::metrics::record_telemetry_dropped(kind, "delivery_failed");
+            tracing::warn!(
+                target: "alerting",
+                url = %url,
+                kind = %kind,
+                error = %e,
+                "alert delivery failed"
+            );
         }
     }
 }
@@ -301,6 +515,7 @@ mod tests {
             message: "Test alert message".to_string(),
             timestamp: "2026-04-16T12:00:00Z".to_string(),
             labels,
+            resolved: false,
         }
     }
 
@@ -333,6 +548,7 @@ mod tests {
             message: "No labels".to_string(),
             timestamp: "2026-04-16T00:00:00Z".to_string(),
             labels: HashMap::new(),
+            resolved: false,
         };
 
         let json = serde_json::to_string(&alert).unwrap();
@@ -395,6 +611,7 @@ mod tests {
             url: None,
             headers: vec![],
             secret: None,
+            routing_key: None,
         }];
 
         let dispatcher = AlertDispatcher::new(channels);
@@ -409,6 +626,7 @@ mod tests {
             url: None, // missing URL
             headers: vec![],
             secret: None,
+            routing_key: None,
         }];
 
         let dispatcher = AlertDispatcher::new(channels);
@@ -427,6 +645,7 @@ mod tests {
             url: Some("http://127.0.0.1/alert".to_string()),
             headers: vec![],
             secret: None,
+            routing_key: None,
         }];
         let dispatcher = AlertDispatcher::new(channels);
         dispatcher.fire(make_alert("critical"));
@@ -434,6 +653,74 @@ mod tests {
         dispatcher.drain().await;
         assert!(dispatcher.tasks.is_closed());
         assert!(dispatcher.tasks.is_empty());
+    }
+
+    #[test]
+    fn slack_payload_formats_firing_and_recovered() {
+        // WOR-1876: readable headline, message section, labels +
+        // timestamp context, and a recovered variant.
+        let alert = make_alert("critical");
+        let v = slack_payload(&alert);
+        assert!(v["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Firing: test_rule (critical)"));
+        assert_eq!(v["blocks"][0]["type"], "header");
+        assert_eq!(v["blocks"][1]["text"]["text"], "Test alert message");
+        assert!(v["blocks"][2]["elements"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("origin=api.example.com"));
+        let mut recovered = make_alert("critical");
+        recovered.resolved = true;
+        let v = slack_payload(&recovered);
+        assert!(v["text"].as_str().unwrap().starts_with("Recovered:"));
+    }
+
+    #[test]
+    fn pagerduty_trigger_and_resolve_share_the_dedup_key() {
+        // WOR-1876: recovery must close the incident the trigger
+        // opened, which requires an identical deduplication key.
+        let alert = make_alert("critical");
+        let trigger = pagerduty_payload(&alert, "rk-123");
+        assert_eq!(trigger["event_action"], "trigger");
+        assert_eq!(trigger["routing_key"], "rk-123");
+        assert_eq!(trigger["payload"]["severity"], "critical");
+        assert_eq!(
+            trigger["payload"]["custom_details"]["origin"],
+            "api.example.com"
+        );
+        let dedup = trigger["dedup_key"].as_str().unwrap().to_string();
+        assert!(dedup.starts_with("sbproxy:test_rule"));
+        assert!(dedup.contains("origin=api.example.com"));
+
+        let mut recovered = make_alert("critical");
+        recovered.resolved = true;
+        let resolve = pagerduty_payload(&recovered, "rk-123");
+        assert_eq!(resolve["event_action"], "resolve");
+        assert_eq!(resolve["dedup_key"].as_str().unwrap(), dedup);
+        assert!(resolve.get("payload").is_none());
+    }
+
+    #[test]
+    fn pagerduty_unknown_severity_maps_to_warning() {
+        let alert = make_alert("weird");
+        let v = pagerduty_payload(&alert, "rk");
+        assert_eq!(v["payload"]["severity"], "warning");
+    }
+
+    #[test]
+    fn channel_config_deserializes_pagerduty_and_slack() {
+        let pd: AlertChannelConfig =
+            serde_json::from_str(r#"{"type": "pagerduty", "routing_key": "rk-1"}"#).unwrap();
+        assert_eq!(pd.channel_type, "pagerduty");
+        assert_eq!(pd.routing_key.as_deref(), Some("rk-1"));
+        let slack: AlertChannelConfig = serde_json::from_str(
+            r#"{"type": "slack", "url": "https://hooks.slack.com/services/T0/B0/x"}"#,
+        )
+        .unwrap();
+        assert_eq!(slack.channel_type, "slack");
+        assert!(slack.routing_key.is_none());
     }
 
     #[test]
@@ -457,6 +744,7 @@ mod tests {
             message: "Multiple labels".to_string(),
             timestamp: "2026-04-16T00:00:00Z".to_string(),
             labels,
+            resolved: false,
         };
 
         let json = serde_json::to_string(&alert).unwrap();

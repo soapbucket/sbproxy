@@ -49,6 +49,7 @@ pub fn check_error_rate_spike(rule: &ErrorRateRule, observed_rate: f64) -> Optio
             ),
             timestamp: chrono::Utc::now().to_rfc3339(),
             labels,
+            resolved: false,
         })
     } else {
         None
