@@ -52,6 +52,10 @@ pub struct AdminConfig {
     /// WOR-1716: RBAC operators in addition to the top-level admin (which
     /// is always the full-access `admin` role).
     pub operators: Vec<AdminOperator>,
+    /// WOR-1870: URL template for trace deep-links in the admin UI.
+    /// `{trace_id}` is substituted with the row's trace id; `None`
+    /// renders trace ids as plain text.
+    pub trace_url_template: Option<String>,
 }
 
 /// PEM certificate + key file paths for admin-server TLS (WOR-1717).
@@ -87,6 +91,7 @@ impl Default for AdminConfig {
             allow_ips: Vec::new(),
             cors_origins: Vec::new(),
             operators: Vec::new(),
+            trace_url_template: None,
         }
     }
 }
@@ -1867,6 +1872,15 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // WOR-1870: operator UI settings the SPA reads at load (trace
+    // deep-link template today).
+    if path_only == "/api/ui-settings" {
+        let body = serde_json::json!({
+            "trace_url_template": state.config.trace_url_template,
+        })
+        .to_string();
+        return (200, "application/json", body);
+    }
     // WOR-1718: spend summary from the AI cost/token metrics.
     // WOR-1875: any of `window`, `group_by`, `from`, `to` selects the
     // windowed shape served from the durable rollups; the zero-arg
@@ -3027,6 +3041,7 @@ mod tests {
 
     fn make_state() -> AdminState {
         AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3591,6 +3606,7 @@ origins:
         let runtime = crate::server::model_host::model_runtime_manager();
         let runtime_revision_before = runtime.current_revision();
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3639,6 +3655,7 @@ origins:
     fn admin_reload_returns_400_on_yaml_parse_error() {
         let f = write_yaml("this is not: valid: yaml: at all\n  - {");
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3671,6 +3688,7 @@ origins:
         let f = write_yaml(&reload_yaml("reload-concurrency.example.com"));
         let state = std::sync::Arc::new(
             AdminState::new(AdminConfig {
+                trace_url_template: None,
                 enabled: true,
                 port: 9090,
                 username: "admin".to_string(),
@@ -3773,6 +3791,7 @@ origins:
         // has occurred). Drift cannot be determined.
         let f = write_yaml(&reload_yaml("drift-no-baseline.example.com"));
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3804,6 +3823,7 @@ origins:
         let dir = tempfile::tempdir().expect("tempdir");
         let bogus = dir.path().join("does-not-exist.yml");
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3836,6 +3856,7 @@ origins:
         // is false.
         let f = write_yaml(&reload_yaml("reload-drift-noop.example.com"));
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3886,6 +3907,7 @@ origins:
         // from the loaded revision.
         let f = write_yaml(&reload_yaml("reload-drift-edit-a.example.com"));
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -4233,6 +4255,7 @@ origins:
         b.mark_success();
         let registry = sbproxy_observe::default_registry(l, b);
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -4259,6 +4282,7 @@ origins:
         b.mark_success();
         let registry = sbproxy_observe::default_registry(l, b);
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),

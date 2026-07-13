@@ -1949,6 +1949,12 @@ pub struct AdminConfig {
     /// Absent means PR3-style ephemeral mutations.
     #[serde(default)]
     pub prompt_persistence_path: Option<std::path::PathBuf>,
+    /// URL template for trace deep-links in the admin UI. The literal
+    /// `{trace_id}` is replaced with the request's trace id, e.g.
+    /// `https://jaeger.internal/trace/{trace_id}`. Unset renders trace
+    /// ids as plain text (no broken default link).
+    #[serde(default)]
+    pub trace_url_template: Option<String>,
     /// Optional TLS for the admin server (WOR-1717). When set, the admin
     /// endpoint and the built-in UI are served over HTTPS using the PEM
     /// certificate and key at the configured paths, instead of plaintext

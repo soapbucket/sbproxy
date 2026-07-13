@@ -1336,6 +1336,14 @@
             "null"
           ]
         },
+        "trace_url_template": {
+          "description": "URL template for trace deep-links in the admin UI. The literal `{trace_id}` is replaced with the request's trace id, e.g. `https://jaeger.internal/trace/{trace_id}`. Unset renders trace ids as plain text (no broken default link).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "tls": {
           "description": "Optional TLS for the admin server (WOR-1717). When set, the admin endpoint and the built-in UI are served over HTTPS using the PEM certificate and key at the configured paths, instead of plaintext HTTP. Leave unset to serve plaintext (loopback default).",
           "default": null,

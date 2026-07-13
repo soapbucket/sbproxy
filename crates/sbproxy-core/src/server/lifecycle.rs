@@ -1260,6 +1260,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // WOR-1870: trace deep-link template for the admin UI.
+            trace_url_template: server_config
+                .admin
+                .as_ref()
+                .and_then(|a| a.trace_url_template.clone()),
         };
         // Pass the same on-disk config path the file watcher uses
         // so `POST /admin/reload` re-reads the same file. The two

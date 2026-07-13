@@ -372,7 +372,23 @@ export interface RequestLog {
   target?: string;
   client?: string;
   client_ip?: string;
+  // WOR-1874 correlation + AI columns on the ring entry.
+  request_id?: string;
+  trace_id?: string;
+  provider?: string;
+  model?: string;
+  tokens_in?: number;
+  tokens_out?: number;
+  cost_usd_micros?: number;
+  guardrail_category?: string;
+  guardrail_action?: string;
+  origin?: string;
   [k: string]: unknown;
+}
+
+// WOR-1870: UI settings served by the admin API.
+export interface UiSettings {
+  trace_url_template?: string | null;
 }
 
 export interface PromptEntry {
@@ -562,6 +578,11 @@ export const api = {
 
   // Logs
   requests: () => getJson<unknown>("/api/requests"),
+  // WOR-1870: operator UI settings (trace deep-link template).
+  uiSettings: () => getJson<UiSettings>("/api/ui-settings"),
+  // WOR-1870: SSE live tail of the request ring. EventSource sends the
+  // session cookie same-origin; the server enforces auth on connect.
+  requestsStreamUrl: () => "/api/requests/stream",
 
   // Metrics
   metrics: () => getText("/metrics"),
