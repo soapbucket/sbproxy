@@ -298,6 +298,23 @@ pub struct RequestLogEntry {
     pub guardrail_action: Option<String>,
 }
 
+/// Filters for [`AdminState::query_requests`] (WOR-1718 / WOR-1874).
+/// Every field is optional; `None` means the dimension is not
+/// filtered.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestLogFilter<'a> {
+    /// Exact status code.
+    pub status: Option<u16>,
+    /// Case-insensitive HTTP method match.
+    pub method: Option<&'a str>,
+    /// Path substring match.
+    pub path_sub: Option<&'a str>,
+    /// Exact guardrail action match (WOR-1874).
+    pub guardrail_action: Option<&'a str>,
+    /// Exact guardrail category match (WOR-1874).
+    pub guardrail_category: Option<&'a str>,
+}
+
 // --- Admin State ---
 
 /// Per-revision cached rendering of the emitted OpenAPI document.
@@ -518,6 +535,8 @@ impl AdminState {
     }
 
     /// Add a request to the log (ring buffer, drops oldest when full).
+    ///
+    /// See [`RequestLogFilter`] for the matching query surface.
     pub fn log_request(&self, entry: RequestLogEntry) {
         let mut log = self
             .recent_requests
@@ -545,17 +564,12 @@ impl AdminState {
         log.iter().rev().take(limit).cloned().collect()
     }
 
-    /// Query the recent-request log (newest first) with optional filters
-    /// and pagination (WOR-1718). `status` is an exact code, `method` is
-    /// case-insensitive, `path_sub` is a substring, `offset`/`limit`
+    /// Query the recent-request log (newest first) with optional
+    /// filters and pagination (WOR-1718 / WOR-1874). `offset`/`limit`
     /// paginate the filtered result.
     pub fn query_requests(
         &self,
-        status: Option<u16>,
-        method: Option<&str>,
-        path_sub: Option<&str>,
-        guardrail_action: Option<&str>,
-        guardrail_category: Option<&str>,
+        filter: &RequestLogFilter<'_>,
         offset: usize,
         limit: usize,
     ) -> Vec<RequestLogEntry> {
@@ -565,14 +579,24 @@ impl AdminState {
             .expect("admin log mutex poisoned");
         log.iter()
             .rev()
-            .filter(|e| status.is_none_or(|s| e.status == s))
-            .filter(|e| method.is_none_or(|m| e.method.eq_ignore_ascii_case(m)))
-            .filter(|e| path_sub.is_none_or(|p| e.path.contains(p)))
+            .filter(|e| filter.status.is_none_or(|s| e.status == s))
+            .filter(|e| {
+                filter
+                    .method
+                    .is_none_or(|m| e.method.eq_ignore_ascii_case(m))
+            })
+            .filter(|e| filter.path_sub.is_none_or(|p| e.path.contains(p)))
             // WOR-1874: exact-match filters on the guardrail columns so
             // the Guardrails admin view can deep-link to blocked rows.
-            .filter(|e| guardrail_action.is_none_or(|a| e.guardrail_action.as_deref() == Some(a)))
             .filter(|e| {
-                guardrail_category.is_none_or(|c| e.guardrail_category.as_deref() == Some(c))
+                filter
+                    .guardrail_action
+                    .is_none_or(|a| e.guardrail_action.as_deref() == Some(a))
+            })
+            .filter(|e| {
+                filter
+                    .guardrail_category
+                    .is_none_or(|c| e.guardrail_category.as_deref() == Some(c))
             })
             .skip(offset)
             .take(limit)
@@ -1855,11 +1879,13 @@ pub fn handle_admin_request(
             .unwrap_or(state.config.max_log_entries)
             .min(state.config.max_log_entries);
         let entries = state.query_requests(
-            status,
-            method_f,
-            path_f,
-            guardrail_action_f,
-            guardrail_category_f,
+            &RequestLogFilter {
+                status,
+                method: method_f,
+                path_sub: path_f,
+                guardrail_action: guardrail_action_f,
+                guardrail_category: guardrail_category_f,
+            },
             offset,
             limit,
         );
@@ -3207,21 +3233,42 @@ mod tests {
             });
         }
         // Status filter.
-        let errs = state.query_requests(Some(500), None, None, None, None, 0, 100);
+        let errs = state.query_requests(
+            &RequestLogFilter {
+                status: Some(500),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
         assert_eq!(errs.len(), 5);
         assert!(errs.iter().all(|e| e.status == 500));
         // Method filter (case-insensitive).
-        let posts = state.query_requests(None, Some("post"), None, None, None, 0, 100);
+        let posts = state.query_requests(
+            &RequestLogFilter {
+                method: Some("post"),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
         assert_eq!(posts.len(), 5);
         // Path substring.
         assert_eq!(
             state
-                .query_requests(None, None, Some("/thing/7"), None, None, 0, 100)
+                .query_requests(
+                    &RequestLogFilter {
+                        path_sub: Some("/thing/7"),
+                        ..Default::default()
+                    },
+                    0,
+                    100,
+                )
                 .len(),
             1
         );
         // Pagination: newest-first, skip 2, take 3.
-        let page = state.query_requests(None, None, None, None, None, 2, 3);
+        let page = state.query_requests(&RequestLogFilter::default(), 2, 3);
         assert_eq!(page.len(), 3);
         assert_eq!(page[0].path, "/api/thing/7");
     }
@@ -3311,12 +3358,34 @@ mod tests {
             client_ip: "127.0.0.1".to_string(),
             ..Default::default()
         });
-        let blocked = state.query_requests(None, None, None, Some("block"), None, 0, 10);
+        let blocked = state.query_requests(
+            &RequestLogFilter {
+                guardrail_action: Some("block"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
         assert_eq!(blocked.len(), 1);
         assert_eq!(blocked[0].guardrail_category.as_deref(), Some("pii"));
-        let pii = state.query_requests(None, None, None, Some("block"), Some("pii"), 0, 10);
+        let pii = state.query_requests(
+            &RequestLogFilter {
+                guardrail_action: Some("block"),
+                guardrail_category: Some("pii"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
         assert_eq!(pii.len(), 1);
-        let none = state.query_requests(None, None, None, Some("redact"), None, 0, 10);
+        let none = state.query_requests(
+            &RequestLogFilter {
+                guardrail_action: Some("redact"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
         assert!(none.is_empty());
     }
 
