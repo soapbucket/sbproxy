@@ -236,9 +236,11 @@ function rosterHref(nodeId: string): string {
 
 .node-alert__roster-link {
   display: inline-block;
+  max-width: 100%;
   margin-top: var(--sb-space-4);
   font-size: 0.8rem;
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {
