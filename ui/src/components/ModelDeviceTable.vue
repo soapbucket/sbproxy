@@ -3,6 +3,10 @@ import type { DeviceVram } from "../api";
 import { formatBytes } from "../lib/format";
 
 defineProps<{ devices: readonly DeviceVram[] }>();
+
+function deviceRowKey(device: DeviceVram, rowIndex: number): string {
+  return `${device.index ?? "no-index"}:${device.name ?? "unknown"}:${rowIndex}`;
+}
 </script>
 
 <template>
@@ -17,7 +21,7 @@ defineProps<{ devices: readonly DeviceVram[] }>();
       <table class="sb-table">
         <thead><tr><th>Index</th><th>Device</th><th>Total</th><th>Free</th></tr></thead>
         <tbody>
-          <tr v-for="device in devices" :key="device.index">
+          <tr v-for="(device, rowIndex) in devices" :key="deviceRowKey(device, rowIndex)">
             <td class="sb-mono">{{ device.index ?? "n/a" }}</td>
             <td>{{ device.name ?? "Unknown device" }}</td>
             <td>{{ formatBytes(device.total_bytes) }}</td>

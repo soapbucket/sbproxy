@@ -13,7 +13,7 @@ defineProps<{
   clusterAuthorityError: ApiError | null;
   clusterBundleError: ApiError | null;
   clusterAuthorityMode: boolean;
-  activeClusterRevision: number | null;
+  initialClusterBundleAbsent: boolean;
   catalogLoaded: boolean;
   catalogModelCount: number;
   previewOnlyCatalog: boolean;
@@ -23,6 +23,7 @@ defineProps<{
   editorOpen: boolean;
   mutationError: string | null;
   mutationBusy: boolean;
+  conflictRetryAllowed: boolean;
 }>();
 
 defineEmits<{
@@ -32,12 +33,19 @@ defineEmits<{
   (event: "retry-authority"): void;
   (event: "retry-bundle"): void;
   (event: "retry-conflict"): void;
+  (event: "reload-conflict"): void;
   (event: "dismiss-conflict"): void;
 }>();
 </script>
 
 <template>
-  <p v-if="banner" class="banner" :class="`banner--${banner.tone}`" role="status">
+  <p
+    v-if="banner"
+    class="banner"
+    :class="`banner--${banner.tone}`"
+    :role="banner.tone === 'err' ? 'alert' : 'status'"
+    :aria-live="banner.tone === 'err' ? 'assertive' : 'polite'"
+  >
     {{ banner.text }}
   </p>
 
@@ -47,7 +55,13 @@ defineEmits<{
     title="Could not load runtime lifecycle status"
     @retry="$emit('retry-status')"
   />
-  <section v-else-if="statusError" class="metadata-warning" aria-label="Runtime refresh warning">
+  <section
+    v-else-if="statusError"
+    class="metadata-warning"
+    aria-label="Runtime refresh warning"
+    role="status"
+    aria-live="polite"
+  >
     <div>
       <strong>Showing the last loaded runtime lifecycle status.</strong>
       <p>{{ statusError.hint }}</p>
@@ -59,6 +73,7 @@ defineEmits<{
     v-if="desiredError"
     class="metadata-warning metadata-warning--error"
     aria-label="Desired state warning"
+    role="alert"
   >
     <div>
       <strong>Desired deployment metadata is unavailable.</strong>
@@ -71,6 +86,7 @@ defineEmits<{
     v-if="catalogError"
     class="metadata-warning metadata-warning--error"
     aria-label="Catalog warning"
+    role="alert"
   >
     <div>
       <strong>The active model catalog is unavailable.</strong>
@@ -83,6 +99,7 @@ defineEmits<{
     v-if="clusterAuthorityMode && clusterAuthorityError"
     class="metadata-warning"
     aria-label="Cluster authority warning"
+    role="alert"
   >
     <div>
       <strong>Cluster authority state could not be verified.</strong>
@@ -95,10 +112,11 @@ defineEmits<{
     v-if="
       clusterAuthorityMode &&
       clusterBundleError &&
-      !(clusterBundleError.status === 404 && activeClusterRevision === null)
+      !initialClusterBundleAbsent
     "
     class="metadata-warning"
     aria-label="Signed bundle warning"
+    role="alert"
   >
     <div>
       <strong>The active signed deployment bundle could not be verified.</strong>
@@ -107,14 +125,19 @@ defineEmits<{
     <button class="sb-btn sb-btn--sm" @click="$emit('retry-bundle')">Retry bundle</button>
   </section>
 
-  <section v-if="catalogLoaded && catalogModelCount === 0" class="catalog-notice catalog-notice--empty">
+  <section
+    v-if="catalogLoaded && catalogModelCount === 0"
+    class="catalog-notice catalog-notice--empty"
+    role="status"
+    aria-live="polite"
+  >
     <StatusBadge label="No deployable variants" tone="warn" />
     <div>
       <h3>The active catalog cannot create a deployment</h3>
-      <p>Add an exact catalog variant with at least one engine and accelerator, then refresh this view.</p>
+      <p>Add a complete stable or preview variant with at least one engine and accelerator, then refresh this view.</p>
     </div>
   </section>
-  <section v-else-if="previewOnlyCatalog" class="catalog-notice">
+  <section v-else-if="previewOnlyCatalog" class="catalog-notice" role="status" aria-live="polite">
     <StatusBadge label="Preview catalog" tone="warn" />
     <div>
       <h3>All selectable variants are preview</h3>
@@ -122,13 +145,23 @@ defineEmits<{
     </div>
   </section>
 
-  <section v-if="blockers.length" class="sb-card blockers" aria-labelledby="blockers-heading">
+  <section
+    v-if="blockers.length"
+    class="sb-card blockers"
+    aria-labelledby="blockers-heading"
+    role="alert"
+  >
     <div>
       <p class="sb-eyebrow">Local admission</p>
       <h2 id="blockers-heading">Serving is blocked on this host</h2>
     </div>
     <ul>
-      <li v-for="blocker in blockers" :key="blocker">{{ blocker }}</li>
+      <li
+        v-for="(blocker, blockerIndex) in blockers"
+        :key="`${blockerIndex}:${blocker}`"
+      >
+        {{ blocker }}
+      </li>
     </ul>
     <p v-if="blockerRecommendation" class="sb-faint">
       Recommended fix: <span class="sb-mono">{{ blockerRecommendation }}</span>
@@ -140,11 +173,18 @@ defineEmits<{
     <div>
       <strong>Desired state changed before your replacement was accepted.</strong>
       <p>
-        Revision {{ conflict.expectedRevision ?? "none" }} became
-        {{ conflict.currentRevision ?? "none" }}. Your removal draft is preserved:
+        Conflict response {{ conflict.status }}. Expected revision
+        {{ conflict.expectedRevision ?? "none" }}. Your removal draft is preserved.
+      </p>
+      <pre class="raw-conflict">{{ conflict.body || "(empty response body)" }}</pre>
+      <p v-if="conflict.comparison">
+        Current revision {{ conflict.currentRevision ?? "none" }}:
         {{ conflict.comparison.added.length }} added,
         {{ conflict.comparison.changed.length }} changed,
         {{ conflict.comparison.removed.length }} removed compared with the current map.
+      </p>
+      <p v-else>
+        {{ conflict.reloadError || "Current authority state is still loading." }}
       </p>
     </div>
     <div class="conflict-actions">
@@ -152,8 +192,16 @@ defineEmits<{
         Dismiss draft
       </button>
       <button
-        class="sb-btn sb-btn--primary sb-btn--sm"
+        v-if="!conflict.comparison"
+        class="sb-btn sb-btn--sm"
         :disabled="mutationBusy"
+        @click="$emit('reload-conflict')"
+      >
+        {{ mutationBusy ? "Reloading..." : "Reload current state" }}
+      </button>
+      <button
+        class="sb-btn sb-btn--primary sb-btn--sm"
+        :disabled="mutationBusy || !conflictRetryAllowed"
         @click="$emit('retry-conflict')"
       >
         {{ mutationBusy ? "Saving..." : "Retry replacement" }}
@@ -204,6 +252,14 @@ defineEmits<{
   margin-bottom: var(--sb-space-4);
   border-radius: var(--sb-radius);
   font-size: 0.8rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.metadata-warning > div,
+.catalog-notice > div,
+.conflict-banner > div {
+  min-width: 0;
 }
 
 .metadata-warning {
@@ -279,6 +335,13 @@ defineEmits<{
   display: flex;
   gap: var(--sb-space-2);
   flex: none;
+}
+
+.raw-conflict {
+  max-width: 100%;
+  margin: var(--sb-space-2) 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .mutation-error {

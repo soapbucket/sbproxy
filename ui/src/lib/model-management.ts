@@ -53,6 +53,7 @@ export interface DeploymentFormParseOptions {
   requireLicenseAcknowledgement: boolean;
   existingDeploymentIds: readonly string[];
   originalDeploymentId?: string | null;
+  catalog: CatalogResponse;
 }
 
 export type DeploymentChange =
@@ -71,11 +72,14 @@ export type DeploymentMutationCommand =
   | { kind: "unsafe_revision" };
 
 export interface DeploymentConflictState {
+  status: number;
+  body: string;
   expectedRevision: number | null;
   currentRevision: number | null;
   attemptedDeployments: Record<string, ModelDeployment>;
-  currentDeployments: Record<string, ModelDeployment>;
-  comparison: ReconcilePlan;
+  currentDeployments: Record<string, ModelDeployment> | null;
+  comparison: ReconcilePlan | null;
+  reloadError: string | null;
 }
 
 export interface ModelDeploymentRow {
@@ -89,6 +93,17 @@ const AUTHORITY_LABELS: Record<ModelHostAuthority, string> = {
   admin_managed: "Admin managed",
   cluster_authority: "Cluster authority",
 };
+
+function emptyRecord<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+function ownValue<T>(
+  record: Readonly<Record<string, T>>,
+  key: string,
+): T | undefined {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
+}
 
 export function authorityLabel(authority: ModelHostAuthority): string {
   return AUTHORITY_LABELS[authority];
@@ -111,7 +126,7 @@ export function deploymentMutationMode(
   return "read_only";
 }
 
-export function nextClusterRevision(activeRevision: number | null): number | null {
+export function nextSafeRevision(activeRevision: number | null): number | null {
   if (activeRevision === null) return 1;
   if (
     !Number.isSafeInteger(activeRevision) ||
@@ -123,6 +138,10 @@ export function nextClusterRevision(activeRevision: number | null): number | nul
   return activeRevision + 1;
 }
 
+export function nextClusterRevision(activeRevision: number | null): number | null {
+  return nextSafeRevision(activeRevision);
+}
+
 export function isDeployableCatalogEntry(entry: CatalogEntry): boolean {
   return deployableCatalogVariants(entry).length > 0;
 }
@@ -131,8 +150,36 @@ export function deployableCatalogVariants(
   entry: CatalogEntry,
 ): CatalogVariant[] {
   return entry.variants.filter(
-    (variant) => variant.engines.length > 0 && variant.accelerators.length > 0,
+    (variant) => catalogVariantDisabledReason(variant) === null,
   );
+}
+
+export function catalogVariantDisabledReason(
+  variant: CatalogVariant,
+): string | null {
+  if (variant.stability === "config_only") {
+    return "Configuration only; this variant is not runnable.";
+  }
+  if (variant.stability === "unsupported") {
+    return "Unsupported by the model host runtime.";
+  }
+  if (variant.engines.length === 0 && variant.accelerators.length === 0) {
+    return "No executable engine or accelerator evidence is available.";
+  }
+  if (variant.engines.length === 0) {
+    return "No executable engine evidence is available.";
+  }
+  if (variant.accelerators.length === 0) {
+    return "No accelerator compatibility evidence is available.";
+  }
+  return null;
+}
+
+export function catalogVariantSupportLabel(variant: CatalogVariant): string {
+  if (variant.stability === "config_only") return "Config only";
+  if (variant.stability === "unsupported") return "Unsupported";
+  if (catalogVariantDisabledReason(variant)) return "Incomplete";
+  return variant.stability === "stable" ? "Stable" : "Preview";
 }
 
 export function deployableCatalogEntries(
@@ -156,7 +203,7 @@ export function deploymentDefaults(
     variant,
     heterogeneous_variants: false,
     replicas: 1,
-    required_labels: {},
+    required_labels: emptyRecord<string>(),
     spread_by: [],
     pull: "on_demand",
     warm: false,
@@ -251,7 +298,7 @@ function parseRequiredLabels(
   raw: string,
   errors: Partial<Record<DeploymentFormField, string>>,
 ): Record<string, string> {
-  const labels: Record<string, string> = {};
+  const labels = emptyRecord<string>();
   const lines = raw
     .split(/\r?\n|,/)
     .map((line) => line.trim())
@@ -332,7 +379,29 @@ export function parseDeploymentForm(
   ) {
     errors.deploymentId = "A deployment with this ID already exists.";
   }
-  if (!model) errors.model = "Choose a catalog model.";
+  const selectedEntry = model
+    ? ownValue(options.catalog.models, model)
+    : undefined;
+  if (!model) {
+    errors.model = "Choose a catalog model.";
+  } else if (!selectedEntry) {
+    errors.model = "The selected model is no longer in the active catalog.";
+  } else if (deployableCatalogVariants(selectedEntry).length === 0) {
+    errors.model = "The selected catalog model has no runnable variants.";
+  }
+
+  if (selectedEntry && variant !== null) {
+    const selectedVariant = selectedEntry.variants.find(
+      (candidate) => candidate.id === variant,
+    );
+    if (!selectedVariant) {
+      errors.variant =
+        "The selected exact variant is no longer in the active catalog.";
+    } else {
+      const disabledReason = catalogVariantDisabledReason(selectedVariant);
+      if (disabledReason) errors.variant = disabledReason;
+    }
+  }
 
   const replicas = parseBoundedInteger(draft.replicas, "replicas", errors, {
     minimum: 1,
@@ -410,7 +479,14 @@ export function parseDeploymentForm(
 
 export function deploymentRemovalGuard(
   state: DeploymentRuntimeState | null,
+  statusCurrent: boolean,
 ): { allowed: boolean; reason: string | null } {
+  if (!statusCurrent) {
+    return {
+      allowed: false,
+      reason: "Refresh runtime lifecycle status before removing this deployment.",
+    };
+  }
   if (state === "ready" || state === "preparing" || state === "draining") {
     return {
       allowed: false,
@@ -421,9 +497,13 @@ export function deploymentRemovalGuard(
 }
 
 function cloneDeployment(deployment: ModelDeployment): ModelDeployment {
+  const requiredLabels = emptyRecord<string>();
+  for (const [key, value] of Object.entries(deployment.required_labels)) {
+    requiredLabels[key] = value;
+  }
   return {
     ...deployment,
-    required_labels: { ...deployment.required_labels },
+    required_labels: requiredLabels,
     spread_by: [...deployment.spread_by],
   };
 }
@@ -431,12 +511,11 @@ function cloneDeployment(deployment: ModelDeployment): ModelDeployment {
 function cloneDeploymentMap(
   deployments: Readonly<Record<string, ModelDeployment>>,
 ): Record<string, ModelDeployment> {
-  return Object.fromEntries(
-    Object.entries(deployments).map(([id, deployment]) => [
-      id,
-      cloneDeployment(deployment),
-    ]),
-  );
+  const clone = emptyRecord<ModelDeployment>();
+  for (const [id, deployment] of Object.entries(deployments)) {
+    clone[id] = cloneDeployment(deployment);
+  }
+  return clone;
 }
 
 export function applyDeploymentChange(
@@ -467,6 +546,9 @@ export function buildDeploymentMutation(input: {
   const mode = deploymentMutationMode(input.document, input.clusterAuthority);
   const deployments = cloneDeploymentMap(input.deployments);
   if (mode === "local_put") {
+    if (nextSafeRevision(input.document.revision) === null) {
+      return { kind: "unsafe_revision" };
+    }
     return {
       kind: "local_put",
       request: {
@@ -476,7 +558,7 @@ export function buildDeploymentMutation(input: {
     };
   }
   if (mode === "signed_cluster_post") {
-    const revision = nextClusterRevision(
+    const revision = nextSafeRevision(
       input.clusterAuthority?.active_revision ?? null,
     );
     if (revision === null) return { kind: "unsafe_revision" };
@@ -493,13 +575,15 @@ export function buildDeploymentMutation(input: {
 }
 
 function canonicalDeployment(deployment: ModelDeployment): ModelDeployment {
+  const requiredLabels = emptyRecord<string>();
+  for (const [key, value] of Object.entries(deployment.required_labels).sort(
+    ([left], [right]) => left.localeCompare(right),
+  )) {
+    requiredLabels[key] = value;
+  }
   return {
     ...cloneDeployment(deployment),
-    required_labels: Object.fromEntries(
-      Object.entries(deployment.required_labels).sort(([left], [right]) =>
-        left.localeCompare(right),
-      ),
-    ),
+    required_labels: requiredLabels,
   };
 }
 
@@ -514,6 +598,8 @@ function deploymentsEqual(
 }
 
 export function createDeploymentConflictState(input: {
+  status?: number;
+  body?: string;
   expectedRevision: number | null;
   currentRevision: number | null;
   attemptedDeployments: Readonly<Record<string, ModelDeployment>>;
@@ -522,31 +608,88 @@ export function createDeploymentConflictState(input: {
   const attemptedIds = Object.keys(input.attemptedDeployments).sort();
   const currentIds = Object.keys(input.currentDeployments).sort();
   const comparison: ReconcilePlan = {
-    added: attemptedIds.filter((id) => !(id in input.currentDeployments)),
-    changed: attemptedIds.filter(
-      (id) =>
-        id in input.currentDeployments &&
-        !deploymentsEqual(
-          input.attemptedDeployments[id],
-          input.currentDeployments[id],
-        ),
+    added: attemptedIds.filter(
+      (id) => !Object.hasOwn(input.currentDeployments, id),
     ),
-    removed: currentIds.filter((id) => !(id in input.attemptedDeployments)),
+    changed: attemptedIds.filter(
+      (id) => {
+        const attempted = ownValue(input.attemptedDeployments, id);
+        const current = ownValue(input.currentDeployments, id);
+        return Boolean(
+          attempted && current && !deploymentsEqual(attempted, current),
+        );
+      },
+    ),
+    removed: currentIds.filter(
+      (id) => !Object.hasOwn(input.attemptedDeployments, id),
+    ),
     preserved: attemptedIds.filter(
-      (id) =>
-        id in input.currentDeployments &&
-        deploymentsEqual(
-          input.attemptedDeployments[id],
-          input.currentDeployments[id],
-        ),
+      (id) => {
+        const attempted = ownValue(input.attemptedDeployments, id);
+        const current = ownValue(input.currentDeployments, id);
+        return Boolean(
+          attempted && current && deploymentsEqual(attempted, current),
+        );
+      },
     ),
   };
   return {
+    status: input.status ?? 409,
+    body: input.body ?? "",
     expectedRevision: input.expectedRevision,
     currentRevision: input.currentRevision,
     attemptedDeployments: cloneDeploymentMap(input.attemptedDeployments),
     currentDeployments: cloneDeploymentMap(input.currentDeployments),
     comparison,
+    reloadError: null,
+  };
+}
+
+export function createPendingDeploymentConflictState(input: {
+  status: number;
+  body: string;
+  expectedRevision: number | null;
+  attemptedDeployments: Readonly<Record<string, ModelDeployment>>;
+}): DeploymentConflictState {
+  return {
+    status: input.status,
+    body: input.body,
+    expectedRevision: input.expectedRevision,
+    currentRevision: null,
+    attemptedDeployments: cloneDeploymentMap(input.attemptedDeployments),
+    currentDeployments: null,
+    comparison: null,
+    reloadError: null,
+  };
+}
+
+export function reconcileDeploymentConflictState(
+  pending: DeploymentConflictState,
+  input: {
+    currentRevision: number | null;
+    currentDeployments: Readonly<Record<string, ModelDeployment>>;
+  },
+): DeploymentConflictState {
+  return createDeploymentConflictState({
+    status: pending.status,
+    body: pending.body,
+    expectedRevision: pending.expectedRevision,
+    currentRevision: input.currentRevision,
+    attemptedDeployments: pending.attemptedDeployments,
+    currentDeployments: input.currentDeployments,
+  });
+}
+
+export function failDeploymentConflictReload(
+  pending: DeploymentConflictState,
+  reloadError: string,
+): DeploymentConflictState {
+  return {
+    ...pending,
+    currentRevision: null,
+    currentDeployments: null,
+    comparison: null,
+    reloadError,
   };
 }
 
@@ -565,7 +708,9 @@ export function deploymentRows(
     .sort((left, right) => left.localeCompare(right))
     .map((deploymentId) => ({
       deploymentId,
-      desired: desiredDeployments?.[deploymentId] ?? null,
+      desired: desiredDeployments
+        ? ownValue(desiredDeployments, deploymentId) ?? null
+        : null,
       runtime: runtimeById.get(deploymentId) ?? null,
     }));
 }

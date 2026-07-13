@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type {
   CatalogEntry,
   CatalogResponse,
+  CatalogVariant,
   ClusterDeploymentAuthority,
   DeploymentDocument,
   DeploymentRuntimeState,
@@ -12,6 +13,8 @@ import {
   applyDeploymentChange,
   authorityLabel,
   buildDeploymentMutation,
+  catalogVariantDisabledReason,
+  catalogVariantSupportLabel,
   createDeploymentConflictState,
   deploymentRows,
   deploymentRemovalGuard,
@@ -76,6 +79,14 @@ function clusterAuthority(
   };
 }
 
+const PROTOTYPE_IDENTIFIERS = ["__proto__", "constructor", "toString"] as const;
+
+function ownRecord<T>(entries: ReadonlyArray<readonly [string, T]>): Record<string, T> {
+  const record = Object.create(null) as Record<string, T>;
+  for (const [key, value] of entries) record[key] = value;
+  return record;
+}
+
 describe("model management presentation", () => {
   it("labels every persistent desired-state authority", () => {
     expect(authorityLabel("file_managed")).toBe("File managed");
@@ -125,6 +136,9 @@ describe("model management presentation", () => {
   it("computes the next safe cluster revision", () => {
     expect(nextClusterRevision(null)).toBe(1);
     expect(nextClusterRevision(7)).toBe(8);
+    expect(nextClusterRevision(Number.MAX_SAFE_INTEGER - 1)).toBe(
+      Number.MAX_SAFE_INTEGER,
+    );
     expect(nextClusterRevision(Number.MAX_SAFE_INTEGER)).toBeNull();
     expect(nextClusterRevision(-1)).toBeNull();
   });
@@ -165,8 +179,48 @@ describe("model management presentation", () => {
     ).toEqual(["q4_k_m"]);
   });
 
+  it("allows only complete stable or preview variants and explains every disabled variant", () => {
+    const base = catalogEntry().variants[0];
+    const variants: CatalogVariant[] = [
+      { ...base, id: "stable", stability: "stable" },
+      { ...base, id: "preview", stability: "preview" },
+      { ...base, id: "config", stability: "config_only" },
+      { ...base, id: "unsupported", stability: "unsupported" },
+      { ...base, id: "no-engine", stability: "stable", engines: [] },
+      {
+        ...base,
+        id: "no-accelerator",
+        stability: "preview",
+        accelerators: [],
+      },
+    ];
+
+    expect(
+      deployableCatalogVariants(catalogEntry({ variants })).map(
+        (variant) => variant.id,
+      ),
+    ).toEqual(["stable", "preview"]);
+
+    expect(catalogVariantDisabledReason(variants[0])).toBeNull();
+    expect(catalogVariantDisabledReason(variants[1])).toBeNull();
+    expect(catalogVariantDisabledReason(variants[2])).toMatch(
+      /configuration only/i,
+    );
+    expect(catalogVariantDisabledReason(variants[3])).toMatch(/unsupported/i);
+    expect(catalogVariantDisabledReason(variants[4])).toMatch(/engine/i);
+    expect(catalogVariantDisabledReason(variants[5])).toMatch(/accelerator/i);
+
+    expect(catalogVariantSupportLabel(variants[0])).toBe("Stable");
+    expect(catalogVariantSupportLabel(variants[1])).toBe("Preview");
+    expect(catalogVariantSupportLabel(variants[2])).toBe("Config only");
+    expect(catalogVariantSupportLabel(variants[3])).toBe("Unsupported");
+    expect(catalogVariantSupportLabel(variants[4])).toBe("Incomplete");
+    expect(catalogVariantSupportLabel(variants[5])).toBe("Incomplete");
+  });
+
   it("creates a complete deployment using the backend-safe defaults", () => {
-    expect(deploymentDefaults("qwen2.5-0.5b-instruct", "q4_k_m")).toEqual({
+    const deployment = deploymentDefaults("qwen2.5-0.5b-instruct", "q4_k_m");
+    expect(deployment).toEqual({
       model: "qwen2.5-0.5b-instruct",
       variant: "q4_k_m",
       heterogeneous_variants: false,
@@ -182,6 +236,7 @@ describe("model management presentation", () => {
       engine: "auto",
       rollout: "rolling",
     });
+    expect(Object.getPrototypeOf(deployment.required_labels)).toBeNull();
   });
 
   it("creates an operator draft from backend-safe defaults", () => {
@@ -266,6 +321,11 @@ describe("model management presentation", () => {
       parseDeploymentForm(draft, {
         requireLicenseAcknowledgement: true,
         existingDeploymentIds: [],
+        catalog: {
+          schema_version: 1,
+          catalog_revision: "catalog-v2",
+          models: { "qwen2.5-0.5b-instruct": catalogEntry() },
+        },
       }),
     ).toEqual({
       errors: {},
@@ -285,6 +345,144 @@ describe("model management presentation", () => {
     });
   });
 
+  it("preserves valid zero and null parser boundaries", () => {
+    const draft = deploymentFormDefaults("zeroes", "model", "q4_k_m");
+    draft.keepAliveSecs = "0";
+    draft.maxConcurrency = "";
+    draft.maxQueueDepth = "0";
+
+    const result = parseDeploymentForm(draft, {
+      requireLicenseAcknowledgement: false,
+      existingDeploymentIds: [],
+      catalog: {
+        schema_version: 1,
+        catalog_revision: "catalog-v2",
+        models: { model: catalogEntry() },
+      },
+    });
+
+    expect(result.value?.deployment).toEqual(
+      expect.objectContaining({
+        keep_alive_secs: 0,
+        max_concurrency: null,
+        max_queue_depth: 0,
+      }),
+    );
+  });
+
+  it("rejects a real duplicate deployment ID branch", () => {
+    const draft = deploymentFormDefaults("duplicate", "model", "q4_k_m");
+    const result = parseDeploymentForm(draft, {
+      requireLicenseAcknowledgement: false,
+      existingDeploymentIds: ["duplicate"],
+      catalog: {
+        schema_version: 1,
+        catalog_revision: "catalog-v2",
+        models: { model: catalogEntry() },
+      },
+    });
+
+    expect(result.errors.deploymentId).toMatch(/already exists/i);
+  });
+
+  it("rejects duplicate and out-of-bounds label and spread input", () => {
+    const duplicate = deploymentFormDefaults("placement", "model", "q4_k_m");
+    duplicate.requiredLabels = "pool=gpu\npool=cpu";
+    duplicate.spreadBy = "zone\nzone";
+    const duplicateResult = parseDeploymentForm(duplicate, {
+      requireLicenseAcknowledgement: false,
+      existingDeploymentIds: [],
+      catalog: {
+        schema_version: 1,
+        catalog_revision: "catalog-v2",
+        models: { model: catalogEntry() },
+      },
+    });
+    expect(duplicateResult.errors.requiredLabels).toMatch(/duplicated/i);
+    expect(duplicateResult.errors.spreadBy).toMatch(/unique/i);
+
+    const bounded = deploymentFormDefaults("placement", "model", "q4_k_m");
+    bounded.requiredLabels = `pool=${"x".repeat(257)}`;
+    bounded.spreadBy = Array.from({ length: 9 }, (_, index) => `zone${index}`).join(
+      "\n",
+    );
+    const boundedResult = parseDeploymentForm(bounded, {
+      requireLicenseAcknowledgement: false,
+      existingDeploymentIds: [],
+      catalog: {
+        schema_version: 1,
+        catalog_revision: "catalog-v2",
+        models: { model: catalogEntry() },
+      },
+    });
+    expect(boundedResult.errors.requiredLabels).toMatch(/bounded/i);
+    expect(boundedResult.errors.spreadBy).toMatch(/at most 8/i);
+  });
+
+  it("rejects stale model and exact variant selections against the current catalog", () => {
+    const catalog: CatalogResponse = {
+      schema_version: 1,
+      catalog_revision: "catalog-v2",
+      models: { current: catalogEntry() },
+    };
+    const staleModel = deploymentFormDefaults("stale-model", "missing", "q4_k_m");
+    const staleVariant = deploymentFormDefaults("stale-variant", "current", "gone");
+    const nonRunnable = deploymentFormDefaults("non-runnable", "current", "config");
+    catalog.models.current.variants.push({
+      ...catalog.models.current.variants[0],
+      id: "config",
+      stability: "config_only",
+    });
+
+    expect(
+      parseDeploymentForm(staleModel, {
+        requireLicenseAcknowledgement: false,
+        existingDeploymentIds: [],
+        catalog,
+      }).errors.model,
+    ).toMatch(/catalog/i);
+    expect(
+      parseDeploymentForm(staleVariant, {
+        requireLicenseAcknowledgement: false,
+        existingDeploymentIds: [],
+        catalog,
+      }).errors.variant,
+    ).toMatch(/catalog/i);
+    expect(
+      parseDeploymentForm(nonRunnable, {
+        requireLicenseAcknowledgement: false,
+        existingDeploymentIds: [],
+        catalog,
+      }).errors.variant,
+    ).toMatch(/configuration only/i);
+  });
+
+  it.each(PROTOTYPE_IDENTIFIERS)(
+    "parses and serializes the prototype-shaped required label %s",
+    (identifier) => {
+      const draft = deploymentFormDefaults("safe-labels", "model", "q4_k_m");
+      draft.requiredLabels = `${identifier}=gpu`;
+
+      const result = parseDeploymentForm(draft, {
+        requireLicenseAcknowledgement: false,
+        existingDeploymentIds: [],
+        catalog: {
+          schema_version: 1,
+          catalog_revision: "catalog-v2",
+          models: { model: catalogEntry() },
+        },
+      });
+
+      expect(result.errors).toEqual({});
+      expect(result.value).not.toBeNull();
+      const labels = result.value?.deployment.required_labels as Record<string, string>;
+      expect(Object.getPrototypeOf(labels)).toBeNull();
+      expect(Object.hasOwn(labels, identifier)).toBe(true);
+      expect(labels[identifier]).toBe("gpu");
+      expect(JSON.parse(JSON.stringify(labels))).toEqual({ [identifier]: "gpu" });
+    },
+  );
+
   it("rejects unsafe identifiers, duplicates, invalid automatic replicas, and missing acknowledgement", () => {
     const draft = deploymentFormDefaults(
       "bad/id",
@@ -296,6 +494,11 @@ describe("model management presentation", () => {
     const result = parseDeploymentForm(draft, {
       requireLicenseAcknowledgement: true,
       existingDeploymentIds: ["bad/id"],
+      catalog: {
+        schema_version: 1,
+        catalog_revision: "catalog-v2",
+        models: { "qwen2.5-0.5b-instruct": catalogEntry() },
+      },
     });
 
     expect(result.value).toBeNull();
@@ -309,7 +512,7 @@ describe("model management presentation", () => {
   it.each<DeploymentRuntimeState>(["ready", "preparing", "draining"])(
     "blocks persistent removal while runtime state is %s",
     (state) => {
-      expect(deploymentRemovalGuard(state)).toEqual({
+      expect(deploymentRemovalGuard(state, true)).toEqual({
         allowed: false,
         reason:
           "Stop this deployment before removing it from desired state.",
@@ -324,12 +527,23 @@ describe("model management presentation", () => {
     "cached",
     "stopped",
     "failed",
-  ])("allows persistent removal while runtime state is %s", (state) => {
-    expect(deploymentRemovalGuard(state)).toEqual({
+  ])("allows persistent removal with a fresh snapshot while runtime state is %s", (state) => {
+    expect(deploymentRemovalGuard(state, true)).toEqual({
       allowed: true,
       reason: null,
     });
   });
+
+  it.each<DeploymentRuntimeState | null>([null, "stopped", "ready"])(
+    "blocks removal with refresh guidance when runtime state %s is absent or stale",
+    (state) => {
+      expect(deploymentRemovalGuard(state, false)).toEqual({
+        allowed: false,
+        reason:
+          "Refresh runtime lifecycle status before removing this deployment.",
+      });
+    },
+  );
 
   it("applies create, rename, and remove changes as complete desired maps", () => {
     const existing = deploymentDefaults("existing", "q4_k_m");
@@ -355,6 +569,52 @@ describe("model management presentation", () => {
       }),
     ).toEqual({ renamed: replacement });
   });
+
+  it.each(PROTOTYPE_IDENTIFIERS)(
+    "creates, renames, deeply clones, and serializes deployment ID %s safely",
+    (identifier) => {
+      const source = deploymentDefaults("source", "q4_k_m");
+      source.required_labels = ownRecord([[identifier, "worker"]]);
+      const created = applyDeploymentChange(ownRecord([]), {
+        kind: "upsert",
+        deploymentId: identifier,
+        deployment: source,
+      });
+
+      expect(Object.getPrototypeOf(created)).toBeNull();
+      expect(Object.hasOwn(created, identifier)).toBe(true);
+      expect(created[identifier]).not.toBe(source);
+      expect(Object.getPrototypeOf(created[identifier].required_labels)).toBeNull();
+      expect(created[identifier].required_labels).not.toBe(source.required_labels);
+      expect(JSON.parse(JSON.stringify(created))).toEqual({
+        [identifier]: expect.objectContaining({
+          model: "source",
+          required_labels: { [identifier]: "worker" },
+        }),
+      });
+
+      const renamed = applyDeploymentChange(created, {
+        kind: "upsert",
+        originalDeploymentId: identifier,
+        deploymentId: `renamed-${identifier}`,
+        deployment: source,
+      });
+      expect(Object.hasOwn(renamed, identifier)).toBe(false);
+      expect(Object.hasOwn(renamed, `renamed-${identifier}`)).toBe(true);
+
+      const renamedToSpecial = applyDeploymentChange(
+        ownRecord([["ordinary", source]]),
+        {
+          kind: "upsert",
+          originalDeploymentId: "ordinary",
+          deploymentId: identifier,
+          deployment: source,
+        },
+      );
+      expect(Object.hasOwn(renamedToSpecial, "ordinary")).toBe(false);
+      expect(Object.hasOwn(renamedToSpecial, identifier)).toBe(true);
+    },
+  );
 
   it("routes complete-map replacement through local optimistic concurrency", () => {
     const document = deploymentDocument("admin_managed", false);
@@ -422,6 +682,38 @@ describe("model management presentation", () => {
     ).toEqual({ kind: "unsafe_revision" });
   });
 
+  it("allows only locally advanceable optimistic revisions", () => {
+    const initial = deploymentDocument("admin_managed", false);
+    expect(
+      buildDeploymentMutation({
+        document: initial,
+        clusterAuthority: null,
+        catalogRevision: "catalog-v2",
+        deployments: {},
+      }).kind,
+    ).toBe("local_put");
+
+    initial.revision = Number.MAX_SAFE_INTEGER - 1;
+    expect(
+      buildDeploymentMutation({
+        document: initial,
+        clusterAuthority: null,
+        catalogRevision: "catalog-v2",
+        deployments: {},
+      }).kind,
+    ).toBe("local_put");
+
+    initial.revision = Number.MAX_SAFE_INTEGER;
+    expect(
+      buildDeploymentMutation({
+        document: initial,
+        clusterAuthority: null,
+        catalogRevision: "catalog-v2",
+        deployments: {},
+      }),
+    ).toEqual({ kind: "unsafe_revision" });
+  });
+
   it("preserves the attempted map and compares it with the reloaded conflict state", () => {
     const attempted = {
       changed: deploymentDefaults("operator-choice", "q4_k_m"),
@@ -450,6 +742,30 @@ describe("model management presentation", () => {
       preserved: [],
     });
   });
+
+  it.each(PROTOTYPE_IDENTIFIERS)(
+    "compares prototype-shaped deployment ID %s using own properties only",
+    (identifier) => {
+      const attempted = ownRecord([
+        [identifier, deploymentDefaults("operator-choice", "q4_k_m")],
+      ]);
+      const conflict = createDeploymentConflictState({
+        expectedRevision: 1,
+        currentRevision: 2,
+        attemptedDeployments: attempted,
+        currentDeployments: ownRecord([]),
+      });
+
+      expect(conflict.comparison).toEqual({
+        added: [identifier],
+        changed: [],
+        removed: [],
+        preserved: [],
+      });
+      expect(Object.getPrototypeOf(conflict.attemptedDeployments)).toBeNull();
+      expect(Object.hasOwn(conflict.attemptedDeployments, identifier)).toBe(true);
+    },
+  );
 
   it("keeps configured stopped deployments separate from canonical runtime state", () => {
     const desired = {
@@ -517,4 +833,30 @@ describe("model management presentation", () => {
       },
     ]);
   });
+
+  it.each(PROTOTYPE_IDENTIFIERS)(
+    "keeps runtime-only deployment ID %s out of the inherited desired map",
+    (identifier) => {
+      const runtime = {
+        deployment: identifier,
+        generation: 1,
+        state: "stopped" as const,
+        active_requests: 0,
+        queued_requests: 0,
+        engine: null,
+        driver_availability: null,
+        artifact_digest: null,
+        selected_devices: [],
+        memory: null,
+        port: null,
+        reason_code: null,
+        job_id: null,
+        last_error: null,
+      };
+
+      expect(deploymentRows({}, [runtime])).toEqual([
+        { deploymentId: identifier, desired: null, runtime },
+      ]);
+    },
+  );
 });

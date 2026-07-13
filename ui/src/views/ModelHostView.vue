@@ -27,6 +27,7 @@ const {
   clusterBundle,
   clusterAuthority,
   runtimeDeployments,
+  runtimeStatusCurrent,
   rows,
   readyDeployments,
   reservedMemory,
@@ -34,7 +35,9 @@ const {
   catalogModels,
   previewOnlyCatalog,
   throughputByModel,
+  initialClusterBundleAbsent,
   canMutate,
+  conflictRetryAllowed,
   persistentGuidance,
   authorityDescription,
   refreshing,
@@ -44,6 +47,7 @@ const {
   saveDeployment,
   removeDeployment,
   retryConflict,
+  reloadConflict,
   dismissConflict,
   runLifecycle,
   closeEditor,
@@ -99,8 +103,8 @@ function confirmRemove(row: ModelDeploymentRow) {
     :cluster-authority-error="clusterStatusReq.error.value ?? null"
     :cluster-bundle-error="clusterBundleReq.error.value ?? null"
     :cluster-authority-mode="deploymentDocument?.authority === 'cluster_authority'"
-    :active-cluster-revision="clusterAuthority?.active_revision ?? null"
-    :catalog-loaded="Boolean(catalog)"
+    :initial-cluster-bundle-absent="initialClusterBundleAbsent"
+    :catalog-loaded="catalogReq.succeeded.value"
     :catalog-model-count="catalogModels.length"
     :preview-only-catalog="previewOnlyCatalog"
     :blockers="blockers"
@@ -109,12 +113,14 @@ function confirmRemove(row: ModelDeploymentRow) {
     :editor-open="Boolean(editor)"
     :mutation-error="mutationError"
     :mutation-busy="mutationBusy"
+    :conflict-retry-allowed="conflictRetryAllowed"
     @retry-status="statusReq.run()"
     @retry-desired="deploymentsReq.run()"
     @retry-catalog="catalogReq.run()"
     @retry-authority="clusterStatusReq.run()"
     @retry-bundle="clusterBundleReq.run()"
     @retry-conflict="retryConflict"
+    @reload-conflict="reloadConflict"
     @dismiss-conflict="dismissConflict"
   />
 
@@ -131,6 +137,7 @@ function confirmRemove(row: ModelDeploymentRow) {
     <ModelDeploymentTable
       :rows="rows"
       :can-mutate="canMutate"
+      :runtime-status-current="runtimeStatusCurrent"
       :persistent-read-only-reason="persistentGuidance"
       :lifecycle-busy="lifecycleBusy"
       :mutation-busy="mutationBusy"
@@ -160,10 +167,12 @@ function confirmRemove(row: ModelDeploymentRow) {
     :initial-deployment-id="editor.originalDeploymentId"
     :initial-deployment="editor.initialDeployment"
     :saving="mutationBusy"
+    :can-save="canMutate && (!conflict || conflictRetryAllowed)"
     :submit-error="mutationError"
     :conflict="conflict"
     @close="closeEditor"
     @save="saveDeployment"
+    @reload-conflict="reloadConflict"
   />
 </template>
 

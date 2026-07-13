@@ -10,13 +10,15 @@ import { useAsync } from "./useAsync";
 import {
   applyDeploymentChange,
   buildDeploymentMutation,
-  createDeploymentConflictState,
+  createPendingDeploymentConflictState,
   deployableCatalogEntries,
   deployableCatalogVariants,
   deploymentMutationMode,
   deploymentRemovalGuard,
   deploymentRows,
-  nextClusterRevision,
+  failDeploymentConflictReload,
+  nextSafeRevision,
+  reconcileDeploymentConflictState,
   type DeploymentChange,
   type DeploymentConflictState,
   type DeploymentFormValue,
@@ -43,18 +45,25 @@ export function useModelManagement() {
   const mutationError = ref<string | null>(null);
   const conflict = ref<DeploymentConflictState | null>(null);
   const pendingConflictChange = ref<DeploymentChange | null>(null);
+  const pendingConflictMode = ref<"local_put" | "signed_cluster_post" | null>(
+    null,
+  );
   const editor = ref<ModelDeploymentEditorState | null>(null);
 
-  function refresh() {
-    void statusReq.run();
-    void catalogReq.run();
-    void deploymentsReq.run();
-    void clusterStatusReq.run();
-    void clusterBundleReq.run();
-    void metricsReq.run();
+  async function refresh(): Promise<void> {
+    await Promise.all([
+      statusReq.run(),
+      catalogReq.run(),
+      deploymentsReq.run(),
+      clusterStatusReq.run(),
+      clusterBundleReq.run(),
+      metricsReq.run(),
+    ]);
   }
 
-  onMounted(refresh);
+  onMounted(() => {
+    void refresh();
+  });
 
   const status = computed(() => statusReq.data.value);
   const catalog = computed(() => catalogReq.data.value);
@@ -65,6 +74,9 @@ export function useModelManagement() {
   );
   const runtimeDeployments = computed<DeploymentRuntimeStatus[]>(
     () => status.value?.deployments ?? [],
+  );
+  const runtimeStatusCurrent = computed(
+    () => statusReq.succeeded.value && statusReq.error.value === null,
   );
   const rows = computed(() =>
     deploymentRows(
@@ -102,7 +114,8 @@ export function useModelManagement() {
 
   const throughputByModel = computed<Record<string, number>>(() => {
     const text = metricsReq.data.value;
-    if (!text) return {};
+    const throughput = Object.create(null) as Record<string, number>;
+    if (!text) return throughput;
     const values = histogramAvgByLabel(
       findFamily(
         parsePrometheus(text),
@@ -110,7 +123,8 @@ export function useModelManagement() {
       ),
       "model",
     );
-    return Object.fromEntries(values.map((value) => [value.key, value.value]));
+    for (const value of values) throughput[value.key] = value.value;
+    return throughput;
   });
 
   const mutationMode = computed(() =>
@@ -118,27 +132,64 @@ export function useModelManagement() {
       ? deploymentMutationMode(deploymentDocument.value, clusterAuthority.value)
       : "read_only",
   );
-  const hasSafeClusterRevision = computed(
+  const catalogProofCurrent = computed(
+    () => catalogReq.succeeded.value && catalogReq.error.value === null,
+  );
+  const managementProofCurrent = computed(
+    () => deploymentsReq.succeeded.value && deploymentsReq.error.value === null,
+  );
+  const clusterAuthorityProofCurrent = computed(
+    () => clusterStatusReq.succeeded.value && clusterStatusReq.error.value === null,
+  );
+  const initialClusterBundleAbsent = computed(
     () =>
-      mutationMode.value !== "signed_cluster_post" ||
-      nextClusterRevision(clusterAuthority.value?.active_revision ?? null) !== null,
+      clusterBundleReq.error.value?.status === 404 &&
+      !clusterBundleReq.loading.value &&
+      clusterAuthorityProofCurrent.value &&
+      clusterAuthority.value?.active_revision === null,
+  );
+  const clusterBundleProofCurrent = computed(
+    () =>
+      clusterBundleReq.succeeded.value || initialClusterBundleAbsent.value,
+  );
+  const hasSafePersistentRevision = computed(
+    () => {
+      if (mutationMode.value === "signed_cluster_post") {
+        return (
+          nextSafeRevision(clusterAuthority.value?.active_revision ?? null) !==
+          null
+        );
+      }
+      if (mutationMode.value === "local_put") {
+        return nextSafeRevision(deploymentDocument.value?.revision ?? null) !== null;
+      }
+      return true;
+    },
   );
   const clusterBundleAllowsPublication = computed(() => {
     if (deploymentDocument.value?.authority !== "cluster_authority") return true;
-    if (clusterBundle.value) return !clusterBundle.value.read_only;
-    if (clusterBundleReq.error.value?.status === 404) {
-      return clusterAuthority.value?.active_revision === null;
-    }
-    return false;
+    if (!clusterBundleProofCurrent.value) return false;
+    if (initialClusterBundleAbsent.value) return true;
+    return clusterBundle.value?.read_only === false;
   });
   const canMutate = computed(
     () =>
       Boolean(deploymentDocument.value) &&
       Boolean(catalog.value) &&
+      managementProofCurrent.value &&
+      catalogProofCurrent.value &&
       catalogModels.value.length > 0 &&
       mutationMode.value !== "read_only" &&
-      hasSafeClusterRevision.value &&
-      clusterBundleAllowsPublication.value,
+      hasSafePersistentRevision.value &&
+      (deploymentDocument.value?.authority !== "cluster_authority" ||
+        (clusterAuthorityProofCurrent.value &&
+          clusterBundleAllowsPublication.value)),
+  );
+  const conflictRetryAllowed = computed(
+    () =>
+      Boolean(conflict.value?.comparison) &&
+      canMutate.value &&
+      !mutationBusy.value,
   );
 
   const persistentGuidance = computed(() => {
@@ -149,28 +200,34 @@ export function useModelManagement() {
     if (document.authority === "file_managed") {
       return "Persistent changes are read-only here. Edit proxy.model_host.deployments in sb.yml, then reload SBproxy.";
     }
+    if (!managementProofCurrent.value) {
+      return "Persistent changes are paused until the current desired deployment map is reloaded successfully.";
+    }
+    if (document.authority === "admin_managed" && document.read_only) {
+      return "Persistent changes are read-only on this node. Use the admin-managed node that owns the deployment store.";
+    }
     if (document.authority === "cluster_authority") {
-      if (clusterStatusReq.error.value || !clusterAuthority.value) {
+      if (!clusterAuthorityProofCurrent.value || !clusterAuthority.value) {
         return "Persistent changes are read-only until this node can verify cluster deployment authority state.";
       }
-      if (clusterAuthority.value.read_only || !clusterAuthority.value.configured) {
+      if (!clusterAuthority.value.configured) {
+        return "Persistent changes are read-only because no cluster deployment authority is configured.";
+      }
+      if (clusterAuthority.value.read_only) {
         return "Persistent changes are read-only on this node. Open this view on the configured authority node to publish a signed deployment revision.";
       }
       if (!clusterBundleAllowsPublication.value) {
         return "Persistent changes are paused until the active signed deployment bundle can be verified on this authority node.";
       }
-      if (!hasSafeClusterRevision.value) {
-        return "The active cluster revision cannot be advanced safely in this browser. Use an authority workflow that preserves the full revision integer.";
-      }
     }
-    if (document.read_only) {
-      return "Persistent changes are read-only on this node. Use the admin-managed node that owns the deployment store.";
-    }
-    if (!catalog.value) {
+    if (!catalogProofCurrent.value || !catalog.value) {
       return "Persistent changes are paused until the active model catalog is available.";
     }
     if (catalogModels.value.length === 0) {
-      return "Persistent changes are paused because the active catalog has no exact variants with both engines and accelerators.";
+      return "Persistent changes are paused because the active catalog has no complete stable or preview variants with engines and accelerators.";
+    }
+    if (!hasSafePersistentRevision.value) {
+      return "The active deployment revision cannot be advanced safely through JSON. Use an authority workflow that preserves the full revision integer.";
     }
     return null;
   });
@@ -182,11 +239,19 @@ export function useModelManagement() {
       return "SBproxy configuration owns the complete deployment map.";
     }
     if (document.authority === "admin_managed") {
-      return "This node's versioned admin store owns the complete deployment map.";
+      return document.read_only
+        ? "This node reads an admin-managed deployment map but cannot change its persistent state."
+        : "This node's versioned admin store owns and can replace the complete deployment map.";
     }
-    return clusterAuthority.value?.read_only
-      ? "This node verifies signed deployment revisions published by the cluster authority."
-      : "This authority node signs and publishes complete deployment revisions.";
+    if (!clusterAuthorityProofCurrent.value || !clusterAuthority.value) {
+      return "Cluster deployment authority ownership has not been verified on this node.";
+    }
+    if (!clusterAuthority.value.configured) {
+      return "No cluster deployment authority is configured, so this node cannot sign revisions.";
+    }
+    return clusterAuthority.value.read_only
+      ? "This node verifies signed deployment revisions; the configured authority node signs them."
+      : "This configured authority node signs and publishes complete deployment revisions.";
   });
 
   const refreshing = computed(
@@ -194,7 +259,9 @@ export function useModelManagement() {
       statusReq.loading.value ||
       catalogReq.loading.value ||
       deploymentsReq.loading.value ||
-      clusterStatusReq.loading.value,
+      clusterStatusReq.loading.value ||
+      clusterBundleReq.loading.value ||
+      metricsReq.loading.value,
   );
 
   function errorText(error: unknown): string {
@@ -212,19 +279,77 @@ export function useModelManagement() {
     return error instanceof Error ? error.message : "The operation failed.";
   }
 
-  function currentPersistentRevision(): number | null {
-    if (mutationMode.value === "signed_cluster_post") {
+  function currentPersistentRevision(
+    mode: "local_put" | "signed_cluster_post",
+  ): number | null {
+    if (mode === "signed_cluster_post") {
       return clusterAuthority.value?.active_revision ?? null;
     }
     return deploymentDocument.value?.revision ?? null;
   }
 
-  async function reloadPersistentState() {
-    await Promise.all([
-      deploymentsReq.run(),
-      clusterStatusReq.run(),
-      clusterBundleReq.run(),
-    ]);
+  function proofFailure(label: string, error: ApiError | null): string {
+    return `${label}: ${error ? errorText(error) : "fresh proof is unavailable"}`;
+  }
+
+  async function reloadConflictProof(): Promise<boolean> {
+    const pending = conflict.value;
+    const mode = pendingConflictMode.value;
+    if (!pending || !mode) return false;
+
+    const requests = [catalogReq.run(), deploymentsReq.run()];
+    if (mode === "signed_cluster_post") {
+      requests.push(clusterStatusReq.run(), clusterBundleReq.run());
+    }
+    await Promise.all(requests);
+
+    const failures: string[] = [];
+    if (!catalogProofCurrent.value) {
+      failures.push(proofFailure("Catalog reload failed", catalogReq.error.value));
+    }
+    if (!managementProofCurrent.value) {
+      failures.push(
+        proofFailure("Desired-state reload failed", deploymentsReq.error.value),
+      );
+    }
+    if (mode === "signed_cluster_post") {
+      if (!clusterAuthorityProofCurrent.value) {
+        failures.push(
+          proofFailure(
+            "Cluster authority reload failed",
+            clusterStatusReq.error.value,
+          ),
+        );
+      }
+      if (!clusterBundleProofCurrent.value) {
+        failures.push(
+          proofFailure(
+            "Signed bundle reload failed",
+            clusterBundleReq.error.value,
+          ),
+        );
+      }
+    }
+
+    const currentDocument = deploymentDocument.value;
+    if (!currentDocument) {
+      failures.push("Desired-state reload failed: no current map was returned");
+    }
+    if (failures.length > 0 || !currentDocument) {
+      const reloadError = failures.join(" ");
+      conflict.value = failDeploymentConflictReload(pending, reloadError);
+      mutationError.value =
+        `Revision conflict ${pending.status}. The raw response and your draft are preserved. ${reloadError}`;
+      return false;
+    }
+
+    conflict.value = reconcileDeploymentConflictState(pending, {
+      currentRevision: currentPersistentRevision(mode),
+      currentDeployments: currentDocument.deployments,
+    });
+    mutationError.value =
+      "A revision conflict occurred. The current authority state was reloaded and your draft is preserved for comparison.";
+    return true;
   }
 
   async function mutateDesiredState(change: DeploymentChange) {
@@ -249,7 +374,7 @@ export function useModelManagement() {
     }
     if (command.kind === "unsafe_revision") {
       mutationError.value =
-        "The active cluster revision cannot be advanced safely in this browser.";
+        "The active deployment revision cannot be advanced safely through JSON.";
       return;
     }
 
@@ -270,6 +395,7 @@ export function useModelManagement() {
       }
       conflict.value = null;
       pendingConflictChange.value = null;
+      pendingConflictMode.value = null;
       editor.value = null;
       banner.value = {
         tone: "ok",
@@ -287,17 +413,16 @@ export function useModelManagement() {
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
         pendingConflictChange.value = change;
-        await reloadPersistentState();
-        const current = deploymentDocument.value?.deployments ?? document.deployments;
-        conflict.value = createDeploymentConflictState({
+        pendingConflictMode.value = command.kind;
+        conflict.value = createPendingDeploymentConflictState({
+          status: error.status,
+          body: error.body,
           expectedRevision,
-          currentRevision: currentPersistentRevision(),
           attemptedDeployments: attempted,
-          currentDeployments: current,
         });
-        mutationError.value = deploymentsReq.error.value
-          ? "A revision conflict occurred. Your draft is preserved, but the current deployment map could not be reloaded. Retry desired state before saving again."
-          : "A revision conflict occurred. The current deployment map was reloaded and your draft is preserved for comparison.";
+        mutationError.value =
+          `Revision conflict ${error.status}. The raw response and your draft are preserved while current authority state reloads.`;
+        await reloadConflictProof();
       } else {
         mutationError.value = errorText(error);
       }
@@ -310,6 +435,7 @@ export function useModelManagement() {
     mutationError.value = null;
     conflict.value = null;
     pendingConflictChange.value = null;
+    pendingConflictMode.value = null;
     if (!canMutate.value || !catalog.value) {
       banner.value = {
         tone: "err",
@@ -325,16 +451,22 @@ export function useModelManagement() {
     mutationError.value = null;
     conflict.value = null;
     pendingConflictChange.value = null;
+    pendingConflictMode.value = null;
     editor.value = {
       originalDeploymentId: row.deploymentId,
       initialDeployment: row.desired,
     };
   }
 
-  function saveDeployment(value: DeploymentFormValue) {
+  async function saveDeployment(value: DeploymentFormValue): Promise<void> {
     const activeEditor = editor.value;
     if (!activeEditor) return;
-    void mutateDesiredState({
+    if (conflict.value && !conflict.value.comparison) {
+      mutationError.value =
+        "Reload current authority state successfully before saving the preserved draft.";
+      return;
+    }
+    await mutateDesiredState({
       kind: "upsert",
       originalDeploymentId: activeEditor.originalDeploymentId,
       deploymentId: value.deploymentId,
@@ -342,8 +474,11 @@ export function useModelManagement() {
     });
   }
 
-  function removeDeployment(row: ModelDeploymentRow) {
-    const guard = deploymentRemovalGuard(row.runtime?.state ?? null);
+  async function removeDeployment(row: ModelDeploymentRow): Promise<void> {
+    const guard = deploymentRemovalGuard(
+      row.runtime?.state ?? null,
+      runtimeStatusCurrent.value,
+    );
     if (!guard.allowed) {
       banner.value = { tone: "warn", text: guard.reason as string };
       return;
@@ -357,18 +492,29 @@ export function useModelManagement() {
     }
     conflict.value = null;
     pendingConflictChange.value = null;
-    void mutateDesiredState({ kind: "remove", deploymentId: row.deploymentId });
+    pendingConflictMode.value = null;
+    await mutateDesiredState({ kind: "remove", deploymentId: row.deploymentId });
   }
 
-  function retryConflict() {
-    if (pendingConflictChange.value) {
-      void mutateDesiredState(pendingConflictChange.value);
+  async function retryConflict(): Promise<void> {
+    if (!conflictRetryAllowed.value || !pendingConflictChange.value) return;
+    await mutateDesiredState(pendingConflictChange.value);
+  }
+
+  async function reloadConflict(): Promise<void> {
+    if (!conflict.value || !pendingConflictMode.value || mutationBusy.value) return;
+    mutationBusy.value = true;
+    try {
+      await reloadConflictProof();
+    } finally {
+      mutationBusy.value = false;
     }
   }
 
   function dismissConflict() {
     conflict.value = null;
     pendingConflictChange.value = null;
+    pendingConflictMode.value = null;
     mutationError.value = null;
   }
 
@@ -405,6 +551,7 @@ export function useModelManagement() {
     editor.value = null;
     conflict.value = null;
     pendingConflictChange.value = null;
+    pendingConflictMode.value = null;
     mutationError.value = null;
   }
 
@@ -426,6 +573,7 @@ export function useModelManagement() {
     clusterBundle,
     clusterAuthority,
     runtimeDeployments,
+    runtimeStatusCurrent,
     rows,
     readyDeployments,
     reservedMemory,
@@ -433,7 +581,9 @@ export function useModelManagement() {
     catalogModels,
     previewOnlyCatalog,
     throughputByModel,
+    initialClusterBundleAbsent,
     canMutate,
+    conflictRetryAllowed,
     persistentGuidance,
     authorityDescription,
     refreshing,
@@ -443,6 +593,7 @@ export function useModelManagement() {
     saveDeployment,
     removeDeployment,
     retryConflict,
+    reloadConflict,
     dismissConflict,
     runLifecycle,
     closeEditor,

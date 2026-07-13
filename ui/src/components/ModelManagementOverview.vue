@@ -104,6 +104,11 @@ defineProps<{
   border-left: 4px solid var(--sb-navy);
 }
 
+.ownership-copy,
+.ownership-title {
+  min-width: 0;
+}
+
 .ownership-copy .sb-eyebrow {
   margin: 0 0 var(--sb-space-1);
 }
@@ -119,6 +124,7 @@ defineProps<{
   margin: var(--sb-space-2) 0 0;
   color: var(--sb-text-muted);
   font-size: 0.82rem;
+  overflow-wrap: anywhere;
 }
 
 .ownership-copy .ownership-guidance {

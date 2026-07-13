@@ -12,6 +12,7 @@ import StatusBadge from "./StatusBadge.vue";
 const props = defineProps<{
   rows: readonly ModelDeploymentRow[];
   canMutate: boolean;
+  runtimeStatusCurrent: boolean;
   persistentReadOnlyReason?: string | null;
   lifecycleBusy?: string;
   mutationBusy?: boolean;
@@ -65,12 +66,27 @@ function resetDisabled(row: ModelDeploymentRow): boolean {
 }
 
 function removeReason(row: ModelDeploymentRow): string | null {
-  const runtimeReason = deploymentRemovalGuard(row.runtime?.state ?? null).reason;
+  const runtimeReason = deploymentRemovalGuard(
+    row.runtime?.state ?? null,
+    props.runtimeStatusCurrent,
+  ).reason;
   if (runtimeReason) return runtimeReason;
   if (!props.canMutate) {
     return props.persistentReadOnlyReason ?? "Persistent desired state is read-only.";
   }
   return null;
+}
+
+function throughputText(row: ModelDeploymentRow): string | null {
+  const model = row.desired?.model;
+  if (
+    !model ||
+    !props.throughputByModel ||
+    !Object.hasOwn(props.throughputByModel, model)
+  ) {
+    return null;
+  }
+  return `${props.throughputByModel[model].toFixed(1)} tok/s average`;
 }
 
 function labels(row: ModelDeploymentRow): string {
@@ -96,11 +112,11 @@ function labels(row: ModelDeploymentRow): string {
         </thead>
         <tbody>
           <tr v-for="row in rows" :key="row.deploymentId">
-            <td>
+            <th scope="row">
               <strong class="sb-mono deployment-id">{{ row.deploymentId }}</strong>
               <span v-if="row.desired" class="table-detail">Configured desired state</span>
               <span v-else class="table-detail table-detail--warn">Runtime status only</span>
-            </td>
+            </th>
             <td>
               <template v-if="row.desired">
                 <strong class="sb-mono">{{ row.desired.model }}</strong>
@@ -133,11 +149,8 @@ function labels(row: ModelDeploymentRow): string {
                 <span v-if="row.runtime.memory" class="table-detail">
                   {{ formatBytes(row.runtime.memory.total_bytes) }} reserved
                 </span>
-                <span
-                  v-if="row.desired && throughputByModel?.[row.desired.model] !== undefined"
-                  class="table-detail"
-                >
-                  {{ throughputByModel[row.desired.model].toFixed(1) }} tok/s average
+                <span v-if="throughputText(row)" class="table-detail">
+                  {{ throughputText(row) }}
                 </span>
                 <span v-if="row.runtime.last_error" class="runtime-error">
                   {{ row.runtime.last_error }}
@@ -169,9 +182,10 @@ function labels(row: ModelDeploymentRow): string {
               <span v-else class="table-detail">Desired policy could not be loaded.</span>
             </td>
             <td class="actions-cell">
-              <div class="action-group" aria-label="Lifecycle actions">
+              <div class="action-group" :aria-label="`Lifecycle actions for ${row.deploymentId}`">
                 <button
                   class="sb-btn sb-btn--sm"
+                  :aria-label="`Load ${row.deploymentId}`"
                   :disabled="loadDisabled(row)"
                   :title="row.runtime?.state === 'ready' ? 'Deployment is already ready.' : undefined"
                   @click="$emit('load', row.deploymentId)"
@@ -180,6 +194,7 @@ function labels(row: ModelDeploymentRow): string {
                 </button>
                 <button
                   class="sb-btn sb-btn--sm"
+                  :aria-label="`Stop ${row.deploymentId}`"
                   :disabled="stopDisabled(row)"
                   :title="row.runtime?.state === 'draining' ? 'Deployment is already draining.' : undefined"
                   @click="$emit('stop', row.deploymentId)"
@@ -188,6 +203,7 @@ function labels(row: ModelDeploymentRow): string {
                 </button>
                 <button
                   class="sb-btn sb-btn--sm"
+                  :aria-label="`Reset ${row.deploymentId}`"
                   :disabled="resetDisabled(row)"
                   title="Reset is available after a retained runtime failure."
                   @click="$emit('reset', row.deploymentId)"
@@ -195,9 +211,14 @@ function labels(row: ModelDeploymentRow): string {
                   {{ lifecycleIsBusy("reset", row.deploymentId) ? "Resetting..." : "Reset" }}
                 </button>
               </div>
-              <div v-if="row.desired" class="action-group action-group--persistent" aria-label="Desired state actions">
+              <div
+                v-if="row.desired"
+                class="action-group action-group--persistent"
+                :aria-label="`Desired state actions for ${row.deploymentId}`"
+              >
                 <button
                   class="sb-btn sb-btn--sm"
+                  :aria-label="`Edit ${row.deploymentId}`"
                   :disabled="!canMutate || mutationBusy"
                   :title="!canMutate ? persistentReadOnlyReason ?? undefined : undefined"
                   @click="$emit('edit', row)"
@@ -206,6 +227,7 @@ function labels(row: ModelDeploymentRow): string {
                 </button>
                 <button
                   class="sb-btn sb-btn--sm sb-btn--danger"
+                  :aria-label="`Remove ${row.deploymentId}`"
                   :disabled="Boolean(removeReason(row)) || mutationBusy"
                   :title="removeReason(row) ?? undefined"
                   @click="$emit('remove', row)"
@@ -244,6 +266,27 @@ function labels(row: ModelDeploymentRow): string {
   min-width: 1120px;
 }
 
+.deployment-table td,
+.deployment-table tbody th {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.deployment-table tbody th {
+  padding: 10px 12px;
+  color: var(--sb-text);
+  border-bottom: 1px solid var(--sb-border);
+  font-size: inherit;
+  text-transform: none;
+  letter-spacing: normal;
+  vertical-align: top;
+  white-space: normal;
+}
+
+.deployment-table tbody tr:last-child th {
+  border-bottom: none;
+}
+
 .deployment-table th:nth-child(1) {
   width: 15%;
 }
@@ -272,6 +315,7 @@ function labels(row: ModelDeploymentRow): string {
   display: block;
   margin-top: var(--sb-space-1);
   font-size: 0.72rem;
+  overflow-wrap: anywhere;
 }
 
 .table-detail {

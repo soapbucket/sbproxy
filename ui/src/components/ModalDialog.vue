@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onMounted, onUnmounted, ref, useId } from "vue";
+import { focusTargetForTab } from "../lib/dialog-focus";
 
 const props = defineProps<{ title: string; wide?: boolean }>();
 const emit = defineEmits<{ (e: "close"): void }>();
@@ -15,20 +16,38 @@ function onKey(e: KeyboardEvent) {
   if (e.key !== "Tab" || !dialog.value) return;
   const focusable = [...dialog.value.querySelectorAll<HTMLElement>(
     'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
-  )].filter((element) => !element.hasAttribute("hidden"));
+  )].filter((element) => {
+    if (
+      element.closest("[hidden]") ||
+      element.closest("[inert]") ||
+      element.closest('[aria-hidden="true"]')
+    ) {
+      return false;
+    }
+    let current: HTMLElement | null = element;
+    while (current) {
+      const style = window.getComputedStyle(current);
+      if (style.display === "none" || style.visibility === "hidden") {
+        return false;
+      }
+      if (current === dialog.value) break;
+      current = current.parentElement;
+    }
+    return true;
+  });
   if (!focusable.length) {
     e.preventDefault();
     dialog.value.focus();
     return;
   }
-  const first = focusable[0];
-  const last = focusable[focusable.length - 1];
-  if (e.shiftKey && document.activeElement === first) {
+  const target = focusTargetForTab(
+    focusable,
+    document.activeElement as HTMLElement | null,
+    e.shiftKey,
+  );
+  if (target) {
     e.preventDefault();
-    last.focus();
-  } else if (!e.shiftKey && document.activeElement === last) {
-    e.preventDefault();
-    first.focus();
+    target.focus();
   }
 }
 onMounted(async () => {
@@ -91,6 +110,7 @@ void props;
   box-shadow: var(--sb-shadow);
   width: 100%;
   max-width: 520px;
+  min-width: 0;
 }
 .dialog--wide {
   max-width: 1040px;
@@ -107,6 +127,7 @@ void props;
 }
 .dialog__body {
   padding: var(--sb-space-5);
+  min-width: 0;
 }
 .dialog__foot {
   padding: var(--sb-space-4) var(--sb-space-5);
@@ -143,6 +164,16 @@ void props;
   .dialog__foot {
     padding-left: var(--sb-space-4);
     padding-right: var(--sb-space-4);
+  }
+
+  .dialog__foot {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 420px) {
+  .dialog__foot :deep(.sb-btn) {
+    width: 100%;
   }
 }
 </style>
