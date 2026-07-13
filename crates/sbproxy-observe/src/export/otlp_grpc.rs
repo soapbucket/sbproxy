@@ -64,6 +64,7 @@ pub fn init_grpc_pipeline(config: &OtlpGrpcConfig) -> anyhow::Result<()> {
         resource_attrs: std::collections::BTreeMap::new(),
         export_metrics: false,
         metrics_interval_secs: None,
+        headers: std::collections::BTreeMap::new(),
     };
     init_otlp_pipeline(&telem)
 }

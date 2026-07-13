@@ -92,6 +92,89 @@ pub fn ai_cost_usd_micros_counter() -> &'static Counter<u64> {
     })
 }
 
+/// OTel histogram `gen_ai.client.operation.duration` (seconds).
+///
+/// Required instrument of the OpenTelemetry GenAI metrics
+/// conventions (WOR-1873). Emitted alongside the canonical
+/// `sbproxy_ai_request_duration_seconds` Prometheus family so
+/// GenAI-aware backends (Datadog LLM Observability, Grafana GenAI
+/// dashboards, Phoenix) chart duration without relabeling. Attribute
+/// vocabulary follows the pinned span vocabulary in `sbproxy-ai`:
+/// `gen_ai.system`, `gen_ai.operation.name`, `gen_ai.request.model`.
+pub fn genai_operation_duration_histogram() -> &'static Histogram<f64> {
+    static H: OnceLock<Histogram<f64>> = OnceLock::new();
+    H.get_or_init(|| {
+        global::meter("sbproxy")
+            .f64_histogram("gen_ai.client.operation.duration")
+            .with_description("GenAI client operation duration in seconds.")
+            .with_unit("s")
+            .build()
+    })
+}
+
+/// OTel histogram `gen_ai.client.token.usage` (tokens).
+///
+/// Recommended instrument of the OpenTelemetry GenAI metrics
+/// conventions (WOR-1873), mirroring the attributed Prometheus token
+/// counter. `gen_ai.token.type` partitions `input` vs `output`,
+/// matching the `direction` vocabulary on the Prometheus side.
+pub fn genai_token_usage_histogram() -> &'static Histogram<u64> {
+    static H: OnceLock<Histogram<u64>> = OnceLock::new();
+    H.get_or_init(|| {
+        global::meter("sbproxy")
+            .u64_histogram("gen_ai.client.token.usage")
+            .with_description("GenAI client token consumption, partitioned by token type.")
+            .with_unit("{token}")
+            .build()
+    })
+}
+
+/// Record one GenAI operation duration under the semconv instrument
+/// name. `operation` is the classified AI surface (the same value the
+/// span vocabulary records on `gen_ai.operation.name`); `provider`
+/// lands on `gen_ai.system`. No-op unless the OTLP metrics pipeline
+/// is installed (`telemetry.export_metrics: true`).
+pub fn record_genai_operation_duration(
+    provider: &str,
+    operation: &str,
+    model: &str,
+    duration_secs: f64,
+) {
+    genai_operation_duration_histogram().record(
+        duration_secs,
+        &[
+            opentelemetry::KeyValue::new("gen_ai.system", provider.to_string()),
+            opentelemetry::KeyValue::new("gen_ai.operation.name", operation.to_string()),
+            opentelemetry::KeyValue::new("gen_ai.request.model", model.to_string()),
+        ],
+    );
+}
+
+/// Record GenAI token usage under the semconv instrument name.
+/// `token_type` is `input` or `output`; zero counts are skipped so
+/// image / audio events do not emit phantom token rows. No-op unless
+/// the OTLP metrics pipeline is installed.
+pub fn record_genai_token_usage(
+    provider: &str,
+    operation: &str,
+    model: &str,
+    token_type: &str,
+    tokens: u64,
+) {
+    if tokens == 0 {
+        return;
+    }
+    genai_token_usage_histogram().record(
+        tokens,
+        &[
+            opentelemetry::KeyValue::new("gen_ai.system", provider.to_string()),
+            opentelemetry::KeyValue::new("gen_ai.operation.name", operation.to_string()),
+            opentelemetry::KeyValue::new("gen_ai.request.model", model.to_string()),
+            opentelemetry::KeyValue::new("gen_ai.token.type", token_type.to_string()),
+        ],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +198,20 @@ mod tests {
         let c1 = ai_cost_usd_micros_counter();
         let c2 = ai_cost_usd_micros_counter();
         assert!(std::ptr::eq(c1, c2));
+    }
+
+    #[test]
+    fn genai_handles_construct_idempotently_and_record_silently() {
+        let h1 = genai_operation_duration_histogram();
+        let h2 = genai_operation_duration_histogram();
+        assert!(std::ptr::eq(h1, h2));
+        let t1 = genai_token_usage_histogram();
+        let t2 = genai_token_usage_histogram();
+        assert!(std::ptr::eq(t1, t2));
+        // No MeterProvider installed: records must be silent no-ops.
+        record_genai_operation_duration("openai", "chat_completions", "gpt-4o", 1.25);
+        record_genai_token_usage("openai", "chat_completions", "gpt-4o", "input", 100);
+        record_genai_token_usage("openai", "chat_completions", "gpt-4o", "output", 0);
     }
 
     #[test]

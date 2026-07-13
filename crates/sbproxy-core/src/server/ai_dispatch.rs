@@ -1546,6 +1546,8 @@ pub(super) async fn handle_ai_proxy(
                         &reason,
                     );
                     ctx.ai_outcome = Some("guardrail_block".to_string());
+                    ctx.ai_guardrail_category = Some(name.to_string());
+                    ctx.ai_guardrail_action = Some("block".to_string());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": reason,
@@ -1604,6 +1606,8 @@ pub(super) async fn handle_ai_proxy(
                             &reason,
                         );
                         ctx.ai_outcome = Some("guardrail_block".to_string());
+                        ctx.ai_guardrail_category = Some(decision.labels.join(","));
+                        ctx.ai_guardrail_action = Some("block".to_string());
                         let error_body = serde_json::json!({
                             "error": {
                                 "message": reason,
@@ -1635,6 +1639,8 @@ pub(super) async fn handle_ai_proxy(
                     // 400, so stamp the precise outcome for the
                     // value-vs-waste metric.
                     ctx.ai_outcome = Some("guardrail_block".to_string());
+                    ctx.ai_guardrail_category = Some(block.name.clone());
+                    ctx.ai_guardrail_action = Some("block".to_string());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -1673,6 +1679,8 @@ pub(super) async fn handle_ai_proxy(
                     // 400, so stamp the precise outcome for the
                     // value-vs-waste metric.
                     ctx.ai_outcome = Some("guardrail_block".to_string());
+                    ctx.ai_guardrail_category = Some(block.name.clone());
+                    ctx.ai_guardrail_action = Some("block".to_string());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -1707,6 +1715,8 @@ pub(super) async fn handle_ai_proxy(
                         // WOR-1496: stamp the precise outcome (the wire
                         // status is a generic 400).
                         ctx.ai_outcome = Some("guardrail_block".to_string());
+                        ctx.ai_guardrail_category = Some(block.name.clone());
+                        ctx.ai_guardrail_action = Some("block".to_string());
                         let error_body = serde_json::json!({
                             "error": {
                                 "message": block.reason,
@@ -2574,13 +2584,22 @@ pub(super) async fn handle_ai_proxy(
                 ai_span.record("gen_ai.request.model", resolved_model.as_str());
                 ai_span.record("llm.model_name", resolved_model.as_str());
             }
+            let upstream_secs = race_start.elapsed().as_secs_f64();
             sbproxy_ai::ai_metrics::record_model_latency(
                 &provider.name,
                 ctx.ai_model.as_deref().unwrap_or(""),
                 surface_label,
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
-                race_start.elapsed().as_secs_f64(),
+                upstream_secs,
+            );
+            // WOR-1873: mirror under the OTel GenAI instrument name so
+            // GenAI-aware backends chart it without relabeling.
+            sbproxy_observe::otel::record_genai_operation_duration(
+                &provider.name,
+                surface_label,
+                ctx.ai_model.as_deref().unwrap_or(""),
+                upstream_secs,
             );
             last_format = sbproxy_ai::client::provider_format(provider);
             last_upstream_host = url::Url::parse(&provider.effective_base_url())
@@ -2908,13 +2927,23 @@ pub(super) async fn handle_ai_proxy(
                 // latency is sliceable per tenant / credential / model
                 // (not just globally per provider/model). Measured once
                 // per request, on the attempt we keep.
+                let upstream_secs = attempt_start.elapsed().as_secs_f64();
                 sbproxy_ai::ai_metrics::record_model_latency(
                     &provider.name,
                     ctx.ai_model.as_deref().unwrap_or(""),
                     surface_label,
                     ctx.tenant_id.as_str(),
                     ctx.principal.api_key_id(),
-                    attempt_start.elapsed().as_secs_f64(),
+                    upstream_secs,
+                );
+                // WOR-1873: mirror under the OTel GenAI instrument
+                // name so GenAI-aware backends chart it without
+                // relabeling.
+                sbproxy_observe::otel::record_genai_operation_duration(
+                    &provider.name,
+                    surface_label,
+                    ctx.ai_model.as_deref().unwrap_or(""),
+                    upstream_secs,
                 );
                 last_provider_name = provider.name.to_string();
                 last_resp = Some(resp);
@@ -3103,6 +3132,9 @@ pub(super) async fn handle_ai_proxy(
                 // WOR-1810: identity for the streamed tool-call rbac
                 // rule, mirroring the buffered input check.
                 Some(ctx.principal.clone()),
+                // WOR-1874: guardrail-column stamping on streaming
+                // blocks.
+                Some(ctx),
             )
             .await
         } else {
@@ -3602,6 +3634,8 @@ pub(super) async fn relay_ai_response_with_cache(
         // value-vs-waste metric attributes it correctly.
         if let Some(c) = ctx.as_mut() {
             c.ai_outcome = Some("guardrail_block".to_string());
+            c.ai_guardrail_category = Some(block.name.clone());
+            c.ai_guardrail_action = Some("block".to_string());
         }
         // WOR-1093: the upstream already produced (and
         // billed) this 2xx response; an output guardrail
@@ -3991,6 +4025,11 @@ pub(super) async fn relay_ai_response_with_cache(
     // reaches the semantic cache even though it is written above
     // in the order-of-operations sense.
     let resp_body = restore_reversible_pii(&resp_body, &reversible_pairs);
+    if (200..300).contains(&status) {
+        // WOR-1877: tool-call span events. Names + ids always
+        // (bounded); arguments only under the trace_content gate.
+        record_ai_tool_call_events(&ai_span, &resp_body, &trace_content);
+    }
     if (200..300).contains(&status) && trace_content.enabled() {
         let completion = extract_completion_text(&resp_body);
         record_ai_output_trace(&ai_span, trace_content, &completion);
@@ -4625,6 +4664,10 @@ pub(super) async fn relay_ai_stream(
     // so the agent-alignment rbac rule sees the same identity on
     // streamed tool calls.
     principal: Option<sbproxy_plugin::Principal>,
+    // WOR-1874: request context, mirrored from the buffered relay, so
+    // a streaming guardrail block stamps the guardrail columns the
+    // access log and admin request ring read at request end.
+    mut ctx: Option<&mut RequestContext>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
     record_ai_provider_response_failure(&ai_span, router_sink.provider_name, status, None);
@@ -4968,6 +5011,13 @@ pub(super) async fn relay_ai_stream(
                             sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                             &block.reason,
                         );
+                        // WOR-1874: stamp the guardrail columns for the
+                        // access log and admin request ring.
+                        if let Some(c) = ctx.as_deref_mut() {
+                            c.ai_outcome = Some("guardrail_block".to_string());
+                            c.ai_guardrail_category = Some(block.name.clone());
+                            c.ai_guardrail_action = Some("block".to_string());
+                        }
                         output_guard_blocked = true;
                         break 'relay;
                     }
@@ -5103,6 +5153,13 @@ pub(super) async fn relay_ai_stream(
                         sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                         &block.reason,
                     );
+                    // WOR-1874: stamp the guardrail columns for the
+                    // access log and admin request ring.
+                    if let Some(c) = ctx.as_deref_mut() {
+                        c.ai_outcome = Some("guardrail_block".to_string());
+                        c.ai_guardrail_category = Some(block.name.clone());
+                        c.ai_guardrail_action = Some("block".to_string());
+                    }
                     output_guard_blocked = true;
                     break;
                 }
@@ -5294,6 +5351,18 @@ pub(super) async fn relay_ai_stream(
                             args.provider_name,
                             args.model,
                             tps,
+                        );
+                    }
+                    // WOR-1873: average inter-token latency (TPOT) over
+                    // the same generation window, so TTFT / TPOT /
+                    // throughput describe one consistent stream. Needs
+                    // at least two tokens to define a gap.
+                    if completion > 1 && gen_secs > 0.0 {
+                        let itl = gen_secs / (completion - 1) as f64;
+                        sbproxy_ai::ai_metrics::record_inter_token_latency(
+                            args.provider_name,
+                            args.model,
+                            itl,
                         );
                     }
                 }

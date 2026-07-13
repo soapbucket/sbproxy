@@ -60,6 +60,10 @@ pub mod synthetic;
 pub mod telemetry;
 pub mod topology;
 pub mod trace_ctx;
+/// WOR-1875 durable windowed usage rollups: hour/day spend buckets in
+/// redb feeding the windowed `/api/usage/spend` admin API, so spend
+/// history survives restarts without an external Prometheus.
+pub mod usage_rollup;
 
 pub use access_log::AccessLogEntry;
 pub use agent_labels::AgentLabels;

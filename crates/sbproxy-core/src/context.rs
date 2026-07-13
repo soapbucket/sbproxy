@@ -746,6 +746,16 @@ pub struct RequestContext {
     /// closed-set strings only (`guardrail_block`, `content_filter`,
     /// ...).
     pub ai_outcome: Option<String>,
+    /// WOR-1874: category (configured guardrail / rule name) of the
+    /// guardrail that intervened on this request. Stamped at every
+    /// unary block site and by the streaming relay when an output
+    /// guardrail terminates a stream, so the access log line and the
+    /// admin request ring can filter on guardrail interventions.
+    pub ai_guardrail_category: Option<String>,
+    /// WOR-1874: what the intervening guardrail did. `block` is the
+    /// only live action today; `redact`, `rewrite`, and `hold` are
+    /// reserved for actions that gain live paths later.
+    pub ai_guardrail_action: Option<String>,
     /// WOR-1528 / WOR-1540: usage sinks for this origin, stashed by
     /// `handle_ai_proxy` when the AI handler configures any. The
     /// end-of-request `logging` hook reads them once the final status,
@@ -1122,6 +1132,8 @@ impl RequestContext {
             ai_cost_usd_micros: None,
             ai_surface: None,
             ai_outcome: None,
+            ai_guardrail_category: None,
+            ai_guardrail_action: None,
             ai_usage_sinks: None,
             ai_policy_sink_tag: None,
             ai_guardrail_labels: Vec::new(),

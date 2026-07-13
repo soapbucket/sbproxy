@@ -564,6 +564,9 @@ pub(super) fn emit_access_log(
         classifier_prompt: ctx.classifier_prompt.as_ref().map(classifier_label),
         classifier_intent: ctx.classifier_intent.map(intent_label),
         error_class: classify_error_class(status),
+        cost_usd_micros: ctx.ai_cost_usd_micros,
+        guardrail_category: ctx.ai_guardrail_category.clone(),
+        guardrail_action: ctx.ai_guardrail_action.clone(),
         auth_ms: ctx
             .request_start
             .zip(ctx.auth_finished_at)
@@ -758,6 +761,15 @@ pub(super) struct AccessLogContext {
     pub(super) fallback_triggered: Option<bool>,
     pub(super) retry_count: Option<u32>,
     pub(super) forward_rule_idx: Option<usize>,
+    /// WOR-1874: derived AI cost in micro-USD, from
+    /// `ctx.ai_cost_usd_micros`.
+    pub(super) cost_usd_micros: Option<u64>,
+    /// WOR-1874: intervening guardrail category, from
+    /// `ctx.ai_guardrail_category`.
+    pub(super) guardrail_category: Option<String>,
+    /// WOR-1874: intervening guardrail action, from
+    /// `ctx.ai_guardrail_action`.
+    pub(super) guardrail_action: Option<String>,
     pub(super) request_geo: Option<String>,
     pub(super) classifier_prompt: Option<String>,
     pub(super) classifier_intent: Option<String>,
@@ -871,6 +883,9 @@ impl AccessLogContext {
             fallback_triggered: None,
             retry_count: None,
             forward_rule_idx: None,
+            cost_usd_micros: None,
+            guardrail_category: None,
+            guardrail_action: None,
             request_geo: None,
             classifier_prompt: None,
             classifier_intent: None,
@@ -1063,6 +1078,9 @@ pub(super) fn emit_access_log_entry(
         classifier_prompt: context.classifier_prompt,
         classifier_intent: context.classifier_intent,
         error_class: context.error_class,
+        cost_usd_micros: context.cost_usd_micros,
+        guardrail_category: context.guardrail_category,
+        guardrail_action: context.guardrail_action,
         // Wave 1 / G1.6: per-agent dimensions. The agent-class
         // resolver lands the typed values on `context` in a
         // follow-up; until then the access log surfaces None and

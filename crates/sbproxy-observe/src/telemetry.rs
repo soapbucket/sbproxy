@@ -29,7 +29,7 @@ use opentelemetry::trace::{
     TraceResult,
 };
 use opentelemetry::{global, Context, KeyValue, Value};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace as sdktrace;
@@ -117,6 +117,16 @@ pub struct TelemetryConfig {
     /// Only consulted when `export_metrics` is `true`.
     #[serde(default)]
     pub metrics_interval_secs: Option<u64>,
+    /// Additional headers attached to every OTLP export request
+    /// (traces and metrics; the OTLP-logs sink reads the same set via
+    /// [`resolved_otlp_headers`]). Values here are already RESOLVED:
+    /// the binary resolves secret references (`${VAR}`, `vault://`,
+    /// `secret://`, `file:`, ...) at boot and refuses to start when
+    /// one cannot be resolved, so a raw reference never reaches the
+    /// collector. Hosted backends (Grafana Cloud, Honeycomb, Langfuse
+    /// Cloud, Datadog OTLP) authenticate with these.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 fn default_service_name() -> String {
@@ -152,8 +162,59 @@ impl Default for TelemetryConfig {
             resource_attrs: std::collections::BTreeMap::new(),
             export_metrics: false,
             metrics_interval_secs: None,
+            headers: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// Boot-resolved OTLP export headers, installed once by the binary
+/// after secret resolution (WOR-1869). The OTLP-logs sink consumes
+/// this set so a config-declared log sink authenticates with the same
+/// headers as the trace and metric pipelines without `sbproxy-core`
+/// growing a secret-resolution dependency. Header changes require a
+/// restart, matching the trace pipeline (which also initialises once
+/// at boot).
+static RESOLVED_OTLP_HEADERS: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+    std::sync::OnceLock::new();
+
+/// Install the boot-resolved OTLP headers. Call once from the binary
+/// after resolving secret references; a second call is ignored.
+pub fn install_resolved_otlp_headers(headers: std::collections::BTreeMap<String, String>) {
+    let _ = RESOLVED_OTLP_HEADERS.set(headers);
+}
+
+/// The boot-resolved OTLP headers, empty when none were configured
+/// (or in contexts like `validate` / tests that never install them).
+pub fn resolved_otlp_headers() -> std::collections::BTreeMap<String, String> {
+    RESOLVED_OTLP_HEADERS.get().cloned().unwrap_or_default()
+}
+
+/// Build a tonic `MetadataMap` from configured header pairs, skipping
+/// (and warning on) names or values that are not valid gRPC metadata.
+/// Skipping rather than failing keeps a typo'd extra header from
+/// taking down the whole export pipeline; the authentication header a
+/// backend requires is validated by that backend rejecting the export.
+pub(crate) fn tonic_metadata_from_headers(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> tonic::metadata::MetadataMap {
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    for (name, value) in headers {
+        match (
+            name.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>(),
+            value.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>(),
+        ) {
+            (Ok(key), Ok(val)) => {
+                metadata.insert(key, val);
+            }
+            _ => {
+                tracing::warn!(
+                    header = %name,
+                    "telemetry: header name or value is not valid gRPC metadata; skipping"
+                );
+            }
+        }
+    }
+    metadata
 }
 
 /// Cost-aware keep decision for a completed AI trace.
@@ -552,14 +613,89 @@ fn otlp_endpoint(config: &TelemetryConfig) -> String {
         .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string())
 }
 
+/// Best-effort hostname for resource detection: `HOSTNAME` env var
+/// first (set on k8s and most shells), then the `hostname` binary.
+fn detect_hostname() -> Option<String> {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        if !h.is_empty() {
+            return Some(h);
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Standard-detector resource attributes (WOR-1869): host + process
+/// identity, `OTEL_RESOURCE_ATTRIBUTES` pairs, and Kubernetes
+/// downward-API attributes when the conventional env vars are set
+/// (`K8S_POD_NAME`, `K8S_POD_NAMESPACE`, `K8S_NODE_NAME`). Without
+/// these, every node's telemetry collapses into one anonymous stream
+/// when aggregated downstream. Returned as ordered pairs; later
+/// entries win on key conflict, and callers append operator attrs
+/// last so explicit config always beats detection.
+fn detected_resource_attrs() -> Vec<(String, String)> {
+    let mut kv: Vec<(String, String)> = Vec::new();
+    if let Some(host) = detect_hostname() {
+        kv.push(("host.name".to_string(), host.clone()));
+        kv.push((
+            "service.instance.id".to_string(),
+            format!("{host}:{}", std::process::id()),
+        ));
+    }
+    // Semconv os.type uses `darwin`, not Rust's `macos`.
+    let os_type = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    kv.push(("os.type".to_string(), os_type.to_string()));
+    kv.push(("process.pid".to_string(), std::process::id().to_string()));
+    for (env_var, attr) in [
+        ("K8S_POD_NAME", "k8s.pod.name"),
+        ("K8S_POD_NAMESPACE", "k8s.namespace.name"),
+        ("K8S_NODE_NAME", "k8s.node.name"),
+    ] {
+        if let Ok(v) = std::env::var(env_var) {
+            if !v.is_empty() {
+                kv.push((attr.to_string(), v));
+            }
+        }
+    }
+    // OTEL_RESOURCE_ATTRIBUTES=key=value,key=value (the standard env
+    // detector's format). Parsed after host/process detection so the
+    // operator's env pairs win over detection.
+    if let Ok(pairs) = std::env::var("OTEL_RESOURCE_ATTRIBUTES") {
+        for pair in pairs.split(',') {
+            if let Some((k, v)) = pair.split_once('=') {
+                let (k, v) = (k.trim(), v.trim());
+                if !k.is_empty() && !v.is_empty() {
+                    kv.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+    }
+    kv
+}
+
 fn otlp_resource(config: &TelemetryConfig) -> Resource {
-    let mut resource_kv = vec![
-        KeyValue::new(semconv::resource::SERVICE_NAME, config.service_name.clone()),
-        KeyValue::new(
-            semconv::resource::SERVICE_VERSION,
-            env!("CARGO_PKG_VERSION"),
-        ),
-    ];
+    // Ordered so that later duplicates win: detected attrs, then the
+    // service identity from config, then the operator's free-form
+    // resource_attrs (explicit config always beats detection).
+    let mut resource_kv: Vec<KeyValue> = detected_resource_attrs()
+        .into_iter()
+        .map(|(k, v)| KeyValue::new(k, v))
+        .collect();
+    resource_kv.push(KeyValue::new(
+        semconv::resource::SERVICE_NAME,
+        config.service_name.clone(),
+    ));
+    resource_kv.push(KeyValue::new(
+        semconv::resource::SERVICE_VERSION,
+        env!("CARGO_PKG_VERSION"),
+    ));
     for (k, v) in &config.resource_attrs {
         resource_kv.push(KeyValue::new(k.clone(), v.clone()));
     }
@@ -571,16 +707,28 @@ fn build_span_exporter(
     endpoint: &str,
 ) -> Result<opentelemetry_otlp::SpanExporter> {
     match config.transport {
-        OtlpTransport::Http => opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(endpoint)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP exporter: {}", e)),
-        OtlpTransport::Grpc => opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC exporter: {}", e)),
+        OtlpTransport::Http => {
+            let mut builder = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint);
+            if !config.headers.is_empty() {
+                builder = builder.with_headers(config.headers.clone().into_iter().collect());
+            }
+            builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP exporter: {}", e))
+        }
+        OtlpTransport::Grpc => {
+            let mut builder = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint);
+            if !config.headers.is_empty() {
+                builder = builder.with_metadata(tonic_metadata_from_headers(&config.headers));
+            }
+            builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC exporter: {}", e))
+        }
     }
 }
 
@@ -673,29 +821,34 @@ pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
         .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string());
     let endpoint = endpoint_owned.as_str();
 
-    let mut resource_kv = vec![
-        KeyValue::new(semconv::resource::SERVICE_NAME, config.service_name.clone()),
-        KeyValue::new(
-            semconv::resource::SERVICE_VERSION,
-            env!("CARGO_PKG_VERSION"),
-        ),
-    ];
-    for (k, v) in &config.resource_attrs {
-        resource_kv.push(KeyValue::new(k.clone(), v.clone()));
-    }
-    let resource = Resource::new(resource_kv);
+    // Same resource construction as the trace pipeline (detection +
+    // service identity + operator attrs), so the two signals stay
+    // joinable downstream.
+    let resource = otlp_resource(config);
 
     let exporter = match config.transport {
-        OtlpTransport::Http => opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_endpoint(endpoint)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP metric exporter: {}", e))?,
-        OtlpTransport::Grpc => opentelemetry_otlp::MetricExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC metric exporter: {}", e))?,
+        OtlpTransport::Http => {
+            let mut builder = opentelemetry_otlp::MetricExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint);
+            if !config.headers.is_empty() {
+                builder = builder.with_headers(config.headers.clone().into_iter().collect());
+            }
+            builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP metric exporter: {}", e))?
+        }
+        OtlpTransport::Grpc => {
+            let mut builder = opentelemetry_otlp::MetricExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint);
+            if !config.headers.is_empty() {
+                builder = builder.with_metadata(tonic_metadata_from_headers(&config.headers));
+            }
+            builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC metric exporter: {}", e))?
+        }
     };
 
     let interval = std::time::Duration::from_secs(config.metrics_interval_secs.unwrap_or(30));
@@ -1319,6 +1472,67 @@ mod tests {
             injected.contains("0af7651916cd43dd8448eb211c80319c"),
             "trace_id not preserved: {}",
             injected
+        );
+    }
+
+    /// WOR-1869: header pairs become gRPC metadata; names or values
+    /// that are not valid metadata are skipped, never a panic.
+    #[test]
+    fn tonic_metadata_from_headers_maps_and_skips_invalid() {
+        let headers = std::collections::BTreeMap::from([
+            ("authorization".to_string(), "Bearer tok".to_string()),
+            ("x-scope-orgid".to_string(), "tenant-1".to_string()),
+            // A name with a space is an invalid tonic metadata key and
+            // a value with a control character is invalid; both must
+            // be skipped.
+            ("Bad Header".to_string(), "v".to_string()),
+            ("x-bad-value".to_string(), "line\nbreak".to_string()),
+        ]);
+        let metadata = tonic_metadata_from_headers(&headers);
+        assert_eq!(
+            metadata.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer tok")
+        );
+        assert_eq!(
+            metadata.get("x-scope-orgid").and_then(|v| v.to_str().ok()),
+            Some("tenant-1")
+        );
+        assert!(metadata.get("bad header").is_none());
+        assert!(metadata.get("x-bad-value").is_none());
+    }
+
+    /// WOR-1869: detection stamps host + process identity, and the
+    /// operator's `resource_attrs` always win on key conflict.
+    #[test]
+    fn otlp_resource_detects_and_operator_attrs_win() {
+        let detected = detected_resource_attrs();
+        let keys: Vec<&str> = detected.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"os.type"), "os.type detected: {keys:?}");
+        assert!(
+            keys.contains(&"process.pid"),
+            "process.pid detected: {keys:?}"
+        );
+
+        let mut config = TelemetryConfig {
+            service_name: "sbproxy-test".to_string(),
+            ..Default::default()
+        };
+        config
+            .resource_attrs
+            .insert("os.type".to_string(), "operator-override".to_string());
+        let resource = otlp_resource(&config);
+        assert_eq!(
+            resource
+                .get(opentelemetry::Key::from_static_str("os.type"))
+                .map(|v| v.to_string()),
+            Some("operator-override".to_string()),
+            "operator resource_attrs must beat detection"
+        );
+        assert_eq!(
+            resource
+                .get(opentelemetry::Key::from_static_str("service.name"))
+                .map(|v| v.to_string()),
+            Some("sbproxy-test".to_string())
         );
     }
 }

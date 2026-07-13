@@ -187,3 +187,74 @@ export function findFamily(
   }
   return undefined;
 }
+
+/** Group a family's samples by the joined values of several labels. */
+export function groupByLabels(
+  family: MetricFamily | undefined,
+  labels: string[],
+): { key: string; value: number }[] {
+  if (!family) return [];
+  const acc = new Map<string, number>();
+  for (const s of family.samples) {
+    const key = labels.map((l) => s.labels[l] ?? "(none)").join(" / ");
+    acc.set(key, (acc.get(key) ?? 0) + s.value);
+  }
+  return [...acc.entries()]
+    .map(([key, value]) => ({ key, value }))
+    .sort((a, b) => b.value - a.value);
+}
+
+function quantileFromBuckets(
+  byLe: Map<number, number>,
+  q: number,
+): number | undefined {
+  const buckets = [...byLe.entries()].sort((a, b) => a[0] - b[0]);
+  const total = buckets.length ? buckets[buckets.length - 1][1] : 0;
+  if (total <= 0) return undefined;
+  const target = q * total;
+  let prevLe = 0;
+  let prevCount = 0;
+  for (const [le, count] of buckets) {
+    if (count >= target) {
+      if (!Number.isFinite(le)) return prevLe;
+      const bucketCount = count - prevCount;
+      if (bucketCount <= 0) return le;
+      const frac = (target - prevCount) / bucketCount;
+      return prevLe + (le - prevLe) * frac;
+    }
+    prevLe = Number.isFinite(le) ? le : prevLe;
+    prevCount = count;
+  }
+  return prevLe;
+}
+
+/**
+ * Per-group histogram quantile (WOR-1871): groups `_bucket` samples by
+ * the joined values of `labels` and computes the q-quantile per group,
+ * sorted descending (worst first).
+ */
+export function histogramQuantileByLabels(
+  family: MetricFamily | undefined,
+  q: number,
+  labels: string[],
+): { key: string; value: number }[] {
+  if (!family) return [];
+  const groups = new Map<string, Map<number, number>>();
+  for (const s of family.samples) {
+    if (!s.name.endsWith("_bucket")) continue;
+    const leRaw = s.labels.le;
+    if (leRaw === undefined) continue;
+    const le = leRaw === "+Inf" ? Infinity : Number(leRaw);
+    if (Number.isNaN(le)) continue;
+    const key = labels.map((l) => s.labels[l] ?? "(none)").join(" / ");
+    const byLe = groups.get(key) ?? new Map<number, number>();
+    byLe.set(le, (byLe.get(le) ?? 0) + s.value);
+    groups.set(key, byLe);
+  }
+  const out: { key: string; value: number }[] = [];
+  for (const [key, byLe] of groups) {
+    const v = quantileFromBuckets(byLe, q);
+    if (v !== undefined) out.push({ key, value: v });
+  }
+  return out.sort((a, b) => b.value - a.value);
+}

@@ -168,6 +168,16 @@ pub struct RequestEvent {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error_class: Option<String>,
 
+    /// WOR-1874: category (configured guardrail / rule name) of the
+    /// guardrail that intervened on this request.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub guardrail_category: Option<String>,
+
+    /// WOR-1874: what the intervening guardrail did (`block` today;
+    /// `redact` / `rewrite` / `hold` reserved).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub guardrail_action: Option<String>,
+
     /// ISO-3166-1 alpha-2 country (filled by geo enrichment when
     /// configured; see PORTAL.md gap 3.1 P2).
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -203,6 +213,8 @@ impl RequestEvent {
             cost_usd_micros: None,
             status_code: None,
             error_class: None,
+            guardrail_category: None,
+            guardrail_action: None,
             request_geo: None,
         }
     }
@@ -248,6 +260,8 @@ mod tests {
             cost_usd_micros: Some(4_500),
             status_code: Some(200),
             error_class: None,
+            guardrail_category: Some("pii".to_string()),
+            guardrail_action: Some("block".to_string()),
             request_geo: Some("US".to_string()),
         }
     }

@@ -95,9 +95,12 @@ const latencyPercentiles = computed(() => {
 const tokenFamily = computed(() =>
   findFamily(
     families.value,
+    // The live family is the attributed counter; keep the removed
+    // unattributed names as fallbacks for older proxy binaries.
+    "sbproxy_ai_tokens_attributed_total",
+    "sbproxy_tokens_attributed_total",
     "sbproxy_ai_tokens_total",
     "sbproxy_tokens_total",
-    "sbproxy_ai_token_total",
   ),
 );
 const costFamily = computed(() =>

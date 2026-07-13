@@ -63,6 +63,7 @@ pub fn check_rate_limit_approaching(rule: &RateLimitRule, utilization: f64) -> O
             ),
             timestamp: chrono::Utc::now().to_rfc3339(),
             labels,
+            resolved: false,
         })
     } else {
         None

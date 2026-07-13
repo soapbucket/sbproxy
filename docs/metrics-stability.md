@@ -1,6 +1,6 @@
 # Metrics stability
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-12*
 
 Naming conventions, stability guarantees, and the full catalogue of metrics emitted by SBproxy.
 
@@ -285,21 +285,24 @@ The same observations appear as `auth_ms` / `upstream_ttfb_ms` / `response_filte
 
 ### AI gateway
 
-#### `sbproxy_ai_requests_total`
+#### Removed: unattributed base counters
 
-| Property | Value |
-|---|---|
-| Type | Counter |
-| Stability | **stable** |
-| Description | Total AI inference requests forwarded by the proxy. |
+The families `sbproxy_ai_requests_total`, `sbproxy_ai_tokens_total`,
+`sbproxy_ai_cost_dollars_total`, and the per-virtual-key trio
+(`sbproxy_ai_key_requests_total`, `sbproxy_ai_key_tokens_total`,
+`sbproxy_ai_key_cost_dollars_total`) were removed. They were
+registered but never written on the live request path, and the
+metrics library registers counter series lazily, so no released
+binary ever exposed a sample under these names on `/metrics`. The
+normal stable-tier deprecation window does not apply to families
+that never emitted.
 
-**Labels:**
-
-| Label | Description | Example values |
-|---|---|---|
-| `provider` | AI provider name | `openai`, `anthropic`, `google`, `cohere` |
-| `model` | Model identifier | `gpt-4o`, `claude-sonnet-4-5`, `gemini-3.5-flash` |
-| `status` | Request outcome | `success`, `error`, `timeout`, `rate_limited` |
+Consumers should read the attributed families instead:
+`sbproxy_ai_requests_attributed_total` (request counts and the
+`outcome` split), `sbproxy_ai_tokens_attributed_total` (token counts
+by `direction`), and `sbproxy_ai_cost_dollars_attributed_total` or
+`sbproxy_ai_cost_usd_micros_total` (spend). Per-key usage is the
+`api_key_id` label on those families.
 
 ---
 
@@ -309,7 +312,7 @@ The same observations appear as `auth_ms` / `upstream_ttfb_ms` / `response_filte
 |---|---|
 | Type | Counter |
 | Stability | **stable** |
-| Description | Total AI gateway requests, partitioned by classified surface (chat completions, assistants, image generation, etc.). Additive sibling of `sbproxy_ai_requests_total`. |
+| Description | Total AI gateway requests, partitioned by classified surface (chat completions, assistants, image generation, etc.). Additive sibling of `sbproxy_ai_requests_attributed_total`. |
 
 **Labels:**
 
@@ -338,41 +341,6 @@ A `status` partition is reserved for a future phase that emits surface-aware bil
 | `method` | Inbound HTTP method | `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` |
 
 Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket schedule of the per-provider `sbproxy_ai_request_duration_seconds` for cross-cut dashboards.
-
----
-
-#### `sbproxy_ai_tokens_total`
-
-| Property | Value |
-|---|---|
-| Type | Counter |
-| Stability | **stable** |
-| Description | Total AI tokens processed. Counts input and output tokens separately. Per-model token counts live in the attributed series below. |
-
-**Labels:**
-
-| Label | Description | Example values |
-|---|---|---|
-| `hostname` | Virtual hostname | `api.example.com` |
-| `provider` | AI provider name | `openai`, `anthropic` |
-| `direction` | Token direction | `input`, `output` |
-
----
-
-#### `sbproxy_ai_cost_dollars_total`
-
-| Property | Value |
-|---|---|
-| Type | Counter |
-| Stability | **stable** |
-| Description | Cumulative estimated cost of AI requests in US dollars, based on the provider pricing catalog. |
-
-**Labels:**
-
-| Label | Description | Example values |
-|---|---|---|
-| `provider` | AI provider name | `openai`, `anthropic` |
-| `model` | Model identifier | `gpt-4o`, `claude-sonnet-4-5` |
 
 ---
 
@@ -588,6 +556,52 @@ No labels.
 |---|---|---|
 | `provider` | AI provider name | `openai`, `anthropic` |
 | `model` | Model identifier | `gpt-4o`, `claude-sonnet-4-5` |
+
+---
+
+#### `sbproxy_ai_inter_token_latency_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **beta** |
+| Description | Average inter-token latency (TPOT) per streaming response, in seconds. Derived from the same generation window as the throughput histogram: window / (completion tokens - 1), recorded once per stream with at least two tokens. Completes the TTFT / TPOT / throughput serving triple. Buckets cover 5ms accelerator gaps through 2.5s degraded streams. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider` | AI provider name | `openai`, `anthropic` |
+| `model` | Model identifier | `gpt-4o`, `claude-sonnet-4-5` |
+
+---
+
+#### OTel GenAI instrument mirrors (OTLP only)
+
+When `telemetry.export_metrics` is on, the gateway also emits the
+OpenTelemetry GenAI metrics instruments over OTLP, alongside the
+`sbproxy.*` mirrors:
+
+- `gen_ai.client.operation.duration` (histogram, seconds): upstream
+  operation duration, recorded where `sbproxy_ai_request_duration_seconds`
+  records.
+- `gen_ai.client.token.usage` (histogram, tokens): token consumption
+  with `gen_ai.token.type` = `input` or `output`, recorded at the
+  billing choke point.
+
+Both carry `gen_ai.system`, `gen_ai.operation.name`, and
+`gen_ai.request.model`, matching the pinned span vocabulary. These are
+OTLP-only mirrors, not Prometheus families; the `sbproxy_*` families
+remain canonical. GenAI-aware backends (Datadog LLM Observability,
+Grafana GenAI dashboards) pick them up with no relabeling.
+
+Exemplars: the AI latency histograms (`sbproxy_ai_ttft_seconds`,
+`sbproxy_ai_inter_token_latency_seconds`,
+`sbproxy_ai_request_duration_seconds`,
+`sbproxy_ai_request_duration_attributed_seconds`) emit OpenMetrics
+exemplars carrying the active `trace_id`, so a latency spike links
+directly to its trace. Scrape with OpenMetrics content negotiation
+and run Prometheus with `--enable-feature=exemplar-storage`.
 
 ---
 

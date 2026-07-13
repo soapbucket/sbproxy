@@ -96,6 +96,19 @@ pub const REQUIRED_OTEL_GENAI_SPAN_FIELDS: &[&str] = &[
     "gen_ai.request.top_p",
 ];
 
+/// GenAI agent-convention fields the MCP `execute_tool` span must keep
+/// emitting (WOR-1877). Where the in-development MCP conventions do
+/// not yet name an attribute, the `sbproxy.mcp.*` namespace holds the
+/// slot so a later rename is mechanical (same pattern as the pinned
+/// gen_ai vocabulary above).
+pub const REQUIRED_OTEL_GENAI_TOOL_SPAN_FIELDS: &[&str] = &[
+    "gen_ai.operation.name",
+    "gen_ai.tool.name",
+    "sbproxy.mcp.server",
+    "sbproxy.mcp.outcome",
+    "sbproxy.mcp.cost_usd",
+];
+
 /// OpenInference span fields SBproxy dual-emits for LLM-native backends.
 pub const REQUIRED_OPENINFERENCE_SPAN_FIELDS: &[&str] = &[
     "llm.provider",
@@ -122,6 +135,48 @@ pub const OP_IMAGE_GENERATION: &str = "image_generation";
 
 /// Operation name for audio (transcription, translation, TTS) requests.
 pub const OP_AUDIO: &str = "audio";
+
+/// Create the span for one MCP tool dispatch (WOR-1877).
+///
+/// Follows the OTel GenAI agent conventions: `gen_ai.operation.name`
+/// is `execute_tool` and `gen_ai.tool.name` carries the dispatched
+/// tool. The gateway terminates both the LLM and the MCP traffic, so
+/// with W3C propagation active this span parents under the caller's
+/// trace and the tree shows the agent request, the tool dispatch, and
+/// the LLM calls with cost on every hop.
+///
+/// Where the in-development MCP semantic conventions do not yet name
+/// an attribute, the `sbproxy.mcp.*` namespace holds the slot
+/// (`server`, `outcome`, `cost_usd`) so a later rename is mechanical.
+/// Tool arguments never land on span attributes (unbounded); content
+/// capture rides span events under the `trace_content` gate instead.
+pub fn execute_tool_span(tool: &str, server: &str) -> Span {
+    tracing::info_span!(
+        "mcp.execute_tool",
+        "gen_ai.operation.name" = "execute_tool",
+        "gen_ai.tool.name" = tool,
+        "sbproxy.mcp.server" = server,
+        "sbproxy.mcp.outcome" = Empty,
+        "sbproxy.mcp.cost_usd" = Empty,
+        "error.type" = Empty,
+    )
+}
+
+/// Record the dispatch outcome on an [`execute_tool_span`].
+///
+/// `outcome` is the same closed vocabulary the dispatch metric uses
+/// (`ok`, `tool_error`); non-`ok` outcomes also stamp `error.type` so
+/// trace backends surface the span as failed. `cost_usd` mirrors the
+/// per-tool cost counter when the price map resolves the tool.
+pub fn record_tool_outcome(span: &Span, outcome: &str, cost_usd: Option<f64>) {
+    span.record("sbproxy.mcp.outcome", outcome);
+    if let Some(cost) = cost_usd {
+        span.record("sbproxy.mcp.cost_usd", cost);
+    }
+    if outcome != "ok" {
+        span.record("error.type", outcome);
+    }
+}
 
 /// Create the top-level span for an AI request.
 ///
@@ -813,6 +868,64 @@ mod tests {
         let span = find_span(&spans, "ai.request");
         assert_field(span, "input.value", "summarize this [redacted]");
         assert_field(span, "output.value", "here is the summary");
+    }
+
+    /// WOR-1877: the MCP execute_tool span carries the pinned agent
+    /// vocabulary, outcome + cost land on record, and a failed
+    /// dispatch stamps `error.type`. Same drop-a-field-fails contract
+    /// as the ai.request conformance test below.
+    #[test]
+    fn execute_tool_span_conforms_to_pinned_tool_vocabulary() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = execute_tool_span("search_docs", "docs-server");
+            record_tool_outcome(&span, "ok", Some(0.002));
+            let failed = execute_tool_span("flaky_tool", "docs-server");
+            record_tool_outcome(&failed, "tool_error", None);
+        });
+        let spans = snapshot_spans(&layer);
+        let ok_span = spans
+            .iter()
+            .find(|s| {
+                s.name == "mcp.execute_tool"
+                    && s.fields.get("gen_ai.tool.name").map(String::as_str) == Some("search_docs")
+            })
+            .expect("execute_tool span captured");
+        for field in REQUIRED_OTEL_GENAI_TOOL_SPAN_FIELDS {
+            assert!(
+                ok_span.fields.contains_key(*field),
+                "execute_tool span missing pinned field {field:?}"
+            );
+        }
+        assert_eq!(
+            ok_span.fields.get("gen_ai.operation.name").unwrap(),
+            "execute_tool"
+        );
+        assert_eq!(
+            ok_span.fields.get("sbproxy.mcp.server").unwrap(),
+            "docs-server"
+        );
+        assert_eq!(ok_span.fields.get("sbproxy.mcp.outcome").unwrap(), "ok");
+        assert!(
+            !ok_span.fields.contains_key("error.type")
+                || ok_span.fields.get("error.type").unwrap().is_empty(),
+            "ok dispatch must not stamp error.type"
+        );
+
+        let failed_span = spans
+            .iter()
+            .find(|s| {
+                s.name == "mcp.execute_tool"
+                    && s.fields.get("gen_ai.tool.name").map(String::as_str) == Some("flaky_tool")
+            })
+            .expect("failed execute_tool span captured");
+        assert_eq!(
+            failed_span.fields.get("sbproxy.mcp.outcome").unwrap(),
+            "tool_error"
+        );
+        assert_eq!(failed_span.fields.get("error.type").unwrap(), "tool_error");
     }
 
     /// GenAI/OpenInference semantic-convention conformance. Pin the source

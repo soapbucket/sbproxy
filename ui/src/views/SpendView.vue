@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
-import { api } from "../api";
+import { computed, onMounted, ref, watch } from "vue";
+import { api, type SpendWindowResponse } from "../api";
 import { useAsync } from "../composables/useAsync";
 import {
   parsePrometheus,
@@ -111,13 +111,173 @@ const hasSpend = computed(() => totalSpend.value > 0);
 const hasTeams = computed(() => spendByTeam.value.length > 0);
 const hasProjects = computed(() => spendByProject.value.length > 0);
 const hasKeys = computed(() => spendByKey.value.length > 0);
+
+// --- Spend history from the durable rollups (WOR-1875) ---
+// Served by /api/usage/spend?window=&group_by=; survives restarts.
+const HISTORY_WINDOWS = ["1h", "24h", "7d", "30d"] as const;
+const HISTORY_GROUPS = [
+  { value: "total", label: "Total" },
+  { value: "model", label: "Model" },
+  { value: "provider", label: "Provider" },
+  { value: "team", label: "Team" },
+  { value: "project", label: "Project" },
+  { value: "api_key", label: "API key" },
+] as const;
+const historyWindow = ref<(typeof HISTORY_WINDOWS)[number]>("24h");
+const historyGroup = ref<string>("model");
+const history = useAsync(() =>
+  api.spendWindow(historyWindow.value, historyGroup.value),
+);
+onMounted(history.run);
+watch([historyWindow, historyGroup], () => history.run());
+
+// Rollups disabled (503) reads as a hint, not a failure.
+const historyDisabled = computed(() => {
+  const e = history.error.value;
+  return e ? String(e).includes("not enabled") : false;
+});
+
+function bucketLabel(tsSecs: number, bucketSecs: number): string {
+  const d = new Date(tsSecs * 1000);
+  if (bucketSecs >= 86400) {
+    return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+  return `${String(d.getHours()).padStart(2, "0")}:00`;
+}
+
+// Spend over time: one bar per bucket, groups folded together.
+const historyOverTime = computed(() => {
+  const res: SpendWindowResponse | null = history.data.value;
+  if (!res) return [];
+  const byTs = new Map<number, number>();
+  for (const b of res.buckets) {
+    byTs.set(b.ts_secs, (byTs.get(b.ts_secs) ?? 0) + b.cost_usd_micros);
+  }
+  return [...byTs.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([ts, micros]) => ({
+      key: bucketLabel(ts, res.bucket_secs),
+      value: micros / 1_000_000,
+    }));
+});
+
+// Per-group totals across the window, for the table.
+interface HistoryRow {
+  group: string;
+  cost: number;
+  tokensIn: number;
+  tokensOut: number;
+  requests: number;
+  blocked: number;
+}
+const historyRows = computed<HistoryRow[]>(() => {
+  const res: SpendWindowResponse | null = history.data.value;
+  if (!res) return [];
+  const byGroup = new Map<string, HistoryRow>();
+  for (const b of res.buckets) {
+    const key = b.group === "" ? "(unattributed)" : b.group;
+    const row = byGroup.get(key) ?? {
+      group: key,
+      cost: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      requests: 0,
+      blocked: 0,
+    };
+    row.cost += b.cost_usd_micros / 1_000_000;
+    row.tokensIn += b.tokens_in;
+    row.tokensOut += b.tokens_out;
+    row.requests += b.requests;
+    row.blocked += b.blocked;
+    byGroup.set(key, row);
+  }
+  return [...byGroup.values()].sort((a, b) => b.cost - a.cost);
+});
+const historyTotals = computed(() => history.data.value?.totals ?? null);
+const hasHistory = computed(() => historyRows.value.length > 0);
 </script>
 
 <template>
   <PageHeader
     title="Spend"
-    subtitle="Estimated AI cost from the live counters. Totals accumulate since process start and reset on restart; scrape /metrics into Prometheus for history."
+    subtitle="Estimated AI cost. History comes from the durable usage rollups and survives restarts; the live sections below accumulate since process start."
   />
+
+  <section class="panel">
+    <div class="history-head">
+      <h2>Spend history</h2>
+      <div class="pickers">
+        <div class="segmented" role="group" aria-label="Time range">
+          <button
+            v-for="w in HISTORY_WINDOWS"
+            :key="w"
+            :class="{ active: historyWindow === w }"
+            @click="historyWindow = w"
+          >
+            {{ w }}
+          </button>
+        </div>
+        <select v-model="historyGroup" aria-label="Group by">
+          <option v-for="g in HISTORY_GROUPS" :key="g.value" :value="g.value">
+            {{ g.label }}
+          </option>
+        </select>
+      </div>
+    </div>
+
+    <p v-if="historyDisabled" class="hint">
+      Usage rollups are not enabled, so windowed history is unavailable.
+      Enable proxy.observability.usage_rollups (on by default) and make
+      sure its path is writable.
+    </p>
+    <ErrorState
+      v-else-if="history.error.value"
+      :error="history.error.value"
+      @retry="history.run"
+    />
+    <p v-else-if="!history.loading.value && !hasHistory" class="hint">
+      No spend recorded in this window yet. History fills in as AI
+      requests flow; totals survive restarts.
+    </p>
+    <template v-else-if="hasHistory">
+      <MiniBars :items="historyOverTime" :format="formatUsd" />
+      <div class="tiles history-tiles" v-if="historyTotals">
+        <StatCard
+          label="Window spend"
+          :value="formatUsd(historyTotals.cost_usd_micros / 1_000_000)"
+          tone="accent"
+        />
+        <StatCard label="Requests" :value="formatNumber(historyTotals.requests)" />
+        <StatCard label="Blocked" :value="formatNumber(historyTotals.blocked)" />
+        <StatCard
+          label="Tokens"
+          :value="formatNumber(historyTotals.tokens_in + historyTotals.tokens_out)"
+        />
+      </div>
+      <table class="detail">
+        <thead>
+          <tr>
+            <th>{{ HISTORY_GROUPS.find((g) => g.value === historyGroup)?.label ?? "Group" }}</th>
+            <th>Cost</th>
+            <th>Tokens in</th>
+            <th>Tokens out</th>
+            <th>Requests</th>
+            <th>Blocked</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="r in historyRows" :key="r.group">
+            <td>{{ r.group }}</td>
+            <td>{{ formatUsd(r.cost) }}</td>
+            <td>{{ formatNumber(r.tokensIn) }}</td>
+            <td>{{ formatNumber(r.tokensOut) }}</td>
+            <td>{{ formatNumber(r.requests) }}</td>
+            <td>{{ formatNumber(r.blocked) }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </template>
+  </section>
 
   <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
 
@@ -216,5 +376,62 @@ const hasKeys = computed(() => spendByKey.value.length > 0);
   padding: 6px 8px;
   border-bottom: 1px solid var(--sb-border);
   font-variant-numeric: tabular-nums;
+}
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.history-head h2 {
+  margin: 0;
+}
+.pickers {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--sb-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.segmented button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--sb-text-muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.segmented button + button {
+  border-left: 1px solid var(--sb-border);
+}
+.segmented button.active {
+  background: var(--sb-bg-subtle, rgba(127, 127, 127, 0.12));
+  color: var(--sb-text);
+}
+.pickers select {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid var(--sb-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--sb-text);
+}
+.history-tiles {
+  margin-top: 12px;
+  margin-bottom: 0;
+}
+.hint {
+  font-size: 13px;
+  color: var(--sb-text-muted);
+  margin: 4px 0 0;
 }
 </style>

@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-12*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -1117,7 +1117,7 @@ origins:
 | `provider` | string | | Provider this key routes to. Matches an entry in the action's `providers:` list. |
 | `key` | string | | Client-facing key material. Accepts `${ENV}` and secret reference URIs. |
 | `models.allow` / `models.deny` | list | | Per-key model gate, enforced with a 403 before any upstream call. Stacks on the origin-level allow-list; most restrictive wins. |
-| `attrs` | object | | Attribution metadata (`project`, `tags`, `budget`, ...) surfaced in the `sbproxy_ai_key_*` metrics. The `budget` here is attribution, not an enforced ceiling; enforced spend caps live in the action-level `budget:` block. |
+| `attrs` | object | | Attribution metadata (`project`, `tags`, `budget`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. The `budget` here is attribution, not an enforced ceiling; enforced spend caps live in the action-level `budget:` block. |
 | `policies` | list | | Sub-policies that fire when this credential matches. `{type: rate_limit, rpm: <n>}` lowers to an enforced per-key requests-per-minute cap; there is no per-key tokens-per-minute knob. `{type: require_pii_redaction, rules: [...]}` gates dispatch on active PII redaction. |
 | `route_to_model` | string | | Pin the upstream `model` field; the client-supplied value is ignored. |
 | `inject_tools` | list | | Replace the request's `tools` array with these provider-native entries. |

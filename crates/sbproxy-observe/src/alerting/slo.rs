@@ -48,6 +48,7 @@ pub fn check_slo_violation(rule: &SloRule, observed_p99_ms: f64) -> Option<Alert
             ),
             timestamp: chrono::Utc::now().to_rfc3339(),
             labels,
+            resolved: false,
         })
     } else {
         None

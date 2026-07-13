@@ -372,7 +372,23 @@ export interface RequestLog {
   target?: string;
   client?: string;
   client_ip?: string;
+  // WOR-1874 correlation + AI columns on the ring entry.
+  request_id?: string;
+  trace_id?: string;
+  provider?: string;
+  model?: string;
+  tokens_in?: number;
+  tokens_out?: number;
+  cost_usd_micros?: number;
+  guardrail_category?: string;
+  guardrail_action?: string;
+  origin?: string;
   [k: string]: unknown;
+}
+
+// WOR-1870: UI settings served by the admin API.
+export interface UiSettings {
+  trace_url_template?: string | null;
 }
 
 export interface PromptEntry {
@@ -465,6 +481,38 @@ export interface LoginResult {
   csrf_token: string;
 }
 
+// Windowed spend from the durable usage rollups (WOR-1875).
+export interface SpendWindowBucket {
+  ts_secs: number;
+  group: string;
+  requests: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd_micros: number;
+  ok: number;
+  blocked: number;
+  error: number;
+}
+
+export interface SpendWindowTotals {
+  requests: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd_micros: number;
+  ok: number;
+  blocked: number;
+  error: number;
+}
+
+export interface SpendWindowResponse {
+  from: number;
+  to: number;
+  group_by: string;
+  bucket_secs: number;
+  buckets: SpendWindowBucket[];
+  totals: SpendWindowTotals;
+}
+
 export const api = {
   // Auth (WOR-1758)
   session: () => getJson<SessionInfo>("/admin/session"),
@@ -530,9 +578,19 @@ export const api = {
 
   // Logs
   requests: () => getJson<unknown>("/api/requests"),
+  // WOR-1870: operator UI settings (trace deep-link template).
+  uiSettings: () => getJson<UiSettings>("/api/ui-settings"),
+  // WOR-1870: SSE live tail of the request ring. EventSource sends the
+  // session cookie same-origin; the server enforces auth on connect.
+  requestsStreamUrl: () => "/api/requests/stream",
 
   // Metrics
   metrics: () => getText("/metrics"),
+  // Windowed spend history from the durable rollups (WOR-1875).
+  spendWindow: (window: string, groupBy: string) =>
+    getJson<SpendWindowResponse>(
+      `/api/usage/spend?window=${encodeURIComponent(window)}&group_by=${encodeURIComponent(groupBy)}`,
+    ),
 
   // Prompts
   prompts: () => getJson<unknown>("/admin/prompts"),

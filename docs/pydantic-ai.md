@@ -1,6 +1,6 @@
 # Pydantic AI with SBproxy
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-12*
 
 A Pydantic AI agent produces two kinds of outbound traffic: completion calls to a model provider and tool calls to MCP servers. Point both at an SBproxy you run and everything the agent does crosses one gateway you control. That is where virtual keys scope which models an application may use and attribute its spend, budgets meter tokens and dollars, guardrails screen prompts and tool calls, and the usage ledger records what actually happened. On the Pydantic AI side the change is a provider with a different base URL and one toolset entry.
 
@@ -62,7 +62,7 @@ origins:
 
 Origin keys match the `Host` header and hostname matching strips the port, so `"127.0.0.1"` matches a client whose base URL is `http://127.0.0.1:8080/v1`. When the gateway runs elsewhere, key the origin with the hostname your application connects to. The real provider key comes from the environment through `${OPENAI_API_KEY}` interpolation; the file never holds a raw provider secret.
 
-It is worth being precise about what the virtual key does. `OpenAIProvider` sends it as `Authorization: Bearer sk-your-virtual-key`; the gateway matches it to the `pydantic-ai-app` credential, enforces the `models.allow` list (a request for a model outside the list gets a 403 before any upstream call), stamps the request with the credential's `project` and `tags` so metrics and the ledger can attribute usage to this application, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your agent never holds the provider key. Two caveats: the `attrs.budget` block is attribution metadata surfaced in the `sbproxy_ai_key_*` metrics, and enforced spend ceilings belong in an action-level `budget:` block; and the virtual key is not inbound authentication by itself, since anyone who can reach the listener could present a key string, so add an `authentication` block to the origin once the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers both in depth.
+It is worth being precise about what the virtual key does. `OpenAIProvider` sends it as `Authorization: Bearer sk-your-virtual-key`; the gateway matches it to the `pydantic-ai-app` credential, enforces the `models.allow` list (a request for a model outside the list gets a 403 before any upstream call), stamps the request with the credential's `project` and `tags` so metrics and the ledger can attribute usage to this application, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your agent never holds the provider key. Two caveats: the `attrs.budget` block is attribution metadata surfaced as attribution labels on the `sbproxy_ai_*_attributed_total` metrics, and enforced spend ceilings belong in an action-level `budget:` block; and the virtual key is not inbound authentication by itself, since anyone who can reach the listener could present a key string, so add an `authentication` block to the origin once the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers both in depth.
 
 ## MCP tools through the gateway
 

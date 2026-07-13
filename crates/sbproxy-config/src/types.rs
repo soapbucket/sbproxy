@@ -1949,6 +1949,12 @@ pub struct AdminConfig {
     /// Absent means PR3-style ephemeral mutations.
     #[serde(default)]
     pub prompt_persistence_path: Option<std::path::PathBuf>,
+    /// URL template for trace deep-links in the admin UI. The literal
+    /// `{trace_id}` is replaced with the request's trace id, e.g.
+    /// `https://jaeger.internal/trace/{trace_id}`. Unset renders trace
+    /// ids as plain text (no broken default link).
+    #[serde(default)]
+    pub trace_url_template: Option<String>,
     /// Optional TLS for the admin server (WOR-1717). When set, the admin
     /// endpoint and the built-in UI are served over HTTPS using the PEM
     /// certificate and key at the configured paths, instead of plaintext
@@ -2534,6 +2540,56 @@ pub struct ObservabilityConfig {
     /// configured endpoint receives traces and (optionally) metrics.
     #[serde(default)]
     pub telemetry: Option<ObservabilityTelemetryConfig>,
+    /// Durable windowed usage rollups. On by default; omit the block
+    /// to accept the defaults.
+    #[serde(default)]
+    pub usage_rollups: Option<UsageRollupsConfig>,
+}
+
+/// Durable spend-rollup configuration (hour and day usage buckets in
+/// an embedded database, so the admin spend API serves windowed
+/// history that survives restarts). Buckets are keyed by provider,
+/// model, tenant, team, credential id, and project, and aggregate
+/// request counts, tokens, cost, and an outcome split. Rows carry no
+/// prompt content and no raw key material, so the file is safe to
+/// back up. Aggregation is deterministic.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct UsageRollupsConfig {
+    /// Whether rollups are recorded. Defaults to `true`. When the
+    /// store path cannot be opened the proxy logs a warning and runs
+    /// with rollups off instead of failing boot.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Rollup database file path. Default
+    /// `/var/lib/sbproxy/usage-rollups.redb`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Days of hourly buckets to keep before compacting into daily
+    /// buckets. Default 90.
+    #[serde(default = "default_rollup_hourly_days")]
+    pub retention_hourly_days: u32,
+    /// Days of daily buckets to keep. Default 395 (about 13 months).
+    #[serde(default = "default_rollup_daily_days")]
+    pub retention_daily_days: u32,
+}
+
+impl Default for UsageRollupsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+            retention_hourly_days: default_rollup_hourly_days(),
+            retention_daily_days: default_rollup_daily_days(),
+        }
+    }
+}
+
+fn default_rollup_hourly_days() -> u32 {
+    90
+}
+
+fn default_rollup_daily_days() -> u32 {
+    395
 }
 
 /// Subset of `sbproxy-observe::LoggingConfig` that lands in the public
@@ -2843,19 +2899,34 @@ pub struct ObservabilityTelemetryConfig {
     /// Period for the OTLP metric exporter, seconds. Default 30s.
     #[serde(default)]
     pub metrics_interval_secs: Option<u64>,
+    /// Additional headers sent with every OTLP export request (traces,
+    /// metrics, and any OTLP log sink). Values may be literals or
+    /// secret references (`${VAR}`, `file:`, `vault://`, `secret://`,
+    /// and the other backend URI schemes); references resolve at boot
+    /// and the proxy refuses to start when one cannot be resolved, so
+    /// a raw reference never reaches the collector. Hosted backends
+    /// (Grafana Cloud, Honeycomb, Langfuse Cloud, Datadog) authenticate
+    /// with these headers.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 /// Configuration for a single alert notification channel.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AlertChannelConfig {
-    /// Channel type: `"webhook"` or `"log"`.
+    /// Channel type: `"webhook"`, `"slack"`, `"pagerduty"`, or `"log"`.
     #[serde(rename = "type")]
     pub channel_type: String,
-    /// Webhook URL (required when `channel_type == "webhook"`).
+    /// Webhook URL. Required for `webhook` (any receiver) and `slack`
+    /// (the incoming-webhook URL); unused by `pagerduty` and `log`.
     pub url: Option<String>,
     /// Additional HTTP headers for webhook delivery.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// PagerDuty Events API v2 routing key (required when
+    /// `channel_type == "pagerduty"`). Accepts secret references.
+    #[serde(default)]
+    pub routing_key: Option<String>,
 }
 
 // --- HTTP/3 Config ---
