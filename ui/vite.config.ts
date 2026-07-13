@@ -29,6 +29,7 @@ export default defineConfig({
       "/metrics": proxyTarget(),
       "/admin/keys": proxyTarget(),
       "/admin/credentials": proxyTarget(),
+      "/admin/cluster": proxyTarget(),
       "/admin/model-host": proxyTarget(),
       "/admin/prompts": proxyTarget(),
       "/admin/drift": proxyTarget(),
