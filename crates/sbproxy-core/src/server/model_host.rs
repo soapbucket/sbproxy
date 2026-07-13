@@ -42,6 +42,7 @@ use sbproxy_model_host::{
 /// unaffected engine generations.
 pub struct ProductionModelRuntime {
     active: ArcSwap<sbproxy_model_host::ModelRuntimeManager>,
+    active_catalog: ArcSwap<Catalog>,
     foundation: RwLock<Option<RuntimeFoundation>>,
     snapshot_preparer: RwLock<Option<Arc<sbproxy_model_host::ProductionDeploymentPreparer>>>,
     cluster_state: RwLock<Option<ClusterRuntimeState>>,
@@ -85,6 +86,21 @@ pub enum AdminDeploymentRevisionError {
     Runtime(#[from] sbproxy_model_host::RuntimeManagerError),
 }
 
+/// Authority and durable desired state exposed to authenticated management APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelManagementSnapshot {
+    /// Active persistent desired-state authority.
+    pub authority: sbproxy_config::ModelHostAuthority,
+    /// Whether local admin mutation is disabled for this authority.
+    pub read_only: bool,
+    /// Durable admin store revision, when admin-managed state is active.
+    pub revision: Option<u64>,
+    /// Durable admin store content digest, when a revision exists.
+    pub content_digest: Option<String>,
+    /// Complete desired deployment map visible to this process.
+    pub deployments: BTreeMap<String, sbproxy_model_host::ModelDeployment>,
+}
+
 impl std::fmt::Debug for ProductionModelRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -118,6 +134,7 @@ struct ClusterRuntimeState {
 pub struct PreparedModelRuntime {
     owner: Arc<ProductionModelRuntime>,
     manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
+    catalog: Arc<Catalog>,
     snapshot_preparer: Option<Arc<sbproxy_model_host::ProductionDeploymentPreparer>>,
     prepared: sbproxy_model_host::PreparedRevision,
     base_epoch: u64,
@@ -382,10 +399,11 @@ fn build_model_maintenance_runtime() -> std::io::Result<tokio::runtime::Runtime>
 
 impl ProductionModelRuntime {
     fn empty() -> Result<Self, sbproxy_model_host::RuntimeManagerError> {
-        let catalog = Catalog::builtin();
-        let manager = empty_runtime_manager(catalog.catalog_revision)?;
+        let catalog = Arc::new(Catalog::builtin());
+        let manager = empty_runtime_manager(catalog.catalog_revision.clone())?;
         Ok(Self {
             active: ArcSwap::from(manager),
+            active_catalog: ArcSwap::from(catalog),
             foundation: RwLock::new(None),
             snapshot_preparer: RwLock::new(None),
             cluster_state: RwLock::new(None),
@@ -461,6 +479,55 @@ impl ProductionModelRuntime {
     /// Current atomic managed-model desired state.
     pub fn current_desired(&self) -> Arc<sbproxy_model_host::RuntimeDesiredState> {
         self.active_manager().current_desired()
+    }
+
+    /// Catalog committed with the current runtime revision.
+    pub fn active_catalog(&self) -> Arc<Catalog> {
+        self.active_catalog.load_full()
+    }
+
+    /// Authority-aware desired-state snapshot for authenticated management APIs.
+    pub fn management_snapshot(
+        &self,
+    ) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError> {
+        let desired = self.current_desired();
+        let authority = desired.control.authority;
+        if authority == sbproxy_config::ModelHostAuthority::AdminManaged {
+            let store_path = desired.control.store_path.clone().ok_or_else(|| {
+                AdminDeploymentRevisionError::Runtime(
+                    sbproxy_model_host::RuntimeManagerError::InvalidDesired(
+                        "admin-managed model host requires a deployment store path".to_string(),
+                    ),
+                )
+            })?;
+            let store = sbproxy_model_host::FileDeploymentRevisionStore::open(store_path)
+                .map_err(map_admin_store_error)?;
+            let durable = store.load().map_err(map_admin_store_error)?;
+            return Ok(match durable {
+                Some(revision) => ModelManagementSnapshot {
+                    authority,
+                    read_only: false,
+                    revision: Some(revision.revision),
+                    content_digest: Some(revision.content_digest),
+                    deployments: revision.deployments,
+                },
+                None => ModelManagementSnapshot {
+                    authority,
+                    read_only: false,
+                    revision: None,
+                    content_digest: None,
+                    deployments: desired.revision.deployments.clone(),
+                },
+            });
+        }
+
+        Ok(ModelManagementSnapshot {
+            authority,
+            read_only: true,
+            revision: None,
+            content_digest: None,
+            deployments: desired.revision.deployments.clone(),
+        })
     }
 
     /// Prepare, durably compare-and-swap, and commit one complete admin revision.
@@ -1105,6 +1172,7 @@ impl ProductionModelRuntime {
         Ok(PreparedModelRuntime {
             owner: Arc::clone(self),
             manager,
+            catalog: candidate.catalog,
             snapshot_preparer,
             prepared,
             base_epoch,
@@ -1162,6 +1230,7 @@ impl ProductionModelRuntime {
         if candidate.replace_manager {
             self.active.store(candidate.manager);
         }
+        self.active_catalog.store(candidate.catalog);
         *self
             .snapshot_preparer
             .write()
@@ -1990,9 +2059,10 @@ mod tests {
         store_path: &Path,
         preparer: Arc<ClusterFixturePreparer>,
     ) -> ProductionModelRuntime {
+        let catalog = Arc::new(Catalog::builtin());
         let manager = Arc::new(
             sbproxy_model_host::ModelRuntimeManager::new(
-                Catalog::builtin().catalog_revision,
+                catalog.catalog_revision.clone(),
                 preparer,
             )
             .expect("fixture manager"),
@@ -2007,12 +2077,53 @@ mod tests {
             .expect("fixture admin revision commits");
         ProductionModelRuntime {
             active: ArcSwap::from(manager),
+            active_catalog: ArcSwap::from(catalog),
             foundation: RwLock::new(None),
             snapshot_preparer: RwLock::new(None),
             cluster_state: RwLock::new(None),
             epoch: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_catalog_becomes_active_only_after_candidate_commit() {
+        let runtime = Arc::new(ProductionModelRuntime::empty().expect("empty runtime"));
+        let initial_revision = runtime.active_catalog().catalog_revision.clone();
+        let mut catalog = Catalog::builtin();
+        catalog.catalog_revision = "prepared-catalog-v2".to_string();
+        let catalog = Arc::new(catalog);
+        let desired = sbproxy_model_host::compile_desired_state(
+            sbproxy_model_host::RuntimeDesiredInput {
+                source_revision: "prepared-catalog-config".to_string(),
+                canonical: None,
+                managed_providers: Vec::new(),
+                legacy_providers: Vec::new(),
+            },
+            &catalog,
+        )
+        .expect("catalog candidate desired state");
+        let directory = tempfile::tempdir().expect("catalog candidate cache");
+
+        let prepared = runtime
+            .prepare_candidate(RuntimeCandidate {
+                desired,
+                catalog: Arc::clone(&catalog),
+                cache_root: directory.path().to_path_buf(),
+                authority_bundle: None,
+            })
+            .await
+            .expect("catalog candidate prepares");
+
+        assert_eq!(runtime.active_catalog().catalog_revision, initial_revision);
+        runtime
+            .commit(prepared)
+            .await
+            .expect("catalog candidate commits");
+        assert_eq!(
+            runtime.active_catalog().catalog_revision,
+            "prepared-catalog-v2"
+        );
     }
 
     #[tokio::test]
@@ -2341,6 +2452,7 @@ deployments:
         );
         let runtime = ProductionModelRuntime {
             active: ArcSwap::from(manager),
+            active_catalog: ArcSwap::from(Arc::clone(&catalog)),
             foundation: RwLock::new(None),
             snapshot_preparer: RwLock::new(None),
             cluster_state: RwLock::new(Some(ClusterRuntimeState { placement, catalog })),

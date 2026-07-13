@@ -14,14 +14,531 @@
 //! savings recorder on the request path (none exists yet), so it is a
 //! separate slice.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use crate::server::model_host::{
+    AdminDeploymentRevisionError, AdminDeploymentRevisionResult, ModelManagementSnapshot,
+    ProductionModelRuntime,
+};
+
 type Resp = (u16, &'static str, String);
 
 const JSON: &str = "application/json";
+
+const MANAGEMENT_SCHEMA_VERSION: u32 = 1;
+
+trait ModelManagementRuntime {
+    fn active_catalog(&self) -> Arc<sbproxy_model_host::Catalog>;
+
+    fn management_snapshot(&self) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError>;
+
+    fn apply_admin_deployment_revision(
+        &self,
+        expected_revision: Option<u64>,
+        deployments: BTreeMap<String, sbproxy_model_host::ModelDeployment>,
+    ) -> Result<AdminDeploymentRevisionResult, AdminDeploymentRevisionError>;
+}
+
+impl ModelManagementRuntime for ProductionModelRuntime {
+    fn active_catalog(&self) -> Arc<sbproxy_model_host::Catalog> {
+        ProductionModelRuntime::active_catalog(self)
+    }
+
+    fn management_snapshot(&self) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError> {
+        ProductionModelRuntime::management_snapshot(self)
+    }
+
+    fn apply_admin_deployment_revision(
+        &self,
+        expected_revision: Option<u64>,
+        deployments: BTreeMap<String, sbproxy_model_host::ModelDeployment>,
+    ) -> Result<AdminDeploymentRevisionResult, AdminDeploymentRevisionError> {
+        tokio::runtime::Handle::current().block_on(
+            ProductionModelRuntime::apply_admin_deployment_revision(
+                self,
+                expected_revision,
+                deployments,
+            ),
+        )
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogResponse {
+    schema_version: u32,
+    catalog_revision: String,
+    models: BTreeMap<String, CatalogModelMetadata>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogModelMetadata {
+    params: String,
+    license: String,
+    family: String,
+    context_length: u64,
+    variants: Vec<CatalogVariantMetadata>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogVariantMetadata {
+    id: String,
+    format: sbproxy_model_host::ArtifactFormat,
+    quant: String,
+    engines: Vec<sbproxy_model_host::EngineKind>,
+    accelerators: BTreeSet<sbproxy_model_host::AcceleratorKind>,
+    min_memory_bytes: u64,
+    stability: sbproxy_model_host::SupportLevel,
+}
+
+#[derive(Debug, Serialize)]
+struct DeploymentsResponse {
+    schema_version: u32,
+    authority: sbproxy_config::ModelHostAuthority,
+    read_only: bool,
+    revision: Option<u64>,
+    content_digest: Option<String>,
+    deployments: BTreeMap<String, sbproxy_model_host::ModelDeployment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeploymentPutRequest {
+    expected_revision: serde_json::Value,
+    #[serde(deserialize_with = "deserialize_unique_deployments")]
+    deployments: BTreeMap<String, StrictModelDeployment>,
+}
+
+fn deserialize_unique_deployments<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, StrictModelDeployment>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueDeployments;
+
+    impl<'de> serde::de::Visitor<'de> for UniqueDeployments {
+        type Value = BTreeMap<String, StrictModelDeployment>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map with unique deployment IDs")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut deployments = BTreeMap::new();
+            while let Some((id, deployment)) = map.next_entry::<String, StrictModelDeployment>()? {
+                if deployments.insert(id.clone(), deployment).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate deployment ID {id:?}"
+                    )));
+                }
+            }
+            Ok(deployments)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueDeployments)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictModelDeployment {
+    model: String,
+    #[serde(default)]
+    variant: Option<String>,
+    #[serde(default)]
+    heterogeneous_variants: bool,
+    #[serde(default = "one_replica")]
+    replicas: u32,
+    #[serde(default)]
+    required_labels: BTreeMap<String, String>,
+    #[serde(default)]
+    spread_by: Vec<String>,
+    #[serde(default)]
+    pull: sbproxy_model_host::PullPolicy,
+    #[serde(default)]
+    warm: bool,
+    #[serde(default)]
+    keep_alive_secs: Option<u64>,
+    #[serde(default)]
+    max_concurrency: Option<u32>,
+    #[serde(default = "default_max_queue_depth")]
+    max_queue_depth: usize,
+    #[serde(default = "default_queue_timeout_ms")]
+    queue_timeout_ms: u64,
+    #[serde(default)]
+    engine: sbproxy_model_host::EngineChoice,
+    #[serde(default)]
+    rollout: sbproxy_model_host::RolloutPolicy,
+}
+
+impl From<StrictModelDeployment> for sbproxy_model_host::ModelDeployment {
+    fn from(deployment: StrictModelDeployment) -> Self {
+        Self {
+            model: deployment.model,
+            variant: deployment.variant,
+            heterogeneous_variants: deployment.heterogeneous_variants,
+            replicas: deployment.replicas,
+            required_labels: deployment.required_labels,
+            spread_by: deployment.spread_by,
+            pull: deployment.pull,
+            warm: deployment.warm,
+            keep_alive_secs: deployment.keep_alive_secs,
+            max_concurrency: deployment.max_concurrency,
+            max_queue_depth: deployment.max_queue_depth,
+            queue_timeout_ms: deployment.queue_timeout_ms,
+            engine: deployment.engine,
+            rollout: deployment.rollout,
+        }
+    }
+}
+
+const fn one_replica() -> u32 {
+    1
+}
+
+const fn default_max_queue_depth() -> usize {
+    128
+}
+
+const fn default_queue_timeout_ms() -> u64 {
+    30_000
+}
+
+#[derive(Debug, Serialize)]
+struct DeploymentPutResponse {
+    schema_version: u32,
+    revision: u64,
+    content_digest: String,
+    plan: sbproxy_model_host::ReconcilePlan,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    code: &'static str,
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_revision: Option<u64>,
+}
+
+fn error_response(status: u16, code: &'static str, error: impl Into<String>) -> Resp {
+    json_response(
+        status,
+        &ErrorResponse {
+            code,
+            error: error.into(),
+            expected_revision: None,
+            actual_revision: None,
+        },
+    )
+}
+
+fn json_response(status: u16, value: &impl Serialize) -> Resp {
+    match serde_json::to_string(value) {
+        Ok(body) => (status, JSON, body),
+        Err(error) => {
+            tracing::error!(%error, "serialize model management response");
+            (
+                500,
+                JSON,
+                r#"{"code":"internal","error":"model management response failed"}"#.to_string(),
+            )
+        }
+    }
+}
+
+fn bounded_metadata(value: &str) -> String {
+    value.chars().take(256).collect()
+}
+
+fn catalog_response(runtime: &impl ModelManagementRuntime) -> Resp {
+    let catalog = runtime.active_catalog();
+    let models = catalog
+        .models
+        .iter()
+        .map(|(id, entry)| {
+            let variants = entry
+                .variants
+                .iter()
+                .map(|variant| CatalogVariantMetadata {
+                    id: variant.id.clone(),
+                    format: variant.format,
+                    quant: bounded_metadata(&variant.quant),
+                    engines: variant.engines.clone(),
+                    accelerators: variant.requirements.accelerators.clone(),
+                    min_memory_bytes: variant.requirements.min_memory_bytes,
+                    stability: variant.stability,
+                })
+                .collect();
+            (
+                id.clone(),
+                CatalogModelMetadata {
+                    params: bounded_metadata(&entry.params),
+                    license: bounded_metadata(&entry.license),
+                    family: bounded_metadata(&entry.family),
+                    context_length: entry.context_length,
+                    variants,
+                },
+            )
+        })
+        .collect();
+    json_response(
+        200,
+        &CatalogResponse {
+            schema_version: MANAGEMENT_SCHEMA_VERSION,
+            catalog_revision: catalog.catalog_revision.clone(),
+            models,
+        },
+    )
+}
+
+fn deployments_get_response(runtime: &impl ModelManagementRuntime) -> Resp {
+    match runtime.management_snapshot() {
+        Ok(snapshot) => json_response(
+            200,
+            &DeploymentsResponse {
+                schema_version: MANAGEMENT_SCHEMA_VERSION,
+                authority: snapshot.authority,
+                read_only: snapshot.read_only,
+                revision: snapshot.revision,
+                content_digest: snapshot.content_digest,
+                deployments: snapshot.deployments,
+            },
+        ),
+        Err(error) => admin_revision_error_response(error),
+    }
+}
+
+fn deployments_put_response(runtime: &impl ModelManagementRuntime, body: Option<&str>) -> Resp {
+    let before = match runtime.management_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return admin_revision_error_response(error),
+    };
+    if before.read_only || before.authority != sbproxy_config::ModelHostAuthority::AdminManaged {
+        return error_response(
+            403,
+            "authority_read_only",
+            "model host authority does not allow local admin mutation",
+        );
+    }
+    let Some(body) = body.filter(|body| !body.trim().is_empty()) else {
+        return error_response(400, "invalid_body", "deployment revision body is required");
+    };
+    let request = match serde_json::from_str::<DeploymentPutRequest>(body) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                400,
+                "invalid_body",
+                format!("invalid deployment revision body: {error}"),
+            )
+        }
+    };
+    let expected_revision = match request.expected_revision {
+        serde_json::Value::Null => None,
+        serde_json::Value::Number(value) => match value.as_u64() {
+            Some(value) => Some(value),
+            None => {
+                return error_response(
+                    400,
+                    "invalid_body",
+                    "expected_revision must be null or an unsigned integer",
+                )
+            }
+        },
+        _ => {
+            return error_response(
+                400,
+                "invalid_body",
+                "expected_revision must be null or an unsigned integer",
+            )
+        }
+    };
+    let deployments = request
+        .deployments
+        .into_iter()
+        .map(|(id, deployment)| (id, deployment.into()))
+        .collect::<BTreeMap<_, _>>();
+    let catalog = runtime.active_catalog();
+    let draft = sbproxy_model_host::DeploymentRevisionDraft {
+        source_mode: sbproxy_model_host::DeploymentSourceMode::AdminManaged,
+        source_revision: "admin-api".to_string(),
+        catalog_revision: catalog.catalog_revision.clone(),
+        deployments,
+    };
+    if let Err(error) = draft.validate() {
+        return error_response(400, "invalid_desired", error.to_string());
+    }
+    for (deployment_id, deployment) in &draft.deployments {
+        let Some(entry) = catalog.get(&deployment.model) else {
+            return error_response(
+                400,
+                "unknown_catalog_model",
+                format!(
+                    "deployment {deployment_id:?} references unknown catalog model {:?}",
+                    deployment.model
+                ),
+            );
+        };
+        if let Some(variant) = deployment.variant.as_ref() {
+            if !entry
+                .variants
+                .iter()
+                .any(|candidate| candidate.id == *variant)
+            {
+                return error_response(
+                    400,
+                    "unknown_catalog_variant",
+                    format!(
+                        "deployment {deployment_id:?} references unknown catalog variant {variant:?}"
+                    ),
+                );
+            }
+        }
+    }
+    let deployment_count = draft.deployments.len();
+    match runtime.apply_admin_deployment_revision(expected_revision, draft.deployments) {
+        Ok(result) => {
+            tracing::info!(
+                target: "sbproxy::admin::audit",
+                action = "model_deployments_replace",
+                source_mode = "admin_managed",
+                prior_revision = ?expected_revision,
+                next_revision = result.revision,
+                content_digest = %result.content_digest,
+                deployment_count,
+                "admin model deployment revision committed"
+            );
+            json_response(
+                200,
+                &DeploymentPutResponse {
+                    schema_version: MANAGEMENT_SCHEMA_VERSION,
+                    revision: result.revision,
+                    content_digest: result.content_digest,
+                    plan: result.plan,
+                },
+            )
+        }
+        Err(error) => admin_revision_error_response(error),
+    }
+}
+
+fn admin_revision_error_response(error: AdminDeploymentRevisionError) -> Resp {
+    match error {
+        AdminDeploymentRevisionError::AuthorityReadOnly { .. } => error_response(
+            403,
+            "authority_read_only",
+            "model host authority does not allow local admin mutation",
+        ),
+        AdminDeploymentRevisionError::RevisionConflict { expected, actual } => json_response(
+            409,
+            &ErrorResponse {
+                code: "revision_conflict",
+                error: "deployment revision conflicts with durable state".to_string(),
+                expected_revision: expected,
+                actual_revision: actual,
+            },
+        ),
+        AdminDeploymentRevisionError::Runtime(
+            error @ sbproxy_model_host::RuntimeManagerError::InvalidDesired(_),
+        ) => error_response(400, "invalid_desired", error.to_string()),
+        AdminDeploymentRevisionError::Runtime(
+            error @ sbproxy_model_host::RuntimeManagerError::Prepare(_),
+        ) => error_response(
+            422,
+            error.reason_code(),
+            "deployment candidate could not be prepared",
+        ),
+        AdminDeploymentRevisionError::Runtime(
+            error @ sbproxy_model_host::RuntimeManagerError::Admission(_),
+        ) => error_response(
+            422,
+            error.reason_code(),
+            "deployment candidate does not fit current serving capacity",
+        ),
+        AdminDeploymentRevisionError::Runtime(sbproxy_model_host::RuntimeManagerError::Engine(
+            error,
+        )) if matches!(
+            error.reason(),
+            sbproxy_model_host::EngineFailureReason::EngineBlocked
+                | sbproxy_model_host::EngineFailureReason::EngineIncompatible
+                | sbproxy_model_host::EngineFailureReason::ArtifactNotReady
+                | sbproxy_model_host::EngineFailureReason::UnsafeArgument
+        ) =>
+        {
+            error_response(
+                422,
+                error.reason().as_str(),
+                "deployment candidate is not compatible with the configured model host",
+            )
+        }
+        AdminDeploymentRevisionError::Store(_)
+        | AdminDeploymentRevisionError::Runtime(sbproxy_model_host::RuntimeManagerError::Store(
+            _,
+        )) => error_response(
+            502,
+            "store_failed",
+            "deployment revision store operation failed",
+        ),
+        AdminDeploymentRevisionError::Runtime(error) => {
+            error_response(502, error.reason_code(), "model runtime operation failed")
+        }
+    }
+}
+
+fn dispatch_with_runtime(
+    runtime: &impl ModelManagementRuntime,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Option<Resp> {
+    let path = path.split('?').next().unwrap_or(path);
+    match path {
+        "/admin/model-host/catalog" => {
+            if !method.eq_ignore_ascii_case("GET") {
+                return Some(error_response(
+                    405,
+                    "method_not_allowed",
+                    "method not allowed",
+                ));
+            }
+            Some(catalog_response(runtime))
+        }
+        "/admin/model-host/deployments" => {
+            if method.eq_ignore_ascii_case("GET") {
+                Some(deployments_get_response(runtime))
+            } else if method.eq_ignore_ascii_case("PUT") {
+                Some(deployments_put_response(runtime, body))
+            } else {
+                Some(error_response(
+                    405,
+                    "method_not_allowed",
+                    "method not allowed",
+                ))
+            }
+        }
+        _ => None,
+    }
+}
 
 /// Handle the model-host admin routes, or return `None` so the caller
 /// falls through to the next dispatcher.
 pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
     let path_only = path.split('?').next().unwrap_or(path);
+    if matches!(
+        path_only,
+        "/admin/model-host/catalog" | "/admin/model-host/deployments"
+    ) {
+        let runtime = crate::server::model_host::model_runtime_manager();
+        return dispatch_with_runtime(runtime.as_ref(), method, path_only, body);
+    }
     match path_only {
         "/admin/model-host/status" => {
             if !method.eq_ignore_ascii_case("GET") {
@@ -300,6 +817,354 @@ fn runtime_error_response(operation: &str, error: sbproxy_model_host::RuntimeMan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use sbproxy_model_host::{Catalog, ModelDeployment, PullPolicy, ReconcilePlan, RolloutPolicy};
+
+    type AppliedRevision = (Option<u64>, BTreeMap<String, ModelDeployment>);
+
+    #[derive(Debug)]
+    struct FakeManagementRuntime {
+        catalog: Arc<Catalog>,
+        snapshot: ModelManagementSnapshot,
+        apply_result:
+            Mutex<Option<Result<AdminDeploymentRevisionResult, AdminDeploymentRevisionError>>>,
+        applied: Mutex<Vec<AppliedRevision>>,
+    }
+
+    impl ModelManagementRuntime for FakeManagementRuntime {
+        fn active_catalog(&self) -> Arc<Catalog> {
+            Arc::clone(&self.catalog)
+        }
+
+        fn management_snapshot(
+            &self,
+        ) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError> {
+            Ok(self.snapshot.clone())
+        }
+
+        fn apply_admin_deployment_revision(
+            &self,
+            expected_revision: Option<u64>,
+            deployments: BTreeMap<String, ModelDeployment>,
+        ) -> Result<AdminDeploymentRevisionResult, AdminDeploymentRevisionError> {
+            self.applied
+                .lock()
+                .expect("applied revisions lock")
+                .push((expected_revision, deployments));
+            self.apply_result
+                .lock()
+                .expect("apply result lock")
+                .take()
+                .expect("configured apply result")
+        }
+    }
+
+    fn management_snapshot(
+        authority: sbproxy_config::ModelHostAuthority,
+    ) -> ModelManagementSnapshot {
+        ModelManagementSnapshot {
+            authority,
+            read_only: authority != sbproxy_config::ModelHostAuthority::AdminManaged,
+            revision: Some(7),
+            content_digest: Some("d".repeat(64)),
+            deployments: BTreeMap::from([("existing".to_string(), deployment())]),
+        }
+    }
+
+    fn deployment() -> ModelDeployment {
+        ModelDeployment {
+            model: "qwen2.5-0.5b-instruct".to_string(),
+            variant: Some("q4_k_m".to_string()),
+            heterogeneous_variants: false,
+            replicas: 1,
+            required_labels: BTreeMap::new(),
+            spread_by: Vec::new(),
+            pull: PullPolicy::OnDemand,
+            warm: false,
+            keep_alive_secs: None,
+            max_concurrency: None,
+            max_queue_depth: 128,
+            queue_timeout_ms: 30_000,
+            engine: sbproxy_model_host::EngineChoice::Auto,
+            rollout: RolloutPolicy::Rolling,
+        }
+    }
+
+    fn fake_runtime(
+        authority: sbproxy_config::ModelHostAuthority,
+        apply_result: Result<AdminDeploymentRevisionResult, AdminDeploymentRevisionError>,
+    ) -> FakeManagementRuntime {
+        FakeManagementRuntime {
+            catalog: Arc::new(Catalog::builtin()),
+            snapshot: management_snapshot(authority),
+            apply_result: Mutex::new(Some(apply_result)),
+            applied: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn valid_put_body(expected_revision: &str, model: &str, variant: &str) -> String {
+        format!(
+            r#"{{
+                "expected_revision": {expected_revision},
+                "deployments": {{
+                    "local-qwen": {{
+                        "model": "{model}",
+                        "variant": "{variant}",
+                        "replicas": 1,
+                        "pull": "on_demand",
+                        "warm": false,
+                        "engine": "auto",
+                        "rollout": "rolling"
+                    }}
+                }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn catalog_route_returns_only_bounded_active_metadata() {
+        let runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+        );
+
+        let (status, content_type, body) =
+            dispatch_with_runtime(&runtime, "GET", "/admin/model-host/catalog", None)
+                .expect("catalog route");
+        let response: serde_json::Value = serde_json::from_str(&body).expect("catalog response");
+
+        assert_eq!(status, 200);
+        assert_eq!(content_type, JSON);
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(
+            response["catalog_revision"],
+            runtime.catalog.catalog_revision
+        );
+        assert_eq!(
+            response["models"]["qwen2.5-0.5b-instruct"]["variants"][0]["id"],
+            "q4_k_m"
+        );
+        assert!(!body.contains("hf_repo"));
+        assert!(!body.contains("hf_token"));
+        assert!(!body.contains("source"));
+        assert!(!body.contains("files"));
+        assert!(!body.contains("sha256"));
+        assert!(!body.contains("qwen2.5-0.5b-instruct-q4_k_m.gguf"));
+    }
+
+    #[test]
+    fn deployments_route_returns_authority_cursor_and_complete_desired_map() {
+        let runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::FileManaged,
+            Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+        );
+
+        let (status, _, body) =
+            dispatch_with_runtime(&runtime, "GET", "/admin/model-host/deployments", None)
+                .expect("deployments route");
+        let response: serde_json::Value = serde_json::from_str(&body).expect("deployment response");
+
+        assert_eq!(status, 200);
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["authority"], "file_managed");
+        assert_eq!(response["read_only"], true);
+        assert_eq!(response["revision"], 7);
+        assert_eq!(response["content_digest"], "d".repeat(64));
+        assert_eq!(
+            response["deployments"]["existing"]["model"],
+            "qwen2.5-0.5b-instruct"
+        );
+    }
+
+    #[test]
+    fn deployment_put_rejects_read_only_authorities() {
+        for authority in [
+            sbproxy_config::ModelHostAuthority::FileManaged,
+            sbproxy_config::ModelHostAuthority::ClusterAuthority,
+        ] {
+            let runtime = fake_runtime(
+                authority,
+                Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+            );
+
+            let (status, _, body) = dispatch_with_runtime(
+                &runtime,
+                "PUT",
+                "/admin/model-host/deployments",
+                Some(r#"{"expected_revision":null,"deployments":{}}"#),
+            )
+            .expect("deployments route");
+            let response: serde_json::Value = serde_json::from_str(&body).expect("error response");
+
+            assert_eq!(status, 403, "{authority:?}: {body}");
+            assert_eq!(response["code"], "authority_read_only");
+            assert!(runtime
+                .applied
+                .lock()
+                .expect("applied revisions lock")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn deployment_put_requires_a_strict_complete_revision_body() {
+        for body in [
+            "",
+            r#"{"deployments":{}}"#,
+            r#"{"expected_revision":null,"deployments":{},"extra":true}"#,
+            r#"{"expected_revision":null,"deployments":{"local-qwen":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m","mystery":true}}}"#,
+            r#"{"expected_revision":null,"deployments":{"duplicate":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m"},"duplicate":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m"}}}"#,
+        ] {
+            let runtime = fake_runtime(
+                sbproxy_config::ModelHostAuthority::AdminManaged,
+                Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+            );
+
+            let (status, _, response_body) =
+                dispatch_with_runtime(&runtime, "PUT", "/admin/model-host/deployments", Some(body))
+                    .expect("deployments route");
+            let response: serde_json::Value =
+                serde_json::from_str(&response_body).expect("error response");
+
+            assert_eq!(status, 400, "{body}: {response_body}");
+            assert_eq!(response["code"], "invalid_body");
+        }
+    }
+
+    #[test]
+    fn deployment_put_rejects_unknown_catalog_models_and_variants() {
+        for (model, variant, code) in [
+            ("not-in-catalog", "q4_k_m", "unknown_catalog_model"),
+            (
+                "qwen2.5-0.5b-instruct",
+                "not-a-variant",
+                "unknown_catalog_variant",
+            ),
+        ] {
+            let runtime = fake_runtime(
+                sbproxy_config::ModelHostAuthority::AdminManaged,
+                Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+            );
+            let body = valid_put_body("null", model, variant);
+
+            let (status, _, response_body) = dispatch_with_runtime(
+                &runtime,
+                "PUT",
+                "/admin/model-host/deployments",
+                Some(&body),
+            )
+            .expect("deployments route");
+            let response: serde_json::Value =
+                serde_json::from_str(&response_body).expect("error response");
+
+            assert_eq!(status, 400, "{response_body}");
+            assert_eq!(response["code"], code);
+            assert!(runtime
+                .applied
+                .lock()
+                .expect("applied revisions lock")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn deployment_put_rejects_invalid_multi_replica_variant_policy() {
+        let runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+        );
+        let body = r#"{
+            "expected_revision": null,
+            "deployments": {
+                "local-qwen": {
+                    "model": "qwen2.5-0.5b-instruct",
+                    "replicas": 2
+                }
+            }
+        }"#;
+
+        let (status, _, response_body) =
+            dispatch_with_runtime(&runtime, "PUT", "/admin/model-host/deployments", Some(body))
+                .expect("deployments route");
+        let response: serde_json::Value =
+            serde_json::from_str(&response_body).expect("error response");
+
+        assert_eq!(status, 400, "{response_body}");
+        assert_eq!(response["code"], "invalid_desired");
+        assert!(runtime
+            .applied
+            .lock()
+            .expect("applied revisions lock")
+            .is_empty());
+    }
+
+    #[test]
+    fn deployment_put_maps_stale_expected_revision_to_conflict() {
+        let runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Err(AdminDeploymentRevisionError::RevisionConflict {
+                expected: Some(6),
+                actual: Some(7),
+            }),
+        );
+        let body = valid_put_body("6", "qwen2.5-0.5b-instruct", "q4_k_m");
+
+        let (status, _, response_body) = dispatch_with_runtime(
+            &runtime,
+            "PUT",
+            "/admin/model-host/deployments",
+            Some(&body),
+        )
+        .expect("deployments route");
+        let response: serde_json::Value =
+            serde_json::from_str(&response_body).expect("error response");
+
+        assert_eq!(status, 409, "{response_body}");
+        assert_eq!(response["code"], "revision_conflict");
+        assert_eq!(response["expected_revision"], 6);
+        assert_eq!(response["actual_revision"], 7);
+    }
+
+    #[test]
+    fn deployment_put_returns_committed_revision_and_reconcile_plan() {
+        let runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Ok(AdminDeploymentRevisionResult {
+                revision: 8,
+                content_digest: "e".repeat(64),
+                plan: ReconcilePlan {
+                    added: vec!["local-qwen".to_string()],
+                    removed: vec!["existing".to_string()],
+                    ..ReconcilePlan::default()
+                },
+            }),
+        );
+        let body = valid_put_body("7", "qwen2.5-0.5b-instruct", "q4_k_m");
+
+        let (status, _, response_body) = dispatch_with_runtime(
+            &runtime,
+            "PUT",
+            "/admin/model-host/deployments",
+            Some(&body),
+        )
+        .expect("deployments route");
+        let response: serde_json::Value =
+            serde_json::from_str(&response_body).expect("success response");
+
+        assert_eq!(status, 200, "{response_body}");
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["revision"], 8);
+        assert_eq!(response["content_digest"], "e".repeat(64));
+        assert_eq!(response["plan"]["added"], serde_json::json!(["local-qwen"]));
+        assert_eq!(response["plan"]["removed"], serde_json::json!(["existing"]));
+        let applied = runtime.applied.lock().expect("applied revisions lock");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].0, Some(7));
+        assert_eq!(applied[0].1["local-qwen"], deployment());
+    }
 
     fn runtime_status(
         state: sbproxy_model_host::DeploymentRuntimeState,
