@@ -18,6 +18,11 @@ export type DeploymentMutationMode =
   | "signed_cluster_post"
   | "read_only";
 
+export type WritableDeploymentMutationMode = Exclude<
+  DeploymentMutationMode,
+  "read_only"
+>;
+
 export interface DeploymentFormDraft {
   deploymentId: string;
   model: string;
@@ -47,6 +52,11 @@ export interface DeploymentFormValue {
 export interface DeploymentFormParseResult {
   value: DeploymentFormValue | null;
   errors: Partial<Record<DeploymentFormField, string>>;
+}
+
+export interface CatalogEvidenceSelection {
+  variants: CatalogVariant[];
+  unavailableVariant: string | null;
 }
 
 export interface DeploymentFormParseOptions {
@@ -79,7 +89,19 @@ export interface DeploymentConflictState {
   attemptedDeployments: Record<string, ModelDeployment>;
   currentDeployments: Record<string, ModelDeployment> | null;
   comparison: ReconcilePlan | null;
+  proof: DeploymentConflictProof | null;
   reloadError: string | null;
+}
+
+export interface DeploymentConflictProof {
+  mode: WritableDeploymentMutationMode;
+  authority: ModelHostAuthority;
+  revision: number | null;
+  contentDigest: string | null;
+  deploymentsFingerprint: string;
+  catalogRevision: string;
+  signerNodeId: string | null;
+  signerKeyId: string | null;
 }
 
 export interface ModelDeploymentRow {
@@ -152,6 +174,25 @@ export function deployableCatalogVariants(
   return entry.variants.filter(
     (variant) => catalogVariantDisabledReason(variant) === null,
   );
+}
+
+export function catalogEvidenceSelection(
+  entry: CatalogEntry | null,
+  exactVariant: string,
+): CatalogEvidenceSelection {
+  if (!exactVariant) {
+    return {
+      variants: entry?.variants ?? [],
+      unavailableVariant: null,
+    };
+  }
+
+  const selected = entry?.variants.find(
+    (variant) => variant.id === exactVariant,
+  );
+  return selected
+    ? { variants: [selected], unavailableVariant: null }
+    : { variants: [], unavailableVariant: exactVariant };
 }
 
 export function catalogVariantDisabledReason(
@@ -597,6 +638,21 @@ function deploymentsEqual(
   );
 }
 
+export function deploymentMapFingerprint(
+  deployments: Readonly<Record<string, ModelDeployment>>,
+): string {
+  return JSON.stringify(
+    Object.keys(deployments)
+      .sort((left, right) => left.localeCompare(right))
+      .map((id) => [
+        id,
+        canonicalDeployment(
+          ownValue(deployments, id) as ModelDeployment,
+        ),
+      ]),
+  );
+}
+
 export function createDeploymentConflictState(input: {
   status?: number;
   body?: string;
@@ -604,6 +660,7 @@ export function createDeploymentConflictState(input: {
   currentRevision: number | null;
   attemptedDeployments: Readonly<Record<string, ModelDeployment>>;
   currentDeployments: Readonly<Record<string, ModelDeployment>>;
+  proof?: DeploymentConflictProof | null;
 }): DeploymentConflictState {
   const attemptedIds = Object.keys(input.attemptedDeployments).sort();
   const currentIds = Object.keys(input.currentDeployments).sort();
@@ -641,6 +698,7 @@ export function createDeploymentConflictState(input: {
     attemptedDeployments: cloneDeploymentMap(input.attemptedDeployments),
     currentDeployments: cloneDeploymentMap(input.currentDeployments),
     comparison,
+    proof: input.proof ?? null,
     reloadError: null,
   };
 }
@@ -659,6 +717,7 @@ export function createPendingDeploymentConflictState(input: {
     attemptedDeployments: cloneDeploymentMap(input.attemptedDeployments),
     currentDeployments: null,
     comparison: null,
+    proof: null,
     reloadError: null,
   };
 }
@@ -668,6 +727,7 @@ export function reconcileDeploymentConflictState(
   input: {
     currentRevision: number | null;
     currentDeployments: Readonly<Record<string, ModelDeployment>>;
+    proof: DeploymentConflictProof;
   },
 ): DeploymentConflictState {
   return createDeploymentConflictState({
@@ -677,6 +737,7 @@ export function reconcileDeploymentConflictState(
     currentRevision: input.currentRevision,
     attemptedDeployments: pending.attemptedDeployments,
     currentDeployments: input.currentDeployments,
+    proof: input.proof,
   });
 }
 
@@ -689,6 +750,7 @@ export function failDeploymentConflictReload(
     currentRevision: null,
     currentDeployments: null,
     comparison: null,
+    proof: null,
     reloadError,
   };
 }

@@ -1,10 +1,12 @@
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import {
   api,
   ApiError,
   type ClusterDeploymentAuthority,
+  type ClusterDeploymentDocument,
   type DeploymentRuntimeStatus,
   type ModelDeployment,
+  type ModelHostAuthority,
 } from "../api";
 import { useAsync } from "./useAsync";
 import {
@@ -14,6 +16,7 @@ import {
   deployableCatalogEntries,
   deployableCatalogVariants,
   deploymentMutationMode,
+  deploymentMapFingerprint,
   deploymentRemovalGuard,
   deploymentRows,
   failDeploymentConflictReload,
@@ -21,6 +24,7 @@ import {
   reconcileDeploymentConflictState,
   type DeploymentChange,
   type DeploymentConflictState,
+  type DeploymentConflictProof,
   type DeploymentFormValue,
   type ModelDeploymentRow,
 } from "../lib/model-management";
@@ -76,7 +80,10 @@ export function useModelManagement() {
     () => status.value?.deployments ?? [],
   );
   const runtimeStatusCurrent = computed(
-    () => statusReq.succeeded.value && statusReq.error.value === null,
+    () =>
+      statusReq.succeeded.value &&
+      statusReq.error.value === null &&
+      Array.isArray(status.value?.deployments),
   );
   const rows = computed(() =>
     deploymentRows(
@@ -152,6 +159,35 @@ export function useModelManagement() {
     () =>
       clusterBundleReq.succeeded.value || initialClusterBundleAbsent.value,
   );
+  const coherentClusterBundle = computed<ClusterDeploymentDocument | null>(() => {
+    const authority = clusterAuthority.value;
+    const activeBundle = clusterBundle.value;
+    const activeCatalog = catalog.value;
+    if (
+      !clusterAuthorityProofCurrent.value ||
+      !clusterBundleReq.succeeded.value ||
+      clusterBundleReq.error.value !== null ||
+      !catalogProofCurrent.value ||
+      !authority ||
+      !activeBundle ||
+      !activeCatalog ||
+      !authority.configured ||
+      authority.read_only ||
+      activeBundle.read_only
+    ) {
+      return null;
+    }
+    if (
+      authority.active_revision !== activeBundle.bundle.revision ||
+      authority.active_content_digest !== activeBundle.bundle.content_digest ||
+      authority.signer_node_id !== activeBundle.signer_node_id ||
+      authority.verifying_key_id !== activeBundle.signer_key_id ||
+      activeBundle.bundle.catalog_revision !== activeCatalog.catalog_revision
+    ) {
+      return null;
+    }
+    return activeBundle;
+  });
   const hasSafePersistentRevision = computed(
     () => {
       if (mutationMode.value === "signed_cluster_post") {
@@ -170,7 +206,7 @@ export function useModelManagement() {
     if (deploymentDocument.value?.authority !== "cluster_authority") return true;
     if (!clusterBundleProofCurrent.value) return false;
     if (initialClusterBundleAbsent.value) return true;
-    return clusterBundle.value?.read_only === false;
+    return coherentClusterBundle.value !== null;
   });
   const canMutate = computed(
     () =>
@@ -185,11 +221,127 @@ export function useModelManagement() {
         (clusterAuthorityProofCurrent.value &&
           clusterBundleAllowsPublication.value)),
   );
+
+  function currentDeploymentBase(): Readonly<Record<string, ModelDeployment>> | null {
+    const document = deploymentDocument.value;
+    if (!document) return null;
+    if (mutationMode.value !== "signed_cluster_post") {
+      return document.deployments;
+    }
+    if (initialClusterBundleAbsent.value) {
+      return Object.create(null) as Record<string, ModelDeployment>;
+    }
+    return coherentClusterBundle.value?.bundle.deployments ?? null;
+  }
+
+  const currentMutationProof = computed<DeploymentConflictProof | null>(() => {
+    const document = deploymentDocument.value;
+    const activeCatalog = catalog.value;
+    const baseDeployments = currentDeploymentBase();
+    const mode = mutationMode.value;
+    if (
+      !canMutate.value ||
+      !document ||
+      !activeCatalog ||
+      !baseDeployments ||
+      mode === "read_only"
+    ) {
+      return null;
+    }
+    const signedBundle = coherentClusterBundle.value;
+    return {
+      mode,
+      authority: document.authority,
+      revision:
+        mode === "signed_cluster_post"
+          ? clusterAuthority.value?.active_revision ?? null
+          : document.revision,
+      contentDigest:
+        mode === "signed_cluster_post"
+          ? signedBundle?.bundle.content_digest ??
+            clusterAuthority.value?.active_content_digest ??
+            null
+          : document.content_digest,
+      deploymentsFingerprint: deploymentMapFingerprint(baseDeployments),
+      catalogRevision: activeCatalog.catalog_revision,
+      signerNodeId:
+        mode === "signed_cluster_post"
+          ? signedBundle?.signer_node_id ??
+            clusterAuthority.value?.signer_node_id ??
+            null
+          : null,
+      signerKeyId:
+        mode === "signed_cluster_post"
+          ? signedBundle?.signer_key_id ??
+            clusterAuthority.value?.verifying_key_id ??
+            null
+          : null,
+    };
+  });
+
+  function conflictProofsEqual(
+    left: DeploymentConflictProof,
+    right: DeploymentConflictProof,
+  ): boolean {
+    return (
+      left.mode === right.mode &&
+      left.authority === right.authority &&
+      left.revision === right.revision &&
+      left.contentDigest === right.contentDigest &&
+      left.deploymentsFingerprint === right.deploymentsFingerprint &&
+      left.catalogRevision === right.catalogRevision &&
+      left.signerNodeId === right.signerNodeId &&
+      left.signerKeyId === right.signerKeyId
+    );
+  }
+
   const conflictRetryAllowed = computed(
-    () =>
-      Boolean(conflict.value?.comparison) &&
-      canMutate.value &&
-      !mutationBusy.value,
+    () => {
+      const activeConflict = conflict.value;
+      const currentProof = currentMutationProof.value;
+      return Boolean(
+        activeConflict?.comparison &&
+          activeConflict.proof &&
+          currentProof &&
+          conflictProofsEqual(activeConflict.proof, currentProof) &&
+          !mutationBusy.value,
+      );
+    },
+  );
+
+  const conflictProofInputsSettled = computed(() => {
+    const proof = conflict.value?.proof;
+    if (!proof || catalogReq.loading.value || deploymentsReq.loading.value) {
+      return false;
+    }
+    return (
+      proof.mode !== "signed_cluster_post" ||
+      (!clusterStatusReq.loading.value && !clusterBundleReq.loading.value)
+    );
+  });
+
+  watch(
+    [currentMutationProof, conflictProofInputsSettled],
+    ([currentProof, settled]) => {
+      const activeConflict = conflict.value;
+      if (
+        !settled ||
+        !activeConflict?.comparison ||
+        !activeConflict.proof ||
+        (currentProof &&
+          conflictProofsEqual(activeConflict.proof, currentProof))
+      ) {
+        return;
+      }
+      const reloadError =
+        "Current authority proof changed or became unavailable. Reload current state or reopen the draft before retrying.";
+      conflict.value = failDeploymentConflictReload(
+        activeConflict,
+        reloadError,
+      );
+      mutationError.value = reloadError;
+    },
+    { flush: "sync" },
   );
 
   const persistentGuidance = computed(() => {
@@ -279,15 +431,6 @@ export function useModelManagement() {
     return error instanceof Error ? error.message : "The operation failed.";
   }
 
-  function currentPersistentRevision(
-    mode: "local_put" | "signed_cluster_post",
-  ): number | null {
-    if (mode === "signed_cluster_post") {
-      return clusterAuthority.value?.active_revision ?? null;
-    }
-    return deploymentDocument.value?.revision ?? null;
-  }
-
   function proofFailure(label: string, error: ApiError | null): string {
     return `${label}: ${error ? errorText(error) : "fresh proof is unavailable"}`;
   }
@@ -335,7 +478,32 @@ export function useModelManagement() {
     if (!currentDocument) {
       failures.push("Desired-state reload failed: no current map was returned");
     }
-    if (failures.length > 0 || !currentDocument) {
+    const expectedAuthority: ModelHostAuthority =
+      mode === "local_put" ? "admin_managed" : "cluster_authority";
+    if (
+      currentDocument &&
+      (currentDocument.authority !== expectedAuthority ||
+        mutationMode.value !== mode)
+    ) {
+      const reloadError =
+        "Deployment authority changed while the conflict was reloading. Reopen the editor or removal draft under the current authority before retrying.";
+      conflict.value = failDeploymentConflictReload(pending, reloadError);
+      mutationError.value = reloadError;
+      return false;
+    }
+    const currentProof = currentMutationProof.value;
+    const currentDeployments = currentDeploymentBase();
+    if (!currentProof || !currentDeployments) {
+      failures.push(
+        "Authority reload failed: no coherent current mutation proof was returned",
+      );
+    }
+    if (
+      failures.length > 0 ||
+      !currentDocument ||
+      !currentProof ||
+      !currentDeployments
+    ) {
       const reloadError = failures.join(" ");
       conflict.value = failDeploymentConflictReload(pending, reloadError);
       mutationError.value =
@@ -344,8 +512,9 @@ export function useModelManagement() {
     }
 
     conflict.value = reconcileDeploymentConflictState(pending, {
-      currentRevision: currentPersistentRevision(mode),
-      currentDeployments: currentDocument.deployments,
+      currentRevision: currentProof.revision,
+      currentDeployments,
+      proof: currentProof,
     });
     mutationError.value =
       "A revision conflict occurred. The current authority state was reloaded and your draft is preserved for comparison.";
@@ -361,7 +530,13 @@ export function useModelManagement() {
       return;
     }
 
-    const attempted = applyDeploymentChange(document.deployments, change);
+    const baseDeployments = currentDeploymentBase();
+    if (!baseDeployments) {
+      mutationError.value =
+        "Persistent mutation is paused until one coherent signed deployment snapshot is available.";
+      return;
+    }
+    const attempted = applyDeploymentChange(baseDeployments, change);
     const command = buildDeploymentMutation({
       document,
       clusterAuthority: clusterAuthority.value,
@@ -461,7 +636,7 @@ export function useModelManagement() {
   async function saveDeployment(value: DeploymentFormValue): Promise<void> {
     const activeEditor = editor.value;
     if (!activeEditor) return;
-    if (conflict.value && !conflict.value.comparison) {
+    if (conflict.value && !conflictRetryAllowed.value) {
       mutationError.value =
         "Reload current authority state successfully before saving the preserved draft.";
       return;
@@ -497,8 +672,42 @@ export function useModelManagement() {
   }
 
   async function retryConflict(): Promise<void> {
-    if (!conflictRetryAllowed.value || !pendingConflictChange.value) return;
-    await mutateDesiredState(pendingConflictChange.value);
+    const pendingChange = pendingConflictChange.value;
+    if (!conflictRetryAllowed.value || !pendingChange) return;
+    if (pendingChange.kind === "remove") {
+      mutationBusy.value = true;
+      banner.value = null;
+      try {
+        await statusReq.run();
+      } finally {
+        mutationBusy.value = false;
+      }
+      const currentRuntime = runtimeDeployments.value.find(
+        (runtime) => runtime.deployment === pendingChange.deploymentId,
+      );
+      const guard = deploymentRemovalGuard(
+        currentRuntime?.state ?? null,
+        runtimeStatusCurrent.value,
+      );
+      if (!guard.allowed) {
+        banner.value = { tone: "warn", text: guard.reason as string };
+        return;
+      }
+      if (
+        currentRuntime &&
+        currentRuntime.state !== "stopped" &&
+        currentRuntime.state !== "configured" &&
+        currentRuntime.state !== "failed"
+      ) {
+        banner.value = {
+          tone: "warn",
+          text: "Wait for this deployment to stop before retrying removal.",
+        };
+        return;
+      }
+      if (!conflictRetryAllowed.value) return;
+    }
+    await mutateDesiredState(pendingChange);
   }
 
   async function reloadConflict(): Promise<void> {
@@ -571,6 +780,7 @@ export function useModelManagement() {
     catalog,
     deploymentDocument,
     clusterBundle,
+    coherentClusterBundle,
     clusterAuthority,
     runtimeDeployments,
     runtimeStatusCurrent,

@@ -9,7 +9,7 @@ defineEmits<{ (e: "retry"): void }>();
 </script>
 
 <template>
-  <div class="error" v-if="error">
+  <div v-if="error" class="error" role="alert" aria-live="assertive">
     <div class="error__code">{{ error.status || "!" }}</div>
     <div class="error__body">
       <p class="error__title">{{ title || "Could not load this view" }}</p>

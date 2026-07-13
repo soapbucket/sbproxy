@@ -41,6 +41,25 @@ function lifecycleIsBusy(action: string, deploymentId: string): boolean {
   return props.lifecycleBusy === `${action}:${deploymentId}`;
 }
 
+type LifecycleAction = "load" | "stop" | "reset";
+
+const LIFECYCLE_ACTION_LABELS: Record<
+  LifecycleAction,
+  { idle: string; busy: string }
+> = {
+  load: { idle: "Load", busy: "Loading" },
+  stop: { idle: "Stop", busy: "Stopping" },
+  reset: { idle: "Reset", busy: "Resetting" },
+};
+
+function lifecycleActionLabel(
+  action: LifecycleAction,
+  deploymentId: string,
+): string {
+  const state = lifecycleIsBusy(action, deploymentId) ? "busy" : "idle";
+  return `${LIFECYCLE_ACTION_LABELS[action][state]} ${deploymentId}`;
+}
+
 function loadDisabled(row: ModelDeploymentRow): boolean {
   const state = row.runtime?.state ?? null;
   return (
@@ -185,7 +204,7 @@ function labels(row: ModelDeploymentRow): string {
               <div class="action-group" :aria-label="`Lifecycle actions for ${row.deploymentId}`">
                 <button
                   class="sb-btn sb-btn--sm"
-                  :aria-label="`Load ${row.deploymentId}`"
+                  :aria-label="lifecycleActionLabel('load', row.deploymentId)"
                   :disabled="loadDisabled(row)"
                   :title="row.runtime?.state === 'ready' ? 'Deployment is already ready.' : undefined"
                   @click="$emit('load', row.deploymentId)"
@@ -194,7 +213,7 @@ function labels(row: ModelDeploymentRow): string {
                 </button>
                 <button
                   class="sb-btn sb-btn--sm"
-                  :aria-label="`Stop ${row.deploymentId}`"
+                  :aria-label="lifecycleActionLabel('stop', row.deploymentId)"
                   :disabled="stopDisabled(row)"
                   :title="row.runtime?.state === 'draining' ? 'Deployment is already draining.' : undefined"
                   @click="$emit('stop', row.deploymentId)"
@@ -203,7 +222,7 @@ function labels(row: ModelDeploymentRow): string {
                 </button>
                 <button
                   class="sb-btn sb-btn--sm"
-                  :aria-label="`Reset ${row.deploymentId}`"
+                  :aria-label="lifecycleActionLabel('reset', row.deploymentId)"
                   :disabled="resetDisabled(row)"
                   title="Reset is available after a retained runtime failure."
                   @click="$emit('reset', row.deploymentId)"

@@ -8,6 +8,7 @@ import type {
   ModelDeployment,
 } from "../api";
 import {
+  catalogEvidenceSelection,
   catalogVariantDisabledReason,
   catalogVariantSupportLabel,
   deployableCatalogEntries,
@@ -85,8 +86,8 @@ const selectedRunnableVariants = computed<CatalogVariant[]>(() =>
 const selectedVariant = computed<CatalogVariant | null>(() =>
   selectedVariants.value.find((variant) => variant.id === draft.variant) ?? null,
 );
-const evidenceVariants = computed(() =>
-  selectedVariant.value ? [selectedVariant.value] : selectedVariants.value,
+const evidenceSelection = computed(() =>
+  catalogEvidenceSelection(selectedEntry.value, draft.variant),
 );
 const availableEngines = computed(() => {
   const variants = selectedVariant.value
@@ -520,7 +521,8 @@ function comparisonCue(conflict: DeploymentConflictState): string {
       <ModelCatalogEvidence
         :model="draft.model"
         :entry="selectedEntry"
-        :variants="evidenceVariants"
+        :variants="evidenceSelection.variants"
+        :unavailable-variant="evidenceSelection.unavailableVariant"
         :automatic-selection="!draft.variant"
         :requires-license-acknowledgement="requiresLicenseAcknowledgement"
         :license-acknowledged="draft.licenseAcknowledged"

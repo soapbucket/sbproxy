@@ -24,7 +24,7 @@ const {
   status,
   catalog,
   deploymentDocument,
-  clusterBundle,
+  coherentClusterBundle,
   clusterAuthority,
   runtimeDeployments,
   runtimeStatusCurrent,
@@ -85,7 +85,7 @@ function confirmRemove(row: ModelDeploymentRow) {
     :status="status ?? null"
     :catalog-revision="catalog?.catalog_revision ?? null"
     :cluster-authority="clusterAuthority"
-    :cluster-bundle="clusterBundle ?? null"
+    :cluster-bundle="coherentClusterBundle"
     :can-mutate="canMutate"
     :guidance="persistentGuidance"
     :authority-description="authorityDescription"

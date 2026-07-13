@@ -3,14 +3,18 @@ import catalogEvidence from "./ModelCatalogEvidence.vue?raw";
 import deploymentModal from "./ModelDeploymentModal.vue?raw";
 import deploymentTable from "./ModelDeploymentTable.vue?raw";
 import deviceTable from "./ModelDeviceTable.vue?raw";
+import errorState from "./ErrorState.vue?raw";
 import managementNotices from "./ModelManagementNotices.vue?raw";
+import modelHostView from "../views/ModelHostView.vue?raw";
 
 const SOURCES: Record<string, string> = {
   "ModelCatalogEvidence.vue": catalogEvidence,
   "ModelDeploymentModal.vue": deploymentModal,
   "ModelDeploymentTable.vue": deploymentTable,
   "ModelDeviceTable.vue": deviceTable,
+  "ErrorState.vue": errorState,
   "ModelManagementNotices.vue": managementNotices,
+  "ModelHostView.vue": modelHostView,
 };
 
 function source(name: string): string {
@@ -48,9 +52,45 @@ describe("model management component contracts", () => {
   it("uses row headers and deployment-specific action names", () => {
     const table = source("ModelDeploymentTable.vue");
     expect(table).toContain('<th scope="row">');
-    for (const action of ["Load", "Stop", "Reset", "Edit", "Remove"]) {
+    for (const action of ["Edit", "Remove"]) {
       expect(table).toContain(`\`${action} \${row.deploymentId}\``);
     }
+    for (const action of ["load", "stop", "reset"]) {
+      expect(table).toContain(
+        `lifecycleActionLabel('${action}', row.deploymentId)`,
+      );
+    }
+  });
+
+  it("announces initial async failures and lifecycle busy verbs", () => {
+    const error = source("ErrorState.vue");
+    const table = source("ModelDeploymentTable.vue");
+    expect(error).toContain('role="alert"');
+    expect(table).toContain("lifecycleActionLabel");
+    for (const action of ["Loading", "Stopping", "Resetting"]) {
+      expect(table).toContain(`\"${action}\"`);
+    }
+  });
+
+  it("shows stale exact pins without unrelated evidence and wraps exact variant IDs", () => {
+    const modal = source("ModelDeploymentModal.vue");
+    const evidence = source("ModelCatalogEvidence.vue");
+    expect(modal).toContain("catalogEvidenceSelection");
+    expect(modal).toContain(':unavailable-variant="evidenceSelection.unavailableVariant"');
+    expect(evidence).toContain("Pinned variant");
+    expect(evidence).toContain('class="sb-mono variant-id"');
+    expect(evidence).toMatch(
+      /\.variant-id\s*\{[^}]*min-width:\s*0;[^}]*overflow-wrap:\s*anywhere;/s,
+    );
+  });
+
+  it("renders only coherent signer data and gates preview copy on fresh catalog proof", () => {
+    const view = source("ModelHostView.vue");
+    const notices = source("ModelManagementNotices.vue");
+    expect(view).toContain(':cluster-bundle="coherentClusterBundle"');
+    expect(notices).toContain(
+      'v-else-if="catalogLoaded && previewOnlyCatalog"',
+    );
   });
 
   it("uses stable composite keys and announced dynamic metadata", () => {

@@ -13,6 +13,7 @@ import {
   applyDeploymentChange,
   authorityLabel,
   buildDeploymentMutation,
+  catalogEvidenceSelection,
   catalogVariantDisabledReason,
   catalogVariantSupportLabel,
   createDeploymentConflictState,
@@ -216,6 +217,22 @@ describe("model management presentation", () => {
     expect(catalogVariantSupportLabel(variants[3])).toBe("Unsupported");
     expect(catalogVariantSupportLabel(variants[4])).toBe("Incomplete");
     expect(catalogVariantSupportLabel(variants[5])).toBe("Incomplete");
+  });
+
+  it("keeps a missing exact variant pin unavailable instead of falling back to current evidence", () => {
+    const entry = catalogEntry();
+    expect(catalogEvidenceSelection(entry, "removed-pin")).toEqual({
+      variants: [],
+      unavailableVariant: "removed-pin",
+    });
+    expect(catalogEvidenceSelection(entry, "q4_k_m")).toEqual({
+      variants: [entry.variants[0]],
+      unavailableVariant: null,
+    });
+    expect(catalogEvidenceSelection(entry, "")).toEqual({
+      variants: entry.variants,
+      unavailableVariant: null,
+    });
   });
 
   it("creates a complete deployment using the backend-safe defaults", () => {

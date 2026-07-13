@@ -117,14 +117,17 @@ function clusterStatus(
   return { deployment_authority: deploymentAuthority } as ClusterStatusResponse;
 }
 
-function bundle(revision = 7): ClusterDeploymentDocument {
+function bundle(
+  revision = 7,
+  deployments: ClusterDeploymentDocument["bundle"]["deployments"] = ownRecord([]),
+): ClusterDeploymentDocument {
   return {
     schema_version: 1,
     bundle: {
       schema_version: 1,
       catalog_revision: "catalog-v1",
       revision,
-      deployments: ownRecord([]),
+      deployments,
       content_digest: "a".repeat(64),
     },
     signer_node_id: "authority-a",
@@ -132,6 +135,71 @@ function bundle(revision = 7): ClusterDeploymentDocument {
     read_only: false,
   };
 }
+
+const CLUSTER_SNAPSHOT_MISMATCHES: ReadonlyArray<{
+  name: string;
+  mutate: (
+    clusterAuthority: ClusterDeploymentAuthority,
+    clusterBundle: ClusterDeploymentDocument,
+  ) => void;
+}> = [
+  {
+    name: "revision",
+    mutate: (_clusterAuthority, clusterBundle) => {
+      clusterBundle.bundle.revision = 8;
+    },
+  },
+  {
+    name: "content digest",
+    mutate: (_clusterAuthority, clusterBundle) => {
+      clusterBundle.bundle.content_digest = "b".repeat(64);
+    },
+  },
+  {
+    name: "signer node",
+    mutate: (_clusterAuthority, clusterBundle) => {
+      clusterBundle.signer_node_id = "authority-b";
+    },
+  },
+  {
+    name: "signing key",
+    mutate: (_clusterAuthority, clusterBundle) => {
+      clusterBundle.signer_key_id = "key-b";
+    },
+  },
+  {
+    name: "catalog revision",
+    mutate: (_clusterAuthority, clusterBundle) => {
+      clusterBundle.bundle.catalog_revision = "catalog-v2";
+    },
+  },
+];
+
+const CONFLICT_PROOF_CHANGES: ReadonlyArray<{
+  name: string;
+  mutate: (current: DeploymentDocument) => void;
+}> = [
+  {
+    name: "revision",
+    mutate: (current) => {
+      current.revision = 6;
+    },
+  },
+  {
+    name: "content digest",
+    mutate: (current) => {
+      current.content_digest = "b".repeat(64);
+    },
+  },
+  {
+    name: "deployment map",
+    mutate: (current) => {
+      current.deployments = ownRecord([
+        ["concurrent", deploymentDefaults("model", "q4")],
+      ]);
+    },
+  },
+];
 
 function mockReads(input: {
   status?: ModelHostStatus | Error;
@@ -190,6 +258,29 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+async function createRemovalConflict() {
+  const desired = ownRecord([
+    ["remove-me", deploymentDefaults("model", "q4")],
+  ]);
+  mockReads({
+    document: document("admin_managed", false, 4, desired),
+    status: status([runtime("remove-me", "stopped")]),
+  });
+  const replace = vi
+    .spyOn(api, "replaceModelHostDeployments")
+    .mockRejectedValueOnce(
+      new ApiError(409, "revision conflict", "raw removal conflict"),
+    )
+    .mockResolvedValue({} as never);
+  const management = useModelManagement();
+  await loadProof(management);
+  vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+    document("admin_managed", false, 5, desired),
+  );
+  await management.removeDeployment(management.rows.value[0]);
+  return { management, replace };
 }
 
 afterEach(() => {
@@ -261,6 +352,113 @@ describe("useModelManagement orchestration", () => {
     await management.clusterStatusReq.run();
     expect(management.clusterAuthority.value?.active_revision).toBeNull();
     expect(management.canMutate.value).toBe(false);
+  });
+
+  it("does not expose a retained signer after a fresh no-active-bundle proof", async () => {
+    mockReads({ document: document("cluster_authority", true) });
+    const management = useModelManagement();
+    await loadProof(management);
+
+    expect(management.coherentClusterBundle.value?.signer_node_id).toBe(
+      "authority-a",
+    );
+    vi.mocked(api.clusterStatus).mockResolvedValueOnce(
+      clusterStatus(authority(null)),
+    );
+    vi.mocked(api.clusterDeployments).mockRejectedValueOnce(
+      new ApiError(404, "no active bundle", "not published"),
+    );
+
+    await Promise.all([
+      management.clusterStatusReq.run(),
+      management.clusterBundleReq.run(),
+    ]);
+
+    expect(management.clusterBundle.value?.signer_node_id).toBe("authority-a");
+    expect(management.initialClusterBundleAbsent.value).toBe(true);
+    expect(management.coherentClusterBundle.value).toBeNull();
+  });
+
+  it("publishes revision one from an empty global map after a fresh initial bundle 404", async () => {
+    const localOnly = deploymentDefaults("model", "q4");
+    mockReads({
+      document: document(
+        "cluster_authority",
+        true,
+        99,
+        ownRecord([["local-only", localOnly]]),
+      ),
+      clusterStatus: clusterStatus(authority(null)),
+      bundle: new ApiError(404, "no active bundle", "not published"),
+    });
+    const publish = vi
+      .spyOn(api, "publishClusterDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openAddDeployment();
+
+    await management.saveDeployment(formValue("first-global"));
+
+    expect(publish).toHaveBeenCalledWith({
+      catalog_revision: "catalog-v1",
+      revision: 1,
+      deployments: {
+        "first-global": formValue("first-global").deployment,
+      },
+    });
+  });
+
+  it.each(CLUSTER_SNAPSHOT_MISMATCHES)(
+    "blocks signed publication when the fresh cluster $name does not agree",
+    async ({ mutate }) => {
+      const activeAuthority = authority();
+      const activeBundle = bundle();
+      mutate(activeAuthority, activeBundle);
+      mockReads({
+        document: document("cluster_authority", true),
+        clusterStatus: clusterStatus(activeAuthority),
+        bundle: activeBundle,
+      });
+      const publish = vi
+        .spyOn(api, "publishClusterDeployments")
+        .mockResolvedValue({} as never);
+      const management = useModelManagement();
+      await loadProof(management);
+
+      expect(management.canMutate.value).toBe(false);
+      management.openAddDeployment();
+      await management.saveDeployment(formValue("must-not-publish"));
+      expect(publish).not.toHaveBeenCalled();
+    },
+  );
+
+  it("blocks a deferred cross-resource snapshot that resolves to different active revisions", async () => {
+    mockReads({ document: document("cluster_authority", true) });
+    const publish = vi
+      .spyOn(api, "publishClusterDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    expect(management.canMutate.value).toBe(true);
+
+    const nextStatus = deferred<ClusterStatusResponse>();
+    const staleBundle = deferred<ClusterDeploymentDocument>();
+    vi.mocked(api.clusterStatus).mockReturnValueOnce(nextStatus.promise);
+    vi.mocked(api.clusterDeployments).mockReturnValueOnce(staleBundle.promise);
+    const statusRefresh = management.clusterStatusReq.run();
+    const bundleRefresh = management.clusterBundleReq.run();
+
+    nextStatus.resolve(clusterStatus(authority(8)));
+    await statusRefresh;
+    expect(management.canMutate.value).toBe(false);
+    staleBundle.resolve(bundle(7));
+    await bundleRefresh;
+
+    expect(management.canMutate.value).toBe(false);
+    management.openAddDeployment();
+    await management.saveDeployment(formValue("must-not-publish"));
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it("gives errors precedence over a retained cluster bundle", async () => {
@@ -336,14 +534,16 @@ describe("useModelManagement orchestration", () => {
   });
 
   it("sends the exact next signed cluster revision and complete map", async () => {
-    const existing = deploymentDefaults("model", "q4");
+    const signedExisting = deploymentDefaults("model", "q4");
+    const projectionOnly = deploymentDefaults("model", "q4");
     mockReads({
       document: document(
         "cluster_authority",
         true,
         7,
-        ownRecord([["existing", existing]]),
+        ownRecord([["projection-only", projectionOnly]]),
       ),
+      bundle: bundle(7, ownRecord([["signed-existing", signedExisting]])),
     });
     const publish = vi
       .spyOn(api, "publishClusterDeployments")
@@ -360,9 +560,34 @@ describe("useModelManagement orchestration", () => {
       revision: 8,
       deployments: {
         added: formValue("added").deployment,
-        existing,
+        "signed-existing": signedExisting,
       },
     });
+  });
+
+  it("requires the latest successful lifecycle response to contain the canonical deployments array", async () => {
+    const desired = ownRecord([
+      ["remove-me", deploymentDefaults("model", "q4")],
+    ]);
+    mockReads({
+      document: document("admin_managed", false, 1, desired),
+      status: { runtime_revision: 1, local_serving: { ready: true } },
+    });
+    const replace = vi
+      .spyOn(api, "replaceModelHostDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+
+    expect(management.runtimeStatusCurrent.value).toBe(false);
+    await management.removeDeployment(management.rows.value[0]);
+    expect(replace).not.toHaveBeenCalled();
+
+    vi.mocked(api.modelHostStatus).mockResolvedValueOnce(status([]));
+    await management.statusReq.run();
+    expect(management.runtimeStatusCurrent.value).toBe(true);
+    await management.removeDeployment(management.rows.value[0]);
+    expect(replace).toHaveBeenCalledTimes(1);
   });
 
   it("preserves raw 409 state and the operator draft before a successful proof reload", async () => {
@@ -447,6 +672,167 @@ describe("useModelManagement orchestration", () => {
     await management.saveDeployment(formValue("draft-id"));
     expect(replace).toHaveBeenCalledTimes(1);
   });
+
+  it("invalidates an admin conflict when reload changes authority to signed cluster publication", async () => {
+    mockReads({ document: document("admin_managed", false, 4) });
+    const replace = vi
+      .spyOn(api, "replaceModelHostDeployments")
+      .mockRejectedValueOnce(
+        new ApiError(409, "revision conflict", "raw admin conflict"),
+      );
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openAddDeployment();
+    vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+      document("cluster_authority", true, 7),
+    );
+
+    await management.saveDeployment(formValue("admin-draft"));
+
+    expect(management.editor.value).not.toBeNull();
+    expect(management.conflict.value).toEqual(
+      expect.objectContaining({
+        body: "raw admin conflict",
+        comparison: null,
+        reloadError: expect.stringMatching(/authority changed.*reopen/i),
+      }),
+    );
+    expect(management.conflictRetryAllowed.value).toBe(false);
+    await management.retryConflict();
+    expect(replace).toHaveBeenCalledTimes(1);
+  });
+
+  it("invalidates a signed cluster conflict when reload changes authority to local admin", async () => {
+    mockReads({ document: document("cluster_authority", true, 7) });
+    const publish = vi
+      .spyOn(api, "publishClusterDeployments")
+      .mockRejectedValueOnce(
+        new ApiError(409, "revision conflict", "raw cluster conflict"),
+      );
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openAddDeployment();
+    vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+      document("admin_managed", false, 8),
+    );
+
+    await management.saveDeployment(formValue("cluster-draft"));
+
+    expect(management.editor.value).not.toBeNull();
+    expect(management.conflict.value).toEqual(
+      expect.objectContaining({
+        body: "raw cluster conflict",
+        comparison: null,
+        reloadError: expect.stringMatching(/authority changed.*reopen/i),
+      }),
+    );
+    expect(management.conflictRetryAllowed.value).toBe(false);
+    await management.retryConflict();
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(CONFLICT_PROOF_CHANGES)(
+    "invalidates a conflict comparison after a page refresh changes its $name proof",
+    async ({ mutate }) => {
+      mockReads({ document: document("admin_managed", false, 4) });
+      const replace = vi
+        .spyOn(api, "replaceModelHostDeployments")
+        .mockRejectedValueOnce(
+          new ApiError(409, "revision conflict", "raw local conflict"),
+        )
+        .mockResolvedValue({} as never);
+      const management = useModelManagement();
+      await loadProof(management);
+      management.openAddDeployment();
+      vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+        document("admin_managed", false, 5),
+      );
+      await management.saveDeployment(formValue("draft-id"));
+      expect(management.conflictRetryAllowed.value).toBe(true);
+
+      const changed = document("admin_managed", false, 5);
+      mutate(changed);
+      vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(changed);
+      await management.refresh();
+
+      expect(management.canMutate.value).toBe(true);
+      expect(management.conflictRetryAllowed.value).toBe(false);
+      await management.retryConflict();
+      await management.saveDeployment(formValue("draft-id"));
+      expect(replace).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each<DeploymentRuntimeState>(["ready", "preparing", "draining"])(
+    "refreshes lifecycle proof and blocks a removal conflict retry when state becomes %s",
+    async (blockedState) => {
+      const { management, replace } = await createRemovalConflict();
+      expect(management.conflictRetryAllowed.value).toBe(true);
+      vi.mocked(api.modelHostStatus).mockResolvedValueOnce(
+        status([runtime("remove-me", blockedState)]),
+      );
+
+      await management.retryConflict();
+
+      expect(replace).toHaveBeenCalledTimes(1);
+      expect(management.banner.value?.text).toMatch(/stop this deployment/i);
+    },
+  );
+
+  it("blocks a removal conflict retry after a noncanonical compatibility status success", async () => {
+    const { management, replace } = await createRemovalConflict();
+    vi.mocked(api.modelHostStatus).mockResolvedValueOnce({
+      runtime_revision: 2,
+      local_serving: { ready: true },
+    });
+
+    await management.retryConflict();
+
+    expect(replace).toHaveBeenCalledTimes(1);
+    expect(management.banner.value?.text).toMatch(/refresh runtime/i);
+  });
+
+  it("blocks a removal conflict retry when the lifecycle refresh fails", async () => {
+    const { management, replace } = await createRemovalConflict();
+    vi.mocked(api.modelHostStatus).mockRejectedValueOnce(
+      new ApiError(503, "runtime refresh failed"),
+    );
+
+    await management.retryConflict();
+
+    expect(replace).toHaveBeenCalledTimes(1);
+    expect(management.banner.value?.text).toMatch(/refresh runtime/i);
+  });
+
+  it.each<DeploymentRuntimeState | null>([
+    "stopped",
+    "configured",
+    "failed",
+    null,
+  ])(
+    "allows a removal conflict retry only after a fresh canonical %s lifecycle result",
+    async (allowedState) => {
+      const { management, replace } = await createRemovalConflict();
+      const statusCallsBeforeRetry = vi.mocked(api.modelHostStatus).mock.calls
+        .length;
+      vi.mocked(api.modelHostStatus).mockResolvedValueOnce(
+        status(
+          allowedState === null
+            ? []
+            : [runtime("remove-me", allowedState)],
+        ),
+      );
+
+      await management.retryConflict();
+
+      expect(replace).toHaveBeenCalledTimes(2);
+      expect(
+        vi.mocked(api.modelHostStatus).mock.invocationCallOrder[
+          statusCallsBeforeRetry
+        ],
+      ).toBeLessThan(replace.mock.invocationCallOrder[1]);
+    },
+  );
 
   it.each<DeploymentRuntimeState>(["stopped", "ready"])(
     "requires a fresh lifecycle snapshot with retained %s state but allows a fresh absent runtime row",

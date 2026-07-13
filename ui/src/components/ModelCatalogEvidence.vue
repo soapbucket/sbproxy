@@ -11,6 +11,7 @@ const props = defineProps<{
   model: string;
   entry: CatalogEntry | null;
   variants: readonly CatalogVariant[];
+  unavailableVariant?: string | null;
   automaticSelection: boolean;
   requiresLicenseAcknowledgement: boolean;
   licenseAcknowledged: boolean;
@@ -22,6 +23,9 @@ const emit = defineEmits<{
 }>();
 
 const evidenceSummary = computed(() => {
+  if (props.unavailableVariant) {
+    return { label: "Pinned variant unavailable", tone: "unsupported" };
+  }
   if (!props.entry || props.variants.length === 0) {
     return { label: "Evidence unavailable", tone: "neutral" };
   }
@@ -86,6 +90,12 @@ function updateAcknowledgement(event: Event) {
         This model is no longer present in the active catalog. Choose a current model before saving.
       </p>
 
+      <p v-if="unavailableVariant" class="selection-note" role="alert">
+        Pinned variant
+        <strong class="sb-mono variant-id">{{ unavailableVariant }}</strong>
+        is no longer present in the active catalog. Choose a current variant before saving.
+      </p>
+
       <p v-if="automaticSelection" class="selection-note">
         Automatic selection can use the runnable variants below. Disabled variants remain visible as catalog evidence.
       </p>
@@ -98,7 +108,7 @@ function updateAcknowledgement(event: Event) {
           :class="{ 'variant-card--disabled': catalogVariantDisabledReason(variant) }"
         >
           <div class="variant-card__head">
-            <strong class="sb-mono">{{ variant.id }}</strong>
+            <strong class="sb-mono variant-id">{{ variant.id }}</strong>
             <span class="stability" :class="`stability--${variantSupportTone(variant)}`">
               {{ catalogVariantSupportLabel(variant) }}
             </span>
@@ -243,6 +253,11 @@ function updateAcknowledgement(event: Event) {
 .selection-note {
   color: var(--sb-text-muted);
   font-size: 0.75rem;
+}
+
+.variant-id {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .variant-list {

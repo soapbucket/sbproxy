@@ -137,7 +137,7 @@ defineEmits<{
       <p>Add a complete stable or preview variant with at least one engine and accelerator, then refresh this view.</p>
     </div>
   </section>
-  <section v-else-if="previewOnlyCatalog" class="catalog-notice" role="status" aria-live="polite">
+  <section v-else-if="catalogLoaded && previewOnlyCatalog" class="catalog-notice" role="status" aria-live="polite">
     <StatusBadge label="Preview catalog" tone="warn" />
     <div>
       <h3>All selectable variants are preview</h3>
