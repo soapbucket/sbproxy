@@ -311,16 +311,21 @@ corrected full-map write from the current revision or a controlled restart.
     each node
       -> read pointer and content
       -> verify identity, signature, digest, revision, and catalog
-      -> prepare local placement and runtime
-      -> persist local generation fences and bundle cursor
-      -> activate the local runtime revision
+      -> reconcile global placement
+      -> persist deployment generation fences
+      -> derive the node-local desired state
+      -> persist the authority cursor
+      -> prepare and commit the local runtime revision
+      -> publish the new local cluster plan
       -> mark the verified bundle active
 
 The `202` response proves signing and cluster-state publication only. It does
-not prove node application. A node can reject the candidate before activation,
-or its local cursor can advance before an activation failure. Runtime rollback
-can also fail and leave that node degraded. Cluster status, rather than the
-publication response, proves placement, readiness, and rollout.
+not prove node application. Runtime preparation or commit can fail after the
+node persists generation fences and its authority cursor. The prior runtime may
+remain active while those markers stay advanced. If activation stopped a
+recreate generation, SBproxy attempts to restore it, but restore can fail and
+leave the node degraded. Cluster status, rather than the publication response,
+proves placement, readiness, and rollout.
 
 After a successful runtime activation, reconciliation preserves unaffected
 engines. Additions prepare before becoming eligible. Replacements become ready

@@ -523,10 +523,17 @@ Cluster-authority bundles contain only the catalog revision, numbered desired
 revision, deployments, and placement rules. Unknown fields and duplicate
 deployment IDs are rejected. The authority publishes signed content and its
 current pointer through the authenticated cluster state store before any
-worker applies the revision. Each worker then verifies, prepares, fences, and
-activates the candidate locally. Verification or preparation failure prevents
-local application. An activation error attempts to restore prior recreate
-generations, but rollback can fail and leave that worker degraded.
+worker applies the revision. Each worker verifies the bundle and reconciles
+placement, persists deployment generation fences, derives its local desired
+state, and persists the authority cursor. Only then does it prepare and commit
+the local runtime. After a successful commit, the worker publishes the new
+cluster plan locally and marks the verified bundle active.
+
+Runtime preparation or commit can fail after generation fences and the cursor
+advance. The previous runtime may remain active, but those durable markers stay
+advanced. If activation stopped a recreate generation, SBproxy attempts to
+restore it. A failed restore leaves the worker degraded. Use cluster status,
+model-host status, and logs to choose an authority-specific recovery.
 
 Every node configures the public verification key and durable cursor state. The
 authority alone also configures the private signing key:
@@ -622,14 +629,22 @@ Pull policy controls cache misses:
 
 `warm: true` goes beyond artifact verification and starts the engine before the
 revision becomes active. Use it when readiness must mean the first token path is
-available. A warm failure aborts the candidate revision.
+available. A warm failure prevents local runtime activation. It does not prove
+that authority state stayed unchanged: an admin deployment-store revision or a
+cluster worker's generation fences and authority cursor may already have
+advanced. Read desired state, model-host status, and logs before recovery. Fix
+and reload the authoritative file, submit a corrected admin map from the
+current revision, or repair the cluster worker and reconcile the signed bundle,
+depending on the active authority.
 
 `rollout: rolling` starts target assignments before draining losing
 assignments. The old generation remains retained until every target reports the
 exact generation, variant, artifact digest, and ready state, or until
 `handoff_timeout_ms` expires. `recreate` emits a drain-only step before it may
-start the target. A failed placement or worker-local prepare preserves the
-prior committed plan and runtime.
+start the target. Placement rejection happens before generation fences or the
+authority cursor advance. Worker-local preparation happens after those writes;
+its failure leaves the previous local plan unpublished and the prior runtime
+may remain active, while fences and the cursor stay advanced.
 
 `required_labels` filters workers before ranking. `spread_by` is an ordered set
 of failure-domain labels, such as `[zone, rack]`; placement prefers a new value
@@ -891,12 +906,14 @@ is a separate measurement and never masquerades as compute activity.
 ## Reload behavior
 
 The runtime collects canonical and compatibility deployments from every origin.
-It validates the complete catalog, cache and engine policy, routes, capacity,
-and warm preparations before commit. Capacity is reserved before a staged warm
-engine starts. On success it preserves unchanged engine generations and
-replaces only changed deployments. On failure it tears down staged work and
-keeps the prior routes and resident engines. A recreate launch failure also
-restarts the stopped prior generation before returning the error.
+It validates the complete catalog, cache and engine policy, and routes while it
+stages the candidate. During commit it reserves capacity, then starts each warm
+engine before snapshot activation. On success it preserves unchanged engine
+generations and replaces only changed deployments. Validation and initial
+preparation failures tear down staged work before runtime publication. A later
+warm or recreate activation failure attempts to restore any stopped prior
+generation. Restore can fail and leave that generation degraded, so status and
+logs are part of recovery.
 
 A cache root, catalog revision, or engine foundation cannot change under a
 resident deployment. Reconcile to an empty desired state first, then apply the
@@ -905,11 +922,14 @@ sets from living in one worker process.
 
 Cluster reconciliation shares that commit lock. Every process computes the
 same global target from one immutable directory view, then filters it to exact
-assignments for its stable node ID. The worker prepares that local projection
-before publishing the new plan. A failed artifact, engine, or runtime prepare
-therefore leaves both the previous local runtime and previous cluster plan
-active. Control-only nodes keep a catalog-aligned empty runtime and never create
-an engine merely to participate in placement.
+assignments for its stable node ID. The worker persists generation fences and
+the authority cursor before it prepares and commits that local projection. It
+publishes the new local cluster plan and marks the bundle active only after the
+runtime commit succeeds. Preparation or commit failure can therefore leave the
+cursor and fences advanced while the prior runtime and plan may remain active.
+An activation restore failure can instead leave the node degraded.
+Control-only nodes keep a catalog-aligned empty runtime and never create an
+engine merely to participate in placement.
 
 ## One-command local run
 
