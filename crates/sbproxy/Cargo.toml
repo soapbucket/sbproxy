@@ -86,6 +86,7 @@ embedded = ["sbproxy-core/embedded"]
 tracing.workspace = true
 sbproxy-core.workspace = true
 sbproxy-config.workspace = true
+sbproxy-mesh.workspace = true
 # `doctor --install`: PATH probes, the pinned llama.cpp release
 # download, and the cache-dir resolver.
 sbproxy-model-host.workspace = true

@@ -6,22 +6,26 @@ The model host starts inference processes beside a gateway that may hold cloud
 provider credentials. Treat write access to `sb.yml`, the deployment revision
 store, engine paths, and the artifact cache as privileged operator access.
 
-This page describes the current single-node boundary. It is intentionally
-blunt: a compromised trusted config can select an explicit engine executable,
-so configuration integrity is part of the process-execution trust root.
+This page describes the local runtime and cluster control-plane boundary. It is
+intentionally blunt: a compromised trusted config can select an explicit engine
+executable or cluster identity, so configuration integrity is part of the
+process-execution trust root.
 
 ## Trust boundaries
 
-Four inputs matter:
+Five inputs matter:
 
 1. Desired state selects models, engines, cache roots, and process policy.
 2. The catalog identifies immutable model artifacts and allowed formats.
 3. Engine acquisition selects an executable, uv environment, or container image.
 4. Requests arrive through the gateway and must stay outside process control.
+5. Cluster identity, membership, snapshots, and signed desired state determine
+   which worker may prepare a replica.
 
-The first three are operator-controlled supply-chain inputs. Request callers are
-untrusted. They may choose only a public model exposed by a configured provider;
-they cannot supply an engine, artifact path, device, port, or argv.
+The first three and cluster identity are operator-controlled supply-chain
+inputs. Request callers are untrusted. They may choose only a public model
+exposed by a configured provider; they cannot supply an engine, artifact path,
+device, port, peer identity, or argv.
 
 ## Configuration is privileged
 
@@ -195,9 +199,53 @@ the admin listener on `127.0.0.1`. Remote admin needs TLS, an IP allowlist, and
 separate named operators. Model lifecycle routes use the same authentication
 and audit boundary as the rest of `/admin/*`.
 
+## Cluster identity and authority
+
+Canonical production clustering uses two independent protections:
+
+- mutually authenticated TLS secures typed-state transport and verifies every
+  peer certificate against the installed cluster CA and server-name SAN;
+- an authenticated cluster gossip key encrypts and authenticates UDP membership
+  messages before they can influence the stable node-ID ring.
+
+Missing or invalid production material fails startup. Shared-key-only mode must
+be marked as development and is not a production peer-identity claim. Cluster
+identity, roles, labels, advertised addresses, endpoints, and security material
+are restart-required, so a reload cannot partially split a running process from
+its installed identity.
+
+Enrollment creates the worker key locally, sends only its signing request, and
+installs the CA-signed result. Tokens are random, expiring, one-time values; the
+authority stores their hashes and consumes a token atomically. Requested roles
+and labels must be an exact subset of the token grant. An authority role is
+never inferred or granted by a worker token.
+
+Worker snapshots are strict, bounded, versioned, path-free documents. They
+contain capabilities, capacity, artifact identities, replica state, health, and
+the active deployment digest, but no local paths, credentials, private keys, or
+engine handles. Publisher node ID and snapshot identity must agree. Expired,
+malformed, incompatible, unreachable, suspect, dead, and unhealthy records are
+excluded from placement while remaining visible to operators.
+
+Cluster-authority desired state uses a separate Ed25519 key pair. The private
+key exists only on a node with the authority role. Bundles deny unknown fields
+at every level and can contain only a catalog revision, monotonic revision,
+model declarations, and placement rules. Readers verify canonical content
+digest, signature, key ID, signer node ID, publisher identity, schema, bounds,
+expiry, and a durable monotonic cursor before runtime preparation. Failed
+verification or preparation retains the last good bundle. Non-authority admin
+writes fail with `deployment_authority_read_only`.
+
+PR 3 does not carry inference requests between nodes. The advertised private
+model endpoint is authenticated placement data, not yet a dispatch channel.
+Request-envelope signing, replay protection, cancellation, and remote streaming
+belong to the distributed data-plane PR and must land before any remote serving
+claim is promoted.
+
 ## Remaining hardening
 
-These controls are not part of the current stable single-node contract:
+These controls are not part of the current stable runtime and cluster-control
+contract:
 
 - Linux cgroup CPU and memory limits per engine process;
 - dropping ambient capabilities and switching to a dedicated Unix user;
@@ -205,8 +253,7 @@ These controls are not part of the current stable single-node contract:
 - signature verification for every engine release and package index;
 - a rootless container requirement;
 - persistent desired-state mutation with review and approval in the admin UI;
-- peer identity, transport encryption, and authorization for multi-node model
-  dispatch.
+- authenticated request authorization for multi-node model dispatch.
 
 Live NVIDIA and multi-node validation runs on GCP in the final PR group. Until
 that evidence is recorded, NVIDIA uv, container, and CUDA source-build paths

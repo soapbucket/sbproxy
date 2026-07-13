@@ -124,6 +124,8 @@ proxy:
   alerting: { ... }
   admin: { ... }
   secrets: { ... }
+  cluster: { ... }
+  model_host: { ... }
 
   # L2 cache (Redis) for distributed rate limiting and caching
   l2_cache_settings:
@@ -243,6 +245,8 @@ proxy:
 | `alerting` | object | | Alert notification channels. |
 | `admin` | object | | Embedded read-only admin / stats API server. |
 | `secrets` | object | | Secrets management backend. See [Secrets](#secrets). |
+| `cluster` | object | unset | Canonical local or distributed cluster identity, membership, mTLS, enrollment, snapshot, and signed deployment-authority settings. |
+| `model_host` | object | unset | Canonical managed-model authority, cache, engines, deployments, placement, and rollout policy. |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
 | `messenger_settings` | object | | Optional shared message bus for inter-component eventing. |
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honoured. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
@@ -362,6 +366,124 @@ Failure modes:
   the absolute path scrubbed so the response does not leak the
   operator's filesystem layout.
 * `405` - any verb other than `GET`.
+
+### Cluster fields
+
+`proxy.cluster` creates one process-owned cluster handle used by model control
+and the mesh key cache. Production mode requires mTLS plus an authenticated
+gossip key:
+
+```yaml
+proxy:
+  cluster:
+    cluster_id: production-models
+    node_id: worker-a
+    roles: [worker]
+    labels: {zone: us-central1-a}
+    seeds: [10.10.0.10:7946]
+    gossip_port: 7946
+    transport_port: 8946
+    advertise_addr: 10.10.0.21:7946
+    transport_advertise_addr: 10.10.0.21:8946
+    model_endpoint: https://10.10.0.21:9443
+    state_dir: /var/lib/sbproxy/cluster
+    snapshot_ttl_secs: 30
+    publish_interval_secs: 5
+    dead_peer_gc_secs: 300
+    security:
+      mode: mtls
+      shared_key: file:/var/lib/sbproxy/cluster/gossip.key
+      cert_file: /var/lib/sbproxy/cluster/node.pem
+      key_file: /var/lib/sbproxy/cluster/node-key.pem
+      ca_file: /var/lib/sbproxy/cluster/ca.pem
+      server_name: sbproxy-mesh
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `cluster_id` | string | required | Stable logical cluster identity shared by every member. |
+| `node_id` | string | required | Stable unique node identity. |
+| `roles` | list | required | Any combination of `gateway`, `worker`, and `authority`. |
+| `labels` | map | `{}` | Bounded authenticated placement and failure-domain labels. |
+| `seeds` | list | `[]` | Static UDP gossip seed addresses in `host:port` form. |
+| `gossip_port` | int | `7946` | UDP SWIM listener. |
+| `transport_port` | int | `8946` | TCP typed-state and cache transport listener. |
+| `advertise_addr` | string | observed address | Gossip address advertised to peers. Enrolled mTLS startup requires an explicit routable IP and port. |
+| `transport_advertise_addr` | string | advertised host plus transport port | mTLS typed-state address advertised to peers. |
+| `model_endpoint` | HTTPS URL | unset | Private model-plane endpoint advertised by workers. Required for placement eligibility. |
+| `state_dir` | path | required | Installed identity plus durable boot, peer-identity high-water, snapshot generation, deployment generation, and authority cursor state. |
+| `snapshot_ttl_secs` | int | `30` | Worker snapshot lifetime; at least two publish intervals. |
+| `publish_interval_secs` | int | `5` | Snapshot publication cadence. |
+| `dead_peer_gc_secs` | int | `300` | Seconds before SWIM removes a dead peer from routing membership. The admin roster retains a bounded tombstone after this GC. |
+| `security.mode` | enum | required | `mtls` for production or `shared_key` for explicit development. |
+| `security.development` | bool | `false` | Must be true for shared-key-only mode. |
+| `security.shared_key` | secret reference | unset | UDP gossip key; required in mTLS production mode too. |
+| `security.cert_file`, `key_file`, `ca_file` | paths | unset | Per-node mTLS material. |
+| `security.server_name` | string | `sbproxy-mesh` | Cluster SAN bound into enrollment. Canonical outbound transport additionally verifies the target `node_id` SAN. |
+| `enrollment.authority_dir` | path | unset | Identity directory used by an authority-role process to enroll nodes. |
+| `deployment_authority.verifying_key_file` | path | unset | Ed25519 public key installed on every node. |
+| `deployment_authority.signing_key_file` | path | unset | Authority-only Ed25519 private key. |
+
+Canonical mTLS supports built-in enrollment or operator-managed PKI. Enrollment
+startup verifies `state_dir/identity.json` with
+`state_dir/authority-verifying.key`. Manual PKI omits both files and requires
+the leaf certificate to contain the node ID DNS SAN plus exactly one SBproxy
+identity URI SAN with cluster ID, node ID, roles, labels, server name, and a
+positive identity epoch. Every claim must match config. Do not mix attestation
+modes within a cluster, and increment the manual identity epoch for certificate
+rotation. `state_dir` also stores an atomically advanced boot epoch used to
+reject join replay after restart. Each verifier durably retains the highest
+accepted identity, certificate, and boot epoch per peer. Model controllers
+persist per-deployment generation high-water marks before publishing a
+placement commit, so an unplaced or fully drained deployment cannot reset after
+restart. Identity, roles, labels, discovery, listeners, advertised endpoints,
+security, state, dead-peer GC, and authority changes require restart. Snapshot
+cadence reloads in place.
+See [model-host.md](model-host.md#cluster-configuration) for enrollment,
+placement, signed bundle, and admin status workflows.
+
+### Model-host fields
+
+`proxy.model_host` is the canonical managed-model desired state:
+
+```yaml
+proxy:
+  model_host:
+    authority: file_managed
+    catalog_file: /etc/sbproxy/models.yaml
+    max_parallel_prepares: 2
+    safety_margin: 0.10
+    shutdown_deadline_ms: 30000
+    handoff_timeout_ms: 60000
+    cache:
+      directory: /var/lib/sbproxy/models
+      budget_gib: 100
+      max_resident_models: 2
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+        replicas: 2
+        required_labels: {accelerator: l4}
+        spread_by: [zone]
+        pull: on_boot
+        warm: true
+        engine: llama_cpp
+        rollout: rolling
+```
+
+Authority values are `file_managed`, `admin_managed`, and
+`cluster_authority`. Deployment pull values are `on_boot`, `on_demand`, and
+`manual`; rollout values are `rolling` and `recreate`. Replicated homogeneous
+deployments must pin a variant unless `heterogeneous_variants: true` is set.
+`catalog_file` selects a catalog v2 document and resolves relative paths from
+the directory containing `sb.yml`; omission uses the built-in catalog. A
+canonical `catalog_file` takes precedence over compatibility provider
+`serve.catalog_file` declarations.
+`required_labels` filters workers and `spread_by` orders failure domains.
+`handoff_timeout_ms` bounds how long rolling placement retains losing
+assignments while target readiness converges. See [model-host.md](model-host.md)
+for the engine, cache, admission, placement, and rollout contracts.
 
 ### Metrics fields
 

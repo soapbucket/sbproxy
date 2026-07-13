@@ -374,7 +374,7 @@ impl DistributedCache<Bytes> {
             );
             return None;
         };
-        let client = pool.client_for(&addr);
+        let client = pool.try_client_for_node(&owner, &addr)?;
         match client.get(key.to_string()).await {
             Ok(v) => v,
             Err(e) => {
@@ -440,7 +440,9 @@ impl DistributedCache<Bytes> {
         let addr = peer_addr_for_node(&owner).ok_or_else(|| {
             anyhow::anyhow!("put_routed: no transport address configured for owner node '{owner}'")
         })?;
-        let client = pool.client_for(&addr);
+        let client = pool.try_client_for_node(&owner, &addr).ok_or_else(|| {
+            anyhow::anyhow!("put_routed: owner node '{owner}' is not an authenticated node ID")
+        })?;
         client.put_with_ttl(key.to_string(), value, ttl_secs).await
     }
 
@@ -473,7 +475,9 @@ impl DistributedCache<Bytes> {
                 "delete_routed: no transport address configured for owner node '{owner}'"
             )
         })?;
-        let client = pool.client_for(&addr);
+        let client = pool.try_client_for_node(&owner, &addr).ok_or_else(|| {
+            anyhow::anyhow!("delete_routed: owner node '{owner}' is not an authenticated node ID")
+        })?;
         client.delete(key.to_string()).await
     }
 }

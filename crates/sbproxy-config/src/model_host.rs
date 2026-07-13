@@ -76,6 +76,9 @@ pub struct ManagedDeploymentConfig {
     /// Worker labels required by this deployment.
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,
+    /// Ordered failure-domain label keys used to spread replicas.
+    #[serde(default)]
+    pub spread_by: Vec<String>,
     /// Artifact download policy.
     #[serde(default)]
     pub pull: ManagedPullPolicy,
@@ -205,6 +208,9 @@ pub struct ModelHostControlConfig {
     /// Revision store path required by admin-managed authority.
     #[serde(default)]
     pub store_path: Option<String>,
+    /// Optional operator catalog file replacing the built-in model catalog.
+    #[serde(default)]
+    pub catalog_file: Option<String>,
     /// Maximum artifact and engine preparations that may run concurrently.
     #[serde(default = "default_max_parallel_prepares")]
     pub max_parallel_prepares: usize,
@@ -214,6 +220,9 @@ pub struct ModelHostControlConfig {
     /// Maximum graceful drain time during shutdown.
     #[serde(default = "default_shutdown_deadline_ms")]
     pub shutdown_deadline_ms: u64,
+    /// Maximum rolling placement handoff time while prior replicas are retained.
+    #[serde(default = "default_handoff_timeout_ms")]
+    pub handoff_timeout_ms: u64,
     /// Artifact cache and residency policy.
     #[serde(default)]
     pub cache: ModelHostCacheConfig,
@@ -230,9 +239,11 @@ impl Default for ModelHostControlConfig {
         Self {
             authority: ModelHostAuthority::default(),
             store_path: None,
+            catalog_file: None,
             max_parallel_prepares: default_max_parallel_prepares(),
             safety_margin: default_safety_margin(),
             shutdown_deadline_ms: default_shutdown_deadline_ms(),
+            handoff_timeout_ms: default_handoff_timeout_ms(),
             cache: ModelHostCacheConfig::default(),
             engines: BTreeMap::new(),
             deployments: BTreeMap::new(),
@@ -250,6 +261,10 @@ const fn default_safety_margin() -> f64 {
 
 const fn default_shutdown_deadline_ms() -> u64 {
     30_000
+}
+
+const fn default_handoff_timeout_ms() -> u64 {
+    60_000
 }
 
 /// Validation failure for canonical model-host configuration.
@@ -275,6 +290,13 @@ impl ModelHostControlConfig {
                 "max_parallel_prepares must be positive",
             ));
         }
+        if self.catalog_file.as_ref().is_some_and(|path| {
+            path.trim().is_empty() || path.len() > 4_096 || path.chars().any(char::is_control)
+        }) {
+            return Err(ModelHostConfigError::new(
+                "catalog_file must be a bounded nonempty path without control characters",
+            ));
+        }
         if !self.safety_margin.is_finite() || self.safety_margin < 0.0 || self.safety_margin >= 1.0
         {
             return Err(ModelHostConfigError::new(
@@ -284,6 +306,11 @@ impl ModelHostControlConfig {
         if self.shutdown_deadline_ms == 0 {
             return Err(ModelHostConfigError::new(
                 "shutdown_deadline_ms must be positive",
+            ));
+        }
+        if self.handoff_timeout_ms == 0 || self.handoff_timeout_ms > 24 * 60 * 60 * 1_000 {
+            return Err(ModelHostConfigError::new(
+                "handoff_timeout_ms must be between 1 and 86400000",
             ));
         }
         if self.authority == ModelHostAuthority::AdminManaged
@@ -412,6 +439,25 @@ fn validate_deployment(
         return Err(ModelHostConfigError::new(format!(
             "deployment {id:?} required labels must have nonempty keys and values"
         )));
+    }
+    if deployment.spread_by.len() > 8 {
+        return Err(ModelHostConfigError::new(format!(
+            "deployment {id:?} spread_by may contain at most 8 label keys"
+        )));
+    }
+    let mut spread_keys = std::collections::BTreeSet::new();
+    for key in &deployment.spread_by {
+        if key.is_empty()
+            || key.len() > 128
+            || !key.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/')
+            })
+            || !spread_keys.insert(key)
+        {
+            return Err(ModelHostConfigError::new(format!(
+                "deployment {id:?} spread_by contains an invalid or duplicate label key"
+            )));
+        }
     }
     Ok(())
 }

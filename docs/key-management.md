@@ -105,6 +105,7 @@ cache:
     gossip_port: 7946
     transport_port: 8946
     advertise_addr: node-a:7946   # what this node advertises to peers
+    transport_advertise_addr: node-a:8946 # optional when host is the same
     # shared_key: env:SBPROXY_MESH_KEY  # encrypt gossip + transport (optional)
 ```
 

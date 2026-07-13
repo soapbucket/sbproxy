@@ -1,0 +1,57 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+
+proxy:
+  http_bind_port: 18081
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 19091
+    username: admin
+    password: ${SB_ADMIN_PASSWORD:-change-this-before-running}
+  cluster:
+    cluster_id: model-cluster-split
+    node_id: gateway-a
+    roles: [gateway]
+    labels: {zone: edge}
+    seeds: [127.0.0.1:17946]
+    gossip_port: 17947
+    transport_port: 18947
+    advertise_addr: 127.0.0.1:17947
+    transport_advertise_addr: 127.0.0.1:18947
+    state_dir: ./state/gateway
+    security:
+      mode: mtls
+      shared_key: file:./state/gateway/gossip.key
+      cert_file: ./state/gateway/node.pem
+      key_file: ./state/gateway/node-key.pem
+      ca_file: ./state/gateway/ca.pem
+      server_name: sbproxy-mesh
+    snapshot_ttl_secs: 10
+    publish_interval_secs: 2
+    dead_peer_gc_secs: 300
+  model_host:
+    authority: file_managed
+    handoff_timeout_ms: 15000
+    cache:
+      directory: ./state/gateway/models
+      budget_gib: 4
+      max_resident_models: 1
+    engines:
+      llama_cpp:
+        launch: binary
+        version: b9905
+        acceleration: auto
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+        replicas: 2
+        spread_by: [zone]
+        pull: on_boot
+        warm: true
+        engine: llama_cpp
+        rollout: rolling
+
+origins:
+  "gateway.local":
+    action: {type: static, status_code: 200, body: gateway}

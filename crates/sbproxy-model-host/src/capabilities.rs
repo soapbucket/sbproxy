@@ -114,6 +114,8 @@ pub enum ConsumerContract {
     ExactRemovalProtectsReferences,
     /// Runtime status and admission failures serialize bounded stable labels.
     StatusReportsStableLifecycle,
+    /// Managed replicas converge on one deterministic placement plan.
+    ClusterPlacementConverges,
 }
 
 impl ConsumerContract {
@@ -145,6 +147,7 @@ impl ConsumerContract {
             Self::KeepAliveStartsAfterLastPermit => "contract.keep_alive_starts_after_last_permit",
             Self::ExactRemovalProtectsReferences => "contract.exact_removal_protects_references",
             Self::StatusReportsStableLifecycle => "contract.status_reports_stable_lifecycle",
+            Self::ClusterPlacementConverges => "contract.cluster_placement_converges",
         }
     }
 
@@ -310,8 +313,83 @@ impl ConsumerContract {
             Self::KeepAliveStartsAfterLastPermit => assert_keep_alive_lifecycle(),
             Self::ExactRemovalProtectsReferences => assert_exact_removal_protection(),
             Self::StatusReportsStableLifecycle => assert_stable_status_shape(),
+            Self::ClusterPlacementConverges => assert_cluster_placement_converges(),
         }
     }
+}
+
+fn assert_cluster_placement_converges() -> Result<(), String> {
+    use crate::node_snapshot::{NodeDeviceSnapshot, NodeEngineSnapshot, NodeHealthState, NodeRole};
+    use crate::{
+        ArtifactFormat, EngineAvailability, EngineKind, GpuVendor, PlacementNode, PlacementRequest,
+    };
+    use std::collections::BTreeMap;
+
+    let node = |node_id: &str, zone: &str| PlacementNode {
+        node_id: node_id.to_string(),
+        roles: BTreeSet::from([NodeRole::Worker]),
+        health: NodeHealthState::Ready,
+        labels: BTreeMap::from([("zone".to_string(), zone.to_string())]),
+        model_endpoint: Some(format!("https://{node_id}.internal:9443")),
+        placement_weight: 64_000,
+        engines: vec![NodeEngineSnapshot {
+            engine: EngineKind::LlamaCpp,
+            availability: EngineAvailability::Available,
+            version: Some("fixture".to_string()),
+            artifact_formats: vec![ArtifactFormat::Gguf],
+            accelerators: BTreeSet::from([crate::AcceleratorKind::Cpu]),
+            supports_container: false,
+            supports_uv: false,
+            reason_code: None,
+        }],
+        devices: vec![NodeDeviceSnapshot {
+            index: 0,
+            vendor: GpuVendor::Cpu,
+            accelerator: Some(crate::AcceleratorKind::Cpu),
+            name: "host RAM".to_string(),
+            total_memory_bytes: 64_000_000_000,
+            available_memory_bytes: 64_000_000_000,
+            compute_capability: None,
+            supports_fp8: false,
+        }],
+        artifacts: Vec::new(),
+    };
+    let deployment: crate::ModelDeployment = serde_yaml::from_str(
+        "model: qwen2.5-0.5b-instruct\nvariant: q4_k_m\nreplicas: 2\nspread_by: [zone]\nengine: llama_cpp\n",
+    )
+    .map_err(|error| error.to_string())?;
+    let request = |nodes| PlacementRequest {
+        deployment_id: "assistant".to_string(),
+        deployment_generation: 7,
+        deployment: deployment.clone(),
+        nodes,
+    };
+    let first = crate::plan_placement(
+        &crate::Catalog::builtin(),
+        request(vec![node("worker-b", "b"), node("worker-a", "a")]),
+    )
+    .map_err(|error| error.to_string())?;
+    let second = crate::plan_placement(
+        &crate::Catalog::builtin(),
+        request(vec![node("worker-a", "a"), node("worker-b", "b")]),
+    )
+    .map_err(|error| error.to_string())?;
+    if first != second
+        || first.unplaced_replicas != 0
+        || first.assignments.len() != 2
+        || first
+            .assignments
+            .iter()
+            .map(|assignment| assignment.failure_domains.get("zone"))
+            .collect::<BTreeSet<_>>()
+            .len()
+            != 2
+    {
+        return Err(format!(
+            "cluster placement did not converge: {first:?} / {second:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn assert_managed_driver_capabilities() -> Result<(), String> {
@@ -1108,8 +1186,22 @@ const CAPABILITIES: &[CapabilityEntry] = &[
     CapabilityEntry {
         id: "cluster.managed_replicas",
         domain: CapabilityDomain::Cluster,
+        status: SupportLevel::Stable,
+        summary: "Managed replicas use versioned worker snapshots, deterministic placement and spread, readiness-gated rollout, and authenticated cluster health status.",
+        evidence: &[
+            "contract.cluster_placement_converges",
+            "test.placement",
+            "test.runtime_reconcile",
+            "test.cluster_control_plane",
+            "test.model_cluster_control",
+        ],
+        consumer: Some(ConsumerContract::ClusterPlacementConverges),
+    },
+    CapabilityEntry {
+        id: "cluster.remote_dispatch",
+        domain: CapabilityDomain::Cluster,
         status: SupportLevel::Unsupported,
-        summary: "Managed multi-node placement and dispatch are reserved for later PR groups.",
+        summary: "Remote inference dispatch and streaming over the private model plane land in the distributed data-plane PR.",
         evidence: &[],
         consumer: None,
     },

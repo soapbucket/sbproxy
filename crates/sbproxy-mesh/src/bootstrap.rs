@@ -46,6 +46,16 @@ pub struct BootstrapConfig {
     /// failure is logged and the node continues without inbound routing.
     pub transport_port: u16,
 
+    /// Gossip address announced in join messages. Canonical callers secure
+    /// those messages with the configured cluster cipher. When absent,
+    /// receivers use the observed UDP source address.
+    pub gossip_advertise_addr: Option<String>,
+
+    /// Typed-state transport address announced in join messages.
+    /// When absent and `transport_port` is nonzero, receivers combine the
+    /// observed peer IP with that port.
+    pub transport_advertise_addr: Option<String>,
+
     /// How often this node emits heartbeats to every known peer (seconds).
     pub heartbeat_interval_secs: u64,
 
@@ -100,10 +110,13 @@ pub struct BootstrapConfig {
 pub struct PeerTlsParams {
     /// This node's certificate, private key, and the shared CA (PEM).
     pub tls: crate::transport::tls::MeshTlsConfig,
-    /// Logical server name every peer certificate is issued for (its SAN).
-    /// Outbound connections verify the peer certificate against this name,
-    /// so the mesh can dial peers by address while pinning one identity.
+    /// Cluster server-name SAN installed by the authority. Compatibility mTLS
+    /// verifies this shared name; enrolled canonical transport verifies the
+    /// target node-ID SAN instead.
     pub server_name: String,
+    /// Enrolled identity proof issuer for canonical clusters. Compatibility
+    /// mTLS may omit this and retain shared-SAN behavior.
+    pub identity_authenticator: Option<Arc<crate::peer_identity::PeerIdentityAuthenticator>>,
 }
 
 impl Default for BootstrapConfig {
@@ -112,6 +125,8 @@ impl Default for BootstrapConfig {
             wait_for_peers_secs: 5,
             gossip_port: 7946,
             transport_port: 8946,
+            gossip_advertise_addr: None,
+            transport_advertise_addr: None,
             heartbeat_interval_secs: 1,
             failure_check_interval_secs: 2,
             failure_timeout_secs: 5,
@@ -218,15 +233,21 @@ pub async fn bootstrap(
 
     // --- Build the shared peer address map ---
     //
-    // Seeded from the bootstrap-time peer snapshot: identity == address
-    // until the gossip loop back-fills real node ids. Constructed BEFORE
+    // Seeded from the bootstrap-time gossip snapshot under temporary address
+    // identities, with each route lowered to the configured TCP port. Join
+    // messages replace those aliases with stable node IDs. Constructed BEFORE
     // the gossip loop so the same `Arc` can be handed to both the loop
     // (which writes gossip-learned mappings into it, L3) and the handle
     // (which exposes it via `peer_addr_lookup` for transport routing).
     let peer_addr_map_init: HashMap<String, String> = node
         .peers()
         .iter()
-        .map(|peer| (peer.clone(), peer.clone()))
+        .map(|peer| {
+            (
+                peer.clone(),
+                replace_port(peer, config.transport_port).unwrap_or_else(|| peer.clone()),
+            )
+        })
         .collect();
     let peer_addr_map = Arc::new(RwLock::new(peer_addr_map_init));
 
@@ -255,6 +276,19 @@ pub async fn bootstrap(
     let gossip_cfg = GossipLoopConfig {
         node_id: node_id.clone(),
         gossip_port: config.gossip_port,
+        gossip_advertise_addr: config.gossip_advertise_addr.clone(),
+        transport_advertise_addr: config
+            .transport_advertise_addr
+            .clone()
+            .or_else(|| {
+                config
+                    .gossip_advertise_addr
+                    .as_deref()
+                    .and_then(|address| replace_port(address, config.transport_port))
+            })
+            .or_else(|| {
+                (config.transport_port > 0).then(|| format!("0.0.0.0:{}", config.transport_port))
+            }),
         heartbeat_interval_secs: config.heartbeat_interval_secs.max(1),
         failure_check_interval_secs: config.failure_check_interval_secs.max(1),
         failure_timeout_secs: config.failure_timeout_secs.max(1),
@@ -272,6 +306,10 @@ pub async fn bootstrap(
         // the next sweep tick" so tests can exercise the path without
         // waiting several seconds.
         dead_peer_gc_secs: config.dead_peer_gc_secs,
+        identity_authenticator: config
+            .peer_tls
+            .as_ref()
+            .and_then(|params| params.identity_authenticator.clone()),
     };
 
     match GossipLoop::start(
@@ -283,6 +321,7 @@ pub async fn bootstrap(
         // mappings into this same `Arc`; the transport layer reads them
         // via `MeshNode::peer_addr_lookup` for routed cache RPCs.
         peer_addr_map.clone(),
+        Some(node.distributed_cache()),
     )
     .await
     {
@@ -310,8 +349,8 @@ pub async fn bootstrap(
     //
     // L3: `peer_addr_map` was already constructed (and handed to the
     // gossip loop) above. It is seeded from the bootstrap-time peer
-    // snapshot (identity == address) and live-updated by the gossip
-    // loop as node ids are learned or addresses rebind.
+    // snapshot under temporary address identities and live-updated by the
+    // gossip loop as stable node IDs and typed-state addresses are learned.
     // K3: the pool gets the same cipher as the gossip loop so every
     // outbound `PeerClient` speaks the same AEAD-wrapped protocol as
     // the server on the other end.
@@ -333,6 +372,7 @@ pub async fn bootstrap(
                 Some(crate::transport::client::MeshTlsClient {
                     connector,
                     server_name,
+                    verify_node_id: p.identity_authenticator.is_some(),
                 }),
             )
         }
@@ -366,9 +406,24 @@ pub async fn bootstrap(
         }
     };
 
-    node = node.with_transport(transport_server, transport_pool, peer_addr_map);
+    node = node
+        .with_transport(transport_server, transport_pool, peer_addr_map)
+        .with_identity_authenticator(
+            config
+                .peer_tls
+                .as_ref()
+                .and_then(|params| params.identity_authenticator.clone()),
+        );
 
     Ok(node)
+}
+
+fn replace_port(address: &str, port: u16) -> Option<String> {
+    if port == 0 {
+        return None;
+    }
+    let (host, _) = address.rsplit_once(':')?;
+    (!host.is_empty()).then(|| format!("{host}:{port}"))
 }
 
 #[cfg(test)]
@@ -401,6 +456,8 @@ mod tests {
             // Ephemeral TCP port so parallel test runs do not collide on
             // the default 8946.
             transport_port: 0,
+            gossip_advertise_addr: None,
+            transport_advertise_addr: None,
             heartbeat_interval_secs: 1,
             failure_check_interval_secs: 2,
             failure_timeout_secs: 5,

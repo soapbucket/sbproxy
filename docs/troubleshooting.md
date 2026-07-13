@@ -1,5 +1,5 @@
 # Troubleshooting
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-11*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -26,6 +26,7 @@ Jump by symptom:
 | Cert expiring, renewal not happening | [ACME renewal is failing](#acme-renewal-is-failing) |
 | No HTTP/3 | [HTTP/3 requests fall back to HTTP/2](#http3-requests-fall-back-to-http2) |
 | Local model never becomes ready | [A local model will not serve](#a-local-model-will-not-serve) |
+| Cluster node unhealthy or placement differs | [The model cluster does not converge](#the-model-cluster-does-not-converge) |
 | Example compose stack broken | [An example docker compose stack will not start](#an-example-docker-compose-stack-will-not-start) |
 
 ## A config setting seems to be ignored
@@ -244,6 +245,65 @@ lowering. New configurations should use `proxy.model_host`. Live NVIDIA
 remediation is verified in the final GCP integration PR; see
 [model-host-certification.md](model-host-certification.md) before treating a
 simulated device test as hardware evidence.
+
+## The model cluster does not converge
+
+Start with the authenticated cluster view, not a single worker log:
+
+```bash
+sbproxy cluster status --format json \
+  | jq '{summary,nodes,unhealthy_nodes,deployments,deployment_authority}'
+```
+
+Check in this order:
+
+- If the process fails at startup, verify unique local gossip and transport
+  ports, reachable advertised addresses, and matching `cluster_id`, seeds, CA,
+  server name, gossip key, and enrolled files under `state_dir`. The signed
+  identity must match the configured node ID, roles, labels, server name, and
+  certificate fingerprint. Canonical cluster bind and security failures are
+  fatal. A legacy key-cache mesh may fall back locally, but `proxy.cluster`
+  never does.
+- If key-cache mesh fields are still present, they must exactly match
+  `proxy.cluster` node ID, seeds, listeners, advertised addresses, shared key,
+  and mTLS fields. Mismatch is rejected so one process cannot split into two
+  clusters.
+- Inspect `unhealthy_nodes[].reasons` and the matching full `nodes` row.
+  `membership_suspect`, `membership_dead`, `snapshot_missing`,
+  `snapshot_expired`, `snapshot_unreachable`, incompatible schema, reported health, missing model
+  endpoint, engine incompatibility, and zero capacity all make a worker
+  ineligible without removing it from the roster.
+- Compare `directory_age_ms`, `snapshot_age_ms`, and `last_ack_age_ms` with
+  `publish_interval_secs` and `snapshot_ttl_secs`. The snapshot lifetime must
+  cover at least two publish intervals. Persistent age growth usually means
+  transport reachability or the worker maintenance thread is failing.
+- A dead node remains in the admin roster after `dead_peer_gc_secs` removes it
+  from routing membership. That retained tombstone is expected; restart the
+  same enrolled identity or remove it through a future explicit roster action.
+- When `deployment_digest_mismatch` is true in file-managed mode, compare the
+  normalized `proxy.model_host` deployment revision on every node. The cluster
+  reports drift; it never overwrites a local file.
+- For unplaced replicas, inspect each deployment's `rejections`. Fix missing
+  labels/endpoints, incompatible variants or engines, insufficient memory, or
+  manual-pull cache misses. A replicated homogeneous deployment must pin a
+  variant unless `heterogeneous_variants: true` is explicit.
+- During rolling replacement, `retained` is expected until all targets report
+  exact generation, variant, artifact digest, and ready state. `timed_out: true`
+  means `handoff_timeout_ms` elapsed; inspect the target workers before retrying.
+- If a generation changes unexpectedly after restart, inspect
+  `state_dir/model-deployment-generations.json` and directory permissions. Do
+  not delete or copy this file between nodes; it is the local controller's
+  monotonic high-water record.
+- In cluster-authority mode, verify `deployment_authority.configured`, key ID,
+  active revision, signer node, and cursor state. `invalid_bundle`,
+  `stale_revision`, `revision_conflict`, and
+  `deployment_authority_read_only` are stable admin error codes. Never copy the
+  private signing key to a worker to bypass a read-only error.
+
+A partition may temporarily overprovision because each side places only on its
+reachable directory. That is an availability tradeoff. It must not produce a
+cross-partition eligible route. Remote request dispatch is not part of this PR;
+the private model endpoint becomes active only with the distributed data plane.
 
 ## An example docker compose stack will not start
 

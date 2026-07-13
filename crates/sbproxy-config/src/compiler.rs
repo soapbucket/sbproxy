@@ -1042,6 +1042,18 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    if let Some(cluster) = crate::cluster::resolve_effective_cluster(&config_file.proxy)
+        .context("config compile: proxy cluster")?
+    {
+        for diagnostic in cluster.diagnostics {
+            tracing::warn!(
+                code = diagnostic.code,
+                message = %diagnostic.message,
+                "cluster configuration migration"
+            );
+        }
+    }
+
     // Lower `proxy.credentials` + `tenant.credentials` + per-origin
     // `credentials:` of type `ai_provider` into the existing
     // `action.virtual_keys` array on each origin's AI handler config

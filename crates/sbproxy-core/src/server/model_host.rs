@@ -18,11 +18,12 @@
 //! `serve:` provider fails admission with a clear residency error
 //! rather than pretending to serve.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
+use anyhow::Context;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use sbproxy_ai::local_host::pick_local_model_name;
@@ -42,6 +43,8 @@ use sbproxy_model_host::{
 pub struct ProductionModelRuntime {
     active: ArcSwap<sbproxy_model_host::ModelRuntimeManager>,
     foundation: RwLock<Option<RuntimeFoundation>>,
+    snapshot_preparer: RwLock<Option<Arc<sbproxy_model_host::ProductionDeploymentPreparer>>>,
+    cluster_state: RwLock<Option<ClusterRuntimeState>>,
     epoch: AtomicU64,
     commit_lock: tokio::sync::Mutex<()>,
 }
@@ -69,14 +72,23 @@ struct RuntimeFoundation {
     cache_root: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct ClusterRuntimeState {
+    placement: sbproxy_model_host::ClusterPlacementState,
+    catalog: Arc<Catalog>,
+}
+
 /// A complete model-runtime candidate prepared without changing live routes.
 pub struct PreparedModelRuntime {
     owner: Arc<ProductionModelRuntime>,
     manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
+    snapshot_preparer: Option<Arc<sbproxy_model_host::ProductionDeploymentPreparer>>,
     prepared: sbproxy_model_host::PreparedRevision,
     base_epoch: u64,
     foundation: Option<RuntimeFoundation>,
     replace_manager: bool,
+    cluster_state: Option<ClusterRuntimeState>,
+    authority_bundle: Option<sbproxy_model_host::VerifiedDeploymentBundle>,
 }
 
 impl std::fmt::Debug for PreparedModelRuntime {
@@ -87,6 +99,9 @@ impl std::fmt::Debug for PreparedModelRuntime {
             .field("base_epoch", &self.base_epoch)
             .field("foundation", &self.foundation)
             .field("replace_manager", &self.replace_manager)
+            .field("cluster_model_control", &self.cluster_state.is_some())
+            .field("authority_bundle", &self.authority_bundle.is_some())
+            .field("has_snapshot_preparer", &self.snapshot_preparer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -150,11 +165,27 @@ impl sbproxy_model_host::DeploymentPreparer for EmptyDeploymentPreparer {
 
 static MODEL_RUNTIME: OnceLock<Arc<ProductionModelRuntime>> = OnceLock::new();
 
+fn empty_runtime_manager(
+    catalog_revision: String,
+) -> Result<Arc<sbproxy_model_host::ModelRuntimeManager>, sbproxy_model_host::RuntimeManagerError> {
+    Ok(Arc::new(
+        sbproxy_model_host::ModelRuntimeManager::new(
+            catalog_revision,
+            Arc::new(EmptyDeploymentPreparer),
+        )?
+        .with_observer(Arc::new(MetricsObserver)),
+    ))
+}
+
 fn load_catalog_from_dir(
     config: &ModelHostConfig,
     config_dir: &Path,
 ) -> Result<Arc<Catalog>, String> {
-    let Some(configured) = config.catalog_file.as_deref() else {
+    load_catalog_path(config.catalog_file.as_deref(), config_dir)
+}
+
+fn load_catalog_path(configured: Option<&str>, config_dir: &Path) -> Result<Arc<Catalog>, String> {
+    let Some(configured) = configured else {
         return Ok(Arc::new(Catalog::builtin()));
     };
     let configured = PathBuf::from(configured);
@@ -316,14 +347,12 @@ fn build_model_maintenance_runtime() -> std::io::Result<tokio::runtime::Runtime>
 impl ProductionModelRuntime {
     fn empty() -> Result<Self, sbproxy_model_host::RuntimeManagerError> {
         let catalog = Catalog::builtin();
-        let manager = sbproxy_model_host::ModelRuntimeManager::new(
-            catalog.catalog_revision,
-            Arc::new(EmptyDeploymentPreparer),
-        )?
-        .with_observer(Arc::new(MetricsObserver));
+        let manager = empty_runtime_manager(catalog.catalog_revision)?;
         Ok(Self {
-            active: ArcSwap::from_pointee(manager),
+            active: ArcSwap::from(manager),
             foundation: RwLock::new(None),
+            snapshot_preparer: RwLock::new(None),
+            cluster_state: RwLock::new(None),
             epoch: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
         })
@@ -347,6 +376,9 @@ impl ProductionModelRuntime {
                 };
                 executor.block_on(async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                    // Let initial cluster and model-runtime reconciliation commit before
+                    // publishing the first worker snapshot.
+                    interval.tick().await;
                     loop {
                         interval.tick().await;
                         let Some(runtime) = weak.upgrade() else {
@@ -358,6 +390,24 @@ impl ProductionModelRuntime {
                             .await;
                         for deployment in stopped {
                             tracing::info!(%deployment, "managed model keep-alive elapsed");
+                        }
+                        if let Err(error) = publish_cluster_node_snapshot(&runtime).await {
+                            tracing::warn!(%error, "publish cluster node model snapshot");
+                        }
+                        match crate::cluster::collect_process_model_directory(false).await {
+                            Ok(Some(view)) => {
+                                if let Err(error) = runtime.reconcile_cluster_directory(view).await
+                                {
+                                    tracing::warn!(%error, "reconcile cluster model placement");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "collect live cluster model directory");
+                            }
+                        }
+                        if let Err(error) = refresh_cluster_deployment_bundle(&runtime).await {
+                            tracing::warn!(%error, "refresh signed cluster deployment bundle");
                         }
                     }
                 });
@@ -377,9 +427,383 @@ impl ProductionModelRuntime {
         self.active_manager().current_desired()
     }
 
+    /// Current committed fleet placement status, when canonical cluster control is active.
+    pub fn cluster_placement_state(&self) -> Option<sbproxy_model_host::ClusterPlacementState> {
+        self.cluster_state
+            .read()
+            .expect("cluster model state lock")
+            .as_ref()
+            .map(|state| state.placement.clone())
+    }
+
+    /// Recompute and atomically reconcile assignments from one directory publication.
+    pub async fn reconcile_cluster_directory(
+        &self,
+        view: Arc<sbproxy_ai::model_directory::ModelDirectoryView>,
+    ) -> anyhow::Result<bool> {
+        let Some(context) = crate::cluster_models::current_cluster_model_context() else {
+            return Ok(false);
+        };
+        let input = crate::cluster_models::placement_input_from_directory(&view)?;
+        self.reconcile_cluster_input(context, input, current_unix_time_ms()?)
+            .await
+    }
+
+    async fn reconcile_cluster_input(
+        &self,
+        context: crate::cluster_models::ClusterModelContext,
+        input: crate::cluster_models::DirectoryPlacementInput,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.commit_lock.lock().await;
+        let Some(current_cluster) = self
+            .cluster_state
+            .read()
+            .expect("cluster model state lock")
+            .clone()
+        else {
+            return Ok(false);
+        };
+        let next_placement = sbproxy_model_host::reconcile_cluster_placement(
+            &current_cluster.catalog,
+            Some(&current_cluster.placement),
+            current_cluster.placement.global().clone(),
+            input.nodes,
+            &input.observations,
+            &input.generation_fences,
+            now_unix_ms,
+        )?;
+        crate::cluster_models::persist_deployment_generations(&next_placement)
+            .context("persist cluster deployment generations before placement commit")?;
+        let local_desired = next_placement.local_desired(&context.node_id)?;
+        let manager = self.active_manager();
+        if local_desired == *manager.current_desired() {
+            *self
+                .cluster_state
+                .write()
+                .expect("cluster model state lock") = Some(ClusterRuntimeState {
+                placement: next_placement,
+                catalog: current_cluster.catalog,
+            });
+            return Ok(false);
+        }
+
+        let current_epoch = self.epoch.load(Ordering::SeqCst);
+        let next_epoch = current_epoch
+            .checked_add(1)
+            .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
+        let prepared = manager.prepare_revision(local_desired).await?;
+        manager.commit_revision(prepared).await?;
+        *self
+            .cluster_state
+            .write()
+            .expect("cluster model state lock") = Some(ClusterRuntimeState {
+            placement: next_placement,
+            catalog: current_cluster.catalog,
+        });
+        self.epoch.store(next_epoch, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    /// Verify and atomically apply one newer signed authority bundle.
+    pub async fn apply_cluster_authority_bundle(
+        &self,
+        verified: &sbproxy_model_host::VerifiedDeploymentBundle,
+    ) -> anyhow::Result<bool> {
+        let Some(context) = crate::cluster_models::current_cluster_model_context() else {
+            anyhow::bail!("signed cluster deployment bundle requires canonical cluster mode");
+        };
+        let _guard = self.commit_lock.lock().await;
+        let Some(current_cluster) = self
+            .cluster_state
+            .read()
+            .expect("cluster model state lock")
+            .clone()
+        else {
+            anyhow::bail!("cluster model controller is not initialized");
+        };
+        if current_cluster.placement.global().control.authority
+            != sbproxy_config::ModelHostAuthority::ClusterAuthority
+        {
+            anyhow::bail!("model host is not configured for cluster_authority");
+        }
+        if verified.bundle().catalog_revision != current_cluster.catalog.catalog_revision {
+            anyhow::bail!(
+                "signed deployment catalog revision {:?} differs from active {:?}",
+                verified.bundle().catalog_revision,
+                current_cluster.catalog.catalog_revision
+            );
+        }
+        let global = desired_from_verified_bundle(current_cluster.placement.global(), verified)?;
+        let view = crate::cluster::current_model_directory()
+            .map(|directory| directory.load())
+            .unwrap_or_else(
+                || Arc::new(sbproxy_ai::model_directory::ModelDirectoryView::default()),
+            );
+        let input = crate::cluster_models::placement_input_from_directory(&view)?;
+        let next_placement = sbproxy_model_host::reconcile_cluster_placement(
+            &current_cluster.catalog,
+            Some(&current_cluster.placement),
+            global,
+            input.nodes,
+            &input.observations,
+            &input.generation_fences,
+            current_unix_time_ms()?,
+        )?;
+        crate::cluster_models::persist_deployment_generations(&next_placement)
+            .context("persist cluster deployment generations before authority commit")?;
+        let local_desired = next_placement.local_desired(&context.node_id)?;
+        let current_epoch = self.epoch.load(Ordering::SeqCst);
+        let next_epoch = current_epoch
+            .checked_add(1)
+            .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
+        let manager = self.active_manager();
+        let runtime_changed = local_desired != *manager.current_desired();
+        let authority = crate::cluster::current_deployment_authority()
+            .ok_or_else(|| anyhow::anyhow!("cluster deployment authority is not installed"))?;
+        authority
+            .persist(verified)
+            .context("persist cluster deployment authority cursor before runtime commit")?;
+        if runtime_changed {
+            let prepared = manager.prepare_revision(local_desired).await?;
+            manager.commit_revision(prepared).await?;
+        }
+        *self
+            .cluster_state
+            .write()
+            .expect("cluster model state lock") = Some(ClusterRuntimeState {
+            placement: next_placement,
+            catalog: current_cluster.catalog,
+        });
+        authority.activate(verified.clone());
+        self.epoch.store(next_epoch, Ordering::SeqCst);
+        Ok(runtime_changed)
+    }
+
     /// Snapshot every configured deployment in deterministic ID order.
     pub async fn statuses(&self) -> Vec<sbproxy_model_host::DeploymentRuntimeStatus> {
         self.active_manager().statuses().await
+    }
+
+    /// Build one bounded, path-free cluster snapshot from current runtime truth.
+    pub async fn node_model_snapshot(
+        &self,
+        identity: &sbproxy_mesh::ClusterIdentity,
+        generation: u64,
+        published_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> Result<
+        sbproxy_model_host::node_snapshot::NodeModelSnapshot,
+        sbproxy_model_host::node_snapshot::NodeSnapshotError,
+    > {
+        use sbproxy_model_host::node_snapshot::{
+            NodeArtifactSnapshot, NodeArtifactState, NodeHealthSnapshot, NodeHealthState,
+            NodeIdentitySnapshot, NodeModelSnapshot, NodeReplicaSnapshot, NodeSnapshotError,
+            NodeSnapshotInventory, RuntimeReplicaIdentity, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        };
+        use sbproxy_model_host::{DeploymentRuntimeState, EngineAvailability};
+        use sha2::{Digest as _, Sha256};
+
+        let is_worker = identity
+            .roles
+            .contains(&sbproxy_mesh::ClusterNodeRole::Worker);
+        let snapshot_preparer = self
+            .snapshot_preparer
+            .read()
+            .expect("model runtime snapshot-preparer lock")
+            .clone();
+        let (mut inventory, inventory_available) = if is_worker {
+            match snapshot_preparer {
+                Some(preparer) => match preparer.node_snapshot_inventory() {
+                    Ok(inventory) => (inventory, true),
+                    Err(error) => {
+                        tracing::warn!(%error, "build cluster model inventory");
+                        (NodeSnapshotInventory::default(), false)
+                    }
+                },
+                None => (NodeSnapshotInventory::default(), false),
+            }
+        } else {
+            (NodeSnapshotInventory::default(), true)
+        };
+        let desired = self.current_desired();
+        let cluster_state = self
+            .cluster_state
+            .read()
+            .expect("cluster model state lock")
+            .clone();
+        let cluster_assignments = cluster_state
+            .as_ref()
+            .map(|state| state.placement.local_assignments(&identity.node_id))
+            .unwrap_or_default();
+        let statuses = self.statuses().await;
+        let mut health_reasons = BTreeSet::new();
+        let mut unhealthy = false;
+        if is_worker && !inventory_available {
+            health_reasons.insert("model_inventory_unavailable".to_string());
+            unhealthy = true;
+        }
+
+        if is_worker {
+            if !inventory
+                .devices
+                .iter()
+                .any(|device| device.accelerator.is_some())
+            {
+                health_reasons.insert("no_compatible_model_device".to_string());
+                unhealthy = true;
+            }
+            if !inventory.engines.iter().any(|engine| {
+                matches!(
+                    engine.availability,
+                    EngineAvailability::Available | EngineAvailability::Acquirable
+                )
+            }) {
+                health_reasons.insert("no_usable_model_engine".to_string());
+                unhealthy = true;
+            }
+            if identity.model_endpoint.is_none() {
+                health_reasons.insert("model_endpoint_missing".to_string());
+                unhealthy = true;
+            }
+        }
+
+        let failed_count = statuses
+            .iter()
+            .filter(|status| status.state == DeploymentRuntimeState::Failed)
+            .count();
+        for status in statuses
+            .iter()
+            .filter(|status| status.state == DeploymentRuntimeState::Failed)
+        {
+            health_reasons.insert(
+                status
+                    .reason_code
+                    .clone()
+                    .unwrap_or_else(|| "deployment_failed".to_string()),
+            );
+        }
+        if !statuses.is_empty() && failed_count == statuses.len() {
+            unhealthy = true;
+        }
+
+        let mut replicas = Vec::with_capacity(statuses.len());
+        for status in &statuses {
+            let Some(compiled) = desired.deployments.get(&status.deployment) else {
+                tracing::warn!(
+                    deployment = %status.deployment,
+                    "runtime status has no current desired deployment"
+                );
+                health_reasons.insert("runtime_desired_mismatch".to_string());
+                unhealthy = true;
+                continue;
+            };
+            let matching_artifact = status.artifact_digest.as_deref().and_then(|digest| {
+                inventory
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.artifact_digest == digest)
+            });
+            let artifact_was_in_inventory = matching_artifact.is_some();
+            let variant = matching_artifact
+                .map(|artifact| artifact.variant.clone())
+                .or_else(|| compiled.desired.variant.clone());
+            if let Some(digest) = status.artifact_digest.as_deref() {
+                if !artifact_was_in_inventory {
+                    inventory.artifacts.push(NodeArtifactSnapshot {
+                        artifact_digest: digest.to_string(),
+                        model: compiled.desired.model.clone(),
+                        variant: variant.clone().unwrap_or_else(|| "unresolved".to_string()),
+                        state: NodeArtifactState::Missing,
+                        completed_bytes: 0,
+                        total_bytes: None,
+                        last_accessed_unix_ms: None,
+                        reason_code: None,
+                    });
+                    health_reasons.insert("artifact_inventory_missing".to_string());
+                }
+            }
+            let mut adapters = compiled
+                .legacy_entry
+                .as_ref()
+                .map(|entry| {
+                    entry
+                        .lora_adapters
+                        .iter()
+                        .map(|adapter| adapter.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            adapters.sort();
+            let deployment_generation = cluster_assignments
+                .get(&status.deployment)
+                .map_or(status.generation, |assignment| {
+                    assignment.deployment_generation
+                });
+            replicas.push(NodeReplicaSnapshot::from_runtime_at_generation(
+                status,
+                deployment_generation,
+                RuntimeReplicaIdentity {
+                    model: &compiled.desired.model,
+                    variant: variant.as_deref(),
+                    endpoint: identity.model_endpoint.as_deref(),
+                    adapters: &adapters,
+                },
+            )?);
+        }
+        inventory
+            .artifacts
+            .sort_by(|left, right| left.artifact_digest.cmp(&right.artifact_digest));
+        replicas.sort_by(|left, right| left.deployment.cmp(&right.deployment));
+
+        let health_state = if unhealthy {
+            NodeHealthState::Unhealthy
+        } else if !health_reasons.is_empty() {
+            NodeHealthState::Degraded
+        } else {
+            NodeHealthState::Ready
+        };
+        let placement_weight = if is_worker && health_state != NodeHealthState::Unhealthy {
+            let available_mib = inventory.devices.iter().fold(0u64, |total, device| {
+                total.saturating_add(device.available_memory_bytes / (1024 * 1024))
+            });
+            u32::try_from(available_mib.clamp(1, u64::from(u32::MAX)))
+                .unwrap_or(u32::MAX)
+                .min(1_000_000)
+        } else {
+            0
+        };
+        let active_revision = cluster_state.as_ref().map_or(&desired.revision, |state| {
+            &state.placement.global().revision
+        });
+        let digest_material = serde_json::to_vec(active_revision).map_err(|error| {
+            NodeSnapshotError::Invalid(format!("encode active deployment digest: {error}"))
+        })?;
+        let active_deployment_digest = hex::encode(Sha256::digest(digest_material));
+        let snapshot = NodeModelSnapshot {
+            schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+            node: NodeIdentitySnapshot {
+                node_id: identity.node_id.clone(),
+                roles: identity.roles.iter().copied().map(snapshot_role).collect(),
+                labels: identity.labels.clone(),
+                model_endpoint: identity.model_endpoint.clone(),
+            },
+            health: NodeHealthSnapshot {
+                state: health_state,
+                reason_codes: health_reasons.into_iter().collect(),
+            },
+            engines: inventory.engines,
+            devices: inventory.devices,
+            artifacts: inventory.artifacts,
+            replicas,
+            placement_weight,
+            active_deployment_digest: Some(active_deployment_digest),
+            generation,
+            published_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 
     /// Snapshot one configured deployment.
@@ -471,40 +895,101 @@ impl ProductionModelRuntime {
 
     async fn prepare_candidate(
         self: &Arc<Self>,
-        candidate: RuntimeCandidate,
+        mut candidate: RuntimeCandidate,
     ) -> anyhow::Result<PreparedModelRuntime> {
         let base_epoch = self.epoch.load(Ordering::SeqCst);
+        let cluster_context = crate::cluster_models::current_cluster_model_context();
+        let mut proposed_cluster_state = None;
+        let mut cluster_worker = false;
+        if let Some(context) = cluster_context {
+            let view = crate::cluster::current_model_directory()
+                .map(|directory| directory.load())
+                .unwrap_or_else(|| {
+                    Arc::new(sbproxy_ai::model_directory::ModelDirectoryView::default())
+                });
+            let input = crate::cluster_models::placement_input_from_directory(&view)?;
+            let previous = self
+                .cluster_state
+                .read()
+                .expect("cluster model state lock")
+                .clone();
+            let now_unix_ms = current_unix_time_ms()?;
+            let placement = sbproxy_model_host::reconcile_cluster_placement(
+                &candidate.catalog,
+                previous.as_ref().map(|state| &state.placement),
+                candidate.desired.clone(),
+                input.nodes,
+                &input.observations,
+                &input.generation_fences,
+                now_unix_ms,
+            )?;
+            candidate.desired = placement.local_desired(&context.node_id)?;
+            cluster_worker = context.is_worker;
+            proposed_cluster_state = Some(ClusterRuntimeState {
+                placement,
+                catalog: Arc::clone(&candidate.catalog),
+            });
+        }
         let current_foundation = self
             .foundation
             .read()
             .expect("model runtime foundation lock")
             .clone();
+        let current_snapshot_preparer = self
+            .snapshot_preparer
+            .read()
+            .expect("model runtime snapshot-preparer lock")
+            .clone();
         let active_manager = self.active_manager();
 
         let needs_production_manager = !candidate.desired.deployments.is_empty()
+            || (cluster_worker
+                && proposed_cluster_state
+                    .as_ref()
+                    .is_some_and(|state| !state.placement.global().deployments.is_empty()))
             || candidate.desired.control.authority
-                == sbproxy_config::ModelHostAuthority::AdminManaged;
-        let (manager, foundation) = if !needs_production_manager {
-            (active_manager.clone(), current_foundation)
+                != sbproxy_config::ModelHostAuthority::FileManaged;
+        let active_catalog_matches = active_manager.current_desired().revision.catalog_revision
+            == candidate.desired.revision.catalog_revision;
+        let (manager, foundation, snapshot_preparer) = if !needs_production_manager
+            && !active_catalog_matches
+        {
+            (
+                empty_runtime_manager(candidate.desired.revision.catalog_revision.clone())?,
+                None,
+                None,
+            )
+        } else if !needs_production_manager {
+            (
+                active_manager.clone(),
+                current_foundation,
+                current_snapshot_preparer,
+            )
         } else {
             let foundation = RuntimeFoundation {
                 catalog_revision: candidate.catalog.catalog_revision.clone(),
                 cache_root: candidate.cache_root.clone(),
             };
             if current_foundation.as_ref() == Some(&foundation) {
-                (active_manager.clone(), Some(foundation))
+                (
+                    active_manager.clone(),
+                    Some(foundation),
+                    current_snapshot_preparer,
+                )
             } else {
                 if !active_manager.current_desired().deployments.is_empty() {
                     anyhow::bail!(
                         "model runtime catalog or cache foundation changed while deployments are configured; reload an empty model_host revision first so the prior engines drain before replacing the foundation"
                     );
                 }
+                let built = build_production_manager(
+                    candidate.catalog.clone(),
+                    candidate.cache_root.clone(),
+                )?;
                 (
-                    build_production_manager(
-                        candidate.catalog.clone(),
-                        candidate.cache_root.clone(),
-                    )?,
+                    built.manager,
                     Some(foundation),
+                    Some(built.snapshot_preparer),
                 )
             }
         };
@@ -513,10 +998,13 @@ impl ProductionModelRuntime {
         Ok(PreparedModelRuntime {
             owner: Arc::clone(self),
             manager,
+            snapshot_preparer,
             prepared,
             base_epoch,
             foundation,
             replace_manager,
+            cluster_state: proposed_cluster_state,
+            authority_bundle: candidate.authority_bundle,
         })
     }
 
@@ -536,6 +1024,30 @@ impl ProductionModelRuntime {
         let next_epoch = current_epoch
             .checked_add(1)
             .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
+        if let Some(cluster) = candidate.cluster_state.as_ref() {
+            crate::cluster_models::persist_deployment_generations(&cluster.placement).map_err(
+                |error| {
+                    sbproxy_model_host::RuntimeManagerError::Prepare(format!(
+                        "persist cluster deployment generations before runtime commit: {error}"
+                    ))
+                },
+            )?;
+        }
+        let authority_activation = if let Some(verified) = candidate.authority_bundle.as_ref() {
+            let authority = crate::cluster::current_deployment_authority().ok_or_else(|| {
+                sbproxy_model_host::RuntimeManagerError::Prepare(
+                    "cluster deployment authority is not installed".to_string(),
+                )
+            })?;
+            authority.persist(verified).map_err(|error| {
+                sbproxy_model_host::RuntimeManagerError::Prepare(format!(
+                    "persist cluster deployment authority cursor before runtime commit: {error}"
+                ))
+            })?;
+            Some((authority, verified.clone()))
+        } else {
+            None
+        };
         let report = candidate
             .manager
             .commit_revision(candidate.prepared)
@@ -544,18 +1056,136 @@ impl ProductionModelRuntime {
             self.active.store(candidate.manager);
         }
         *self
+            .snapshot_preparer
+            .write()
+            .expect("model runtime snapshot-preparer lock") = candidate.snapshot_preparer;
+        *self
             .foundation
             .write()
             .expect("model runtime foundation lock") = candidate.foundation;
+        *self
+            .cluster_state
+            .write()
+            .expect("cluster model state lock") = candidate.cluster_state;
+        if let Some((authority, verified)) = authority_activation {
+            authority.activate(verified);
+        }
         self.epoch.store(next_epoch, Ordering::SeqCst);
         Ok(report)
     }
+}
+
+fn current_unix_time_ms() -> anyhow::Result<u64> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| anyhow::anyhow!("system time before Unix epoch: {error}"))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| anyhow::anyhow!("Unix time milliseconds overflowed"))
+}
+
+fn desired_from_verified_bundle(
+    current: &sbproxy_model_host::RuntimeDesiredState,
+    verified: &sbproxy_model_host::VerifiedDeploymentBundle,
+) -> anyhow::Result<sbproxy_model_host::RuntimeDesiredState> {
+    if current.legacy_host_policy.is_some() {
+        anyhow::bail!("cluster_authority cannot replace legacy serve desired state");
+    }
+    let revision = verified.revision_draft();
+    let deployments = revision
+        .deployments
+        .iter()
+        .map(|(id, deployment)| {
+            (
+                id.clone(),
+                sbproxy_model_host::CompiledDeployment {
+                    desired: deployment.clone(),
+                    origin: sbproxy_model_host::DesiredDeploymentOrigin::Canonical,
+                    legacy_entry: None,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for route in &current.routes {
+        if !deployments.contains_key(&route.deployment) {
+            anyhow::bail!(
+                "signed deployment bundle omits routed deployment {:?}",
+                route.deployment
+            );
+        }
+    }
+    let mut control = current.control.clone();
+    control.deployments = revision
+        .deployments
+        .iter()
+        .map(|(id, deployment)| {
+            managed_deployment_from_model(deployment.clone())
+                .map(|deployment| (id.clone(), deployment))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(sbproxy_model_host::RuntimeDesiredState {
+        revision,
+        deployments,
+        routes: current.routes.clone(),
+        control,
+        legacy_host_policy: None,
+    })
+}
+
+async fn refresh_cluster_deployment_bundle(runtime: &ProductionModelRuntime) -> anyhow::Result<()> {
+    let Some(state) = runtime.cluster_placement_state() else {
+        return Ok(());
+    };
+    if state.global().control.authority != sbproxy_config::ModelHostAuthority::ClusterAuthority {
+        return Ok(());
+    }
+    let authority = crate::cluster::current_deployment_authority()
+        .ok_or_else(|| anyhow::anyhow!("cluster deployment authority is not installed"))?;
+    if let Some(verified) = authority.read_candidate().await? {
+        runtime.apply_cluster_authority_bundle(&verified).await?;
+    }
+    authority
+        .republish_active_if_due(std::time::Duration::from_secs(24 * 60 * 60))
+        .await?;
+    Ok(())
+}
+
+async fn publish_cluster_node_snapshot(runtime: &ProductionModelRuntime) -> anyhow::Result<()> {
+    let Some(publication) = crate::cluster::begin_process_node_snapshot_publication(false).await?
+    else {
+        return Ok(());
+    };
+    let snapshot = runtime
+        .node_model_snapshot(
+            publication.identity(),
+            publication.generation(),
+            publication.published_at_unix_ms(),
+            publication.expires_at_unix_ms(),
+        )
+        .await?;
+    publication.publish(snapshot).await
 }
 
 struct RuntimeCandidate {
     desired: sbproxy_model_host::RuntimeDesiredState,
     catalog: Arc<Catalog>,
     cache_root: PathBuf,
+    authority_bundle: Option<sbproxy_model_host::VerifiedDeploymentBundle>,
+}
+
+const fn snapshot_role(
+    role: sbproxy_mesh::ClusterNodeRole,
+) -> sbproxy_model_host::node_snapshot::NodeRole {
+    match role {
+        sbproxy_mesh::ClusterNodeRole::Gateway => {
+            sbproxy_model_host::node_snapshot::NodeRole::Gateway
+        }
+        sbproxy_mesh::ClusterNodeRole::Worker => {
+            sbproxy_model_host::node_snapshot::NodeRole::Worker
+        }
+        sbproxy_mesh::ClusterNodeRole::Authority => {
+            sbproxy_model_host::node_snapshot::NodeRole::Authority
+        }
+    }
 }
 
 fn compile_runtime_candidate(
@@ -594,16 +1224,71 @@ fn compile_runtime_candidate(
         }
     }
 
-    let catalog = match legacy_providers.first() {
-        Some(legacy) => {
+    let catalog = match pipeline
+        .config
+        .server
+        .model_host
+        .as_ref()
+        .and_then(|control| control.catalog_file.as_deref())
+    {
+        Some(catalog_file) => {
+            load_catalog_path(Some(catalog_file), config_dir).map_err(anyhow::Error::msg)?
+        }
+        None if !legacy_providers.is_empty() => {
+            let legacy = &legacy_providers[0];
             load_catalog_from_dir(&legacy.config, config_dir).map_err(anyhow::Error::msg)?
         }
         None => Arc::new(Catalog::builtin()),
     };
+    let mut canonical = pipeline.config.server.model_host.clone();
+    let mut authority_bundle = None;
+    if canonical.as_ref().is_some_and(|control| {
+        control.authority == sbproxy_config::ModelHostAuthority::ClusterAuthority
+    }) {
+        let authority = crate::cluster::current_deployment_authority().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cluster_authority model host requires proxy.cluster.deployment_authority"
+            )
+        })?;
+        let verified = authority
+            .read_candidate_blocking()
+            .map_err(anyhow::Error::from)?
+            .or_else(|| authority.active());
+        let control = canonical
+            .as_mut()
+            .expect("cluster authority control exists");
+        control.deployments.clear();
+        if let Some(verified) = verified {
+            if verified.bundle().catalog_revision != catalog.catalog_revision {
+                anyhow::bail!(
+                    "signed deployment catalog revision {:?} differs from active {:?}",
+                    verified.bundle().catalog_revision,
+                    catalog.catalog_revision
+                );
+            }
+            control.deployments = verified
+                .bundle()
+                .deployments()
+                .into_iter()
+                .map(|(id, deployment)| {
+                    managed_deployment_from_model(deployment).map(|deployment| (id, deployment))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            authority_bundle = Some(verified);
+        } else if !managed_providers.is_empty() {
+            anyhow::bail!(
+                "cluster_authority model providers require an active signed deployment bundle"
+            );
+        }
+    }
+    let desired_source_revision = authority_bundle.as_ref().map_or_else(
+        || pipeline.config_revision.clone(),
+        |verified| verified.revision_draft().source_revision,
+    );
     let desired = sbproxy_model_host::compile_desired_state(
         sbproxy_model_host::RuntimeDesiredInput {
-            source_revision: pipeline.config_revision.clone(),
-            canonical: pipeline.config.server.model_host.clone(),
+            source_revision: desired_source_revision,
+            canonical,
             managed_providers,
             legacy_providers,
         },
@@ -620,6 +1305,47 @@ fn compile_runtime_candidate(
         desired,
         catalog,
         cache_root,
+        authority_bundle,
+    })
+}
+
+fn managed_deployment_from_model(
+    deployment: sbproxy_model_host::ModelDeployment,
+) -> anyhow::Result<sbproxy_config::ManagedDeploymentConfig> {
+    let engine = match deployment.engine {
+        sbproxy_model_host::EngineChoice::Auto => sbproxy_config::ManagedEngineChoice::Auto,
+        sbproxy_model_host::EngineChoice::Vllm => sbproxy_config::ManagedEngineChoice::Vllm,
+        sbproxy_model_host::EngineChoice::LlamaCpp => sbproxy_config::ManagedEngineChoice::LlamaCpp,
+        sbproxy_model_host::EngineChoice::Embedded => {
+            anyhow::bail!("signed cluster deployments do not support the embedded engine")
+        }
+    };
+    Ok(sbproxy_config::ManagedDeploymentConfig {
+        model: deployment.model,
+        variant: deployment.variant,
+        heterogeneous_variants: deployment.heterogeneous_variants,
+        replicas: deployment.replicas,
+        required_labels: deployment.required_labels,
+        spread_by: deployment.spread_by,
+        pull: match deployment.pull {
+            sbproxy_model_host::PullPolicy::OnBoot => sbproxy_config::ManagedPullPolicy::OnBoot,
+            sbproxy_model_host::PullPolicy::OnDemand => sbproxy_config::ManagedPullPolicy::OnDemand,
+            sbproxy_model_host::PullPolicy::Manual => sbproxy_config::ManagedPullPolicy::Manual,
+        },
+        warm: deployment.warm,
+        keep_alive_secs: deployment.keep_alive_secs,
+        max_concurrency: deployment.max_concurrency,
+        max_queue_depth: deployment.max_queue_depth,
+        queue_timeout_ms: deployment.queue_timeout_ms,
+        engine,
+        rollout: match deployment.rollout {
+            sbproxy_model_host::RolloutPolicy::Rolling => {
+                sbproxy_config::ManagedRolloutPolicy::Rolling
+            }
+            sbproxy_model_host::RolloutPolicy::Recreate => {
+                sbproxy_config::ManagedRolloutPolicy::Recreate
+            }
+        },
     })
 }
 
@@ -628,13 +1354,31 @@ pub fn validate_model_runtime(
     pipeline: &crate::pipeline::CompiledPipeline,
     config_dir: &Path,
 ) -> anyhow::Result<()> {
-    compile_runtime_candidate(pipeline, config_dir).map(|_| ())
+    let candidate = compile_runtime_candidate(pipeline, config_dir)?;
+    if pipeline.config.server.cluster.is_none() {
+        if let Some((deployment, _)) = candidate
+            .desired
+            .deployments
+            .iter()
+            .find(|(_, deployment)| deployment.desired.replicas != 1)
+        {
+            anyhow::bail!(
+                "single-node runtime requires deployment {deployment:?} to use replicas: 1"
+            );
+        }
+    }
+    Ok(())
+}
+
+struct BuiltProductionManager {
+    manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
+    snapshot_preparer: Arc<sbproxy_model_host::ProductionDeploymentPreparer>,
 }
 
 fn build_production_manager(
     catalog: Arc<Catalog>,
     cache_root: PathBuf,
-) -> anyhow::Result<Arc<sbproxy_model_host::ModelRuntimeManager>> {
+) -> anyhow::Result<BuiltProductionManager> {
     let transport = artifact_transport().map_err(anyhow::Error::msg)?;
     let artifacts = Arc::new(
         ArtifactManager::new(cache_root.clone(), transport)
@@ -664,11 +1408,14 @@ fn build_production_manager(
     ));
     let manager = sbproxy_model_host::ModelRuntimeManager::new_with_device_capacities(
         catalog.catalog_revision.clone(),
-        preparer,
+        preparer.clone(),
         capacities,
     )?
     .with_observer(Arc::new(MetricsObserver));
-    Ok(Arc::new(manager))
+    Ok(BuiltProductionManager {
+        manager: Arc::new(manager),
+        snapshot_preparer: preparer,
+    })
 }
 
 /// Return the permanent process-wide managed-model runtime handle.
@@ -939,6 +1686,143 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Debug, Default)]
+    struct ClusterFixtureProcess;
+
+    #[async_trait::async_trait]
+    impl sbproxy_model_host::EngineProcess for ClusterFixtureProcess {
+        fn id(&self) -> Option<u32> {
+            Some(17)
+        }
+
+        async fn has_exited(&self) -> Result<bool, sbproxy_model_host::EngineDriverError> {
+            Ok(false)
+        }
+
+        async fn shutdown(
+            &self,
+            _grace: std::time::Duration,
+        ) -> Result<(), sbproxy_model_host::EngineDriverError> {
+            Ok(())
+        }
+
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+    }
+
+    struct ClusterFixtureRuntime {
+        deployment: String,
+        generation: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_model_host::PreparedDeploymentRuntime for ClusterFixtureRuntime {
+        async fn memory_estimate(
+            &self,
+            _intent: sbproxy_model_host::PullIntent,
+        ) -> Result<sbproxy_model_host::MemoryEstimate, sbproxy_model_host::RuntimeManagerError>
+        {
+            Ok(sbproxy_model_host::MemoryEstimate::from_total(0, 1))
+        }
+
+        async fn start(
+            &self,
+            _intent: sbproxy_model_host::PullIntent,
+        ) -> Result<sbproxy_model_host::RunningEngine, sbproxy_model_host::RuntimeManagerError>
+        {
+            Ok(sbproxy_model_host::RunningEngine {
+                deployment: self.deployment.clone(),
+                generation: self.generation,
+                kind: sbproxy_model_host::EngineKind::LlamaCpp,
+                port: 20_017,
+                selected_devices: vec![0],
+                accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+                started_at_ms: 1,
+                artifact_digest: "a".repeat(64),
+                memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1),
+                process: Arc::new(ClusterFixtureProcess),
+            })
+        }
+
+        async fn stop(
+            &self,
+            _grace: std::time::Duration,
+        ) -> Result<(), sbproxy_model_host::RuntimeManagerError> {
+            Ok(())
+        }
+
+        async fn reset(
+            &self,
+        ) -> Result<Option<sbproxy_model_host::OperationJob>, sbproxy_model_host::RuntimeManagerError>
+        {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct ClusterFixturePreparer {
+        fail: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_model_host::DeploymentPreparer for ClusterFixturePreparer {
+        async fn prepare(
+            &self,
+            request: sbproxy_model_host::DeploymentPrepareRequest,
+        ) -> Result<
+            Arc<dyn sbproxy_model_host::PreparedDeploymentRuntime>,
+            sbproxy_model_host::RuntimeManagerError,
+        > {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(sbproxy_model_host::RuntimeManagerError::Prepare(
+                    "injected cluster prepare failure".to_string(),
+                ));
+            }
+            Ok(Arc::new(ClusterFixtureRuntime {
+                deployment: request.deployment_id,
+                generation: request.generation,
+            }))
+        }
+    }
+
+    fn cluster_fixture_node() -> sbproxy_model_host::PlacementNode {
+        use sbproxy_model_host::node_snapshot::{
+            NodeDeviceSnapshot, NodeEngineSnapshot, NodeHealthState, NodeRole,
+        };
+
+        sbproxy_model_host::PlacementNode {
+            node_id: "worker-a".to_string(),
+            roles: BTreeSet::from([NodeRole::Worker]),
+            health: NodeHealthState::Ready,
+            labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
+            model_endpoint: Some("https://worker-a.internal:9443".to_string()),
+            placement_weight: 64_000,
+            engines: vec![NodeEngineSnapshot {
+                engine: sbproxy_model_host::EngineKind::LlamaCpp,
+                availability: sbproxy_model_host::EngineAvailability::Available,
+                version: Some("fixture".to_string()),
+                artifact_formats: vec![sbproxy_model_host::ArtifactFormat::Gguf],
+                accelerators: BTreeSet::from([sbproxy_model_host::AcceleratorKind::Cpu]),
+                supports_container: false,
+                supports_uv: false,
+                reason_code: None,
+            }],
+            devices: vec![NodeDeviceSnapshot {
+                index: 0,
+                vendor: sbproxy_model_host::GpuVendor::Cpu,
+                accelerator: Some(sbproxy_model_host::AcceleratorKind::Cpu),
+                name: "host RAM".to_string(),
+                total_memory_bytes: 64_000_000_000,
+                available_memory_bytes: 64_000_000_000,
+                compute_capability: None,
+                supports_fp8: false,
+            }],
+            artifacts: Vec::new(),
+        }
+    }
 
     fn config_with_serve(serve_yaml: Option<&str>) -> AiHandlerConfig {
         let providers = match serve_yaml {
@@ -987,6 +1871,186 @@ mod tests {
         assert_eq!(
             lane_class_for(Some(sbproxy_ai::identity::KeyPriority::Batch)),
             PriorityClass::Batch
+        );
+    }
+
+    #[tokio::test]
+    async fn control_only_empty_manager_accepts_the_global_custom_catalog() {
+        let mut catalog = Catalog::builtin();
+        catalog.catalog_revision = "control-only-catalog-v2".to_string();
+        let desired = sbproxy_model_host::compile_desired_state(
+            sbproxy_model_host::RuntimeDesiredInput {
+                source_revision: "control-only-config".to_string(),
+                canonical: None,
+                managed_providers: Vec::new(),
+                legacy_providers: Vec::new(),
+            },
+            &catalog,
+        )
+        .expect("empty control-only projection");
+        let manager = empty_runtime_manager(catalog.catalog_revision.clone())
+            .expect("catalog-aligned empty manager");
+
+        let prepared = manager
+            .prepare_revision(desired)
+            .await
+            .expect("custom catalog projection prepares");
+        manager
+            .commit_revision(prepared)
+            .await
+            .expect("custom catalog projection commits");
+
+        assert_eq!(
+            manager.current_desired().revision.catalog_revision,
+            "control-only-catalog-v2"
+        );
+        assert!(manager.current_desired().deployments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_snapshot_reports_inventory_failure_as_stable_unhealthy_state() {
+        let runtime = ProductionModelRuntime::empty().expect("empty runtime");
+        let identity = sbproxy_mesh::ClusterIdentity {
+            cluster_id: "cluster-a".to_string(),
+            node_id: "worker-a".to_string(),
+            roles: BTreeSet::from([sbproxy_mesh::ClusterNodeRole::Worker]),
+            labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
+            peer_address: Some("127.0.0.1:7946".to_string()),
+            model_endpoint: Some("https://127.0.0.1:9443".to_string()),
+        };
+
+        let snapshot = runtime
+            .node_model_snapshot(&identity, 3, 1_000, 31_000)
+            .await
+            .expect("bounded unhealthy snapshot");
+
+        assert_eq!(
+            snapshot.health.state,
+            sbproxy_model_host::node_snapshot::NodeHealthState::Unhealthy
+        );
+        assert!(snapshot
+            .health
+            .reason_codes
+            .contains(&"model_inventory_unavailable".to_string()));
+        assert_eq!(snapshot.placement_weight, 0);
+        assert!(snapshot.replicas.is_empty());
+        snapshot.validate().expect("snapshot remains publishable");
+
+        let gateway = sbproxy_mesh::ClusterIdentity {
+            cluster_id: "cluster-a".to_string(),
+            node_id: "gateway-a".to_string(),
+            roles: BTreeSet::from([sbproxy_mesh::ClusterNodeRole::Gateway]),
+            labels: BTreeMap::new(),
+            peer_address: Some("127.0.0.1:7947".to_string()),
+            model_endpoint: None,
+        };
+        let snapshot = runtime
+            .node_model_snapshot(&gateway, 4, 2_000, 32_000)
+            .await
+            .expect("gateway snapshot");
+        assert_eq!(
+            snapshot.health.state,
+            sbproxy_model_host::node_snapshot::NodeHealthState::Ready
+        );
+        assert!(snapshot.health.reason_codes.is_empty());
+        assert_eq!(snapshot.placement_weight, 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_assignment_prepare_failure_preserves_prior_plan_and_runtime() {
+        let catalog = Arc::new(Catalog::builtin());
+        let global = sbproxy_model_host::compile_desired_state(
+            sbproxy_model_host::RuntimeDesiredInput {
+                source_revision: "cluster-fixture-1".to_string(),
+                canonical: Some(
+                    serde_yaml::from_str(
+                        r#"
+deployments:
+  coder:
+    model: qwen2.5-0.5b-instruct
+    variant: q4_k_m
+"#,
+                    )
+                    .expect("model host config"),
+                ),
+                managed_providers: Vec::new(),
+                legacy_providers: Vec::new(),
+            },
+            &catalog,
+        )
+        .expect("global desired");
+        let placement = sbproxy_model_host::reconcile_cluster_placement(
+            &catalog,
+            None,
+            global,
+            Vec::new(),
+            &BTreeMap::new(),
+            &sbproxy_model_host::DeploymentGenerationFences::default(),
+            1_000,
+        )
+        .expect("initial unplaced state");
+        let preparer = Arc::new(ClusterFixturePreparer::default());
+        preparer.fail.store(true, Ordering::SeqCst);
+        let manager = Arc::new(
+            sbproxy_model_host::ModelRuntimeManager::new(
+                catalog.catalog_revision.clone(),
+                preparer.clone(),
+            )
+            .expect("fixture manager"),
+        );
+        let runtime = ProductionModelRuntime {
+            active: ArcSwap::from(manager),
+            foundation: RwLock::new(None),
+            snapshot_preparer: RwLock::new(None),
+            cluster_state: RwLock::new(Some(ClusterRuntimeState { placement, catalog })),
+            epoch: AtomicU64::new(0),
+            commit_lock: tokio::sync::Mutex::new(()),
+        };
+        let context = crate::cluster_models::ClusterModelContext {
+            node_id: "worker-a".to_string(),
+            is_worker: true,
+        };
+        let input = crate::cluster_models::DirectoryPlacementInput {
+            nodes: vec![cluster_fixture_node()],
+            observations: BTreeMap::new(),
+            generation_fences: sbproxy_model_host::DeploymentGenerationFences::default(),
+        };
+
+        let error = runtime
+            .reconcile_cluster_input(context.clone(), input.clone(), 1_100)
+            .await
+            .expect_err("injected prepare must abort the placement commit");
+        assert!(error
+            .to_string()
+            .contains("injected cluster prepare failure"));
+        assert!(runtime.current_desired().deployments.is_empty());
+        assert!(runtime
+            .cluster_placement_state()
+            .expect("prior placement")
+            .deployments()["coder"]
+            .target
+            .assignments
+            .is_empty());
+
+        preparer.fail.store(false, Ordering::SeqCst);
+        assert!(runtime
+            .reconcile_cluster_input(context, input, 1_200)
+            .await
+            .expect("retry succeeds"));
+        assert!(runtime.current_desired().deployments.contains_key("coder"));
+        assert_eq!(
+            runtime.status("coder").await.expect("status").state,
+            sbproxy_model_host::DeploymentRuntimeState::Ready
+        );
+        assert_eq!(
+            runtime
+                .cluster_placement_state()
+                .expect("placement")
+                .deployments()["coder"]
+                .target
+                .assignments[0]
+                .node_id,
+            "worker-a"
         );
     }
 

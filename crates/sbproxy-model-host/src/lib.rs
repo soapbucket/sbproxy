@@ -35,6 +35,8 @@ pub mod artifact;
 pub mod artifact_spec;
 pub mod capabilities;
 pub mod catalog;
+pub mod cluster_authority;
+pub mod cluster_placement;
 pub mod config;
 pub mod cuda_build;
 pub mod deployment;
@@ -45,6 +47,7 @@ pub mod device_residency;
 pub mod embedded;
 pub mod engine_driver;
 pub mod fit;
+pub mod generation_store;
 pub mod hybrid;
 pub mod jobs;
 pub mod kv_tiering;
@@ -53,6 +56,8 @@ pub mod llama_driver;
 pub mod llama_release;
 pub mod lora;
 pub mod manifest;
+pub mod node_snapshot;
+pub mod placement;
 pub mod probe_cpu;
 #[cfg(all(target_os = "macos", feature = "gpu-apple"))]
 pub mod probe_metal;
@@ -62,6 +67,7 @@ pub mod process;
 pub mod pull;
 pub mod report;
 pub mod residency;
+pub mod rollout;
 pub mod runtime;
 pub mod runtime_manager;
 pub mod scheduling;
@@ -99,6 +105,15 @@ pub use catalog::{
     ArtifactResolveError, Catalog, CatalogDiagnostic, CatalogEntry, CatalogError, CatalogLoad,
     ModelRef, PullPolicy, ResolveError,
 };
+pub use cluster_authority::{
+    DeploymentAuthorityError, DeploymentBundleCursor, DeploymentSigningKey, DeploymentVerifyingKey,
+    FileDeploymentBundleCursorStore, RestrictedDeploymentBundle, RestrictedDeploymentBundleDraft,
+    SignedDeploymentBundle, VerifiedDeploymentBundle, RESTRICTED_DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
+};
+pub use cluster_placement::{
+    reconcile_cluster_placement, ClusterDeploymentPlacement, ClusterPlacementError,
+    ClusterPlacementState, DeploymentGenerationFences, PriorDeploymentPlacement,
+};
 pub use config::{
     AcquireSource, ChunkedPrefill, EngineAccel, EngineAcquire, EngineChoice, EngineDoctor,
     EngineEnv, EngineKind, EngineLaunchMethod, EngineProvisioning, EvictionPolicy, KvCacheQuant,
@@ -134,6 +149,7 @@ pub use fit::{
     plan_fit_kv_with_margin_and_concurrency, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
     MemoryEstimate, ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
 };
+pub use generation_store::{DeploymentGenerationStoreError, FileDeploymentGenerationStore};
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
 pub use jobs::{
     FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
@@ -156,6 +172,10 @@ pub use manifest::{
     resolve_cache_dir, resolve_cache_dir_default, validate_serve_against_manifest, SourceScheme,
     SERVICE_CACHE_DIR,
 };
+pub use placement::{
+    plan_placement, PlacementAssignment, PlacementError, PlacementNode, PlacementPlan,
+    PlacementRejectionReason, PlacementRequest,
+};
 pub use probe_cpu::{detect_total_memory_bytes, CpuProbe};
 #[cfg(all(target_os = "macos", feature = "gpu-apple"))]
 pub use probe_metal::MetalGpuProbe;
@@ -168,6 +188,11 @@ pub use process::{
 pub use pull::{pull_plan, PullItem, PullMode};
 pub use report::{ModelValue, ValueReport};
 pub use residency::{Admission, ResidencyManager, Resident};
+pub use rollout::{
+    filter_desired_state_for_assignments, plan_rollout, AssignedModelDeployment,
+    DeploymentGenerationFence, RolloutDecision, RolloutError, RolloutPhase,
+    RolloutReplicaObservation, RolloutRequest, VersionedPlacementAssignment,
+};
 pub use runtime::{
     parse_params, ConfigDirMetadataProvider, DeviceVram, ModelHostObserver, ModelHostRuntime,
     ModelHostStatus, ModelMetadataProvider, ModelStatus, NoopObserver, RuntimeError, VramStatus,

@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-11*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -145,7 +145,9 @@ origin can call the API cross-origin.
 
 Everything below is reachable at `http(s)://<bind>:<port>`. The probe
 routes are unauthenticated; the rest need auth (Basic or a session), and
-mutations need the `admin` role.
+mutations need the `admin` role. The one exception is
+`POST /admin/cluster/enroll`, which authenticates an expiring one-time cluster
+token instead of an existing admin operator.
 
 **Health and readiness (unauthenticated).**
 
@@ -180,6 +182,10 @@ mutations need the `admin` role.
 | POST | `/admin/model-host/drain` | Alias for the bounded drain and stop operation. |
 | POST | `/admin/model-host/evict` | Compatibility alias for the bounded drain and stop operation. |
 | POST | `/admin/model-host/reset` | Clear retained crash-loop state for a configured deployment. |
+| GET | `/admin/cluster/status` | Complete cluster roster, health and unhealthy-node alerts, model eligibility, placement, rollout, digest consistency, and authority state. |
+| GET | `/admin/cluster/deployments` | Locally active verified deployment bundle and signer identity. |
+| POST | `/admin/cluster/deployments` | Authority-only strict deployment draft publication. Non-authority nodes return `deployment_authority_read_only`. |
+| POST | `/admin/cluster/enroll` | Exchange a valid one-time enrollment token and locally generated CSR for installed cluster identity material. |
 | GET | `/admin/cluster/metrics` | Fleet-aggregated metrics (mesh tier; see [observability.md](observability.md)). |
 
 ### Managed model lifecycle
@@ -223,6 +229,41 @@ The current web UI shows model-host health on Overview. Selecting models,
 editing desired deployments, and fleet management land in the later admin UI
 PRs. Until then, `file_managed` desired state changes go through config review
 and the shared reload transaction.
+
+### Cluster health and unhealthy-node callouts
+
+`GET /admin/cluster/status` is the backend contract for the admin cluster
+view. It never removes a failed node merely to make the fleet look healthy.
+The `nodes` array is the complete membership roster; each row includes
+membership state, acknowledgement age, local identity, roles, labels, reported
+health, stable unhealthy reasons, model endpoint, snapshot age and generation,
+engine/device/artifact counts, replicas, model eligibility, and exclusion
+reason.
+
+The separate `unhealthy_nodes` array is intentionally redundant. It gives the
+UI a direct alert feed while the same nodes remain visible in the full table.
+The directory retains bounded dead-node tombstones after SWIM routing GC, so a
+failed node does not disappear merely because it is no longer a routing owner.
+The summary includes total, healthy, degraded, and unhealthy nodes, eligible
+workers and replicas, deployment digest mismatch, rollout count, and unplaced
+replicas. Deployment rows include exact assignments, rejection reasons,
+retained and draining generations, readiness, timeout, and handoff deadline.
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/cluster/status" | jq '{summary,nodes,unhealthy_nodes}'
+
+sbproxy cluster status \
+  --admin-url "${SB_ADMIN_URL}" \
+  --username admin \
+  --format text
+```
+
+The operator-product UI will render this as a cluster summary, a complete node
+table, and prominent unhealthy-node callouts. It will also add model selection
+and persistent deployment mutation. Those UI controls remain later scope; the
+authenticated read contract, signed authority write boundary, and CLI are
+available now.
 
 Config values support environment-variable interpolation (`${ENV_VAR}`)
 and secret backend references (HashiCorp Vault, AWS and GCP Secret

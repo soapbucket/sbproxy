@@ -10,10 +10,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Distributed clustering layer for sbproxy: SWIM gossip, CRDTs, and a consistent-hash distributed cache. Backs the dynamic key plane's clusterwide cache tier and cross-replica counters."
+description = "Shared local or distributed cluster substrate for sbproxy identity, SWIM liveness, typed state, caches, metrics, and managed models."
 
 [dependencies]
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -45,9 +46,14 @@ rustls-pki-types = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 url = { workspace = true }
+fs2 = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
+x509-parser.workspace = true
+ed25519-dalek = "2"
+time = "0.3"
+subtle = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = "3"
-rcgen = { workspace = true }
 sbproxy-storage = { workspace = true, features = ["mock", "redis"] }

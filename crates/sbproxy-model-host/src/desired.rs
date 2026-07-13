@@ -143,6 +143,13 @@ impl RuntimeDesiredState {
             route.origin == origin && route.provider == provider && route.model == model
         })
     }
+
+    /// Stable SHA-256 identity of the complete global desired revision.
+    pub fn revision_digest(&self) -> Result<String, DesiredStateError> {
+        let bytes = serde_json::to_vec(&self.revision)
+            .map_err(|error| DesiredStateError::Invalid(error.to_string()))?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    }
 }
 
 /// Complete-revision validation or normalization failure.
@@ -193,11 +200,6 @@ pub fn compile_desired_state(
     let mut revision_deployments = BTreeMap::new();
     let mut compiled_deployments = BTreeMap::new();
     for (id, deployment) in &control.deployments {
-        if deployment.replicas != 1 {
-            return Err(DesiredStateError::Invalid(format!(
-                "single-node runtime requires deployment {id:?} to use replicas: 1"
-            )));
-        }
         validate_catalog_deployment(id, deployment, catalog)?;
         let desired = lower_canonical_deployment(deployment);
         revision_deployments.insert(id.clone(), desired.clone());
@@ -485,6 +487,7 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
         heterogeneous_variants: config.heterogeneous_variants,
         replicas: config.replicas,
         required_labels: config.required_labels.clone(),
+        spread_by: config.spread_by.clone(),
         pull: match config.pull {
             ManagedPullPolicy::OnBoot => PullPolicy::OnBoot,
             ManagedPullPolicy::OnDemand => PullPolicy::OnDemand,
@@ -531,6 +534,7 @@ fn lower_legacy_deployment(
         heterogeneous_variants: false,
         replicas: 1,
         required_labels: BTreeMap::new(),
+        spread_by: Vec::new(),
         pull,
         warm: pull == PullPolicy::OnBoot,
         keep_alive_secs: entry

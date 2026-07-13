@@ -41,6 +41,7 @@ tokio.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 tempfile = "3"
 base64.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 # Wave 4 G4.10: boilerplate-stripping e2e calls into the production
@@ -125,6 +126,7 @@ axum = { version = "0.7", default-features = false, features = ["http1", "json",
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+sbproxy-mesh.workspace = true
 
 # Rate-limit budget e2e. Lives at the top level so default discovery
 # picks it up without an explicit registration; this entry documents

@@ -196,6 +196,11 @@ pub struct ProxyHarness {
     /// proxy child is reaped, so listings and other workspace files
     /// stay readable for the full life of the proxy.
     _workspace: Option<tempfile::TempDir>,
+    /// Captured child stderr, retained for startup-failure diagnostics while
+    /// successful harnesses remain quiet.
+    _stderr: NamedTempFile,
+    /// Captured child stdout, including the default tracing subscriber output.
+    _stdout: Option<NamedTempFile>,
     /// Lazy-initialised so harness construction does not invoke
     /// `reqwest::blocking::Client::builder().build()` at the call site.
     /// Building the blocking client spins up an internal tokio
@@ -214,7 +219,17 @@ impl ProxyHarness {
     pub fn start_with_yaml(yaml: &str) -> anyhow::Result<Self> {
         let port = pick_free_port()?;
         let final_yaml = inject_port(yaml, port)?;
-        Self::start_with_resolved_yaml(&final_yaml, port)
+        Self::start_with_resolved_yaml(&final_yaml, port, None)
+    }
+
+    /// Start the proxy with a test-specific graceful shutdown budget.
+    pub fn start_with_yaml_and_shutdown_grace(
+        yaml: &str,
+        shutdown_grace_ms: u64,
+    ) -> anyhow::Result<Self> {
+        let port = pick_free_port()?;
+        let final_yaml = inject_port(yaml, port)?;
+        Self::start_with_resolved_yaml(&final_yaml, port, Some(shutdown_grace_ms))
     }
 
     /// Start the proxy using a binary compiled with
@@ -230,6 +245,7 @@ impl ProxyHarness {
             &final_yaml,
             port,
             ProxyBinaryFlavor::NoDefaultFeatures,
+            None,
         )
     }
 
@@ -243,14 +259,24 @@ impl ProxyHarness {
         Self::start_with_yaml(&yaml)
     }
 
-    fn start_with_resolved_yaml(yaml: &str, port: u16) -> anyhow::Result<Self> {
-        Self::start_with_resolved_yaml_using_binary(yaml, port, ProxyBinaryFlavor::Default)
+    fn start_with_resolved_yaml(
+        yaml: &str,
+        port: u16,
+        shutdown_grace_ms: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_resolved_yaml_using_binary(
+            yaml,
+            port,
+            ProxyBinaryFlavor::Default,
+            shutdown_grace_ms,
+        )
     }
 
     fn start_with_resolved_yaml_using_binary(
         yaml: &str,
         port: u16,
         binary: ProxyBinaryFlavor,
+        shutdown_grace_ms: Option<u64>,
     ) -> anyhow::Result<Self> {
         let bin = proxy_binary_path_for(binary);
         if !bin.is_file() {
@@ -269,11 +295,18 @@ impl ProxyHarness {
         file.write_all(yaml.as_bytes())?;
         file.flush()?;
 
-        let child = Command::new(&bin)
+        let stderr = NamedTempFile::new()?;
+        let mut command = Command::new(&bin);
+        if let Some(shutdown_grace_ms) = shutdown_grace_ms {
+            command
+                .arg("--shutdown-grace-ms")
+                .arg(shutdown_grace_ms.to_string());
+        }
+        let child = command
             .arg("--config")
             .arg(file.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr.reopen()?))
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {}: {}", bin.display(), e))?;
 
@@ -282,9 +315,11 @@ impl ProxyHarness {
             port,
             _config: Some(file),
             _workspace: None,
+            _stderr: stderr,
+            _stdout: None,
             client: std::sync::OnceLock::new(),
         };
-        harness.wait_for_ready(startup_timeout())?;
+        harness.wait_for_ready_with_diagnostics(startup_timeout())?;
         Ok(harness)
     }
 
@@ -299,6 +334,24 @@ impl ProxyHarness {
     /// listing loader's "config-file parent is the Repo root"
     /// contract holds.
     pub fn start_with_workspace(yaml: &str, files: &[(&str, &str)]) -> anyhow::Result<Self> {
+        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, None)
+    }
+
+    /// Start the proxy in an isolated config workspace with a test-specific
+    /// graceful shutdown budget.
+    pub fn start_with_workspace_and_shutdown_grace(
+        yaml: &str,
+        files: &[(&str, &str)],
+        shutdown_grace_ms: u64,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, Some(shutdown_grace_ms))
+    }
+
+    fn start_with_workspace_and_optional_shutdown_grace(
+        yaml: &str,
+        files: &[(&str, &str)],
+        shutdown_grace_ms: Option<u64>,
+    ) -> anyhow::Result<Self> {
         let port = pick_free_port()?;
         let final_yaml = inject_port(yaml, port)?;
         let bin = proxy_binary_path();
@@ -321,11 +374,19 @@ impl ProxyHarness {
         let cfg_path = tmp.path().join("sb.yml");
         std::fs::write(&cfg_path, final_yaml.as_bytes())?;
 
-        let child = Command::new(&bin)
+        let stderr = NamedTempFile::new()?;
+        let stdout = NamedTempFile::new()?;
+        let mut command = Command::new(&bin);
+        if let Some(shutdown_grace_ms) = shutdown_grace_ms {
+            command
+                .arg("--shutdown-grace-ms")
+                .arg(shutdown_grace_ms.to_string());
+        }
+        let child = command
             .arg("--config")
             .arg(&cfg_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(stdout.reopen()?))
+            .stderr(Stdio::from(stderr.reopen()?))
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {}: {}", bin.display(), e))?;
 
@@ -334,10 +395,21 @@ impl ProxyHarness {
             port,
             _config: None,
             _workspace: Some(tmp),
+            _stderr: stderr,
+            _stdout: Some(stdout),
             client: std::sync::OnceLock::new(),
         };
-        harness.wait_for_ready(startup_timeout())?;
+        harness.wait_for_ready_with_diagnostics(startup_timeout())?;
         Ok(harness)
+    }
+
+    fn wait_for_ready_with_diagnostics(&self, timeout: Duration) -> anyhow::Result<()> {
+        self.wait_for_ready(timeout).map_err(|error| {
+            let stdout = self.stdout_contents();
+            let stderr = std::fs::read_to_string(self._stderr.path())
+                .unwrap_or_else(|read_error| format!("<read child stderr: {read_error}>"));
+            anyhow::anyhow!("{error:#}\nchild stdout:\n{stdout}\nchild stderr:\n{stderr}")
+        })
     }
 
     /// Build (or return) the lazy-initialised blocking HTTP client.
@@ -390,6 +462,39 @@ impl ProxyHarness {
     /// bypass `reqwest`'s header normalization).
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Ask the proxy to terminate cleanly, then kill it only if the deadline
+    /// elapses. Cluster tests use this to verify managed engine children are
+    /// drained and reaped with their owning proxy.
+    pub fn terminate_gracefully(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            let pid = i32::try_from(self.child.id())
+                .map_err(|_| anyhow::anyhow!("proxy child PID overflowed i32"))?;
+            // SAFETY: `pid` belongs to this live `Child`; SIGTERM does not
+            // access memory and its return value is checked.
+            let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        #[cfg(not(unix))]
+        self.child.kill()?;
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.child.kill()?;
+        self.child.wait()?;
+        anyhow::bail!("proxy did not exit after SIGTERM within {timeout:?}")
     }
 
     /// Block until the supplied port responds to an HTTP request, or
@@ -456,6 +561,23 @@ impl ProxyHarness {
             return ws.path().join("sb.yml");
         }
         unreachable!("harness must own either a config tempfile or a workspace tempdir")
+    }
+
+    /// Captured child stderr for diagnostics in multi-process tests.
+    pub fn stderr_contents(&self) -> String {
+        std::fs::read_to_string(self._stderr.path())
+            .unwrap_or_else(|error| format!("<read child stderr: {error}>"))
+    }
+
+    /// Captured child stdout, including default-format tracing output.
+    pub fn stdout_contents(&self) -> String {
+        self._stdout.as_ref().map_or_else(
+            || "<child stdout not captured>".to_string(),
+            |stdout| {
+                std::fs::read_to_string(stdout.path())
+                    .unwrap_or_else(|error| format!("<read child stdout: {error}>"))
+            },
+        )
     }
 
     /// Overwrite the proxy's on-disk config with new YAML and

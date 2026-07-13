@@ -48,6 +48,8 @@ schemars = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = "2"
 fs2 = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }
@@ -57,6 +59,7 @@ futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
+url = { workspace = true }
 nvml-wrapper = { version = "0.10", optional = true }
 # Weight download is a plain HTTP GET that follows HF's redirect to the
 # resolve-cache/Xet backend; reqwest's default redirect policy resolves
@@ -79,5 +82,6 @@ axum = { version = "0.8", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+sbproxy-ai.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

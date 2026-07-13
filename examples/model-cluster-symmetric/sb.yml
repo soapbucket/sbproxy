@@ -1,0 +1,89 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Two-node local development topology. Run this same file twice with the
+# per-node environment shown in README.md. Production clusters use mTLS.
+
+proxy:
+  http_bind_port: ${SB_HTTP_PORT:-8081}
+
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: ${SB_ADMIN_PORT:-9091}
+    username: admin
+    password: ${SB_ADMIN_PASSWORD:-change-this-before-running}
+
+  cluster:
+    cluster_id: model-cluster-symmetric
+    node_id: ${SB_NODE_ID}
+    roles: [gateway, worker]
+    labels:
+      zone: ${SB_ZONE:-local-a}
+    seeds: ["${SB_SEED}"]
+    gossip_port: ${SB_GOSSIP_PORT:-17946}
+    transport_port: ${SB_TRANSPORT_PORT:-18946}
+    advertise_addr: "127.0.0.1:${SB_GOSSIP_PORT:-17946}"
+    transport_advertise_addr: "127.0.0.1:${SB_TRANSPORT_PORT:-18946}"
+    model_endpoint: "https://127.0.0.1:${SB_MODEL_PORT:-19443}"
+    state_dir: "${SB_STATE_DIR:-./state/node-a}"
+    snapshot_ttl_secs: 10
+    publish_interval_secs: 2
+    dead_peer_gc_secs: 300
+    security:
+      mode: shared_key
+      development: true
+      shared_key: ${SB_CLUSTER_KEY:-local-model-cluster-secret}
+
+  # The compatibility block is intentionally present to prove the key cache
+  # and managed-model controller reuse the canonical cluster handle.
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: "${SB_STATE_DIR:-./state/node-a}/keys.redb"
+    cache:
+      tier: mesh
+      mesh_node_id: ${SB_NODE_ID}
+      mesh:
+        seeds: ["${SB_SEED}"]
+        gossip_port: ${SB_GOSSIP_PORT:-17946}
+        transport_port: ${SB_TRANSPORT_PORT:-18946}
+        advertise_addr: "127.0.0.1:${SB_GOSSIP_PORT:-17946}"
+        transport_advertise_addr: "127.0.0.1:${SB_TRANSPORT_PORT:-18946}"
+        shared_key: ${SB_CLUSTER_KEY:-local-model-cluster-secret}
+    crypto:
+      pepper: ${SB_KEY_PEPPER:-local-model-key-pepper}
+      master_key: ${SB_KEY_MASTER:-local-model-key-master}
+
+  model_host:
+    authority: file_managed
+    handoff_timeout_ms: 15000
+    cache:
+      directory: "${SB_STATE_DIR:-./state/node-a}/models"
+      budget_gib: 4
+      max_resident_models: 1
+    engines:
+      llama_cpp:
+        launch: binary
+        version: b9905
+        acceleration: auto
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+        replicas: 2
+        spread_by: [zone]
+        pull: on_boot
+        warm: true
+        engine: llama_cpp
+        rollout: rolling
+
+origins:
+  "localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
+          default_model: qwen

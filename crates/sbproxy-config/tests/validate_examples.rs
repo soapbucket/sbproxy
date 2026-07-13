@@ -119,3 +119,18 @@ fn every_oss_example_compiles() {
         );
     }
 }
+
+#[test]
+fn every_split_model_cluster_role_compiles() {
+    export_example_env_dummies();
+    let example = examples_root().join("model-cluster-split");
+    let files = ["gateway.yml", "worker-a.yml", "worker-b.yml"];
+
+    for name in files {
+        let file = example.join(name);
+        let yaml = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("{}: read failed: {error}", file.display()));
+        sbproxy_config::compile_config(&yaml)
+            .unwrap_or_else(|error| panic!("{}: compile_config: {error}", file.display()));
+    }
+}

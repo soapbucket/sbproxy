@@ -462,6 +462,9 @@ pub struct ProxyServerConfig {
     /// Canonical desired state and lifecycle policy for models hosted by SBproxy.
     #[serde(default)]
     pub model_host: Option<crate::model_host::ModelHostControlConfig>,
+    /// Optional shared cluster substrate for keys, metrics, and managed models.
+    #[serde(default)]
+    pub cluster: Option<crate::cluster::ClusterConfig>,
     /// Secrets management configuration.
     #[serde(default)]
     pub secrets: Option<SecretsConfig>,
@@ -647,6 +650,7 @@ impl Default for ProxyServerConfig {
             alerting: None,
             admin: None,
             model_host: None,
+            cluster: None,
             secrets: None,
             key_management: None,
             l2_cache: None,
@@ -910,6 +914,10 @@ pub struct MeshClusterConfig {
     /// gossip bind when unset.
     #[serde(default)]
     pub advertise_addr: Option<String>,
+    /// Address this node advertises for typed-state transport (`host:port`).
+    /// Defaults to the gossip-advertised host and `transport_port`.
+    #[serde(default)]
+    pub transport_advertise_addr: Option<String>,
     /// Optional cluster-wide shared secret (AES-256-GCM) for the gossip and
     /// transport wire. Accepts an inline value or `env:NAME`. Plaintext when
     /// unset.
@@ -951,6 +959,7 @@ impl Default for MeshClusterConfig {
             gossip_port: default_gossip_port(),
             transport_port: default_transport_port(),
             advertise_addr: None,
+            transport_advertise_addr: None,
             shared_key: None,
             peer_tls: None,
         }
