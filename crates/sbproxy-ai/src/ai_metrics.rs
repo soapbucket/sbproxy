@@ -1552,12 +1552,40 @@ mod tests {
 
     #[test]
     fn test_record_failover() {
-        record_failover("openai", "anthropic", "rate_limited");
+        // WOR-1535: the dispatch path emits three reason kinds
+        // (retriable upstream status, transport failure, content-policy
+        // fallback). Pin the label names and that vocabulary so a
+        // rename breaks this test instead of silently orphaning
+        // dashboards and the provider-health admin view.
+        record_failover("primary", "backup", "http_503");
+        record_failover("primary", "backup", "transport");
+        record_failover("primary", "backup", "content_policy");
         let families = prometheus::gather();
         let failovers = families
             .iter()
-            .find(|f| f.name() == "sbproxy_ai_failovers_total");
-        assert!(failovers.is_some());
+            .find(|f| f.name() == "sbproxy_ai_failovers_total")
+            .expect("failover counter must be registered");
+        let mut reasons = std::collections::HashSet::new();
+        for m in failovers.get_metric() {
+            let labels: std::collections::HashMap<&str, &str> = m
+                .get_label()
+                .iter()
+                .map(|l| (l.name(), l.value()))
+                .collect();
+            assert!(labels.contains_key("from_provider"));
+            assert!(labels.contains_key("to_provider"));
+            if labels.get("from_provider").copied() == Some("primary") {
+                assert_eq!(labels.get("to_provider").copied(), Some("backup"));
+                reasons.insert(labels["reason"].to_string());
+                assert_eq!(m.get_counter().value(), 1.0);
+            }
+        }
+        for expected in ["http_503", "transport", "content_policy"] {
+            assert!(
+                reasons.contains(expected),
+                "missing failover reason {expected}"
+            );
+        }
     }
 
     #[test]
