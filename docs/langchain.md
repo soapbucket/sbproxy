@@ -1,6 +1,6 @@
 # LangChain with SBproxy
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-12*
 
 A LangChain application normally talks to providers directly: `langchain-openai` calls `api.openai.com`, and each tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the LangChain side the change is a base URL on the model and one server entry for tools.
 
@@ -56,7 +56,7 @@ origins:
 
 Origin keys match the `Host` header and hostname matching strips the port, so `"127.0.0.1"` matches a client whose base URL is `http://127.0.0.1:8080`. When the gateway runs on another machine, key the origin with the hostname your application uses. The real provider key comes from the environment through `${OPENAI_API_KEY}` interpolation; never put a raw provider key in the file.
 
-Be precise about what the virtual key is doing here. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `langchain-app` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your application never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces in the `sbproxy_ai_key_*` metrics; enforced spend ceilings live in an action-level `budget:` block. The virtual key is not inbound authentication by itself either: a request presenting an unknown key, or no key at all, still passes through on the provider's configured key, so add an `authentication` block to the origin whenever the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
+Be precise about what the virtual key is doing here. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `langchain-app` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your application never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. The virtual key is not inbound authentication by itself either: a request presenting an unknown key, or no key at all, still passes through on the provider's configured key, so add an `authentication` block to the origin whenever the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
 
 ## MCP tools through the gateway
 

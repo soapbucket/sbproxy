@@ -11,22 +11,24 @@ use prometheus::{
 use std::sync::LazyLock;
 
 // --- Provider metrics ---
-
-static AI_REQUESTS: LazyLock<CounterVec> = LazyLock::new(|| {
-    register_counter_vec!(
-        Opts::new("sbproxy_ai_requests_total", "AI gateway requests"),
-        &["provider", "model", "status"]
-    )
-    .unwrap()
-});
+//
+// WOR-1873: the original unattributed `sbproxy_ai_requests_total`,
+// `sbproxy_ai_tokens_total`, and `sbproxy_ai_cost_dollars_total`
+// families (plus the per-virtual-key trio) were registered here but
+// had no live writer; the dispatch path records the attributed
+// families below instead. They were removed rather than re-wired
+// because a same-named `sbproxy_ai_tokens_total` also existed in the
+// custom registry and the merged /metrics render would have emitted
+// two families with different label sets. See
+// docs/metrics-stability.md for the deprecation note.
 
 /// Per-surface request counter, partitioned by AI surface (chat
 /// completions, assistants, embeddings, image generation, etc.) and
 /// HTTP method.
 ///
-/// Additive with `sbproxy_ai_requests_total`; dashboards that
-/// aggregate by provider/model continue to use the original counter,
-/// while surface-aware views use this one. Cardinality is bounded by
+/// Additive with `sbproxy_ai_requests_attributed_total`; dashboards
+/// that aggregate by provider/model use the attributed counter, while
+/// surface-aware views use this one. Cardinality is bounded by
 /// the closed `AiSurface::label()` set times the standard HTTP method
 /// set (~17 surfaces times ~7 methods). A `status` partition will be
 /// added in a later phase when per-surface billing events carry the
@@ -55,22 +57,6 @@ static AI_SURFACE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
         )
         .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
         &["surface", "method"]
-    )
-    .unwrap()
-});
-
-static AI_TOKENS: LazyLock<CounterVec> = LazyLock::new(|| {
-    register_counter_vec!(
-        Opts::new("sbproxy_ai_tokens_total", "Tokens consumed"),
-        &["provider", "model", "direction"] // direction: "input" | "output"
-    )
-    .unwrap()
-});
-
-static AI_COST: LazyLock<CounterVec> = LazyLock::new(|| {
-    register_counter_vec!(
-        Opts::new("sbproxy_ai_cost_dollars_total", "Estimated cost in USD"),
-        &["provider", "model"]
     )
     .unwrap()
 });
@@ -162,6 +148,24 @@ static AI_OUTPUT_THROUGHPUT: LazyLock<HistogramVec> = LazyLock::new(|| {
         .buckets(vec![
             1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0
         ]),
+        &["provider", "model"]
+    )
+    .unwrap()
+});
+
+// WOR-1873: average inter-token latency (TPOT) per streaming
+// response, in seconds. Recorded once per stream alongside TTFT and
+// output throughput, from the same generation window (first token ->
+// stream end) divided by the gap count, so the three serving signals
+// stay mutually consistent. Buckets span sub-10ms accelerator gaps
+// through multi-second degraded streams.
+static AI_INTER_TOKEN_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_inter_token_latency_seconds",
+            "AI streaming average inter-token latency (TPOT)"
+        )
+        .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
         &["provider", "model"]
     )
     .unwrap()
@@ -473,32 +477,6 @@ pub fn shadow_timeout_value() -> f64 {
     AI_SHADOW_TIMEOUT.get()
 }
 
-// --- Per-key metrics ---
-
-static AI_KEY_REQUESTS: LazyLock<CounterVec> = LazyLock::new(|| {
-    register_counter_vec!(
-        Opts::new("sbproxy_ai_key_requests_total", "Requests per virtual key"),
-        &["virtual_key", "provider", "model"]
-    )
-    .unwrap()
-});
-
-static AI_KEY_TOKENS: LazyLock<CounterVec> = LazyLock::new(|| {
-    register_counter_vec!(
-        Opts::new("sbproxy_ai_key_tokens_total", "Tokens per virtual key"),
-        &["virtual_key", "direction"]
-    )
-    .unwrap()
-});
-
-static AI_KEY_COST: LazyLock<CounterVec> = LazyLock::new(|| {
-    register_counter_vec!(
-        Opts::new("sbproxy_ai_key_cost_dollars_total", "Cost per virtual key"),
-        &["virtual_key"]
-    )
-    .unwrap()
-});
-
 // --- AI gateway rate-limit rejection counter ---
 //
 // Operators alert on any non-zero rate of this counter to detect a
@@ -540,40 +518,12 @@ static AI_TOKEN_ESTIMATE_ERROR_RATIO: LazyLock<HistogramVec> = LazyLock::new(|| 
     .unwrap()
 });
 
-/// Record a completed AI request.
-pub fn record_ai_request(
-    provider: &str,
-    model: &str,
-    status: u16,
-    duration_secs: f64,
-    input_tokens: u64,
-    output_tokens: u64,
-    cost: f64,
-) {
-    let status_str = status.to_string();
-    AI_REQUESTS
-        .with_label_values(&[provider, model, &status_str])
-        .inc();
-    AI_LATENCY
-        .with_label_values(&[provider, model])
-        .observe(duration_secs);
-    AI_TOKENS
-        .with_label_values(&[provider, model, "input"])
-        .inc_by(input_tokens as f64);
-    AI_TOKENS
-        .with_label_values(&[provider, model, "output"])
-        .inc_by(output_tokens as f64);
-    if cost > 0.0 {
-        AI_COST.with_label_values(&[provider, model]).inc_by(cost);
-    }
-}
-
 /// Record a request against the per-surface counter.
 ///
 /// Called once per AI request from `handle_ai_proxy` (in `sbproxy-core`)
-/// with the surface label from `classify_surface`. Separate from
-/// `record_ai_request` so adding the surface partition does not change
-/// the cardinality of the original counter that existing dashboards
+/// with the surface label from `classify_surface`. Kept separate from
+/// the attributed request counter so the surface partition does not
+/// change the cardinality of the families that existing dashboards
 /// and alerts depend on.
 pub fn record_surface_request(surface: &str, method: &str) {
     AI_SURFACE_REQUESTS
@@ -682,6 +632,20 @@ pub fn record_output_throughput(provider: &str, model: &str, tokens_per_second: 
         AI_OUTPUT_THROUGHPUT
             .with_label_values(&[provider, model])
             .observe(tokens_per_second);
+    }
+}
+
+/// Record one streaming response's average inter-token latency
+/// (TPOT), in seconds. Callers derive it from the same generation
+/// window `record_output_throughput` uses: window / (tokens - 1),
+/// so it needs at least two tokens to be defined. Non-finite and
+/// non-positive values are dropped so the histogram only sees
+/// meaningful gaps.
+pub fn record_inter_token_latency(provider: &str, model: &str, seconds: f64) {
+    if seconds.is_finite() && seconds > 0.0 {
+        AI_INTER_TOKEN_LATENCY
+            .with_label_values(&[provider, model])
+            .observe(seconds);
     }
 }
 
@@ -805,29 +769,6 @@ pub fn record_token_estimate_error(model: &str, estimated: u64, actual: u64) {
     AI_TOKEN_ESTIMATE_ERROR_RATIO
         .with_label_values(&[model])
         .observe(ratio);
-}
-
-/// Record per-key usage.
-pub fn record_key_usage(
-    key: &str,
-    provider: &str,
-    model: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-    cost: f64,
-) {
-    AI_KEY_REQUESTS
-        .with_label_values(&[key, provider, model])
-        .inc();
-    AI_KEY_TOKENS
-        .with_label_values(&[key, "input"])
-        .inc_by(input_tokens as f64);
-    AI_KEY_TOKENS
-        .with_label_values(&[key, "output"])
-        .inc_by(output_tokens as f64);
-    if cost > 0.0 {
-        AI_KEY_COST.with_label_values(&[key]).inc_by(cost);
-    }
 }
 
 // --- Waste-signal metrics (WOR-1085) ---
@@ -1004,7 +945,7 @@ pub fn record_waste(
 // Per-request attribution tags ride on every AI spend record (see
 // `crate::attribution`). The dashboard wants spend broken down by
 // the business dimensions those tags carry; this section exposes
-// the same totals as `AI_TOKENS` + `AI_COST` plus a bounded set of
+// the request / token / cost totals plus a bounded set of
 // attribution labels.
 //
 // ## Cardinality
@@ -1366,17 +1307,6 @@ mod tests {
     }
 
     #[test]
-    fn test_record_ai_request() {
-        record_ai_request("openai", "gpt-4o", 200, 1.5, 100, 50, 0.003);
-        // Verify counter incremented (use prometheus gather())
-        let families = prometheus::gather();
-        let ai_req = families
-            .iter()
-            .find(|f| f.name() == "sbproxy_ai_requests_total");
-        assert!(ai_req.is_some());
-    }
-
-    #[test]
     fn test_record_surface_request() {
         record_surface_request("assistants", "DELETE");
         record_surface_request("image_generation", "POST");
@@ -1654,8 +1584,19 @@ mod tests {
     }
 
     #[test]
-    fn test_key_usage() {
-        record_key_usage("vk-test-123", "openai", "gpt-4o", 100, 50, 0.003);
+    fn test_record_inter_token_latency() {
+        record_inter_token_latency("openai", "gpt-4o", 0.032);
+        // Non-positive / non-finite samples are dropped by the helper.
+        record_inter_token_latency("openai", "gpt-4o", 0.0);
+        record_inter_token_latency("openai", "gpt-4o", f64::NAN);
+        record_inter_token_latency("openai", "gpt-4o", -0.5);
+        let families = prometheus::gather();
+        let itl = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_inter_token_latency_seconds")
+            .expect("inter-token latency histogram must be registered");
+        let sample = &itl.get_metric()[0];
+        assert_eq!(sample.get_histogram().get_sample_count(), 1);
     }
 
     #[test]

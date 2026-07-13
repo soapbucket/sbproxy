@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-12*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -788,7 +788,7 @@ Label cardinality is capped by `metrics.max_cardinality_per_label` (default `100
 | `sbproxy_errors_total` | Counter | `hostname`, `error_type` |
 | `sbproxy_active_connections` | Gauge | (none) |
 | `sbproxy_cache_hits_total` | Counter | `hostname`, `result` (`hit`, `miss`) |
-| `sbproxy_ai_tokens_total` | Counter | `hostname`, `provider`, `direction` (`input`, `output`) |
+| `sbproxy_ai_tokens_attributed_total` | Counter | `provider`, `model`, `surface`, `direction` (`input`, `output`), attribution labels |
 
 #### Agent detection metrics
 

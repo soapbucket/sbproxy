@@ -112,9 +112,8 @@ rule_files:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `sbproxy_ai_requests_total` | Counter | `provider`, `status` | AI provider requests |
-| `sbproxy_ai_tokens_input_total` | Counter | `provider` | Input tokens consumed |
-| `sbproxy_ai_tokens_output_total` | Counter | `provider` | Output tokens generated |
+| `sbproxy_ai_requests_attributed_total` | Counter | `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | AI requests by attribution and outcome |
+| `sbproxy_ai_tokens_attributed_total` | Counter | `provider`, `model`, `surface`, `direction`, attribution labels | Tokens consumed, by direction and attribution |
 | `sbproxy_ai_request_duration_seconds_bucket` | Histogram | `provider`, `le` | AI request latency distribution |
 | `sbproxy_ai_ttft_seconds_bucket` | Histogram | `le` | Time to first token distribution |
 | `sbproxy_ai_cache_hits_total` | Counter | | AI semantic cache hits |

@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-12*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -1545,9 +1545,8 @@ A representative slice of the catalog appears below. The canonical, exhaustive r
 | `sbproxy_policy_triggers_total` | counter | Policy triggers by type and action (covers WAF blocks, rate-limit triggers, etc.) |
 | `sbproxy_cache_results_total` | counter | Cache outcomes (hit, miss, stale, bypass) |
 | `sbproxy_circuit_breaker_transitions_total` | counter | Circuit-breaker state transitions per upstream |
-| `sbproxy_ai_requests_total` | counter | AI gateway requests by provider and model |
-| `sbproxy_ai_tokens_total` | counter | AI tokens by direction (input/output) |
-| `sbproxy_ai_cost_dollars_total` | counter | AI spend in USD |
+| `sbproxy_ai_requests_attributed_total` | counter | AI gateway requests by provider, model, and outcome |
+| `sbproxy_ai_tokens_attributed_total` | counter | AI tokens by direction (input/output) and attribution |
 | `sbproxy_ai_cost_usd_micros_total` | counter | AI spend in micro-USD by provider, model, and tenant |
 | `sbproxy_ai_ttft_seconds` | histogram | Time to first AI token, by provider |
 

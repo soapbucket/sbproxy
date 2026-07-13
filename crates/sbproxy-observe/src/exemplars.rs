@@ -12,6 +12,10 @@
 //! - `sbproxy_policy_evaluation_duration_seconds_bucket`
 //! - `sbproxy_outbound_request_duration_seconds_bucket`
 //! - `sbproxy_audit_emit_duration_seconds_bucket`
+//! - `sbproxy_ai_ttft_seconds_bucket`
+//! - `sbproxy_ai_inter_token_latency_seconds_bucket`
+//! - `sbproxy_ai_request_duration_seconds_bucket`
+//! - `sbproxy_ai_request_duration_attributed_seconds_bucket`
 //!
 //! Operators MUST run Prometheus with `--enable-feature=exemplar-storage`
 //! and scrape with `application/openmetrics-text` content negotiation.
@@ -145,6 +149,12 @@ fn is_exemplar_metric(metric: &str) -> bool {
             | "sbproxy_policy_evaluation_duration_seconds"
             | "sbproxy_outbound_request_duration_seconds"
             | "sbproxy_audit_emit_duration_seconds"
+            // WOR-1873: AI serving histograms, so a TTFT / TPOT /
+            // duration spike links straight to its trace.
+            | "sbproxy_ai_ttft_seconds"
+            | "sbproxy_ai_inter_token_latency_seconds"
+            | "sbproxy_ai_request_duration_seconds"
+            | "sbproxy_ai_request_duration_attributed_seconds"
     )
 }
 

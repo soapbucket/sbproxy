@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-12*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -752,7 +752,7 @@ origins:
 | `route_to_model` | string | unset | Pins every request from this credential to one model. |
 | `inject_tools` | list | `[]` | Provider-native tool definitions injected into requests from this credential. |
 
-At compile time each `ai_provider` credential is lowered onto the runtime key registry (`VirtualKeyConfig` in `crates/sbproxy-ai/src/identity.rs`) that AI dispatch reads. Per-key usage shows up in the `sbproxy_ai_key_*` metrics.
+At compile time each `ai_provider` credential is lowered onto the runtime key registry (`VirtualKeyConfig` in `crates/sbproxy-ai/src/identity.rs`) that AI dispatch reads. Per-key usage shows up in the attributed spend metrics: filter or `sum by (api_key_id)` on `sbproxy_ai_requests_attributed_total`, `sbproxy_ai_tokens_attributed_total`, and `sbproxy_ai_cost_dollars_attributed_total`.
 
 ## Caching
 
@@ -1119,13 +1119,11 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `sbproxy_ai_requests_total` | Counter | `provider`, `model`, `status` | Total AI requests |
 | `sbproxy_ai_surface_requests_total` | Counter | `surface`, `method` | Total AI requests partitioned by classified surface (chat completions, assistants, image generation, ...) and HTTP method |
 | `sbproxy_ai_surface_request_duration_seconds` | Histogram | `surface`, `method` | Per-surface request latency. Buckets match `sbproxy_ai_request_duration_seconds` for side-by-side dashboards |
-| `sbproxy_ai_tokens_total` | Counter | `provider`, `model`, `direction` | Tokens consumed (`direction` is `input` or `output`) |
-| `sbproxy_ai_cost_dollars_total` | Counter | `provider`, `model` | Estimated cost in USD |
 | `sbproxy_ai_cost_usd_micros_total` | Counter | `provider`, `model`, `tenant_id` | Derived request cost in micro-USD (`1e-6` USD); mirrored to OTLP as `sbproxy.ai.cost_usd_micros` when `telemetry.export_metrics` is enabled |
 | `sbproxy_ai_request_duration_seconds` | Histogram | `provider`, `model` | End-to-end AI request latency. Now recorded on the live path for every accepted upstream response |
+| `sbproxy_ai_inter_token_latency_seconds` | Histogram | `provider`, `model` | Average inter-token latency (TPOT) per streaming response, derived from the generation window. Completes the TTFT / TPOT / throughput serving triple |
 | `sbproxy_ai_tokens_attributed_total` | Counter | `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | Per-attribution token spend. `sum by (tenant_id, model)` for multi-tenant multi-model token volume |
 | `sbproxy_ai_cost_dollars_attributed_total` | Counter | same as above minus `direction` | Per-attribution USD spend. `sum by (api_key_id)` for per-credential chargeback |
 | `sbproxy_ai_request_duration_attributed_seconds` | Histogram | `provider`, `model`, `surface`, `tenant_id`, `api_key_id` | Model latency sliceable per tenant / credential / model. `histogram_quantile(0.95, sum by (le, tenant_id, model) (rate(..._bucket[5m])))` |
@@ -1134,9 +1132,6 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `category` | Guardrail block events (pii, injection, jailbreak, etc.) |
 | `sbproxy_ai_cache_results_total` | Counter | `provider`, `cache_type`, `result` | AI response cache results (`cache_type` is `exact` or `semantic`, `result` is `hit` or `miss`) |
 | `sbproxy_ai_budget_utilization_ratio` | Gauge | `scope` | Current budget utilization as a 0 to 1 ratio |
-| `sbproxy_ai_key_requests_total` | Counter | `virtual_key`, `provider`, `model` | Requests per virtual key |
-| `sbproxy_ai_key_tokens_total` | Counter | `virtual_key`, `direction` | Tokens per virtual key |
-| `sbproxy_ai_key_cost_dollars_total` | Counter | `virtual_key` | Cost in USD per virtual key |
 | `sbproxy_ai_realtime_sessions_active` | Gauge | | Currently open OpenAI Realtime API WebSocket sessions |
 | `sbproxy_ai_realtime_session_duration_seconds` | Histogram | `provider`, `close_reason` | Wall-clock duration of a Realtime WebSocket session, observed at close. `close_reason` is `client_closed` or `error` |
 | `sbproxy_ai_realtime_audio_seconds_total` | Counter | `provider`, `direction` | Cumulative audio seconds forwarded over Realtime sessions. Frame-exact accounting requires terminate-and-relay (not on the OSS path); the OSS dispatcher uses session wall-clock as a duration proxy on close |

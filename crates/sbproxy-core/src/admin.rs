@@ -1821,7 +1821,6 @@ pub fn handle_admin_request(
     // WOR-1718: spend summary from the AI cost/token metrics.
     if path_only == "/api/usage/spend" {
         let snap = sbproxy_observe::metrics::metrics().snapshot_named(&[
-            "sbproxy_ai_tokens_total",
             "sbproxy_tokens_attributed_total",
             "sbproxy_ai_tokens_attributed_total",
             "sbproxy_ai_cost_usd_micros_total",
@@ -2006,7 +2005,6 @@ fn spend_totals_from_snapshot(snap: &std::collections::HashMap<String, f64>) -> 
     let tokens = first_positive_snapshot_value(
         snap,
         &[
-            "sbproxy_ai_tokens_total",
             "sbproxy_ai_tokens_attributed_total",
             "sbproxy_tokens_attributed_total",
         ],
@@ -3199,7 +3197,6 @@ mod tests {
     #[test]
     fn spend_totals_use_attributed_tokens_when_legacy_tokens_are_empty() {
         let snap = std::collections::HashMap::from([
-            ("sbproxy_ai_tokens_total".to_string(), 0.0),
             ("sbproxy_tokens_attributed_total".to_string(), 39.0),
             ("sbproxy_ai_cost_usd_micros_total".to_string(), 195.0),
         ]);
@@ -3213,7 +3210,6 @@ mod tests {
     #[test]
     fn spend_totals_accept_ai_prefixed_attributed_metric_name() {
         let snap = std::collections::HashMap::from([
-            ("sbproxy_ai_tokens_total".to_string(), 0.0),
             ("sbproxy_ai_tokens_attributed_total".to_string(), 44.0),
             ("sbproxy_ai_cost_dollars_attributed_total".to_string(), 0.25),
         ]);

@@ -105,7 +105,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (provider) (rate(sbproxy_ai_requests_total[5m]))",
+          "expr": "sum by (provider) (rate(sbproxy_ai_requests_attributed_total[5m]))",
           "legendFormat": "{{provider}}",
           "datasource": {
             "type": "prometheus",

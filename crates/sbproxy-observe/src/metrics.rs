@@ -232,8 +232,6 @@ pub struct ProxyMetrics {
     pub active_connections: IntGauge,
     /// Counter `sbproxy_cache_hits_total` of cache hits and misses labelled by hostname.
     pub cache_hits: IntCounterVec,
-    /// Counter `sbproxy_ai_tokens_total` of AI token usage labelled by hostname, provider, and direction.
-    pub ai_tokens_total: IntCounterVec,
     /// Counter `sbproxy_ai_cost_usd_micros_total` of AI request cost in
     /// micro-USD, labelled by provider, model, and tenant.
     pub ai_cost_usd_micros_total: IntCounterVec,
@@ -394,12 +392,6 @@ impl ProxyMetrics {
         let cache_hits = IntCounterVec::new(
             Opts::new("sbproxy_cache_hits_total", "Cache hit/miss counts"),
             &["hostname", "result"], // "hit" or "miss"
-        )
-        .unwrap();
-
-        let ai_tokens_total = IntCounterVec::new(
-            Opts::new("sbproxy_ai_tokens_total", "AI token usage"),
-            &["hostname", "provider", "direction"], // "input" or "output"
         )
         .unwrap();
 
@@ -683,9 +675,6 @@ impl ProxyMetrics {
             .unwrap();
         registry.register(Box::new(cache_hits.clone())).unwrap();
         registry
-            .register(Box::new(ai_tokens_total.clone()))
-            .unwrap();
-        registry
             .register(Box::new(ai_cost_usd_micros_total.clone()))
             .unwrap();
         registry
@@ -766,7 +755,6 @@ impl ProxyMetrics {
             errors_total,
             active_connections,
             cache_hits,
-            ai_tokens_total,
             ai_cost_usd_micros_total,
             semantic_cache_results,
             inference_requests,
@@ -3292,9 +3280,9 @@ pub fn set_operator_leader_is_leader(is_leader: bool) {
 
 // --- per-credential token attribution metric ---------------------------
 //
-// `sbproxy_ai_tokens_total{hostname, provider, direction}` already
-// rolls up token usage by upstream provider; that surface is what the
-// AI router consumes for fairness decisions. This second metric
+// `sbproxy_ai_tokens_attributed_total` (in `sbproxy-ai`) already
+// rolls up token usage by upstream provider and model; that surface
+// is what spend dashboards consume. This second metric
 // indexes the same observation by who-paid attribution
 // (`project`, `user`, `tag`) so a per-tenant operator can write a
 // Prometheus alert against budget burn without scraping the access
@@ -3316,9 +3304,9 @@ pub fn set_operator_leader_is_leader(is_leader: bool) {
 /// `project` and `user` come from the matched virtual-key config;
 /// `tag` is the first element of the credential's `tags:` list
 /// (callers wanting per-tag fan-out emit one call per tag). The
-/// `direction` enum mirrors the existing `sbproxy_ai_tokens_total`
-/// shape: `input` for the prompt side, `output` for the completion
-/// side.
+/// `direction` enum takes `input` for the prompt side and `output`
+/// for the completion side, matching the attributed token counter
+/// in `sbproxy-ai`.
 ///
 /// Empty `project` / `user` / `tag` strings serialise as empty
 /// labels; downstream queries should `OR project=""` etc. to roll up
@@ -3574,17 +3562,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ai_tokens() {
-        let m = ProxyMetrics::new();
-        m.ai_tokens_total
-            .with_label_values(&["example.com", "openai", "input"])
-            .inc_by(500);
-        let output = m.render();
-        assert!(output.contains("sbproxy_ai_tokens_total"));
-        assert!(output.contains("openai"));
-    }
-
-    #[test]
     fn test_render_contains_all_metric_names() {
         let m = ProxyMetrics::new();
         // Touch each legacy metric so they appear in output.
@@ -3597,9 +3574,6 @@ mod tests {
         m.errors_total.with_label_values(&["h", "e"]).inc();
         m.active_connections.set(1);
         m.cache_hits.with_label_values(&["h", "hit"]).inc();
-        m.ai_tokens_total
-            .with_label_values(&["h", "p", "input"])
-            .inc();
         m.ai_cost_usd_micros_total
             .with_label_values(&["p", "m", "tenant-a"])
             .inc_by(42);
@@ -3633,7 +3607,6 @@ mod tests {
         assert!(output.contains("sbproxy_errors_total"));
         assert!(output.contains("sbproxy_active_connections"));
         assert!(output.contains("sbproxy_cache_hits_total"));
-        assert!(output.contains("sbproxy_ai_tokens_total"));
         assert!(output.contains("sbproxy_ai_cost_usd_micros_total"));
         assert!(output.contains("sbproxy_origin_requests_total"));
         assert!(output.contains("sbproxy_origin_request_duration_seconds"));

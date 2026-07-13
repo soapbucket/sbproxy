@@ -1442,6 +1442,23 @@ pub(super) fn emit_ai_billing_event(
         tenant_id,
         cost_usd_micros,
     );
+    // WOR-1873: mirror token usage under the OTel GenAI instrument
+    // name from the same choke point (a no-op unless the operator
+    // enabled telemetry.export_metrics).
+    sbproxy_observe::otel::record_genai_token_usage(
+        provider_name,
+        surface_label,
+        model_label,
+        "input",
+        input_tokens,
+    );
+    sbproxy_observe::otel::record_genai_token_usage(
+        provider_name,
+        surface_label,
+        model_label,
+        "output",
+        output_tokens,
+    );
 
     // WOR-1095: realtime + audio surfaces consume seconds, not tokens,
     // and realtime has no catalogue price, so the token / cost

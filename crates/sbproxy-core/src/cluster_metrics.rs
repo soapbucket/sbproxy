@@ -34,7 +34,11 @@ const STATE_SCHEMA_VERSION: u32 = 1;
 const PUBLISHED_METRICS: &[&str] = &[
     "sbproxy_requests_total",
     "sbproxy_active_connections",
-    "sbproxy_ai_tokens_total",
+    // WOR-1873: the unattributed sbproxy_ai_tokens_total family was
+    // removed (it had no live writer); the attributed family is the
+    // one the dispatch path actually increments, and its series still
+    // sum meaningfully across nodes.
+    "sbproxy_ai_tokens_attributed_total",
     "sbproxy_ai_cost_usd_micros_total",
 ];
 

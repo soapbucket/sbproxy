@@ -20,7 +20,7 @@ groups:
           description: "The P95 request latency has been above 2 seconds for 5 minutes. Current value: {{ $value | humanizeDuration }}."
 
       - alert: SBProxyAIProviderDown
-        expr: rate(sbproxy_ai_requests_total{status="success"}[2m]) == 0 and rate(sbproxy_ai_requests_total{status="error"}[2m]) > 0
+        expr: rate(sbproxy_ai_requests_attributed_total{outcome="ok"}[2m]) == 0 and rate(sbproxy_ai_requests_attributed_total{outcome!="ok"}[2m]) > 0
         for: 2m
         labels:
           severity: critical

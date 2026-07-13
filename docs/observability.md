@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-12*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -258,7 +258,7 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_operator_reconcile_duration_seconds_bucket` | 22 | `kind` label plus 11 histogram buckets 1ms..60s. |
 | `sbproxy_operator_leader_transitions_total` | 3 | Labels: `result` (elected\|renewed\|lost). |
 | `sbproxy_operator_leader_is_leader` | 1 | Gauge; 1 when this replica holds the lease. |
-| `sbproxy_tokens_attributed_total` | 8 000 | Labels: `project` (sanitised), `user` (sanitised), `tag` (sanitised; first element of the virtual key's `tags:` list with fan-out per tag), `direction` (input\|output). Cardinality not bounded by a fixed cap; the existing `sbproxy_label_cardinality_overflow_total` counter fires when any label exceeds budget. Sits next to `sbproxy_ai_tokens_total{hostname,provider,direction}` and indexes the same observation by who-paid attribution. |
+| `sbproxy_tokens_attributed_total` | 8 000 | Labels: `project` (sanitised), `user` (sanitised), `tag` (sanitised; first element of the virtual key's `tags:` list with fan-out per tag), `direction` (input\|output). Cardinality not bounded by a fixed cap; the existing `sbproxy_label_cardinality_overflow_total` counter fires when any label exceeds budget. Sits next to `sbproxy_ai_tokens_attributed_total` and indexes the same observation by who-paid attribution. |
 | `sbproxy_label_cardinality_overflow_per_tenant_total` | 8 000 | Labels: `metric` (sanitised name of the demoted family), `label` (sanitised label key that overflowed), `tenant_id`. Same demotion signal as `sbproxy_label_cardinality_overflow_total` but partitioned by tenant so a noisy-tenant root-cause investigation does not have to scan every metric. |
 | `sbproxy_a2a_hops_total` | 60 | Labels: `route`, `spec` (a2a-spec version), `decision` (allow\|deny\|warn). Counts each per-request A2A hop the proxy observes. |
 | `sbproxy_a2a_chain_depth_bucket` | 60 | `route`, `spec`; histogram buckets 1..32 chain hops. Tracks A2A call-graph depth before truncation. |

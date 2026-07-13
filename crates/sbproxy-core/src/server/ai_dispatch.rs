@@ -2574,13 +2574,22 @@ pub(super) async fn handle_ai_proxy(
                 ai_span.record("gen_ai.request.model", resolved_model.as_str());
                 ai_span.record("llm.model_name", resolved_model.as_str());
             }
+            let upstream_secs = race_start.elapsed().as_secs_f64();
             sbproxy_ai::ai_metrics::record_model_latency(
                 &provider.name,
                 ctx.ai_model.as_deref().unwrap_or(""),
                 surface_label,
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
-                race_start.elapsed().as_secs_f64(),
+                upstream_secs,
+            );
+            // WOR-1873: mirror under the OTel GenAI instrument name so
+            // GenAI-aware backends chart it without relabeling.
+            sbproxy_observe::otel::record_genai_operation_duration(
+                &provider.name,
+                surface_label,
+                ctx.ai_model.as_deref().unwrap_or(""),
+                upstream_secs,
             );
             last_format = sbproxy_ai::client::provider_format(provider);
             last_upstream_host = url::Url::parse(&provider.effective_base_url())
@@ -2908,13 +2917,23 @@ pub(super) async fn handle_ai_proxy(
                 // latency is sliceable per tenant / credential / model
                 // (not just globally per provider/model). Measured once
                 // per request, on the attempt we keep.
+                let upstream_secs = attempt_start.elapsed().as_secs_f64();
                 sbproxy_ai::ai_metrics::record_model_latency(
                     &provider.name,
                     ctx.ai_model.as_deref().unwrap_or(""),
                     surface_label,
                     ctx.tenant_id.as_str(),
                     ctx.principal.api_key_id(),
-                    attempt_start.elapsed().as_secs_f64(),
+                    upstream_secs,
+                );
+                // WOR-1873: mirror under the OTel GenAI instrument
+                // name so GenAI-aware backends chart it without
+                // relabeling.
+                sbproxy_observe::otel::record_genai_operation_duration(
+                    &provider.name,
+                    surface_label,
+                    ctx.ai_model.as_deref().unwrap_or(""),
+                    upstream_secs,
                 );
                 last_provider_name = provider.name.to_string();
                 last_resp = Some(resp);
@@ -5294,6 +5313,18 @@ pub(super) async fn relay_ai_stream(
                             args.provider_name,
                             args.model,
                             tps,
+                        );
+                    }
+                    // WOR-1873: average inter-token latency (TPOT) over
+                    // the same generation window, so TTFT / TPOT /
+                    // throughput describe one consistent stream. Needs
+                    // at least two tokens to define a gap.
+                    if completion > 1 && gen_secs > 0.0 {
+                        let itl = gen_secs / (completion - 1) as f64;
+                        sbproxy_ai::ai_metrics::record_inter_token_latency(
+                            args.provider_name,
+                            args.model,
+                            itl,
                         );
                     }
                 }
