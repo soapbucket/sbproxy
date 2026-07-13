@@ -26,8 +26,9 @@ use sbproxy_mesh::transport::tls::{build_http2_acceptor, MeshTlsConfig};
 use sbproxy_mesh::ClusterHandle;
 
 use super::{
-    DispatchReplayFence, DispatchVerifier, ModelPlaneError, PreparedWorkerExecution,
-    SignedDispatchEnvelope, WorkerModelExecution, MAX_SIGNED_DISPATCH_ENVELOPE_BYTES,
+    rewrite_engine_model, DispatchReplayFence, DispatchVerifier, ModelPlaneError,
+    PreparedWorkerExecution, SignedDispatchEnvelope, WorkerModelExecution,
+    MAX_SIGNED_DISPATCH_ENVELOPE_BYTES,
 };
 
 /// Versioned internal path prefix reserved for private model dispatch.
@@ -498,35 +499,6 @@ impl Stream for GuardedUpstreamStream {
     }
 }
 
-fn rewrite_engine_model(
-    body: &[u8],
-    content_type: Option<&str>,
-    engine_model: &str,
-    max_body_bytes: usize,
-) -> Result<Bytes, ModelPlaneError> {
-    let is_json = content_type.is_some_and(|value| {
-        let media_type = value.split(';').next().unwrap_or_default().trim();
-        media_type == "application/json" || media_type.ends_with("+json")
-    });
-    if !is_json {
-        return Ok(Bytes::copy_from_slice(body));
-    }
-    let mut value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|_| ModelPlaneError::InvalidRequest)?;
-    let object = value
-        .as_object_mut()
-        .ok_or(ModelPlaneError::InvalidRequest)?;
-    object.insert(
-        "model".to_string(),
-        serde_json::Value::String(engine_model.to_string()),
-    );
-    let encoded = serde_json::to_vec(&value).map_err(|_| ModelPlaneError::InvalidRequest)?;
-    if encoded.len() > max_body_bytes {
-        return Err(ModelPlaneError::BodyTooLarge);
-    }
-    Ok(Bytes::from(encoded))
-}
-
 async fn collect_bounded(mut body: Incoming, max_bytes: usize) -> Result<Bytes, ModelPlaneError> {
     let mut collected = BytesMut::new();
     while let Some(frame) = body.frame().await {
@@ -583,6 +555,10 @@ fn headers_are_bounded(headers: &HeaderMap) -> bool {
 }
 
 fn error_response(error: ModelPlaneError) -> Response<ServerBody> {
+    sbproxy_observe::metrics::record_model_plane_rejection(
+        error.code(),
+        error.retry_class().as_str(),
+    );
     let status = match &error {
         ModelPlaneError::Envelope(super::DispatchEnvelopeError::ReplayDetected) => {
             StatusCode::CONFLICT
@@ -592,9 +568,9 @@ fn error_response(error: ModelPlaneError) -> Response<ServerBody> {
             StatusCode::CONFLICT
         }
         ModelPlaneError::Admission(_) => StatusCode::TOO_MANY_REQUESTS,
-        ModelPlaneError::Runtime(_) | ModelPlaneError::Upstream(_) => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        ModelPlaneError::NoEligibleReplica
+        | ModelPlaneError::Runtime(_)
+        | ModelPlaneError::Upstream(_) => StatusCode::SERVICE_UNAVAILABLE,
         ModelPlaneError::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         ModelPlaneError::Shutdown => StatusCode::SERVICE_UNAVAILABLE,
         ModelPlaneError::InvalidRequest

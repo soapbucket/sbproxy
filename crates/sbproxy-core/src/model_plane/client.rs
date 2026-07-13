@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
@@ -83,6 +84,22 @@ impl ModelPlaneResponse {
     }
 }
 
+impl From<ModelPlaneResponse> for reqwest::Response {
+    fn from(response: ModelPlaneResponse) -> Self {
+        let ModelPlaneResponse {
+            status,
+            headers,
+            body,
+            version,
+        } = response;
+        let mut response = http::Response::new(reqwest::Body::wrap_stream(body));
+        *response.status_mut() = status;
+        *response.version_mut() = version;
+        *response.headers_mut() = headers;
+        response.into()
+    }
+}
+
 /// Stateless connector for authenticated private model-plane attempts.
 #[derive(Debug, Clone)]
 pub struct ModelPlaneClient {
@@ -97,6 +114,21 @@ impl ModelPlaneClient {
 
     /// Send one already-signed dispatch and return its backpressured response.
     pub async fn dispatch(
+        &self,
+        endpoint: &str,
+        signed: &SignedDispatchEnvelope,
+        request_body: Bytes,
+    ) -> Result<ModelPlaneResponse, ModelPlaneError> {
+        let started = std::time::Instant::now();
+        let result = self.dispatch_inner(endpoint, signed, request_body).await;
+        sbproxy_observe::metrics::record_model_plane_peer_dispatch(
+            if result.is_ok() { "success" } else { "error" },
+            started.elapsed().as_secs_f64(),
+        );
+        result
+    }
+
+    async fn dispatch_inner(
         &self,
         endpoint: &str,
         signed: &SignedDispatchEnvelope,
@@ -201,9 +233,43 @@ impl ModelPlaneClient {
         Ok(ModelPlaneResponse {
             status: parts.status,
             headers: parts.headers,
-            body: Box::pin(stream),
+            body: Box::pin(ObservedPeerStream {
+                inner: Box::pin(stream),
+                complete: false,
+            }),
             version,
         })
+    }
+}
+
+struct ObservedPeerStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, ModelPlaneError>> + Send>>,
+    complete: bool,
+}
+
+impl Stream for ObservedPeerStream {
+    type Item = Result<Bytes, ModelPlaneError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(context) {
+            Poll::Ready(None) => {
+                self.complete = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.complete = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            result => result,
+        }
+    }
+}
+
+impl Drop for ObservedPeerStream {
+    fn drop(&mut self) {
+        if !self.complete {
+            sbproxy_observe::metrics::record_model_plane_stream_cancellation("peer");
+        }
     }
 }
 

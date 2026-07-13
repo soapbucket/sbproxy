@@ -418,9 +418,14 @@ async fn mtls_h2_streams_and_binds_proof_to_tls_peer() {
         )
         .await
         .expect("mTLS dispatch");
-    assert_eq!(response.status, http::StatusCode::OK);
-    let (version, frames) = collect_response(response).await;
-    assert_eq!(version, http::Version::HTTP_2);
+    let response = reqwest::Response::from(response);
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(response.version(), http::Version::HTTP_2);
+    let frames = response
+        .bytes_stream()
+        .map(|frame| frame.expect("response frame"))
+        .collect::<Vec<_>>()
+        .await;
     assert_eq!(frames.concat(), RESPONSE_BODY);
     assert!(frames.len() >= 2, "delayed engine writes should stream");
     let forwarded: serde_json::Value =

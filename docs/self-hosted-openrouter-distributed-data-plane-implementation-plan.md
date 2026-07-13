@@ -528,7 +528,7 @@ Commit: `git commit -m "WOR-1847: stream over the private model plane"`
 - Produces: stable `ModelPlaneError::retry_class()` distinguishing security, capacity, readiness, transport, and terminal stream failures.
 - Consumes: Task 3 ordered candidates and Task 4 transport.
 
-- [ ] **Step 1: Write failing local/peer/fallback tests**
+- [x] **Step 1: Write failing local/peer/fallback tests**
 
 ```rust,no_run
 #[tokio::test]
@@ -553,13 +553,13 @@ async fn security_rejection_does_not_try_another_replica() {
 }
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `cargo test -p sbproxy-core --test managed_replica_dispatch -- --nocapture`
 
 Expected: compile failure because managed providers still resolve only local runtime state.
 
-- [ ] **Step 3: Implement managed attempt resolution**
+- [x] **Step 3: Implement managed attempt resolution**
 
 ```rust,no_run
 pub enum ManagedAttempt {
@@ -577,11 +577,11 @@ pub async fn managed_attempts(
 
 Evaluate provider and logical-model eligibility before this call. Snapshot the directory once per provider attempt. Verify every candidate matches the active deployment generation. Build a new nonce per peer attempt, but preserve one public request ID. Do not include the bearer key.
 
-- [ ] **Step 4: Integrate all existing forwarding shapes**
+- [x] **Step 4: Integrate all existing forwarding shapes**
 
 Route JSON, method-aware JSON, native byte bypass, and raw multipart bodies through a shared `send_provider_attempt` adapter. External providers keep the existing `AiClient` path. Managed candidates use local execution or `ModelPlaneClient`. Provider fallback begins only after the managed candidate list returns a retryable pre-output exhaustion.
 
-- [ ] **Step 5: Write failing mid-stream and trace tests**
+- [x] **Step 5: Write failing mid-stream and trace tests**
 
 ```rust,no_run
 #[tokio::test]
@@ -600,7 +600,7 @@ fn route_trace_is_bounded_and_contains_no_endpoint() {
 }
 ```
 
-- [ ] **Step 6: Run and verify RED**
+- [x] **Step 6: Run and verify RED**
 
 Run: `cargo test -p sbproxy-core --test managed_replica_dispatch mid_stream_failure_is_partial_and_never_replayed -- --nocapture`
 
@@ -608,11 +608,11 @@ Run: `cargo test -p sbproxy-core --test managed_replica_dispatch route_trace_is_
 
 Expected: FAIL because replica-level stream outcomes and traces do not exist.
 
-- [ ] **Step 7: Add bounded metrics and tracing**
+- [x] **Step 7: Add bounded metrics and tracing**
 
 Register counters/histograms for route class, replica attempts, pre-output failover, cancellation, auth/replay rejection, queue refusal, and peer latency. Labels are allowlisted enums plus bounded provider/deployment identifiers already used by the model host. Trace candidate counts and selected reason, never the endpoint or node certificate.
 
-- [ ] **Step 8: Run focused tests and commit**
+- [x] **Step 8: Run focused tests and commit**
 
 Run: `cargo test -p sbproxy-core --test managed_replica_dispatch && cargo test -p sbproxy-core server::ai_dispatch::tests`
 

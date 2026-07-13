@@ -1636,6 +1636,107 @@ pub fn record_provider_attempt(provider: &str, outcome: &'static str) {
         .inc();
 }
 
+/// Count one managed-replica attempt without exposing worker topology.
+pub fn record_managed_replica_attempt(
+    provider: &str,
+    deployment: &str,
+    route_class: &'static str,
+    outcome: &str,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_managed_replica_attempts_total",
+            "Managed model replica attempts by provider, deployment, route class, and bounded outcome",
+            &["provider", "deployment", "route_class", "outcome"],
+        )
+        .expect("managed replica attempt counter registers")
+    });
+    let provider = sanitize_label("provider", provider);
+    let deployment = sanitize_label("deployment", deployment);
+    let outcome = sanitize_label("managed_replica_outcome", outcome);
+    counter
+        .with_label_values(&[
+            provider.as_str(),
+            deployment.as_str(),
+            route_class,
+            outcome.as_str(),
+        ])
+        .inc();
+}
+
+/// Count a safe managed-replica handover made before client output.
+pub fn record_managed_replica_failover(provider: &str, deployment: &str, reason: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_managed_replica_failovers_total",
+            "Safe pre-output managed replica handovers by provider, deployment, and bounded reason",
+            &["provider", "deployment", "reason"],
+        )
+        .expect("managed replica failover counter registers")
+    });
+    let provider = sanitize_label("provider", provider);
+    let deployment = sanitize_label("deployment", deployment);
+    let reason = sanitize_label("managed_replica_failover_reason", reason);
+    counter
+        .with_label_values(&[provider.as_str(), deployment.as_str(), reason.as_str()])
+        .inc();
+}
+
+/// Record private peer dispatch time to response headers.
+pub fn record_model_plane_peer_dispatch(outcome: &'static str, duration_seconds: f64) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let histogram = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_model_plane_peer_dispatch_seconds",
+            "Private model-plane peer dispatch duration to response headers by outcome",
+            &["outcome"],
+            vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+        )
+        .expect("model-plane peer dispatch histogram registers")
+    });
+    histogram
+        .with_label_values(&[outcome])
+        .observe(duration_seconds);
+}
+
+/// Count a private response body dropped before its terminal frame.
+pub fn record_model_plane_stream_cancellation(route_class: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_plane_stream_cancellations_total",
+            "Managed response streams dropped before completion by route class",
+            &["route_class"],
+        )
+        .expect("model-plane cancellation counter registers")
+    });
+    counter.with_label_values(&[route_class]).inc();
+}
+
+/// Count authenticated model-plane refusals using stable internal codes only.
+pub fn record_model_plane_rejection(code: &str, retry_class: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_plane_rejections_total",
+            "Private model-plane request refusals by bounded code and retry class",
+            &["code", "retry_class"],
+        )
+        .expect("model-plane rejection counter registers")
+    });
+    let code = sanitize_label("model_plane_rejection_code", code);
+    counter
+        .with_label_values(&[code.as_str(), retry_class])
+        .inc();
+}
+
 /// Count a silently-degraded best-effort operation on
 /// `sbproxy_silent_degradations_total{op}`. Surfaces error paths that
 /// were previously dropped with `let _ = ...` (cache promotion, cache

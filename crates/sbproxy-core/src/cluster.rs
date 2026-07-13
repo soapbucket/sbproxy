@@ -194,6 +194,13 @@ pub(crate) struct ProcessModelPlaneConfig {
     pub(crate) cluster: ClusterHandle,
 }
 
+/// Installed authentication material used by gateway-side model-plane clients.
+#[derive(Clone)]
+pub(crate) struct ProcessModelPlaneClientConfig {
+    pub(crate) security: Arc<ModelPlaneSecurity>,
+    pub(crate) cluster: ClusterHandle,
+}
+
 impl std::fmt::Debug for ModelPlaneSecurity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -711,7 +718,13 @@ impl ClusterOwner {
                 }
             },
         };
-        let model_plane_security = resolve_model_plane_security(effective.as_ref())?;
+        let model_plane_security = resolve_model_plane_security(
+            effective.as_ref(),
+            server.model_host.is_some()
+                || effective
+                    .as_ref()
+                    .is_some_and(|config| config.model_bind.is_some()),
+        )?;
         let model_plane_bind = effective
             .as_ref()
             .and_then(|config| config.model_bind.as_deref())
@@ -807,6 +820,19 @@ impl ClusterOwner {
             .and_then(|installed| {
                 Some(ProcessModelPlaneConfig {
                     bind_addr: installed.model_plane_bind?,
+                    security: installed.model_plane_security.clone()?,
+                    cluster: installed.handle.clone(),
+                })
+            })
+    }
+
+    fn model_plane_client_config(&self) -> Option<ProcessModelPlaneClientConfig> {
+        self.installed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|installed| {
+                Some(ProcessModelPlaneClientConfig {
                     security: installed.model_plane_security.clone()?,
                     cluster: installed.handle.clone(),
                 })
@@ -1322,8 +1348,9 @@ fn resolve_security(
 
 fn resolve_model_plane_security(
     config: Option<&EffectiveClusterConfig>,
+    data_plane_enabled: bool,
 ) -> Result<Option<Arc<ModelPlaneSecurity>>> {
-    let Some(config) = config.filter(|config| config.model_bind.is_some()) else {
+    let Some(config) = config.filter(|_| data_plane_enabled) else {
         return Ok(None);
     };
     let security = match &config.security {
@@ -1437,6 +1464,11 @@ pub(crate) fn current_cluster_state_directory() -> Option<PathBuf> {
 /// Configured process-owned private model plane, when this node is a worker.
 pub(crate) fn current_process_model_plane_config() -> Option<ProcessModelPlaneConfig> {
     process_owner().model_plane_config()
+}
+
+/// Configured process-owned authentication for outbound private model dispatch.
+pub(crate) fn current_process_model_plane_client_config() -> Option<ProcessModelPlaneClientConfig> {
+    process_owner().model_plane_client_config()
 }
 
 /// Reserve a due process node-snapshot publication.

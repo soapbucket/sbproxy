@@ -730,6 +730,10 @@ pub struct RequestContext {
     /// response stream. Dropping the context releases capacity to the next
     /// priority-ordered request.
     pub managed_model_permit: Option<crate::server::model_host::ManagedModelPermit>,
+    /// Bounded non-sensitive replica decision for a distributed managed request.
+    pub managed_route_trace: Option<crate::model_plane::ManagedRouteTrace>,
+    /// Direct local or authenticated peer route selected for a managed request.
+    pub managed_route_class: Option<sbproxy_ai::managed_replica::ManagedRouteClass>,
     /// Derived AI request cost in micro-USD (`1e-6` USD), computed
     /// from the same pricing catalog used by AI billing metrics.
     pub ai_cost_usd_micros: Option<u64>,
@@ -1129,6 +1133,8 @@ impl RequestContext {
             ai_key_tpm_bucket: None,
             ai_lane_priority: None,
             managed_model_permit: None,
+            managed_route_trace: None,
+            managed_route_class: None,
             ai_cost_usd_micros: None,
             ai_surface: None,
             ai_outcome: None,

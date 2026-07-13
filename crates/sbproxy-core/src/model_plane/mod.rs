@@ -1,12 +1,20 @@
 //! Authenticated private model-plane request primitives.
 
 mod client;
+mod dispatch;
 mod envelope;
 mod execution;
 mod replay;
+mod request;
 mod server;
 
+pub(crate) use request::{multipart_model, rewrite_engine_model};
+
 pub use client::{ModelPlaneClient, ModelPlaneClientSecurity, ModelPlaneResponse};
+pub use dispatch::{
+    dispatch_managed_candidates, ManagedAttemptResponse, ManagedAttemptTrace,
+    ManagedDispatchFailure, ManagedDispatchOutcome, ManagedReplicaExecutor, ManagedRouteTrace,
+};
 pub use envelope::{
     body_sha256_hex, DispatchAuthProof, DispatchEnvelope, DispatchEnvelopeError, DispatchSigner,
     DispatchVerifier, SignedDispatchEnvelope, VerifiedDispatch, DISPATCH_ENVELOPE_SCHEMA_VERSION,
@@ -22,6 +30,9 @@ pub use server::{
 /// Stable private model-plane failure taxonomy.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelPlaneError {
+    /// No current replica passed generation, health, endpoint, and state filters.
+    #[error("no eligible managed deployment replica")]
+    NoEligibleReplica,
     /// The dispatch named a generation no longer assigned to this worker.
     #[error("stale managed deployment generation")]
     StaleDeploymentGeneration,
@@ -68,10 +79,39 @@ pub enum ModelPlaneError {
     Shutdown,
 }
 
+/// Stable retry class used by bounded route traces and metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPlaneRetryClass {
+    /// Authentication, TLS identity, or replay safety failed.
+    Security,
+    /// Queue or worker capacity was temporarily unavailable.
+    Capacity,
+    /// The candidate was stale, unassigned, or not ready.
+    Readiness,
+    /// A connection, upstream, or listener failed before output.
+    Transport,
+    /// The request is invalid or cannot be retried safely.
+    Terminal,
+}
+
+impl ModelPlaneRetryClass {
+    /// Closed lowercase label used by metrics and traces.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Security => "security",
+            Self::Capacity => "capacity",
+            Self::Readiness => "readiness",
+            Self::Transport => "transport",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
 impl ModelPlaneError {
     /// Stable machine-readable error code.
     pub fn code(&self) -> &str {
         match self {
+            Self::NoEligibleReplica => "no_eligible_replica",
             Self::StaleDeploymentGeneration => "stale_deployment_generation",
             Self::DeploymentNotAssigned => "deployment_not_assigned",
             Self::Admission(error) => error.reason.as_str(),
@@ -91,7 +131,8 @@ impl ModelPlaneError {
     /// Whether a different current replica may safely be attempted before output.
     pub fn retryable(&self) -> bool {
         match self {
-            Self::StaleDeploymentGeneration
+            Self::NoEligibleReplica
+            | Self::StaleDeploymentGeneration
             | Self::DeploymentNotAssigned
             | Self::Transport(_)
             | Self::Upstream(_)
@@ -112,6 +153,35 @@ impl ModelPlaneError {
             | Self::InvalidRequest
             | Self::InvalidConfiguration(_)
             | Self::Tls(_) => false,
+        }
+    }
+
+    /// Closed-set failure class for retry policy, traces, and metrics.
+    pub fn retry_class(&self) -> ModelPlaneRetryClass {
+        match self {
+            Self::Envelope(_) | Self::InvalidConfiguration(_) | Self::Tls(_) => {
+                ModelPlaneRetryClass::Security
+            }
+            Self::Admission(_) => ModelPlaneRetryClass::Capacity,
+            Self::NoEligibleReplica
+            | Self::StaleDeploymentGeneration
+            | Self::DeploymentNotAssigned
+            | Self::Runtime(_) => ModelPlaneRetryClass::Readiness,
+            Self::Transport(_) | Self::Upstream(_) | Self::Shutdown => {
+                ModelPlaneRetryClass::Transport
+            }
+            Self::Remote { code, retryable } => {
+                if !retryable {
+                    ModelPlaneRetryClass::Security
+                } else if code.contains("queue") || code.contains("capacity") {
+                    ModelPlaneRetryClass::Capacity
+                } else if code.contains("generation") || code.contains("assigned") {
+                    ModelPlaneRetryClass::Readiness
+                } else {
+                    ModelPlaneRetryClass::Transport
+                }
+            }
+            Self::BodyTooLarge | Self::InvalidRequest => ModelPlaneRetryClass::Terminal,
         }
     }
 }

@@ -747,32 +747,102 @@ pub(super) async fn handle_ai_proxy(
             })?;
         let provider = &config.providers[provider_idx];
 
-        let resp = AI_CLIENT
-            .load()
-            .forward_bytes(
-                provider,
-                &method_str,
-                &path,
-                body_bytes,
-                &request_content_type,
-            )
+        let distributed_managed = crate::server::model_host::distributed_managed_provider(provider);
+        let response_result: anyhow::Result<reqwest::Response> = if distributed_managed {
+            async {
+                let requested_model =
+                    crate::model_plane::multipart_model(body_bytes.as_ref(), &request_content_type)
+                        .map_err(anyhow::Error::new)?;
+                let origin = ctx
+                    .origin_idx
+                    .and_then(|index| ctx.pipeline.config.origins.get(index))
+                    .map(|origin| origin.origin_id.to_string())
+                    .unwrap_or_else(|| ctx.hostname.to_string());
+                let preferred_region = ctx
+                    .principal
+                    .attrs
+                    .metadata
+                    .get("region")
+                    .cloned()
+                    .or_else(|| ctx.request_geo.clone());
+                let prefix_key = format!(
+                    "{}:{}",
+                    ctx.tenant_id,
+                    requested_model.as_deref().unwrap_or_default()
+                );
+                let maximum = config
+                    .max_body_size
+                    .filter(|maximum| *maximum > 0)
+                    .unwrap_or(64 * 1024 * 1024)
+                    .min(1024 * 1024 * 1024);
+                match crate::server::model_host::distributed_managed_upstream(
+                    crate::server::model_host::ManagedDistributedRequest {
+                        origin: &origin,
+                        provider,
+                        requested_model: requested_model.as_deref(),
+                        request_id: ctx.request_id.as_str(),
+                        tenant_id: ctx.tenant_id.as_str(),
+                        governed_key_id: ctx.principal.api_key_id(),
+                        policy_revision: &pipeline.config_revision,
+                        path: &path,
+                        body: body_bytes,
+                        content_type: Some(&request_content_type),
+                        priority: crate::server::model_host::lane_class_for(ctx.ai_lane_priority),
+                        prefix_key: prefix_key.as_bytes(),
+                        preferred_region: preferred_region.as_deref(),
+                        requested_adapter: None,
+                        max_body_bytes: maximum,
+                    },
+                )
+                .await
+                {
+                    Ok(Some(upstream)) => {
+                        ctx.ai_serve_model = Some(upstream.public_model);
+                        ctx.managed_model_permit = upstream.local_permit;
+                        ctx.managed_route_class = Some(upstream.route_class);
+                        ctx.managed_route_trace = Some(upstream.trace);
+                        Ok(upstream.response)
+                    }
+                    Ok(None) => Err(anyhow::anyhow!(
+                        "distributed managed provider did not produce an attempt"
+                    )),
+                    Err(error) => {
+                        if let Some(trace) = error.trace() {
+                            ctx.managed_route_trace = Some(trace.clone());
+                        }
+                        Err(anyhow::Error::new(error))
+                    }
+                }
+            }
             .await
-            .map_err(|e| {
-                record_ai_transport_failure(
-                    &ai_span,
-                    Some(provider.name.as_str()),
-                    &e,
-                    "AI upstream multipart request failed",
-                );
-                warn!(
-                    error = %e,
-                    method = %method_str,
-                    ai.surface = surface_label,
-                    content_type = %request_content_type,
-                    "AI proxy: upstream multipart request failed"
-                );
-                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-            })?;
+        } else {
+            AI_CLIENT
+                .load()
+                .forward_bytes(
+                    provider,
+                    &method_str,
+                    &path,
+                    body_bytes,
+                    &request_content_type,
+                )
+                .await
+        };
+        let resp = response_result.map_err(|e| {
+            record_ai_transport_failure(
+                &ai_span,
+                Some(provider.name.as_str()),
+                &e,
+                "AI upstream multipart request failed",
+            );
+            warn!(
+                error = %e,
+                method = %method_str,
+                ai.surface = surface_label,
+                content_type = %request_content_type,
+                "AI proxy: upstream multipart request failed"
+            );
+            Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+        })?;
 
         let format = sbproxy_ai::client::provider_format(provider);
 
@@ -2622,10 +2692,16 @@ pub(super) async fn handle_ai_proxy(
         // A failed prior managed attempt may still hold deployment capacity.
         // Release it before this attempt queues or dispatches.
         ctx.managed_model_permit = None;
+        ctx.managed_route_trace = None;
+        ctx.managed_route_class = None;
         let mut resolved_provider = config.providers[provider_idx].clone();
         let mut local_public_model = None;
         let mut local_engine_model = None;
-        if resolved_provider.serve.is_some() || resolved_provider.is_managed_model() {
+        let distributed_managed =
+            crate::server::model_host::distributed_managed_provider(&resolved_provider);
+        if (resolved_provider.serve.is_some() || resolved_provider.is_managed_model())
+            && !distributed_managed
+        {
             let requested = (!model.is_empty()).then_some(model.as_str());
             let origin = ctx
                 .origin_idx
@@ -2646,6 +2722,8 @@ pub(super) async fn handle_ai_proxy(
                     local_public_model = Some(upstream.public_model);
                     local_engine_model = Some(upstream.engine_model);
                     ctx.managed_model_permit = Some(upstream.permit);
+                    ctx.managed_route_class =
+                        Some(sbproxy_ai::managed_replica::ManagedRouteClass::Local);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -2697,7 +2775,7 @@ pub(super) async fn handle_ai_proxy(
         // engine reports its weights file path there) back to the
         // public name the client asked for. Reset per attempt so
         // a failover to a hosted lane clears it.
-        ctx.ai_serve_model = local_public_model;
+        ctx.ai_serve_model = local_public_model.clone();
         ai_span.record("gen_ai.system", provider.name.as_str());
         ai_span.record("llm.provider", provider.name.as_str());
         if !resolved_model.is_empty() {
@@ -2789,21 +2867,97 @@ pub(super) async fn handle_ai_proxy(
             provider = %provider.name,
             attempt = attempt,
         );
-        let result = async {
-            if let Some((bypass_body, native_path)) = upstream_call {
-                AI_CLIENT
-                    .load()
-                    .forward_native_bypass(provider, &method_str, native_path, bypass_body)
-                    .await
-            } else {
-                AI_CLIENT
-                    .load()
-                    .forward_request(provider, &path, &attempt_body)
-                    .await
+        let result: anyhow::Result<reqwest::Response> = if distributed_managed {
+            let managed_body = serde_json::to_vec(&attempt_body)
+                .map(bytes::Bytes::from)
+                .map_err(anyhow::Error::from);
+            match managed_body {
+                Ok(managed_body) => {
+                    let origin = ctx
+                        .origin_idx
+                        .and_then(|index| ctx.pipeline.config.origins.get(index))
+                        .map(|origin| origin.origin_id.to_string())
+                        .unwrap_or_else(|| ctx.hostname.to_string());
+                    let prefix_key = extract_prefix_key(&attempt_body, 1024);
+                    let requested_adapter = attempt_body
+                        .get("adapter")
+                        .or_else(|| attempt_body.get("lora_adapter"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let preferred_region = ctx
+                        .principal
+                        .attrs
+                        .metadata
+                        .get("region")
+                        .cloned()
+                        .or_else(|| ctx.request_geo.clone());
+                    let maximum = config
+                        .max_body_size
+                        .filter(|maximum| *maximum > 0)
+                        .unwrap_or(64 * 1024 * 1024)
+                        .min(1024 * 1024 * 1024);
+                    let managed = crate::server::model_host::distributed_managed_upstream(
+                        crate::server::model_host::ManagedDistributedRequest {
+                            origin: &origin,
+                            provider,
+                            requested_model: (!model.is_empty()).then_some(model.as_str()),
+                            request_id: ctx.request_id.as_str(),
+                            tenant_id: ctx.tenant_id.as_str(),
+                            governed_key_id: ctx.principal.api_key_id(),
+                            policy_revision: &pipeline.config_revision,
+                            path: &path,
+                            body: managed_body,
+                            content_type: Some("application/json"),
+                            priority: crate::server::model_host::lane_class_for(
+                                ctx.ai_lane_priority,
+                            ),
+                            prefix_key: &prefix_key,
+                            preferred_region: preferred_region.as_deref(),
+                            requested_adapter: requested_adapter.as_deref(),
+                            max_body_bytes: maximum,
+                        },
+                    )
+                    .instrument(attempt_span)
+                    .await;
+                    match managed {
+                        Ok(Some(upstream)) => {
+                            local_public_model = Some(upstream.public_model);
+                            ctx.managed_model_permit = upstream.local_permit;
+                            ctx.managed_route_class = Some(upstream.route_class);
+                            ctx.managed_route_trace = Some(upstream.trace);
+                            Ok(upstream.response)
+                        }
+                        Ok(None) => Err(anyhow::anyhow!(
+                            "distributed managed provider did not produce an attempt"
+                        )),
+                        Err(error) => {
+                            if let Some(trace) = error.trace() {
+                                ctx.managed_route_trace = Some(trace.clone());
+                            }
+                            Err(anyhow::Error::new(error))
+                        }
+                    }
+                }
+                Err(error) => Err(error),
             }
-        }
-        .instrument(attempt_span)
-        .await;
+        } else {
+            async {
+                if let Some((bypass_body, native_path)) = upstream_call {
+                    AI_CLIENT
+                        .load()
+                        .forward_native_bypass(provider, &method_str, native_path, bypass_body)
+                        .await
+                } else {
+                    AI_CLIENT
+                        .load()
+                        .forward_request(provider, &path, &attempt_body)
+                        .await
+                }
+            }
+            .instrument(attempt_span)
+            .await
+        };
+        ctx.ai_serve_model = local_public_model.clone();
 
         match result {
             Ok(resp) => {

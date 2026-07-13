@@ -26,6 +26,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use bytes::Bytes;
 use sbproxy_ai::local_host::pick_local_model_name;
 use sbproxy_ai::AiHandlerConfig;
 use sbproxy_model_host::{
@@ -1896,6 +1897,426 @@ pub struct ManagedLocalUpstream {
     pub engine_model: String,
     /// Deployment admission held until the complete request context drops.
     pub permit: ManagedModelPermit,
+}
+
+/// Complete governed request passed to the distributed managed-model router.
+pub struct ManagedDistributedRequest<'a> {
+    /// Origin whose committed route table selected the provider.
+    pub origin: &'a str,
+    /// Canonical managed-model provider.
+    pub provider: &'a sbproxy_ai::provider::ProviderConfig,
+    /// Public model requested by the caller, when present.
+    pub requested_model: Option<&'a str>,
+    /// Stable request correlation ID.
+    pub request_id: &'a str,
+    /// Evaluated tenant identity.
+    pub tenant_id: &'a str,
+    /// Non-secret governed credential ID.
+    pub governed_key_id: &'a str,
+    /// Effective compiled policy revision.
+    pub policy_revision: &'a str,
+    /// OpenAI-compatible inference path.
+    pub path: &'a str,
+    /// Exact post-policy request body.
+    pub body: Bytes,
+    /// Request media type retained for the worker engine.
+    pub content_type: Option<&'a str>,
+    /// Scheduler lane selected from the governed key.
+    pub priority: sbproxy_model_host::PriorityClass,
+    /// Stable prompt or tenant affinity key.
+    pub prefix_key: &'a [u8],
+    /// Optional locality hint.
+    pub preferred_region: Option<&'a str>,
+    /// Optional adapter that must already be declared by the replica.
+    pub requested_adapter: Option<&'a str>,
+    /// Maximum engine-facing request body size.
+    pub max_body_bytes: usize,
+}
+
+/// Selected distributed response and its public route identity.
+#[derive(Debug)]
+pub struct ManagedDistributedUpstream {
+    /// Backpressured local or authenticated peer response.
+    pub response: reqwest::Response,
+    /// Stable public model name echoed to clients.
+    pub public_model: String,
+    /// Local admission ownership, absent for peer responses.
+    pub local_permit: Option<ManagedModelPermit>,
+    /// Selected direct local call or authenticated peer hop.
+    pub route_class: sbproxy_ai::managed_replica::ManagedRouteClass,
+    /// Bounded non-sensitive route explanation.
+    pub trace: crate::model_plane::ManagedRouteTrace,
+}
+
+/// Distributed route resolution or bounded attempt failure.
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedDistributedError {
+    /// The committed public route or cluster client state was inconsistent.
+    #[error("managed route resolution failed: {0}")]
+    Resolution(String),
+    /// Every safe current replica attempt failed.
+    #[error(transparent)]
+    Dispatch(#[from] crate::model_plane::ManagedDispatchFailure),
+}
+
+impl ManagedDistributedError {
+    /// Bounded route trace when candidate selection reached dispatch.
+    pub fn trace(&self) -> Option<&crate::model_plane::ManagedRouteTrace> {
+        match self {
+            Self::Resolution(_) => None,
+            Self::Dispatch(failure) => Some(&failure.trace),
+        }
+    }
+}
+
+struct ProductionManagedReplicaExecutor {
+    runtime: Arc<ProductionModelRuntime>,
+    client_config: crate::cluster::ProcessModelPlaneClientConfig,
+    request_id: String,
+    tenant_id: String,
+    governed_key_id: String,
+    policy_revision: String,
+    public_model: String,
+    path: String,
+    body: Bytes,
+    content_type: Option<String>,
+    priority: sbproxy_model_host::PriorityClass,
+    max_body_bytes: usize,
+}
+
+#[async_trait]
+impl crate::model_plane::ManagedReplicaExecutor for ProductionManagedReplicaExecutor {
+    async fn execute(
+        &self,
+        candidate: &sbproxy_ai::managed_replica::ManagedReplicaCandidate,
+    ) -> Result<crate::model_plane::ManagedAttemptResponse, crate::model_plane::ModelPlaneError>
+    {
+        match candidate.route_class {
+            sbproxy_ai::managed_replica::ManagedRouteClass::Local => {
+                self.execute_local(candidate).await
+            }
+            sbproxy_ai::managed_replica::ManagedRouteClass::Peer => {
+                self.execute_peer(candidate).await
+            }
+        }
+    }
+}
+
+impl ProductionManagedReplicaExecutor {
+    async fn execute_local(
+        &self,
+        candidate: &sbproxy_ai::managed_replica::ManagedReplicaCandidate,
+    ) -> Result<crate::model_plane::ManagedAttemptResponse, crate::model_plane::ModelPlaneError>
+    {
+        let execution = crate::model_plane::WorkerModelExecution::production(
+            Arc::clone(&self.runtime),
+            self.client_config.cluster.identity().node_id.clone(),
+        )
+        .prepare(
+            &candidate.replica.deployment,
+            candidate.replica.deployment_generation,
+            self.priority,
+        )
+        .await?;
+        let body = crate::model_plane::rewrite_engine_model(
+            &self.body,
+            self.content_type.as_deref(),
+            &execution.engine_model,
+            self.max_body_bytes,
+        )?;
+        let target = format!("{}{}", execution.base_url, self.path);
+        let mut request = managed_loopback_client().post(target).body(body);
+        if let Some(content_type) = self.content_type.as_deref() {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| crate::model_plane::ModelPlaneError::Upstream(error.to_string()))?;
+        Ok(
+            crate::model_plane::ManagedAttemptResponse::with_local_permit(
+                response,
+                execution.permit,
+            ),
+        )
+    }
+
+    async fn execute_peer(
+        &self,
+        candidate: &sbproxy_ai::managed_replica::ManagedReplicaCandidate,
+    ) -> Result<crate::model_plane::ManagedAttemptResponse, crate::model_plane::ModelPlaneError>
+    {
+        let endpoint = candidate.replica.endpoint.as_deref().ok_or(
+            crate::model_plane::ModelPlaneError::InvalidConfiguration(
+                "peer candidate has no model endpoint".to_string(),
+            ),
+        )?;
+        let issued_at_unix_ms = current_unix_time_ms().map_err(|error| {
+            crate::model_plane::ModelPlaneError::InvalidConfiguration(error.to_string())
+        })?;
+        let expires_at_unix_ms = issued_at_unix_ms.checked_add(10_000).ok_or_else(|| {
+            crate::model_plane::ModelPlaneError::InvalidConfiguration(
+                "dispatch expiry overflowed".to_string(),
+            )
+        })?;
+        let envelope = crate::model_plane::DispatchEnvelope {
+            schema_version: crate::model_plane::DISPATCH_ENVELOPE_SCHEMA_VERSION,
+            issuer_node_id: self.client_config.cluster.identity().node_id.clone(),
+            audience_node_id: candidate.replica.node_id.clone(),
+            request_id: normalize_dispatch_identifier(&self.request_id, "request"),
+            nonce: uuid::Uuid::new_v4().to_string(),
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+            hop_count: 1,
+            tenant_id: normalize_dispatch_identifier(&self.tenant_id, "tenant"),
+            governed_key_id: normalize_dispatch_identifier(&self.governed_key_id, "anonymous"),
+            policy_revision: normalize_policy_revision(&self.policy_revision),
+            deployment: candidate.replica.deployment.clone(),
+            deployment_generation: candidate.replica.deployment_generation,
+            logical_model: self.public_model.clone(),
+            priority: self.priority,
+            method: "POST".to_string(),
+            path: self.path.clone(),
+            content_type: self.content_type.clone(),
+            body_sha256: crate::model_plane::body_sha256_hex(&self.body),
+        };
+        let (signed, security) = match self.client_config.security.as_ref() {
+            crate::cluster::ModelPlaneSecurity::Mtls { tls, server_name } => (
+                envelope.sign(crate::model_plane::DispatchSigner::PeerIdentity(
+                    &self.client_config.cluster,
+                ))?,
+                crate::model_plane::ModelPlaneClientSecurity::Mtls {
+                    tls: tls.clone(),
+                    server_name: server_name.clone(),
+                },
+            ),
+            crate::cluster::ModelPlaneSecurity::DevelopmentSharedKey { key } => (
+                envelope.sign(crate::model_plane::DispatchSigner::DevelopmentSharedKey(
+                    key.as_bytes(),
+                ))?,
+                crate::model_plane::ModelPlaneClientSecurity::DevelopmentSharedKey {
+                    key: Arc::from(key.as_bytes()),
+                },
+            ),
+        };
+        let response = crate::model_plane::ModelPlaneClient::new(security)
+            .dispatch(endpoint, &signed, self.body.clone())
+            .await?;
+        Ok(crate::model_plane::ManagedAttemptResponse::without_permit(
+            response.into(),
+        ))
+    }
+}
+
+fn managed_loopback_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn normalize_dispatch_identifier(value: &str, fallback: &str) -> String {
+    let candidate = if value.is_empty() { fallback } else { value };
+    if candidate.len() <= 128
+        && candidate.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':' | b'@' | b'/')
+        })
+    {
+        candidate.to_string()
+    } else {
+        use sha2::{Digest as _, Sha256};
+        format!("id:{}", hex::encode(Sha256::digest(candidate.as_bytes())))
+    }
+}
+
+fn normalize_policy_revision(value: &str) -> String {
+    if !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
+    {
+        value.to_string()
+    } else {
+        normalize_dispatch_identifier(value, "unversioned")
+    }
+}
+
+/// Whether this provider uses the canonical distributed model data plane.
+pub fn distributed_managed_provider(provider: &sbproxy_ai::provider::ProviderConfig) -> bool {
+    provider.is_managed_model()
+        && crate::cluster::current_cluster_settings()
+            .is_some_and(|settings| settings.model_control_enabled)
+}
+
+/// Resolve one directory snapshot and dispatch through current replicas.
+pub async fn distributed_managed_upstream(
+    request: ManagedDistributedRequest<'_>,
+) -> Result<Option<ManagedDistributedUpstream>, ManagedDistributedError> {
+    if !distributed_managed_provider(request.provider) {
+        return Ok(None);
+    }
+    let runtime = model_runtime_manager();
+    let placement = runtime.cluster_placement_state().ok_or_else(|| {
+        ManagedDistributedError::Resolution(
+            "canonical cluster placement is not initialized".to_string(),
+        )
+    })?;
+    let desired = placement.global();
+    let names = desired
+        .routes
+        .iter()
+        .filter(|route| {
+            route.origin == request.origin && route.provider == request.provider.name.as_str()
+        })
+        .map(|route| route.model.clone())
+        .collect::<Vec<_>>();
+    let public_model = pick_local_model_name(&names, request.requested_model, request.provider)
+        .ok_or_else(|| {
+            ManagedDistributedError::Resolution(format!(
+                "provider {:?} has managed routes {names:?}, but request model {:?} has no unambiguous match",
+                request.provider.name.as_str(),
+                request.requested_model
+            ))
+        })?;
+    let route = desired
+        .route_for(
+            request.origin,
+            request.provider.name.as_str(),
+            &public_model,
+        )
+        .ok_or_else(|| {
+            ManagedDistributedError::Resolution(format!(
+                "provider {:?} model {public_model:?} has no committed deployment route",
+                request.provider.name.as_str()
+            ))
+        })?;
+    if request.provider.deployment.as_deref() != Some(route.deployment.as_str()) {
+        return Err(ManagedDistributedError::Resolution(
+            "provider deployment differs from its committed route".to_string(),
+        ));
+    }
+    let client_config =
+        crate::cluster::current_process_model_plane_client_config().ok_or_else(|| {
+            ManagedDistributedError::Resolution(
+                "distributed model-plane client authentication is not installed".to_string(),
+            )
+        })?;
+    let local_node_id = client_config.cluster.identity().node_id.as_str();
+    let view = crate::cluster::current_model_directory()
+        .map(|directory| directory.load())
+        .unwrap_or_else(|| Arc::new(sbproxy_ai::model_directory::ModelDirectoryView::default()));
+    let mut selection = sbproxy_ai::managed_replica::ManagedReplicaRouter::ordered_candidates(
+        &view,
+        &route.deployment,
+        sbproxy_ai::managed_replica::ManagedReplicaInput {
+            local_node_id,
+            requested_adapter: request.requested_adapter,
+            preferred_region: request.preferred_region,
+            prefix_key: request.prefix_key,
+            allow_cold: true,
+        },
+    );
+    if selection.candidates.is_empty() {
+        if let Some(generation) =
+            runtime.cluster_assignment_generation(local_node_id, &route.deployment)
+        {
+            let deployment = desired.deployments.get(&route.deployment).ok_or_else(|| {
+                ManagedDistributedError::Resolution(
+                    "local assignment has no global deployment".to_string(),
+                )
+            })?;
+            selection
+                .candidates
+                .push(sbproxy_ai::managed_replica::ManagedReplicaCandidate {
+                    replica: sbproxy_ai::model_directory::ModelDirectoryReplica {
+                        node_id: local_node_id.to_string(),
+                        deployment: route.deployment.clone(),
+                        deployment_generation: generation,
+                        model: deployment.desired.model.clone(),
+                        variant: deployment.desired.variant.clone(),
+                        endpoint: client_config.cluster.identity().model_endpoint.clone(),
+                        state: sbproxy_model_host::DeploymentRuntimeState::Assigned,
+                        active_requests: 0,
+                        queue_depth: 0,
+                        adapters: Vec::new(),
+                        node_labels: client_config.cluster.identity().labels.clone(),
+                        compute_utilization_millis: None,
+                        memory_occupancy_millis: None,
+                        model_plane_health: runtime.model_plane_health(),
+                    },
+                    route_class: sbproxy_ai::managed_replica::ManagedRouteClass::Local,
+                });
+            selection.trace.eligible_candidates = 1;
+            selection.trace.selected_reason = Some("local_assignment");
+        }
+    }
+    let executor = ProductionManagedReplicaExecutor {
+        runtime,
+        client_config,
+        request_id: request.request_id.to_string(),
+        tenant_id: request.tenant_id.to_string(),
+        governed_key_id: request.governed_key_id.to_string(),
+        policy_revision: request.policy_revision.to_string(),
+        public_model: public_model.clone(),
+        path: request.path.to_string(),
+        body: request.body,
+        content_type: request.content_type.map(str::to_string),
+        priority: request.priority,
+        max_body_bytes: request.max_body_bytes,
+    };
+    let deployment = route.deployment.clone();
+    match crate::model_plane::dispatch_managed_candidates(selection, &executor).await {
+        Ok(outcome) => {
+            record_managed_route_trace(request.provider.name.as_str(), &deployment, &outcome.trace);
+            Ok(Some(ManagedDistributedUpstream {
+                response: outcome.response,
+                public_model,
+                local_permit: outcome.local_permit,
+                route_class: outcome.route_class,
+                trace: outcome.trace,
+            }))
+        }
+        Err(failure) => {
+            record_managed_route_trace(request.provider.name.as_str(), &deployment, &failure.trace);
+            Err(ManagedDistributedError::Dispatch(failure))
+        }
+    }
+}
+
+fn record_managed_route_trace(
+    provider: &str,
+    deployment: &str,
+    trace: &crate::model_plane::ManagedRouteTrace,
+) {
+    for (index, attempt) in trace.attempts.iter().enumerate() {
+        let route_class = match attempt.route_class {
+            sbproxy_ai::managed_replica::ManagedRouteClass::Local => "local",
+            sbproxy_ai::managed_replica::ManagedRouteClass::Peer => "peer",
+        };
+        sbproxy_observe::metrics::record_managed_replica_attempt(
+            provider,
+            deployment,
+            route_class,
+            &attempt.outcome,
+        );
+        if index < trace.failovers {
+            sbproxy_observe::metrics::record_managed_replica_failover(
+                provider,
+                deployment,
+                &attempt.outcome,
+            );
+        }
+    }
+    tracing::debug!(
+        provider,
+        deployment,
+        candidates = trace.selection.total_candidates,
+        eligible = trace.selection.eligible_candidates,
+        attempts = trace.attempts.len(),
+        failovers = trace.failovers,
+        truncated = trace.truncated_candidates,
+        selected_reason = trace.selection.selected_reason.unwrap_or("none"),
+        "managed replica route decision"
+    );
 }
 
 /// Resolve, admit, and ready a canonical or legacy managed provider.
