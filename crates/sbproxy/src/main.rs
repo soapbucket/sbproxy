@@ -1360,12 +1360,64 @@ fn runtime_telemetry_config_for_cli(cli: &Cli) -> Option<sbproxy_observe::Teleme
     let path = pick_run_path(cli)?;
     let yaml = std::fs::read_to_string(&path).ok()?;
     let compiled = sbproxy_config::compile_config(&yaml).ok()?;
-    compiled
+    let telemetry = compiled
         .server
         .observability
         .as_ref()
-        .and_then(|observability| observability.telemetry.as_ref())
-        .map(runtime_telemetry_config)
+        .and_then(|observability| observability.telemetry.as_ref())?;
+    // WOR-1869: telemetry headers may hold provider-URI secret
+    // references (vault://, secret://, ...), which need the backend
+    // manager. Install the process resolver now; the call is
+    // idempotent, so the serve path installing the same resolver
+    // again later is a no-op.
+    if telemetry
+        .headers
+        .values()
+        .any(|v| sbproxy_vault::looks_like_secret_reference_uri(v))
+    {
+        install_secret_resolver(&path);
+    }
+    let mapped = runtime_telemetry_config(telemetry);
+    if !mapped.headers.is_empty() {
+        // Share the boot-resolved header set with the OTLP-logs sink,
+        // which is built later inside sbproxy-core (it has no secret
+        // resolution dependency of its own).
+        sbproxy_observe::telemetry::install_resolved_otlp_headers(mapped.headers.clone());
+    }
+    Some(mapped)
+}
+
+/// Resolve secret references in `telemetry.headers` values at boot.
+///
+/// Follows the WOR-1767 fail-loud convention: a recognized reference
+/// that cannot be resolved aborts startup rather than reaching the
+/// collector verbatim as a bearer token. Literal values pass through
+/// unchanged.
+fn resolve_telemetry_headers(
+    raw: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    if raw.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    let resolver = sbproxy_vault::process_resolver();
+    raw.iter()
+        .map(|(name, value)| {
+            let resolved = match resolver.as_deref() {
+                Some(r) => r.resolve(value),
+                // No backends declared: `${VAR}` / `file:` still
+                // resolve; provider URIs fail loud with a pointer at
+                // proxy.secrets.backends.
+                None => sbproxy_vault::SecretResolver::new().resolve(value),
+            };
+            match resolved {
+                Ok(v) => (name.clone(), v),
+                Err(e) => {
+                    eprintln!("Fatal: telemetry header '{name}': {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        })
+        .collect()
 }
 
 fn runtime_telemetry_config(
@@ -1390,6 +1442,7 @@ fn runtime_telemetry_config(
         resource_attrs: raw.resource_attrs.clone(),
         export_metrics: raw.export_metrics,
         metrics_interval_secs: raw.metrics_interval_secs,
+        headers: resolve_telemetry_headers(&raw.headers),
     }
 }
 
@@ -3823,6 +3876,29 @@ fn mask_secrets(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             for (k, v) in map.iter_mut() {
+                // WOR-1869: `headers` maps (telemetry export, alert
+                // webhook channels) carry auth tokens under arbitrary
+                // vendor names (x-honeycomb-team, x-scope-orgid), so a
+                // key-name allowlist cannot catch them. Mask every
+                // literal string directly under a `headers` map;
+                // references stay visible as pointers.
+                if k == "headers" {
+                    if let serde_json::Value::Object(headers) = v {
+                        for header_value in headers.values_mut() {
+                            match header_value {
+                                serde_json::Value::String(s) => {
+                                    if !is_secret_reference(s) {
+                                        *s = "***MASKED***".to_string();
+                                    }
+                                }
+                                // Transform-style header blocks nest
+                                // add / set maps; keep walking those.
+                                other => mask_secrets(other),
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if is_secret_key(k) {
                     if let serde_json::Value::String(s) = v {
                         if !is_secret_reference(s) {
@@ -5209,6 +5285,10 @@ mod tests {
             )]),
             export_metrics: true,
             metrics_interval_secs: Some(15),
+            headers: std::collections::BTreeMap::from([(
+                "x-honeycomb-team".to_string(),
+                "literal-token".to_string(),
+            )]),
         };
 
         let mapped = runtime_telemetry_config(&raw);
@@ -5230,6 +5310,12 @@ mod tests {
         );
         assert!(mapped.export_metrics);
         assert_eq!(mapped.metrics_interval_secs, Some(15));
+        // WOR-1869: literal header values pass through resolution
+        // unchanged and land on the runtime config.
+        assert_eq!(
+            mapped.headers.get("x-honeycomb-team").map(String::as_str),
+            Some("literal-token")
+        );
     }
 
     /// The version line is load-bearing: the marketing site `Hero.vue`

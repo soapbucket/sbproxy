@@ -2385,6 +2385,9 @@ fn compile_one_sink(
                 service_name,
                 timeout,
                 resource_attrs,
+                // WOR-1869: same boot-resolved auth headers as the
+                // trace/metric pipelines (empty when none configured).
+                headers: sbproxy_observe::telemetry::resolved_otlp_headers(),
             };
             match sbproxy_observe::OtlpLogSink::new(opts) {
                 Ok(s) => Box::new(s),

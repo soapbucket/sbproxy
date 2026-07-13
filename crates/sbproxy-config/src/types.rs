@@ -2843,6 +2843,16 @@ pub struct ObservabilityTelemetryConfig {
     /// Period for the OTLP metric exporter, seconds. Default 30s.
     #[serde(default)]
     pub metrics_interval_secs: Option<u64>,
+    /// Additional headers sent with every OTLP export request (traces,
+    /// metrics, and any OTLP log sink). Values may be literals or
+    /// secret references (`${VAR}`, `file:`, `vault://`, `secret://`,
+    /// and the other backend URI schemes); references resolve at boot
+    /// and the proxy refuses to start when one cannot be resolved, so
+    /// a raw reference never reaches the collector. Hosted backends
+    /// (Grafana Cloud, Honeycomb, Langfuse Cloud, Datadog) authenticate
+    /// with these headers.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 /// Configuration for a single alert notification channel.

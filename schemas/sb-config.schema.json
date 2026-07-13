@@ -1189,6 +1189,14 @@
           ],
           "format": "uint64",
           "minimum": 0.0
+        },
+        "headers": {
+          "description": "Additional headers sent with every OTLP export request (traces, metrics, and any OTLP log sink). Values may be literals or secret references (`${VAR}`, `file:`, `vault://`, `secret://`, and the other backend URI schemes); references resolve at boot and the proxy refuses to start when one cannot be resolved, so a raw reference never reaches the collector. Hosted backends (Grafana Cloud, Honeycomb, Langfuse Cloud, Datadog) authenticate with these headers.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       }
     },
