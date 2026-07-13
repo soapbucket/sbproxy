@@ -1166,6 +1166,103 @@ describe("useModelManagement orchestration", () => {
     );
   });
 
+  it("blocks Add conflict retry when the target ID appears during reload", async () => {
+    const deploymentId = "__proto__";
+    const concurrent = deploymentDefaults("model", "q4");
+    mockReads({ document: document("admin_managed", false, 4) });
+    const replace = vi
+      .spyOn(api, "replaceModelHostDeployments")
+      .mockRejectedValueOnce(
+        new ApiError(409, "revision conflict", "raw Add collision"),
+      )
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openAddDeployment();
+    vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+      document(
+        "admin_managed",
+        false,
+        5,
+        ownRecord([[deploymentId, concurrent]]),
+      ),
+    );
+
+    await management.saveDeployment(formValue(deploymentId));
+    expect(management.conflictRetryAllowed.value).toBe(true);
+    expect(
+      Object.hasOwn(
+        management.canonicalDesiredDeployments.value ?? {},
+        deploymentId,
+      ),
+    ).toBe(true);
+
+    await management.retryConflict();
+
+    expect(replace).toHaveBeenCalledTimes(1);
+    expect(management.editor.value).not.toBeNull();
+    expect(management.conflict.value?.body).toBe("raw Add collision");
+    expect(management.mutationError.value).toMatch(
+      /already exists.*(?:reopen|another deployment ID)/i,
+    );
+  });
+
+  it("blocks rename conflict retry when the target ID appears during reload", async () => {
+    const originalDeploymentId = "edit-me";
+    const targetDeploymentId = "constructor";
+    const opened = deploymentDefaults("model", "q4");
+    const concurrent = { ...opened, warm: true };
+    mockReads({
+      document: document(
+        "admin_managed",
+        false,
+        4,
+        ownRecord([[originalDeploymentId, opened]]),
+      ),
+    });
+    const replace = vi
+      .spyOn(api, "replaceModelHostDeployments")
+      .mockRejectedValueOnce(
+        new ApiError(409, "revision conflict", "raw rename collision"),
+      )
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openEditDeployment(management.rows.value[0]);
+    vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+      document(
+        "admin_managed",
+        false,
+        5,
+        ownRecord([
+          [originalDeploymentId, opened],
+          [targetDeploymentId, concurrent],
+        ]),
+      ),
+    );
+
+    await management.saveDeployment({
+      deploymentId: targetDeploymentId,
+      deployment: { ...opened, replicas: 2 },
+    });
+    expect(management.conflictRetryAllowed.value).toBe(true);
+    expect(
+      Object.hasOwn(
+        management.canonicalDesiredDeployments.value ?? {},
+        targetDeploymentId,
+      ),
+    ).toBe(true);
+
+    await management.retryConflict();
+
+    expect(replace).toHaveBeenCalledTimes(1);
+    expect(management.editor.value).not.toBeNull();
+    expect(management.conflict.value?.body).toBe("raw rename collision");
+    expect(management.mutationError.value).toMatch(
+      /already exists.*(?:reopen|another deployment ID)/i,
+    );
+  });
+
   it("keeps raw conflict without a current-map claim when any proof reload fails", async () => {
     mockReads({ document: document("admin_managed", false, 4) });
     const replace = vi

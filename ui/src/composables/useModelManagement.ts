@@ -276,25 +276,37 @@ export function useModelManagement() {
     return deploymentMapFingerprint(singleton);
   }
 
-  function editorSessionError(
+  function upsertSessionError(
     activeEditor: ModelDeploymentEditorState,
+    change: Extract<DeploymentChange, { kind: "upsert" }>,
   ): string | null {
     if (mutationMode.value !== activeEditor.openingMode) {
       return "Desired-state authority changed after this editor opened. Your draft is preserved. Reopen the editor under the current authority before saving.";
     }
-    if (activeEditor.baselineDeploymentId === null) return null;
-    const currentDeployment = canonicalDesiredDeployment(
-      activeEditor.baselineDeploymentId,
-    );
-    if (
-      !currentDeployment ||
-      activeEditor.baselineDeploymentFingerprint === null ||
-      deploymentBaselineFingerprint(
+    const desired = canonicalDesiredDeployments.value;
+    if (!desired) {
+      return "Reload the current desired deployment map before saving.";
+    }
+    if (activeEditor.baselineDeploymentId !== null) {
+      const currentDeployment = canonicalDesiredDeployment(
         activeEditor.baselineDeploymentId,
-        currentDeployment,
-      ) !== activeEditor.baselineDeploymentFingerprint
+      );
+      if (
+        !currentDeployment ||
+        activeEditor.baselineDeploymentFingerprint === null ||
+        deploymentBaselineFingerprint(
+          activeEditor.baselineDeploymentId,
+          currentDeployment,
+        ) !== activeEditor.baselineDeploymentFingerprint
+      ) {
+        return "The deployment changed or disappeared after this editor opened. Your draft is preserved. Reopen the editor from the current desired state before saving.";
+      }
+    }
+    if (
+      change.deploymentId !== activeEditor.originalDeploymentId &&
+      Object.hasOwn(desired, change.deploymentId)
     ) {
-      return "The deployment changed or disappeared after this editor opened. Your draft is preserved. Reopen the editor from the current desired state before saving.";
+      return "A deployment with this ID already exists in the current desired state. Your draft is preserved. Reopen the editor or choose another deployment ID before saving.";
     }
     return null;
   }
@@ -728,30 +740,18 @@ export function useModelManagement() {
         "Reload current authority state successfully before saving the preserved draft.";
       return;
     }
-    const desired = canonicalDesiredDeployments.value;
-    if (!desired) {
-      mutationError.value =
-        "Reload the current desired deployment map before saving.";
-      return;
-    }
-    const sessionError = editorSessionError(activeEditor);
+    const change = {
+      kind: "upsert" as const,
+      originalDeploymentId: activeEditor.originalDeploymentId,
+      deploymentId: value.deploymentId,
+      deployment: value.deployment,
+    };
+    const sessionError = upsertSessionError(activeEditor, change);
     if (sessionError) {
       mutationError.value = sessionError;
       return;
     }
-    if (
-      value.deploymentId !== activeEditor.originalDeploymentId &&
-      Object.hasOwn(desired, value.deploymentId)
-    ) {
-      mutationError.value = "A deployment with this ID already exists.";
-      return;
-    }
-    await mutateDesiredState({
-      kind: "upsert",
-      originalDeploymentId: activeEditor.originalDeploymentId,
-      deploymentId: value.deploymentId,
-      deployment: value.deployment,
-    });
+    await mutateDesiredState(change);
   }
 
   async function removeDeployment(row: ModelDeploymentRow): Promise<void> {
@@ -792,7 +792,7 @@ export function useModelManagement() {
     if (pendingChange.kind === "upsert") {
       const activeEditor = editor.value;
       if (!activeEditor) return;
-      const sessionError = editorSessionError(activeEditor);
+      const sessionError = upsertSessionError(activeEditor, pendingChange);
       if (sessionError) {
         mutationError.value = sessionError;
         return;
