@@ -12,6 +12,16 @@ the next version cut.
 
 ### Added
 
+- **Model deployment management in the built-in admin UI.** Operators can
+  browse catalog evidence, add or edit the complete desired deployment map,
+  resolve revision conflicts explicitly, and run Load, Stop, or Reset. The
+  same UI respects file-managed, admin-managed, and signed cluster-authority
+  ownership; file-managed and verifier nodes stay read-only.
+- **Cluster operations and unhealthy-node alerts in the admin UI.** The
+  Cluster page now shows every node, placement and rollout state, deployment
+  authority, and prominent links to unhealthy roster entries. Health remains
+  visible when metrics fail, and the last cluster snapshot stays on screen
+  with a stale warning after a refresh error.
 - Streaming responses now run every built-in output guardrail, with
   verdicts matching the buffered path. A per-stream session matches the
   substring guardrails (injection, toxicity, jailbreak, content safety)
