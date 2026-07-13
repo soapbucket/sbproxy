@@ -74,6 +74,49 @@ describe("admin API JSON integer safety", () => {
     expect(error).toBeInstanceOf(ApiError);
     expect(error).toMatchObject({ status: 409, body });
   });
+
+  it("preserves exact bounded catalog picker evidence", async () => {
+    stubFetch(
+      JSON.stringify({
+        schema_version: 1,
+        catalog_revision: "catalog-v2",
+        models: {
+          qwen: {
+            params: "0.5B",
+            license: "Apache-2.0",
+            family: "qwen",
+            context_length: 32768,
+            variants: [
+              {
+                id: "q4_k_m",
+                format: "gguf",
+                quant: "Q4_K_M",
+                engines: ["llama_cpp"],
+                accelerators: ["cpu", "metal"],
+                min_memory_bytes: 512000000,
+                download_size_bytes: 384000000,
+                certification: "local-metal-2026-07",
+                stability: "preview",
+              },
+            ],
+          },
+        },
+      }),
+    );
+
+    await expect(api.modelHostCatalog()).resolves.toMatchObject({
+      models: {
+        qwen: {
+          variants: [
+            {
+              download_size_bytes: 384000000,
+              certification: "local-metal-2026-07",
+            },
+          ],
+        },
+      },
+    });
+  });
 });
 
 describe("deployment mutation request contracts", () => {
@@ -124,6 +167,40 @@ describe("deployment mutation request contracts", () => {
         method: "POST",
         body: JSON.stringify(draft),
       }),
+    ]);
+  });
+});
+
+describe("model lifecycle request contracts", () => {
+  it("uses canonical deployment IDs for load, stop, and reset", async () => {
+    const fetchMock = stubFetch("{}");
+
+    await api.modelHostLoad("local-qwen");
+    await api.modelHostStop("local-qwen");
+    await api.modelHostReset("local-qwen");
+
+    expect(fetchMock.mock.calls).toEqual([
+      [
+        "/admin/model-host/load",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ deployment: "local-qwen" }),
+        }),
+      ],
+      [
+        "/admin/model-host/stop",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ deployment: "local-qwen" }),
+        }),
+      ],
+      [
+        "/admin/model-host/reset",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ deployment: "local-qwen" }),
+        }),
+      ],
     ]);
   });
 });

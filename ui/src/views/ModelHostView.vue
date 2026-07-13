@@ -1,246 +1,206 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { api, ApiError, type ModelHostStatus, type ResidentModel } from "../api";
-import { useAsync } from "../composables/useAsync";
-import { parsePrometheus, findFamily, histogramAvgByLabel } from "../lib/metrics";
-import { formatBytes } from "../lib/format";
-import PageHeader from "../components/PageHeader.vue";
-import StatCard from "../components/StatCard.vue";
-import StatusBadge from "../components/StatusBadge.vue";
-import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
+import ModelDeploymentModal from "../components/ModelDeploymentModal.vue";
+import ModelDeploymentTable from "../components/ModelDeploymentTable.vue";
+import ModelDeviceTable from "../components/ModelDeviceTable.vue";
+import ModelManagementNotices from "../components/ModelManagementNotices.vue";
+import ModelManagementOverview from "../components/ModelManagementOverview.vue";
+import PageHeader from "../components/PageHeader.vue";
+import { useModelManagement } from "../composables/useModelManagement";
+import type { ModelDeploymentRow } from "../lib/model-management";
 
-const req = useAsync(() => api.modelHostStatus());
-const metricsReq = useAsync(() => api.metrics());
-function refresh() {
-  req.run();
-  metricsReq.run();
-}
-onMounted(refresh);
+const {
+  statusReq,
+  catalogReq,
+  deploymentsReq,
+  clusterStatusReq,
+  clusterBundleReq,
+  banner,
+  lifecycleBusy,
+  mutationBusy,
+  mutationError,
+  conflict,
+  editor,
+  status,
+  catalog,
+  deploymentDocument,
+  clusterBundle,
+  clusterAuthority,
+  runtimeDeployments,
+  rows,
+  readyDeployments,
+  reservedMemory,
+  blockers,
+  catalogModels,
+  previewOnlyCatalog,
+  throughputByModel,
+  canMutate,
+  persistentGuidance,
+  authorityDescription,
+  refreshing,
+  refresh,
+  openAddDeployment,
+  openEditDeployment,
+  saveDeployment,
+  removeDeployment,
+  retryConflict,
+  dismissConflict,
+  runLifecycle,
+  closeEditor,
+} = useModelManagement();
 
-// ---- load / evict (WOR-1765) ----
-const loadName = ref("");
-const busy = ref("");
-const banner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
-
-async function act(label: string, fn: () => Promise<unknown>, ok: string) {
-  if (busy.value) return;
-  busy.value = label;
-  banner.value = null;
-  try {
-    await fn();
-    banner.value = { tone: "ok", text: ok };
-    refresh();
-  } catch (e) {
-    const msg = e instanceof ApiError ? e.hint : e instanceof Error ? e.message : "Failed.";
-    banner.value = { tone: "err", text: msg };
-  } finally {
-    busy.value = "";
+function confirmRemove(row: ModelDeploymentRow) {
+  if (window.confirm(`Remove deployment ${row.deploymentId} from desired state?`)) {
+    removeDeployment(row);
   }
-}
-const loadModel = () =>
-  act("load", () => api.modelHostLoad(loadName.value.trim()), `Loading "${loadName.value.trim()}".`);
-const evictModel = (name: string) =>
-  act(`evict:${name}`, () => api.modelHostEvict(name), `Evicted "${name}".`);
-
-const status = computed<ModelHostStatus | null>(() => req.data.value ?? null);
-const serving = computed(() => !!status.value?.serving);
-const models = computed<ResidentModel[]>(() => status.value?.models ?? []);
-const vram = computed(() => status.value?.vram);
-// Doctor's admission verdict: shown only when serving would reject.
-const localServing = computed(() => status.value?.local_serving);
-const blockers = computed(() =>
-  localServing.value && localServing.value.ready === false ? (localServing.value.blockers ?? []) : [],
-);
-
-// Avg tok/s per model name from the throughput histogram (WOR-895).
-const tps = computed(() => {
-  const text = metricsReq.data.value;
-  if (!text) return new Map<string, number>();
-  const rows = histogramAvgByLabel(
-    findFamily(parsePrometheus(text), "sbproxy_ai_output_throughput_tokens_per_second"),
-    "model",
-  );
-  return new Map(rows.map((r) => [r.key, r.value]));
-});
-function tpsFor(name?: string): string {
-  const v = name ? tps.value.get(name) : undefined;
-  return v !== undefined ? `${v.toFixed(1)} tok/s` : "-";
-}
-function stateLabel(s: ResidentModel["state"]): string {
-  if (typeof s === "string") return s;
-  if (s && typeof s === "object") return Object.keys(s)[0] ?? "unknown";
-  return "unknown";
-}
-function stateTone(s: ResidentModel["state"]): "ok" | "warn" | "err" | "neutral" {
-  const l = stateLabel(s).toLowerCase();
-  if (l.includes("ready")) return "ok";
-  if (l.includes("fail")) return "err";
-  if (l.includes("load")) return "warn";
-  return "neutral";
 }
 </script>
 
 <template>
   <PageHeader
     title="Model host"
-    subtitle="Locally served models: residency, VRAM, and token throughput."
+    subtitle="Desired model deployments and local runtime residency, controlled from one operational view."
   >
     <template #actions>
-      <button class="sb-btn sb-btn--sm" @click="refresh">Refresh</button>
+      <button
+        class="sb-btn sb-btn--primary"
+        :disabled="!canMutate"
+        :title="!canMutate ? persistentGuidance ?? undefined : undefined"
+        @click="openAddDeployment"
+      >
+        Add deployment
+      </button>
+      <button class="sb-btn sb-btn--sm" :disabled="refreshing" @click="refresh">
+        {{ refreshing ? "Refreshing..." : "Refresh" }}
+      </button>
     </template>
   </PageHeader>
 
-  <ErrorState v-if="req.error.value" :error="req.error.value" @retry="refresh" />
-  <EmptyState
-    v-else-if="req.data.value !== null && !serving"
-    message="No local model host configured. Add a serve: block to an ai_proxy provider to serve models on this node."
+  <ModelManagementOverview
+    :document="deploymentDocument ?? null"
+    :status="status ?? null"
+    :catalog-revision="catalog?.catalog_revision ?? null"
+    :cluster-authority="clusterAuthority"
+    :cluster-bundle="clusterBundle ?? null"
+    :can-mutate="canMutate"
+    :guidance="persistentGuidance"
+    :authority-description="authorityDescription"
+    :runtime-count="runtimeDeployments.length"
+    :ready-count="readyDeployments"
+    :reserved-memory="reservedMemory"
   />
-  <template v-else>
-    <div class="grid">
-      <StatCard label="Resident models" :value="models.length" tone="accent" />
-      <StatCard
-        label="VRAM used"
-        :value="formatBytes(vram?.used_bytes)"
-        :sub="vram?.budget_bytes ? `of ${formatBytes(vram.budget_bytes)}` : undefined"
-      />
-      <StatCard label="VRAM free" :value="formatBytes(vram?.free_bytes)" />
-    </div>
 
-    <p v-if="banner" class="banner" :class="`banner--${banner.tone}`">{{ banner.text }}</p>
+  <ModelManagementNotices
+    :banner="banner ?? null"
+    :status-error="statusReq.error.value ?? null"
+    :has-status="Boolean(status)"
+    :desired-error="deploymentsReq.error.value ?? null"
+    :catalog-error="catalogReq.error.value ?? null"
+    :cluster-authority-error="clusterStatusReq.error.value ?? null"
+    :cluster-bundle-error="clusterBundleReq.error.value ?? null"
+    :cluster-authority-mode="deploymentDocument?.authority === 'cluster_authority'"
+    :active-cluster-revision="clusterAuthority?.active_revision ?? null"
+    :catalog-loaded="Boolean(catalog)"
+    :catalog-model-count="catalogModels.length"
+    :preview-only-catalog="previewOnlyCatalog"
+    :blockers="blockers"
+    :blocker-recommendation="status?.local_serving?.recommendation"
+    :conflict="conflict"
+    :editor-open="Boolean(editor)"
+    :mutation-error="mutationError"
+    :mutation-busy="mutationBusy"
+    @retry-status="statusReq.run()"
+    @retry-desired="deploymentsReq.run()"
+    @retry-catalog="catalogReq.run()"
+    @retry-authority="clusterStatusReq.run()"
+    @retry-bundle="clusterBundleReq.run()"
+    @retry-conflict="retryConflict"
+    @dismiss-conflict="dismissConflict"
+  />
 
-    <div class="sb-card panel blockers" v-if="blockers.length">
-      <h3>Serving is blocked on this host</h3>
-      <ul>
-        <li v-for="(b, i) in blockers" :key="i">{{ b }}</li>
-      </ul>
-      <p v-if="localServing?.recommendation" class="sb-faint">
-        Recommended fix: <span class="sb-mono">{{ localServing.recommendation }}</span>
-      </p>
-      <p class="sb-faint">Run <span class="sb-mono">sbproxy doctor</span> on this host for the full report.</p>
-    </div>
-
-    <div class="sb-card panel">
-      <h3>Load a model</h3>
-      <div class="action">
-        <input
-          v-model="loadName"
-          class="sb-input"
-          placeholder="catalog id or hf:Org/Repo:QUANT"
-          @keydown.enter="loadModel"
-        />
-        <button class="sb-btn" :disabled="!loadName.trim() || busy === 'load'" @click="loadModel">
-          {{ busy === "load" ? "Loading..." : "Load" }}
-        </button>
+  <section class="deployment-section" aria-labelledby="deployments-heading">
+    <div class="section-heading">
+      <div>
+        <p class="sb-eyebrow">Desired / runtime</p>
+        <h2 id="deployments-heading">Deployment ledger</h2>
       </div>
-      <p class="sb-faint">
-        Spawns the engine and makes the model resident. keep_alive is set in
-        config; evicting frees its VRAM immediately.
+      <p>
+        Configured deployments remain listed when stopped. Runtime-only rows remain visible when management metadata fails.
       </p>
     </div>
+    <ModelDeploymentTable
+      :rows="rows"
+      :can-mutate="canMutate"
+      :persistent-read-only-reason="persistentGuidance"
+      :lifecycle-busy="lifecycleBusy"
+      :mutation-busy="mutationBusy"
+      :throughput-by-model="throughputByModel"
+      @edit="openEditDeployment"
+      @remove="confirmRemove"
+      @load="runLifecycle('load', $event)"
+      @stop="runLifecycle('stop', $event)"
+      @reset="runLifecycle('reset', $event)"
+    />
+  </section>
 
-    <div class="sb-card panel" v-if="models.length">
-      <h3>Resident models</h3>
-      <div class="table-wrap">
-        <table class="sb-table">
-          <thead>
-            <tr>
-              <th>Model</th><th>State</th><th>VRAM</th><th>Keep-alive</th>
-              <th>Throughput</th><th></th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="(m, i) in models" :key="i">
-              <td class="sb-mono">{{ m.name ?? "unknown" }}</td>
-              <td><StatusBadge :label="stateLabel(m.state)" :tone="stateTone(m.state)" /></td>
-              <td>{{ formatBytes(m.vram_bytes) }}</td>
-              <td>{{ m.keep_alive_secs != null ? `${m.keep_alive_secs}s` : "-" }}</td>
-              <td>{{ tpsFor(m.name) }}</td>
-              <td>
-                <button
-                  v-if="m.name"
-                  class="sb-btn sb-btn--sm"
-                  :disabled="busy === `evict:${m.name}`"
-                  @click="evictModel(m.name)"
-                >
-                  {{ busy === `evict:${m.name}` ? "Evicting..." : "Evict" }}
-                </button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
+  <ModelDeviceTable
+    v-if="status?.vram?.devices?.length"
+    :devices="status.vram.devices"
+  />
 
-    <div class="sb-card panel" v-if="vram?.devices?.length">
-      <h3>GPU devices</h3>
-      <div class="table-wrap">
-        <table class="sb-table">
-          <thead>
-            <tr><th>#</th><th>Device</th><th>Total</th><th>Free</th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="d in vram.devices" :key="d.index">
-              <td>{{ d.index }}</td>
-              <td>{{ d.name }}</td>
-              <td>{{ formatBytes(d.total_bytes) }}</td>
-              <td>{{ formatBytes(d.free_bytes) }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </template>
+  <EmptyState
+    v-if="!refreshing && !status && !deploymentDocument && !statusReq.error.value && !deploymentsReq.error.value"
+    message="No model host deployment state is available."
+  />
+
+  <ModelDeploymentModal
+    v-if="editor && catalog"
+    :catalog="catalog"
+    :existing-deployment-ids="Object.keys(deploymentDocument?.deployments ?? {})"
+    :initial-deployment-id="editor.originalDeploymentId"
+    :initial-deployment="editor.initialDeployment"
+    :saving="mutationBusy"
+    :submit-error="mutationError"
+    :conflict="conflict"
+    @close="closeEditor"
+    @save="saveDeployment"
+  />
 </template>
 
 <style scoped>
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: var(--sb-space-4);
-  margin-bottom: var(--sb-space-5);
+.deployment-section {
+  margin-bottom: var(--sb-space-6);
 }
-.panel {
-  margin-bottom: var(--sb-space-4);
-}
-.panel h3 {
-  margin-bottom: var(--sb-space-3);
-}
-.table-wrap {
-  overflow-x: auto;
-}
-.action {
+
+.section-heading {
   display: flex;
-  align-items: center;
-  gap: var(--sb-space-3);
-  margin-bottom: var(--sb-space-3);
-  flex-wrap: wrap;
-}
-.action .sb-input {
-  max-width: 360px;
-}
-.banner {
-  padding: var(--sb-space-3) var(--sb-space-4);
-  border-radius: var(--sb-radius-sm);
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--sb-space-4);
   margin-bottom: var(--sb-space-4);
-  font-size: 0.9rem;
 }
-.banner--ok {
-  background: var(--sb-accent-tint);
-  color: var(--sb-accent);
+
+.section-heading .sb-eyebrow {
+  margin: 0 0 var(--sb-space-1);
 }
-.banner--err {
-  background: #fdecea;
-  color: #c0392b;
+
+.section-heading > p {
+  max-width: 62ch;
+  margin: 0;
+  color: var(--sb-text-faint);
+  font-size: 0.76rem;
+  text-align: right;
 }
-.blockers {
-  border-left: 3px solid #c0392b;
-}
-.blockers ul {
-  margin: 0 0 var(--sb-space-3);
-  padding-left: 1.2em;
-}
-.blockers li {
-  margin-bottom: var(--sb-space-2);
+
+@media (max-width: 760px) {
+  .section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .section-heading > p {
+    max-width: none;
+    text-align: left;
+  }
 }
 </style>

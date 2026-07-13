@@ -1,14 +1,47 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted } from "vue";
+import { nextTick, onMounted, onUnmounted, ref, useId } from "vue";
 
 const props = defineProps<{ title: string; wide?: boolean }>();
 const emit = defineEmits<{ (e: "close"): void }>();
+const dialog = ref<HTMLElement | null>(null);
+const titleId = useId();
+let previouslyFocused: HTMLElement | null = null;
 
 function onKey(e: KeyboardEvent) {
-  if (e.key === "Escape") emit("close");
+  if (e.key === "Escape") {
+    emit("close");
+    return;
+  }
+  if (e.key !== "Tab" || !dialog.value) return;
+  const focusable = [...dialog.value.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+  )].filter((element) => !element.hasAttribute("hidden"));
+  if (!focusable.length) {
+    e.preventDefault();
+    dialog.value.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
 }
-onMounted(() => document.addEventListener("keydown", onKey));
-onUnmounted(() => document.removeEventListener("keydown", onKey));
+onMounted(async () => {
+  previouslyFocused = document.activeElement as HTMLElement | null;
+  document.addEventListener("keydown", onKey);
+  await nextTick();
+  const initial = dialog.value?.querySelector<HTMLElement>("[autofocus]");
+  (initial ?? dialog.value)?.focus();
+});
+onUnmounted(() => {
+  document.removeEventListener("keydown", onKey);
+  previouslyFocused?.focus();
+});
 
 // Reference props so it is not flagged unused under strict settings.
 void props;
@@ -16,9 +49,17 @@ void props;
 
 <template>
   <div class="scrim" @click.self="$emit('close')">
-    <div class="dialog" :class="{ 'dialog--wide': wide }" role="dialog" aria-modal="true">
+    <div
+      ref="dialog"
+      class="dialog"
+      :class="{ 'dialog--wide': wide }"
+      role="dialog"
+      aria-modal="true"
+      :aria-labelledby="titleId"
+      tabindex="-1"
+    >
       <header class="dialog__head">
-        <h2>{{ title }}</h2>
+        <h2 :id="titleId">{{ title }}</h2>
         <button class="close" aria-label="Close" @click="$emit('close')">×</button>
       </header>
       <div class="dialog__body">
@@ -52,7 +93,10 @@ void props;
   max-width: 520px;
 }
 .dialog--wide {
-  max-width: 780px;
+  max-width: 1040px;
+}
+.dialog:focus {
+  outline: none;
 }
 .dialog__head {
   display: flex;
@@ -82,5 +126,23 @@ void props;
 }
 .close:hover {
   color: var(--sb-text);
+}
+.close:focus-visible {
+  outline: 3px solid var(--sb-accent-ring);
+  outline-offset: 2px;
+  border-radius: var(--sb-radius-sm);
+}
+
+@media (max-width: 620px) {
+  .scrim {
+    padding: var(--sb-space-3);
+  }
+
+  .dialog__head,
+  .dialog__body,
+  .dialog__foot {
+    padding-left: var(--sb-space-4);
+    padding-right: var(--sb-space-4);
+  }
 }
 </style>

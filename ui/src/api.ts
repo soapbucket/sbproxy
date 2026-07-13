@@ -300,9 +300,12 @@ export interface LocalServing {
   recommendation?: string;
 }
 export interface ModelHostStatus {
-  // Real shape: {serving, models, vram, local_serving} or {serving:false, reason}.
+  // Managed runtime shape. `models` remains as a compatibility mirror of
+  // `deployments`; new UI code keys lifecycle actions by `deployment`.
   serving?: boolean;
   reason?: string;
+  runtime_revision?: number;
+  deployments?: DeploymentRuntimeStatus[];
   models?: ResidentModel[];
   vram?: {
     budget_bytes?: number;
@@ -329,6 +332,38 @@ export interface ResidentModel {
   keep_alive_secs?: number;
   engine?: string;
   [k: string]: unknown;
+}
+
+export type EngineAvailability =
+  | "available"
+  | "acquirable"
+  | "incompatible"
+  | "blocked";
+
+export interface RuntimeMemoryEstimate {
+  device_index: number;
+  weight_bytes: number;
+  kv_bytes: number;
+  runtime_overhead_bytes: number;
+  safety_margin_bytes: number;
+  total_bytes: number;
+}
+
+export interface DeploymentRuntimeStatus {
+  deployment: string;
+  generation: number;
+  state: DeploymentRuntimeState;
+  active_requests: number;
+  queued_requests: number;
+  engine: EngineKind | null;
+  driver_availability: EngineAvailability | null;
+  artifact_digest: string | null;
+  selected_devices: number[];
+  memory: RuntimeMemoryEstimate | null;
+  port: number | null;
+  reason_code: string | null;
+  job_id: string | null;
+  last_error: string | null;
 }
 
 export interface KeyPolicy {
@@ -650,6 +685,8 @@ export interface CatalogVariant {
   engines: EngineKind[];
   accelerators: AcceleratorKind[];
   min_memory_bytes: number;
+  download_size_bytes: number;
+  certification: string;
   stability: SupportLevel;
 }
 
@@ -922,10 +959,14 @@ export const api = {
       request,
     ),
   // Load (spawn/ready) or evict (unload to free VRAM) a model (WOR-1765).
-  modelHostLoad: (model: string) =>
-    sendJson<unknown>("POST", "/admin/model-host/load", { model }),
-  modelHostEvict: (model: string) =>
-    sendJson<unknown>("POST", "/admin/model-host/evict", { model }),
+  modelHostLoad: (deployment: string) =>
+    sendJson<unknown>("POST", "/admin/model-host/load", { deployment }),
+  modelHostStop: (deployment: string) =>
+    sendJson<unknown>("POST", "/admin/model-host/stop", { deployment }),
+  modelHostReset: (deployment: string) =>
+    sendJson<unknown>("POST", "/admin/model-host/reset", { deployment }),
+  modelHostEvict: (deployment: string) =>
+    sendJson<unknown>("POST", "/admin/model-host/evict", { deployment }),
 
   // Keys
   keys: () => getJson<unknown>("/admin/keys"),
