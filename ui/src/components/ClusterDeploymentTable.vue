@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import type { ClusterDeploymentRolloutStatus } from "../api";
-import { formatReasonCode } from "../lib/cluster-health";
+import {
+  formatReasonCode,
+  placementAssignmentKey,
+} from "../lib/cluster-health";
 import { formatBytes, formatTime } from "../lib/format";
 import EmptyState from "./EmptyState.vue";
 import StatusBadge from "./StatusBadge.vue";
@@ -96,8 +99,8 @@ function rejectionOverflow(deployment: ClusterDeploymentRolloutStatus): number {
               <td>
                 <ul v-if="deployment.assignments.length" class="assignment-list">
                   <li
-                    v-for="(assignment, index) in deployment.assignments"
-                    :key="`${assignment.node_id}:${index}`"
+                    v-for="assignment in deployment.assignments"
+                    :key="placementAssignmentKey(assignment)"
                   >
                     <strong class="sb-mono">{{ assignment.node_id }}</strong>
                     <span>{{ assignment.variant_id }}</span>

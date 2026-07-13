@@ -1,21 +1,19 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { ClusterNode, ClusterNodeAlert } from "../api";
+import type { ClusterNodeAlert } from "../api";
 import {
+  clusterNodeAnchorId,
   formatAgeMs,
   formatReasonCode,
-  sortClusterNodes,
   sortNodeAlerts,
 } from "../lib/cluster-health";
 import StatusBadge from "./StatusBadge.vue";
 
 const props = defineProps<{
   alerts: readonly ClusterNodeAlert[];
-  nodes: readonly ClusterNode[];
 }>();
 
 const orderedAlerts = computed(() => sortNodeAlerts(props.alerts));
-const orderedNodes = computed(() => sortClusterNodes(props.nodes));
 
 function healthTone(
   health: ClusterNodeAlert["health"],
@@ -39,8 +37,7 @@ function ageAgo(ageMs: number): string {
 }
 
 function rosterHref(nodeId: string): string {
-  const index = orderedNodes.value.findIndex((node) => node.node_id === nodeId);
-  return index < 0 ? "#node-roster" : `#cluster-node-${index}`;
+  return `#${clusterNodeAnchorId(nodeId)}`;
 }
 </script>
 
@@ -107,7 +104,7 @@ function rosterHref(nodeId: string): string {
         </dl>
 
         <a class="node-alert__roster-link" :href="rosterHref(alert.node_id)">
-          View this node in the full roster
+          View {{ alert.node_id }} in the full roster
         </a>
       </article>
     </div>

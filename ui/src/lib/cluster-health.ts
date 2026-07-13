@@ -1,8 +1,73 @@
-import type { ClusterNode, ClusterNodeAlert } from "../api";
+import type {
+  ClusterMetrics,
+  ClusterNode,
+  ClusterNodeAlert,
+  PlacementAssignment,
+} from "../api";
 
 function compareText(left: string, right: string): number {
   if (left === right) return 0;
   return left < right ? -1 : 1;
+}
+
+const HASH_OFFSET = 0xcbf29ce484222325n;
+const HASH_PRIME = 0x100000001b3n;
+const HASH_MASK = 0xffffffffffffffffn;
+
+function stableIdentityHash(value: string): string {
+  let hash = HASH_OFFSET;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    hash ^= BigInt(codeUnit & 0xff);
+    hash = (hash * HASH_PRIME) & HASH_MASK;
+    hash ^= BigInt(codeUnit >>> 8);
+    hash = (hash * HASH_PRIME) & HASH_MASK;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+export function clusterNodeAnchorId(nodeId: string): string {
+  const readable = nodeId
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24);
+  return `cluster-node-${readable || "node"}-${stableIdentityHash(nodeId)}`;
+}
+
+interface ClusterMetricsSummaryInput {
+  metrics: ClusterMetrics | null;
+  loading: boolean;
+  notEnabled: boolean;
+  error: boolean;
+}
+
+export function clusterMetricsSummary({
+  metrics,
+  loading,
+  notEnabled,
+  error,
+}: ClusterMetricsSummaryInput): string {
+  if (error) return "Fleet metrics unavailable";
+  if (notEnabled) return "Fleet metrics not enabled";
+  if (loading) {
+    return metrics ? "Refreshing fleet metrics" : "Loading fleet metrics";
+  }
+  return `${metrics?.nodes ?? 0} reporting nodes, ${Object.keys(metrics?.metrics ?? {}).length} metrics`;
+}
+
+export function placementAssignmentKey(
+  assignment: PlacementAssignment,
+): string {
+  const identity = [
+    assignment.node_id,
+    assignment.variant_id,
+    String(assignment.device_index),
+    assignment.artifact_digest,
+  ]
+    .map((part) => `${part.length}:${part}`)
+    .join("|");
+  return `assignment-${stableIdentityHash(identity)}`;
 }
 
 export function sortClusterNodes(nodes: readonly ClusterNode[]): ClusterNode[] {

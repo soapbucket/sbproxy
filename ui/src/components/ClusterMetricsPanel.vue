@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { ApiError, ClusterMetrics } from "../api";
+import { clusterMetricsSummary } from "../lib/cluster-health";
 import { formatNumber } from "../lib/format";
 import EmptyState from "./EmptyState.vue";
 import ErrorState from "./ErrorState.vue";
@@ -20,12 +21,14 @@ const metricRows = computed(() =>
     .sort((left, right) => left.name.localeCompare(right.name)),
 );
 
-const summaryText = computed(() => {
-  if (props.error) return "Fleet metrics unavailable";
-  if (props.notEnabled) return "Fleet metrics not enabled";
-  if (props.loading && !props.metrics) return "Loading fleet metrics";
-  return `${props.metrics?.nodes ?? 0} reporting nodes, ${metricRows.value.length} metrics`;
-});
+const summaryText = computed(() =>
+  clusterMetricsSummary({
+    metrics: props.metrics,
+    loading: props.loading,
+    notEnabled: props.notEnabled,
+    error: props.error !== null,
+  }),
+);
 </script>
 
 <template>

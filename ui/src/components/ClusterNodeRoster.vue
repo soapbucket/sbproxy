@@ -2,6 +2,7 @@
 import { computed } from "vue";
 import type { ClusterNode } from "../api";
 import {
+  clusterNodeAnchorId,
   formatAgeMs,
   formatReasonCode,
   sortClusterNodes,
@@ -63,8 +64,8 @@ function labelEntries(labels: Record<string, string>): [string, string][] {
           </thead>
           <tbody>
             <tr
-              v-for="(node, index) in orderedNodes"
-              :id="`cluster-node-${index}`"
+              v-for="node in orderedNodes"
+              :id="clusterNodeAnchorId(node.node_id)"
               :key="node.node_id"
               :class="{ 'roster-row--unhealthy': node.health === 'unhealthy' }"
             >

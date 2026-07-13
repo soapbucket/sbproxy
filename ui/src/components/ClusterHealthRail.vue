@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { ClusterNode, ClusterSummary } from "../api";
-import { sortClusterNodes } from "../lib/cluster-health";
+import {
+  clusterNodeAnchorId,
+  sortClusterNodes,
+} from "../lib/cluster-health";
 
 const props = defineProps<{
   nodes: readonly ClusterNode[];
@@ -44,14 +47,14 @@ function healthLabel(health: ClusterNode["health"]): string {
     >
       <div class="health-rail__track">
         <a
-          v-for="(node, index) in orderedNodes"
+          v-for="node in orderedNodes"
           :key="node.node_id"
           class="health-rail__node"
           :class="[
             `health-rail__node--${node.health}`,
             { 'health-rail__node--local': node.local },
           ]"
-          :href="`#cluster-node-${index}`"
+          :href="`#${clusterNodeAnchorId(node.node_id)}`"
           :aria-label="`${node.node_id}: ${node.health}${node.local ? ', local node' : ''}`"
         >
           <span class="health-rail__marker" aria-hidden="true">

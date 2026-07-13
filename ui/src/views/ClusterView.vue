@@ -110,7 +110,7 @@ onMounted(refresh);
     </section>
 
     <ClusterHealthRail :nodes="status.nodes" :summary="status.summary" />
-    <ClusterNodeAlerts :alerts="status.unhealthy_nodes" :nodes="status.nodes" />
+    <ClusterNodeAlerts :alerts="status.unhealthy_nodes" />
 
     <section
       v-if="status.summary.deployment_digest_mismatch || status.summary.unplaced_replicas > 0"
