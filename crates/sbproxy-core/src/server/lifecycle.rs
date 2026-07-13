@@ -729,6 +729,9 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     install_tenant_cardinality_state(&server_config);
     validate_sinks_config(&server_config);
     install_sink_dispatcher_from_config(&compiled);
+    // WOR-1875: this is the startup path (the earlier call site runs
+    // on reload); the installer is set-once so both calling is safe.
+    install_usage_rollups_from_config(&compiled);
 
     // Walk the inventory-based plugin registry once at startup and
     // emit one `sbproxy_plugin_registered_total{kind, plugin}` row

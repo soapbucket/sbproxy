@@ -23,7 +23,7 @@
 //!
 //! ## Write path
 //!
-//! The request path never touches redb. [`RollupWriter`] owns a
+//! The request path never touches redb. [`RollupWriter`](crate::usage_rollup::RollupWriter) owns a
 //! bounded channel drained by one dedicated thread (redb is a
 //! synchronous embedded store); a full queue drops the event and
 //! increments `sbproxy_telemetry_dropped_total{kind="usage_rollup"}`
