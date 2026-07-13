@@ -233,6 +233,15 @@ struct ErrorResponse {
     actual_revision: Option<u64>,
 }
 
+#[derive(Debug, Serialize)]
+struct DurableStateAdvancedResponse<'a> {
+    code: &'static str,
+    error: &'static str,
+    durable_state_advanced: bool,
+    revision: u64,
+    content_digest: &'a str,
+}
+
 fn error_response(status: u16, code: &'static str, error: impl Into<String>) -> Resp {
     json_response(
         status,
@@ -447,7 +456,29 @@ fn deployments_put_response(runtime: &impl ModelManagementRuntime, body: Option<
                 },
             )
         }
-        Err(error) => admin_revision_error_response(error),
+        Err(error) => {
+            if let AdminDeploymentRevisionError::DurableStateAdvanced {
+                revision,
+                content_digest,
+                source,
+            } = &error
+            {
+                tracing::error!(
+                    target: "sbproxy::admin::audit",
+                    action = "model_deployments_replace",
+                    outcome = "runtime_commit_failed",
+                    source_mode = "admin_managed",
+                    prior_revision = ?expected_revision,
+                    next_revision = *revision,
+                    content_digest = %content_digest,
+                    deployment_count,
+                    reason_code = source.reason_code(),
+                    error = %source,
+                    "admin model deployment durable state advanced but runtime commit failed"
+                );
+            }
+            admin_revision_error_response(error)
+        }
     }
 }
 
@@ -557,6 +588,29 @@ fn admin_revision_error_response(error: AdminDeploymentRevisionError) -> Resp {
         ),
         AdminDeploymentRevisionError::Runtime(error) => {
             error_response(502, error.reason_code(), "model runtime operation failed")
+        }
+        AdminDeploymentRevisionError::DurableStateAdvanced {
+            revision,
+            content_digest,
+            source,
+        } => {
+            tracing::error!(
+                revision,
+                content_digest,
+                reason_code = source.reason_code(),
+                error = %source,
+                "durable admin deployment state advanced but runtime publication failed"
+            );
+            json_response(
+                502,
+                &DurableStateAdvancedResponse {
+                    code: "runtime_commit_failed",
+                    error: "durable deployment state advanced, but runtime publication failed",
+                    durable_state_advanced: true,
+                    revision,
+                    content_digest: &content_digest,
+                },
+            )
         }
     }
 }
@@ -871,11 +925,17 @@ fn runtime_error_response(operation: &str, error: sbproxy_model_host::RuntimeMan
         | sbproxy_model_host::RuntimeManagerError::Draining(_) => 409,
         _ => 502,
     };
+    tracing::error!(
+        operation,
+        reason_code = error.reason_code(),
+        error = %error,
+        "model host lifecycle operation failed"
+    );
     (
         status,
         JSON,
         serde_json::json!({
-            "error": format!("{operation} failed: {error}"),
+            "error": format!("{operation} failed; inspect server logs"),
             "reason_code": error.reason_code(),
         })
         .to_string(),
@@ -1399,6 +1459,48 @@ models:
         assert_eq!(response["code"], "prepare_infrastructure_failed");
         assert!(!body.contains(private_path.to_string_lossy().as_ref()));
         assert!(!body.contains("fixture failure"));
+    }
+
+    #[test]
+    fn post_commit_failure_reports_the_durable_cursor_without_private_diagnostics() {
+        let error = AdminDeploymentRevisionError::DurableStateAdvanced {
+            revision: 9,
+            content_digest: "a".repeat(64),
+            source: sbproxy_model_host::RuntimeManagerError::Prepare(
+                "private runtime diagnostic".to_string(),
+            ),
+        };
+
+        let (status, _, body) = admin_revision_error_response(error);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error response");
+
+        assert_eq!(status, 502);
+        assert_eq!(response["code"], "runtime_commit_failed");
+        assert_eq!(response["durable_state_advanced"], true);
+        assert_eq!(response["revision"], 9);
+        assert_eq!(response["content_digest"], "a".repeat(64));
+        assert!(!body.contains("private runtime diagnostic"));
+    }
+
+    #[test]
+    fn lifecycle_runtime_failures_do_not_expose_private_diagnostics() {
+        let private_path = std::path::PathBuf::from("/private/model-cache/secret/lease.lock");
+        let artifact_error = sbproxy_model_host::ArtifactError::Io {
+            operation: "lease artifact",
+            path: private_path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private transport diagnostic",
+            ),
+        };
+
+        let (status, _, body) = runtime_error_response("load", artifact_error.into());
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error response");
+
+        assert_eq!(status, 502);
+        assert_eq!(response["reason_code"], "prepare_infrastructure_failed");
+        assert!(!body.contains(private_path.to_string_lossy().as_ref()));
+        assert!(!body.contains("private transport diagnostic"));
     }
 
     #[test]

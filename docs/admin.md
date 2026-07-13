@@ -265,16 +265,21 @@ sbproxy models stop local-qwen --format json
 Lifecycle errors include bounded `reason_code` values. A stop enters drain,
 rejects new requests, waits for active stream permits up to the configured
 deadline, and then stops the engine. Reset does not change `sb.yml`; it clears a
-retained failure so the configured generation can be started again.
+retained failure so the configured generation can be started again. Detailed
+paths and transport diagnostics stay in server logs and are not returned to the
+browser.
 
 The Model host page renders catalog evidence and support state, exact variant
 availability, desired deployments, runtime status, and lifecycle actions.
 Stable and preview variants are selectable only when their engine and
 accelerator evidence is complete. Unsupported, config-only, and incomplete
-entries remain visible but disabled. The deployment form covers placement,
-replicas, pull and warm behavior, keepalive, concurrency, queueing, engine, and
-rollout. License acknowledgement is required when selecting a model that needs
-it.
+entries remain visible but disabled. Pickle variants also remain disabled unless
+the logical catalog model explicitly sets `allow_pickle`. Local admin-managed
+deployments are always one replica and omit cluster-only label, spread, and
+heterogeneous placement controls. The authority-node form adds those controls
+for signed cluster placement. Both forms cover pull and warm behavior,
+keepalive, concurrency, queueing, engine, and rollout. License acknowledgement
+is required when selecting a model that needs it.
 
 Admin-managed edits replace the complete map with compare-and-swap. A conflict
 keeps the submitted form and attempted map visible, reloads current state, and
@@ -282,6 +287,11 @@ requires an explicit retry after the operator compares them. Removal is
 blocked while runtime evidence is stale or the deployment is ready,
 preparing, or draining. File-managed and cluster verifier views explain their
 read-only authority instead of offering a local save action.
+
+Any non-conflict mutation failure also reloads catalog, desired state, and
+runtime status because the durable authority may already have advanced. Signed
+cluster failures additionally reload the authority cursor and signed bundle.
+The operator draft remains open throughout recovery.
 
 ### Cluster health and unhealthy-node callouts
 

@@ -108,7 +108,8 @@ pub use catalog::{
 pub use cluster_authority::{
     DeploymentAuthorityError, DeploymentBundleCursor, DeploymentSigningKey, DeploymentVerifyingKey,
     FileDeploymentBundleCursorStore, RestrictedDeploymentBundle, RestrictedDeploymentBundleDraft,
-    SignedDeploymentBundle, VerifiedDeploymentBundle, RESTRICTED_DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
+    SignedDeploymentBundle, VerifiedDeploymentBundle, MAX_BUNDLE_BYTES,
+    RESTRICTED_DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
 };
 pub use cluster_placement::{
     reconcile_cluster_placement, ClusterDeploymentPlacement, ClusterPlacementError,

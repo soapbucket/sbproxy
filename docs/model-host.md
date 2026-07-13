@@ -390,6 +390,11 @@ current document immediately before a write. Send `expected_revision: null`
 only when the returned revision is `null`; otherwise send the exact unsigned
 integer returned by GET.
 
+Local admin-managed state is deliberately single-node: every deployment must
+use exactly one replica, with no heterogeneous variants, required labels, or
+spread keys. Multi-replica and placement intent belongs in a signed cluster
+bundle published by the configured authority node.
+
 ```bash
 curl -u "admin:${SB_ADMIN_PASSWORD}" \
   -X PUT \
@@ -474,8 +479,10 @@ Mutation failures use these status and code pairs:
 |---|---|---|
 | `403` | `authority_read_only` | Local deployment replacement is disabled for the current authority. |
 | `409` | `revision_conflict` | `expected_revision` differs from durable state. The response includes `expected_revision` and `actual_revision` when present. |
-| `422` | A bounded preparation, admission, or compatibility reason such as `prepare_failed`, `insufficient_capacity`, `engine_incompatible`, or `artifact_not_ready` | The candidate could not be prepared or activated safely. A pre-CAS failure leaves the store unchanged. A post-CAS activation failure leaves the durable revision advanced, and failed rollback can leave runtime degraded. Read desired state, status, and logs before explicit recovery. |
-| `502` | A bounded infrastructure or runtime reason such as `prepare_infrastructure_failed`, `store_failed`, or an engine failure code | Storage, artifact transport, provisioning, or runtime infrastructure failed. Determine whether the durable revision advanced; do not infer runtime health from the HTTP status. Read desired state, status, and logs before explicit recovery. |
+| `422` | A bounded preparation, admission, or compatibility reason such as `prepare_failed`, `insufficient_capacity`, `engine_incompatible`, or `artifact_not_ready` | The candidate could not be prepared before the durable compare-and-swap, so the store remains unchanged. |
+| `502` | `runtime_commit_failed` | The compare-and-swap succeeded but runtime publication failed. The response sets `durable_state_advanced: true` and returns the new `revision` and `content_digest`. Reload desired state and runtime status before any correction. |
+| `502` | A bounded infrastructure reason such as `prepare_infrastructure_failed`, `store_failed`, or an engine failure code | Storage, artifact transport, provisioning, or runtime infrastructure failed before durable publication. Detailed paths and transport diagnostics remain in server logs. |
+| `413` | `request_body_too_large` | The admin request body exceeds the signed bundle limit of 512 KiB. |
 
 Malformed bodies, unknown fields, duplicate map keys, invalid desired state,
 and unknown catalog models or variants return `400` with a stable code such as
@@ -486,7 +493,8 @@ Every authenticated mutation emits an audit record with `operator`, `role`,
 `method`, and `path`. A successful local replacement also emits
 `action=model_deployments_replace`, `source_mode=admin_managed`,
 `prior_revision`, `next_revision`, `content_digest`, and `deployment_count` on
-the `sbproxy::admin::audit` target.
+the `sbproxy::admin::audit` target. A post-CAS publication failure emits the
+same cursor fields with `outcome=runtime_commit_failed`.
 
 ### Model-management UI
 
@@ -498,7 +506,8 @@ variants remain visible as evidence but cannot be selected. The evidence panel
 shows family, parameters, license, context, exact variant, format, quantization,
 minimum memory, download size, engines, accelerators, certification, and
 support level. An unavailable exact pin is shown as unavailable; the UI does
-not substitute evidence from a different variant.
+not substitute evidence from a different variant. Pickle variants fail closed
+unless the logical catalog entry explicitly opts in with `allow_pickle: true`.
 
 Creating a deployment or changing its logical model requires explicit license
 acknowledgement. The form covers deployment ID, logical model, automatic or
@@ -506,6 +515,10 @@ exact variant selection, heterogeneous variants, replicas, required labels,
 spread keys, pull policy, warm behavior, engine, rollout policy, keep-alive,
 maximum concurrency, queue depth, and queue timeout. Add, edit, rename, and
 remove operations always build one complete replacement map.
+
+In local admin mode the form fixes replicas at one and hides heterogeneous,
+required-label, and spread controls. Those fields appear only for an authority
+node publishing signed cluster placement intent.
 
 Removal requires a fresh lifecycle response. A deployment in `ready`,
 `preparing`, or `draining` state must be stopped first. If a write returns
@@ -516,6 +529,10 @@ revision, digest, signer, and desired-map proof are coherent. Edit and rename
 retries also verify that the original deployment baseline has not changed and
 that the target ID did not appear. Removal retries fetch fresh lifecycle state
 again before sending another write.
+
+For any other mutation failure, the UI reloads catalog, desired state, and
+runtime status because durable state may already have advanced. Signed cluster
+failures also reload the authority cursor and bundle. The draft stays open.
 
 ### Cluster-authority publication
 

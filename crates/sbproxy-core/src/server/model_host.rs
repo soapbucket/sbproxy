@@ -84,6 +84,17 @@ pub enum AdminDeploymentRevisionError {
     /// Candidate preparation or runtime commit failed.
     #[error(transparent)]
     Runtime(#[from] sbproxy_model_host::RuntimeManagerError),
+    /// Durable desired state advanced, but its prepared runtime could not publish.
+    #[error("durable state advanced to revision {revision}, but runtime commit failed: {source}")]
+    DurableStateAdvanced {
+        /// Durable revision callers must use for their next optimistic update.
+        revision: u64,
+        /// Canonical digest of the durable revision that won the compare-and-swap.
+        content_digest: String,
+        /// Detailed process-local failure, retained for logs rather than API display.
+        #[source]
+        source: sbproxy_model_host::RuntimeManagerError,
+    },
 }
 
 /// Authority and durable desired state exposed to authenticated management APIs.
@@ -594,8 +605,14 @@ impl ProductionModelRuntime {
                     .to_string(),
             ));
         }
-        let report = manager.commit_revision(prepared).await?;
         self.epoch.store(next_epoch, Ordering::SeqCst);
+        let report = manager.commit_revision(prepared).await.map_err(|source| {
+            AdminDeploymentRevisionError::DurableStateAdvanced {
+                revision: durable.revision,
+                content_digest: durable.content_digest.clone(),
+                source,
+            }
+        })?;
         Ok(AdminDeploymentRevisionResult {
             revision: durable.revision,
             content_digest: durable.content_digest,
@@ -1906,6 +1923,7 @@ mod tests {
         deployment: String,
         generation: u64,
         stops: Arc<AtomicUsize>,
+        fail_start: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
@@ -1923,6 +1941,11 @@ mod tests {
             _intent: sbproxy_model_host::PullIntent,
         ) -> Result<sbproxy_model_host::RunningEngine, sbproxy_model_host::RuntimeManagerError>
         {
+            if self.fail_start.load(Ordering::SeqCst) {
+                return Err(sbproxy_model_host::RuntimeManagerError::Prepare(
+                    "injected cluster start failure".to_string(),
+                ));
+            }
             Ok(sbproxy_model_host::RunningEngine {
                 deployment: self.deployment.clone(),
                 generation: self.generation,
@@ -1956,6 +1979,7 @@ mod tests {
     #[derive(Default)]
     struct ClusterFixturePreparer {
         fail: AtomicBool,
+        fail_start: Arc<AtomicBool>,
         stops: Arc<AtomicUsize>,
         block_prepare: AtomicBool,
         prepare_entered: tokio::sync::Notify,
@@ -1984,6 +2008,7 @@ mod tests {
                 deployment: request.deployment_id,
                 generation: request.generation,
                 stops: self.stops.clone(),
+                fail_start: self.fail_start.clone(),
             }))
         }
     }
@@ -2327,6 +2352,33 @@ mod tests {
         ));
         assert!(store.load().unwrap().is_none());
         assert!(runtime.current_desired().deployments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_revision_reports_when_durable_state_advances_before_commit_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("deployments.json");
+        let store = sbproxy_model_host::FileDeploymentRevisionStore::open(&store_path).unwrap();
+        let preparer = Arc::new(ClusterFixturePreparer::default());
+        preparer.fail_start.store(true, Ordering::SeqCst);
+        let runtime = admin_fixture_runtime(&store_path, preparer).await;
+        let mut deployment = admin_fixture_deployment();
+        deployment.warm = true;
+
+        let error = runtime
+            .apply_admin_deployment_revision(
+                None,
+                BTreeMap::from([("warm-failure".to_string(), deployment)]),
+            )
+            .await
+            .expect_err("runtime commit fails after durable compare-and-swap");
+
+        assert!(error.to_string().contains("durable state advanced"));
+        let durable = store.load().unwrap().expect("durable revision committed");
+        assert_eq!(durable.revision, 1);
+        assert!(durable.deployments.contains_key("warm-failure"));
+        assert!(runtime.current_desired().deployments.is_empty());
+        assert_eq!(runtime.epoch.load(Ordering::SeqCst), 1);
     }
 
     #[test]
