@@ -5,6 +5,7 @@ import deploymentTable from "./ModelDeploymentTable.vue?raw";
 import deviceTable from "./ModelDeviceTable.vue?raw";
 import errorState from "./ErrorState.vue?raw";
 import managementNotices from "./ModelManagementNotices.vue?raw";
+import managementOverview from "./ModelManagementOverview.vue?raw";
 import modelHostView from "../views/ModelHostView.vue?raw";
 
 const SOURCES: Record<string, string> = {
@@ -14,6 +15,7 @@ const SOURCES: Record<string, string> = {
   "ModelDeviceTable.vue": deviceTable,
   "ErrorState.vue": errorState,
   "ModelManagementNotices.vue": managementNotices,
+  "ModelManagementOverview.vue": managementOverview,
   "ModelHostView.vue": modelHostView,
 };
 
@@ -91,6 +93,32 @@ describe("model management component contracts", () => {
     expect(notices).toContain(
       'v-else-if="catalogLoaded && previewOnlyCatalog"',
     );
+  });
+
+  it("uses canonical desired IDs for modal duplicate validation", () => {
+    const view = source("ModelHostView.vue");
+    expect(view).toContain(
+      ':existing-deployment-ids="Object.keys(canonicalDesiredDeployments ?? {})"',
+    );
+  });
+
+  it("renders canonical desired count and effective revision evidence", () => {
+    const view = source("ModelHostView.vue");
+    const overview = source("ModelManagementOverview.vue");
+    expect(view).toContain(
+      ':desired-deployments="canonicalDesiredDeployments"',
+    );
+    expect(view).toContain(':desired-revision="effectiveDesiredRevision"');
+    expect(view).toContain(
+      ':desired-content-digest="effectiveDesiredContentDigest"',
+    );
+    expect(overview).toContain("Object.keys(desiredDeployments).length");
+    expect(overview).toContain(
+      'desiredRevision === undefined ? "Unavailable" : desiredRevision ?? "Initial"',
+    );
+    expect(overview).toContain("desiredContentDigest");
+    expect(overview).not.toContain("Object.keys(document.deployments)");
+    expect(overview).not.toContain("document.content_digest");
   });
 
   it("uses stable composite keys and announced dynamic metadata", () => {

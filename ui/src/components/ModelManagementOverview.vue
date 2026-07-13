@@ -3,6 +3,7 @@ import type {
   ClusterDeploymentAuthority,
   ClusterDeploymentDocument,
   DeploymentDocument,
+  ModelDeployment,
   ModelHostStatus,
 } from "../api";
 import { formatBytes, shortId } from "../lib/format";
@@ -12,6 +13,9 @@ import StatusBadge from "./StatusBadge.vue";
 
 defineProps<{
   document: DeploymentDocument | null;
+  desiredDeployments: Readonly<Record<string, ModelDeployment>> | null;
+  desiredRevision?: number | null;
+  desiredContentDigest?: string | null;
   status: ModelHostStatus | null;
   catalogRevision: string | null;
   clusterAuthority: ClusterDeploymentAuthority | null;
@@ -29,7 +33,7 @@ defineProps<{
   <div class="summary-grid">
     <StatCard
       label="Desired deployments"
-      :value="document ? Object.keys(document.deployments).length : 'n/a'"
+      :value="desiredDeployments ? Object.keys(desiredDeployments).length : 'n/a'"
       :sub="document ? authorityLabel(document.authority) : 'Ownership unavailable'"
       tone="accent"
     />
@@ -64,7 +68,9 @@ defineProps<{
     <dl class="ownership-facts">
       <div>
         <dt>Desired revision</dt>
-        <dd class="sb-mono">{{ document?.revision ?? "Initial" }}</dd>
+        <dd class="sb-mono">
+          {{ desiredRevision === undefined ? "Unavailable" : desiredRevision ?? "Initial" }}
+        </dd>
       </div>
       <div>
         <dt>Catalog</dt>
@@ -78,10 +84,10 @@ defineProps<{
         <dt>Bundle signer</dt>
         <dd class="sb-mono">{{ clusterBundle.signer_node_id }}</dd>
       </div>
-      <div v-if="document?.content_digest">
+      <div v-if="desiredContentDigest">
         <dt>Content digest</dt>
-        <dd class="sb-mono" :title="document.content_digest">
-          {{ shortId(document.content_digest, 12, 8) }}
+        <dd class="sb-mono" :title="desiredContentDigest">
+          {{ shortId(desiredContentDigest, 12, 8) }}
         </dd>
       </div>
     </dl>

@@ -85,12 +85,6 @@ export function useModelManagement() {
       statusReq.error.value === null &&
       Array.isArray(status.value?.deployments),
   );
-  const rows = computed(() =>
-    deploymentRows(
-      deploymentDocument.value?.deployments ?? null,
-      runtimeDeployments.value,
-    ),
-  );
   const readyDeployments = computed(
     () => runtimeDeployments.value.filter((runtime) => runtime.state === "ready").length,
   );
@@ -188,6 +182,43 @@ export function useModelManagement() {
     }
     return activeBundle;
   });
+  const canonicalDesiredDeployments = computed<
+    Readonly<Record<string, ModelDeployment>> | null
+  >(() => {
+    const document = deploymentDocument.value;
+    if (!document) return null;
+    if (document.authority !== "cluster_authority") {
+      return document.deployments;
+    }
+    if (initialClusterBundleAbsent.value) {
+      return Object.create(null) as Record<string, ModelDeployment>;
+    }
+    return coherentClusterBundle.value?.bundle.deployments ?? null;
+  });
+  const effectiveDesiredRevision = computed<number | null | undefined>(() => {
+    const document = deploymentDocument.value;
+    if (!document) return undefined;
+    if (document.authority !== "cluster_authority") return document.revision;
+    if (initialClusterBundleAbsent.value) return null;
+    return coherentClusterBundle.value?.bundle.revision;
+  });
+  const effectiveDesiredContentDigest = computed<
+    string | null | undefined
+  >(() => {
+    const document = deploymentDocument.value;
+    if (!document) return undefined;
+    if (document.authority !== "cluster_authority") {
+      return document.content_digest;
+    }
+    if (initialClusterBundleAbsent.value) return null;
+    return coherentClusterBundle.value?.bundle.content_digest;
+  });
+  const rows = computed(() =>
+    deploymentRows(
+      canonicalDesiredDeployments.value,
+      runtimeDeployments.value,
+    ),
+  );
   const hasSafePersistentRevision = computed(
     () => {
       if (mutationMode.value === "signed_cluster_post") {
@@ -222,22 +253,19 @@ export function useModelManagement() {
           clusterBundleAllowsPublication.value)),
   );
 
-  function currentDeploymentBase(): Readonly<Record<string, ModelDeployment>> | null {
-    const document = deploymentDocument.value;
-    if (!document) return null;
-    if (mutationMode.value !== "signed_cluster_post") {
-      return document.deployments;
-    }
-    if (initialClusterBundleAbsent.value) {
-      return Object.create(null) as Record<string, ModelDeployment>;
-    }
-    return coherentClusterBundle.value?.bundle.deployments ?? null;
+  function canonicalDesiredDeployment(
+    deploymentId: string,
+  ): ModelDeployment | null {
+    const deployments = canonicalDesiredDeployments.value;
+    return deployments && Object.hasOwn(deployments, deploymentId)
+      ? deployments[deploymentId]
+      : null;
   }
 
   const currentMutationProof = computed<DeploymentConflictProof | null>(() => {
     const document = deploymentDocument.value;
     const activeCatalog = catalog.value;
-    const baseDeployments = currentDeploymentBase();
+    const baseDeployments = canonicalDesiredDeployments.value;
     const mode = mutationMode.value;
     if (
       !canMutate.value ||
@@ -492,7 +520,7 @@ export function useModelManagement() {
       return false;
     }
     const currentProof = currentMutationProof.value;
-    const currentDeployments = currentDeploymentBase();
+    const currentDeployments = canonicalDesiredDeployments.value;
     if (!currentProof || !currentDeployments) {
       failures.push(
         "Authority reload failed: no coherent current mutation proof was returned",
@@ -530,7 +558,7 @@ export function useModelManagement() {
       return;
     }
 
-    const baseDeployments = currentDeploymentBase();
+    const baseDeployments = canonicalDesiredDeployments.value;
     if (!baseDeployments) {
       mutationError.value =
         "Persistent mutation is paused until one coherent signed deployment snapshot is available.";
@@ -622,14 +650,15 @@ export function useModelManagement() {
   }
 
   function openEditDeployment(row: ModelDeploymentRow) {
-    if (!row.desired || !canMutate.value || !catalog.value) return;
+    const desired = canonicalDesiredDeployment(row.deploymentId);
+    if (!desired || !canMutate.value || !catalog.value) return;
     mutationError.value = null;
     conflict.value = null;
     pendingConflictChange.value = null;
     pendingConflictMode.value = null;
     editor.value = {
       originalDeploymentId: row.deploymentId,
-      initialDeployment: row.desired,
+      initialDeployment: desired,
     };
   }
 
@@ -641,6 +670,19 @@ export function useModelManagement() {
         "Reload current authority state successfully before saving the preserved draft.";
       return;
     }
+    const desired = canonicalDesiredDeployments.value;
+    if (!desired) {
+      mutationError.value =
+        "Reload the current desired deployment map before saving.";
+      return;
+    }
+    if (
+      value.deploymentId !== activeEditor.originalDeploymentId &&
+      Object.hasOwn(desired, value.deploymentId)
+    ) {
+      mutationError.value = "A deployment with this ID already exists.";
+      return;
+    }
     await mutateDesiredState({
       kind: "upsert",
       originalDeploymentId: activeEditor.originalDeploymentId,
@@ -650,8 +692,18 @@ export function useModelManagement() {
   }
 
   async function removeDeployment(row: ModelDeploymentRow): Promise<void> {
+    if (!canonicalDesiredDeployment(row.deploymentId)) {
+      banner.value = {
+        tone: "warn",
+        text: "This deployment is not present in the current desired map. Refresh before removing it.",
+      };
+      return;
+    }
+    const currentRuntime = runtimeDeployments.value.find(
+      (runtime) => runtime.deployment === row.deploymentId,
+    );
     const guard = deploymentRemovalGuard(
-      row.runtime?.state ?? null,
+      currentRuntime?.state ?? null,
       runtimeStatusCurrent.value,
     );
     if (!guard.allowed) {
@@ -781,6 +833,9 @@ export function useModelManagement() {
     deploymentDocument,
     clusterBundle,
     coherentClusterBundle,
+    canonicalDesiredDeployments,
+    effectiveDesiredRevision,
+    effectiveDesiredContentDigest,
     clusterAuthority,
     runtimeDeployments,
     runtimeStatusCurrent,

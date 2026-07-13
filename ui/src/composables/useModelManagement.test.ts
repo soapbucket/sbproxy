@@ -13,6 +13,7 @@ import {
   type ClusterDeploymentDocument,
   type ClusterStatusResponse,
   type DeploymentDocument,
+  type ModelDeployment,
   type DeploymentRuntimeState,
   type DeploymentRuntimeStatus,
   type ModelHostStatus,
@@ -563,6 +564,232 @@ describe("useModelManagement orchestration", () => {
         "signed-existing": signedExisting,
       },
     });
+  });
+
+  it("rejects an add that collides with a signed deployment hidden from the local projection", async () => {
+    const hidden = deploymentDefaults("model", "q4");
+    mockReads({
+      document: document("cluster_authority", true, 7, ownRecord([])),
+      bundle: bundle(7, ownRecord([["hidden-signed", hidden]])),
+    });
+    const publish = vi
+      .spyOn(api, "publishClusterDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openAddDeployment();
+
+    await management.saveDeployment(formValue("hidden-signed"));
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(management.mutationError.value).toEqual(
+      expect.stringMatching(/already exists/i),
+    );
+  });
+
+  it("seeds a signed cluster edit from the canonical bundle instead of a stale row", async () => {
+    const signed: ModelDeployment = {
+      ...deploymentDefaults("model", "q4"),
+      replicas: 3,
+      required_labels: ownRecord([["zone", "west"]]),
+      spread_by: ["zone"],
+      pull: "on_boot",
+      warm: true,
+      keep_alive_secs: 600,
+      max_concurrency: 4,
+    };
+    const projection: ModelDeployment = {
+      ...signed,
+      replicas: 1,
+      required_labels: ownRecord([["zone", "stale"]]),
+      spread_by: [],
+      pull: "manual",
+      warm: false,
+      keep_alive_secs: 5,
+      max_concurrency: 1,
+    };
+    mockReads({
+      document: document(
+        "cluster_authority",
+        true,
+        7,
+        ownRecord([["shared", projection]]),
+      ),
+      bundle: bundle(7, ownRecord([["shared", signed]])),
+    });
+    const management = useModelManagement();
+    await loadProof(management);
+
+    management.openEditDeployment({
+      deploymentId: "shared",
+      desired: projection,
+      runtime: null,
+    });
+
+    expect(management.editor.value?.initialDeployment).toEqual(signed);
+  });
+
+  it("preserves signed fields while applying the intended edit", async () => {
+    const signed: ModelDeployment = {
+      ...deploymentDefaults("model", "q4"),
+      replicas: 3,
+      required_labels: ownRecord([["zone", "west"]]),
+      spread_by: ["zone"],
+      pull: "on_boot",
+      warm: true,
+      keep_alive_secs: 600,
+      max_concurrency: 4,
+      max_queue_depth: 64,
+      queue_timeout_ms: 5_000,
+    };
+    const projection: ModelDeployment = {
+      ...signed,
+      replicas: 1,
+      required_labels: ownRecord([["zone", "stale"]]),
+      spread_by: [],
+      pull: "manual",
+      warm: false,
+      keep_alive_secs: 5,
+      max_concurrency: 1,
+      max_queue_depth: 2,
+      queue_timeout_ms: 100,
+    };
+    mockReads({
+      document: document(
+        "cluster_authority",
+        true,
+        7,
+        ownRecord([["shared", projection]]),
+      ),
+      bundle: bundle(7, ownRecord([["shared", signed]])),
+    });
+    const publish = vi
+      .spyOn(api, "publishClusterDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openEditDeployment({
+      deploymentId: "shared",
+      desired: projection,
+      runtime: null,
+    });
+    const seed = management.editor.value?.initialDeployment;
+    expect(seed).not.toBeNull();
+    expect(seed).not.toBeUndefined();
+    if (!seed) return;
+
+    await management.saveDeployment({
+      deploymentId: "shared",
+      deployment: { ...seed, replicas: 4 },
+    });
+
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish.mock.calls[0][0].deployments.shared).toEqual({
+      ...signed,
+      replicas: 4,
+    });
+  });
+
+  it("builds rows from the signed desired map plus the local runtime union", async () => {
+    const signed = deploymentDefaults("model", "q4");
+    const projection = deploymentDefaults("model", "q4");
+    mockReads({
+      document: document(
+        "cluster_authority",
+        true,
+        7,
+        ownRecord([["projection-only", projection]]),
+      ),
+      bundle: bundle(7, ownRecord([["signed-only", signed]])),
+      status: status([runtime("runtime-only", "ready")]),
+    });
+    const management = useModelManagement();
+    await loadProof(management);
+
+    expect(management.rows.value.map((row) => row.deploymentId)).toEqual([
+      "runtime-only",
+      "signed-only",
+    ]);
+    expect(management.rows.value[0]).toEqual(
+      expect.objectContaining({ desired: null, runtime: expect.any(Object) }),
+    );
+    expect(management.rows.value[1]).toEqual(
+      expect.objectContaining({ desired: signed, runtime: null }),
+    );
+    const effective = management as typeof management & {
+      effectiveDesiredRevision?: { value: number | null | undefined };
+      effectiveDesiredContentDigest?: { value: string | null | undefined };
+    };
+    expect(effective.effectiveDesiredRevision?.value).toBe(7);
+    expect(effective.effectiveDesiredContentDigest?.value).toBe(
+      "a".repeat(64),
+    );
+  });
+
+  it("keeps initial no-bundle desired state empty and prototype safe", async () => {
+    const projection = deploymentDefaults("model", "q4");
+    mockReads({
+      document: document(
+        "cluster_authority",
+        true,
+        99,
+        ownRecord([["projection-only", projection]]),
+      ),
+      clusterStatus: clusterStatus(authority(null)),
+      bundle: new ApiError(404, "no active bundle", "not published"),
+      status: status([runtime("runtime-only", "stopped")]),
+    });
+    const management = useModelManagement();
+    await loadProof(management);
+
+    expect(management.rows.value.map((row) => row.deploymentId)).toEqual([
+      "runtime-only",
+    ]);
+    const desired = (
+      management as typeof management & {
+        canonicalDesiredDeployments?: {
+          value: Readonly<Record<string, ModelDeployment>> | null;
+        };
+      }
+    ).canonicalDesiredDeployments?.value;
+    expect(desired).toBeDefined();
+    if (!desired) return;
+    expect(Object.keys(desired)).toEqual([]);
+    expect(Object.getPrototypeOf(desired)).toBeNull();
+    const effective = management as typeof management & {
+      effectiveDesiredRevision?: { value: number | null | undefined };
+      effectiveDesiredContentDigest?: { value: string | null | undefined };
+    };
+    expect(effective.effectiveDesiredRevision?.value).toBeNull();
+    expect(effective.effectiveDesiredContentDigest?.value).toBeNull();
+  });
+
+  it("does not publish removal for a projection-only target absent from the signed map", async () => {
+    const projection = deploymentDefaults("model", "q4");
+    const signed = deploymentDefaults("model", "q4");
+    mockReads({
+      document: document(
+        "cluster_authority",
+        true,
+        7,
+        ownRecord([["projection-only", projection]]),
+      ),
+      bundle: bundle(7, ownRecord([["signed-only", signed]])),
+      status: status([]),
+    });
+    const publish = vi
+      .spyOn(api, "publishClusterDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+
+    await management.removeDeployment({
+      deploymentId: "projection-only",
+      desired: projection,
+      runtime: null,
+    });
+
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it("requires the latest successful lifecycle response to contain the canonical deployments array", async () => {

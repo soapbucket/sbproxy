@@ -25,6 +25,9 @@ const {
   catalog,
   deploymentDocument,
   coherentClusterBundle,
+  canonicalDesiredDeployments,
+  effectiveDesiredRevision,
+  effectiveDesiredContentDigest,
   clusterAuthority,
   runtimeDeployments,
   runtimeStatusCurrent,
@@ -82,6 +85,9 @@ function confirmRemove(row: ModelDeploymentRow) {
 
   <ModelManagementOverview
     :document="deploymentDocument ?? null"
+    :desired-deployments="canonicalDesiredDeployments"
+    :desired-revision="effectiveDesiredRevision"
+    :desired-content-digest="effectiveDesiredContentDigest"
     :status="status ?? null"
     :catalog-revision="catalog?.catalog_revision ?? null"
     :cluster-authority="clusterAuthority"
@@ -163,7 +169,7 @@ function confirmRemove(row: ModelDeploymentRow) {
   <ModelDeploymentModal
     v-if="editor && catalog"
     :catalog="catalog"
-    :existing-deployment-ids="Object.keys(deploymentDocument?.deployments ?? {})"
+    :existing-deployment-ids="Object.keys(canonicalDesiredDeployments ?? {})"
     :initial-deployment-id="editor.originalDeploymentId"
     :initial-deployment="editor.initialDeployment"
     :saving="mutationBusy"
