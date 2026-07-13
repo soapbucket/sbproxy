@@ -1990,6 +1990,14 @@
             "null"
           ]
         },
+        "model_bind": {
+          "description": "Private model-plane listener in IP:port form.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "model_endpoint": {
           "description": "Private model-plane endpoint advertised by worker nodes.",
           "default": null,

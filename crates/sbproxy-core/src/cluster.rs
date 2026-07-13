@@ -153,6 +153,55 @@ struct InstalledCluster {
     settings: Arc<ReloadableClusterSettings>,
     snapshot_publication: Arc<SnapshotPublicationState>,
     deployment_authority: Option<ClusterDeploymentAuthority>,
+    model_plane_security: Option<Arc<ModelPlaneSecurity>>,
+}
+
+/// Resolved shared key used only by the explicit development model plane.
+pub(crate) struct ModelPlaneSharedKey(Arc<[u8]>);
+
+impl ModelPlaneSharedKey {
+    #[cfg(test)]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ModelPlaneSharedKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _secret_length = self.0.len();
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+/// Process-owned authentication material for the private model plane.
+pub(crate) enum ModelPlaneSecurity {
+    /// Canonical production mTLS material.
+    Mtls {
+        tls: sbproxy_mesh::transport::tls::MeshTlsConfig,
+        server_name: String,
+    },
+    /// Explicit development h2c authentication material.
+    DevelopmentSharedKey { key: ModelPlaneSharedKey },
+}
+
+impl std::fmt::Debug for ModelPlaneSecurity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mtls { tls, server_name } => {
+                let material_configured =
+                    !tls.cert_pem.is_empty() && !tls.key_pem.is_empty() && !tls.ca_pem.is_empty();
+                formatter
+                    .debug_struct("ModelPlaneSecurity::Mtls")
+                    .field("server_name", server_name)
+                    .field("material_configured", &material_configured)
+                    .finish_non_exhaustive()
+            }
+            Self::DevelopmentSharedKey { key } => formatter
+                .debug_struct("ModelPlaneSecurity::DevelopmentSharedKey")
+                .field("key", key)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -574,8 +623,19 @@ pub struct ClusterOwner {
 
 impl std::fmt::Debug for ClusterOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         formatter
             .debug_struct("ClusterOwner")
+            .field("installed", &installed.is_some())
+            .field(
+                "model_plane_configured",
+                &installed
+                    .as_ref()
+                    .is_some_and(|cluster| cluster.model_plane_security.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -641,6 +701,7 @@ impl ClusterOwner {
                 }
             },
         };
+        let model_plane_security = resolve_model_plane_security(effective.as_ref())?;
         let snapshot_publication = Arc::new(SnapshotPublicationState::new(
             model_snapshot_publication_enabled(effective.as_ref()),
             snapshot_generation_directory(effective.as_ref()),
@@ -662,6 +723,7 @@ impl ClusterOwner {
             settings: Arc::new(ReloadableClusterSettings::new(settings)),
             snapshot_publication,
             deployment_authority,
+            model_plane_security,
         });
         Ok(handle)
     }
@@ -708,6 +770,16 @@ impl ClusterOwner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .and_then(|installed| installed.deployment_authority.clone())
+    }
+
+    /// Resolved private model-plane authentication material, if configured.
+    #[cfg(test)]
+    pub(crate) fn model_plane_security(&self) -> Option<Arc<ModelPlaneSecurity>> {
+        self.installed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|installed| installed.model_plane_security.clone())
     }
 
     /// Reserve a due node-snapshot generation and hold publication serialization.
@@ -1217,6 +1289,48 @@ fn resolve_security(
     }
 }
 
+fn resolve_model_plane_security(
+    config: Option<&EffectiveClusterConfig>,
+) -> Result<Option<Arc<ModelPlaneSecurity>>> {
+    let Some(config) = config.filter(|config| config.model_bind.is_some()) else {
+        return Ok(None);
+    };
+    let security = match &config.security {
+        EffectiveClusterSecurity::Mtls {
+            cert_file,
+            key_file,
+            ca_file,
+            server_name,
+            ..
+        } => ModelPlaneSecurity::Mtls {
+            tls: sbproxy_mesh::transport::tls::MeshTlsConfig {
+                cert_pem: std::fs::read_to_string(cert_file).with_context(|| {
+                    format!("read model-plane cluster certificate {cert_file:?}")
+                })?,
+                key_pem: std::fs::read_to_string(key_file).with_context(|| {
+                    format!("read model-plane cluster private key {key_file:?}")
+                })?,
+                ca_pem: std::fs::read_to_string(ca_file)
+                    .with_context(|| format!("read model-plane cluster CA {ca_file:?}"))?,
+            },
+            server_name: server_name.clone(),
+        },
+        EffectiveClusterSecurity::SharedKey {
+            reference,
+            development: true,
+        } => ModelPlaneSecurity::DevelopmentSharedKey {
+            key: ModelPlaneSharedKey(Arc::from(resolve_secret_material(reference)?.into_bytes())),
+        },
+        EffectiveClusterSecurity::SharedKey {
+            development: false, ..
+        } => anyhow::bail!("model-plane shared key requires explicit development mode"),
+        EffectiveClusterSecurity::LegacyPlaintext => {
+            anyhow::bail!("model-plane listener requires authenticated cluster security")
+        }
+    };
+    Ok(Some(Arc::new(security)))
+}
+
 fn resolve_secret_material(reference: &str) -> Result<String> {
     let bytes = if let Some(name) = reference.strip_prefix("env:") {
         std::env::var(name)
@@ -1333,4 +1447,107 @@ fn start_cluster_metrics(handle: &ClusterHandle) {
         sbproxy_mesh::cluster_metrics::ClusterMetrics::new(),
     ));
     cluster_runtime().spawn(crate::cluster_metrics::run_loop(handle.clone(), 15));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct FakeBootstrap;
+
+    impl ClusterBootstrap for FakeBootstrap {
+        fn bootstrap(
+            &self,
+            identity: ClusterIdentity,
+            _config: &EffectiveClusterConfig,
+        ) -> Result<ClusterHandle> {
+            let node_id = identity.node_id.clone();
+            ClusterHandle::distributed(
+                identity,
+                Arc::new(sbproxy_mesh::MeshNode::new(node_id, Vec::new(), 8)),
+            )
+            .map_err(anyhow::Error::from)
+        }
+    }
+
+    #[test]
+    fn owner_installs_redacted_model_plane_security() {
+        let state = tempfile::tempdir().expect("state directory");
+        let server: ProxyServerConfig = serde_yaml::from_str(&format!(
+            r#"
+cluster:
+  cluster_id: cluster-a
+  node_id: worker-a
+  roles: [worker]
+  model_bind: 127.0.0.1:9443
+  model_endpoint: http://127.0.0.1:9443
+  state_dir: {}
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+"#,
+            state.path().display()
+        ))
+        .expect("model plane config");
+        let owner = ClusterOwner::new(Arc::new(FakeBootstrap));
+        owner.reconcile(&server).expect("install cluster");
+
+        let security = owner.model_plane_security().expect("model plane security");
+        let ModelPlaneSecurity::DevelopmentSharedKey { key } = security.as_ref() else {
+            panic!("expected development security");
+        };
+        assert_eq!(key.as_bytes(), b"local-development-secret");
+        assert!(!format!("{security:?}").contains("local-development-secret"));
+    }
+
+    #[test]
+    fn owner_loads_mtls_model_plane_material_without_debug_exposure() {
+        let state = tempfile::tempdir().expect("state directory");
+        let cert = state.path().join("node.pem");
+        let key = state.path().join("node-key.pem");
+        let ca = state.path().join("ca.pem");
+        std::fs::write(&cert, "certificate-secret").expect("certificate fixture");
+        std::fs::write(&key, "private-key-secret").expect("key fixture");
+        std::fs::write(&ca, "ca-secret").expect("CA fixture");
+        let server: ProxyServerConfig = serde_yaml::from_str(&format!(
+            r#"
+cluster:
+  cluster_id: cluster-a
+  node_id: worker-a
+  roles: [worker]
+  model_bind: 127.0.0.1:9443
+  model_endpoint: https://127.0.0.1:9443
+  state_dir: {}
+  security:
+    mode: mtls
+    shared_key: local-development-gossip-secret
+    cert_file: {}
+    key_file: {}
+    ca_file: {}
+    server_name: sbproxy-mesh
+"#,
+            state.path().display(),
+            cert.display(),
+            key.display(),
+            ca.display(),
+        ))
+        .expect("mTLS model plane config");
+        let owner = ClusterOwner::new(Arc::new(FakeBootstrap));
+        owner.reconcile(&server).expect("install cluster");
+
+        let security = owner.model_plane_security().expect("model plane security");
+        let ModelPlaneSecurity::Mtls { tls, server_name } = security.as_ref() else {
+            panic!("expected mTLS security");
+        };
+        assert_eq!(tls.cert_pem, "certificate-secret");
+        assert_eq!(tls.key_pem, "private-key-secret");
+        assert_eq!(tls.ca_pem, "ca-secret");
+        assert_eq!(server_name, "sbproxy-mesh");
+        let debug = format!("{security:?}");
+        for secret in ["certificate-secret", "private-key-secret", "ca-secret"] {
+            assert!(!debug.contains(secret));
+        }
+    }
 }

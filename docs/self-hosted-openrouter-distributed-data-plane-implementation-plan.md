@@ -37,7 +37,7 @@
 - Produces: crate-private `ModelPlaneSecurity::{Mtls, DevelopmentSharedKey}` from the installed process cluster.
 - Produces: `build_http2_acceptor` and `build_http2_connector` with ALPN restricted to `h2`.
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 ```rust,no_run
 #[test]
@@ -55,13 +55,13 @@ fn production_model_plane_requires_mtls() {
 }
 ```
 
-- [ ] **Step 2: Run the configuration tests and verify RED**
+- [x] **Step 2: Run the configuration tests and verify RED**
 
 Run: `cargo test -p sbproxy-config --test cluster_config model_bind -- --nocapture`
 
 Expected: FAIL because `model_bind` is not part of `ClusterConfig` or the restart fingerprint.
 
-- [ ] **Step 3: Add the bounded bind contract**
+- [x] **Step 3: Add the bounded bind contract**
 
 ```rust,no_run
 pub struct ClusterConfig {
@@ -82,7 +82,7 @@ fn validate_model_bind(bind: &str) -> Result<(), ClusterConfigError> {
 
 Validation rules: `model_bind` requires the worker role and `model_endpoint`; canonical mTLS may bind HTTPS, while shared-key mode requires `development: true` and an HTTP endpoint. Add the field to lowering and restart comparison.
 
-- [ ] **Step 4: Write failing peer-proof and ALPN tests**
+- [x] **Step 4: Write failing peer-proof and ALPN tests**
 
 ```rust,no_run
 #[test]
@@ -105,7 +105,7 @@ async fn model_plane_tls_negotiates_h2_only() {
 }
 ```
 
-- [ ] **Step 5: Run peer-proof tests and verify RED**
+- [x] **Step 5: Run peer-proof tests and verify RED**
 
 Run: `cargo test -p sbproxy-mesh cluster_handle::tests::handle_signs_and_verifies_a_domain_separated_peer_payload -- --nocapture`
 
@@ -113,7 +113,7 @@ Run: `cargo test -p sbproxy-mesh transport::tls::tests::model_plane_tls_negotiat
 
 Expected: FAIL because the public wrapper methods and HTTP/2 acceptor do not exist.
 
-- [ ] **Step 6: Expose bounded peer authentication and installed security**
+- [x] **Step 6: Expose bounded peer authentication and installed security**
 
 ```rust,no_run
 pub fn sign_peer_payload(&self, context: &str, payload: &[u8]) -> Result<PeerIdentityProof, ClusterStateError>;
@@ -134,7 +134,7 @@ pub(crate) enum ModelPlaneSecurity {
 
 `ModelPlaneSharedKey` is a crate-private, cloneable byte wrapper with a redacted `Debug` implementation. The wrappers must return a typed `AuthenticationUnavailable` error on local or unauthenticated handles. `ClusterOwner` reads PEM material once from the effective configuration and stores a cloneable model-plane profile without exposing it through admin state.
 
-- [ ] **Step 7: Run focused tests and commit**
+- [x] **Step 7: Run focused tests and commit**
 
 Run: `cargo test -p sbproxy-config --test cluster_config`
 

@@ -23,6 +23,7 @@ cluster:
   transport_port: 8946
   advertise_addr: 10.0.0.12:7946
   transport_advertise_addr: 10.0.0.12:8946
+  model_bind: 0.0.0.0:9443
   model_endpoint: https://10.0.0.12:9443
   state_dir: /var/lib/sbproxy/cluster
   security:
@@ -56,6 +57,7 @@ cluster:
         effective.transport_advertise_addr.as_deref(),
         Some("10.0.0.12:8946")
     );
+    assert_eq!(effective.model_bind.as_deref(), Some("0.0.0.0:9443"));
     assert_eq!(
         effective.security.mode(),
         EffectiveClusterSecurityMode::Mtls
@@ -102,6 +104,7 @@ fn generated_proxy_schema_exposes_cluster_contract() {
         "roles",
         "labels",
         "transport_advertise_addr",
+        "model_bind",
         "state_dir",
         "security",
         "snapshot_ttl_secs",
@@ -109,6 +112,95 @@ fn generated_proxy_schema_exposes_cluster_contract() {
         "deployment_authority",
     ] {
         assert!(json.contains(&format!("\"{field}\"")), "missing {field}");
+    }
+}
+
+#[test]
+fn model_plane_bind_is_restart_owned_and_requires_a_worker_endpoint() {
+    let proxy = parse(
+        r#"
+cluster:
+  cluster_id: dev-a
+  node_id: worker-a
+  roles: [worker]
+  model_bind: 127.0.0.1:9443
+  model_endpoint: http://127.0.0.1:9443
+  state_dir: ./cluster-state
+  security:
+    mode: shared_key
+    development: true
+    shared_key: local-development-secret
+"#,
+    );
+    let effective = resolve_effective_cluster(&proxy)
+        .expect("model plane config")
+        .expect("cluster enabled");
+    assert_eq!(effective.model_bind.as_deref(), Some("127.0.0.1:9443"));
+    assert_eq!(
+        effective.restart_fingerprint().model_bind,
+        effective.model_bind
+    );
+
+    let missing_endpoint: sbproxy_config::ClusterConfig = serde_yaml::from_str(
+        r#"
+cluster_id: dev-a
+node_id: worker-a
+roles: [worker]
+model_bind: 127.0.0.1:9443
+state_dir: ./cluster-state
+security:
+  mode: shared_key
+  development: true
+  shared_key: local-development-secret
+"#,
+    )
+    .expect("missing endpoint fixture");
+    let error = missing_endpoint
+        .validate()
+        .expect_err("model bind requires an advertised endpoint");
+    assert!(error.to_string().contains("model_endpoint"));
+
+    let gateway_only: sbproxy_config::ClusterConfig = serde_yaml::from_str(
+        r#"
+cluster_id: dev-a
+node_id: gateway-a
+roles: [gateway]
+model_bind: 127.0.0.1:9443
+model_endpoint: http://127.0.0.1:9443
+state_dir: ./cluster-state
+security:
+  mode: shared_key
+  development: true
+  shared_key: local-development-secret
+"#,
+    )
+    .expect("gateway-only fixture");
+    let error = gateway_only
+        .validate()
+        .expect_err("model plane listener requires worker role");
+    assert!(error.to_string().contains("worker role"));
+}
+
+#[test]
+fn model_plane_bind_rejects_hostnames_and_ephemeral_ports() {
+    for model_bind in ["localhost:9443", "127.0.0.1:0", "missing-port"] {
+        let cluster: sbproxy_config::ClusterConfig = serde_yaml::from_str(&format!(
+            r#"
+cluster_id: dev-a
+node_id: worker-a
+roles: [worker]
+model_bind: {model_bind}
+model_endpoint: http://127.0.0.1:9443
+state_dir: ./cluster-state
+security:
+  mode: shared_key
+  development: true
+  shared_key: local-development-secret
+"#
+        ))
+        .expect("invalid bind fixture");
+        let error = cluster.validate().expect_err("invalid model bind");
+        assert!(error.to_string().contains("model_bind"), "{model_bind}");
     }
 }
 

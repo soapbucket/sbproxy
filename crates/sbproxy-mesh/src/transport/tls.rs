@@ -73,16 +73,29 @@ pub(crate) fn load_roots(ca_pem: &str) -> Result<RootCertStore> {
 /// requires + verifies the connecting peer's client certificate against the
 /// shared CA.
 pub fn build_acceptor(cfg: &MeshTlsConfig) -> Result<TlsAcceptor> {
+    build_acceptor_with_alpn(cfg, Vec::new())
+}
+
+/// Build a model-plane server acceptor that negotiates HTTP/2 only.
+pub fn build_http2_acceptor(cfg: &MeshTlsConfig) -> Result<TlsAcceptor> {
+    build_acceptor_with_alpn(cfg, vec![b"h2".to_vec()])
+}
+
+fn build_acceptor_with_alpn(
+    cfg: &MeshTlsConfig,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<TlsAcceptor> {
     let roots = Arc::new(load_roots(&cfg.ca_pem)?);
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider())
         .build()
         .context("build mesh client-cert verifier")?;
-    let server_config = ServerConfig::builder_with_provider(provider())
+    let mut server_config = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .context("select TLS protocol versions")?
         .with_client_cert_verifier(verifier)
         .with_single_cert(load_chain(&cfg.cert_pem)?, load_key(&cfg.key_pem)?)
         .context("install mesh server certificate")?;
+    server_config.alpn_protocols = alpn_protocols;
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
@@ -90,13 +103,26 @@ pub fn build_acceptor(cfg: &MeshTlsConfig) -> Result<TlsAcceptor> {
 /// verifies the peer's server certificate against the shared CA. The caller
 /// supplies the `ServerName` at connect time.
 pub fn build_connector(cfg: &MeshTlsConfig) -> Result<TlsConnector> {
+    build_connector_with_alpn(cfg, Vec::new())
+}
+
+/// Build a model-plane client connector that negotiates HTTP/2 only.
+pub fn build_http2_connector(cfg: &MeshTlsConfig) -> Result<TlsConnector> {
+    build_connector_with_alpn(cfg, vec![b"h2".to_vec()])
+}
+
+fn build_connector_with_alpn(
+    cfg: &MeshTlsConfig,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<TlsConnector> {
     let roots = load_roots(&cfg.ca_pem)?;
-    let client_config = ClientConfig::builder_with_provider(provider())
+    let mut client_config = ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .context("select TLS protocol versions")?
         .with_root_certificates(roots)
         .with_client_auth_cert(load_chain(&cfg.cert_pem)?, load_key(&cfg.key_pem)?)
         .context("install mesh client certificate")?;
+    client_config.alpn_protocols = alpn_protocols;
     Ok(TlsConnector::from(Arc::new(client_config)))
 }
 
@@ -178,6 +204,30 @@ mod tests {
         tls.read_exact(&mut resp).await.unwrap();
         assert_eq!(&resp, b"pong");
         assert_eq!(&server.await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn model_plane_tls_negotiates_h2_only() {
+        let pki = make_pki();
+        let acceptor = build_http2_acceptor(&config_from(&pki)).unwrap();
+        let connector = build_http2_connector(&config_from(&pki)).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.expect("server handshake");
+            tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let tls = connector
+            .connect(name, tcp)
+            .await
+            .expect("client handshake");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        assert_eq!(server.await.unwrap().as_deref(), Some(b"h2".as_slice()));
     }
 
     #[tokio::test]
