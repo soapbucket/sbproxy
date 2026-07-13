@@ -154,6 +154,9 @@ thiserror = "2"
 
 # HTTP
 http = "1"
+http-body-util = "0.1"
+hyper = { version = "1.9", features = ["client", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 # Pingora
 pingora = "0.8"

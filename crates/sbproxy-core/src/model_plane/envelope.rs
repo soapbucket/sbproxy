@@ -15,7 +15,8 @@ pub const DISPATCH_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 /// Domain separator used for enrolled peer-identity proofs.
 pub const DISPATCH_PROOF_CONTEXT: &str = "sbproxy.model-dispatch.v1";
 
-const MAX_SIGNED_ENVELOPE_BYTES: usize = 128 * 1024;
+/// Maximum serialized signed dispatch envelope size.
+pub const MAX_SIGNED_DISPATCH_ENVELOPE_BYTES: usize = 128 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
 const MAX_POLICY_REVISION_BYTES: usize = 256;
 const MAX_CONTENT_TYPE_BYTES: usize = 256;
@@ -256,7 +257,7 @@ impl DispatchEnvelope {
 impl SignedDispatchEnvelope {
     /// Strictly decode one bounded signed envelope.
     pub fn parse_json(bytes: &[u8]) -> Result<Self, DispatchEnvelopeError> {
-        if bytes.len() > MAX_SIGNED_ENVELOPE_BYTES {
+        if bytes.len() > MAX_SIGNED_DISPATCH_ENVELOPE_BYTES {
             return Err(DispatchEnvelopeError::EnvelopeTooLarge);
         }
         let signed: Self =
@@ -269,7 +270,7 @@ impl SignedDispatchEnvelope {
     /// Encode one bounded signed envelope.
     pub fn to_json(&self) -> Result<Vec<u8>, DispatchEnvelopeError> {
         let bytes = serde_json::to_vec(self).map_err(|_| DispatchEnvelopeError::InvalidEnvelope)?;
-        if bytes.len() > MAX_SIGNED_ENVELOPE_BYTES {
+        if bytes.len() > MAX_SIGNED_DISPATCH_ENVELOPE_BYTES {
             return Err(DispatchEnvelopeError::EnvelopeTooLarge);
         }
         Ok(bytes)

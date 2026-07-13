@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::Context;
@@ -46,9 +46,14 @@ pub struct ProductionModelRuntime {
     foundation: RwLock<Option<RuntimeFoundation>>,
     snapshot_preparer: RwLock<Option<Arc<sbproxy_model_host::ProductionDeploymentPreparer>>>,
     cluster_state: RwLock<Option<ClusterRuntimeState>>,
+    model_plane_health: AtomicU8,
     epoch: AtomicU64,
     commit_lock: tokio::sync::Mutex<()>,
 }
+
+const MODEL_PLANE_UNAVAILABLE: u8 = 0;
+const MODEL_PLANE_DEGRADED: u8 = 1;
+const MODEL_PLANE_READY: u8 = 2;
 
 /// Successful durable admin deployment revision and its runtime effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +122,7 @@ impl std::fmt::Debug for ProductionModelRuntime {
         formatter
             .debug_struct("ProductionModelRuntime")
             .field("epoch", &self.epoch.load(Ordering::SeqCst))
+            .field("model_plane_health", &self.model_plane_health())
             .field(
                 "foundation",
                 &self
@@ -190,12 +196,24 @@ impl std::fmt::Debug for ManagedModelPermit {
 }
 
 impl ManagedModelPermit {
+    pub(crate) fn from_admission(
+        manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
+        deployment: String,
+        admission: sbproxy_model_host::DeploymentAdmissionPermit,
+    ) -> Self {
+        Self {
+            manager,
+            deployment,
+            admission,
+        }
+    }
+
     /// Canonical deployment held by this request.
     pub fn deployment(&self) -> &str {
         &self.deployment
     }
 
-    async fn ensure_ready(
+    pub(crate) async fn ensure_ready(
         &self,
         priority: sbproxy_model_host::PriorityClass,
     ) -> Result<sbproxy_model_host::RunningEngine, sbproxy_model_host::RuntimeManagerError> {
@@ -418,13 +436,56 @@ impl ProductionModelRuntime {
             foundation: RwLock::new(None),
             snapshot_preparer: RwLock::new(None),
             cluster_state: RwLock::new(None),
+            model_plane_health: AtomicU8::new(MODEL_PLANE_UNAVAILABLE),
             epoch: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
         })
     }
 
-    fn active_manager(&self) -> Arc<sbproxy_model_host::ModelRuntimeManager> {
+    pub(crate) fn active_manager(&self) -> Arc<sbproxy_model_host::ModelRuntimeManager> {
         self.active.load_full()
+    }
+
+    pub(crate) fn cluster_assignment_generation(
+        &self,
+        local_node_id: &str,
+        deployment: &str,
+    ) -> Option<u64> {
+        self.cluster_state
+            .read()
+            .expect("cluster model state lock")
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .placement
+                    .local_assignments(local_node_id)
+                    .get(deployment)
+                    .map(|assignment| assignment.deployment_generation)
+            })
+    }
+
+    /// Publish the current private model-plane listener health into worker snapshots.
+    pub(crate) fn set_model_plane_health(
+        &self,
+        health: sbproxy_model_host::node_snapshot::ModelPlaneHealth,
+    ) {
+        let value = match health {
+            sbproxy_model_host::node_snapshot::ModelPlaneHealth::Unavailable => {
+                MODEL_PLANE_UNAVAILABLE
+            }
+            sbproxy_model_host::node_snapshot::ModelPlaneHealth::Degraded => MODEL_PLANE_DEGRADED,
+            sbproxy_model_host::node_snapshot::ModelPlaneHealth::Ready => MODEL_PLANE_READY,
+        };
+        self.model_plane_health.store(value, Ordering::SeqCst);
+    }
+
+    /// Load the health value included in the next immutable worker snapshot.
+    pub(crate) fn model_plane_health(&self) -> sbproxy_model_host::node_snapshot::ModelPlaneHealth {
+        match self.model_plane_health.load(Ordering::SeqCst) {
+            MODEL_PLANE_READY => sbproxy_model_host::node_snapshot::ModelPlaneHealth::Ready,
+            MODEL_PLANE_DEGRADED => sbproxy_model_host::node_snapshot::ModelPlaneHealth::Degraded,
+            _ => sbproxy_model_host::node_snapshot::ModelPlaneHealth::Unavailable,
+        }
     }
 
     fn start_maintenance(runtime: &Arc<Self>) {
@@ -984,7 +1045,7 @@ impl ProductionModelRuntime {
             health: NodeHealthSnapshot {
                 state: health_state,
                 reason_codes: health_reasons.into_iter().collect(),
-                model_plane: sbproxy_model_host::node_snapshot::ModelPlaneHealth::Unavailable,
+                model_plane: self.model_plane_health(),
             },
             engines: inventory.engines,
             devices: inventory.devices,
@@ -2131,6 +2192,7 @@ mod tests {
             foundation: RwLock::new(None),
             snapshot_preparer: RwLock::new(None),
             cluster_state: RwLock::new(None),
+            model_plane_health: AtomicU8::new(MODEL_PLANE_UNAVAILABLE),
             epoch: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
         }
@@ -2596,6 +2658,7 @@ deployments:
             foundation: RwLock::new(None),
             snapshot_preparer: RwLock::new(None),
             cluster_state: RwLock::new(Some(ClusterRuntimeState { placement, catalog })),
+            model_plane_health: AtomicU8::new(MODEL_PLANE_UNAVAILABLE),
             epoch: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
         };

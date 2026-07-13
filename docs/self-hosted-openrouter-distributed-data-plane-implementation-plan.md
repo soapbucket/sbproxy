@@ -410,7 +410,7 @@ Commit: `git commit -m "WOR-1850: route current managed replicas"`
 - Produces: `ModelPlaneServer::start(config, security, cluster, execution)` and graceful `ModelPlaneServerHandle::shutdown()`.
 - Produces: `ModelPlaneClient::dispatch(candidate, signed, body)` returning status, allowlisted headers, and a backpressured byte stream.
 
-- [ ] **Step 1: Write failing worker-execution tests**
+- [x] **Step 1: Write failing worker-execution tests**
 
 ```rust,no_run
 #[tokio::test]
@@ -428,13 +428,13 @@ async fn concurrent_cold_requests_share_one_runtime_prepare() {
 }
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `cargo test -p sbproxy-core --test model_plane_transport worker_ -- --nocapture`
 
 Expected: compile failure because the execution service is absent.
 
-- [ ] **Step 3: Extract a generation-fenced worker service**
+- [x] **Step 3: Extract a generation-fenced worker service**
 
 ```rust,no_run
 pub struct PreparedWorkerExecution {
@@ -455,7 +455,7 @@ impl WorkerModelExecution {
 
 It must verify the active cluster assignment and generation before admission, use the existing bounded queue, call `ensure_ready_for_generation`, and hold the permit until the returned response stream is dropped.
 
-- [ ] **Step 4: Write failing transport tests**
+- [x] **Step 4: Write failing transport tests**
 
 ```rust,no_run
 #[tokio::test]
@@ -477,7 +477,7 @@ async fn replay_and_auth_errors_are_not_retryable_capacity_errors() {
 }
 ```
 
-- [ ] **Step 5: Run and verify RED**
+- [x] **Step 5: Run and verify RED**
 
 Run: `cargo test -p sbproxy-core --test model_plane_transport mtls_h2_streams_and_binds_proof_to_tls_peer -- --nocapture`
 
@@ -485,7 +485,7 @@ Run: `cargo test -p sbproxy-core --test model_plane_transport replay_and_auth_er
 
 Expected: FAIL because no listener or client exists.
 
-- [ ] **Step 6: Implement the listener, client, and response stream**
+- [x] **Step 6: Implement the listener, client, and response stream**
 
 ```rust,no_run
 pub const MODEL_PLANE_PATH_PREFIX: &str = "/_sbproxy/model-plane/v1";
@@ -499,11 +499,11 @@ pub struct ModelPlaneResponse {
 
 Use Hyper HTTP/2 for the separate listener. Production accepts only mTLS with `h2` ALPN and binds the verified request proof to the TLS leaf fingerprint. Explicit development mode uses h2c plus HMAC. The server accepts only the internal prefix, bounds headers and body by the configured AI body limit, validates the envelope and replay fence before local admission, strips all public authorization headers, rewrites only the engine model field, and forwards to `127.0.0.1:<engine-port>`. Dropping either side of the stream drops the upstream request and permit.
 
-- [ ] **Step 7: Add lifecycle ownership and health publication**
+- [x] **Step 7: Add lifecycle ownership and health publication**
 
-Start the server after the model runtime is installed and before the public pipeline is loaded. Publish `Starting`, `Ready`, or `Unavailable` through process state consumed by node snapshots. On shutdown, stop accepting, cancel active peer requests within the model shutdown deadline, then drain engines.
+Start the server after the model runtime is installed and before the public pipeline is loaded. Publish `Degraded` while starting, `Ready` after bind, or `Unavailable` after failure and shutdown through process state consumed by node snapshots. On shutdown, stop accepting, cancel active peer requests within the model shutdown deadline, then drain engines.
 
-- [ ] **Step 8: Run focused tests and commit**
+- [x] **Step 8: Run focused tests and commit**
 
 Run: `cargo test -p sbproxy-core --test model_plane_transport && cargo test -p sbproxy-core server::model_host::tests`
 

@@ -138,6 +138,9 @@ url.workspace = true
 
 # HTTP types (HeaderMap for auth checks)
 http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 
 # Async
 async-trait.workspace = true

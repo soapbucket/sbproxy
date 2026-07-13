@@ -153,14 +153,15 @@ struct InstalledCluster {
     settings: Arc<ReloadableClusterSettings>,
     snapshot_publication: Arc<SnapshotPublicationState>,
     deployment_authority: Option<ClusterDeploymentAuthority>,
+    model_plane_bind: Option<std::net::SocketAddr>,
     model_plane_security: Option<Arc<ModelPlaneSecurity>>,
 }
 
 /// Resolved shared key used only by the explicit development model plane.
+#[derive(Clone)]
 pub(crate) struct ModelPlaneSharedKey(Arc<[u8]>);
 
 impl ModelPlaneSharedKey {
-    #[cfg(test)]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -174,6 +175,7 @@ impl std::fmt::Debug for ModelPlaneSharedKey {
 }
 
 /// Process-owned authentication material for the private model plane.
+#[derive(Clone)]
 pub(crate) enum ModelPlaneSecurity {
     /// Canonical production mTLS material.
     Mtls {
@@ -182,6 +184,14 @@ pub(crate) enum ModelPlaneSecurity {
     },
     /// Explicit development h2c authentication material.
     DevelopmentSharedKey { key: ModelPlaneSharedKey },
+}
+
+/// Installed listener and authentication material for the process model plane.
+#[derive(Clone)]
+pub(crate) struct ProcessModelPlaneConfig {
+    pub(crate) bind_addr: std::net::SocketAddr,
+    pub(crate) security: Arc<ModelPlaneSecurity>,
+    pub(crate) cluster: ClusterHandle,
 }
 
 impl std::fmt::Debug for ModelPlaneSecurity {
@@ -702,6 +712,12 @@ impl ClusterOwner {
             },
         };
         let model_plane_security = resolve_model_plane_security(effective.as_ref())?;
+        let model_plane_bind = effective
+            .as_ref()
+            .and_then(|config| config.model_bind.as_deref())
+            .map(str::parse)
+            .transpose()
+            .context("parse validated model-plane bind address")?;
         let snapshot_publication = Arc::new(SnapshotPublicationState::new(
             model_snapshot_publication_enabled(effective.as_ref()),
             snapshot_generation_directory(effective.as_ref()),
@@ -723,6 +739,7 @@ impl ClusterOwner {
             settings: Arc::new(ReloadableClusterSettings::new(settings)),
             snapshot_publication,
             deployment_authority,
+            model_plane_bind,
             model_plane_security,
         });
         Ok(handle)
@@ -780,6 +797,20 @@ impl ClusterOwner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .and_then(|installed| installed.model_plane_security.clone())
+    }
+
+    fn model_plane_config(&self) -> Option<ProcessModelPlaneConfig> {
+        self.installed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|installed| {
+                Some(ProcessModelPlaneConfig {
+                    bind_addr: installed.model_plane_bind?,
+                    security: installed.model_plane_security.clone()?,
+                    cluster: installed.handle.clone(),
+                })
+            })
     }
 
     /// Reserve a due node-snapshot generation and hold publication serialization.
@@ -1401,6 +1432,11 @@ pub fn current_cluster_settings() -> Option<ClusterSettings> {
 /// Durable state directory for canonical cluster model control.
 pub(crate) fn current_cluster_state_directory() -> Option<PathBuf> {
     process_owner().state_directory()
+}
+
+/// Configured process-owned private model plane, when this node is a worker.
+pub(crate) fn current_process_model_plane_config() -> Option<ProcessModelPlaneConfig> {
+    process_owner().model_plane_config()
 }
 
 /// Reserve a due process node-snapshot publication.
