@@ -93,6 +93,60 @@ impl FileDeploymentRevisionStore {
         self.load_unlocked()
     }
 
+    /// Load the current revision and adopt `expected_catalog_revision` only
+    /// when durable desired state is already empty.
+    ///
+    /// The rebase is a monotonic revision written under the same exclusive
+    /// cross-process lock as compare-and-swap. A nonempty revision remains
+    /// fail-closed so configured deployments can never be reinterpreted by a
+    /// different catalog.
+    pub fn load_or_rebase_empty_catalog(
+        &self,
+        expected_catalog_revision: &str,
+    ) -> Result<Option<DeploymentRevision>, DeploymentStoreError> {
+        if expected_catalog_revision.trim().is_empty() {
+            return Err(DeploymentError::Invalid(
+                "expected catalog revision must not be empty".to_string(),
+            )
+            .into());
+        }
+        let lock = self.open_lock()?;
+        FileExt::lock_exclusive(&lock)
+            .map_err(|source| io_error("lock deployment store", &self.lock_path, source))?;
+        let Some(current) = self.load_unlocked()? else {
+            return Ok(None);
+        };
+        if current.source_mode != DeploymentSourceMode::AdminManaged {
+            return Err(DeploymentStoreError::WrongSourceMode(current.source_mode));
+        }
+        if current.catalog_revision == expected_catalog_revision {
+            return Ok(Some(current));
+        }
+        if !current.deployments.is_empty() {
+            return Err(DeploymentError::Invalid(format!(
+                "stored catalog revision {:?} differs from active {:?} while deployments remain configured",
+                current.catalog_revision, expected_catalog_revision
+            ))
+            .into());
+        }
+        let next_revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(DeploymentStoreError::RevisionOverflow)?;
+        if next_revision > crate::MAX_SAFE_JSON_INTEGER {
+            return Err(DeploymentStoreError::RevisionOverflow);
+        }
+        let rebased = DeploymentRevisionDraft {
+            source_mode: DeploymentSourceMode::AdminManaged,
+            source_revision: current.source_revision,
+            catalog_revision: expected_catalog_revision.to_string(),
+            deployments: current.deployments,
+        }
+        .into_revision(next_revision)?;
+        self.write_atomic(&rebased)?;
+        Ok(Some(rebased))
+    }
+
     /// Atomically replace desired state when `expected_revision` still
     /// matches the durable revision.
     pub fn compare_and_swap(
@@ -120,6 +174,9 @@ impl FileDeploymentRevisionStore {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(DeploymentStoreError::RevisionOverflow)?;
+        if next_revision > crate::MAX_SAFE_JSON_INTEGER {
+            return Err(DeploymentStoreError::RevisionOverflow);
+        }
         let revision = candidate.into_revision(next_revision)?;
         self.write_atomic(&revision)?;
         Ok(revision)

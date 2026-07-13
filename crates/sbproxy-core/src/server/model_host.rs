@@ -1092,6 +1092,10 @@ impl ProductionModelRuntime {
     ) -> anyhow::Result<PreparedModelRuntime> {
         let base_epoch = self.epoch.load(Ordering::SeqCst);
         let cluster_context = crate::cluster_models::current_cluster_model_context();
+        validate_model_authority_context(
+            candidate.desired.control.authority,
+            cluster_context.is_some(),
+        )?;
         let mut proposed_cluster_state = None;
         let mut cluster_worker = false;
         if let Some(context) = cluster_context {
@@ -1561,6 +1565,10 @@ pub fn validate_model_runtime(
     config_dir: &Path,
 ) -> anyhow::Result<()> {
     let candidate = compile_runtime_candidate(pipeline, config_dir)?;
+    validate_model_authority_context(
+        candidate.desired.control.authority,
+        pipeline.config.server.cluster.is_some(),
+    )?;
     if pipeline.config.server.cluster.is_none() {
         if let Some((deployment, _)) = candidate
             .desired
@@ -1572,6 +1580,18 @@ pub fn validate_model_runtime(
                 "single-node runtime requires deployment {deployment:?} to use replicas: 1"
             );
         }
+    }
+    Ok(())
+}
+
+fn validate_model_authority_context(
+    authority: sbproxy_config::ModelHostAuthority,
+    cluster_model_control: bool,
+) -> anyhow::Result<()> {
+    if cluster_model_control && authority == sbproxy_config::ModelHostAuthority::AdminManaged {
+        anyhow::bail!(
+            "model_host authority admin_managed cannot be combined with cluster model control; use cluster_authority for admin-published multi-node desired state"
+        );
     }
     Ok(())
 }
@@ -2418,6 +2438,29 @@ mod tests {
             lane_class_for(Some(sbproxy_ai::identity::KeyPriority::Batch)),
             PriorityClass::Batch
         );
+    }
+
+    #[test]
+    fn admin_managed_authority_is_rejected_when_cluster_model_control_is_active() {
+        let error = validate_model_authority_context(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            true,
+        )
+        .expect_err("cluster model control requires signed authority state");
+
+        assert!(error
+            .to_string()
+            .contains("admin_managed cannot be combined with cluster model control"));
+        assert!(validate_model_authority_context(
+            sbproxy_config::ModelHostAuthority::ClusterAuthority,
+            true
+        )
+        .is_ok());
+        assert!(validate_model_authority_context(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            false
+        )
+        .is_ok());
     }
 
     #[tokio::test]

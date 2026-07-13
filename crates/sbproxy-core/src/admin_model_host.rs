@@ -278,6 +278,9 @@ fn catalog_response(runtime: &impl ModelManagementRuntime) -> Resp {
         .models
         .iter()
         .map(|(id, entry)| {
+            if entry.context_length > sbproxy_model_host::MAX_SAFE_JSON_INTEGER {
+                return None;
+            }
             let variants = entry
                 .variants
                 .iter()
@@ -286,6 +289,12 @@ fn catalog_response(runtime: &impl ModelManagementRuntime) -> Resp {
                         .files
                         .iter()
                         .try_fold(0u64, |total, file| total.checked_add(file.size_bytes))?;
+                    if download_size_bytes > sbproxy_model_host::MAX_SAFE_JSON_INTEGER
+                        || variant.requirements.min_memory_bytes
+                            > sbproxy_model_host::MAX_SAFE_JSON_INTEGER
+                    {
+                        return None;
+                    }
                     Some(CatalogVariantMetadata {
                         id: variant.id.clone(),
                         format: variant.format,
@@ -313,7 +322,7 @@ fn catalog_response(runtime: &impl ModelManagementRuntime) -> Resp {
         })
         .collect::<Option<BTreeMap<_, _>>>();
     let Some(models) = models else {
-        tracing::error!("model catalog variant download size overflow");
+        tracing::error!("model catalog metadata exceeds exact admin JSON bounds");
         return error_response(500, "internal", "model catalog metadata unavailable");
     };
     json_response(
@@ -371,7 +380,14 @@ fn deployments_put_response(runtime: &impl ModelManagementRuntime, body: Option<
     let expected_revision = match request.expected_revision {
         serde_json::Value::Null => None,
         serde_json::Value::Number(value) => match value.as_u64() {
-            Some(value) => Some(value),
+            Some(value) if value <= sbproxy_model_host::MAX_SAFE_JSON_INTEGER => Some(value),
+            Some(_) => {
+                return error_response(
+                    400,
+                    "invalid_body",
+                    "expected_revision exceeds the exact admin JSON integer range",
+                )
+            }
             None => {
                 return error_response(
                     400,
@@ -1204,6 +1220,24 @@ models:
     }
 
     #[test]
+    fn catalog_route_rejects_integers_that_javascript_cannot_represent_exactly() {
+        let runtime = fake_runtime_with_catalog(catalog_metadata_fixture(
+            9_007_199_254_740_992,
+            1,
+            "fixture",
+        ));
+
+        let (status, _, body) =
+            dispatch_with_runtime(&runtime, "GET", "/admin/model-host/catalog", None)
+                .expect("catalog route");
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error response");
+
+        assert_eq!(status, 500);
+        assert_eq!(response["code"], "internal");
+        assert!(!body.contains("9007199254740992"));
+    }
+
+    #[test]
     fn deployments_route_returns_authority_cursor_and_complete_desired_map() {
         let runtime = fake_runtime(
             sbproxy_config::ModelHostAuthority::FileManaged,
@@ -1398,6 +1432,33 @@ models:
                 .expect("applied revisions lock")
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn deployment_put_rejects_an_unsafe_javascript_revision_cursor() {
+        let runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+        );
+        let body = valid_put_body("9007199254740992", "qwen2.5-0.5b-instruct", "q4_k_m");
+
+        let (status, _, response_body) = dispatch_with_runtime(
+            &runtime,
+            "PUT",
+            "/admin/model-host/deployments",
+            Some(&body),
+        )
+        .expect("deployments route");
+        let response: serde_json::Value =
+            serde_json::from_str(&response_body).expect("error response");
+
+        assert_eq!(status, 400);
+        assert_eq!(response["code"], "invalid_body");
+        assert!(runtime
+            .applied
+            .lock()
+            .expect("applied revisions lock")
+            .is_empty());
     }
 
     #[test]

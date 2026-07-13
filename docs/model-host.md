@@ -287,6 +287,11 @@ last-good configuration return without reusing the failed identity.
 | `admin_managed` | The versioned store at `store_path` is authoritative. Authenticated API and UI writes replace its complete deployment map with optimistic concurrency, then the store supplies the same map after restart. |
 | `cluster_authority` | One authority signs and publishes complete restricted deployment bundles. Its UI can publish; verifier nodes display the canonical signed map read-only. Every node verifies the signer, digest, schema, catalog, monotonic revision, and expiry before applying it. |
 
+`admin_managed` is a single-node authority and cannot be combined with the new
+cluster model-control plane. Multi-node admin publication uses
+`cluster_authority`; invalid mixed configuration fails validation before a
+runtime candidate is prepared.
+
 ### File-managed edits
 
 The model-management UI never rewrites `sb.yml`. In `file_managed` mode it
@@ -388,7 +393,9 @@ Its `deployments` object is a complete replacement map, not a patch. Omitting an
 existing ID removes it; renaming sends the new ID and omits the old ID. Read the
 current document immediately before a write. Send `expected_revision: null`
 only when the returned revision is `null`; otherwise send the exact unsigned
-integer returned by GET.
+integer returned by GET. Admin JSON integers are capped at
+`9,007,199,254,740,991`, JavaScript's largest exactly representable integer;
+larger cursors are rejected instead of being rounded by the browser.
 
 Local admin-managed state is deliberately single-node: every deployment must
 use exactly one replica, with no heterogeneous variants, required labels, or
@@ -936,6 +943,10 @@ A cache root, catalog revision, or engine foundation cannot change under a
 resident deployment. Reconcile to an empty desired state first, then apply the
 new foundation. This rule prevents two incompatible artifact stores or engine
 sets from living in one worker process.
+
+For `admin_managed` authority, the empty durable store adopts the new catalog
+as its next monotonic revision under the cross-process store lock. A nonempty
+store remains catalog-fenced and the reload fails until the operator drains it.
 
 Cluster reconciliation shares that commit lock. Every process computes the
 same global target from one immutable directory view, then filters it to exact

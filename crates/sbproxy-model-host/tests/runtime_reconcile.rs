@@ -1546,6 +1546,98 @@ async fn admin_managed_reconciliation_loads_the_store_and_invalid_updates_preser
 }
 
 #[tokio::test]
+async fn drained_admin_store_adopts_a_new_catalog_revision_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let store_path = directory.path().join("deployments.json");
+    let store = FileDeploymentRevisionStore::open(&store_path).unwrap();
+    let mut initial = manager_desired("catalog-v1", &[("old", false, 30)], 2).revision;
+    initial.source_mode = DeploymentSourceMode::AdminManaged;
+    store.compare_and_swap(None, initial).unwrap();
+    let mut drained = manager_desired("catalog-v1-drained", &[], 2).revision;
+    drained.source_mode = DeploymentSourceMode::AdminManaged;
+    store.compare_and_swap(Some(1), drained).unwrap();
+
+    let mut next_catalog = Catalog::builtin();
+    next_catalog.catalog_revision = "catalog-v2".to_string();
+    let candidate = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "catalog-v2-wrapper".to_string(),
+            canonical: Some(ModelHostControlConfig {
+                authority: ModelHostAuthority::AdminManaged,
+                store_path: Some(store_path.display().to_string()),
+                ..ModelHostControlConfig::default()
+            }),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &next_catalog,
+    )
+    .unwrap();
+    let manager = Arc::new(
+        ModelRuntimeManager::new(
+            next_catalog.catalog_revision.clone(),
+            FixturePreparer::new(Duration::from_millis(1)),
+        )
+        .unwrap(),
+    );
+
+    manager
+        .reconcile(candidate)
+        .await
+        .expect("empty durable state can rebase to the active catalog");
+
+    let rebased = store.load().unwrap().expect("rebased durable revision");
+    assert_eq!(rebased.revision, 3);
+    assert_eq!(rebased.catalog_revision, "catalog-v2");
+    assert!(rebased.deployments.is_empty());
+}
+
+#[tokio::test]
+async fn nonempty_admin_store_refuses_a_new_catalog_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let store_path = directory.path().join("deployments.json");
+    let store = FileDeploymentRevisionStore::open(&store_path).unwrap();
+    let mut initial = manager_desired("catalog-v1", &[("old", false, 30)], 2).revision;
+    initial.source_mode = DeploymentSourceMode::AdminManaged;
+    store.compare_and_swap(None, initial).unwrap();
+
+    let mut next_catalog = Catalog::builtin();
+    next_catalog.catalog_revision = "catalog-v2".to_string();
+    let candidate = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "catalog-v2-wrapper".to_string(),
+            canonical: Some(ModelHostControlConfig {
+                authority: ModelHostAuthority::AdminManaged,
+                store_path: Some(store_path.display().to_string()),
+                ..ModelHostControlConfig::default()
+            }),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &next_catalog,
+    )
+    .unwrap();
+    let manager = Arc::new(
+        ModelRuntimeManager::new(
+            next_catalog.catalog_revision.clone(),
+            FixturePreparer::new(Duration::from_millis(1)),
+        )
+        .unwrap(),
+    );
+
+    let error = manager
+        .reconcile(candidate)
+        .await
+        .expect_err("configured durable state remains catalog fenced");
+
+    assert!(matches!(error, RuntimeManagerError::Store(_)));
+    let unchanged = store.load().unwrap().expect("original durable revision");
+    assert_eq!(unchanged.revision, 1);
+    assert_ne!(unchanged.catalog_revision, "catalog-v2");
+    assert!(unchanged.deployments.contains_key("old"));
+}
+
+#[tokio::test]
 async fn admin_revision_preparation_uses_the_supplied_revision_without_changing_store_normalization(
 ) {
     let directory = tempfile::tempdir().unwrap();

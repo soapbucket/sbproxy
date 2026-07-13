@@ -3307,16 +3307,11 @@ fn load_admin_candidate(
     let store = FileDeploymentRevisionStore::open(path)
         .map_err(|error| RuntimeManagerError::Store(error.to_string()))?;
     let stored = store
-        .load()
+        .load_or_rebase_empty_catalog(expected_catalog_revision)
         .map_err(|error| RuntimeManagerError::Store(error.to_string()))?;
     let (source_revision, deployments) = match stored {
         Some(revision) => {
-            if revision.catalog_revision != expected_catalog_revision {
-                return Err(RuntimeManagerError::Store(format!(
-                    "stored catalog revision {:?} differs from active {:?}",
-                    revision.catalog_revision, expected_catalog_revision
-                )));
-            }
+            debug_assert_eq!(revision.catalog_revision, expected_catalog_revision);
             (
                 format!("{}#{}", revision.source_revision, revision.revision),
                 revision.deployments,
