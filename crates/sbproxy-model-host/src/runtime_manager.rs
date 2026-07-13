@@ -74,6 +74,33 @@ impl RuntimeManagerError {
     }
 }
 
+impl From<crate::ArtifactError> for RuntimeManagerError {
+    fn from(error: crate::ArtifactError) -> Self {
+        match error {
+            candidate @ (crate::ArtifactError::InvalidArtifact(_)
+            | crate::ArtifactError::SizeMismatch { .. }
+            | crate::ArtifactError::DigestMismatch { .. }
+            | crate::ArtifactError::ManualArtifactMissing { .. }
+            | crate::ArtifactError::OfflineArtifactMissing { .. }
+            | crate::ArtifactError::StartupArtifactNotSelected { .. }
+            | crate::ArtifactError::PickleRefused { .. }
+            | crate::ArtifactError::PickleUnsafe { .. }
+            | crate::ArtifactError::RemovalBlocked { .. }) => Self::Prepare(candidate.to_string()),
+            infrastructure @ (crate::ArtifactError::Io { .. }
+            | crate::ArtifactError::Transport(_)
+            | crate::ArtifactError::HttpStatus { .. }
+            | crate::ArtifactError::UnexpectedResponse { .. }
+            | crate::ArtifactError::CacheCorrupt { .. }
+            | crate::ArtifactError::Job(_)
+            | crate::ArtifactError::Serialization(_)
+            | crate::ArtifactError::Clock(_)
+            | crate::ArtifactError::Join(_)) => {
+                Self::PrepareInfrastructure(infrastructure.to_string())
+            }
+        }
+    }
+}
+
 /// Immutable input used to create one deployment runtime generation.
 #[derive(Debug, Clone)]
 pub struct DeploymentPrepareRequest {
@@ -2841,7 +2868,7 @@ impl ProductionPreparedDeployment {
                 },
             )
             .await
-            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+            .map_err(RuntimeManagerError::from)?;
         self.artifact_cached.store(true, Ordering::SeqCst);
         *self.last_job_id.lock().await = Some(ready.job.id.clone());
         Ok(ready)

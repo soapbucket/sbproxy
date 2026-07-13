@@ -1614,6 +1614,90 @@ impl ModelMetadataProvider for ProductionFixtureMetadata {
     }
 }
 
+#[tokio::test]
+async fn production_preparer_classifies_artifact_ensure_io_as_infrastructure() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let artifacts =
+        Arc::new(ArtifactManager::new(&cache, Arc::new(UnavailableArtifactTransport)).unwrap());
+    let catalog = Arc::new(Catalog::builtin());
+    let probe = Arc::new(StaticGpuProbe::new(vec![GpuDescriptor {
+        index: 0,
+        vendor: GpuVendor::Cpu,
+        name: "fixture CPU".to_string(),
+        total_vram_bytes: 8 * 1024 * 1024 * 1024,
+        free_vram_bytes: 8 * 1024 * 1024 * 1024,
+        compute_utilization: None,
+        memory_occupancy: Some(0.0),
+        compute_capability: None,
+        supports_fp8: false,
+        mem_bandwidth_gbps: None,
+    }]));
+    let preparer = ProductionDeploymentPreparer::new(
+        Arc::clone(&catalog),
+        artifacts,
+        probe,
+        Arc::new(ProductionFixtureMetadata),
+        NetworkPolicy::Denied,
+    );
+    let mut control = ModelHostControlConfig::default();
+    control.cache.directory = Some(cache.display().to_string());
+    control.deployments.insert(
+        "fixture".to_string(),
+        ManagedDeploymentConfig {
+            model: "qwen2.5-0.5b-instruct".to_string(),
+            variant: Some("q4_k_m".to_string()),
+            pull: ManagedPullPolicy::OnBoot,
+            warm: true,
+            engine: ManagedEngineChoice::LlamaCpp,
+            ..serde_yaml::from_str("model: qwen2.5-0.5b-instruct").unwrap()
+        },
+    );
+    let desired = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "artifact-io-fixture".to_string(),
+            canonical: Some(control),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog,
+    )
+    .unwrap();
+    let prepared = preparer
+        .prepare(DeploymentPrepareRequest {
+            deployment_id: "fixture".to_string(),
+            generation: 1,
+            desired: desired.deployments["fixture"].clone(),
+            control: desired.control.clone(),
+            legacy_host_policy: desired.legacy_host_policy.clone(),
+        })
+        .await
+        .expect("initial artifact lease succeeds");
+    let digest = std::fs::read_dir(cache.join("locks"))
+        .unwrap()
+        .find_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()?
+                .strip_prefix("lease-")?
+                .strip_suffix(".lock")
+                .map(str::to_string)
+        })
+        .expect("prepared deployment holds an artifact lease");
+    std::fs::create_dir(cache.join("locks").join(format!("{digest}.lock"))).unwrap();
+
+    let error = prepared
+        .memory_estimate(PullIntent::Startup)
+        .await
+        .expect_err("artifact cache lock I/O rejects preparation");
+
+    assert!(matches!(
+        error,
+        RuntimeManagerError::PrepareInfrastructure(_)
+    ));
+}
+
 struct ProductionFixtureDriver {
     launches: Arc<Mutex<Vec<(String, std::path::PathBuf, String)>>>,
 }

@@ -1140,32 +1140,36 @@ mod tests {
 
     #[test]
     fn candidate_preparation_failure_maps_to_unprocessable_entity() {
-        let (status, _, body) =
-            admin_revision_error_response(AdminDeploymentRevisionError::Runtime(
-                sbproxy_model_host::RuntimeManagerError::Prepare(
-                    "candidate capability mismatch".to_string(),
-                ),
-            ));
+        let artifact_error = sbproxy_model_host::ArtifactError::ManualArtifactMissing {
+            digest: "candidate-artifact-digest".to_string(),
+        };
+        let (status, _, body) = admin_revision_error_response(
+            AdminDeploymentRevisionError::Runtime(artifact_error.into()),
+        );
         let response: serde_json::Value = serde_json::from_str(&body).expect("error response");
 
         assert_eq!(status, 422);
         assert_eq!(response["code"], "prepare_failed");
-        assert!(!body.contains("candidate capability mismatch"));
+        assert!(!body.contains("candidate-artifact-digest"));
     }
 
     #[test]
     fn infrastructure_preparation_failure_maps_to_bad_gateway() {
-        let (status, _, body) =
-            admin_revision_error_response(AdminDeploymentRevisionError::Runtime(
-                sbproxy_model_host::RuntimeManagerError::PrepareInfrastructure(
-                    "cache lease path must remain private".to_string(),
-                ),
-            ));
+        let private_path = std::path::PathBuf::from("/private/cache/lease.lock");
+        let artifact_error = sbproxy_model_host::ArtifactError::Io {
+            operation: "lease artifact",
+            path: private_path.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "fixture failure"),
+        };
+        let (status, _, body) = admin_revision_error_response(
+            AdminDeploymentRevisionError::Runtime(artifact_error.into()),
+        );
         let response: serde_json::Value = serde_json::from_str(&body).expect("error response");
 
         assert_eq!(status, 502);
         assert_eq!(response["code"], "prepare_infrastructure_failed");
-        assert!(!body.contains("cache lease path must remain private"));
+        assert!(!body.contains(private_path.to_string_lossy().as_ref()));
+        assert!(!body.contains("fixture failure"));
     }
 
     #[test]
