@@ -2387,12 +2387,8 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     state: std::sync::Arc<AdminState>,
 ) {
     use tokio::io::AsyncReadExt;
-    // 64 KiB is enough for every admin route the proxy ships, including
-    // a few-KiB prompt template POST. Larger bodies (a giant template,
-    // a SBOM upload) would need streaming reads gated on Content-Length;
-    // none of the current routes need that and growing the buffer
-    // hot-path is preferable to per-byte plumbing.
-    const MAX_ADMIN_REQUEST_BYTES: usize = 64 * 1024;
+    const MAX_ADMIN_HEADER_BYTES: usize = 64 * 1024;
+    const MAX_ADMIN_BODY_BYTES: usize = sbproxy_model_host::MAX_BUNDLE_BYTES;
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut tmp = [0u8; 8192];
     // Read at least the headers (everything up to the \r\n\r\n). For
@@ -2400,16 +2396,18 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     // Content-Length or hit the cap.
     let mut content_length: Option<usize> = None;
     let mut header_end: Option<usize> = None;
+    let mut request_too_large = false;
     loop {
         match sock.read(&mut tmp).await {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
-                if buf.len() >= MAX_ADMIN_REQUEST_BYTES {
-                    break;
-                }
                 if header_end.is_none() {
                     if let Some(p) = find_header_end(&buf) {
+                        if p + 4 > MAX_ADMIN_HEADER_BYTES {
+                            request_too_large = true;
+                            break;
+                        }
                         header_end = Some(p);
                         let head = String::from_utf8_lossy(&buf[..p]);
                         for line in head.lines() {
@@ -2424,11 +2422,27 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                                 content_length = Some(v);
                             }
                         }
+                        if content_length.is_some_and(|length| length > MAX_ADMIN_BODY_BYTES) {
+                            request_too_large = true;
+                            break;
+                        }
+                    } else if buf.len() > MAX_ADMIN_HEADER_BYTES {
+                        request_too_large = true;
+                        break;
                     }
                 }
                 if let (Some(end), Some(cl)) = (header_end, content_length) {
                     // header bytes + 4 for "\r\n\r\n" + cl body bytes
-                    if buf.len() >= end + 4 + cl {
+                    let body_start = end + 4;
+                    if buf.len().saturating_sub(body_start) > MAX_ADMIN_BODY_BYTES {
+                        request_too_large = true;
+                        break;
+                    }
+                    let Some(request_end) = body_start.checked_add(cl) else {
+                        request_too_large = true;
+                        break;
+                    };
+                    if buf.len() >= request_end {
                         break;
                     }
                 }
@@ -2442,6 +2456,22 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         }
     }
     if buf.is_empty() {
+        return;
+    }
+    if request_too_large {
+        let _ = write_admin_response(
+            sock,
+            413,
+            "application/json",
+            &serde_json::json!({
+                "code": "request_body_too_large",
+                "error": format!(
+                    "admin request body exceeds {MAX_ADMIN_BODY_BYTES} bytes"
+                ),
+            })
+            .to_string(),
+        )
+        .await;
         return;
     }
     let request = String::from_utf8_lossy(&buf);
@@ -2783,6 +2813,7 @@ fn reason_phrase(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
@@ -3079,6 +3110,57 @@ mod tests {
             cors_origins: Vec::new(),
             operators: Vec::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn admin_listener_rejects_a_declared_body_larger_than_signed_bundle_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let handler = tokio::spawn(handle_admin_connection(
+            server,
+            std::sync::Arc::new(make_state()),
+        ));
+        let request = format!(
+            "POST /admin/cluster/deployments HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            512 * 1024 + 1
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large"));
+        assert!(response.contains("request_body_too_large"));
+    }
+
+    #[tokio::test]
+    async fn admin_listener_reads_a_body_at_the_signed_bundle_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(1024 * 1024);
+        let handler = tokio::spawn(handle_admin_connection(
+            server,
+            std::sync::Arc::new(make_state()),
+        ));
+        let body = vec![b'x'; 512 * 1024];
+        let request = format!(
+            "POST /unknown HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: {}\r\n\r\n",
+            basic_auth("admin", "secret"),
+            body.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.write_all(&body).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(!response.contains("request_body_too_large"));
     }
 
     fn basic_auth(user: &str, pass: &str) -> String {

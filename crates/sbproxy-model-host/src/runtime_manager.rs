@@ -18,13 +18,13 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
     AcceleratorKind, AcquireSource, AcquisitionContext, ArtifactFormat, ArtifactManager,
-    BackoffPolicy, Catalog, CompiledDeployment, DeploymentRevisionDraft, DeploymentRoute,
-    DeploymentSourceMode, EngineAccel, EngineAvailability, EngineDriver, EngineDriverError,
-    EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod, EngineProvisioning,
-    FileDeploymentRevisionStore, GpuProbe, KvCacheQuant, LaunchRequest, LegacyHostPolicy,
-    LlamaCppDriver, ModelMetadata, ModelMetadataProvider, NetworkPolicy, OperationJob,
-    ProvisionRequest, PullIntent, ResolveArtifactRequest, RunningEngine, RuntimeDesiredState,
-    VllmDriver, WorkerProfile,
+    BackoffPolicy, Catalog, CompiledDeployment, DeploymentRevision, DeploymentRevisionDraft,
+    DeploymentRoute, DeploymentSourceMode, EngineAccel, EngineAvailability, EngineDriver,
+    EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod,
+    EngineProvisioning, FileDeploymentRevisionStore, GpuProbe, KvCacheQuant, LaunchRequest,
+    LegacyHostPolicy, LlamaCppDriver, ModelMetadata, ModelMetadataProvider, NetworkPolicy,
+    OperationJob, ProvisionRequest, PullIntent, ResolveArtifactRequest, RunningEngine,
+    RuntimeDesiredState, VllmDriver, WorkerProfile,
 };
 
 /// Reconciliation, preparation, or lifecycle failure.
@@ -36,6 +36,9 @@ pub enum RuntimeManagerError {
     /// Static deployment preparation failed.
     #[error("prepare deployment: {0}")]
     Prepare(String),
+    /// Host infrastructure failed while preparing a deployment.
+    #[error("prepare deployment infrastructure: {0}")]
+    PrepareInfrastructure(String),
     /// Managed engine lifecycle failed.
     #[error(transparent)]
     Engine(#[from] EngineDriverError),
@@ -68,6 +71,33 @@ impl RuntimeManagerError {
     /// Stable bounded reason code for request failover and admin responses.
     pub fn reason_code(&self) -> &'static str {
         runtime_error_reason_code(self)
+    }
+}
+
+impl From<crate::ArtifactError> for RuntimeManagerError {
+    fn from(error: crate::ArtifactError) -> Self {
+        match error {
+            candidate @ (crate::ArtifactError::InvalidArtifact(_)
+            | crate::ArtifactError::SizeMismatch { .. }
+            | crate::ArtifactError::DigestMismatch { .. }
+            | crate::ArtifactError::ManualArtifactMissing { .. }
+            | crate::ArtifactError::OfflineArtifactMissing { .. }
+            | crate::ArtifactError::StartupArtifactNotSelected { .. }
+            | crate::ArtifactError::PickleRefused { .. }
+            | crate::ArtifactError::PickleUnsafe { .. }
+            | crate::ArtifactError::RemovalBlocked { .. }) => Self::Prepare(candidate.to_string()),
+            infrastructure @ (crate::ArtifactError::Io { .. }
+            | crate::ArtifactError::Transport(_)
+            | crate::ArtifactError::HttpStatus { .. }
+            | crate::ArtifactError::UnexpectedResponse { .. }
+            | crate::ArtifactError::CacheCorrupt { .. }
+            | crate::ArtifactError::Job(_)
+            | crate::ArtifactError::Serialization(_)
+            | crate::ArtifactError::Clock(_)
+            | crate::ArtifactError::Join(_)) => {
+                Self::PrepareInfrastructure(infrastructure.to_string())
+            }
+        }
     }
 }
 
@@ -1383,6 +1413,24 @@ impl ModelRuntimeManager {
         desired: RuntimeDesiredState,
     ) -> Result<PreparedRevision, RuntimeManagerError> {
         let desired = self.normalize_candidate(desired)?;
+        self.prepare_normalized_revision(desired).await
+    }
+
+    /// Prepare one caller-supplied durable admin revision without rereading its store.
+    pub async fn prepare_admin_revision(
+        &self,
+        template: RuntimeDesiredState,
+        revision: DeploymentRevision,
+    ) -> Result<PreparedRevision, RuntimeManagerError> {
+        let desired =
+            normalize_admin_revision(template, revision, self.expected_catalog_revision.as_str())?;
+        self.prepare_normalized_revision(desired).await
+    }
+
+    async fn prepare_normalized_revision(
+        &self,
+        desired: RuntimeDesiredState,
+    ) -> Result<PreparedRevision, RuntimeManagerError> {
         validate_desired_state(&desired, &self.expected_catalog_revision)?;
         let current = self.snapshot.load_full();
         let plan = plan_reconciliation(&current, &desired);
@@ -1438,7 +1486,7 @@ impl ModelRuntimeManager {
                     let desired = request.desired.clone();
                     let preparation_identity = PreparationIdentity::from_request(&request);
                     let permit = limiter.clone().acquire_owned().await.map_err(|_| {
-                        RuntimeManagerError::Prepare(
+                        RuntimeManagerError::PrepareInfrastructure(
                             "model preparation limiter is closed".to_string(),
                         )
                     })?;
@@ -2660,7 +2708,7 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             )
             .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
         let driver = self.drivers.get(&resolved.engine).cloned().ok_or_else(|| {
-            RuntimeManagerError::Prepare(format!(
+            RuntimeManagerError::PrepareInfrastructure(format!(
                 "no managed {:?} driver is registered for deployment {:?}",
                 resolved.engine, request.deployment_id
             ))
@@ -2718,7 +2766,7 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
         let artifact_lease = self
             .artifacts
             .lease(&resolved.artifact_digest)
-            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+            .map_err(|error| RuntimeManagerError::PrepareInfrastructure(error.to_string()))?;
         Ok(Arc::new(ProductionPreparedDeployment {
             id: request.deployment_id,
             generation: request.generation,
@@ -2820,7 +2868,7 @@ impl ProductionPreparedDeployment {
                 },
             )
             .await
-            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+            .map_err(RuntimeManagerError::from)?;
         self.artifact_cached.store(true, Ordering::SeqCst);
         *self.last_job_id.lock().await = Some(ready.job.id.clone());
         Ok(ready)
@@ -3123,7 +3171,9 @@ fn allocate_loopback_port() -> Result<u16, RuntimeManagerError> {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .and_then(|listener| listener.local_addr())
         .map(|address| address.port())
-        .map_err(|error| RuntimeManagerError::Prepare(format!("allocate loopback port: {error}")))
+        .map_err(|error| {
+            RuntimeManagerError::PrepareInfrastructure(format!("allocate loopback port: {error}"))
+        })
 }
 
 fn empty_desired_state(catalog_revision: &str) -> Result<RuntimeDesiredState, RuntimeManagerError> {
@@ -3257,16 +3307,11 @@ fn load_admin_candidate(
     let store = FileDeploymentRevisionStore::open(path)
         .map_err(|error| RuntimeManagerError::Store(error.to_string()))?;
     let stored = store
-        .load()
+        .load_or_rebase_empty_catalog(expected_catalog_revision)
         .map_err(|error| RuntimeManagerError::Store(error.to_string()))?;
     let (source_revision, deployments) = match stored {
         Some(revision) => {
-            if revision.catalog_revision != expected_catalog_revision {
-                return Err(RuntimeManagerError::Store(format!(
-                    "stored catalog revision {:?} differs from active {:?}",
-                    revision.catalog_revision, expected_catalog_revision
-                )));
-            }
+            debug_assert_eq!(revision.catalog_revision, expected_catalog_revision);
             (
                 format!("{}#{}", revision.source_revision, revision.revision),
                 revision.deployments,
@@ -3280,7 +3325,73 @@ fn load_admin_candidate(
         catalog_revision: expected_catalog_revision.to_string(),
         deployments: deployments.clone(),
     };
-    desired.deployments = deployments
+    desired.deployments = compile_canonical_deployments(deployments);
+    desired.control.deployments.clear();
+    desired.legacy_host_policy = None;
+    Ok(desired)
+}
+
+fn normalize_admin_revision(
+    mut template: RuntimeDesiredState,
+    revision: DeploymentRevision,
+    expected_catalog_revision: &str,
+) -> Result<RuntimeDesiredState, RuntimeManagerError> {
+    if template.control.authority != sbproxy_config::ModelHostAuthority::AdminManaged
+        || template.revision.source_mode != DeploymentSourceMode::AdminManaged
+    {
+        return Err(RuntimeManagerError::InvalidDesired(
+            "admin revision preparation requires admin_managed authority".to_string(),
+        ));
+    }
+    let configured_store = template.control.store_path.as_deref().ok_or_else(|| {
+        RuntimeManagerError::InvalidDesired(
+            "admin-managed model host requires a deployment store path".to_string(),
+        )
+    })?;
+    if configured_store.trim().is_empty() {
+        return Err(RuntimeManagerError::InvalidDesired(
+            "admin-managed model host requires a non-empty deployment store path".to_string(),
+        ));
+    }
+    revision
+        .validate()
+        .map_err(|error| RuntimeManagerError::InvalidDesired(error.to_string()))?;
+    if revision.source_mode != DeploymentSourceMode::AdminManaged {
+        return Err(RuntimeManagerError::InvalidDesired(format!(
+            "admin revision preparation requires admin_managed source mode, got {:?}",
+            revision.source_mode
+        )));
+    }
+    if template.revision.catalog_revision != expected_catalog_revision {
+        return Err(RuntimeManagerError::InvalidDesired(format!(
+            "template catalog revision {:?} differs from active {:?}",
+            template.revision.catalog_revision, expected_catalog_revision
+        )));
+    }
+    if revision.catalog_revision != expected_catalog_revision {
+        return Err(RuntimeManagerError::InvalidDesired(format!(
+            "candidate catalog revision {:?} differs from active {:?}",
+            revision.catalog_revision, expected_catalog_revision
+        )));
+    }
+
+    template.revision = DeploymentRevisionDraft {
+        source_mode: DeploymentSourceMode::AdminManaged,
+        source_revision: format!("{}#{}", revision.source_revision, revision.revision),
+        catalog_revision: revision.catalog_revision,
+        deployments: revision.deployments.clone(),
+    };
+    template.deployments = compile_canonical_deployments(revision.deployments);
+    template.control.deployments.clear();
+    template.legacy_host_policy = None;
+    validate_desired_state(&template, expected_catalog_revision)?;
+    Ok(template)
+}
+
+fn compile_canonical_deployments(
+    deployments: BTreeMap<String, crate::ModelDeployment>,
+) -> BTreeMap<String, CompiledDeployment> {
+    deployments
         .into_iter()
         .map(|(id, deployment)| {
             (
@@ -3292,16 +3403,14 @@ fn load_admin_candidate(
                 },
             )
         })
-        .collect();
-    desired.control.deployments.clear();
-    desired.legacy_host_policy = None;
-    Ok(desired)
+        .collect()
 }
 
 fn runtime_error_reason_code(error: &RuntimeManagerError) -> &'static str {
     match error {
         RuntimeManagerError::InvalidDesired(_) => "invalid_desired",
         RuntimeManagerError::Prepare(_) => "prepare_failed",
+        RuntimeManagerError::PrepareInfrastructure(_) => "prepare_infrastructure_failed",
         RuntimeManagerError::Engine(error) => error.reason().as_str(),
         RuntimeManagerError::Admission(rejection) => rejection.reason.as_str(),
         RuntimeManagerError::Store(_) => "store_failed",

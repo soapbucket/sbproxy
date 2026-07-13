@@ -1,5 +1,5 @@
 # Model-host capability matrix
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-13*
 
 *Generated from the executable registry; do not hand-edit.*
 
@@ -22,14 +22,14 @@ Registry version: `1`
 | `engine.llama_cpp_managed` | `engine` | `preview` | test.engine_drivers<br>test.cuda_build<br>cert.apple_metal.2026-07-11 | Managed llama.cpp supports digest-verified binary acquisition and Linux CUDA source builds; Apple Metal is certified while live CUDA remains deferred. |
 | `engine.vllm_uv` | `engine` | `preview` | test.engine_drivers | Managed vLLM can use a pinned uv environment; live NVIDIA certification remains deferred. |
 | `engine.vllm_container` | `engine` | `preview` | test.engine_drivers | Digest-pinned private container plans use read-only artifacts and selected devices; live NVIDIA certification remains deferred. |
-| `lifecycle.atomic_reconciliation` | `lifecycle` | `stable` | contract.canonical_desired_state_reconciles_atomically<br>test.runtime_reconcile<br>test.model_host_reload | Startup, file reload, SIGHUP, and admin reload prepare a complete revision before swapping the last good runtime. |
+| `lifecycle.atomic_reconciliation` | `lifecycle` | `stable` | contract.canonical_desired_state_reconciles_atomically<br>test.runtime_reconcile<br>test.model_host_reload | Startup, file reload, SIGHUP, and admin reload prepare a complete revision before commit; pre-commit failures do not publish the candidate. |
 | `lifecycle.single_node_residency` | `lifecycle` | `stable` | contract.eviction_changes_admission | Single-node residency honors the global resident limit and configured eviction policy across devices. |
 | `lifecycle.keep_alive` | `lifecycle` | `stable` | contract.keep_alive_starts_after_last_permit<br>test.local_admission<br>test.runtime_reconcile | Keep-alive starts after the last completed request and never expires active or queued work. |
 | `cluster.managed_replicas` | `cluster` | `stable` | contract.cluster_placement_converges<br>test.placement<br>test.runtime_reconcile<br>test.cluster_control_plane<br>test.model_cluster_control | Managed replicas use versioned worker snapshots, deterministic placement and spread, readiness-gated rollout, and authenticated cluster health status. |
 | `cluster.remote_dispatch` | `cluster` | `unsupported` | none | Remote inference dispatch and streaming over the private model plane land in the distributed data-plane PR. |
 | `policy.local_provider_governance` | `policy` | `preview` | none | Local providers remain behind the existing gateway policy path. |
 | `admin.model_status` | `admin` | `stable` | contract.status_reports_stable_lifecycle<br>test.models_lifecycle_cli<br>test.admin_model_host | Authenticated admin status, load, stop, drain, and reset adapt the shared runtime lifecycle. |
-| `admin.model_management` | `admin` | `unsupported` | none | Persistent desired-state mutation and model-management UI land in the operator-product PR. |
+| `admin.model_management` | `admin` | `preview` | contract.canonical_desired_state_reconciles_atomically<br>test.admin_model_management<br>test.ui_model_management | Backend E2E covers authenticated full-map revision conflicts and restart persistence; UI unit and component contracts cover mode-aware catalog evidence, lifecycle state, conflict recovery, removal guards, and cluster authority proof. |
 | `platform.apple_metal` | `platform` | `stable` | contract.catalog_v2_selects_exact_artifact<br>test.engine_drivers<br>cert.apple_metal.2026-07-11 | Apple Metal completed a real managed gateway completion, status, stop, cache-reuse, and Ctrl-C shutdown gate on Apple M4 Max. |
 | `platform.nvidia_cuda` | `platform` | `preview` | test.cuda_build<br>test.local_admission | NVIDIA discovery, vLLM, and CUDA llama.cpp have deterministic coverage; live GCP certification is reserved for the final PR group. |
 | `lifecycle.priority_admission` | `lifecycle` | `stable` | contract.priority_gate_changes_dispatch | Configured local concurrency changes request admission. |

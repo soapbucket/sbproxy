@@ -64,13 +64,16 @@ fn model_host_capabilities_match_the_cluster_control_plane_boundary() {
     for id in [
         "engine.vllm_uv",
         "engine.vllm_container",
+        "admin.model_management",
         "platform.nvidia_cuda",
     ] {
         assert_eq!(status(id), SupportLevel::Preview, "{id}");
     }
-    for id in ["cluster.remote_dispatch", "admin.model_management"] {
-        assert_eq!(status(id), SupportLevel::Unsupported, "{id}");
-    }
+    assert_eq!(
+        status("cluster.remote_dispatch"),
+        SupportLevel::Unsupported,
+        "cluster.remote_dispatch"
+    );
 }
 
 #[test]
@@ -181,7 +184,7 @@ fn markdown_is_deterministic_and_exposes_all_support_levels() {
     let second = capability_registry().render_markdown();
 
     assert_eq!(first, second);
-    assert!(first.starts_with("# Model-host capability matrix\n*Last modified: 2026-07-11*\n"));
+    assert!(first.starts_with("# Model-host capability matrix\n*Last modified: 2026-07-13*\n"));
     assert!(first.contains("Registry version: `1`"));
     for status in ["stable", "preview", "config_only", "unsupported"] {
         assert!(first.contains(&format!("`{status}`")), "missing {status}");

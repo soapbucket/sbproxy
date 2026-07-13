@@ -1,9 +1,11 @@
 # Model host
 
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-13*
 
 SBproxy can own model processes on one worker or place them across a managed
-cluster. Desired models live under `proxy.model_host`; an AI provider with
+cluster. Model-host control lives under `proxy.model_host`. Depending on its
+authority mode, desired deployments come from that file block, the durable
+admin store, or a signed cluster bundle. An AI provider with
 `provider_type: managed_model` exposes a deployment to clients. Requests still
 pass through the normal key, policy, budget, routing, and usage planes before
 they reach a local engine.
@@ -25,7 +27,9 @@ The worker-local runtime is complete enough to operate as one coherent system:
 - One process-wide manager owns deployment generations, per-device memory,
   request admission, keep-alive, drain, crash-loop state, and durable jobs.
 - Startup and every reload path prepare the full candidate before changing
-  routes. A bad candidate leaves the last good runtime in place.
+  routes. Parse, validation, and preparation failures do not publish the
+  candidate; activation and rollback failures have the recovery boundary
+  documented under desired-state authority.
 - The CLI can pull, inspect, remove, list running deployments, and stop one.
 - One process-owned cluster handle carries key-cache and model-control state.
   Versioned worker snapshots feed a lock-free directory, deterministic
@@ -35,14 +39,14 @@ The worker-local runtime is complete enough to operate as one coherent system:
 - File-managed clusters report deployment digest drift. Cluster-authority mode
   verifies an Ed25519-signed, content-addressed desired-state bundle before the
   same atomic runtime commit used by file reload.
+- Authenticated catalog and deployment APIs back a mode-aware admin UI. The UI
+  can replace the complete admin-managed map, publish a signed map from an
+  authority node, run lifecycle actions, and inspect cluster operations.
 
-This PR completes the cluster control plane, not the distributed inference data
-plane. A gateway can inspect placement and operate a co-located assigned
-replica, but it does not dispatch a request to a remote worker until the next
-data-plane PR. Persistent model selection and desired-state editing in the
-admin UI remain in the operator-product PR. Live NVIDIA and multi-node
-certification on GCP is deliberately reserved for the final integration PR.
-The generated
+The cluster control plane and operator product do not include the distributed
+inference data plane. A gateway can inspect placement and operate a co-located
+assigned replica, but it does not dispatch a request to a remote worker. Live
+hardware support remains governed by executable evidence. The generated
 [capability matrix](model-host-capabilities.md) records this boundary.
 
 ## Canonical configuration
@@ -161,10 +165,11 @@ Roles are independent and may be combined:
 must advertise an explicit routable IP and port so later SWIM traffic can be
 matched to the signed join.
 `transport_advertise_addr` is the mTLS typed-state address. A worker also needs
-an HTTPS `model_endpoint`; PR 3 records it for placement, while PR 4 will use it
-for remote inference. Identity, roles, labels, listeners, seeds, endpoints,
-security material, state directory, enrollment authority, and signing authority
-are restart-required fields. Snapshot cadence can reload in place.
+an HTTPS `model_endpoint`; the control plane records it for placement, but the
+current runtime does not dispatch inference to remote workers. Identity, roles,
+labels, listeners, seeds, endpoints, security material, state directory,
+enrollment authority, and signing authority are restart-required fields.
+Snapshot cadence can reload in place.
 
 Production mode requires mTLS plus a separate authenticated gossip key. Shared
 key mode must set `development: true` and is for local fixtures only. Canonical
@@ -278,20 +283,281 @@ last-good configuration return without reusing the failed identity.
 
 | Value | Behavior |
 |---|---|
-| `file_managed` | `sb.yml` is authoritative. Every node computes placement from the same desired state and reports a digest mismatch when files differ. |
-| `admin_managed` | A revision store at `store_path` is authoritative. The runtime and restart-safe store contract exist, but public desired-state CRUD and the management UI ship in a later PR. |
-| `cluster_authority` | One authority signs and publishes strict deployment bundles. Every node verifies the signer, digest, schema, monotonic revision, and expiry before applying it. Non-authority writes return `deployment_authority_read_only`. |
+| `file_managed` | `sb.yml` is authoritative. The UI displays the configured map read-only and gives the exact edit and reload instruction. Every node computes placement from the same desired state and reports a digest mismatch when files differ. |
+| `admin_managed` | The versioned store at `store_path` is authoritative. Authenticated API and UI writes replace its complete deployment map with optimistic concurrency, then the store supplies the same map after restart. |
+| `cluster_authority` | One authority signs and publishes complete restricted deployment bundles. Its UI can publish; verifier nodes display the canonical signed map read-only. Every node verifies the signer, digest, schema, catalog, monotonic revision, and expiry before applying it. |
 
-`file_managed` participates in ordinary config reload. Editing the file,
-`sbproxy apply`, the file watcher, and `POST /admin/reload` all use the same
-prepare-and-commit transaction.
+`admin_managed` is a single-node authority and cannot be combined with the new
+cluster model-control plane. Multi-node admin publication uses
+`cluster_authority`; invalid mixed configuration fails validation before a
+runtime candidate is prepared.
+
+### File-managed edits
+
+The model-management UI never rewrites `sb.yml`. In `file_managed` mode it
+disables persistent Add, Edit, and Remove controls and instructs the operator to
+edit `proxy.model_host.deployments` in `sb.yml`, then reload SBproxy. Use either
+of these explicit reload paths after saving the file:
+
+```bash
+sbproxy apply -f /etc/sbproxy/sb.yml
+
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  -X POST \
+  "${SB_ADMIN_URL}/admin/reload"
+```
+
+The file watcher and SIGHUP use the same prepare-and-commit transaction.
+Lifecycle actions remain available for deployments already defined by the
+file. Parse, validation, and preparation failures happen before runtime or
+request-pipeline publication. A later activation failure can occur after a
+recreate rollout has stopped an old generation. SBproxy attempts to restore
+that generation, but restoration can fail and leave the current runtime
+degraded. Inspect model-host status and logs, correct `sb.yml` or its runtime
+dependencies, and reload again. Restart only after the authoritative file is
+safe to apply.
+
+### Authenticated catalog and local deployment API
+
+All model-management routes use the admin server's authentication, RBAC, and
+browser-session CSRF checks. `GET /admin/model-host/catalog` returns bounded
+operator metadata from the active catalog. It includes each logical model's
+family, parameter count, license, and context length, plus each variant's
+format, quantization, compatible engines and accelerators, minimum memory,
+download size, certification evidence, and support level.
+
+This request selects one catalog entry from the full response:
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/catalog" \
+  | jq '{schema_version, catalog_revision, model: .models["qwen2.5-0.5b-instruct"]}'
+```
+
+The built-in catalog returns:
+
+```json
+{
+  "schema_version": 1,
+  "catalog_revision": "builtin-2026-07-10",
+  "model": {
+    "params": "0.5B",
+    "license": "apache-2.0",
+    "family": "qwen",
+    "context_length": 32768,
+    "variants": [
+      {
+        "id": "q4_k_m",
+        "format": "gguf",
+        "quant": "Q4_K_M",
+        "engines": ["llama_cpp"],
+        "accelerators": ["cpu", "metal", "cuda"],
+        "min_memory_bytes": 1073741824,
+        "download_size_bytes": 491400032,
+        "certification": "bootstrap-metadata-2026-07-10",
+        "stability": "preview"
+      }
+    ]
+  }
+}
+```
+
+`GET /admin/model-host/deployments` returns the complete map visible to the
+local process together with its authority and write boundary:
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/deployments" \
+  | jq '{schema_version, authority, read_only, revision, deployments}'
+```
+
+An empty admin-managed store starts with this response:
+
+```json
+{
+  "schema_version": 1,
+  "authority": "admin_managed",
+  "read_only": false,
+  "revision": null,
+  "deployments": {}
+}
+```
+
+The unfiltered response also has `content_digest`. Both `revision` and
+`content_digest` are `null` until the first admin-managed revision is stored.
+File-managed and cluster-authority responses set `read_only: true` and do not
+expose a local durable revision through this endpoint.
+
+`PUT /admin/model-host/deployments` is available only in `admin_managed` mode.
+Its `deployments` object is a complete replacement map, not a patch. Omitting an
+existing ID removes it; renaming sends the new ID and omits the old ID. Read the
+current document immediately before a write. Send `expected_revision: null`
+only when the returned revision is `null`; otherwise send the exact unsigned
+integer returned by GET. Admin JSON integers are capped at
+`9,007,199,254,740,991`, JavaScript's largest exactly representable integer;
+larger cursors are rejected instead of being rounded by the browser.
+
+Local admin-managed state is deliberately single-node: every deployment must
+use exactly one replica, with no heterogeneous variants, required labels, or
+spread keys. Multi-replica and placement intent belongs in a signed cluster
+bundle published by the configured authority node.
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  -X PUT \
+  -H 'content-type: application/json' \
+  -d '{
+    "expected_revision": null,
+    "deployments": {
+      "local-qwen": {
+        "model": "qwen2.5-0.5b-instruct",
+        "variant": "q4_k_m",
+        "heterogeneous_variants": false,
+        "replicas": 1,
+        "required_labels": {},
+        "spread_by": [],
+        "pull": "on_demand",
+        "warm": false,
+        "keep_alive_secs": 1800,
+        "max_concurrency": 4,
+        "max_queue_depth": 32,
+        "queue_timeout_ms": 30000,
+        "engine": "llama_cpp",
+        "rollout": "rolling"
+      }
+    }
+  }' \
+  "${SB_ADMIN_URL}/admin/model-host/deployments" \
+  | jq '{schema_version, revision, plan}'
+```
+
+The first successful replacement returns:
+
+```json
+{
+  "schema_version": 1,
+  "revision": 1,
+  "plan": {
+    "added": ["local-qwen"],
+    "changed": [],
+    "removed": [],
+    "preserved": []
+  }
+}
+```
+
+`200` means the new desired and runtime snapshot was published. Cleanup of an
+old generation still uses a bounded drain after publication. A drain timeout or
+retirement failure is not included in this PUT response, so inspect runtime
+status and logs when a replacement or removal retires a running generation.
+
+The unfiltered response also returns the 64-character SHA-256
+`content_digest`. The server validates the strict body, complete desired-state
+semantics, and catalog references first. Under one commit lock it then checks
+the durable expected revision, assigns the next revision, and prepares the
+complete runtime candidate before the durable compare-and-swap. A preparation
+failure writes nothing. If another process advances the store during
+preparation, the final compare-and-swap fails and the server tears down the
+staged work. After a successful compare-and-swap, the server activates the
+prepared revision in the live runtime. Activation preserves unaffected
+generations and attempts to restore a stopped recreate generation when an
+error occurs. That rollback can also fail. The durable revision then remains
+advanced while the runtime can be degraded or only partly recovered.
+
+Do not retry from the old cursor. Read the deployment document, runtime status,
+and logs first. Recovery is explicit: repair the reported artifact, engine, or
+capacity problem and submit a corrected complete map using the current durable
+revision. Use Reset or Load when the reported lifecycle state calls for it, or
+restart after confirming the persisted desired map and its dependencies are
+safe. The persisted revision is loaded from `store_path` on restart.
+
+The deployment API owns only `proxy.model_host` desired state. Provider routes
+under `origins[].action.providers` remain configuration-owned and are never
+added, renamed, or removed by an API or UI mutation. Configure a
+`provider_type: managed_model` route to the deployment ID before exposing it to
+clients. Add the desired deployment before adding its provider route. Remove or
+retarget every provider route before removing or renaming its deployment;
+otherwise PUT returns `400 invalid_desired`. The model-management API never
+rewrites `sb.yml`.
+
+Mutation failures use these status and code pairs:
+
+| Status | Code | Meaning |
+|---|---|---|
+| `403` | `authority_read_only` | Local deployment replacement is disabled for the current authority. |
+| `409` | `revision_conflict` | `expected_revision` differs from durable state. The response includes `expected_revision` and `actual_revision` when present. |
+| `422` | A bounded preparation, admission, or compatibility reason such as `prepare_failed`, `insufficient_capacity`, `engine_incompatible`, or `artifact_not_ready` | The candidate could not be prepared before the durable compare-and-swap, so the store remains unchanged. |
+| `502` | `runtime_commit_failed` | The compare-and-swap succeeded but runtime publication failed. The response sets `durable_state_advanced: true` and returns the new `revision` and `content_digest`. Reload desired state and runtime status before any correction. |
+| `502` | A bounded infrastructure reason such as `prepare_infrastructure_failed`, `store_failed`, or an engine failure code | Storage, artifact transport, provisioning, or runtime infrastructure failed before durable publication. Detailed paths and transport diagnostics remain in server logs. |
+| `413` | `request_body_too_large` | The admin request body exceeds the signed bundle limit of 512 KiB. |
+
+Malformed bodies, unknown fields, duplicate map keys, invalid desired state,
+and unknown catalog models or variants return `400` with a stable code such as
+`invalid_body`, `invalid_desired`, `unknown_catalog_model`, or
+`unknown_catalog_variant`.
+
+Every authenticated mutation emits an audit record with `operator`, `role`,
+`method`, and `path`. A successful local replacement also emits
+`action=model_deployments_replace`, `source_mode=admin_managed`,
+`prior_revision`, `next_revision`, `content_digest`, and `deployment_count` on
+the `sbproxy::admin::audit` target. A post-CAS publication failure emits the
+same cursor fields with `outcome=runtime_commit_failed`.
+
+### Model-management UI
+
+The Model host page joins catalog, desired-state, runtime, metrics, and cluster
+authority responses without treating one stale response as current proof. Its
+catalog browser keeps stable and preview variants available when they name at
+least one engine and accelerator. Config-only, unsupported, and incomplete
+variants remain visible as evidence but cannot be selected. The evidence panel
+shows family, parameters, license, context, exact variant, format, quantization,
+minimum memory, download size, engines, accelerators, certification, and
+support level. An unavailable exact pin is shown as unavailable; the UI does
+not substitute evidence from a different variant. Pickle variants fail closed
+unless the logical catalog entry explicitly opts in with `allow_pickle: true`.
+
+Creating a deployment or changing its logical model requires explicit license
+acknowledgement. The form covers deployment ID, logical model, automatic or
+exact variant selection, heterogeneous variants, replicas, required labels,
+spread keys, pull policy, warm behavior, engine, rollout policy, keep-alive,
+maximum concurrency, queue depth, and queue timeout. Add, edit, rename, and
+remove operations always build one complete replacement map.
+
+In local admin mode the form fixes replicas at one and hides heterogeneous,
+required-label, and spread controls. Those fields appear only for an authority
+node publishing signed cluster placement intent.
+
+Removal requires a fresh lifecycle response. A deployment in `ready`,
+`preparing`, or `draining` state must be stopped first. If a write returns
+`409`, the UI preserves the form and attempted complete map, displays the raw
+response, reloads the current authority state, and shows an add/change/remove
+comparison. Retry stays disabled unless the refreshed catalog, authority,
+revision, digest, signer, and desired-map proof are coherent. Edit and rename
+retries also verify that the original deployment baseline has not changed and
+that the target ID did not appear. Removal retries fetch fresh lifecycle state
+again before sending another write.
+
+For any other mutation failure, the UI reloads catalog, desired state, and
+runtime status because durable state may already have advanced. Signed cluster
+failures also reload the authority cursor and bundle. The draft stays open.
+
+### Cluster-authority publication
 
 Cluster-authority bundles contain only the catalog revision, numbered desired
 revision, deployments, and placement rules. Unknown fields and duplicate
-deployment IDs are rejected. The current pointer and content are published
-separately through the authenticated cluster state store, and readers retain
-their last good revision after signature, identity, rollback, or runtime
-prepare failure.
+deployment IDs are rejected. The authority publishes signed content and its
+current pointer through the authenticated cluster state store before any
+worker applies the revision. Each worker verifies the bundle and reconciles
+placement, persists deployment generation fences, derives its local desired
+state, and persists the authority cursor. Only then does it prepare and commit
+the local runtime. After a successful commit, the worker publishes the new
+cluster plan locally and marks the verified bundle active.
+
+Runtime preparation or commit can fail after generation fences and the cursor
+advance. The previous runtime may remain active, but those durable markers stay
+advanced. If activation stopped a recreate generation, SBproxy attempts to
+restore it. A failed restore leaves the worker degraded. Use cluster status,
+model-host status, and logs to choose an authority-specific recovery.
 
 Every node configures the public verification key and durable cursor state. The
 authority alone also configures the private signing key:
@@ -332,11 +598,45 @@ curl -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/admin/cluster/deployments"
 ```
 
-The authority returns `202` with the revision, content digest, signer node, and
-signer key. `GET /admin/cluster/deployments` returns the locally active verified
-bundle. A revision lower than the durable cursor is rejected after restart;
-equal revision with different content returns `revision_conflict`. The active
-bundle is republished before its bounded seven-day state lifetime expires.
+The authority returns this response shape:
+
+```json
+{
+  "schema_version": 1,
+  "revision": 1,
+  "content_digest": "<64-character SHA-256>",
+  "signer_node_id": "authority-1",
+  "signer_key_id": "<configured verification-key ID>",
+  "status": "published"
+}
+```
+
+`202` confirms only that the authority signed the bundle and published its
+content and current pointer. It does not prove that a worker accepted the
+catalog revision, prepared an engine, received placement, or became ready.
+Use `GET /admin/cluster/status` for worker application, placement, readiness,
+and rollout truth. `GET /admin/cluster/deployments` returns the locally active
+verified bundle and whether this node can publish. A node without the signing
+key returns `403 deployment_authority_read_only` for POST and displays the
+verified map read-only in the UI.
+
+The UI publishes from the signed bundle's complete deployment map, never from a
+worker-local projection. It accepts that map as canonical only when fresh
+cluster status and bundle responses agree on the authority revision, content
+digest, signer node, signer key, and active catalog revision. With no active
+bundle, a fresh `404` whose parsed body has
+`code: deployment_bundle_missing`, plus a fresh authority status whose active
+revision is `null`, proves an empty canonical map; the first publication uses
+revision `1`. A generic proxy or intermediary `404` is not publication proof.
+
+The UI uses exactly the next revision. The backend also accepts any higher
+positive revision and treats the same revision with the same digest as an
+idempotent publication. A lower revision returns `409 stale_revision`; an equal
+revision with different content returns `409 revision_conflict`. The UI handles
+either conflict with the same preserved draft and coherent-proof reload used
+for local admin conflicts. A revision lower than the durable cursor is also
+rejected after restart. The active bundle is republished before its bounded
+seven-day state lifetime expires.
 
 ## Deployment fields
 
@@ -353,14 +653,22 @@ Pull policy controls cache misses:
 
 `warm: true` goes beyond artifact verification and starts the engine before the
 revision becomes active. Use it when readiness must mean the first token path is
-available. A warm failure aborts the candidate revision.
+available. A warm failure prevents local runtime activation. It does not prove
+that authority state stayed unchanged: an admin deployment-store revision or a
+cluster worker's generation fences and authority cursor may already have
+advanced. Read desired state, model-host status, and logs before recovery. Fix
+and reload the authoritative file, submit a corrected admin map from the
+current revision, or repair the cluster worker and reconcile the signed bundle,
+depending on the active authority.
 
 `rollout: rolling` starts target assignments before draining losing
 assignments. The old generation remains retained until every target reports the
 exact generation, variant, artifact digest, and ready state, or until
 `handoff_timeout_ms` expires. `recreate` emits a drain-only step before it may
-start the target. A failed placement or worker-local prepare preserves the
-prior committed plan and runtime.
+start the target. Placement rejection happens before generation fences or the
+authority cursor advance. Worker-local preparation happens after those writes;
+its failure leaves the previous local plan unpublished and the prior runtime
+may remain active, while fences and the cursor stay advanced.
 
 `required_labels` filters workers before ranking. `spread_by` is an ordered set
 of failure-domain labels, such as `[zone, rack]`; placement prefers a new value
@@ -556,15 +864,22 @@ in cache for a later restart.
 The equivalent authenticated routes are:
 
 ```text
+GET  /admin/model-host/catalog
+GET  /admin/model-host/deployments
+PUT  /admin/model-host/deployments
 GET  /admin/model-host/status
 POST /admin/model-host/load
 POST /admin/model-host/stop
 POST /admin/model-host/drain
+POST /admin/model-host/evict
 POST /admin/model-host/reset
 ```
 
-Load, stop, drain, and reset accept `{"deployment":"local-qwen"}`. The legacy
-`model` request field remains an input alias during the compatibility window.
+Load, stop, drain, evict, and reset accept
+`{"deployment":"local-qwen"}`. Stop and drain perform the same bounded drain
+and shutdown; evict is their compatibility alias. The legacy `model` request
+field remains an input alias during the compatibility window. The Model host UI
+exposes Load, Stop, and Reset against these shared lifecycle actions.
 
 Cluster operators use the same admin credentials:
 
@@ -593,10 +908,18 @@ rollout phase and deadline, and signed-authority state. Suspect, dead,
 unreachable, stale, incompatible, and explicitly unhealthy workers remain
 visible but receive no new assignments.
 
-The built-in model-management UI consumes this contract in the operator-product
-PR. That view will show the node table and unhealthy callouts alongside model
-selection and deployment mutation. PR 3 deliberately ships the authenticated
-backend and CLI first; it does not claim that persistent UI mutation is ready.
+The Cluster page renders every node in a health rail and keeps unhealthy nodes
+in two places: prominent alert cards for immediate action and the complete
+roster for full membership context. The rail links each node to its roster row.
+A failed status refresh leaves the last loaded snapshot visible under a stale
+warning, while a stale model directory receives its own control-plane warning.
+
+Deployment rollout rows show desired, placed, and unplaced replicas; generation
+and phase; target readiness and timeout; handoff deadline; exact assignments;
+retained and draining generations; and bounded placement rejection reasons.
+Fleet metrics are secondary telemetry fetched independently from cluster status.
+A missing, loading, or failed metrics response does not hide the primary health,
+roster, alert, or rollout state.
 
 Useful metrics include `sbproxy_model_host_active_requests`,
 `sbproxy_model_host_queued_requests`, `sbproxy_model_host_deployment_state`,
@@ -607,25 +930,34 @@ is a separate measurement and never masquerades as compute activity.
 ## Reload behavior
 
 The runtime collects canonical and compatibility deployments from every origin.
-It validates the complete catalog, cache and engine policy, routes, capacity,
-and warm preparations before commit. Capacity is reserved before a staged warm
-engine starts. On success it preserves unchanged engine generations and
-replaces only changed deployments. On failure it tears down staged work and
-keeps the prior routes and resident engines. A recreate launch failure also
-restarts the stopped prior generation before returning the error.
+It validates the complete catalog, cache and engine policy, and routes while it
+stages the candidate. During commit it reserves capacity, then starts each warm
+engine before snapshot activation. On success it preserves unchanged engine
+generations and replaces only changed deployments. Validation and initial
+preparation failures tear down staged work before runtime publication. A later
+warm or recreate activation failure attempts to restore any stopped prior
+generation. Restore can fail and leave that generation degraded, so status and
+logs are part of recovery.
 
 A cache root, catalog revision, or engine foundation cannot change under a
 resident deployment. Reconcile to an empty desired state first, then apply the
 new foundation. This rule prevents two incompatible artifact stores or engine
 sets from living in one worker process.
 
+For `admin_managed` authority, the empty durable store adopts the new catalog
+as its next monotonic revision under the cross-process store lock. A nonempty
+store remains catalog-fenced and the reload fails until the operator drains it.
+
 Cluster reconciliation shares that commit lock. Every process computes the
 same global target from one immutable directory view, then filters it to exact
-assignments for its stable node ID. The worker prepares that local projection
-before publishing the new plan. A failed artifact, engine, or runtime prepare
-therefore leaves both the previous local runtime and previous cluster plan
-active. Control-only nodes keep a catalog-aligned empty runtime and never create
-an engine merely to participate in placement.
+assignments for its stable node ID. The worker persists generation fences and
+the authority cursor before it prepares and commits that local projection. It
+publishes the new local cluster plan and marks the bundle active only after the
+runtime commit succeeds. Preparation or commit failure can therefore leave the
+cursor and fences advanced while the prior runtime and plan may remain active.
+An activation restore failure can instead leave the node degraded.
+Control-only nodes keep a catalog-aligned empty runtime and never create an
+engine merely to participate in placement.
 
 ## One-command local run
 

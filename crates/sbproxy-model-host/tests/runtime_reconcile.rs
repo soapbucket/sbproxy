@@ -1545,6 +1545,153 @@ async fn admin_managed_reconciliation_loads_the_store_and_invalid_updates_preser
     assert!(manager.current_desired().deployments.contains_key("stored"));
 }
 
+#[tokio::test]
+async fn drained_admin_store_adopts_a_new_catalog_revision_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let store_path = directory.path().join("deployments.json");
+    let store = FileDeploymentRevisionStore::open(&store_path).unwrap();
+    let mut initial = manager_desired("catalog-v1", &[("old", false, 30)], 2).revision;
+    initial.source_mode = DeploymentSourceMode::AdminManaged;
+    store.compare_and_swap(None, initial).unwrap();
+    let mut drained = manager_desired("catalog-v1-drained", &[], 2).revision;
+    drained.source_mode = DeploymentSourceMode::AdminManaged;
+    store.compare_and_swap(Some(1), drained).unwrap();
+
+    let mut next_catalog = Catalog::builtin();
+    next_catalog.catalog_revision = "catalog-v2".to_string();
+    let candidate = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "catalog-v2-wrapper".to_string(),
+            canonical: Some(ModelHostControlConfig {
+                authority: ModelHostAuthority::AdminManaged,
+                store_path: Some(store_path.display().to_string()),
+                ..ModelHostControlConfig::default()
+            }),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &next_catalog,
+    )
+    .unwrap();
+    let manager = Arc::new(
+        ModelRuntimeManager::new(
+            next_catalog.catalog_revision.clone(),
+            FixturePreparer::new(Duration::from_millis(1)),
+        )
+        .unwrap(),
+    );
+
+    manager
+        .reconcile(candidate)
+        .await
+        .expect("empty durable state can rebase to the active catalog");
+
+    let rebased = store.load().unwrap().expect("rebased durable revision");
+    assert_eq!(rebased.revision, 3);
+    assert_eq!(rebased.catalog_revision, "catalog-v2");
+    assert!(rebased.deployments.is_empty());
+}
+
+#[tokio::test]
+async fn nonempty_admin_store_refuses_a_new_catalog_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let store_path = directory.path().join("deployments.json");
+    let store = FileDeploymentRevisionStore::open(&store_path).unwrap();
+    let mut initial = manager_desired("catalog-v1", &[("old", false, 30)], 2).revision;
+    initial.source_mode = DeploymentSourceMode::AdminManaged;
+    store.compare_and_swap(None, initial).unwrap();
+
+    let mut next_catalog = Catalog::builtin();
+    next_catalog.catalog_revision = "catalog-v2".to_string();
+    let candidate = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "catalog-v2-wrapper".to_string(),
+            canonical: Some(ModelHostControlConfig {
+                authority: ModelHostAuthority::AdminManaged,
+                store_path: Some(store_path.display().to_string()),
+                ..ModelHostControlConfig::default()
+            }),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &next_catalog,
+    )
+    .unwrap();
+    let manager = Arc::new(
+        ModelRuntimeManager::new(
+            next_catalog.catalog_revision.clone(),
+            FixturePreparer::new(Duration::from_millis(1)),
+        )
+        .unwrap(),
+    );
+
+    let error = manager
+        .reconcile(candidate)
+        .await
+        .expect_err("configured durable state remains catalog fenced");
+
+    assert!(matches!(error, RuntimeManagerError::Store(_)));
+    let unchanged = store.load().unwrap().expect("original durable revision");
+    assert_eq!(unchanged.revision, 1);
+    assert_ne!(unchanged.catalog_revision, "catalog-v2");
+    assert!(unchanged.deployments.contains_key("old"));
+}
+
+#[tokio::test]
+async fn admin_revision_preparation_uses_the_supplied_revision_without_changing_store_normalization(
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let store_path = directory.path().join("deployments.json");
+    let store = FileDeploymentRevisionStore::open(&store_path).unwrap();
+    let mut stored = manager_desired("stored-source", &[("stored", false, 30)], 2).revision;
+    stored.source_mode = DeploymentSourceMode::AdminManaged;
+    store.compare_and_swap(None, stored).unwrap();
+
+    let template = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "admin-template".to_string(),
+            canonical: Some(ModelHostControlConfig {
+                authority: ModelHostAuthority::AdminManaged,
+                store_path: Some(store_path.display().to_string()),
+                ..ModelHostControlConfig::default()
+            }),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &Catalog::builtin(),
+    )
+    .unwrap();
+    let mut supplied = manager_desired("supplied-source", &[("supplied", false, 30)], 2).revision;
+    supplied.source_mode = DeploymentSourceMode::AdminManaged;
+    let supplied = supplied.into_revision(2).unwrap();
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+
+    let prepared = manager
+        .prepare_admin_revision(template.clone(), supplied)
+        .await
+        .expect("supplied durable revision prepares");
+    manager.abort_prepared(prepared).await;
+    assert_eq!(
+        preparer.prepares.lock().unwrap().get("supplied").copied(),
+        Some(1)
+    );
+    assert_eq!(
+        preparer.prepares.lock().unwrap().get("stored").copied(),
+        None
+    );
+
+    let prepared = manager
+        .prepare_revision(template)
+        .await
+        .expect("ordinary preparation normalizes from the durable store");
+    manager.abort_prepared(prepared).await;
+    assert_eq!(
+        preparer.prepares.lock().unwrap().get("stored").copied(),
+        Some(1)
+    );
+}
+
 struct ProductionFixtureMetadata;
 
 impl ModelMetadataProvider for ProductionFixtureMetadata {
@@ -1557,6 +1704,90 @@ impl ModelMetadataProvider for ProductionFixtureMetadata {
             max_context: 128,
         })
     }
+}
+
+#[tokio::test]
+async fn production_preparer_classifies_artifact_ensure_io_as_infrastructure() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let artifacts =
+        Arc::new(ArtifactManager::new(&cache, Arc::new(UnavailableArtifactTransport)).unwrap());
+    let catalog = Arc::new(Catalog::builtin());
+    let probe = Arc::new(StaticGpuProbe::new(vec![GpuDescriptor {
+        index: 0,
+        vendor: GpuVendor::Cpu,
+        name: "fixture CPU".to_string(),
+        total_vram_bytes: 8 * 1024 * 1024 * 1024,
+        free_vram_bytes: 8 * 1024 * 1024 * 1024,
+        compute_utilization: None,
+        memory_occupancy: Some(0.0),
+        compute_capability: None,
+        supports_fp8: false,
+        mem_bandwidth_gbps: None,
+    }]));
+    let preparer = ProductionDeploymentPreparer::new(
+        Arc::clone(&catalog),
+        artifacts,
+        probe,
+        Arc::new(ProductionFixtureMetadata),
+        NetworkPolicy::Denied,
+    );
+    let mut control = ModelHostControlConfig::default();
+    control.cache.directory = Some(cache.display().to_string());
+    control.deployments.insert(
+        "fixture".to_string(),
+        ManagedDeploymentConfig {
+            model: "qwen2.5-0.5b-instruct".to_string(),
+            variant: Some("q4_k_m".to_string()),
+            pull: ManagedPullPolicy::OnBoot,
+            warm: true,
+            engine: ManagedEngineChoice::LlamaCpp,
+            ..serde_yaml::from_str("model: qwen2.5-0.5b-instruct").unwrap()
+        },
+    );
+    let desired = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "artifact-io-fixture".to_string(),
+            canonical: Some(control),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &catalog,
+    )
+    .unwrap();
+    let prepared = preparer
+        .prepare(DeploymentPrepareRequest {
+            deployment_id: "fixture".to_string(),
+            generation: 1,
+            desired: desired.deployments["fixture"].clone(),
+            control: desired.control.clone(),
+            legacy_host_policy: desired.legacy_host_policy.clone(),
+        })
+        .await
+        .expect("initial artifact lease succeeds");
+    let digest = std::fs::read_dir(cache.join("locks"))
+        .unwrap()
+        .find_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()?
+                .strip_prefix("lease-")?
+                .strip_suffix(".lock")
+                .map(str::to_string)
+        })
+        .expect("prepared deployment holds an artifact lease");
+    std::fs::create_dir(cache.join("locks").join(format!("{digest}.lock"))).unwrap();
+
+    let error = prepared
+        .memory_estimate(PullIntent::Startup)
+        .await
+        .expect_err("artifact cache lock I/O rejects preparation");
+
+    assert!(matches!(
+        error,
+        RuntimeManagerError::PrepareInfrastructure(_)
+    ));
 }
 
 struct ProductionFixtureDriver {

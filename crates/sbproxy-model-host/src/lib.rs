@@ -108,7 +108,8 @@ pub use catalog::{
 pub use cluster_authority::{
     DeploymentAuthorityError, DeploymentBundleCursor, DeploymentSigningKey, DeploymentVerifyingKey,
     FileDeploymentBundleCursorStore, RestrictedDeploymentBundle, RestrictedDeploymentBundleDraft,
-    SignedDeploymentBundle, VerifiedDeploymentBundle, RESTRICTED_DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
+    SignedDeploymentBundle, VerifiedDeploymentBundle, MAX_BUNDLE_BYTES,
+    RESTRICTED_DEPLOYMENT_BUNDLE_SCHEMA_VERSION,
 };
 pub use cluster_placement::{
     reconcile_cluster_placement, ClusterDeploymentPlacement, ClusterPlacementError,
@@ -126,7 +127,7 @@ pub use cuda_build::{
 };
 pub use deployment::{
     DeploymentError, DeploymentRevision, DeploymentRevisionDraft, DeploymentSourceMode,
-    ModelDeployment, RolloutPolicy, DEPLOYMENT_SCHEMA_VERSION,
+    ModelDeployment, RolloutPolicy, DEPLOYMENT_SCHEMA_VERSION, MAX_SAFE_JSON_INTEGER,
 };
 pub use deployment_store::{DeploymentStoreError, FileDeploymentRevisionStore};
 pub use desired::{

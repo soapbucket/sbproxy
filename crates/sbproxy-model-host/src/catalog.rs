@@ -24,6 +24,12 @@ use serde::{Deserialize, Serialize};
 /// models from the design doc. Parsed once via [`Catalog::builtin`].
 pub const BUILTIN_CATALOG_YAML: &str = include_str!("../data/models.yaml");
 
+const MAX_CATALOG_ID_BYTES: usize = 128;
+const MAX_CATALOG_REVISION_BYTES: usize = 128;
+const MAX_CATALOG_MODELS: usize = 1_024;
+const MAX_CATALOG_VARIANTS_PER_MODEL: usize = 128;
+const MAX_CATALOG_ENGINES_PER_VARIANT: usize = 16;
+
 /// A quant family a catalog entry can be served in. Kept as a plain
 /// string so the catalog can name engine-specific quants
 /// (`Q4_K_M`, `FP8`, `AWQ`, `GPTQ`, `bf16`) without this crate
@@ -470,9 +476,24 @@ impl Catalog {
         if self.schema_version == 1 && self.catalog_revision.is_empty() {
             self.catalog_revision = "legacy-v1".to_string();
         }
+        if self.catalog_revision.len() > MAX_CATALOG_REVISION_BYTES {
+            return Err(CatalogError::Invalid(format!(
+                "catalog_revision exceeds {MAX_CATALOG_REVISION_BYTES} bytes"
+            )));
+        }
+        if self.models.len() > MAX_CATALOG_MODELS {
+            return Err(CatalogError::Invalid(format!(
+                "catalog contains more than {MAX_CATALOG_MODELS} models"
+            )));
+        }
 
         let mut diagnostics = Vec::new();
         for (model, entry) in &mut self.models {
+            if model.len() > MAX_CATALOG_ID_BYTES {
+                return Err(CatalogError::Invalid(format!(
+                    "model ID exceeds {MAX_CATALOG_ID_BYTES} bytes"
+                )));
+            }
             if !crate::artifact_spec::valid_identifier(model) {
                 return Err(CatalogError::Invalid(format!(
                     "model '{model}' has an invalid logical ID"
@@ -504,9 +525,25 @@ impl Catalog {
                     "model '{model}' with catalog v2 variants requires context_length"
                 )));
             }
+            if entry.variants.len() > MAX_CATALOG_VARIANTS_PER_MODEL {
+                return Err(CatalogError::Invalid(format!(
+                    "model '{model}' contains more than {MAX_CATALOG_VARIANTS_PER_MODEL} variants"
+                )));
+            }
 
             let mut variant_ids = BTreeSet::new();
             for variant in &entry.variants {
+                if variant.id.len() > MAX_CATALOG_ID_BYTES {
+                    return Err(CatalogError::Invalid(format!(
+                        "model '{model}' variant ID exceeds {MAX_CATALOG_ID_BYTES} bytes"
+                    )));
+                }
+                if variant.engines.len() > MAX_CATALOG_ENGINES_PER_VARIANT {
+                    return Err(CatalogError::Invalid(format!(
+                        "model '{model}' variant '{}' contains more than {MAX_CATALOG_ENGINES_PER_VARIANT} engines",
+                        variant.id
+                    )));
+                }
                 if !variant_ids.insert(variant.id.as_str()) {
                     return Err(CatalogError::Invalid(format!(
                         "model '{model}' has duplicate variant '{}'",

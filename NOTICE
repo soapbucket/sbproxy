@@ -277,6 +277,15 @@ https://github.com/dimforge/simba
 
 ===========================================================================
 
+expect-type
+Copyright 2024 Misha Kaletsky
+Licensed under the Apache License, Version 2.0
+https://github.com/mmkal/expect-type
+
+Used as a dev-dependency in UI test tooling only.
+
+===========================================================================
+
 Additional dependencies are dual-licensed under MIT OR Apache-2.0. Under
 the terms of dual licensing, this project uses them under the MIT license
 where available. A full list of dependencies and their licenses can be

@@ -238,3 +238,94 @@ fn built_in_catalog_contains_a_real_pinned_bootstrap_variant() {
         .assert_behavior()
         .expect("catalog v2 consumer contract executes");
 }
+
+fn bounded_variant(id: &str, engines: &str) -> String {
+    format!(
+        "      - id: {id}\n        format: gguf\n        quant: Q4_K_M\n        engines: [{engines}]\n        source: hf:Org/Fixture\n        revision: {REVISION}\n        files:\n          - path: model.gguf\n            sha256: {GGUF_SHA256}\n            size_bytes: 1\n        requirements:\n          accelerators: [cpu]\n          min_memory_bytes: 1\n        stability: preview\n        certification: fixture\n"
+    )
+}
+
+fn bounded_model(id: &str, variants: &str) -> String {
+    format!(
+        "  {id}:\n    params: 1B\n    license: apache-2.0\n    family: fixture\n    context_length: 4096\n    variants:\n{variants}"
+    )
+}
+
+#[test]
+fn custom_catalog_admin_metadata_limits_accept_boundaries_and_reject_oversize() {
+    const MAX_ID_BYTES: usize = 128;
+    const MAX_REVISION_BYTES: usize = 128;
+    const MAX_MODELS: usize = 1_024;
+    const MAX_VARIANTS: usize = 128;
+    const MAX_ENGINES: usize = 16;
+
+    let boundary_id = "m".repeat(MAX_ID_BYTES);
+    let boundary_revision = "r".repeat(MAX_REVISION_BYTES);
+    let boundary_engines = std::iter::repeat_n("llama_cpp", MAX_ENGINES)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let boundary = format!(
+        "schema_version: 2\ncatalog_revision: {boundary_revision}\nmodels:\n{}",
+        bounded_model(
+            &boundary_id,
+            &bounded_variant(&boundary_id, &boundary_engines)
+        )
+    );
+    Catalog::from_yaml(&boundary).expect("catalog metadata at every length boundary is accepted");
+
+    let oversized_revision = format!(
+        "schema_version: 2\ncatalog_revision: {}\nmodels:\n{}",
+        "r".repeat(MAX_REVISION_BYTES + 1),
+        bounded_model("model", &bounded_variant("variant", "llama_cpp"))
+    );
+    assert!(Catalog::from_yaml(&oversized_revision).is_err());
+
+    let oversized_model_id = format!(
+        "schema_version: 2\ncatalog_revision: fixture\nmodels:\n{}",
+        bounded_model(
+            &"m".repeat(MAX_ID_BYTES + 1),
+            &bounded_variant("variant", "llama_cpp")
+        )
+    );
+    assert!(Catalog::from_yaml(&oversized_model_id).is_err());
+
+    let oversized_variant_id = format!(
+        "schema_version: 2\ncatalog_revision: fixture\nmodels:\n{}",
+        bounded_model(
+            "model",
+            &bounded_variant(&"v".repeat(MAX_ID_BYTES + 1), "llama_cpp")
+        )
+    );
+    assert!(Catalog::from_yaml(&oversized_variant_id).is_err());
+
+    let oversized_models = (0..=MAX_MODELS)
+        .map(|index| {
+            bounded_model(
+                &format!("model-{index}"),
+                &bounded_variant("variant", "llama_cpp"),
+            )
+        })
+        .collect::<String>();
+    assert!(Catalog::from_yaml(&format!(
+        "schema_version: 2\ncatalog_revision: fixture\nmodels:\n{oversized_models}"
+    ))
+    .is_err());
+
+    let oversized_variants = (0..=MAX_VARIANTS)
+        .map(|index| bounded_variant(&format!("variant-{index}"), "llama_cpp"))
+        .collect::<String>();
+    assert!(Catalog::from_yaml(&format!(
+        "schema_version: 2\ncatalog_revision: fixture\nmodels:\n{}",
+        bounded_model("model", &oversized_variants)
+    ))
+    .is_err());
+
+    let oversized_engines = std::iter::repeat_n("llama_cpp", MAX_ENGINES + 1)
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(Catalog::from_yaml(&format!(
+        "schema_version: 2\ncatalog_revision: fixture\nmodels:\n{}",
+        bounded_model("model", &bounded_variant("variant", &oversized_engines))
+    ))
+    .is_err());
+}

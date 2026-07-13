@@ -27,7 +27,8 @@ use crate::{
 /// Current restricted deployment-bundle schema.
 pub const RESTRICTED_DEPLOYMENT_BUNDLE_SCHEMA_VERSION: u32 = 1;
 const SIGNING_DOMAIN: &str = "sbproxy/restricted-deployment-bundle/v1";
-const MAX_BUNDLE_BYTES: usize = 512 * 1024;
+/// Largest canonical signed deployment bundle accepted by the authority plane.
+pub const MAX_BUNDLE_BYTES: usize = 512 * 1024;
 const MAX_KEY_FILE_BYTES: u64 = 1_024;
 const MAX_CURSOR_BYTES: u64 = 4 * 1024;
 static CURSOR_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);

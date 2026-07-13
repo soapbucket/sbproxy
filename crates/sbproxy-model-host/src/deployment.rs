@@ -16,6 +16,10 @@ use crate::{EngineChoice, PullPolicy};
 /// Current canonical deployment document schema.
 pub const DEPLOYMENT_SCHEMA_VERSION: u32 = 1;
 
+/// Largest integer emitted through JavaScript-admin JSON contracts without
+/// losing exactness.
+pub const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+
 /// System that owns persistent model desired state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

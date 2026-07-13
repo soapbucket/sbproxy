@@ -1,7 +1,10 @@
 # Self-hosted OpenRouter delivery design
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-13*
 
-*Status: Approved implementation design. Stable product claims remain controlled by the executable capability registry and certification evidence.*
+*Status: Approved delivery design. The implemented operator-product slice is
+labeled below. Remote distributed inference and live hardware certification
+remain roadmap gates, not shipped claims. Stable product claims remain
+controlled by the executable capability registry and certification evidence.*
 
 ## Decision
 
@@ -19,7 +22,7 @@ directory, routing, policy, and observability contracts used by a cluster.
 When clustering is disabled, SBproxy starts no gossip, peer-transport, or
 distributed-state tasks.
 
-The work ships as seven sequential, independently reviewable pull requests.
+The delivery roadmap uses seven sequential, independently reviewable pull requests.
 Live GCP validation is reserved for the final certification pull request.
 
 ## Source and baseline
@@ -199,8 +202,9 @@ All desired-state sources compile to a versioned `DeploymentRevision` with:
 - Engine overrides and rollout policy.
 - A content digest used for comparison, signing, and audit.
 
-The runtime swaps a revision only after complete validation. Failed validation
-leaves the last-good revision active.
+The runtime publishes a revision only after complete validation. Validation
+failures occur before revision publication and leave the current revision
+pointer unchanged.
 
 ### Operation job
 
@@ -230,42 +234,103 @@ SBproxy supports three explicit deployment-authority modes.
 
 | Mode | Persistent authority | Admin behavior |
 | --- | --- | --- |
-| `admin_managed` | Versioned durable SBproxy deployment store | Browse, create, edit, rollout, stop, and remove deployments |
-| `file_managed` | `sb.yml`, a deployment file, or an external GitOps process | Persistent fields are read-only; UI shows the exact required config change |
-| `cluster_authority` | One configured node signs restricted deployment bundles | Authenticated authority UI can mutate; other nodes are read-only |
+| `admin_managed` | Versioned durable SBproxy deployment store | Browse catalog evidence; create, edit, replace, load, stop, reset, and remove deployments through full-map compare-and-swap |
+| `file_managed` | `sb.yml`, a deployment file, or an external GitOps process | Persistent fields are read-only; changes use config review and the shared apply or reload path |
+| `cluster_authority` | One configured authority signs restricted complete deployment bundles | The authority UI can publish; verifier nodes show the coherent proof and remain read-only |
 
 The admin server never silently rewrites `sb.yml`.
 
-Admin mutations use optimistic revision checks, complete schema and capability
-validation, durable audit records, and previewable diffs. Cluster bundles may
-contain only model deployments, catalog revision, and placement rules. They
-cannot contain secrets, arbitrary proxy configuration, or private keys.
+Admin mutations use optimistic revision checks, strict desired-state and active
+catalog validation, tracing audit events, and explicit post-conflict
+comparisons. Cluster bundles may contain only model deployments, catalog
+revision, and placement rules. They cannot contain secrets, arbitrary proxy
+configuration, or private keys.
 
 The model-management UI supports:
 
-- Catalog search and hardware-compatible recommendations.
-- Auto or explicit artifact-variant selection.
-- Disk and memory estimates plus license acknowledgement.
-- Deployment creation, replica and placement configuration, and rollout.
-- Pull, load, drain, stop, remove, and safe artifact deletion.
-- Shared progress, errors, route explanations, and effective policy.
+- Catalog evidence with support, certification, exact-variant availability,
+  engine and accelerator compatibility, download size, minimum memory, and
+  license acknowledgement.
+- Auto or explicit artifact-variant selection without substituting evidence
+  when an exact pin is unavailable.
+- Full deployment creation and editing for replicas, placement labels and
+  spread, pull and warm behavior, keepalive, concurrency, queueing, engine,
+  and rollout.
+- Load, stop, reset, and guarded deployment removal.
+- Conflict comparison that preserves the attempted map and form, reloads the
+  latest proof, and requires an explicit retry.
+- A cluster health rail, prominent unhealthy-node alerts, the complete roster,
+  stale-evidence warnings, rollout detail, and independent fleet metrics.
 
-Destructive actions are disabled while an artifact is resident or referenced.
+Removal is disabled while runtime evidence is stale or the deployment is
+ready, preparing, or draining. Conflict retry repeats the same safety check.
 
 ## Runtime flows
 
-### Desired state
+### File-managed reload
 
-    file, admin mutation, or signed cluster bundle
-      -> schema and capability validation
-      -> versioned DeploymentRevision
-      -> atomic desired-state swap
-      -> reconciliation
+    read sb.yml
+      -> compile config, routes, catalog, and desired deployments
+      -> prepare the complete runtime candidate
+      -> commit the runtime revision
+      -> publish the request pipeline
 
-Reconciliation preserves unaffected engines. Additions prepare before becoming
-eligible. Replacements become ready before the old generation drains, subject
-to the documented handoff timeout. Removal stops new admissions before bounded
-drain and shutdown.
+File reload has no deployment-store compare-and-swap and no signed-bundle
+cursor. Parse, validation, and preparation failures occur before runtime and
+pipeline publication. Runtime commit can stop an old recreate generation;
+SBproxy attempts to restore it if activation fails, but rollback can fail and
+leave the current runtime degraded. The file remains authoritative, so recovery
+means correcting it or its runtime dependencies and reloading explicitly.
+
+### Admin-managed replacement
+
+    authenticate strict full-map PUT
+      -> validate desired state and active catalog references
+      -> compare expected_revision under the commit lock
+      -> prepare the complete runtime candidate
+      -> deployment-store compare-and-swap
+      -> activate the prepared runtime revision
+      -> return the committed revision and plan
+
+Body, validation, cursor, and preparation failures occur before the durable
+compare-and-swap. A race aborts staged work. Activation occurs after the store
+advances. It attempts to preserve unaffected generations and restore prior
+recreate generations on error, but rollback can fail. A failed request can
+therefore leave the durable revision advanced and runtime degraded. Recovery
+starts with the desired-state GET, runtime status, and logs, followed by a
+corrected full-map write from the current revision or a controlled restart.
+
+### Cluster-authority publication and application
+
+    authority POST
+      -> validate the restricted bundle and revision
+      -> sign and verify the envelope
+      -> publish content, then its current pointer
+      -> return 202 published
+
+    each node
+      -> read pointer and content
+      -> verify identity, signature, digest, revision, and catalog
+      -> reconcile global placement
+      -> persist deployment generation fences
+      -> derive the node-local desired state
+      -> persist the authority cursor
+      -> prepare and commit the local runtime revision
+      -> publish the new local cluster plan
+      -> mark the verified bundle active
+
+The `202` response proves signing and cluster-state publication only. It does
+not prove node application. Runtime preparation or commit can fail after the
+node persists generation fences and its authority cursor. The prior runtime may
+remain active while those markers stay advanced. If activation stopped a
+recreate generation, SBproxy attempts to restore it, but restore can fail and
+leave the node degraded. Cluster status, rather than the publication response,
+proves placement, readiness, and rollout.
+
+After a successful runtime activation, reconciliation preserves unaffected
+engines. Additions prepare before becoming eligible. Replacements become ready
+before the old generation drains, subject to the documented handoff timeout.
+Removal stops new admissions before bounded drain and shutdown.
 
 ### Artifact and launch
 
@@ -417,22 +482,27 @@ Deliver:
 Exit: policy and limits behave identically through local, peer, and external
 routes. Concurrency tests prove strict allowances are not exceeded.
 
-### PR 6: Operator product
+### PR 6: Operator product, implemented slice
 
 Primary Linear scope: SH-18, SH-19, SH-20, SH-21, and SH-22, plus WOR-1685,
 WOR-1661, and WOR-1665 outcomes.
 
-Deliver:
+Implemented in this slice:
 
-- Mode-aware model-management API and UI.
-- Model, node, deployment, replica, artifact, job, request, and policy views.
-- Mac service installation and managed llama.cpp packaging.
-- GPU worker image and generic GCP-compatible NVIDIA bootstrap.
-- Complete metrics, dashboards, alerts, route explanation, and value reporting.
-- Public docs, migration guide, examples, schemas, and operator runbooks.
+- Authenticated catalog evidence and complete desired-state APIs.
+- Durable `admin_managed` replacement with revision conflict handling and
+  restart recovery.
+- Mode-aware model management for admin, file, cluster authority, and cluster
+  verifier nodes.
+- Catalog, deployment, runtime, lifecycle, conflict, and removal-safety UI.
+- Cluster health, complete roster, unhealthy-node alerts, stale evidence,
+  rollout state, coherent authority proof, and separate fleet metrics UI.
+- Contract, backend E2E, and UI unit/component evidence, plus regenerated public
+  capability and documentation artifacts.
 
-Exit: an operator can select, deploy, monitor, stop, and safely remove models
-through CLI or UI. Packaging and simulated integration gates are green.
+This slice does not promote the roadmap's remote peer inference, managed
+service packaging, GPU worker image, or live hardware certification outcomes.
+Those keep their own delivery and evidence gates.
 
 ### PR 7: Certification
 

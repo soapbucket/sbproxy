@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-13*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -115,8 +115,9 @@ proxy:
 
 A `read_only` operator can read config, metrics, logs, and status but
 cannot create keys, edit config, reload, or otherwise mutate. Every
-authenticated mutation is written to the audit trail (the
-`sbproxy::admin::audit` log target) with the operator's identity.
+authenticated mutation emits a structured event on the
+`sbproxy::admin::audit` tracing target with the operator's identity. Persistence
+depends on the configured tracing sink.
 
 ## Remote access and CORS
 
@@ -176,6 +177,9 @@ token instead of an existing admin operator.
 | GET | `/admin/log-level` | Current tracing filter directive. |
 | PUT | `/admin/log-level` | Change the log level at runtime, e.g. `{"level":"debug"}` or `{"level":"sbproxy_ai=debug"}`, no restart. |
 | GET | `/api/health/targets` | Per-target health, outlier, and breaker state. |
+| GET | `/admin/model-host/catalog` | Bundled model and exact-variant evidence, including the rendered catalog revision. |
+| GET | `/admin/model-host/deployments` | Complete local desired-state document with authority, read-only state, revision, digest, and deployment map. |
+| PUT | `/admin/model-host/deployments` | Replace the complete local deployment map under `admin_managed` authority with `expected_revision` compare-and-swap. |
 | GET | `/admin/model-host/status` | Managed deployment generation, lifecycle, engine, artifact, memory, device, port, queue, reason, and job state. |
 | POST | `/admin/model-host/load` | Start one configured deployment and wait for ready, `{"deployment":"<id>"}`. |
 | POST | `/admin/model-host/stop` | Drain and stop one configured deployment, `{"deployment":"<id>"}`. |
@@ -188,11 +192,49 @@ token instead of an existing admin operator.
 | POST | `/admin/cluster/enroll` | Exchange a valid one-time enrollment token and locally generated CSR for installed cluster identity material. |
 | GET | `/admin/cluster/metrics` | Fleet-aggregated metrics (mesh tier; see [observability.md](observability.md)). |
 
-### Managed model lifecycle
+### Managed model operations
 
 These routes adapt the same process-wide runtime used by startup, reload, and
-request admission. They do not create arbitrary deployments. The deployment ID
-must already exist in the active desired state.
+request admission. Read the catalog before choosing a model or exact variant,
+and read the current deployment document before changing desired state:
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/catalog" \
+  | jq '{catalog_revision,models}'
+
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/deployments" \
+  | jq '{authority,read_only,revision,content_digest,deployments}'
+```
+
+`PUT /admin/model-host/deployments` is available only under
+`admin_managed` authority. Its strict JSON body contains
+`expected_revision` and the complete replacement `deployments` map. Use
+`null` only when creating the first revision; use the unsigned revision from
+the latest read after that. A stale value returns `409 revision_conflict`.
+The API validates and prepares the complete candidate before the durable
+compare-and-swap. A race aborts the staged candidate. If final runtime
+activation fails after the store advances, SBproxy attempts to restore prior
+recreate generations. Rollback can fail, leaving the durable revision advanced
+and the runtime degraded. Read the deployment document, runtime status, and
+logs before recovery. Repair the reported dependency and send a corrected full
+map from the current revision, use Reset or Load when status directs it, or
+restart after confirming the persisted desired state is safe.
+
+Under `file_managed` authority, the deployment endpoint is read-only and
+changes continue through reviewed `sb.yml` plus `sbproxy apply -f <path>` or
+`POST /admin/reload`. Under cluster authority, only the authority node can
+publish a signed complete map through `POST /admin/cluster/deployments`;
+verifier nodes remain read-only. Neither deployment API rewrites `sb.yml` or
+provider routes under `origins[].action.providers`. Add a desired deployment
+before configuring its provider route, and remove or retarget the route before
+removing or renaming the deployment. See
+[Model host](model-host.md#authenticated-catalog-and-local-deployment-api) for
+the request schema, validation order, stable errors, and audit fields.
+
+The lifecycle actions below do not create arbitrary deployments. The
+deployment ID must already exist in active desired state.
 
 ```bash
 export SB_ADMIN_URL=http://127.0.0.1:9090
@@ -223,12 +265,33 @@ sbproxy models stop local-qwen --format json
 Lifecycle errors include bounded `reason_code` values. A stop enters drain,
 rejects new requests, waits for active stream permits up to the configured
 deadline, and then stops the engine. Reset does not change `sb.yml`; it clears a
-retained failure so the configured generation can be started again.
+retained failure so the configured generation can be started again. Detailed
+paths and transport diagnostics stay in server logs and are not returned to the
+browser.
 
-The current web UI shows model-host health on Overview. Selecting models,
-editing desired deployments, and fleet management land in the later admin UI
-PRs. Until then, `file_managed` desired state changes go through config review
-and the shared reload transaction.
+The Model host page renders catalog evidence and support state, exact variant
+availability, desired deployments, runtime status, and lifecycle actions.
+Stable and preview variants are selectable only when their engine and
+accelerator evidence is complete. Unsupported, config-only, and incomplete
+entries remain visible but disabled. Pickle variants also remain disabled unless
+the logical catalog model explicitly sets `allow_pickle`. Local admin-managed
+deployments are always one replica and omit cluster-only label, spread, and
+heterogeneous placement controls. The authority-node form adds those controls
+for signed cluster placement. Both forms cover pull and warm behavior,
+keepalive, concurrency, queueing, engine, and rollout. License acknowledgement
+is required when selecting a model that needs it.
+
+Admin-managed edits replace the complete map with compare-and-swap. A conflict
+keeps the submitted form and attempted map visible, reloads current state, and
+requires an explicit retry after the operator compares them. Removal is
+blocked while runtime evidence is stale or the deployment is ready,
+preparing, or draining. File-managed and cluster verifier views explain their
+read-only authority instead of offering a local save action.
+
+Any non-conflict mutation failure also reloads catalog, desired state, and
+runtime status because the durable authority may already have advanced. Signed
+cluster failures additionally reload the authority cursor and signed bundle.
+The operator draft remains open throughout recovery.
 
 ### Cluster health and unhealthy-node callouts
 
@@ -259,11 +322,20 @@ sbproxy cluster status \
   --format text
 ```
 
-The operator-product UI will render this as a cluster summary, a complete node
-table, and prominent unhealthy-node callouts. It will also add model selection
-and persistent deployment mutation. Those UI controls remain later scope; the
-authenticated read contract, signed authority write boundary, and CLI are
-available now.
+The Cluster page renders the local node first, then the complete roster, with a
+health rail and prominent unhealthy-node alerts. It keeps stale nodes visible,
+marks stale directory evidence, warns when a refresh fails, and shows rollout
+assignments, rejection reasons, generations, readiness, and handoff state.
+Fleet metrics come from the separate cluster metrics endpoint and do not hide
+roster or rollout evidence when metrics are unavailable.
+
+The authority node can publish the signed complete deployment map from the
+Model host page. The UI accepts a deployment bundle only when its active
+revision, digest, signer, key, and catalog revision form one coherent proof.
+A missing bundle is valid only for a fresh authority with no active revision;
+its first publication is revision 1. Stale or same-revision conflicting
+publication returns `409`. Verifier nodes display the proof and remain
+read-only.
 
 Config values support environment-variable interpolation (`${ENV_VAR}`)
 and secret backend references (HashiCorp Vault, AWS and GCP Secret
@@ -322,7 +394,8 @@ sum across instances. See [observability.md](observability.md).
 ## The built-in web UI
 
 A Vue single-page app drives the endpoints above (keys and credentials,
-config and drift, logs, metrics, prompts, model-host status). It is off
+config and drift, logs, metrics, prompts, model management, and cluster
+operations). It is off
 by default and lives behind a cargo feature so the lean binary carries
 no front-end assets.
 
@@ -362,8 +435,8 @@ The screenshots above were captured against a `--features embed-admin-ui` releas
 - Keep the server on loopback (the default) unless it is behind TLS with
   an `allow_ips` allowlist.
 - Give day-to-day operators the `read_only` role and reserve `admin` for
-  the accounts that actually change state; every mutation is audited with
-  the operator's identity.
+  the accounts that actually change state; every mutation emits an audit event
+  with the operator's identity.
 
 ## What is not here yet
 
