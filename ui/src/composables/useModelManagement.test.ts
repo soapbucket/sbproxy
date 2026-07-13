@@ -479,6 +479,76 @@ describe("useModelManagement orchestration", () => {
   });
 
   it.each([
+    {
+      label: "authority",
+      authorityReadOnly: true,
+      bundleReadOnly: false,
+    },
+    {
+      label: "bundle",
+      authorityReadOnly: false,
+      bundleReadOnly: true,
+    },
+    {
+      label: "authority and bundle",
+      authorityReadOnly: true,
+      bundleReadOnly: true,
+    },
+  ])(
+    "keeps a verified signed bundle visible when $label is read-only without allowing publication",
+    async ({ authorityReadOnly, bundleReadOnly }) => {
+      const desired = deploymentDefaults("model", "q4");
+      const activeBundle = bundle(
+        7,
+        ownRecord([["signed-readonly", desired]]),
+      );
+      activeBundle.read_only = bundleReadOnly;
+      mockReads({
+        document: document(
+          "cluster_authority",
+          true,
+          7,
+          ownRecord([["projection-only", deploymentDefaults("model", "q4")]]),
+        ),
+        clusterStatus: clusterStatus(authority(7, authorityReadOnly)),
+        bundle: activeBundle,
+        status: status([runtime("signed-readonly", "stopped")]),
+      });
+      const publish = vi
+        .spyOn(api, "publishClusterDeployments")
+        .mockResolvedValue({} as never);
+      const management = useModelManagement();
+      await loadProof(management);
+
+      expect(management.coherentClusterBundle.value).toBe(activeBundle);
+      expect(Object.keys(management.canonicalDesiredDeployments.value ?? {})).toEqual([
+        "signed-readonly",
+      ]);
+      expect(management.rows.value).toEqual([
+        expect.objectContaining({
+          deploymentId: "signed-readonly",
+          desired,
+          runtime: expect.objectContaining({ state: "stopped" }),
+        }),
+      ]);
+      expect(management.effectiveDesiredRevision.value).toBe(7);
+      expect(management.effectiveDesiredContentDigest.value).toBe(
+        "a".repeat(64),
+      );
+      expect(management.coherentClusterBundle.value?.signer_node_id).toBe(
+        "authority-a",
+      );
+      expect(management.canMutate.value).toBe(false);
+
+      management.openEditDeployment(management.rows.value[0]);
+      await management.removeDeployment(management.rows.value[0]);
+
+      expect(management.editor.value).toBeNull();
+      expect(publish).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
     document("file_managed", true),
     document("admin_managed", true),
     document("cluster_authority", true),
@@ -690,6 +760,204 @@ describe("useModelManagement orchestration", () => {
     });
   });
 
+  it("blocks a signed edit when the canonical deployment changes after refresh", async () => {
+    const deploymentId = "__proto__";
+    const opened: ModelDeployment = {
+      ...deploymentDefaults("model", "q4"),
+      required_labels: ownRecord([["zone", "west"]]),
+      replicas: 2,
+    };
+    const changed: ModelDeployment = {
+      ...opened,
+      required_labels: ownRecord([["zone", "east"]]),
+      warm: true,
+    };
+    mockReads({
+      document: document("cluster_authority", true, 7),
+      bundle: bundle(7, ownRecord([[deploymentId, opened]])),
+    });
+    const publish = vi
+      .spyOn(api, "publishClusterDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    const row = management.rows.value.find(
+      (candidate) => candidate.deploymentId === deploymentId,
+    );
+    expect(row).toBeDefined();
+    if (!row) return;
+    management.openEditDeployment(row);
+
+    vi.mocked(api.clusterStatus).mockResolvedValueOnce(
+      clusterStatus(authority(8)),
+    );
+    vi.mocked(api.clusterDeployments).mockResolvedValueOnce(
+      bundle(8, ownRecord([[deploymentId, changed]])),
+    );
+    await Promise.all([
+      management.clusterStatusReq.run(),
+      management.clusterBundleReq.run(),
+    ]);
+
+    await management.saveDeployment({
+      deploymentId,
+      deployment: { ...opened, replicas: 3 },
+    });
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(management.editor.value).not.toBeNull();
+    expect(management.mutationError.value).toMatch(
+      /changed or disappeared.*reopen/i,
+    );
+  });
+
+  it("blocks a local edit when the canonical deployment disappears after refresh", async () => {
+    const opened = deploymentDefaults("model", "q4");
+    mockReads({
+      document: document(
+        "admin_managed",
+        false,
+        7,
+        ownRecord([["edit-me", opened]]),
+      ),
+    });
+    const replace = vi
+      .spyOn(api, "replaceModelHostDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openEditDeployment(management.rows.value[0]);
+
+    vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+      document("admin_managed", false, 8, ownRecord([])),
+    );
+    await management.deploymentsReq.run();
+
+    await management.saveDeployment({
+      deploymentId: "edit-me",
+      deployment: { ...opened, replicas: 2 },
+    });
+
+    expect(replace).not.toHaveBeenCalled();
+    expect(management.editor.value).not.toBeNull();
+    expect(management.mutationError.value).toMatch(
+      /changed or disappeared.*reopen/i,
+    );
+  });
+
+  it("preserves unrelated signed changes when the edited deployment baseline is unchanged", async () => {
+    const deploymentId = "__proto__";
+    const opened: ModelDeployment = {
+      ...deploymentDefaults("model", "q4"),
+      required_labels: ownRecord([
+        ["zone", "west"],
+        ["tier", "gpu"],
+      ]),
+    };
+    const semanticallyUnchanged: ModelDeployment = {
+      ...opened,
+      required_labels: ownRecord([
+        ["tier", "gpu"],
+        ["zone", "west"],
+      ]),
+    };
+    const unrelated = deploymentDefaults("model", "q4");
+    mockReads({
+      document: document("cluster_authority", true, 7),
+      bundle: bundle(7, ownRecord([[deploymentId, opened]])),
+    });
+    const publish = vi
+      .spyOn(api, "publishClusterDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    const row = management.rows.value.find(
+      (candidate) => candidate.deploymentId === deploymentId,
+    );
+    expect(row).toBeDefined();
+    if (!row) return;
+    management.openEditDeployment(row);
+
+    vi.mocked(api.clusterStatus).mockResolvedValueOnce(
+      clusterStatus(authority(8)),
+    );
+    vi.mocked(api.clusterDeployments).mockResolvedValueOnce(
+      bundle(
+        8,
+        ownRecord([
+          [deploymentId, semanticallyUnchanged],
+          ["unrelated", unrelated],
+        ]),
+      ),
+    );
+    await Promise.all([
+      management.clusterStatusReq.run(),
+      management.clusterBundleReq.run(),
+    ]);
+
+    const edited = { ...opened, replicas: 2 };
+    await management.saveDeployment({ deploymentId, deployment: edited });
+
+    expect(publish).toHaveBeenCalledTimes(1);
+    const request = publish.mock.calls[0][0];
+    expect(request.revision).toBe(9);
+    expect(Object.keys(request.deployments).sort()).toEqual([
+      "__proto__",
+      "unrelated",
+    ]);
+    expect(Object.hasOwn(request.deployments, deploymentId)).toBe(true);
+    expect(request.deployments[deploymentId]).toEqual(edited);
+    expect(request.deployments.unrelated).toEqual(unrelated);
+  });
+
+  it("blocks an edit when desired-state authority mode changes after opening", async () => {
+    const opened = deploymentDefaults("model", "q4");
+    mockReads({
+      document: document(
+        "admin_managed",
+        false,
+        7,
+        ownRecord([["edit-me", opened]]),
+      ),
+    });
+    const replace = vi
+      .spyOn(api, "replaceModelHostDeployments")
+      .mockResolvedValue({} as never);
+    const publish = vi
+      .spyOn(api, "publishClusterDeployments")
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openEditDeployment(management.rows.value[0]);
+
+    vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+      document("cluster_authority", true, 8),
+    );
+    vi.mocked(api.clusterStatus).mockResolvedValueOnce(
+      clusterStatus(authority(8)),
+    );
+    vi.mocked(api.clusterDeployments).mockResolvedValueOnce(
+      bundle(8, ownRecord([["edit-me", opened]])),
+    );
+    await Promise.all([
+      management.deploymentsReq.run(),
+      management.clusterStatusReq.run(),
+      management.clusterBundleReq.run(),
+    ]);
+
+    await management.saveDeployment({
+      deploymentId: "edit-me",
+      deployment: { ...opened, replicas: 2 },
+    });
+
+    expect(replace).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    expect(management.editor.value).not.toBeNull();
+    expect(management.mutationError.value).toMatch(
+      /authority changed.*reopen/i,
+    );
+  });
+
   it("builds rows from the signed desired map plus the local runtime union", async () => {
     const signed = deploymentDefaults("model", "q4");
     const projection = deploymentDefaults("model", "q4");
@@ -852,6 +1120,50 @@ describe("useModelManagement orchestration", () => {
     expect(management.conflictRetryAllowed.value).toBe(true);
     await management.retryConflict();
     expect(replace).toHaveBeenCalledTimes(2);
+  });
+
+  it("blocks conflict retry when its edited deployment changed during reload", async () => {
+    const opened = deploymentDefaults("model", "q4");
+    const changed = { ...opened, warm: true };
+    mockReads({
+      document: document(
+        "admin_managed",
+        false,
+        4,
+        ownRecord([["edit-me", opened]]),
+      ),
+    });
+    const replace = vi
+      .spyOn(api, "replaceModelHostDeployments")
+      .mockRejectedValueOnce(
+        new ApiError(409, "revision conflict", "raw edit conflict"),
+      )
+      .mockResolvedValue({} as never);
+    const management = useModelManagement();
+    await loadProof(management);
+    management.openEditDeployment(management.rows.value[0]);
+    vi.mocked(api.modelHostDeployments).mockResolvedValueOnce(
+      document(
+        "admin_managed",
+        false,
+        5,
+        ownRecord([["edit-me", changed]]),
+      ),
+    );
+
+    await management.saveDeployment({
+      deploymentId: "edit-me",
+      deployment: { ...opened, replicas: 2 },
+    });
+    expect(management.conflictRetryAllowed.value).toBe(true);
+
+    await management.retryConflict();
+
+    expect(replace).toHaveBeenCalledTimes(1);
+    expect(management.editor.value).not.toBeNull();
+    expect(management.mutationError.value).toMatch(
+      /changed or disappeared.*reopen/i,
+    );
   });
 
   it("keeps raw conflict without a current-map claim when any proof reload fails", async () => {

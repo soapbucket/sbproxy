@@ -27,12 +27,16 @@ import {
   type DeploymentConflictProof,
   type DeploymentFormValue,
   type ModelDeploymentRow,
+  type WritableDeploymentMutationMode,
 } from "../lib/model-management";
 import { findFamily, histogramAvgByLabel, parsePrometheus } from "../lib/metrics";
 
 export interface ModelDeploymentEditorState {
   originalDeploymentId: string | null;
   initialDeployment: ModelDeployment | null;
+  openingMode: WritableDeploymentMutationMode;
+  baselineDeploymentId: string | null;
+  baselineDeploymentFingerprint: string | null;
 }
 
 export function useModelManagement() {
@@ -165,9 +169,7 @@ export function useModelManagement() {
       !authority ||
       !activeBundle ||
       !activeCatalog ||
-      !authority.configured ||
-      authority.read_only ||
-      activeBundle.read_only
+      !authority.configured
     ) {
       return null;
     }
@@ -236,8 +238,11 @@ export function useModelManagement() {
   const clusterBundleAllowsPublication = computed(() => {
     if (deploymentDocument.value?.authority !== "cluster_authority") return true;
     if (!clusterBundleProofCurrent.value) return false;
+    const authority = clusterAuthority.value;
+    if (!authority || !authority.configured || authority.read_only) return false;
     if (initialClusterBundleAbsent.value) return true;
-    return coherentClusterBundle.value !== null;
+    const activeBundle = coherentClusterBundle.value;
+    return activeBundle !== null && !activeBundle.read_only;
   });
   const canMutate = computed(
     () =>
@@ -260,6 +265,38 @@ export function useModelManagement() {
     return deployments && Object.hasOwn(deployments, deploymentId)
       ? deployments[deploymentId]
       : null;
+  }
+
+  function deploymentBaselineFingerprint(
+    deploymentId: string,
+    deployment: ModelDeployment,
+  ): string {
+    const singleton = Object.create(null) as Record<string, ModelDeployment>;
+    singleton[deploymentId] = deployment;
+    return deploymentMapFingerprint(singleton);
+  }
+
+  function editorSessionError(
+    activeEditor: ModelDeploymentEditorState,
+  ): string | null {
+    if (mutationMode.value !== activeEditor.openingMode) {
+      return "Desired-state authority changed after this editor opened. Your draft is preserved. Reopen the editor under the current authority before saving.";
+    }
+    if (activeEditor.baselineDeploymentId === null) return null;
+    const currentDeployment = canonicalDesiredDeployment(
+      activeEditor.baselineDeploymentId,
+    );
+    if (
+      !currentDeployment ||
+      activeEditor.baselineDeploymentFingerprint === null ||
+      deploymentBaselineFingerprint(
+        activeEditor.baselineDeploymentId,
+        currentDeployment,
+      ) !== activeEditor.baselineDeploymentFingerprint
+    ) {
+      return "The deployment changed or disappeared after this editor opened. Your draft is preserved. Reopen the editor from the current desired state before saving.";
+    }
+    return null;
   }
 
   const currentMutationProof = computed<DeploymentConflictProof | null>(() => {
@@ -639,19 +676,34 @@ export function useModelManagement() {
     conflict.value = null;
     pendingConflictChange.value = null;
     pendingConflictMode.value = null;
-    if (!canMutate.value || !catalog.value) {
+    const mode = mutationMode.value;
+    if (!canMutate.value || !catalog.value || mode === "read_only") {
       banner.value = {
         tone: "err",
         text: persistentGuidance.value ?? "No deployable catalog entry is available.",
       };
       return;
     }
-    editor.value = { originalDeploymentId: null, initialDeployment: null };
+    editor.value = {
+      originalDeploymentId: null,
+      initialDeployment: null,
+      openingMode: mode,
+      baselineDeploymentId: null,
+      baselineDeploymentFingerprint: null,
+    };
   }
 
   function openEditDeployment(row: ModelDeploymentRow) {
     const desired = canonicalDesiredDeployment(row.deploymentId);
-    if (!desired || !canMutate.value || !catalog.value) return;
+    const mode = mutationMode.value;
+    if (
+      !desired ||
+      !canMutate.value ||
+      !catalog.value ||
+      mode === "read_only"
+    ) {
+      return;
+    }
     mutationError.value = null;
     conflict.value = null;
     pendingConflictChange.value = null;
@@ -659,6 +711,12 @@ export function useModelManagement() {
     editor.value = {
       originalDeploymentId: row.deploymentId,
       initialDeployment: desired,
+      openingMode: mode,
+      baselineDeploymentId: row.deploymentId,
+      baselineDeploymentFingerprint: deploymentBaselineFingerprint(
+        row.deploymentId,
+        desired,
+      ),
     };
   }
 
@@ -674,6 +732,11 @@ export function useModelManagement() {
     if (!desired) {
       mutationError.value =
         "Reload the current desired deployment map before saving.";
+      return;
+    }
+    const sessionError = editorSessionError(activeEditor);
+    if (sessionError) {
+      mutationError.value = sessionError;
       return;
     }
     if (
@@ -726,6 +789,15 @@ export function useModelManagement() {
   async function retryConflict(): Promise<void> {
     const pendingChange = pendingConflictChange.value;
     if (!conflictRetryAllowed.value || !pendingChange) return;
+    if (pendingChange.kind === "upsert") {
+      const activeEditor = editor.value;
+      if (!activeEditor) return;
+      const sessionError = editorSessionError(activeEditor);
+      if (sessionError) {
+        mutationError.value = sessionError;
+        return;
+      }
+    }
     if (pendingChange.kind === "remove") {
       mutationBusy.value = true;
       banner.value = null;
