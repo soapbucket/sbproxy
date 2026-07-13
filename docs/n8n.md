@@ -1,6 +1,6 @@
 # n8n with SBproxy
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-12*
 
 n8n workflows normally talk to model providers directly: you paste an OpenAI key into a credential and every AI Agent run calls `api.openai.com`. Point that credential at an SBproxy you run instead, and every workflow run crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. n8n is configured through its UI rather than code, so this page walks through the fields to fill in and the exact values to type, on both sides of the wire.
 
@@ -41,7 +41,7 @@ origins:
 
 Origin keys match the `Host` header and hostname matching strips the port, so `"127.0.0.1"` matches a client whose base URL is `http://127.0.0.1:8080`. When the gateway runs on another machine, key the origin with the hostname n8n will dial. The real provider key comes from the environment through `${OPENAI_API_KEY}` interpolation; never put a raw provider key in the file.
 
-Be precise about what the virtual key does. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `n8n` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. n8n never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces in the `sbproxy_ai_key_*` metrics; enforced spend ceilings live in an action-level `budget:` block. The virtual key is not inbound authentication by itself either: anyone who can reach the listener and guess a key could present it, so add an `authentication` block to the origin when the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
+Be precise about what the virtual key does. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `n8n` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. n8n never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. The virtual key is not inbound authentication by itself either: anyone who can reach the listener and guess a key could present it, so add an `authentication` block to the origin when the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
 
 ### Verify the gateway side
 
@@ -75,7 +75,7 @@ If n8n runs in Docker and the gateway runs on the host, `127.0.0.1` inside the c
 3. Click the plus on the Chat Model socket and pick OpenAI Chat Model.
 4. Open the node. In the credential selector at the top of its settings (labeled Credential to connect with), choose the credential you created.
 5. In Model, pick `gpt-4o-mini`. The dropdown is filled by a model-list call to your Base URL, so it shows what the gateway config exposes. If the list fails to load (an origin fronting a non-OpenAI provider passes the upstream's native list format through), switch the Model field from its list mode to its ID mode and type `gpt-4o-mini`.
-6. Open the chat panel and send a message. The reply crossed the gateway: the run is attributed to the `n8n` key in the `sbproxy_ai_key_*` metrics and the usage ledger, and the same completion asked twice can come back from cache.
+6. Open the chat panel and send a message. The reply crossed the gateway: the run is attributed to the `n8n` key (its `api_key_id` label on the `sbproxy_ai_*_attributed_total` metrics) and the usage ledger, and the same completion asked twice can come back from cache.
 
 ## MCP tools through the gateway
 

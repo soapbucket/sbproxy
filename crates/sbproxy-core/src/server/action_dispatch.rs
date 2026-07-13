@@ -1715,7 +1715,23 @@ pub(super) async fn handle_mcp_action(
                                 };
 
                                 let call_started = std::time::Instant::now();
-                                let call = mcp.federation.call_tool(&name, outbound_arguments);
+                                // WOR-1877: execute_tool span per the
+                                // GenAI agent conventions. Parents
+                                // under the active request trace, so
+                                // the agent request, tool dispatch,
+                                // and any LLM calls render as one
+                                // tree with cost on every hop.
+                                let tool_span = sbproxy_ai::tracing_spans::execute_tool_span(
+                                    &name,
+                                    federated
+                                        .as_ref()
+                                        .map(|t| t.server_name.as_str())
+                                        .unwrap_or("unknown"),
+                                );
+                                let call = tracing::Instrument::instrument(
+                                    mcp.federation.call_tool(&name, outbound_arguments),
+                                    tool_span.clone(),
+                                );
                                 let outcome = match timeout {
                                     Some(d) => match tokio::time::timeout(d, call).await {
                                         Ok(r) => r,
@@ -1753,6 +1769,30 @@ pub(super) async fn handle_mcp_action(
                                         is_code_execution,
                                     );
                                 }
+
+                                // WOR-1877: stamp the dispatch outcome
+                                // and resolved cost on the tool span,
+                                // mirroring the dispatch metric's
+                                // closed vocabulary.
+                                let tool_outcome = match &outcome {
+                                    Ok(value) => {
+                                        if value
+                                            .get("isError")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false)
+                                        {
+                                            "tool_error"
+                                        } else {
+                                            "ok"
+                                        }
+                                    }
+                                    Err(_) => "tool_error",
+                                };
+                                sbproxy_ai::tracing_spans::record_tool_outcome(
+                                    &tool_span,
+                                    tool_outcome,
+                                    mcp.tool_cost(&name),
+                                );
 
                                 // WOR-1644: attribute the call into the
                                 // usage plane. Metrics always fire;

@@ -12,6 +12,8 @@ const nav = [
   { to: "/logs", label: "Logs" },
   { to: "/metrics", label: "Metrics" },
   { to: "/spend", label: "Spend" },
+  { to: "/ai-performance", label: "AI performance" },
+  { to: "/guardrails", label: "Guardrails" },
   { to: "/prompts", label: "Prompts" },
   { to: "/playground", label: "Playground" },
   { to: "/cache", label: "Cache" },

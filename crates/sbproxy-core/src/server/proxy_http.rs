@@ -4050,6 +4050,17 @@ impl ProxyHttp for SbProxy {
                     .client_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_default(),
+                // WOR-1874: correlation + AI columns so LogsView rows
+                // expand usefully and the guardrail filters have data.
+                request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
+                trace_id: ctx.trace_ctx.as_ref().map(|t| t.trace_id.clone()),
+                provider: ctx.ai_provider.clone(),
+                model: ctx.ai_model.clone(),
+                tokens_in: ctx.ai_tokens_in,
+                tokens_out: ctx.ai_tokens_out,
+                cost_usd_micros: ctx.ai_cost_usd_micros,
+                guardrail_category: ctx.ai_guardrail_category.clone(),
+                guardrail_action: ctx.ai_guardrail_action.clone(),
             });
         }
 
@@ -4152,6 +4163,29 @@ impl ProxyHttp for SbProxy {
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
                 outcome,
+            );
+            // WOR-1875: request count + outcome split for the durable
+            // spend rollups, once per AI request (blocked requests
+            // that never billed included). Token / cost contributions
+            // ride the billing choke point instead.
+            sbproxy_observe::usage_rollup::record_usage_rollup(
+                sbproxy_observe::usage_rollup::RollupEvent {
+                    ts_secs: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    dims: sbproxy_observe::usage_rollup::RollupDims {
+                        provider: ctx.ai_provider.clone().unwrap_or_default(),
+                        model: ctx.ai_model.clone().unwrap_or_default(),
+                        tenant: ctx.tenant_id.to_string(),
+                        team: ctx.attribution_tags.team.clone().unwrap_or_default(),
+                        api_key_id: ctx.principal.api_key_id().to_string(),
+                        project: ctx.attribution_tags.project.clone().unwrap_or_default(),
+                    },
+                    kind: sbproxy_observe::usage_rollup::RollupKind::Outcome(
+                        sbproxy_observe::usage_rollup::RollupOutcome::from_outcome_label(outcome),
+                    ),
+                },
             );
 
             // WOR-1497: a request blocked before dispatch (budget cap,

@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-12*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -258,7 +258,7 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_operator_reconcile_duration_seconds_bucket` | 22 | `kind` label plus 11 histogram buckets 1ms..60s. |
 | `sbproxy_operator_leader_transitions_total` | 3 | Labels: `result` (elected\|renewed\|lost). |
 | `sbproxy_operator_leader_is_leader` | 1 | Gauge; 1 when this replica holds the lease. |
-| `sbproxy_tokens_attributed_total` | 8 000 | Labels: `project` (sanitised), `user` (sanitised), `tag` (sanitised; first element of the virtual key's `tags:` list with fan-out per tag), `direction` (input\|output). Cardinality not bounded by a fixed cap; the existing `sbproxy_label_cardinality_overflow_total` counter fires when any label exceeds budget. Sits next to `sbproxy_ai_tokens_total{hostname,provider,direction}` and indexes the same observation by who-paid attribution. |
+| `sbproxy_tokens_attributed_total` | 8 000 | Labels: `project` (sanitised), `user` (sanitised), `tag` (sanitised; first element of the virtual key's `tags:` list with fan-out per tag), `direction` (input\|output). Cardinality not bounded by a fixed cap; the existing `sbproxy_label_cardinality_overflow_total` counter fires when any label exceeds budget. Sits next to `sbproxy_ai_tokens_attributed_total` and indexes the same observation by who-paid attribution. |
 | `sbproxy_label_cardinality_overflow_per_tenant_total` | 8 000 | Labels: `metric` (sanitised name of the demoted family), `label` (sanitised label key that overflowed), `tenant_id`. Same demotion signal as `sbproxy_label_cardinality_overflow_total` but partitioned by tenant so a noisy-tenant root-cause investigation does not have to scan every metric. |
 | `sbproxy_a2a_hops_total` | 60 | Labels: `route`, `spec` (a2a-spec version), `decision` (allow\|deny\|warn). Counts each per-request A2A hop the proxy observes. |
 | `sbproxy_a2a_chain_depth_bucket` | 60 | `route`, `spec`; histogram buckets 1..32 chain hops. Tracks A2A call-graph depth before truncation. |
@@ -311,6 +311,33 @@ Metrics are per-instance: each process exposes only its own counters at `/metric
 
 For deployments running the mesh key tier without a Prometheus, one node can report fleet totals directly. Each node periodically publishes a small allow-list of `sbproxy_*` totals into the mesh, and `GET /admin/cluster/metrics` returns the summed values plus the node count. This is a convenience for a single-pane view without a metrics stack, not a replacement for Prometheus: the set is curated, the cadence is coarse, and it only reports while the mesh tier is on (otherwise the endpoint returns 404). Prefer Prometheus for anything beyond an at-a-glance total.
 
+### Durable usage rollups and windowed spend
+
+Prometheus counters are process-lifetime, so on their own the admin Spend page zeroes at every restart. The proxy therefore also folds every AI request into durable spend rollups: hour buckets keyed by provider, model, tenant, team, credential id, and project, each aggregating request counts, tokens by direction, cost in micro-USD, and a closed outcome split (`ok` / `blocked` / `error`). Buckets live in an embedded database file; hourly buckets compact into daily buckets past the hourly retention, and daily buckets prune past the daily retention. Rows carry no prompt content and no raw key material (credential id only), so the file is safe to back up and ship, and the write path is a bounded queue drained off the data plane (a full queue drops the event and increments `sbproxy_telemetry_dropped_total{kind="usage_rollup"}` rather than blocking traffic).
+
+```yaml
+proxy:
+  observability:
+    usage_rollups:
+      enabled: true                                # default
+      path: /var/lib/sbproxy/usage-rollups.redb    # default
+      retention_hourly_days: 90                    # then compacted daily
+      retention_daily_days: 395                    # about 13 months
+```
+
+Rollups are on by default. When the path cannot be opened the proxy logs a warning and runs with rollups off instead of failing boot; point `path` somewhere writable for non-root deployments.
+
+Query the windowed spend API on the admin listener:
+
+```
+GET /api/usage/spend?window=24h&group_by=model
+GET /api/usage/spend?from=1760000000&to=1760086400&group_by=team
+```
+
+`window` is one of `1h | 24h | 7d | 30d`; `from` / `to` are Unix seconds and override the window; `group_by` is one of `provider | model | tenant | team | api_key | project | total`. The response carries `bucket_secs` (3600 while the window is inside the hourly retention, 86400 past it), time-ordered `buckets` (`ts_secs`, `group`, `requests`, `tokens_in`, `tokens_out`, `cost_usd_micros`, `ok`, `blocked`, `error`), and window `totals` in the same shape. Calling `/api/usage/spend` with no parameters keeps returning the legacy process-lifetime totals. The admin Spend page renders this history with a range selector, so yesterday's spend still renders after a restart.
+
+The bucket schema doubles as the ingestion contract for external spend pipelines: the same events feed the rollups and the usage sinks, so a durable analytics store can consume the identical dimensions.
+
 ## Logs
 
 ### Structured-log schema
@@ -339,6 +366,16 @@ Required when the line is request-scoped:
 | `route` | string | Origin route key |
 
 Per-request lifecycle lines (`request_started`, `request_completed`, `request_error`) carry the same body as `RequestEvent` (`agent_id`, `agent_class`, `rail`, `shape`, `status_code`, `latency_ms`, `error_class`).
+
+AI request lines additionally carry the spend and governance columns log-only consumers grep for first:
+
+| Field | Type | Notes |
+|---|---|---|
+| `cost_usd_micros` | integer | Derived AI request cost in micro-USD (`1e-6` USD). Integer so log math is exact. Present on AI requests including zero-cost cache hits; absent on non-AI traffic. Same value the cost metric, span, and usage ledger carry. |
+| `guardrail_category` | string | Configured guardrail / rule name that intervened. Absent when no guardrail intervened. |
+| `guardrail_action` | string enum | What the guardrail did. `block` is the only live action today; `redact`, `rewrite`, and `hold` are reserved. |
+
+The same three columns ride the `RequestEvent` envelope and the admin request ring, and `/api/requests` accepts `guardrail_action=` and `guardrail_category=` as exact-match query filters alongside the existing `status`, `method`, and `path` params.
 
 Event types pinned for Wave 1: `request_started`, `request_completed`, `request_error`, `policy_evaluated`, `policy_blocked`, `action_challenge_issued`, `action_redeemed`, `ledger_call`, `audit_emit`, `notify_dispatch`, `boot`, `config_reload`, `health_status_change`.
 
@@ -601,6 +638,8 @@ OpenTelemetry SDK, pinned to the `0.27.x` family. The tracer is initialized once
 
 OTLP gRPC (port 4317) is the default exporter. HTTP/protobuf (port 4318) is supported for environments that block gRPC. The `stdout` exporter is for local debugging only.
 
+Every signal carries detected resource attributes so multi-node telemetry stays distinguishable downstream: `host.name`, `os.type`, `process.pid`, and a `service.instance.id` of the form `<host>:<pid>`, plus `k8s.pod.name` / `k8s.namespace.name` / `k8s.node.name` when the conventional downward-API env vars (`K8S_POD_NAME`, `K8S_POD_NAMESPACE`, `K8S_NODE_NAME`) are set, plus any `OTEL_RESOURCE_ATTRIBUTES` pairs. Keys set in `resource_attrs` win over detection, so explicit config always beats the detector.
+
 ### W3C TraceContext propagation
 
 Every inbound HTTP path extracts `traceparent` and `tracestate` from request headers; if absent, a fresh root span starts. On the proxied path, the upstream request filter injects the distributed-tracing headers before the request leaves for the upstream, so proxied traffic propagates context end to end.
@@ -653,9 +692,30 @@ redactor and the origin PII redactor when configured, capped at 8 KiB per
 captured value, and truncated with `...[truncated]`; streaming completions are
 assembled from forwarded chunks before export.
 
+When a completion carries tool calls, the `ai.request` span additionally
+emits one `gen_ai.tool.message` span event per call with the tool-call id
+and name (both bounded; at most 16 events per completion). Call arguments
+join the event only under the same `trace_content` gate and redaction as
+the message content.
+
+### MCP execute_tool spans
+
+The gateway terminates both the LLM traffic and the MCP tool traffic, so it
+can emit the trace most gateways cannot: the agent request, its tool
+dispatches, and the LLM calls in one tree with cost on every hop. Every MCP
+`tools/call` dispatch runs inside an `mcp.execute_tool` span following the
+OpenTelemetry GenAI agent conventions: `gen_ai.operation.name = execute_tool`
+and `gen_ai.tool.name` carry the dispatch, and W3C propagation parents the
+span under the caller's trace. Where the in-development MCP conventions do
+not yet name an attribute, the `sbproxy.mcp.*` namespace holds the slot
+(`sbproxy.mcp.server`, `sbproxy.mcp.outcome`, `sbproxy.mcp.cost_usd`) so a
+later rename is mechanical; a failed dispatch also stamps `error.type`.
+Tool arguments never become span attributes (unbounded); tool names are
+bounded by the tool registry.
+
 #### Verified backend matrix
 
-OTLP is vendor-agnostic. Use an OpenTelemetry Collector as the default ingress when you want fan-out, retries, memory limits, or backend-specific auth. Direct export is fine for a single trusted backend that accepts the same transport SBproxy is configured to emit and does not require custom OTLP headers. SBproxy's telemetry block exposes endpoint, transport, service name, resource attributes, sampling, and metric-export toggles; it does not expose per-exporter auth headers. Put Datadog Cloud, Honeycomb, Langfuse Cloud, and any other API-key backend behind the Collector.
+OTLP is vendor-agnostic. Use an OpenTelemetry Collector as the default ingress when you want fan-out, retries, memory limits, or per-signal routing. Direct export works for any single backend, including API-key backends: the telemetry block exposes endpoint, transport, service name, resource attributes, sampling, metric-export toggles, and a `headers:` map applied to every OTLP export request (traces, metrics, and any OTLP log sink). Header values accept secret references (`${VAR}`, `file:`, `vault://`, `secret://`, ...); they resolve at boot and the proxy refuses to start when one cannot be resolved, so a raw reference never reaches the collector, and literal header values are masked in config printouts.
 
 The reference Compose stack under `examples/observability-stack/` is the verified local path. SBproxy sends OTLP gRPC to the Collector on host port `4327`; the Collector receives on container port `4317` and fans traces to Tempo, Phoenix, and Langfuse. It mirrors OTLP metrics to Prometheus with remote write and sends OTLP logs to Loki.
 
@@ -669,6 +729,32 @@ The reference Compose stack under `examples/observability-stack/` is the verifie
 | Datadog | Datadog Agent on `http://datadog-agent:4317` gRPC or `http://datadog-agent:4318` HTTP; use a Collector or Datadog Distribution of the OTel Collector for cloud-auth export | Datadog Agent OTLP receiver, Datadog Distribution of the OTel Collector, or direct OTLP intake from a Collector | APM traces with `gen_ai.*`, `llm.*`, `error.type`, token, and cost attributes. Use Datadog dashboards or notebooks for LLM-specific panels. |
 | Honeycomb | `http://otel-collector:4317`; use the Collector so it can attach the Honeycomb API-key header | `otlphttp/honeycomb` with `x-honeycomb-team: ${HONEYCOMB_API_KEY}` | High-cardinality trace exploration. `request_id`, `agent_id`, prompt capture, status, token, and cost attributes stay queryable without turning them into Prometheus labels. |
 | Generic OTLP collector | `http://otel-collector:4317` for gRPC or `http://otel-collector:4318` for HTTP/protobuf | Any OTLP-compatible exporter chain | Whatever the downstream exporter supports. This is the best path for vendor migration and dual shipping. |
+
+##### Direct authenticated export
+
+Point the telemetry block straight at a hosted backend and put its
+auth header in `headers:`. Typical header names: Honeycomb
+`x-honeycomb-team`, Grafana Cloud OTLP `authorization: Basic <token>`,
+Datadog OTLP intake `dd-api-key`, Langfuse Cloud `authorization:
+Basic <public:secret base64>`.
+
+```yaml
+proxy:
+  observability:
+    telemetry:
+      enabled: true
+      endpoint: "https://api.honeycomb.io"
+      transport: http
+      service_name: "sbproxy"
+      export_metrics: true
+      headers:
+        x-honeycomb-team: "${HONEYCOMB_API_KEY}"
+```
+
+The same set applies to every OTLP signal, so traces, mirrored
+metrics, and an `otlp` log sink authenticate identically. Header
+changes require a restart; the export pipelines initialise once at
+boot.
 
 ##### SBproxy to Collector
 
@@ -924,6 +1010,25 @@ The OTLP endpoint targets the OTel Collector (host port 4327, mapped to the cont
 For a full LLM-native smoke test, enable `trace_content: true` on the AI origin and send a chat-completions request through SBproxy. Phoenix and Langfuse render the same generation with prompt, response, provider, model, token split, USD cost, TTFT, latency, and status fields from the emitted `gen_ai.*` and OpenInference attributes/events.
 
 `docker compose down -v` drops the named volumes for Prometheus, Grafana, Tempo, Loki, and Langfuse's Postgres, ClickHouse, MinIO, and Redis storage for a fresh start.
+
+## Alert notification channels
+
+The alert dispatcher fans fired alerts out to every channel declared under `proxy.alerting.channels`. Four channel types ship: `log` (a warn-level line), `webhook` (JSON envelope POST with optional HMAC signing), `slack`, and `pagerduty`. The Slack and PagerDuty channels are formatters over the same delivery transport as `webhook`: a failed delivery increments `sbproxy_telemetry_dropped_total{kind="alert_slack"|"alert_pagerduty"}` and never blocks the data plane, and the alert still reaches any configured `log` channel.
+
+```yaml
+proxy:
+  alerting:
+    channels:
+      - type: slack
+        url: "${SLACK_ALERTS_WEBHOOK_URL}"
+      - type: pagerduty
+        routing_key: "${PAGERDUTY_ROUTING_KEY}"
+      - type: log
+```
+
+The Slack message carries the rule, severity, firing or recovered state, the message, and the alert labels. The PagerDuty channel sends Events API v2 events with a deduplication key derived from the rule name plus its labels, so repeated fires of the same rule group into a single incident, and a recovery notification for the same rule resolves it. Severities map onto PagerDuty's vocabulary (`critical` stays `critical`; everything else arrives as `warning`).
+
+Prometheus-side alerting is independent of these channels: `dashboards/prometheus/alerts.yml` ships alert rules for an external Prometheus, including AI budget utilization above 90%, per-provider error burn above 20%, and spend velocity above a dollar-per-hour threshold you should tune to your budget.
 
 ## See also
 

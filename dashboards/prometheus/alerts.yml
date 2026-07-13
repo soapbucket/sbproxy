@@ -20,7 +20,7 @@ groups:
           description: "The P95 request latency has been above 2 seconds for 5 minutes. Current value: {{ $value | humanizeDuration }}."
 
       - alert: SBProxyAIProviderDown
-        expr: rate(sbproxy_ai_requests_total{status="success"}[2m]) == 0 and rate(sbproxy_ai_requests_total{status="error"}[2m]) > 0
+        expr: rate(sbproxy_ai_requests_attributed_total{outcome="ok"}[2m]) == 0 and rate(sbproxy_ai_requests_attributed_total{outcome!="ok"}[2m]) > 0
         for: 2m
         labels:
           severity: critical
@@ -119,3 +119,30 @@ groups:
         annotations:
           summary: "Model-host load queue backed up"
           description: "More than 20 requests have been queued waiting for a cold model to load for 5 minutes. Cold starts are not keeping up; consider keep_alive to hold the model resident."
+
+      - alert: SBProxyAIBudgetNearExhaustion
+        expr: max by (scope) (sbproxy_ai_budget_utilization_ratio) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI budget over 90% for scope {{ $labels.scope }}"
+          description: "Budget utilization for {{ $labels.scope }} has been above 90% for 5 minutes. Requests start failing with budget_exceeded at 100%; raise the budget or slow the traffic."
+
+      - alert: SBProxyAIProviderErrorBurn
+        expr: sum by (provider) (rate(sbproxy_ai_requests_attributed_total{outcome!="ok"}[5m])) / sum by (provider) (rate(sbproxy_ai_requests_attributed_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Provider {{ $labels.provider }} error burn above 20%"
+          description: "More than 20% of requests to {{ $labels.provider }} ended in a non-ok outcome over the last 5 minutes. Check provider status and failover configuration."
+
+      - alert: SBProxyAISpendVelocity
+        expr: sum(rate(sbproxy_ai_cost_usd_micros_total[15m])) * 3600 / 1000000 > 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI spend velocity above $10/hour"
+          description: "Derived AI spend has been running above $10 per hour for 15 minutes. Tune the threshold to your budget; the unit conversion is micro-USD/s to USD/h."

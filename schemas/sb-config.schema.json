@@ -706,6 +706,18 @@
               "type": "null"
             }
           ]
+        },
+        "usage_rollups": {
+          "description": "Durable windowed usage rollups. On by default; omit the block to accept the defaults.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UsageRollupsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -1189,6 +1201,47 @@
           ],
           "format": "uint64",
           "minimum": 0.0
+        },
+        "headers": {
+          "description": "Additional headers sent with every OTLP export request (traces, metrics, and any OTLP log sink). Values may be literals or secret references (`${VAR}`, `file:`, `vault://`, `secret://`, and the other backend URI schemes); references resolve at boot and the proxy refuses to start when one cannot be resolved, so a raw reference never reaches the collector. Hosted backends (Grafana Cloud, Honeycomb, Langfuse Cloud, Datadog) authenticate with these headers.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "UsageRollupsConfig": {
+      "description": "Durable spend-rollup configuration (hour and day usage buckets in an embedded database, so the admin spend API serves windowed history that survives restarts). Buckets are keyed by provider, model, tenant, team, credential id, and project, and aggregate request counts, tokens, cost, and an outcome split. Rows carry no prompt content and no raw key material, so the file is safe to back up. Aggregation is deterministic.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether rollups are recorded. Defaults to `true`. When the store path cannot be opened the proxy logs a warning and runs with rollups off instead of failing boot.",
+          "default": true,
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Rollup database file path. Default `/var/lib/sbproxy/usage-rollups.redb`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retention_hourly_days": {
+          "description": "Days of hourly buckets to keep before compacting into daily buckets. Default 90.",
+          "default": 90,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "retention_daily_days": {
+          "description": "Days of daily buckets to keep. Default 395 (about 13 months).",
+          "default": 395,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
         }
       }
     },
@@ -1214,11 +1267,11 @@
       ],
       "properties": {
         "type": {
-          "description": "Channel type: `\"webhook\"` or `\"log\"`.",
+          "description": "Channel type: `\"webhook\"`, `\"slack\"`, `\"pagerduty\"`, or `\"log\"`.",
           "type": "string"
         },
         "url": {
-          "description": "Webhook URL (required when `channel_type == \"webhook\"`).",
+          "description": "Webhook URL. Required for `webhook` (any receiver) and `slack` (the incoming-webhook URL); unused by `pagerduty` and `log`.",
           "type": [
             "string",
             "null"
@@ -1231,6 +1284,14 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "routing_key": {
+          "description": "PagerDuty Events API v2 routing key (required when `channel_type == \"pagerduty\"`). Accepts secret references.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -1269,6 +1330,14 @@
         },
         "prompt_persistence_path": {
           "description": "WOR-800 PR5: filesystem path to a redb file that persists the prompt-store runtime overlay. When set, every successful `POST /admin/prompts/.../versions` and `PUT /admin/prompts/.../pin` also writes through to the file, and the file's existing contents are hydrated into the in-memory overlay at boot. Absent means PR3-style ephemeral mutations.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trace_url_template": {
+          "description": "URL template for trace deep-links in the admin UI. The literal `{trace_id}` is replaced with the request's trace id, e.g. `https://jaeger.internal/trace/{trace_id}`. Unset renders trace ids as plain text (no broken default link).",
           "default": null,
           "type": [
             "string",

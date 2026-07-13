@@ -59,6 +59,12 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace", "metric
 opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "grpc-tonic", "trace", "metrics", "logs"] }
 opentelemetry-semantic-conventions = "0.27"
 tracing-opentelemetry = "0.28"
+# WOR-1869: build gRPC MetadataMap for authenticated OTLP export.
+# Version pinned by the workspace to match opentelemetry-otlp's tonic.
+tonic.workspace = true
+# WOR-1875: durable usage rollup buckets (the workspace's embedded-KV
+# convention; the response cache and keystore use redb the same way).
+redb.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

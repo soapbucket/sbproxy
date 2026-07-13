@@ -52,6 +52,10 @@ pub struct AdminConfig {
     /// WOR-1716: RBAC operators in addition to the top-level admin (which
     /// is always the full-access `admin` role).
     pub operators: Vec<AdminOperator>,
+    /// WOR-1870: URL template for trace deep-links in the admin UI.
+    /// `{trace_id}` is substituted with the row's trace id; `None`
+    /// renders trace ids as plain text.
+    pub trace_url_template: Option<String>,
 }
 
 /// PEM certificate + key file paths for admin-server TLS (WOR-1717).
@@ -87,6 +91,7 @@ impl Default for AdminConfig {
             allow_ips: Vec::new(),
             cors_origins: Vec::new(),
             operators: Vec::new(),
+            trace_url_template: None,
         }
     }
 }
@@ -245,7 +250,7 @@ impl AdminIpFilter {
 // --- Request Log ---
 
 /// Recent request log entry stored in a ring buffer.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RequestLogEntry {
     /// RFC 3339 timestamp marking when the request was processed.
     pub timestamp: String,
@@ -261,6 +266,53 @@ pub struct RequestLogEntry {
     pub latency_ms: f64,
     /// Client IP address as observed by the proxy.
     pub client_ip: String,
+    /// Request id, correlating the ring row with the access log line
+    /// and the trace (WOR-1874).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// W3C trace id when tracing is active; the admin LogsView renders
+    /// it as an operator-configured deep link (WOR-1870).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// AI provider that served the request, when the AI gateway did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// AI model, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Prompt tokens, when the AI usage parser reported them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    /// Completion tokens, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    /// Derived AI cost in micro-USD (WOR-1874).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+    /// Category of the guardrail that intervened, when one did
+    /// (WOR-1874).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardrail_category: Option<String>,
+    /// What the intervening guardrail did (`block` today; WOR-1874).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardrail_action: Option<String>,
+}
+
+/// Filters for [`AdminState::query_requests`] (WOR-1718 / WOR-1874).
+/// Every field is optional; `None` means the dimension is not
+/// filtered.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestLogFilter<'a> {
+    /// Exact status code.
+    pub status: Option<u16>,
+    /// Case-insensitive HTTP method match.
+    pub method: Option<&'a str>,
+    /// Path substring match.
+    pub path_sub: Option<&'a str>,
+    /// Exact guardrail action match (WOR-1874).
+    pub guardrail_action: Option<&'a str>,
+    /// Exact guardrail category match (WOR-1874).
+    pub guardrail_category: Option<&'a str>,
 }
 
 // --- Admin State ---
@@ -483,6 +535,8 @@ impl AdminState {
     }
 
     /// Add a request to the log (ring buffer, drops oldest when full).
+    ///
+    /// See [`RequestLogFilter`] for the matching query surface.
     pub fn log_request(&self, entry: RequestLogEntry) {
         let mut log = self
             .recent_requests
@@ -510,15 +564,12 @@ impl AdminState {
         log.iter().rev().take(limit).cloned().collect()
     }
 
-    /// Query the recent-request log (newest first) with optional filters
-    /// and pagination (WOR-1718). `status` is an exact code, `method` is
-    /// case-insensitive, `path_sub` is a substring, `offset`/`limit`
+    /// Query the recent-request log (newest first) with optional
+    /// filters and pagination (WOR-1718 / WOR-1874). `offset`/`limit`
     /// paginate the filtered result.
     pub fn query_requests(
         &self,
-        status: Option<u16>,
-        method: Option<&str>,
-        path_sub: Option<&str>,
+        filter: &RequestLogFilter<'_>,
         offset: usize,
         limit: usize,
     ) -> Vec<RequestLogEntry> {
@@ -528,9 +579,25 @@ impl AdminState {
             .expect("admin log mutex poisoned");
         log.iter()
             .rev()
-            .filter(|e| status.is_none_or(|s| e.status == s))
-            .filter(|e| method.is_none_or(|m| e.method.eq_ignore_ascii_case(m)))
-            .filter(|e| path_sub.is_none_or(|p| e.path.contains(p)))
+            .filter(|e| filter.status.is_none_or(|s| e.status == s))
+            .filter(|e| {
+                filter
+                    .method
+                    .is_none_or(|m| e.method.eq_ignore_ascii_case(m))
+            })
+            .filter(|e| filter.path_sub.is_none_or(|p| e.path.contains(p)))
+            // WOR-1874: exact-match filters on the guardrail columns so
+            // the Guardrails admin view can deep-link to blocked rows.
+            .filter(|e| {
+                filter
+                    .guardrail_action
+                    .is_none_or(|a| e.guardrail_action.as_deref() == Some(a))
+            })
+            .filter(|e| {
+                filter
+                    .guardrail_category
+                    .is_none_or(|c| e.guardrail_category.as_deref() == Some(c))
+            })
             .skip(offset)
             .take(limit)
             .cloned()
@@ -1801,6 +1868,9 @@ pub fn handle_admin_request(
         let status = rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok());
         let method_f = rl_query_param(path, "method");
         let path_f = rl_query_param(path, "path");
+        // WOR-1874: guardrail-column filters.
+        let guardrail_action_f = rl_query_param(path, "guardrail_action");
+        let guardrail_category_f = rl_query_param(path, "guardrail_category");
         let offset = rl_query_param(path, "offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -1808,7 +1878,17 @@ pub fn handle_admin_request(
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(state.config.max_log_entries)
             .min(state.config.max_log_entries);
-        let entries = state.query_requests(status, method_f, path_f, offset, limit);
+        let entries = state.query_requests(
+            &RequestLogFilter {
+                status,
+                method: method_f,
+                path_sub: path_f,
+                guardrail_action: guardrail_action_f,
+                guardrail_category: guardrail_category_f,
+            },
+            offset,
+            limit,
+        );
         return match serde_json::to_string(&entries) {
             Ok(body) => (200, "application/json", body),
             Err(e) => (
@@ -1818,10 +1898,28 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // WOR-1870: operator UI settings the SPA reads at load (trace
+    // deep-link template today).
+    if path_only == "/api/ui-settings" {
+        let body = serde_json::json!({
+            "trace_url_template": state.config.trace_url_template,
+        })
+        .to_string();
+        return (200, "application/json", body);
+    }
     // WOR-1718: spend summary from the AI cost/token metrics.
+    // WOR-1875: any of `window`, `group_by`, `from`, `to` selects the
+    // windowed shape served from the durable rollups; the zero-arg
+    // legacy shape (process-lifetime counter totals) is unchanged.
     if path_only == "/api/usage/spend" {
+        let window = rl_query_param(path, "window");
+        let group_by = rl_query_param(path, "group_by");
+        let from_p = rl_query_param(path, "from").and_then(|s| s.parse::<u64>().ok());
+        let to_p = rl_query_param(path, "to").and_then(|s| s.parse::<u64>().ok());
+        if window.is_some() || group_by.is_some() || from_p.is_some() || to_p.is_some() {
+            return windowed_spend_response(window, group_by, from_p, to_p);
+        }
         let snap = sbproxy_observe::metrics::metrics().snapshot_named(&[
-            "sbproxy_ai_tokens_total",
             "sbproxy_tokens_attributed_total",
             "sbproxy_ai_tokens_attributed_total",
             "sbproxy_ai_cost_usd_micros_total",
@@ -2002,11 +2100,102 @@ fn first_positive_snapshot_value(
         .unwrap_or(0.0)
 }
 
+/// WOR-1875: parse a `window=` value into seconds.
+fn parse_spend_window(window: &str) -> Option<u64> {
+    Some(match window {
+        "1h" => 3_600,
+        "24h" => 86_400,
+        "7d" => 7 * 86_400,
+        "30d" => 30 * 86_400,
+        _ => return None,
+    })
+}
+
+/// WOR-1875: serve the windowed spend shape from the rollup store.
+/// Parameter validation runs before the store lookup so a bad request
+/// is a 400 even when rollups are disabled; a valid request without a
+/// store is a 503 that names the config knob.
+fn windowed_spend_response(
+    window: Option<&str>,
+    group_by: Option<&str>,
+    from_p: Option<u64>,
+    to_p: Option<u64>,
+) -> (u16, &'static str, String) {
+    let Some(group) = sbproxy_observe::usage_rollup::GroupBy::parse(group_by.unwrap_or("total"))
+    else {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|total)"}"#
+                .to_string(),
+        );
+    };
+    let window_secs = match window {
+        None => None,
+        Some(w) => match parse_spend_window(w) {
+            Some(secs) => Some(secs),
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    r#"{"error":"unknown window (1h|24h|7d|30d)"}"#.to_string(),
+                );
+            }
+        },
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (from, to) = match (from_p, to_p, window_secs) {
+        (Some(f), Some(t), _) => (f, t),
+        (Some(f), None, _) => (f, now),
+        (None, _, Some(w)) => (now.saturating_sub(w), now),
+        _ => (now.saturating_sub(86_400), now),
+    };
+    if from >= to {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"from must be before to"}"#.to_string(),
+        );
+    }
+    let Some(writer) = sbproxy_observe::usage_rollup::usage_rollup_writer() else {
+        return (
+            503,
+            "application/json",
+            r#"{"error":"usage rollups are not enabled (proxy.observability.usage_rollups)"}"#
+                .to_string(),
+        );
+    };
+    match writer
+        .store()
+        .query(from, to, group, now, writer.hourly_retention_secs())
+    {
+        Ok(res) => {
+            let body = serde_json::json!({
+                "from": from,
+                "to": to,
+                "group_by": group_by.unwrap_or("total"),
+                "bucket_secs": res.bucket_secs,
+                "buckets": res.buckets,
+                "totals": res.totals,
+            })
+            .to_string();
+            (200, "application/json", body)
+        }
+        Err(e) => (
+            500,
+            "application/json",
+            format!(r#"{{"error":"rollup query failed: {e}"}}"#),
+        ),
+    }
+}
+
 fn spend_totals_from_snapshot(snap: &std::collections::HashMap<String, f64>) -> (f64, f64) {
     let tokens = first_positive_snapshot_value(
         snap,
         &[
-            "sbproxy_ai_tokens_total",
             "sbproxy_ai_tokens_attributed_total",
             "sbproxy_tokens_attributed_total",
         ],
@@ -2878,6 +3067,7 @@ mod tests {
 
     fn make_state() -> AdminState {
         AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -2970,6 +3160,7 @@ mod tests {
             status: 200,
             latency_ms: 1.5,
             client_ip: "127.0.0.1".to_string(),
+            ..Default::default()
         });
         let entries = state.get_recent_requests(10);
         assert_eq!(entries.len(), 1);
@@ -2988,6 +3179,7 @@ mod tests {
                 status: 200,
                 latency_ms: 0.0,
                 client_ip: "127.0.0.1".to_string(),
+                ..Default::default()
             });
         }
         let entries = state.get_recent_requests(10);
@@ -3009,6 +3201,7 @@ mod tests {
                 status: 200,
                 latency_ms: 0.0,
                 client_ip: "127.0.0.1".to_string(),
+                ..Default::default()
             });
         }
         let entries = state.get_recent_requests(100);
@@ -3036,26 +3229,164 @@ mod tests {
                 status: if i < 5 { 200 } else { 500 },
                 latency_ms: 1.0,
                 client_ip: "127.0.0.1".to_string(),
+                ..Default::default()
             });
         }
         // Status filter.
-        let errs = state.query_requests(Some(500), None, None, 0, 100);
+        let errs = state.query_requests(
+            &RequestLogFilter {
+                status: Some(500),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
         assert_eq!(errs.len(), 5);
         assert!(errs.iter().all(|e| e.status == 500));
         // Method filter (case-insensitive).
-        let posts = state.query_requests(None, Some("post"), None, 0, 100);
+        let posts = state.query_requests(
+            &RequestLogFilter {
+                method: Some("post"),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
         assert_eq!(posts.len(), 5);
         // Path substring.
         assert_eq!(
             state
-                .query_requests(None, None, Some("/thing/7"), 0, 100)
+                .query_requests(
+                    &RequestLogFilter {
+                        path_sub: Some("/thing/7"),
+                        ..Default::default()
+                    },
+                    0,
+                    100,
+                )
                 .len(),
             1
         );
         // Pagination: newest-first, skip 2, take 3.
-        let page = state.query_requests(None, None, None, 2, 3);
+        let page = state.query_requests(&RequestLogFilter::default(), 2, 3);
         assert_eq!(page.len(), 3);
         assert_eq!(page[0].path, "/api/thing/7");
+    }
+
+    #[test]
+    fn windowed_spend_validates_params_and_serves_rollups() {
+        // WOR-1875. The 400 paths are pure parameter validation and
+        // run before any store lookup.
+        let (code, _, body) = windowed_spend_response(Some("2h"), None, None, None);
+        assert_eq!(code, 400);
+        assert!(body.contains("unknown window"));
+        let (code, _, body) = windowed_spend_response(None, Some("nope"), None, None);
+        assert_eq!(code, 400);
+        assert!(body.contains("unknown group_by"));
+        let (code, _, body) = windowed_spend_response(None, None, Some(10), Some(5));
+        assert_eq!(code, 400);
+        assert!(body.contains("before"));
+
+        // Happy path against a real store. The process-global writer
+        // slot is set-once; this test owns the installed instance.
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            sbproxy_observe::usage_rollup::RollupStore::open(&dir.path().join("r.redb")).unwrap(),
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store
+            .fold(&[sbproxy_observe::usage_rollup::RollupEvent {
+                ts_secs: now - 60,
+                dims: sbproxy_observe::usage_rollup::RollupDims {
+                    provider: "openai".to_string(),
+                    model: "gpt-4o".to_string(),
+                    tenant: "t".to_string(),
+                    team: "growth".to_string(),
+                    api_key_id: "sk1".to_string(),
+                    project: "p".to_string(),
+                },
+                kind: sbproxy_observe::usage_rollup::RollupKind::Usage {
+                    tokens_in: 5,
+                    tokens_out: 2,
+                    cost_usd_micros: 42,
+                },
+            }])
+            .unwrap();
+        let writer =
+            sbproxy_observe::usage_rollup::RollupWriter::spawn(store, 90 * 86_400, 395 * 86_400);
+        sbproxy_observe::usage_rollup::install_usage_rollup_writer(writer);
+        // Keep the backing dir alive for the process-global writer.
+        std::mem::forget(dir);
+
+        let (code, _, body) = windowed_spend_response(Some("24h"), Some("model"), None, None);
+        assert_eq!(code, 200, "windowed spend must serve: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["group_by"], "model");
+        assert_eq!(v["bucket_secs"], 3600);
+        assert_eq!(v["totals"]["cost_usd_micros"], 42);
+        assert_eq!(v["totals"]["tokens_in"], 5);
+        assert_eq!(v["buckets"][0]["group"], "gpt-4o");
+    }
+
+    #[test]
+    fn query_requests_filters_on_guardrail_columns() {
+        // WOR-1874: `guardrail_action` / `guardrail_category` filter
+        // exactly, so the Guardrails view can deep-link to blocked rows.
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 400,
+            latency_ms: 3.0,
+            client_ip: "127.0.0.1".to_string(),
+            guardrail_category: Some("pii".to_string()),
+            guardrail_action: Some("block".to_string()),
+            ..Default::default()
+        });
+        state.log_request(RequestLogEntry {
+            timestamp: "t1".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 200,
+            latency_ms: 2.0,
+            client_ip: "127.0.0.1".to_string(),
+            ..Default::default()
+        });
+        let blocked = state.query_requests(
+            &RequestLogFilter {
+                guardrail_action: Some("block"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].guardrail_category.as_deref(), Some("pii"));
+        let pii = state.query_requests(
+            &RequestLogFilter {
+                guardrail_action: Some("block"),
+                guardrail_category: Some("pii"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(pii.len(), 1);
+        let none = state.query_requests(
+            &RequestLogFilter {
+                guardrail_action: Some("redact"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert!(none.is_empty());
     }
 
     #[test]
@@ -3112,6 +3443,7 @@ mod tests {
                 status: 200,
                 latency_ms: 0.0,
                 client_ip: "127.0.0.1".to_string(),
+                ..Default::default()
             });
         }
         let entries = state.get_recent_requests(2);
@@ -3199,7 +3531,6 @@ mod tests {
     #[test]
     fn spend_totals_use_attributed_tokens_when_legacy_tokens_are_empty() {
         let snap = std::collections::HashMap::from([
-            ("sbproxy_ai_tokens_total".to_string(), 0.0),
             ("sbproxy_tokens_attributed_total".to_string(), 39.0),
             ("sbproxy_ai_cost_usd_micros_total".to_string(), 195.0),
         ]);
@@ -3213,7 +3544,6 @@ mod tests {
     #[test]
     fn spend_totals_accept_ai_prefixed_attributed_metric_name() {
         let snap = std::collections::HashMap::from([
-            ("sbproxy_ai_tokens_total".to_string(), 0.0),
             ("sbproxy_ai_tokens_attributed_total".to_string(), 44.0),
             ("sbproxy_ai_cost_dollars_attributed_total".to_string(), 0.25),
         ]);
@@ -3264,6 +3594,7 @@ mod tests {
             status: 200,
             latency_ms: 0.0,
             client_ip: "127.0.0.1".to_string(),
+            ..Default::default()
         });
         let auth = basic_auth("admin", "secret");
         let (status, _, body) =
@@ -3344,6 +3675,7 @@ origins:
         let runtime = crate::server::model_host::model_runtime_manager();
         let runtime_revision_before = runtime.current_revision();
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3392,6 +3724,7 @@ origins:
     fn admin_reload_returns_400_on_yaml_parse_error() {
         let f = write_yaml("this is not: valid: yaml: at all\n  - {");
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3424,6 +3757,7 @@ origins:
         let f = write_yaml(&reload_yaml("reload-concurrency.example.com"));
         let state = std::sync::Arc::new(
             AdminState::new(AdminConfig {
+                trace_url_template: None,
                 enabled: true,
                 port: 9090,
                 username: "admin".to_string(),
@@ -3526,6 +3860,7 @@ origins:
         // has occurred). Drift cannot be determined.
         let f = write_yaml(&reload_yaml("drift-no-baseline.example.com"));
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3557,6 +3892,7 @@ origins:
         let dir = tempfile::tempdir().expect("tempdir");
         let bogus = dir.path().join("does-not-exist.yml");
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3589,6 +3925,7 @@ origins:
         // is false.
         let f = write_yaml(&reload_yaml("reload-drift-noop.example.com"));
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3639,6 +3976,7 @@ origins:
         // from the loaded revision.
         let f = write_yaml(&reload_yaml("reload-drift-edit-a.example.com"));
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -3986,6 +4324,7 @@ origins:
         b.mark_success();
         let registry = sbproxy_observe::default_registry(l, b);
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),
@@ -4012,6 +4351,7 @@ origins:
         b.mark_success();
         let registry = sbproxy_observe::default_registry(l, b);
         let state = AdminState::new(AdminConfig {
+            trace_url_template: None,
             enabled: true,
             port: 9090,
             username: "admin".to_string(),

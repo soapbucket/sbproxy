@@ -25,7 +25,7 @@
 
 use opentelemetry::logs::{AnyValue, LogRecord, Logger, LoggerProvider, Severity};
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::logs::LoggerProvider as SdkLoggerProvider;
 use opentelemetry_sdk::Resource;
 
@@ -53,6 +53,11 @@ pub struct OtlpLogSinkOptions {
     pub timeout: std::time::Duration,
     /// Free-form resource attributes from `telemetry.resource_attrs`.
     pub resource_attrs: std::collections::BTreeMap<String, String>,
+    /// Headers attached to every export request (WOR-1869). Values
+    /// must already be resolved; the binary resolves secret
+    /// references at boot and installs the set via
+    /// [`crate::telemetry::install_resolved_otlp_headers`].
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for OtlpLogSinkOptions {
@@ -63,6 +68,7 @@ impl Default for OtlpLogSinkOptions {
             service_name: "sbproxy".to_string(),
             timeout: std::time::Duration::from_secs(10),
             resource_attrs: std::collections::BTreeMap::new(),
+            headers: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -90,18 +96,32 @@ impl OtlpLogSink {
         // The 0.27 OTLP-logs builder API mirrors the trace + metric
         // builders already wired in `telemetry.rs`.
         let exporter = match options.transport {
-            OtlpTransport::Http => opentelemetry_otlp::LogExporter::builder()
-                .with_http()
-                .with_endpoint(endpoint.clone())
-                .with_timeout(timeout)
-                .build()
-                .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP log exporter: {}", e))?,
-            OtlpTransport::Grpc => opentelemetry_otlp::LogExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint.clone())
-                .with_timeout(timeout)
-                .build()
-                .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC log exporter: {}", e))?,
+            OtlpTransport::Http => {
+                let mut builder = opentelemetry_otlp::LogExporter::builder()
+                    .with_http()
+                    .with_endpoint(endpoint.clone())
+                    .with_timeout(timeout);
+                if !options.headers.is_empty() {
+                    builder = builder.with_headers(options.headers.clone().into_iter().collect());
+                }
+                builder
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP log exporter: {}", e))?
+            }
+            OtlpTransport::Grpc => {
+                let mut builder = opentelemetry_otlp::LogExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint.clone())
+                    .with_timeout(timeout);
+                if !options.headers.is_empty() {
+                    builder = builder.with_metadata(crate::telemetry::tonic_metadata_from_headers(
+                        &options.headers,
+                    ));
+                }
+                builder
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC log exporter: {}", e))?
+            }
         };
 
         // Resource: identifies this proxy instance to the collector.
@@ -247,6 +267,10 @@ pub struct MockOtlpCollector {
     pub addr: std::net::SocketAddr,
     /// Captured raw request bodies (protobuf-encoded).
     pub bodies: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    /// Captured raw header blocks (request line + headers), one per
+    /// request, so tests can assert configured auth headers arrive
+    /// (WOR-1869).
+    pub header_blocks: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -260,7 +284,10 @@ impl MockOtlpCollector {
         let addr = listener.local_addr()?;
         let bodies: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let header_blocks: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let bodies_clone = bodies.clone();
+        let header_blocks_clone = header_blocks.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = match listener.accept().await {
@@ -268,6 +295,7 @@ impl MockOtlpCollector {
                     Err(_) => return,
                 };
                 let bodies = bodies_clone.clone();
+                let header_blocks = header_blocks_clone.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = vec![0u8; 65536];
@@ -283,6 +311,11 @@ impl MockOtlpCollector {
                         .map(|p| p + 4)
                         .unwrap_or(buf.len());
                     let body = buf[split..].to_vec();
+                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                    header_blocks
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(head);
                     bodies.lock().unwrap_or_else(|e| e.into_inner()).push(body);
                     // 200 OK with an empty body so the exporter does
                     // not retry.
@@ -296,8 +329,17 @@ impl MockOtlpCollector {
         Ok(Self {
             addr,
             bodies,
+            header_blocks,
             handle,
         })
+    }
+
+    /// Snapshot of the captured request header blocks.
+    pub fn headers_snapshot(&self) -> Vec<String> {
+        self.header_blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Number of accepted requests so far.
@@ -358,6 +400,11 @@ mod tests {
             service_name: "sbproxy-test".to_string(),
             timeout: std::time::Duration::from_secs(2),
             resource_attrs: std::collections::BTreeMap::new(),
+            // WOR-1869: assert configured headers reach the collector.
+            headers: std::collections::BTreeMap::from([(
+                "authorization".to_string(),
+                "Bearer wor1869-test-token".to_string(),
+            )]),
         };
         let sink = match OtlpLogSink::new(options) {
             Ok(s) => s,
@@ -411,6 +458,15 @@ mod tests {
             snap.iter().any(|b| !b.is_empty()),
             "every captured body should be non-empty; snap lengths: {:?}",
             snap.iter().map(|b| b.len()).collect::<Vec<_>>()
+        );
+        // WOR-1869: the configured auth header must reach the
+        // collector on every export request.
+        let heads = collector.headers_snapshot();
+        assert!(
+            heads.iter().any(|h| h
+                .to_ascii_lowercase()
+                .contains("authorization: bearer wor1869-test-token")),
+            "expected authorization header on the export request; header blocks: {heads:?}"
         );
 
         reset_sink_dispatcher_for_test();
