@@ -1,5 +1,5 @@
 # Model-host capability matrix
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-12*
 
 *Generated from the executable registry; do not hand-edit.*
 
@@ -29,7 +29,7 @@ Registry version: `1`
 | `cluster.remote_dispatch` | `cluster` | `unsupported` | none | Remote inference dispatch and streaming over the private model plane land in the distributed data-plane PR. |
 | `policy.local_provider_governance` | `policy` | `preview` | none | Local providers remain behind the existing gateway policy path. |
 | `admin.model_status` | `admin` | `stable` | contract.status_reports_stable_lifecycle<br>test.models_lifecycle_cli<br>test.admin_model_host | Authenticated admin status, load, stop, drain, and reset adapt the shared runtime lifecycle. |
-| `admin.model_management` | `admin` | `unsupported` | none | Persistent desired-state mutation and model-management UI land in the operator-product PR. |
+| `admin.model_management` | `admin` | `stable` | contract.canonical_desired_state_reconciles_atomically<br>test.admin_model_management<br>test.ui_model_management | Backend E2E covers authenticated full-map revision conflicts and restart persistence; UI unit and component contracts cover mode-aware catalog evidence, lifecycle state, conflict recovery, removal guards, and cluster authority proof. |
 | `platform.apple_metal` | `platform` | `stable` | contract.catalog_v2_selects_exact_artifact<br>test.engine_drivers<br>cert.apple_metal.2026-07-11 | Apple Metal completed a real managed gateway completion, status, stop, cache-reuse, and Ctrl-C shutdown gate on Apple M4 Max. |
 | `platform.nvidia_cuda` | `platform` | `preview` | test.cuda_build<br>test.local_admission | NVIDIA discovery, vLLM, and CUDA llama.cpp have deterministic coverage; live GCP certification is reserved for the final PR group. |
 | `lifecycle.priority_admission` | `lifecycle` | `stable` | contract.priority_gate_changes_dispatch | Configured local concurrency changes request admission. |

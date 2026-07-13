@@ -1,9 +1,11 @@
 # Model host
 
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-12*
 
 SBproxy can own model processes on one worker or place them across a managed
-cluster. Desired models live under `proxy.model_host`; an AI provider with
+cluster. Model-host control lives under `proxy.model_host`. Depending on its
+authority mode, desired deployments come from that file block, the durable
+admin store, or a signed cluster bundle. An AI provider with
 `provider_type: managed_model` exposes a deployment to clients. Requests still
 pass through the normal key, policy, budget, routing, and usage planes before
 they reach a local engine.
@@ -35,14 +37,14 @@ The worker-local runtime is complete enough to operate as one coherent system:
 - File-managed clusters report deployment digest drift. Cluster-authority mode
   verifies an Ed25519-signed, content-addressed desired-state bundle before the
   same atomic runtime commit used by file reload.
+- Authenticated catalog and deployment APIs back a mode-aware admin UI. The UI
+  can replace the complete admin-managed map, publish a signed map from an
+  authority node, run lifecycle actions, and inspect cluster operations.
 
-This PR completes the cluster control plane, not the distributed inference data
-plane. A gateway can inspect placement and operate a co-located assigned
-replica, but it does not dispatch a request to a remote worker until the next
-data-plane PR. Persistent model selection and desired-state editing in the
-admin UI remain in the operator-product PR. Live NVIDIA and multi-node
-certification on GCP is deliberately reserved for the final integration PR.
-The generated
+The cluster control plane and operator product do not include the distributed
+inference data plane. A gateway can inspect placement and operate a co-located
+assigned replica, but it does not dispatch a request to a remote worker. Live
+hardware support remains governed by executable evidence. The generated
 [capability matrix](model-host-capabilities.md) records this boundary.
 
 ## Canonical configuration
@@ -161,10 +163,11 @@ Roles are independent and may be combined:
 must advertise an explicit routable IP and port so later SWIM traffic can be
 matched to the signed join.
 `transport_advertise_addr` is the mTLS typed-state address. A worker also needs
-an HTTPS `model_endpoint`; PR 3 records it for placement, while PR 4 will use it
-for remote inference. Identity, roles, labels, listeners, seeds, endpoints,
-security material, state directory, enrollment authority, and signing authority
-are restart-required fields. Snapshot cadence can reload in place.
+an HTTPS `model_endpoint`; the control plane records it for placement, but the
+current runtime does not dispatch inference to remote workers. Identity, roles,
+labels, listeners, seeds, endpoints, security material, state directory,
+enrollment authority, and signing authority are restart-required fields.
+Snapshot cadence can reload in place.
 
 Production mode requires mTLS plus a separate authenticated gossip key. Shared
 key mode must set `development: true` and is for local fixtures only. Canonical
@@ -278,13 +281,228 @@ last-good configuration return without reusing the failed identity.
 
 | Value | Behavior |
 |---|---|
-| `file_managed` | `sb.yml` is authoritative. Every node computes placement from the same desired state and reports a digest mismatch when files differ. |
-| `admin_managed` | A revision store at `store_path` is authoritative. The runtime and restart-safe store contract exist, but public desired-state CRUD and the management UI ship in a later PR. |
-| `cluster_authority` | One authority signs and publishes strict deployment bundles. Every node verifies the signer, digest, schema, monotonic revision, and expiry before applying it. Non-authority writes return `deployment_authority_read_only`. |
+| `file_managed` | `sb.yml` is authoritative. The UI displays the configured map read-only and gives the exact edit and reload instruction. Every node computes placement from the same desired state and reports a digest mismatch when files differ. |
+| `admin_managed` | The versioned store at `store_path` is authoritative. Authenticated API and UI writes replace its complete deployment map with optimistic concurrency, then the store supplies the same map after restart. |
+| `cluster_authority` | One authority signs and publishes complete restricted deployment bundles. Its UI can publish; verifier nodes display the canonical signed map read-only. Every node verifies the signer, digest, schema, catalog, monotonic revision, and expiry before applying it. |
 
-`file_managed` participates in ordinary config reload. Editing the file,
-`sbproxy apply`, the file watcher, and `POST /admin/reload` all use the same
-prepare-and-commit transaction.
+### File-managed edits
+
+The model-management UI never rewrites `sb.yml`. In `file_managed` mode it
+disables persistent Add, Edit, and Remove controls and instructs the operator to
+edit `proxy.model_host.deployments` in `sb.yml`, then reload SBproxy. Use either
+of these explicit reload paths after saving the file:
+
+```bash
+sbproxy apply -f /etc/sbproxy/sb.yml
+
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  -X POST \
+  "${SB_ADMIN_URL}/admin/reload"
+```
+
+The file watcher and SIGHUP use the same prepare-and-commit transaction.
+Lifecycle actions remain available for deployments already defined by the
+file. A failed reload leaves the prior desired map, routes, and runtimes active.
+
+### Authenticated catalog and local deployment API
+
+All model-management routes use the admin server's authentication, RBAC, and
+browser-session CSRF checks. `GET /admin/model-host/catalog` returns bounded
+operator metadata from the active catalog. It includes each logical model's
+family, parameter count, license, and context length, plus each variant's
+format, quantization, compatible engines and accelerators, minimum memory,
+download size, certification evidence, and support level.
+
+This request selects one catalog entry from the full response:
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/catalog" \
+  | jq '{schema_version, catalog_revision, model: .models["qwen2.5-0.5b-instruct"]}'
+```
+
+The built-in catalog returns:
+
+```json
+{
+  "schema_version": 1,
+  "catalog_revision": "builtin-2026-07-10",
+  "model": {
+    "params": "0.5B",
+    "license": "apache-2.0",
+    "family": "qwen",
+    "context_length": 32768,
+    "variants": [
+      {
+        "id": "q4_k_m",
+        "format": "gguf",
+        "quant": "Q4_K_M",
+        "engines": ["llama_cpp"],
+        "accelerators": ["cpu", "metal", "cuda"],
+        "min_memory_bytes": 1073741824,
+        "download_size_bytes": 491400032,
+        "certification": "bootstrap-metadata-2026-07-10",
+        "stability": "preview"
+      }
+    ]
+  }
+}
+```
+
+`GET /admin/model-host/deployments` returns the complete map visible to the
+local process together with its authority and write boundary:
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/deployments" \
+  | jq '{schema_version, authority, read_only, revision, deployments}'
+```
+
+An empty admin-managed store starts with this response:
+
+```json
+{
+  "schema_version": 1,
+  "authority": "admin_managed",
+  "read_only": false,
+  "revision": null,
+  "deployments": {}
+}
+```
+
+The unfiltered response also has `content_digest`. Both `revision` and
+`content_digest` are `null` until the first admin-managed revision is stored.
+File-managed and cluster-authority responses set `read_only: true` and do not
+expose a local durable revision through this endpoint.
+
+`PUT /admin/model-host/deployments` is available only in `admin_managed` mode.
+Its `deployments` object is a complete replacement map, not a patch. Omitting an
+existing ID removes it; renaming sends the new ID and omits the old ID. Read the
+current document immediately before a write. Send `expected_revision: null`
+only when the returned revision is `null`; otherwise send the exact unsigned
+integer returned by GET.
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" \
+  -X PUT \
+  -H 'content-type: application/json' \
+  -d '{
+    "expected_revision": null,
+    "deployments": {
+      "local-qwen": {
+        "model": "qwen2.5-0.5b-instruct",
+        "variant": "q4_k_m",
+        "heterogeneous_variants": false,
+        "replicas": 1,
+        "required_labels": {},
+        "spread_by": [],
+        "pull": "on_demand",
+        "warm": false,
+        "keep_alive_secs": 1800,
+        "max_concurrency": 4,
+        "max_queue_depth": 32,
+        "queue_timeout_ms": 30000,
+        "engine": "llama_cpp",
+        "rollout": "rolling"
+      }
+    }
+  }' \
+  "${SB_ADMIN_URL}/admin/model-host/deployments" \
+  | jq '{schema_version, revision, plan}'
+```
+
+The first successful replacement returns:
+
+```json
+{
+  "schema_version": 1,
+  "revision": 1,
+  "plan": {
+    "added": ["local-qwen"],
+    "changed": [],
+    "removed": [],
+    "preserved": []
+  }
+}
+```
+
+`200` means the new desired and runtime snapshot was published. Cleanup of an
+old generation still uses a bounded drain after publication. A drain timeout or
+retirement failure is not included in this PUT response, so inspect runtime
+status and logs when a replacement or removal retires a running generation.
+
+The unfiltered response also returns the 64-character SHA-256
+`content_digest`. The server validates the strict body, complete desired-state
+semantics, and catalog references first. Under one commit lock it then checks
+the durable expected revision, assigns the next revision, and prepares the
+complete runtime candidate before the durable compare-and-swap. A preparation
+failure writes nothing. If another process advances the store during
+preparation, the final compare-and-swap fails and the server tears down the
+staged work. After a successful compare-and-swap, the server activates the
+prepared revision in the live runtime. If that final activation fails, the
+durable revision remains advanced while the last-good runtime stays active.
+Read the deployment document and runtime status before retrying. The persisted
+revision is loaded from `store_path` on restart.
+
+The deployment API owns only `proxy.model_host` desired state. Provider routes
+under `origins[].action.providers` remain configuration-owned and are never
+added, renamed, or removed by an API or UI mutation. Configure a
+`provider_type: managed_model` route to the deployment ID before exposing it to
+clients. Add the desired deployment before adding its provider route. Remove or
+retarget every provider route before removing or renaming its deployment;
+otherwise PUT returns `400 invalid_desired`. The model-management API never
+rewrites `sb.yml`.
+
+Stable mutation failures use these status and code pairs:
+
+| Status | Code | Meaning |
+|---|---|---|
+| `403` | `authority_read_only` | Local deployment replacement is disabled for the current authority. |
+| `409` | `revision_conflict` | `expected_revision` differs from durable state. The response includes `expected_revision` and `actual_revision` when present. |
+| `422` | A bounded preparation, admission, or compatibility reason such as `prepare_failed`, `insufficient_capacity`, `engine_incompatible`, or `artifact_not_ready` | The candidate could not be prepared or activated safely. The last-good runtime remains active. Read the deployment document because the durable revision can advance when final activation fails after the compare-and-swap. |
+| `502` | A bounded infrastructure or runtime reason such as `prepare_infrastructure_failed`, `store_failed`, or an engine failure code | Storage, artifact transport, provisioning, or runtime infrastructure failed. The last-good runtime remains active, but the durable revision can already be advanced after the compare-and-swap. |
+
+Malformed bodies, unknown fields, duplicate map keys, invalid desired state,
+and unknown catalog models or variants return `400` with a stable code such as
+`invalid_body`, `invalid_desired`, `unknown_catalog_model`, or
+`unknown_catalog_variant`.
+
+Every authenticated mutation emits an audit record with `operator`, `role`,
+`method`, and `path`. A successful local replacement also emits
+`action=model_deployments_replace`, `source_mode=admin_managed`,
+`prior_revision`, `next_revision`, `content_digest`, and `deployment_count` on
+the `sbproxy::admin::audit` target.
+
+### Model-management UI
+
+The Model host page joins catalog, desired-state, runtime, metrics, and cluster
+authority responses without treating one stale response as current proof. Its
+catalog browser keeps stable and preview variants available when they name at
+least one engine and accelerator. Config-only, unsupported, and incomplete
+variants remain visible as evidence but cannot be selected. The evidence panel
+shows family, parameters, license, context, exact variant, format, quantization,
+minimum memory, download size, engines, accelerators, certification, and
+support level. An unavailable exact pin is shown as unavailable; the UI does
+not substitute evidence from a different variant.
+
+Creating a deployment or changing its logical model requires explicit license
+acknowledgement. The form covers deployment ID, logical model, automatic or
+exact variant selection, heterogeneous variants, replicas, required labels,
+spread keys, pull policy, warm behavior, engine, rollout policy, keep-alive,
+maximum concurrency, queue depth, and queue timeout. Add, edit, rename, and
+remove operations always build one complete replacement map.
+
+Removal requires a fresh lifecycle response. A deployment in `ready`,
+`preparing`, or `draining` state must be stopped first. If a write returns
+`409`, the UI preserves the form and attempted complete map, displays the raw
+response, reloads the current authority state, and shows an add/change/remove
+comparison. Retry stays disabled unless the refreshed catalog, authority,
+revision, digest, signer, and desired-map proof are coherent. Edit and rename
+retries also verify that the original deployment baseline has not changed and
+that the target ID did not appear. Removal retries fetch fresh lifecycle state
+again before sending another write.
+
+### Cluster-authority publication
 
 Cluster-authority bundles contain only the catalog revision, numbered desired
 revision, deployments, and placement rules. Unknown fields and duplicate
@@ -334,9 +552,26 @@ curl -u "admin:${SB_ADMIN_PASSWORD}" \
 
 The authority returns `202` with the revision, content digest, signer node, and
 signer key. `GET /admin/cluster/deployments` returns the locally active verified
-bundle. A revision lower than the durable cursor is rejected after restart;
-equal revision with different content returns `revision_conflict`. The active
-bundle is republished before its bounded seven-day state lifetime expires.
+bundle and whether this node can publish. A node without the signing key
+returns `403 deployment_authority_read_only` for POST and displays the verified
+map read-only in the UI.
+
+The UI publishes from the signed bundle's complete deployment map, never from a
+worker-local projection. It accepts that map as canonical only when fresh
+cluster status and bundle responses agree on the authority revision, content
+digest, signer node, signer key, and active catalog revision. With no active
+bundle, a fresh `404 deployment_bundle_missing` plus a fresh authority status
+whose active revision is `null` proves an empty canonical map; the first
+publication uses revision `1`.
+
+The UI uses exactly the next revision. The backend also accepts any higher
+positive revision and treats the same revision with the same digest as an
+idempotent publication. A lower revision returns `409 stale_revision`; an equal
+revision with different content returns `409 revision_conflict`. The UI handles
+either conflict with the same preserved draft and coherent-proof reload used
+for local admin conflicts. A revision lower than the durable cursor is also
+rejected after restart. The active bundle is republished before its bounded
+seven-day state lifetime expires.
 
 ## Deployment fields
 
@@ -556,15 +791,22 @@ in cache for a later restart.
 The equivalent authenticated routes are:
 
 ```text
+GET  /admin/model-host/catalog
+GET  /admin/model-host/deployments
+PUT  /admin/model-host/deployments
 GET  /admin/model-host/status
 POST /admin/model-host/load
 POST /admin/model-host/stop
 POST /admin/model-host/drain
+POST /admin/model-host/evict
 POST /admin/model-host/reset
 ```
 
-Load, stop, drain, and reset accept `{"deployment":"local-qwen"}`. The legacy
-`model` request field remains an input alias during the compatibility window.
+Load, stop, drain, evict, and reset accept
+`{"deployment":"local-qwen"}`. Stop and drain perform the same bounded drain
+and shutdown; evict is their compatibility alias. The legacy `model` request
+field remains an input alias during the compatibility window. The Model host UI
+exposes Load, Stop, and Reset against these shared lifecycle actions.
 
 Cluster operators use the same admin credentials:
 
@@ -593,10 +835,18 @@ rollout phase and deadline, and signed-authority state. Suspect, dead,
 unreachable, stale, incompatible, and explicitly unhealthy workers remain
 visible but receive no new assignments.
 
-The built-in model-management UI consumes this contract in the operator-product
-PR. That view will show the node table and unhealthy callouts alongside model
-selection and deployment mutation. PR 3 deliberately ships the authenticated
-backend and CLI first; it does not claim that persistent UI mutation is ready.
+The Cluster page renders every node in a health rail and keeps unhealthy nodes
+in two places: prominent alert cards for immediate action and the complete
+roster for full membership context. The rail links each node to its roster row.
+A failed status refresh leaves the last loaded snapshot visible under a stale
+warning, while a stale model directory receives its own control-plane warning.
+
+Deployment rollout rows show desired, placed, and unplaced replicas; generation
+and phase; target readiness and timeout; handoff deadline; exact assignments;
+retained and draining generations; and bounded placement rejection reasons.
+Fleet metrics are secondary telemetry fetched independently from cluster status.
+A missing, loading, or failed metrics response does not hide the primary health,
+roster, alert, or rollout state.
 
 Useful metrics include `sbproxy_model_host_active_requests`,
 `sbproxy_model_host_queued_requests`, `sbproxy_model_host_deployment_state`,

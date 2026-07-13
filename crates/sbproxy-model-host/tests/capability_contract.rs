@@ -57,6 +57,7 @@ fn model_host_capabilities_match_the_cluster_control_plane_boundary() {
         "lifecycle.model_cli",
         "cluster.managed_replicas",
         "admin.model_status",
+        "admin.model_management",
         "platform.apple_metal",
     ] {
         assert_eq!(status(id), SupportLevel::Stable, "{id}");
@@ -68,7 +69,7 @@ fn model_host_capabilities_match_the_cluster_control_plane_boundary() {
     ] {
         assert_eq!(status(id), SupportLevel::Preview, "{id}");
     }
-    for id in ["cluster.remote_dispatch", "admin.model_management"] {
+    for id in ["cluster.remote_dispatch"] {
         assert_eq!(status(id), SupportLevel::Unsupported, "{id}");
     }
 }
@@ -181,7 +182,7 @@ fn markdown_is_deterministic_and_exposes_all_support_levels() {
     let second = capability_registry().render_markdown();
 
     assert_eq!(first, second);
-    assert!(first.starts_with("# Model-host capability matrix\n*Last modified: 2026-07-11*\n"));
+    assert!(first.starts_with("# Model-host capability matrix\n*Last modified: 2026-07-12*\n"));
     assert!(first.contains("Registry version: `1`"));
     for status in ["stable", "preview", "config_only", "unsupported"] {
         assert!(first.contains(&format!("`{status}`")), "missing {status}");

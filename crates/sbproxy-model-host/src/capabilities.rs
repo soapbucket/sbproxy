@@ -893,7 +893,7 @@ impl CapabilityRegistry {
     /// Render the deterministic checked-in Markdown capability matrix.
     pub fn render_markdown(&self) -> String {
         let mut output = String::from(
-            "# Model-host capability matrix\n*Last modified: 2026-07-11*\n\n*Generated from the executable registry; do not hand-edit.*\n\n",
+            "# Model-host capability matrix\n*Last modified: 2026-07-12*\n\n*Generated from the executable registry; do not hand-edit.*\n\n",
         );
         output.push_str(&format!("Registry version: `{}`\n\n", self.version));
         output.push_str("## Product capabilities\n\n");
@@ -1228,10 +1228,14 @@ const CAPABILITIES: &[CapabilityEntry] = &[
     CapabilityEntry {
         id: "admin.model_management",
         domain: CapabilityDomain::Admin,
-        status: SupportLevel::Unsupported,
-        summary: "Persistent desired-state mutation and model-management UI land in the operator-product PR.",
-        evidence: &[],
-        consumer: None,
+        status: SupportLevel::Stable,
+        summary: "Backend E2E covers authenticated full-map revision conflicts and restart persistence; UI unit and component contracts cover mode-aware catalog evidence, lifecycle state, conflict recovery, removal guards, and cluster authority proof.",
+        evidence: &[
+            "contract.canonical_desired_state_reconciles_atomically",
+            "test.admin_model_management",
+            "test.ui_model_management",
+        ],
+        consumer: Some(ConsumerContract::CanonicalDesiredStateReconcilesAtomically),
     },
     CapabilityEntry {
         id: "platform.apple_metal",
