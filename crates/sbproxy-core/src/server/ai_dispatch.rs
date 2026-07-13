@@ -4025,6 +4025,11 @@ pub(super) async fn relay_ai_response_with_cache(
     // reaches the semantic cache even though it is written above
     // in the order-of-operations sense.
     let resp_body = restore_reversible_pii(&resp_body, &reversible_pairs);
+    if (200..300).contains(&status) {
+        // WOR-1877: tool-call span events. Names + ids always
+        // (bounded); arguments only under the trace_content gate.
+        record_ai_tool_call_events(&ai_span, &resp_body, &trace_content);
+    }
     if (200..300).contains(&status) && trace_content.enabled() {
         let completion = extract_completion_text(&resp_body);
         record_ai_output_trace(&ai_span, trace_content, &completion);

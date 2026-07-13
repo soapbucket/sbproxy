@@ -473,6 +473,96 @@ pub(super) fn record_ai_output_trace(
     });
 }
 
+/// WOR-1877: maximum tool-call events emitted per completion, so a
+/// pathological completion cannot flood the span.
+const AI_TOOL_CALL_EVENTS_MAX: usize = 16;
+
+/// Extract the tool calls a completion carries: OpenAI-style
+/// `choices[].message.tool_calls[]` and Anthropic-style `content[]`
+/// blocks with `type == "tool_use"`. Returns `(id, name, arguments)`
+/// tuples with arguments as the raw provider text.
+fn extract_tool_calls(value: &serde_json::Value) -> Vec<(String, String, String)> {
+    let mut calls = Vec::new();
+    if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(tool_calls) = choice
+                .get("message")
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|v| v.as_array())
+            {
+                for call in tool_calls {
+                    let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let args = call
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        calls.push((id.to_string(), name.to_string(), args));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(content) = value.get("content").and_then(|v| v.as_array()) {
+        for block in content {
+            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let args = block
+                    .get("input")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    calls.push((id.to_string(), name.to_string(), args));
+                }
+            }
+        }
+    }
+    calls.truncate(AI_TOOL_CALL_EVENTS_MAX);
+    calls
+}
+
+/// WOR-1877: emit tool-call span events on the AI request span when a
+/// completion carries tool calls. Names and ids are always emitted
+/// (both are bounded); arguments ride along only when the origin
+/// enabled `trace_content`, redacted and truncated like the rest of
+/// the traced content.
+pub(super) fn record_ai_tool_call_events(
+    span: &tracing::Span,
+    body: &[u8],
+    args: &AiTraceContentArgs<'_>,
+) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+    let calls = extract_tool_calls(&value);
+    if calls.is_empty() {
+        return;
+    }
+    span.in_scope(|| {
+        for (index, (id, name, arguments)) in calls.iter().enumerate() {
+            let redacted = if args.enabled && !arguments.trim().is_empty() {
+                Some(redact_ai_trace_content(arguments, args.pii_redactor))
+            } else {
+                None
+            };
+            sbproxy_observe::trace_ctx::events::ai_tool_call_event(
+                index,
+                id,
+                name,
+                redacted.as_deref(),
+            );
+        }
+    });
+}
+
 fn truncate_ai_trace_content(input: &str) -> String {
     truncate_utf8_with_marker(input, AI_TRACE_CONTENT_MAX_BYTES)
 }
@@ -2617,5 +2707,52 @@ mod budget_window_tests {
         assert_ne!(keys[0].1, later[0].1);
         // ...while the cumulative key never rolls.
         assert_eq!(keys[2].1, later[2].1);
+    }
+
+    /// WOR-1877: tool calls extract from both hub shapes, and the
+    /// per-completion event count is bounded.
+    #[test]
+    fn extract_tool_calls_handles_openai_and_anthropic_shapes() {
+        use super::{extract_tool_calls, AI_TOOL_CALL_EVENTS_MAX};
+        let openai = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [
+                        {"id": "call_1", "function": {"name": "search", "arguments": "{\"q\":\"x\"}"}},
+                        {"id": "call_2", "function": {"name": "fetch", "arguments": "{}"}}
+                    ]
+                }
+            }]
+        });
+        let calls = extract_tool_calls(&openai);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "call_1");
+        assert_eq!(calls[0].1, "search");
+        assert_eq!(calls[0].2, "{\"q\":\"x\"}");
+
+        let anthropic = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "thinking"},
+                {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "SF"}}
+            ]
+        });
+        let calls = extract_tool_calls(&anthropic);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "get_weather");
+        assert!(calls[0].2.contains("SF"));
+
+        // No tool calls -> empty; plain completions emit nothing.
+        let plain = serde_json::json!({"choices": [{"message": {"content": "hi"}}]});
+        assert!(extract_tool_calls(&plain).is_empty());
+
+        // Bounded: a flood of calls truncates at the cap.
+        let mut many = Vec::new();
+        for i in 0..40 {
+            many.push(serde_json::json!(
+                {"id": format!("c{i}"), "function": {"name": "t", "arguments": ""}}
+            ));
+        }
+        let flood = serde_json::json!({"choices": [{"message": {"tool_calls": many}}]});
+        assert_eq!(extract_tool_calls(&flood).len(), AI_TOOL_CALL_EVENTS_MAX);
     }
 }

@@ -692,6 +692,27 @@ redactor and the origin PII redactor when configured, capped at 8 KiB per
 captured value, and truncated with `...[truncated]`; streaming completions are
 assembled from forwarded chunks before export.
 
+When a completion carries tool calls, the `ai.request` span additionally
+emits one `gen_ai.tool.message` span event per call with the tool-call id
+and name (both bounded; at most 16 events per completion). Call arguments
+join the event only under the same `trace_content` gate and redaction as
+the message content.
+
+### MCP execute_tool spans
+
+The gateway terminates both the LLM traffic and the MCP tool traffic, so it
+can emit the trace most gateways cannot: the agent request, its tool
+dispatches, and the LLM calls in one tree with cost on every hop. Every MCP
+`tools/call` dispatch runs inside an `mcp.execute_tool` span following the
+OpenTelemetry GenAI agent conventions: `gen_ai.operation.name = execute_tool`
+and `gen_ai.tool.name` carry the dispatch, and W3C propagation parents the
+span under the caller's trace. Where the in-development MCP conventions do
+not yet name an attribute, the `sbproxy.mcp.*` namespace holds the slot
+(`sbproxy.mcp.server`, `sbproxy.mcp.outcome`, `sbproxy.mcp.cost_usd`) so a
+later rename is mechanical; a failed dispatch also stamps `error.type`.
+Tool arguments never become span attributes (unbounded); tool names are
+bounded by the tool registry.
+
 #### Verified backend matrix
 
 OTLP is vendor-agnostic. Use an OpenTelemetry Collector as the default ingress when you want fan-out, retries, memory limits, or per-signal routing. Direct export works for any single backend, including API-key backends: the telemetry block exposes endpoint, transport, service name, resource attributes, sampling, metric-export toggles, and a `headers:` map applied to every OTLP export request (traces, metrics, and any OTLP log sink). Header values accept secret references (`${VAR}`, `file:`, `vault://`, `secret://`, ...); they resolve at boot and the proxy refuses to start when one cannot be resolved, so a raw reference never reaches the collector, and literal header values are masked in config printouts.

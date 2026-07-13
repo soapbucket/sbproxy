@@ -57,6 +57,33 @@ pub fn ai_input_message_event(index: usize, role: &str, content: &str) {
     );
 }
 
+/// Emit one tool-call span event on the current span (WOR-1877).
+///
+/// Fired for every tool call a completion carries. `id` and `name`
+/// are bounded (ids are provider-minted, names come from the tool
+/// registry) and always present; `arguments` MUST be `None` unless the
+/// origin enabled `trace_content`, and callers redact + truncate it
+/// before passing.
+pub fn ai_tool_call_event(index: usize, id: &str, name: &str, arguments: Option<&str>) {
+    match arguments {
+        Some(args) => tracing::info!(
+            event = "ai_tool_call",
+            "gen_ai.event.name" = "gen_ai.tool.message",
+            "gen_ai.tool.call.id" = id,
+            "gen_ai.tool.name" = name,
+            "gen_ai.tool.call.arguments" = args,
+            "llm.output_messages.index" = index,
+        ),
+        None => tracing::info!(
+            event = "ai_tool_call",
+            "gen_ai.event.name" = "gen_ai.tool.message",
+            "gen_ai.tool.call.id" = id,
+            "gen_ai.tool.name" = name,
+            "llm.output_messages.index" = index,
+        ),
+    }
+}
+
 /// Emit a redacted AI output message event on the current span.
 ///
 /// The event carries both OpenTelemetry GenAI-style message attributes

@@ -140,6 +140,33 @@ pub async fn assert_complete_ai_span_exports(
     assert_attr(&attrs, "sbproxy.ai.cost_usd_micros", "12");
     assert_attr(&attrs, "input.value", "hello from WOR-1217");
     assert_attr(&attrs, "output.value", "collector received the span");
+
+    // WOR-1877: the MCP execute_tool span arrives with the pinned
+    // agent vocabulary and parents under the ai.request span, so the
+    // agent request and its tool dispatch render as one trace.
+    let tool_attrs = find_span_attrs(&collector.received, "mcp.execute_tool")
+        .unwrap_or_else(|| {
+            let names = observed_span_names(&collector.received);
+            panic!("mcp.execute_tool span did not arrive over {transport:?}; saw names {names:?}");
+        });
+    assert_attr(&tool_attrs, "gen_ai.operation.name", "execute_tool");
+    assert_attr(&tool_attrs, "gen_ai.tool.name", "search_docs");
+    assert_attr(&tool_attrs, "sbproxy.mcp.server", "docs-server");
+    assert_attr(&tool_attrs, "sbproxy.mcp.outcome", "ok");
+    assert_attr(&tool_attrs, "sbproxy.mcp.cost_usd", "0.002");
+
+    let (ai_trace, ai_span_id, _) =
+        find_span_ids(&collector.received, "ai.request").expect("ai.request span ids");
+    let (tool_trace, _, tool_parent) =
+        find_span_ids(&collector.received, "mcp.execute_tool").expect("tool span ids");
+    assert_eq!(
+        ai_trace, tool_trace,
+        "execute_tool must share the ai.request trace"
+    );
+    assert_eq!(
+        tool_parent, ai_span_id,
+        "execute_tool must parent under the ai.request span"
+    );
 }
 
 fn emit_complete_ai_request_span() {
@@ -161,6 +188,13 @@ fn emit_complete_ai_request_span() {
     sbproxy_ai::tracing_spans::record_finish_reasons(&span, &["stop"]);
     sbproxy_ai::tracing_spans::record_input_content(&span, "hello from WOR-1217");
     sbproxy_ai::tracing_spans::record_output_content(&span, "collector received the span");
+    // WOR-1877: a tool dispatch made in service of this request; the
+    // span parents under ai.request because that span is entered.
+    let tool_span = sbproxy_ai::tracing_spans::execute_tool_span("search_docs", "docs-server");
+    {
+        let _tool_entered = tool_span.clone().entered();
+        sbproxy_ai::tracing_spans::record_tool_outcome(&tool_span, "ok", Some(0.002));
+    }
 }
 
 async fn wait_for_span_attrs(
@@ -196,6 +230,27 @@ fn find_span_attrs(received: &Received, span_name: &str) -> Option<HashMap<Strin
                                 })
                                 .collect(),
                         );
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// WOR-1877: fetch `(trace_id, span_id, parent_span_id)` for the first
+/// span with `span_name`, for parentage assertions across spans.
+fn find_span_ids(received: &Received, span_name: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    for req in received.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for rs in &req.resource_spans {
+            for ss in &rs.scope_spans {
+                for span in &ss.spans {
+                    if span.name == span_name {
+                        return Some((
+                            span.trace_id.clone(),
+                            span.span_id.clone(),
+                            span.parent_span_id.clone(),
+                        ));
                     }
                 }
             }
