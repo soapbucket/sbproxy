@@ -543,10 +543,6 @@ impl ProductionModelRuntime {
         if authority != sbproxy_config::ModelHostAuthority::AdminManaged {
             return Err(AdminDeploymentRevisionError::AuthorityReadOnly { authority });
         }
-        let current_epoch = self.epoch.load(Ordering::SeqCst);
-        let next_epoch = current_epoch
-            .checked_add(1)
-            .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
         let store_path = template.control.store_path.clone().ok_or_else(|| {
             sbproxy_model_host::RuntimeManagerError::InvalidDesired(
                 "admin-managed model host requires a deployment store path".to_string(),
@@ -554,15 +550,21 @@ impl ProductionModelRuntime {
         })?;
         let store = sbproxy_model_host::FileDeploymentRevisionStore::open(store_path)
             .map_err(map_admin_store_error)?;
-        let _current = store.load().map_err(map_admin_store_error)?;
-        let next_revision = expected_revision
-            .unwrap_or(0)
+        let current = store.load().map_err(map_admin_store_error)?;
+        let actual_revision = current.as_ref().map(|revision| revision.revision);
+        if expected_revision != actual_revision {
+            return Err(AdminDeploymentRevisionError::RevisionConflict {
+                expected: expected_revision,
+                actual: actual_revision,
+            });
+        }
+        let current_epoch = self.epoch.load(Ordering::SeqCst);
+        let next_epoch = current_epoch
             .checked_add(1)
-            .ok_or_else(|| {
-                AdminDeploymentRevisionError::Store(
-                    "deployment revision counter overflow".to_string(),
-                )
-            })?;
+            .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
+        let next_revision = actual_revision.unwrap_or(0).checked_add(1).ok_or_else(|| {
+            AdminDeploymentRevisionError::Store("deployment revision counter overflow".to_string())
+        })?;
         let draft = sbproxy_model_host::DeploymentRevisionDraft {
             source_mode: sbproxy_model_host::DeploymentSourceMode::AdminManaged,
             source_revision: "admin-api".to_string(),
@@ -2144,7 +2146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_revision_mutation_maps_conflict_and_aborts_prepared_slots() {
+    async fn admin_revision_mutation_maps_known_conflict_before_preparing() {
         let directory = tempfile::tempdir().unwrap();
         let store_path = directory.path().join("deployments.json");
         let store = sbproxy_model_host::FileDeploymentRevisionStore::open(&store_path).unwrap();
@@ -2188,11 +2190,46 @@ mod tests {
             .current_desired()
             .deployments
             .contains_key("existing"));
-        assert_eq!(preparer.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(preparer.stops.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn admin_revision_uses_the_expected_cursor_when_the_store_catches_up_during_prepare() {
+    async fn admin_revision_max_stale_cursor_returns_conflict_before_increment() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("deployments.json");
+        let store = sbproxy_model_host::FileDeploymentRevisionStore::open(&store_path).unwrap();
+        store
+            .compare_and_swap(
+                None,
+                sbproxy_model_host::DeploymentRevisionDraft {
+                    source_mode: sbproxy_model_host::DeploymentSourceMode::AdminManaged,
+                    source_revision: "existing-admin-revision".to_string(),
+                    catalog_revision: Catalog::builtin().catalog_revision,
+                    deployments: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let preparer = Arc::new(ClusterFixturePreparer::default());
+        let runtime = admin_fixture_runtime(&store_path, preparer.clone()).await;
+
+        let error = runtime
+            .apply_admin_deployment_revision(u64::MAX.into(), BTreeMap::new())
+            .await
+            .expect_err("stale maximum cursor conflicts with durable revision");
+
+        assert_eq!(
+            error,
+            AdminDeploymentRevisionError::RevisionConflict {
+                expected: Some(u64::MAX),
+                actual: Some(1),
+            }
+        );
+        assert_eq!(preparer.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(store.load().unwrap().expect("durable revision").revision, 1);
+    }
+
+    #[tokio::test]
+    async fn admin_revision_keeps_durable_cas_safety_when_store_advances_during_prepare() {
         let directory = tempfile::tempdir().unwrap();
         let store_path = directory.path().join("deployments.json");
         let store = sbproxy_model_host::FileDeploymentRevisionStore::open(&store_path).unwrap();
@@ -2219,7 +2256,7 @@ mod tests {
             async move {
                 runtime
                     .apply_admin_deployment_revision(
-                        Some(2),
+                        Some(1),
                         BTreeMap::from([("replacement".to_string(), admin_fixture_deployment())]),
                     )
                     .await
@@ -2239,25 +2276,30 @@ mod tests {
                     )]),
                 },
             )
-            .expect("concurrent writer advances the store to the expected cursor");
+            .expect("concurrent writer advances the store past the expected cursor");
         preparer.block_prepare.store(false, Ordering::SeqCst);
         preparer.prepare_release.notify_one();
 
-        let result = apply
+        let error = apply
             .await
             .expect("apply task")
-            .expect("prepared cursor successor commits exactly");
+            .expect_err("durable compare-and-swap rejects the prepared stale cursor");
 
-        let durable = store.load().unwrap().expect("durable replacement");
-        assert_eq!(result.revision, 3);
-        assert_eq!(result.content_digest, durable.content_digest);
-        assert!(durable.deployments.contains_key("replacement"));
+        assert_eq!(
+            error,
+            AdminDeploymentRevisionError::RevisionConflict {
+                expected: Some(1),
+                actual: Some(2),
+            }
+        );
+        let durable = store.load().unwrap().expect("concurrent durable revision");
+        assert_eq!(durable.revision, 2);
+        assert!(durable.deployments.contains_key("concurrent"));
         assert!(runtime
             .current_desired()
             .deployments
-            .contains_key("replacement"));
-        assert_eq!(result.plan.added, vec!["replacement"]);
-        assert_eq!(result.plan.removed, vec!["existing"]);
+            .contains_key("existing"));
+        assert_eq!(preparer.stops.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

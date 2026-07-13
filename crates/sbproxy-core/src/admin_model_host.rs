@@ -107,42 +107,44 @@ struct DeploymentsResponse {
 #[serde(deny_unknown_fields)]
 struct DeploymentPutRequest {
     expected_revision: serde_json::Value,
-    #[serde(deserialize_with = "deserialize_unique_deployments")]
+    #[serde(deserialize_with = "deserialize_unique_btree_map")]
     deployments: BTreeMap<String, StrictModelDeployment>,
 }
 
-fn deserialize_unique_deployments<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, StrictModelDeployment>, D::Error>
+fn deserialize_unique_btree_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    K: serde::Deserialize<'de> + Ord,
+    V: serde::Deserialize<'de>,
 {
-    struct UniqueDeployments;
+    struct UniqueMap<K, V>(std::marker::PhantomData<(K, V)>);
 
-    impl<'de> serde::de::Visitor<'de> for UniqueDeployments {
-        type Value = BTreeMap<String, StrictModelDeployment>;
+    impl<'de, K, V> serde::de::Visitor<'de> for UniqueMap<K, V>
+    where
+        K: serde::Deserialize<'de> + Ord,
+        V: serde::Deserialize<'de>,
+    {
+        type Value = BTreeMap<K, V>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a map with unique deployment IDs")
+            formatter.write_str("a map with unique keys")
         }
 
         fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
         where
             A: serde::de::MapAccess<'de>,
         {
-            let mut deployments = BTreeMap::new();
-            while let Some((id, deployment)) = map.next_entry::<String, StrictModelDeployment>()? {
-                if deployments.insert(id.clone(), deployment).is_some() {
-                    return Err(serde::de::Error::custom(format!(
-                        "duplicate deployment ID {id:?}"
-                    )));
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<K, V>()? {
+                if values.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate map key"));
                 }
             }
-            Ok(deployments)
+            Ok(values)
         }
     }
 
-    deserializer.deserialize_map(UniqueDeployments)
+    deserializer.deserialize_map(UniqueMap(std::marker::PhantomData))
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,7 +157,7 @@ struct StrictModelDeployment {
     heterogeneous_variants: bool,
     #[serde(default = "one_replica")]
     replicas: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_btree_map")]
     required_labels: BTreeMap<String, String>,
     #[serde(default)]
     spread_by: Vec<String>,
@@ -479,6 +481,13 @@ fn admin_revision_error_response(error: AdminDeploymentRevisionError) -> Resp {
                 "deployment candidate is not compatible with the configured model host",
             )
         }
+        AdminDeploymentRevisionError::Runtime(
+            error @ sbproxy_model_host::RuntimeManagerError::PrepareInfrastructure(_),
+        ) => error_response(
+            502,
+            error.reason_code(),
+            "model runtime preparation infrastructure failed",
+        ),
         AdminDeploymentRevisionError::Store(_)
         | AdminDeploymentRevisionError::Runtime(sbproxy_model_host::RuntimeManagerError::Store(
             _,
@@ -1017,6 +1026,7 @@ mod tests {
             r#"{"expected_revision":null,"deployments":{},"extra":true}"#,
             r#"{"expected_revision":null,"deployments":{"local-qwen":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m","mystery":true}}}"#,
             r#"{"expected_revision":null,"deployments":{"duplicate":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m"},"duplicate":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m"}}}"#,
+            r#"{"expected_revision":null,"deployments":{"local-qwen":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m","required_labels":{"pool":"cpu","pool":"gpu"}}}}"#,
         ] {
             let runtime = fake_runtime(
                 sbproxy_config::ModelHostAuthority::AdminManaged,
@@ -1126,6 +1136,36 @@ mod tests {
         assert_eq!(response["code"], "revision_conflict");
         assert_eq!(response["expected_revision"], 6);
         assert_eq!(response["actual_revision"], 7);
+    }
+
+    #[test]
+    fn candidate_preparation_failure_maps_to_unprocessable_entity() {
+        let (status, _, body) =
+            admin_revision_error_response(AdminDeploymentRevisionError::Runtime(
+                sbproxy_model_host::RuntimeManagerError::Prepare(
+                    "candidate capability mismatch".to_string(),
+                ),
+            ));
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error response");
+
+        assert_eq!(status, 422);
+        assert_eq!(response["code"], "prepare_failed");
+        assert!(!body.contains("candidate capability mismatch"));
+    }
+
+    #[test]
+    fn infrastructure_preparation_failure_maps_to_bad_gateway() {
+        let (status, _, body) =
+            admin_revision_error_response(AdminDeploymentRevisionError::Runtime(
+                sbproxy_model_host::RuntimeManagerError::PrepareInfrastructure(
+                    "cache lease path must remain private".to_string(),
+                ),
+            ));
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error response");
+
+        assert_eq!(status, 502);
+        assert_eq!(response["code"], "prepare_infrastructure_failed");
+        assert!(!body.contains("cache lease path must remain private"));
     }
 
     #[test]

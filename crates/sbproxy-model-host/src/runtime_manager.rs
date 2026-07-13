@@ -36,6 +36,9 @@ pub enum RuntimeManagerError {
     /// Static deployment preparation failed.
     #[error("prepare deployment: {0}")]
     Prepare(String),
+    /// Host infrastructure failed while preparing a deployment.
+    #[error("prepare deployment infrastructure: {0}")]
+    PrepareInfrastructure(String),
     /// Managed engine lifecycle failed.
     #[error(transparent)]
     Engine(#[from] EngineDriverError),
@@ -1456,7 +1459,7 @@ impl ModelRuntimeManager {
                     let desired = request.desired.clone();
                     let preparation_identity = PreparationIdentity::from_request(&request);
                     let permit = limiter.clone().acquire_owned().await.map_err(|_| {
-                        RuntimeManagerError::Prepare(
+                        RuntimeManagerError::PrepareInfrastructure(
                             "model preparation limiter is closed".to_string(),
                         )
                     })?;
@@ -2678,7 +2681,7 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             )
             .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
         let driver = self.drivers.get(&resolved.engine).cloned().ok_or_else(|| {
-            RuntimeManagerError::Prepare(format!(
+            RuntimeManagerError::PrepareInfrastructure(format!(
                 "no managed {:?} driver is registered for deployment {:?}",
                 resolved.engine, request.deployment_id
             ))
@@ -2736,7 +2739,7 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
         let artifact_lease = self
             .artifacts
             .lease(&resolved.artifact_digest)
-            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+            .map_err(|error| RuntimeManagerError::PrepareInfrastructure(error.to_string()))?;
         Ok(Arc::new(ProductionPreparedDeployment {
             id: request.deployment_id,
             generation: request.generation,
@@ -3141,7 +3144,9 @@ fn allocate_loopback_port() -> Result<u16, RuntimeManagerError> {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .and_then(|listener| listener.local_addr())
         .map(|address| address.port())
-        .map_err(|error| RuntimeManagerError::Prepare(format!("allocate loopback port: {error}")))
+        .map_err(|error| {
+            RuntimeManagerError::PrepareInfrastructure(format!("allocate loopback port: {error}"))
+        })
 }
 
 fn empty_desired_state(catalog_revision: &str) -> Result<RuntimeDesiredState, RuntimeManagerError> {
@@ -3383,6 +3388,7 @@ fn runtime_error_reason_code(error: &RuntimeManagerError) -> &'static str {
     match error {
         RuntimeManagerError::InvalidDesired(_) => "invalid_desired",
         RuntimeManagerError::Prepare(_) => "prepare_failed",
+        RuntimeManagerError::PrepareInfrastructure(_) => "prepare_infrastructure_failed",
         RuntimeManagerError::Engine(error) => error.reason().as_str(),
         RuntimeManagerError::Admission(rejection) => rejection.reason.as_str(),
         RuntimeManagerError::Store(_) => "store_failed",
