@@ -164,7 +164,7 @@ Commit: `git commit -m "WOR-1847: define model plane security"`
 - Produces: `DispatchReplayFence::check_and_record(issuer, nonce, expires_at_unix_ms, now_unix_ms)`.
 - Consumes: Task 1 peer-proof and development shared-key authentication.
 
-- [ ] **Step 1: Write failing strict-envelope tests**
+- [x] **Step 1: Write failing strict-envelope tests**
 
 ```rust,no_run
 #[test]
@@ -183,13 +183,13 @@ fn envelope_denies_unknown_fields_and_oversize_values() {
 }
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `cargo test -p sbproxy-core --test model_plane_envelope envelope_ -- --nocapture`
 
 Expected: compile failure because the envelope module is absent.
 
-- [ ] **Step 3: Implement the canonical signed envelope**
+- [x] **Step 3: Implement the canonical signed envelope**
 
 ```rust,no_run
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,7 +226,7 @@ pub enum DispatchAuthProof {
 
 Canonical signing bytes exclude `auth`. Validate exact schema version, bounded ASCII identifiers, `hop_count == 1`, maximum lifetime 30 seconds, clock skew 5 seconds, worker audience, generation greater than zero, allowlisted HTTP methods and AI paths, SHA-256 body binding, gateway role, and certificate fingerprint equality with the TLS peer when mTLS is used.
 
-- [ ] **Step 4: Write failing replay tests**
+- [x] **Step 4: Write failing replay tests**
 
 ```rust,no_run
 #[test]
@@ -244,13 +244,13 @@ fn full_replay_fence_fails_closed_without_evicting_live_entries() {
 }
 ```
 
-- [ ] **Step 5: Run replay tests and verify RED**
+- [x] **Step 5: Run replay tests and verify RED**
 
 Run: `cargo test -p sbproxy-core --test model_plane_envelope replay -- --nocapture`
 
 Expected: FAIL because `DispatchReplayFence` is absent.
 
-- [ ] **Step 6: Implement a bounded expiry-aware replay fence**
+- [x] **Step 6: Implement a bounded expiry-aware replay fence**
 
 ```rust,no_run
 pub struct DispatchReplayFence {
@@ -269,7 +269,7 @@ pub fn check_and_record(
 
 Prune expired entries under the same lock, reject an existing live key as `replay_detected`, and fail closed when the remaining live set is at capacity.
 
-- [ ] **Step 7: Run focused tests and commit**
+- [x] **Step 7: Run focused tests and commit**
 
 Run: `cargo test -p sbproxy-core --test model_plane_envelope`
 
