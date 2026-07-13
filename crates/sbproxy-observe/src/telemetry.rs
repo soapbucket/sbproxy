@@ -712,8 +712,7 @@ fn build_span_exporter(
                 .with_http()
                 .with_endpoint(endpoint);
             if !config.headers.is_empty() {
-                builder =
-                    builder.with_headers(config.headers.clone().into_iter().collect());
+                builder = builder.with_headers(config.headers.clone().into_iter().collect());
             }
             builder
                 .build()
@@ -833,8 +832,7 @@ pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
                 .with_http()
                 .with_endpoint(endpoint);
             if !config.headers.is_empty() {
-                builder =
-                    builder.with_headers(config.headers.clone().into_iter().collect());
+                builder = builder.with_headers(config.headers.clone().into_iter().collect());
             }
             builder
                 .build()

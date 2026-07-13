@@ -102,8 +102,7 @@ impl OtlpLogSink {
                     .with_endpoint(endpoint.clone())
                     .with_timeout(timeout);
                 if !options.headers.is_empty() {
-                    builder =
-                        builder.with_headers(options.headers.clone().into_iter().collect());
+                    builder = builder.with_headers(options.headers.clone().into_iter().collect());
                 }
                 builder
                     .build()
@@ -115,9 +114,9 @@ impl OtlpLogSink {
                     .with_endpoint(endpoint.clone())
                     .with_timeout(timeout);
                 if !options.headers.is_empty() {
-                    builder = builder.with_metadata(
-                        crate::telemetry::tonic_metadata_from_headers(&options.headers),
-                    );
+                    builder = builder.with_metadata(crate::telemetry::tonic_metadata_from_headers(
+                        &options.headers,
+                    ));
                 }
                 builder
                     .build()
@@ -464,9 +463,9 @@ mod tests {
         // collector on every export request.
         let heads = collector.headers_snapshot();
         assert!(
-            heads
-                .iter()
-                .any(|h| h.to_ascii_lowercase().contains("authorization: bearer wor1869-test-token")),
+            heads.iter().any(|h| h
+                .to_ascii_lowercase()
+                .contains("authorization: bearer wor1869-test-token")),
             "expected authorization header on the export request; header blocks: {heads:?}"
         );
 
