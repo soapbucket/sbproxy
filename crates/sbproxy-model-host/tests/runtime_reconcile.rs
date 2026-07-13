@@ -1545,6 +1545,61 @@ async fn admin_managed_reconciliation_loads_the_store_and_invalid_updates_preser
     assert!(manager.current_desired().deployments.contains_key("stored"));
 }
 
+#[tokio::test]
+async fn admin_revision_preparation_uses_the_supplied_revision_without_changing_store_normalization(
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let store_path = directory.path().join("deployments.json");
+    let store = FileDeploymentRevisionStore::open(&store_path).unwrap();
+    let mut stored = manager_desired("stored-source", &[("stored", false, 30)], 2).revision;
+    stored.source_mode = DeploymentSourceMode::AdminManaged;
+    store.compare_and_swap(None, stored).unwrap();
+
+    let template = compile_desired_state(
+        RuntimeDesiredInput {
+            source_revision: "admin-template".to_string(),
+            canonical: Some(ModelHostControlConfig {
+                authority: ModelHostAuthority::AdminManaged,
+                store_path: Some(store_path.display().to_string()),
+                ..ModelHostControlConfig::default()
+            }),
+            managed_providers: Vec::new(),
+            legacy_providers: Vec::new(),
+        },
+        &Catalog::builtin(),
+    )
+    .unwrap();
+    let mut supplied = manager_desired("supplied-source", &[("supplied", false, 30)], 2).revision;
+    supplied.source_mode = DeploymentSourceMode::AdminManaged;
+    let supplied = supplied.into_revision(2).unwrap();
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+
+    let prepared = manager
+        .prepare_admin_revision(template.clone(), supplied)
+        .await
+        .expect("supplied durable revision prepares");
+    manager.abort_prepared(prepared).await;
+    assert_eq!(
+        preparer.prepares.lock().unwrap().get("supplied").copied(),
+        Some(1)
+    );
+    assert_eq!(
+        preparer.prepares.lock().unwrap().get("stored").copied(),
+        None
+    );
+
+    let prepared = manager
+        .prepare_revision(template)
+        .await
+        .expect("ordinary preparation normalizes from the durable store");
+    manager.abort_prepared(prepared).await;
+    assert_eq!(
+        preparer.prepares.lock().unwrap().get("stored").copied(),
+        Some(1)
+    );
+}
+
 struct ProductionFixtureMetadata;
 
 impl ModelMetadataProvider for ProductionFixtureMetadata {

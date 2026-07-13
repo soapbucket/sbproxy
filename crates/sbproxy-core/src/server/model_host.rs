@@ -49,6 +49,42 @@ pub struct ProductionModelRuntime {
     commit_lock: tokio::sync::Mutex<()>,
 }
 
+/// Successful durable admin deployment revision and its runtime effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminDeploymentRevisionResult {
+    /// Monotonic durable store revision.
+    pub revision: u64,
+    /// Canonical digest of the exact durable revision.
+    pub content_digest: String,
+    /// Runtime reconciliation caused by the revision.
+    pub plan: sbproxy_model_host::ReconcilePlan,
+}
+
+/// Failure to apply one complete admin-managed deployment revision.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AdminDeploymentRevisionError {
+    /// The configured authority does not accept local admin mutations.
+    #[error("model host authority {authority:?} does not allow local admin mutations")]
+    AuthorityReadOnly {
+        /// Active persistent desired-state authority.
+        authority: sbproxy_config::ModelHostAuthority,
+    },
+    /// The caller's optimistic revision no longer matches durable state.
+    #[error("deployment revision conflict: expected {expected:?}, actual {actual:?}")]
+    RevisionConflict {
+        /// Caller-observed revision, or none for initial creation.
+        expected: Option<u64>,
+        /// Current durable revision, or none when the store is empty.
+        actual: Option<u64>,
+    },
+    /// The durable revision store could not be read or updated.
+    #[error("admin deployment store: {0}")]
+    Store(String),
+    /// Candidate preparation or runtime commit failed.
+    #[error(transparent)]
+    Runtime(#[from] sbproxy_model_host::RuntimeManagerError),
+}
+
 impl std::fmt::Debug for ProductionModelRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -425,6 +461,77 @@ impl ProductionModelRuntime {
     /// Current atomic managed-model desired state.
     pub fn current_desired(&self) -> Arc<sbproxy_model_host::RuntimeDesiredState> {
         self.active_manager().current_desired()
+    }
+
+    /// Prepare, durably compare-and-swap, and commit one complete admin revision.
+    pub async fn apply_admin_deployment_revision(
+        &self,
+        expected_revision: Option<u64>,
+        deployments: BTreeMap<String, sbproxy_model_host::ModelDeployment>,
+    ) -> Result<AdminDeploymentRevisionResult, AdminDeploymentRevisionError> {
+        let _guard = self.commit_lock.lock().await;
+        let manager = self.active_manager();
+        let template = manager.current_desired();
+        let authority = template.control.authority;
+        if authority != sbproxy_config::ModelHostAuthority::AdminManaged {
+            return Err(AdminDeploymentRevisionError::AuthorityReadOnly { authority });
+        }
+        let current_epoch = self.epoch.load(Ordering::SeqCst);
+        let next_epoch = current_epoch
+            .checked_add(1)
+            .ok_or(sbproxy_model_host::RuntimeManagerError::CounterOverflow)?;
+        let store_path = template.control.store_path.clone().ok_or_else(|| {
+            sbproxy_model_host::RuntimeManagerError::InvalidDesired(
+                "admin-managed model host requires a deployment store path".to_string(),
+            )
+        })?;
+        let store = sbproxy_model_host::FileDeploymentRevisionStore::open(store_path)
+            .map_err(map_admin_store_error)?;
+        let _current = store.load().map_err(map_admin_store_error)?;
+        let next_revision = expected_revision
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                AdminDeploymentRevisionError::Store(
+                    "deployment revision counter overflow".to_string(),
+                )
+            })?;
+        let draft = sbproxy_model_host::DeploymentRevisionDraft {
+            source_mode: sbproxy_model_host::DeploymentSourceMode::AdminManaged,
+            source_revision: "admin-api".to_string(),
+            catalog_revision: template.revision.catalog_revision.clone(),
+            deployments,
+        };
+        let candidate = draft
+            .clone()
+            .into_revision(next_revision)
+            .map_err(|error| {
+                sbproxy_model_host::RuntimeManagerError::InvalidDesired(error.to_string())
+            })?;
+        let prepared = manager
+            .prepare_admin_revision((*template).clone(), candidate.clone())
+            .await?;
+        let durable = match store.compare_and_swap(expected_revision, draft) {
+            Ok(durable) => durable,
+            Err(error) => {
+                manager.abort_prepared(prepared).await;
+                return Err(map_admin_store_error(error));
+            }
+        };
+        if durable != candidate {
+            manager.abort_prepared(prepared).await;
+            return Err(AdminDeploymentRevisionError::Store(
+                "compare-and-swap returned a different revision than the prepared candidate"
+                    .to_string(),
+            ));
+        }
+        let report = manager.commit_revision(prepared).await?;
+        self.epoch.store(next_epoch, Ordering::SeqCst);
+        Ok(AdminDeploymentRevisionResult {
+            revision: durable.revision,
+            content_digest: durable.content_digest,
+            plan: report.plan,
+        })
     }
 
     /// Current committed fleet placement status, when canonical cluster control is active.
@@ -1075,6 +1182,17 @@ impl ProductionModelRuntime {
     }
 }
 
+fn map_admin_store_error(
+    error: sbproxy_model_host::DeploymentStoreError,
+) -> AdminDeploymentRevisionError {
+    match error {
+        sbproxy_model_host::DeploymentStoreError::Conflict { expected, actual } => {
+            AdminDeploymentRevisionError::RevisionConflict { expected, actual }
+        }
+        error => AdminDeploymentRevisionError::Store(error.to_string()),
+    }
+}
+
 fn current_unix_time_ms() -> anyhow::Result<u64> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1686,7 +1804,7 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     #[derive(Debug, Default)]
     struct ClusterFixtureProcess;
@@ -1716,6 +1834,7 @@ mod tests {
     struct ClusterFixtureRuntime {
         deployment: String,
         generation: u64,
+        stops: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -1751,6 +1870,7 @@ mod tests {
             &self,
             _grace: std::time::Duration,
         ) -> Result<(), sbproxy_model_host::RuntimeManagerError> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1765,6 +1885,10 @@ mod tests {
     #[derive(Default)]
     struct ClusterFixturePreparer {
         fail: AtomicBool,
+        stops: Arc<AtomicUsize>,
+        block_prepare: AtomicBool,
+        prepare_entered: tokio::sync::Notify,
+        prepare_release: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -1776,6 +1900,10 @@ mod tests {
             Arc<dyn sbproxy_model_host::PreparedDeploymentRuntime>,
             sbproxy_model_host::RuntimeManagerError,
         > {
+            if self.block_prepare.load(Ordering::SeqCst) {
+                self.prepare_entered.notify_one();
+                self.prepare_release.notified().await;
+            }
             if self.fail.load(Ordering::SeqCst) {
                 return Err(sbproxy_model_host::RuntimeManagerError::Prepare(
                     "injected cluster prepare failure".to_string(),
@@ -1784,6 +1912,7 @@ mod tests {
             Ok(Arc::new(ClusterFixtureRuntime {
                 deployment: request.deployment_id,
                 generation: request.generation,
+                stops: self.stops.clone(),
             }))
         }
     }
@@ -1833,6 +1962,218 @@ mod tests {
             None => serde_json::json!([{"name": "openai", "api_key": "sk-x"}]),
         };
         AiHandlerConfig::from_config(serde_json::json!({ "providers": providers })).unwrap()
+    }
+
+    fn admin_fixture_deployment() -> sbproxy_model_host::ModelDeployment {
+        serde_yaml::from_str("model: qwen2.5-0.5b-instruct\nvariant: q4_k_m\npull: on_demand\n")
+            .expect("fixture deployment")
+    }
+
+    fn admin_fixture_template(store_path: &Path) -> sbproxy_model_host::RuntimeDesiredState {
+        sbproxy_model_host::compile_desired_state(
+            sbproxy_model_host::RuntimeDesiredInput {
+                source_revision: "admin-fixture-template".to_string(),
+                canonical: Some(sbproxy_config::ModelHostControlConfig {
+                    authority: sbproxy_config::ModelHostAuthority::AdminManaged,
+                    store_path: Some(store_path.display().to_string()),
+                    ..sbproxy_config::ModelHostControlConfig::default()
+                }),
+                managed_providers: Vec::new(),
+                legacy_providers: Vec::new(),
+            },
+            &Catalog::builtin(),
+        )
+        .expect("admin fixture template")
+    }
+
+    async fn admin_fixture_runtime(
+        store_path: &Path,
+        preparer: Arc<ClusterFixturePreparer>,
+    ) -> ProductionModelRuntime {
+        let manager = Arc::new(
+            sbproxy_model_host::ModelRuntimeManager::new(
+                Catalog::builtin().catalog_revision,
+                preparer,
+            )
+            .expect("fixture manager"),
+        );
+        let prepared = manager
+            .prepare_revision(admin_fixture_template(store_path))
+            .await
+            .expect("fixture admin revision prepares");
+        manager
+            .commit_revision(prepared)
+            .await
+            .expect("fixture admin revision commits");
+        ProductionModelRuntime {
+            active: ArcSwap::from(manager),
+            foundation: RwLock::new(None),
+            snapshot_preparer: RwLock::new(None),
+            cluster_state: RwLock::new(None),
+            epoch: AtomicU64::new(0),
+            commit_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_revision_mutation_rejects_non_admin_authority() {
+        let runtime = ProductionModelRuntime::empty().expect("empty runtime");
+
+        let error = runtime
+            .apply_admin_deployment_revision(None, BTreeMap::new())
+            .await
+            .expect_err("file-managed runtime is read-only to admin mutation");
+
+        assert_eq!(
+            error,
+            AdminDeploymentRevisionError::AuthorityReadOnly {
+                authority: sbproxy_config::ModelHostAuthority::FileManaged,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_revision_mutation_maps_conflict_and_aborts_prepared_slots() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("deployments.json");
+        let store = sbproxy_model_host::FileDeploymentRevisionStore::open(&store_path).unwrap();
+        let catalog_revision = Catalog::builtin().catalog_revision;
+        store
+            .compare_and_swap(
+                None,
+                sbproxy_model_host::DeploymentRevisionDraft {
+                    source_mode: sbproxy_model_host::DeploymentSourceMode::AdminManaged,
+                    source_revision: "existing-admin-revision".to_string(),
+                    catalog_revision,
+                    deployments: BTreeMap::from([(
+                        "existing".to_string(),
+                        admin_fixture_deployment(),
+                    )]),
+                },
+            )
+            .unwrap();
+        let preparer = Arc::new(ClusterFixturePreparer::default());
+        let runtime = admin_fixture_runtime(&store_path, preparer.clone()).await;
+
+        let error = runtime
+            .apply_admin_deployment_revision(
+                None,
+                BTreeMap::from([("replacement".to_string(), admin_fixture_deployment())]),
+            )
+            .await
+            .expect_err("stale expected revision conflicts");
+
+        assert_eq!(
+            error,
+            AdminDeploymentRevisionError::RevisionConflict {
+                expected: None,
+                actual: Some(1),
+            }
+        );
+        let durable = store.load().unwrap().expect("existing durable revision");
+        assert_eq!(durable.revision, 1);
+        assert!(durable.deployments.contains_key("existing"));
+        assert!(runtime
+            .current_desired()
+            .deployments
+            .contains_key("existing"));
+        assert_eq!(preparer.stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_revision_uses_the_expected_cursor_when_the_store_catches_up_during_prepare() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("deployments.json");
+        let store = sbproxy_model_host::FileDeploymentRevisionStore::open(&store_path).unwrap();
+        let catalog_revision = Catalog::builtin().catalog_revision;
+        store
+            .compare_and_swap(
+                None,
+                sbproxy_model_host::DeploymentRevisionDraft {
+                    source_mode: sbproxy_model_host::DeploymentSourceMode::AdminManaged,
+                    source_revision: "existing-admin-revision".to_string(),
+                    catalog_revision: catalog_revision.clone(),
+                    deployments: BTreeMap::from([(
+                        "existing".to_string(),
+                        admin_fixture_deployment(),
+                    )]),
+                },
+            )
+            .unwrap();
+        let preparer = Arc::new(ClusterFixturePreparer::default());
+        let runtime = Arc::new(admin_fixture_runtime(&store_path, preparer.clone()).await);
+        preparer.block_prepare.store(true, Ordering::SeqCst);
+        let apply = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .apply_admin_deployment_revision(
+                        Some(2),
+                        BTreeMap::from([("replacement".to_string(), admin_fixture_deployment())]),
+                    )
+                    .await
+            }
+        });
+        preparer.prepare_entered.notified().await;
+        store
+            .compare_and_swap(
+                Some(1),
+                sbproxy_model_host::DeploymentRevisionDraft {
+                    source_mode: sbproxy_model_host::DeploymentSourceMode::AdminManaged,
+                    source_revision: "concurrent-admin-revision".to_string(),
+                    catalog_revision,
+                    deployments: BTreeMap::from([(
+                        "concurrent".to_string(),
+                        admin_fixture_deployment(),
+                    )]),
+                },
+            )
+            .expect("concurrent writer advances the store to the expected cursor");
+        preparer.block_prepare.store(false, Ordering::SeqCst);
+        preparer.prepare_release.notify_one();
+
+        let result = apply
+            .await
+            .expect("apply task")
+            .expect("prepared cursor successor commits exactly");
+
+        let durable = store.load().unwrap().expect("durable replacement");
+        assert_eq!(result.revision, 3);
+        assert_eq!(result.content_digest, durable.content_digest);
+        assert!(durable.deployments.contains_key("replacement"));
+        assert!(runtime
+            .current_desired()
+            .deployments
+            .contains_key("replacement"));
+        assert_eq!(result.plan.added, vec!["replacement"]);
+        assert_eq!(result.plan.removed, vec!["existing"]);
+    }
+
+    #[tokio::test]
+    async fn admin_revision_preparation_failure_leaves_store_and_runtime_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("deployments.json");
+        let store = sbproxy_model_host::FileDeploymentRevisionStore::open(&store_path).unwrap();
+        let preparer = Arc::new(ClusterFixturePreparer::default());
+        let runtime = admin_fixture_runtime(&store_path, preparer.clone()).await;
+        preparer.fail.store(true, Ordering::SeqCst);
+
+        let error = runtime
+            .apply_admin_deployment_revision(
+                None,
+                BTreeMap::from([("broken".to_string(), admin_fixture_deployment())]),
+            )
+            .await
+            .expect_err("injected preparation failure rejects candidate");
+
+        assert!(matches!(
+            error,
+            AdminDeploymentRevisionError::Runtime(
+                sbproxy_model_host::RuntimeManagerError::Prepare(ref message)
+            ) if message.contains("injected cluster prepare failure")
+        ));
+        assert!(store.load().unwrap().is_none());
+        assert!(runtime.current_desired().deployments.is_empty());
     }
 
     #[test]

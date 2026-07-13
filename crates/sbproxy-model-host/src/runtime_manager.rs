@@ -18,13 +18,13 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
     AcceleratorKind, AcquireSource, AcquisitionContext, ArtifactFormat, ArtifactManager,
-    BackoffPolicy, Catalog, CompiledDeployment, DeploymentRevisionDraft, DeploymentRoute,
-    DeploymentSourceMode, EngineAccel, EngineAvailability, EngineDriver, EngineDriverError,
-    EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod, EngineProvisioning,
-    FileDeploymentRevisionStore, GpuProbe, KvCacheQuant, LaunchRequest, LegacyHostPolicy,
-    LlamaCppDriver, ModelMetadata, ModelMetadataProvider, NetworkPolicy, OperationJob,
-    ProvisionRequest, PullIntent, ResolveArtifactRequest, RunningEngine, RuntimeDesiredState,
-    VllmDriver, WorkerProfile,
+    BackoffPolicy, Catalog, CompiledDeployment, DeploymentRevision, DeploymentRevisionDraft,
+    DeploymentRoute, DeploymentSourceMode, EngineAccel, EngineAvailability, EngineDriver,
+    EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod,
+    EngineProvisioning, FileDeploymentRevisionStore, GpuProbe, KvCacheQuant, LaunchRequest,
+    LegacyHostPolicy, LlamaCppDriver, ModelMetadata, ModelMetadataProvider, NetworkPolicy,
+    OperationJob, ProvisionRequest, PullIntent, ResolveArtifactRequest, RunningEngine,
+    RuntimeDesiredState, VllmDriver, WorkerProfile,
 };
 
 /// Reconciliation, preparation, or lifecycle failure.
@@ -1383,6 +1383,24 @@ impl ModelRuntimeManager {
         desired: RuntimeDesiredState,
     ) -> Result<PreparedRevision, RuntimeManagerError> {
         let desired = self.normalize_candidate(desired)?;
+        self.prepare_normalized_revision(desired).await
+    }
+
+    /// Prepare one caller-supplied durable admin revision without rereading its store.
+    pub async fn prepare_admin_revision(
+        &self,
+        template: RuntimeDesiredState,
+        revision: DeploymentRevision,
+    ) -> Result<PreparedRevision, RuntimeManagerError> {
+        let desired =
+            normalize_admin_revision(template, revision, self.expected_catalog_revision.as_str())?;
+        self.prepare_normalized_revision(desired).await
+    }
+
+    async fn prepare_normalized_revision(
+        &self,
+        desired: RuntimeDesiredState,
+    ) -> Result<PreparedRevision, RuntimeManagerError> {
         validate_desired_state(&desired, &self.expected_catalog_revision)?;
         let current = self.snapshot.load_full();
         let plan = plan_reconciliation(&current, &desired);
@@ -3280,7 +3298,73 @@ fn load_admin_candidate(
         catalog_revision: expected_catalog_revision.to_string(),
         deployments: deployments.clone(),
     };
-    desired.deployments = deployments
+    desired.deployments = compile_canonical_deployments(deployments);
+    desired.control.deployments.clear();
+    desired.legacy_host_policy = None;
+    Ok(desired)
+}
+
+fn normalize_admin_revision(
+    mut template: RuntimeDesiredState,
+    revision: DeploymentRevision,
+    expected_catalog_revision: &str,
+) -> Result<RuntimeDesiredState, RuntimeManagerError> {
+    if template.control.authority != sbproxy_config::ModelHostAuthority::AdminManaged
+        || template.revision.source_mode != DeploymentSourceMode::AdminManaged
+    {
+        return Err(RuntimeManagerError::InvalidDesired(
+            "admin revision preparation requires admin_managed authority".to_string(),
+        ));
+    }
+    let configured_store = template.control.store_path.as_deref().ok_or_else(|| {
+        RuntimeManagerError::InvalidDesired(
+            "admin-managed model host requires a deployment store path".to_string(),
+        )
+    })?;
+    if configured_store.trim().is_empty() {
+        return Err(RuntimeManagerError::InvalidDesired(
+            "admin-managed model host requires a non-empty deployment store path".to_string(),
+        ));
+    }
+    revision
+        .validate()
+        .map_err(|error| RuntimeManagerError::InvalidDesired(error.to_string()))?;
+    if revision.source_mode != DeploymentSourceMode::AdminManaged {
+        return Err(RuntimeManagerError::InvalidDesired(format!(
+            "admin revision preparation requires admin_managed source mode, got {:?}",
+            revision.source_mode
+        )));
+    }
+    if template.revision.catalog_revision != expected_catalog_revision {
+        return Err(RuntimeManagerError::InvalidDesired(format!(
+            "template catalog revision {:?} differs from active {:?}",
+            template.revision.catalog_revision, expected_catalog_revision
+        )));
+    }
+    if revision.catalog_revision != expected_catalog_revision {
+        return Err(RuntimeManagerError::InvalidDesired(format!(
+            "candidate catalog revision {:?} differs from active {:?}",
+            revision.catalog_revision, expected_catalog_revision
+        )));
+    }
+
+    template.revision = DeploymentRevisionDraft {
+        source_mode: DeploymentSourceMode::AdminManaged,
+        source_revision: format!("{}#{}", revision.source_revision, revision.revision),
+        catalog_revision: revision.catalog_revision,
+        deployments: revision.deployments.clone(),
+    };
+    template.deployments = compile_canonical_deployments(revision.deployments);
+    template.control.deployments.clear();
+    template.legacy_host_policy = None;
+    validate_desired_state(&template, expected_catalog_revision)?;
+    Ok(template)
+}
+
+fn compile_canonical_deployments(
+    deployments: BTreeMap<String, crate::ModelDeployment>,
+) -> BTreeMap<String, CompiledDeployment> {
+    deployments
         .into_iter()
         .map(|(id, deployment)| {
             (
@@ -3292,10 +3376,7 @@ fn load_admin_candidate(
                 },
             )
         })
-        .collect();
-    desired.control.deployments.clear();
-    desired.legacy_host_policy = None;
-    Ok(desired)
+        .collect()
 }
 
 fn runtime_error_reason_code(error: &RuntimeManagerError) -> &'static str {
