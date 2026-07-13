@@ -4164,6 +4164,29 @@ impl ProxyHttp for SbProxy {
                 ctx.principal.api_key_id(),
                 outcome,
             );
+            // WOR-1875: request count + outcome split for the durable
+            // spend rollups, once per AI request (blocked requests
+            // that never billed included). Token / cost contributions
+            // ride the billing choke point instead.
+            sbproxy_observe::usage_rollup::record_usage_rollup(
+                sbproxy_observe::usage_rollup::RollupEvent {
+                    ts_secs: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    dims: sbproxy_observe::usage_rollup::RollupDims {
+                        provider: ctx.ai_provider.clone().unwrap_or_default(),
+                        model: ctx.ai_model.clone().unwrap_or_default(),
+                        tenant: ctx.tenant_id.to_string(),
+                        team: ctx.attribution_tags.team.clone().unwrap_or_default(),
+                        api_key_id: ctx.principal.api_key_id().to_string(),
+                        project: ctx.attribution_tags.project.clone().unwrap_or_default(),
+                    },
+                    kind: sbproxy_observe::usage_rollup::RollupKind::Outcome(
+                        sbproxy_observe::usage_rollup::RollupOutcome::from_outcome_label(outcome),
+                    ),
+                },
+            );
 
             // WOR-1497: a request blocked before dispatch (budget cap,
             // guardrail, rate limit) or one that failed without an

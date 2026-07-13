@@ -265,6 +265,7 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
     // the legacy `tracing::*!` fallback continues to drive stdout.
     validate_sinks_config(&compiled.server);
     install_sink_dispatcher_from_config(&compiled);
+    install_usage_rollups_from_config(&compiled);
 
     // WOR-173: refresh the AI provider catalog and rebuild the AI
     // client alongside the pipeline. Both globals live behind an
@@ -2171,6 +2172,55 @@ fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
 /// snapshot so `current_sink_dispatcher()` returns `None`; the
 /// `emit()` path then falls back to the legacy single `tracing::*!`
 /// subscriber and stdout behaviour is preserved.
+/// WOR-1875: open the durable usage-rollup store and install the
+/// process-global writer. Default-on: an absent config block means
+/// the defaults apply. Idempotent (the writer slot is set-once), so
+/// the reload path calling again is a no-op. A store that cannot open
+/// (missing directory, permissions) logs a warning and leaves rollups
+/// off rather than failing boot; the windowed spend API then reports
+/// rollups unavailable while live counters keep working.
+fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) {
+    use sbproxy_observe::usage_rollup::{
+        install_usage_rollup_writer, usage_rollup_writer, RollupStore, RollupWriter,
+    };
+    if usage_rollup_writer().is_some() {
+        return;
+    }
+    let cfg = compiled
+        .server
+        .observability
+        .as_ref()
+        .and_then(|o| o.usage_rollups.clone())
+        .unwrap_or_default();
+    if !cfg.enabled {
+        return;
+    }
+    let path = cfg
+        .path
+        .clone()
+        .unwrap_or_else(|| "/var/lib/sbproxy/usage-rollups.redb".to_string());
+    match RollupStore::open(std::path::Path::new(&path)) {
+        Ok(store) => {
+            let day = 86_400u64;
+            let writer = RollupWriter::spawn(
+                std::sync::Arc::new(store),
+                u64::from(cfg.retention_hourly_days) * day,
+                u64::from(cfg.retention_daily_days) * day,
+            );
+            install_usage_rollup_writer(writer);
+            tracing::info!(path = %path, "usage rollups enabled");
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path,
+                error = %e,
+                "usage rollups disabled: store could not be opened (set \
+                 proxy.observability.usage_rollups.path to a writable location)"
+            );
+        }
+    }
+}
+
 fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig) {
     use sbproxy_observe::sink_dispatcher::{
         install_sink_dispatcher, CompiledSink, SinkDispatcher, SinkScope,
@@ -2479,6 +2529,7 @@ mod tests {
         server.observability = Some(ObservabilityConfig {
             log: Some(log_cfg),
             telemetry: None,
+            usage_rollups: None,
         });
         server.tenants = vec![ProxyTenantConfig {
             id: "acme".to_string(),

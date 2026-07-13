@@ -311,6 +311,33 @@ Metrics are per-instance: each process exposes only its own counters at `/metric
 
 For deployments running the mesh key tier without a Prometheus, one node can report fleet totals directly. Each node periodically publishes a small allow-list of `sbproxy_*` totals into the mesh, and `GET /admin/cluster/metrics` returns the summed values plus the node count. This is a convenience for a single-pane view without a metrics stack, not a replacement for Prometheus: the set is curated, the cadence is coarse, and it only reports while the mesh tier is on (otherwise the endpoint returns 404). Prefer Prometheus for anything beyond an at-a-glance total.
 
+### Durable usage rollups and windowed spend
+
+Prometheus counters are process-lifetime, so on their own the admin Spend page zeroes at every restart. The proxy therefore also folds every AI request into durable spend rollups: hour buckets keyed by provider, model, tenant, team, credential id, and project, each aggregating request counts, tokens by direction, cost in micro-USD, and a closed outcome split (`ok` / `blocked` / `error`). Buckets live in an embedded database file; hourly buckets compact into daily buckets past the hourly retention, and daily buckets prune past the daily retention. Rows carry no prompt content and no raw key material (credential id only), so the file is safe to back up and ship, and the write path is a bounded queue drained off the data plane (a full queue drops the event and increments `sbproxy_telemetry_dropped_total{kind="usage_rollup"}` rather than blocking traffic).
+
+```yaml
+proxy:
+  observability:
+    usage_rollups:
+      enabled: true                                # default
+      path: /var/lib/sbproxy/usage-rollups.redb    # default
+      retention_hourly_days: 90                    # then compacted daily
+      retention_daily_days: 395                    # about 13 months
+```
+
+Rollups are on by default. When the path cannot be opened the proxy logs a warning and runs with rollups off instead of failing boot; point `path` somewhere writable for non-root deployments.
+
+Query the windowed spend API on the admin listener:
+
+```
+GET /api/usage/spend?window=24h&group_by=model
+GET /api/usage/spend?from=1760000000&to=1760086400&group_by=team
+```
+
+`window` is one of `1h | 24h | 7d | 30d`; `from` / `to` are Unix seconds and override the window; `group_by` is one of `provider | model | tenant | team | api_key | project | total`. The response carries `bucket_secs` (3600 while the window is inside the hourly retention, 86400 past it), time-ordered `buckets` (`ts_secs`, `group`, `requests`, `tokens_in`, `tokens_out`, `cost_usd_micros`, `ok`, `blocked`, `error`), and window `totals` in the same shape. Calling `/api/usage/spend` with no parameters keeps returning the legacy process-lifetime totals. The admin Spend page renders this history with a range selector, so yesterday's spend still renders after a restart.
+
+The bucket schema doubles as the ingestion contract for external spend pipelines: the same events feed the rollups and the usage sinks, so a durable analytics store can consume the identical dimensions.
+
 ## Logs
 
 ### Structured-log schema

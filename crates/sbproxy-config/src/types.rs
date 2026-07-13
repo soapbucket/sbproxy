@@ -2534,6 +2534,56 @@ pub struct ObservabilityConfig {
     /// configured endpoint receives traces and (optionally) metrics.
     #[serde(default)]
     pub telemetry: Option<ObservabilityTelemetryConfig>,
+    /// Durable windowed usage rollups. On by default; omit the block
+    /// to accept the defaults.
+    #[serde(default)]
+    pub usage_rollups: Option<UsageRollupsConfig>,
+}
+
+/// Durable spend-rollup configuration (hour and day usage buckets in
+/// an embedded database, so the admin spend API serves windowed
+/// history that survives restarts). Buckets are keyed by provider,
+/// model, tenant, team, credential id, and project, and aggregate
+/// request counts, tokens, cost, and an outcome split. Rows carry no
+/// prompt content and no raw key material, so the file is safe to
+/// back up. Aggregation is deterministic.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct UsageRollupsConfig {
+    /// Whether rollups are recorded. Defaults to `true`. When the
+    /// store path cannot be opened the proxy logs a warning and runs
+    /// with rollups off instead of failing boot.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Rollup database file path. Default
+    /// `/var/lib/sbproxy/usage-rollups.redb`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Days of hourly buckets to keep before compacting into daily
+    /// buckets. Default 90.
+    #[serde(default = "default_rollup_hourly_days")]
+    pub retention_hourly_days: u32,
+    /// Days of daily buckets to keep. Default 395 (about 13 months).
+    #[serde(default = "default_rollup_daily_days")]
+    pub retention_daily_days: u32,
+}
+
+impl Default for UsageRollupsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+            retention_hourly_days: default_rollup_hourly_days(),
+            retention_daily_days: default_rollup_daily_days(),
+        }
+    }
+}
+
+fn default_rollup_hourly_days() -> u32 {
+    90
+}
+
+fn default_rollup_daily_days() -> u32 {
+    395
 }
 
 /// Subset of `sbproxy-observe::LoggingConfig` that lands in the public

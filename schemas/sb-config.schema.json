@@ -706,6 +706,18 @@
               "type": "null"
             }
           ]
+        },
+        "usage_rollups": {
+          "description": "Durable windowed usage rollups. On by default; omit the block to accept the defaults.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UsageRollupsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -1197,6 +1209,39 @@
           "additionalProperties": {
             "type": "string"
           }
+        }
+      }
+    },
+    "UsageRollupsConfig": {
+      "description": "Durable spend-rollup configuration (hour and day usage buckets in an embedded database, so the admin spend API serves windowed history that survives restarts). Buckets are keyed by provider, model, tenant, team, credential id, and project, and aggregate request counts, tokens, cost, and an outcome split. Rows carry no prompt content and no raw key material, so the file is safe to back up. Aggregation is deterministic.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether rollups are recorded. Defaults to `true`. When the store path cannot be opened the proxy logs a warning and runs with rollups off instead of failing boot.",
+          "default": true,
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Rollup database file path. Default `/var/lib/sbproxy/usage-rollups.redb`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retention_hourly_days": {
+          "description": "Days of hourly buckets to keep before compacting into daily buckets. Default 90.",
+          "default": 90,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "retention_daily_days": {
+          "description": "Days of daily buckets to keep. Default 395 (about 13 months).",
+          "default": 395,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
         }
       }
     },

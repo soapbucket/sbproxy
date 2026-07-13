@@ -1868,7 +1868,17 @@ pub fn handle_admin_request(
         };
     }
     // WOR-1718: spend summary from the AI cost/token metrics.
+    // WOR-1875: any of `window`, `group_by`, `from`, `to` selects the
+    // windowed shape served from the durable rollups; the zero-arg
+    // legacy shape (process-lifetime counter totals) is unchanged.
     if path_only == "/api/usage/spend" {
+        let window = rl_query_param(path, "window");
+        let group_by = rl_query_param(path, "group_by");
+        let from_p = rl_query_param(path, "from").and_then(|s| s.parse::<u64>().ok());
+        let to_p = rl_query_param(path, "to").and_then(|s| s.parse::<u64>().ok());
+        if window.is_some() || group_by.is_some() || from_p.is_some() || to_p.is_some() {
+            return windowed_spend_response(window, group_by, from_p, to_p);
+        }
         let snap = sbproxy_observe::metrics::metrics().snapshot_named(&[
             "sbproxy_tokens_attributed_total",
             "sbproxy_ai_tokens_attributed_total",
@@ -2048,6 +2058,98 @@ fn first_positive_snapshot_value(
         .map(|name| snapshot_value(snap, name))
         .find(|value| *value > 0.0)
         .unwrap_or(0.0)
+}
+
+/// WOR-1875: parse a `window=` value into seconds.
+fn parse_spend_window(window: &str) -> Option<u64> {
+    Some(match window {
+        "1h" => 3_600,
+        "24h" => 86_400,
+        "7d" => 7 * 86_400,
+        "30d" => 30 * 86_400,
+        _ => return None,
+    })
+}
+
+/// WOR-1875: serve the windowed spend shape from the rollup store.
+/// Parameter validation runs before the store lookup so a bad request
+/// is a 400 even when rollups are disabled; a valid request without a
+/// store is a 503 that names the config knob.
+fn windowed_spend_response(
+    window: Option<&str>,
+    group_by: Option<&str>,
+    from_p: Option<u64>,
+    to_p: Option<u64>,
+) -> (u16, &'static str, String) {
+    let Some(group) = sbproxy_observe::usage_rollup::GroupBy::parse(group_by.unwrap_or("total"))
+    else {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|total)"}"#
+                .to_string(),
+        );
+    };
+    let window_secs = match window {
+        None => None,
+        Some(w) => match parse_spend_window(w) {
+            Some(secs) => Some(secs),
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    r#"{"error":"unknown window (1h|24h|7d|30d)"}"#.to_string(),
+                );
+            }
+        },
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (from, to) = match (from_p, to_p, window_secs) {
+        (Some(f), Some(t), _) => (f, t),
+        (Some(f), None, _) => (f, now),
+        (None, _, Some(w)) => (now.saturating_sub(w), now),
+        _ => (now.saturating_sub(86_400), now),
+    };
+    if from >= to {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"from must be before to"}"#.to_string(),
+        );
+    }
+    let Some(writer) = sbproxy_observe::usage_rollup::usage_rollup_writer() else {
+        return (
+            503,
+            "application/json",
+            r#"{"error":"usage rollups are not enabled (proxy.observability.usage_rollups)"}"#
+                .to_string(),
+        );
+    };
+    match writer
+        .store()
+        .query(from, to, group, now, writer.hourly_retention_secs())
+    {
+        Ok(res) => {
+            let body = serde_json::json!({
+                "from": from,
+                "to": to,
+                "group_by": group_by.unwrap_or("total"),
+                "bucket_secs": res.bucket_secs,
+                "buckets": res.buckets,
+                "totals": res.totals,
+            })
+            .to_string();
+            (200, "application/json", body)
+        }
+        Err(e) => (
+            500,
+            "application/json",
+            format!(r#"{{"error":"rollup query failed: {e}"}}"#),
+        ),
+    }
 }
 
 fn spend_totals_from_snapshot(snap: &std::collections::HashMap<String, f64>) -> (f64, f64) {
@@ -3107,6 +3209,64 @@ mod tests {
         let page = state.query_requests(None, None, None, None, None, 2, 3);
         assert_eq!(page.len(), 3);
         assert_eq!(page[0].path, "/api/thing/7");
+    }
+
+    #[test]
+    fn windowed_spend_validates_params_and_serves_rollups() {
+        // WOR-1875. The 400 paths are pure parameter validation and
+        // run before any store lookup.
+        let (code, _, body) = windowed_spend_response(Some("2h"), None, None, None);
+        assert_eq!(code, 400);
+        assert!(body.contains("unknown window"));
+        let (code, _, body) = windowed_spend_response(None, Some("nope"), None, None);
+        assert_eq!(code, 400);
+        assert!(body.contains("unknown group_by"));
+        let (code, _, body) = windowed_spend_response(None, None, Some(10), Some(5));
+        assert_eq!(code, 400);
+        assert!(body.contains("before"));
+
+        // Happy path against a real store. The process-global writer
+        // slot is set-once; this test owns the installed instance.
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            sbproxy_observe::usage_rollup::RollupStore::open(&dir.path().join("r.redb")).unwrap(),
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store
+            .fold(&[sbproxy_observe::usage_rollup::RollupEvent {
+                ts_secs: now - 60,
+                dims: sbproxy_observe::usage_rollup::RollupDims {
+                    provider: "openai".to_string(),
+                    model: "gpt-4o".to_string(),
+                    tenant: "t".to_string(),
+                    team: "growth".to_string(),
+                    api_key_id: "sk1".to_string(),
+                    project: "p".to_string(),
+                },
+                kind: sbproxy_observe::usage_rollup::RollupKind::Usage {
+                    tokens_in: 5,
+                    tokens_out: 2,
+                    cost_usd_micros: 42,
+                },
+            }])
+            .unwrap();
+        let writer =
+            sbproxy_observe::usage_rollup::RollupWriter::spawn(store, 90 * 86_400, 395 * 86_400);
+        sbproxy_observe::usage_rollup::install_usage_rollup_writer(writer);
+        // Keep the backing dir alive for the process-global writer.
+        std::mem::forget(dir);
+
+        let (code, _, body) = windowed_spend_response(Some("24h"), Some("model"), None, None);
+        assert_eq!(code, 200, "windowed spend must serve: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["group_by"], "model");
+        assert_eq!(v["bucket_secs"], 3600);
+        assert_eq!(v["totals"]["cost_usd_micros"], 42);
+        assert_eq!(v["totals"]["tokens_in"], 5);
+        assert_eq!(v["buckets"][0]["group"], "gpt-4o");
     }
 
     #[test]

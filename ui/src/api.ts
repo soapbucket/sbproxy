@@ -465,6 +465,38 @@ export interface LoginResult {
   csrf_token: string;
 }
 
+// Windowed spend from the durable usage rollups (WOR-1875).
+export interface SpendWindowBucket {
+  ts_secs: number;
+  group: string;
+  requests: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd_micros: number;
+  ok: number;
+  blocked: number;
+  error: number;
+}
+
+export interface SpendWindowTotals {
+  requests: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd_micros: number;
+  ok: number;
+  blocked: number;
+  error: number;
+}
+
+export interface SpendWindowResponse {
+  from: number;
+  to: number;
+  group_by: string;
+  bucket_secs: number;
+  buckets: SpendWindowBucket[];
+  totals: SpendWindowTotals;
+}
+
 export const api = {
   // Auth (WOR-1758)
   session: () => getJson<SessionInfo>("/admin/session"),
@@ -533,6 +565,11 @@ export const api = {
 
   // Metrics
   metrics: () => getText("/metrics"),
+  // Windowed spend history from the durable rollups (WOR-1875).
+  spendWindow: (window: string, groupBy: string) =>
+    getJson<SpendWindowResponse>(
+      `/api/usage/spend?window=${encodeURIComponent(window)}&group_by=${encodeURIComponent(groupBy)}`,
+    ),
 
   // Prompts
   prompts: () => getJson<unknown>("/admin/prompts"),

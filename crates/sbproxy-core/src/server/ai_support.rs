@@ -1459,6 +1459,31 @@ pub(super) fn emit_ai_billing_event(
         "output",
         output_tokens,
     );
+    // WOR-1875: feed the durable spend rollups from the same choke
+    // point (a no-op when rollups are off). The request count and
+    // outcome split ride the end-of-request outcome event instead, so
+    // blocked requests that never bill still count.
+    sbproxy_observe::usage_rollup::record_usage_rollup(
+        sbproxy_observe::usage_rollup::RollupEvent {
+            ts_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            dims: sbproxy_observe::usage_rollup::RollupDims {
+                provider: provider_name.to_string(),
+                model: model_label.to_string(),
+                tenant: tenant_id.to_string(),
+                team: tags.team.clone().unwrap_or_default(),
+                api_key_id: api_key_id.to_string(),
+                project: tags.project.clone().unwrap_or_default(),
+            },
+            kind: sbproxy_observe::usage_rollup::RollupKind::Usage {
+                tokens_in: input_tokens,
+                tokens_out: output_tokens,
+                cost_usd_micros,
+            },
+        },
+    );
 
     // WOR-1095: realtime + audio surfaces consume seconds, not tokens,
     // and realtime has no catalogue price, so the token / cost
