@@ -22,6 +22,118 @@ export function setCsrfToken(token: string | null): void {
 }
 
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const MAX_SAFE_JSON_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
+
+export class UnsafeJsonIntegerError extends RangeError {
+  constructor(value: string | number) {
+    super(
+      `JSON integer ${String(value)} is outside JavaScript's safe integer range`,
+    );
+    this.name = "UnsafeJsonIntegerError";
+  }
+}
+
+function assertSafeIntegerValue(value: unknown): void {
+  if (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    !Number.isSafeInteger(value)
+  ) {
+    throw new UnsafeJsonIntegerError(value);
+  }
+}
+
+function stringifyJsonSafely(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, candidate: unknown) => {
+    assertSafeIntegerValue(candidate);
+    return candidate;
+  });
+}
+
+function isDigit(character: string | undefined): boolean {
+  return character !== undefined && character >= "0" && character <= "9";
+}
+
+function jsonNumberEnd(raw: string, start: number): number | null {
+  let cursor = start;
+  if (raw[cursor] === "-") cursor += 1;
+
+  if (raw[cursor] === "0") {
+    cursor += 1;
+  } else {
+    if (!isDigit(raw[cursor])) return null;
+    while (isDigit(raw[cursor])) cursor += 1;
+  }
+
+  if (raw[cursor] === ".") {
+    cursor += 1;
+    if (!isDigit(raw[cursor])) return null;
+    while (isDigit(raw[cursor])) cursor += 1;
+  }
+
+  if (raw[cursor] === "e" || raw[cursor] === "E") {
+    cursor += 1;
+    if (raw[cursor] === "+" || raw[cursor] === "-") cursor += 1;
+    if (!isDigit(raw[cursor])) return null;
+    while (isDigit(raw[cursor])) cursor += 1;
+  }
+
+  return cursor;
+}
+
+function assertSafeJsonNumberToken(token: string): void {
+  if (!token.includes(".") && !token.includes("e") && !token.includes("E")) {
+    const magnitude = BigInt(token.startsWith("-") ? token.slice(1) : token);
+    if (magnitude > MAX_SAFE_JSON_INTEGER) {
+      throw new UnsafeJsonIntegerError(token);
+    }
+    return;
+  }
+
+  const value = Number(token);
+  if (
+    !Number.isFinite(value) ||
+    (Number.isInteger(value) && !Number.isSafeInteger(value))
+  ) {
+    throw new UnsafeJsonIntegerError(token);
+  }
+}
+
+function assertSafeJsonIntegers(raw: string): void {
+  let cursor = 0;
+  while (cursor < raw.length) {
+    if (raw[cursor] === '"') {
+      cursor += 1;
+      while (cursor < raw.length) {
+        if (raw[cursor] === "\\") {
+          cursor += 2;
+        } else if (raw[cursor] === '"') {
+          cursor += 1;
+          break;
+        } else {
+          cursor += 1;
+        }
+      }
+      continue;
+    }
+
+    if (raw[cursor] === "-" || isDigit(raw[cursor])) {
+      const end = jsonNumberEnd(raw, cursor);
+      if (end !== null) {
+        assertSafeJsonNumberToken(raw.slice(cursor, end));
+        cursor = end;
+        continue;
+      }
+    }
+    cursor += 1;
+  }
+}
+
+async function parseJsonResponse<T>(response: Response): Promise<T> {
+  const raw = await response.text();
+  assertSafeJsonIntegers(raw);
+  return JSON.parse(raw) as T;
+}
 
 export class ApiError extends Error {
   status: number;
@@ -71,7 +183,7 @@ async function request(
   }
   if (body !== undefined) {
     init.headers = { ...init.headers, "Content-Type": "application/json" };
-    init.body = JSON.stringify(body);
+    init.body = stringifyJsonSafely(body);
   }
   let res: Response;
   try {
@@ -93,7 +205,7 @@ async function request(
 
 async function getJson<T>(path: string): Promise<T> {
   const res = await request("GET", path);
-  return (await res.json()) as T;
+  return await parseJsonResponse<T>(res);
 }
 
 async function getText(path: string): Promise<string> {
@@ -109,7 +221,7 @@ async function sendJson<T>(
   const res = await request(method, path, body);
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) {
-    return (await res.json()) as T;
+    return await parseJsonResponse<T>(res);
   }
   return (await res.text()) as unknown as T;
 }
@@ -580,6 +692,23 @@ export interface ModelDeployment {
   rollout: RolloutPolicy;
 }
 
+export interface ModelDeploymentRequest {
+  model: string;
+  variant?: string | null;
+  heterogeneous_variants?: boolean;
+  replicas?: number;
+  required_labels?: Record<string, string>;
+  spread_by?: string[];
+  pull?: PullPolicy;
+  warm?: boolean;
+  keep_alive_secs?: number | null;
+  max_concurrency?: number | null;
+  max_queue_depth?: number;
+  queue_timeout_ms?: number;
+  engine?: EngineChoice;
+  rollout?: RolloutPolicy;
+}
+
 export interface DeploymentDocument {
   schema_version: number;
   authority: ModelHostAuthority;
@@ -591,7 +720,7 @@ export interface DeploymentDocument {
 
 export interface DeploymentReplacementRequest {
   expected_revision: number | null;
-  deployments: Record<string, ModelDeployment>;
+  deployments: Record<string, ModelDeploymentRequest>;
 }
 
 export interface ReconcilePlan {
@@ -618,11 +747,14 @@ export interface ModelManagementErrorResponse {
 export interface ClusterDeploymentBundleDraft {
   catalog_revision: string;
   revision: number;
-  deployments: Record<string, ModelDeployment>;
+  deployments: Record<string, ModelDeploymentRequest>;
 }
 
-export interface ClusterDeploymentBundle extends ClusterDeploymentBundleDraft {
+export interface ClusterDeploymentBundle {
   schema_version: number;
+  catalog_revision: string;
+  revision: number;
+  deployments: Record<string, ModelDeployment>;
   content_digest: string;
 }
 
