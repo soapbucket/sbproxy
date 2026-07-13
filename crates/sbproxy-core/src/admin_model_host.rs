@@ -90,6 +90,8 @@ struct CatalogVariantMetadata {
     engines: Vec<sbproxy_model_host::EngineKind>,
     accelerators: BTreeSet<sbproxy_model_host::AcceleratorKind>,
     min_memory_bytes: u64,
+    download_size_bytes: u64,
+    certification: String,
     stability: sbproxy_model_host::SupportLevel,
 }
 
@@ -269,17 +271,25 @@ fn catalog_response(runtime: &impl ModelManagementRuntime) -> Resp {
             let variants = entry
                 .variants
                 .iter()
-                .map(|variant| CatalogVariantMetadata {
-                    id: variant.id.clone(),
-                    format: variant.format,
-                    quant: bounded_metadata(&variant.quant),
-                    engines: variant.engines.clone(),
-                    accelerators: variant.requirements.accelerators.clone(),
-                    min_memory_bytes: variant.requirements.min_memory_bytes,
-                    stability: variant.stability,
+                .map(|variant| {
+                    let download_size_bytes = variant
+                        .files
+                        .iter()
+                        .try_fold(0u64, |total, file| total.checked_add(file.size_bytes))?;
+                    Some(CatalogVariantMetadata {
+                        id: variant.id.clone(),
+                        format: variant.format,
+                        quant: bounded_metadata(&variant.quant),
+                        engines: variant.engines.clone(),
+                        accelerators: variant.requirements.accelerators.clone(),
+                        min_memory_bytes: variant.requirements.min_memory_bytes,
+                        download_size_bytes,
+                        certification: bounded_metadata(&variant.certification),
+                        stability: variant.stability,
+                    })
                 })
-                .collect();
-            (
+                .collect::<Option<Vec<_>>>()?;
+            Some((
                 id.clone(),
                 CatalogModelMetadata {
                     params: bounded_metadata(&entry.params),
@@ -288,9 +298,13 @@ fn catalog_response(runtime: &impl ModelManagementRuntime) -> Resp {
                     context_length: entry.context_length,
                     variants,
                 },
-            )
+            ))
         })
-        .collect();
+        .collect::<Option<BTreeMap<_, _>>>();
+    let Some(models) = models else {
+        tracing::error!("model catalog variant download size overflow");
+        return error_response(500, "internal", "model catalog metadata unavailable");
+    };
     json_response(
         200,
         &CatalogResponse {
@@ -914,6 +928,54 @@ mod tests {
         }
     }
 
+    fn catalog_metadata_fixture(
+        first_size_bytes: u64,
+        second_size_bytes: u64,
+        certification: &str,
+    ) -> Catalog {
+        Catalog::from_yaml(&format!(
+            r#"
+schema_version: 2
+catalog_revision: admin-catalog-fixture
+models:
+  admin-fixture:
+    params: 1B
+    license: apache-2.0
+    family: fixture
+    context_length: 4096
+    variants:
+      - id: q4_k_m
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: hf:Private/SecretRepo
+        revision: private-source-revision
+        files:
+          - path: private/config.json
+            sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            size_bytes: {first_size_bytes}
+          - path: private/weights.gguf
+            sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+            size_bytes: {second_size_bytes}
+        requirements:
+          accelerators: [cpu, metal]
+          min_memory_bytes: 1024
+        stability: preview
+        certification: {certification}
+"#,
+        ))
+        .expect("admin catalog fixture")
+    }
+
+    fn fake_runtime_with_catalog(catalog: Catalog) -> FakeManagementRuntime {
+        let mut runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+        );
+        runtime.catalog = Arc::new(catalog);
+        runtime
+    }
+
     fn valid_put_body(expected_revision: &str, model: &str, variant: &str) -> String {
         format!(
             r#"{{
@@ -934,11 +996,12 @@ mod tests {
     }
 
     #[test]
-    fn catalog_route_returns_only_bounded_active_metadata() {
-        let runtime = fake_runtime(
-            sbproxy_config::ModelHostAuthority::AdminManaged,
-            Err(AdminDeploymentRevisionError::Store("unused".to_string())),
-        );
+    fn catalog_route_returns_exact_bounded_active_metadata_only() {
+        let runtime = fake_runtime_with_catalog(catalog_metadata_fixture(
+            17,
+            25,
+            "fixture-certification-2026-07-12",
+        ));
 
         let (status, content_type, body) =
             dispatch_with_runtime(&runtime, "GET", "/admin/model-host/catalog", None)
@@ -953,15 +1016,85 @@ mod tests {
             runtime.catalog.catalog_revision
         );
         assert_eq!(
-            response["models"]["qwen2.5-0.5b-instruct"]["variants"][0]["id"],
+            response["models"]["admin-fixture"]["variants"][0]["id"],
             "q4_k_m"
+        );
+        let variant = &response["models"]["admin-fixture"]["variants"][0];
+        assert_eq!(variant["download_size_bytes"], 42);
+        assert_eq!(variant["certification"], "fixture-certification-2026-07-12");
+        assert_eq!(
+            variant
+                .as_object()
+                .expect("variant metadata object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "accelerators",
+                "certification",
+                "download_size_bytes",
+                "engines",
+                "format",
+                "id",
+                "min_memory_bytes",
+                "quant",
+                "stability",
+            ])
         );
         assert!(!body.contains("hf_repo"));
         assert!(!body.contains("hf_token"));
-        assert!(!body.contains("source"));
-        assert!(!body.contains("files"));
-        assert!(!body.contains("sha256"));
-        assert!(!body.contains("qwen2.5-0.5b-instruct-q4_k_m.gguf"));
+        assert!(!body.contains("\"source\""));
+        assert!(!body.contains("\"revision\""));
+        assert!(!body.contains("\"files\""));
+        assert!(!body.contains("\"path\""));
+        assert!(!body.contains("\"sha256\""));
+        assert!(!body.contains("\"token\""));
+        assert!(!body.contains("hf:Private/SecretRepo"));
+        assert!(!body.contains("private-source-revision"));
+        assert!(!body.contains("private/config.json"));
+        assert!(!body.contains("private/weights.gguf"));
+        assert!(!body.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn catalog_route_bounds_certification_display_metadata() {
+        let certification = "c".repeat(257);
+        let runtime = fake_runtime_with_catalog(catalog_metadata_fixture(17, 25, &certification));
+
+        let (status, _, body) =
+            dispatch_with_runtime(&runtime, "GET", "/admin/model-host/catalog", None)
+                .expect("catalog route");
+        let response: serde_json::Value = serde_json::from_str(&body).expect("catalog response");
+
+        assert_eq!(status, 200);
+        let returned = response["models"]["admin-fixture"]["variants"][0]["certification"]
+            .as_str()
+            .expect("bounded certification");
+        assert_eq!(returned.chars().count(), 256);
+        assert_eq!(returned, "c".repeat(256));
+    }
+
+    #[test]
+    fn catalog_route_returns_stable_internal_error_when_download_size_overflows() {
+        let runtime = fake_runtime_with_catalog(catalog_metadata_fixture(u64::MAX, 1, "fixture"));
+
+        let (status, content_type, body) =
+            dispatch_with_runtime(&runtime, "GET", "/admin/model-host/catalog", None)
+                .expect("catalog route");
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error response");
+
+        assert_eq!(status, 500);
+        assert_eq!(content_type, JSON);
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "code": "internal",
+                "error": "model catalog metadata unavailable",
+            })
+        );
+        assert!(!body.contains("admin-fixture"));
+        assert!(!body.contains("Private"));
+        assert!(!body.contains("private-source-revision"));
     }
 
     #[test]
