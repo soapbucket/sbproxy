@@ -245,7 +245,7 @@ impl AdminIpFilter {
 // --- Request Log ---
 
 /// Recent request log entry stored in a ring buffer.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RequestLogEntry {
     /// RFC 3339 timestamp marking when the request was processed.
     pub timestamp: String,
@@ -261,6 +261,36 @@ pub struct RequestLogEntry {
     pub latency_ms: f64,
     /// Client IP address as observed by the proxy.
     pub client_ip: String,
+    /// Request id, correlating the ring row with the access log line
+    /// and the trace (WOR-1874).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// W3C trace id when tracing is active; the admin LogsView renders
+    /// it as an operator-configured deep link (WOR-1870).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// AI provider that served the request, when the AI gateway did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// AI model, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Prompt tokens, when the AI usage parser reported them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    /// Completion tokens, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    /// Derived AI cost in micro-USD (WOR-1874).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+    /// Category of the guardrail that intervened, when one did
+    /// (WOR-1874).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardrail_category: Option<String>,
+    /// What the intervening guardrail did (`block` today; WOR-1874).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardrail_action: Option<String>,
 }
 
 // --- Admin State ---
@@ -519,6 +549,8 @@ impl AdminState {
         status: Option<u16>,
         method: Option<&str>,
         path_sub: Option<&str>,
+        guardrail_action: Option<&str>,
+        guardrail_category: Option<&str>,
         offset: usize,
         limit: usize,
     ) -> Vec<RequestLogEntry> {
@@ -531,6 +563,12 @@ impl AdminState {
             .filter(|e| status.is_none_or(|s| e.status == s))
             .filter(|e| method.is_none_or(|m| e.method.eq_ignore_ascii_case(m)))
             .filter(|e| path_sub.is_none_or(|p| e.path.contains(p)))
+            // WOR-1874: exact-match filters on the guardrail columns so
+            // the Guardrails admin view can deep-link to blocked rows.
+            .filter(|e| guardrail_action.is_none_or(|a| e.guardrail_action.as_deref() == Some(a)))
+            .filter(|e| {
+                guardrail_category.is_none_or(|c| e.guardrail_category.as_deref() == Some(c))
+            })
             .skip(offset)
             .take(limit)
             .cloned()
@@ -1801,6 +1839,9 @@ pub fn handle_admin_request(
         let status = rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok());
         let method_f = rl_query_param(path, "method");
         let path_f = rl_query_param(path, "path");
+        // WOR-1874: guardrail-column filters.
+        let guardrail_action_f = rl_query_param(path, "guardrail_action");
+        let guardrail_category_f = rl_query_param(path, "guardrail_category");
         let offset = rl_query_param(path, "offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -1808,7 +1849,15 @@ pub fn handle_admin_request(
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(state.config.max_log_entries)
             .min(state.config.max_log_entries);
-        let entries = state.query_requests(status, method_f, path_f, offset, limit);
+        let entries = state.query_requests(
+            status,
+            method_f,
+            path_f,
+            guardrail_action_f,
+            guardrail_category_f,
+            offset,
+            limit,
+        );
         return match serde_json::to_string(&entries) {
             Ok(body) => (200, "application/json", body),
             Err(e) => (
@@ -2968,6 +3017,7 @@ mod tests {
             status: 200,
             latency_ms: 1.5,
             client_ip: "127.0.0.1".to_string(),
+            ..Default::default()
         });
         let entries = state.get_recent_requests(10);
         assert_eq!(entries.len(), 1);
@@ -2986,6 +3036,7 @@ mod tests {
                 status: 200,
                 latency_ms: 0.0,
                 client_ip: "127.0.0.1".to_string(),
+                ..Default::default()
             });
         }
         let entries = state.get_recent_requests(10);
@@ -3007,6 +3058,7 @@ mod tests {
                 status: 200,
                 latency_ms: 0.0,
                 client_ip: "127.0.0.1".to_string(),
+                ..Default::default()
             });
         }
         let entries = state.get_recent_requests(100);
@@ -3034,26 +3086,63 @@ mod tests {
                 status: if i < 5 { 200 } else { 500 },
                 latency_ms: 1.0,
                 client_ip: "127.0.0.1".to_string(),
+                ..Default::default()
             });
         }
         // Status filter.
-        let errs = state.query_requests(Some(500), None, None, 0, 100);
+        let errs = state.query_requests(Some(500), None, None, None, None, 0, 100);
         assert_eq!(errs.len(), 5);
         assert!(errs.iter().all(|e| e.status == 500));
         // Method filter (case-insensitive).
-        let posts = state.query_requests(None, Some("post"), None, 0, 100);
+        let posts = state.query_requests(None, Some("post"), None, None, None, 0, 100);
         assert_eq!(posts.len(), 5);
         // Path substring.
         assert_eq!(
             state
-                .query_requests(None, None, Some("/thing/7"), 0, 100)
+                .query_requests(None, None, Some("/thing/7"), None, None, 0, 100)
                 .len(),
             1
         );
         // Pagination: newest-first, skip 2, take 3.
-        let page = state.query_requests(None, None, None, 2, 3);
+        let page = state.query_requests(None, None, None, None, None, 2, 3);
         assert_eq!(page.len(), 3);
         assert_eq!(page[0].path, "/api/thing/7");
+    }
+
+    #[test]
+    fn query_requests_filters_on_guardrail_columns() {
+        // WOR-1874: `guardrail_action` / `guardrail_category` filter
+        // exactly, so the Guardrails view can deep-link to blocked rows.
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 400,
+            latency_ms: 3.0,
+            client_ip: "127.0.0.1".to_string(),
+            guardrail_category: Some("pii".to_string()),
+            guardrail_action: Some("block".to_string()),
+            ..Default::default()
+        });
+        state.log_request(RequestLogEntry {
+            timestamp: "t1".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 200,
+            latency_ms: 2.0,
+            client_ip: "127.0.0.1".to_string(),
+            ..Default::default()
+        });
+        let blocked = state.query_requests(None, None, None, Some("block"), None, 0, 10);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].guardrail_category.as_deref(), Some("pii"));
+        let pii = state.query_requests(None, None, None, Some("block"), Some("pii"), 0, 10);
+        assert_eq!(pii.len(), 1);
+        let none = state.query_requests(None, None, None, Some("redact"), None, 0, 10);
+        assert!(none.is_empty());
     }
 
     #[test]
@@ -3110,6 +3199,7 @@ mod tests {
                 status: 200,
                 latency_ms: 0.0,
                 client_ip: "127.0.0.1".to_string(),
+                ..Default::default()
             });
         }
         let entries = state.get_recent_requests(2);
@@ -3260,6 +3350,7 @@ mod tests {
             status: 200,
             latency_ms: 0.0,
             client_ip: "127.0.0.1".to_string(),
+            ..Default::default()
         });
         let auth = basic_auth("admin", "secret");
         let (status, _, body) =

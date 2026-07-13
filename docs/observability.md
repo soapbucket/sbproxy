@@ -340,6 +340,16 @@ Required when the line is request-scoped:
 
 Per-request lifecycle lines (`request_started`, `request_completed`, `request_error`) carry the same body as `RequestEvent` (`agent_id`, `agent_class`, `rail`, `shape`, `status_code`, `latency_ms`, `error_class`).
 
+AI request lines additionally carry the spend and governance columns log-only consumers grep for first:
+
+| Field | Type | Notes |
+|---|---|---|
+| `cost_usd_micros` | integer | Derived AI request cost in micro-USD (`1e-6` USD). Integer so log math is exact. Present on AI requests including zero-cost cache hits; absent on non-AI traffic. Same value the cost metric, span, and usage ledger carry. |
+| `guardrail_category` | string | Configured guardrail / rule name that intervened. Absent when no guardrail intervened. |
+| `guardrail_action` | string enum | What the guardrail did. `block` is the only live action today; `redact`, `rewrite`, and `hold` are reserved. |
+
+The same three columns ride the `RequestEvent` envelope and the admin request ring, and `/api/requests` accepts `guardrail_action=` and `guardrail_category=` as exact-match query filters alongside the existing `status`, `method`, and `path` params.
+
 Event types pinned for Wave 1: `request_started`, `request_completed`, `request_error`, `policy_evaluated`, `policy_blocked`, `action_challenge_issued`, `action_redeemed`, `ledger_call`, `audit_emit`, `notify_dispatch`, `boot`, `config_reload`, `health_status_change`.
 
 ### Redaction policy

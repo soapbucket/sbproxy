@@ -4050,6 +4050,17 @@ impl ProxyHttp for SbProxy {
                     .client_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_default(),
+                // WOR-1874: correlation + AI columns so LogsView rows
+                // expand usefully and the guardrail filters have data.
+                request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
+                trace_id: ctx.trace_ctx.as_ref().map(|t| t.trace_id.clone()),
+                provider: ctx.ai_provider.clone(),
+                model: ctx.ai_model.clone(),
+                tokens_in: ctx.ai_tokens_in,
+                tokens_out: ctx.ai_tokens_out,
+                cost_usd_micros: ctx.ai_cost_usd_micros,
+                guardrail_category: ctx.ai_guardrail_category.clone(),
+                guardrail_action: ctx.ai_guardrail_action.clone(),
             });
         }
 

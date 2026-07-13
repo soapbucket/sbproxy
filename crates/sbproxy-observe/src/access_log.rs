@@ -306,6 +306,22 @@ pub struct AccessLogEntry {
     /// `None` for successful requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<String>,
+    /// WOR-1874: derived AI request cost in micro-USD (`1e-6` USD).
+    /// Integer so log math is exact. Present on AI requests including
+    /// zero-cost cache hits; absent on non-AI traffic. Same value the
+    /// cost metric, span, and usage ledger carry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+    /// WOR-1874: category (configured guardrail / rule name) of the
+    /// guardrail that intervened on this request. Absent when no
+    /// guardrail intervened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardrail_category: Option<String>,
+    /// WOR-1874: what the intervening guardrail did. `block` is the
+    /// only live action today; `redact`, `rewrite`, and `hold` are
+    /// reserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardrail_action: Option<String>,
 
     // --- Wave 1 / G1.6 per-agent dimensions ---
     /// Stable agent identifier from the agent-class catalog (e.g.
@@ -603,6 +619,9 @@ impl Default for AccessLogEntry {
             classifier_prompt: None,
             classifier_intent: None,
             error_class: None,
+            cost_usd_micros: None,
+            guardrail_category: None,
+            guardrail_action: None,
             agent_id: None,
             agent_class: None,
             agent_vendor: None,
@@ -756,6 +775,19 @@ impl AccessLogEntryBuilder {
         self.inner.shape = Some(shape.into());
         self
     }
+    /// Set the derived AI cost in micro-USD (WOR-1874).
+    pub fn cost_usd_micros(mut self, cost: u64) -> Self {
+        self.inner.cost_usd_micros = Some(cost);
+        self
+    }
+
+    /// Set the intervening guardrail's category and action (WOR-1874).
+    pub fn guardrail(mut self, category: impl Into<String>, action: impl Into<String>) -> Self {
+        self.inner.guardrail_category = Some(category.into());
+        self.inner.guardrail_action = Some(action.into());
+        self
+    }
+
     /// Set the quote price in micro-units of `currency`.
     pub fn price(mut self, price: u64) -> Self {
         self.inner.price = Some(price);
@@ -891,6 +923,9 @@ mod tests {
             classifier_prompt: None,
             classifier_intent: None,
             error_class: None,
+            cost_usd_micros: None,
+            guardrail_category: None,
+            guardrail_action: None,
             agent_id: None,
             agent_class: None,
             agent_vendor: None,
@@ -926,6 +961,27 @@ mod tests {
         assert_eq!(v["bytes_in"], 128);
         assert_eq!(v["bytes_out"], 512);
         assert_eq!(v["client_ip"], "10.0.0.1");
+    }
+
+    #[test]
+    fn cost_and_guardrail_columns_serialize_and_omit() {
+        // WOR-1874: the AI cost and guardrail columns serialize with
+        // exact keys when set and are omitted entirely when None.
+        let mut entry = minimal_entry();
+        entry.cost_usd_micros = Some(4_500);
+        entry.guardrail_category = Some("pii".to_string());
+        entry.guardrail_action = Some("block".to_string());
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cost_usd_micros"], 4_500);
+        assert_eq!(v["guardrail_category"], "pii");
+        assert_eq!(v["guardrail_action"], "block");
+
+        let bare = serde_json::to_string(&minimal_entry()).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&bare).unwrap();
+        assert!(b.get("cost_usd_micros").is_none());
+        assert!(b.get("guardrail_category").is_none());
+        assert!(b.get("guardrail_action").is_none());
     }
 
     #[test]

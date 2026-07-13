@@ -241,6 +241,10 @@ pub fn dispatch_terminal_event(
     ev.tokens_in = ctx.ai_tokens_in.and_then(|v| u32::try_from(v).ok());
     ev.tokens_out = ctx.ai_tokens_out.and_then(|v| u32::try_from(v).ok());
     ev.cost_usd_micros = ctx.ai_cost_usd_micros;
+    // WOR-1874: guardrail intervention columns, mirrored onto the
+    // event envelope so log-only consumers can filter on them.
+    ev.guardrail_category = ctx.ai_guardrail_category.clone();
+    ev.guardrail_action = ctx.ai_guardrail_action.clone();
     ev.status_code = ctx.response_status;
     ev.error_class = error_class.map(str::to_string);
     ev.request_geo = ctx.request_geo.clone();
