@@ -295,51 +295,48 @@ Commit: `git commit -m "WOR-1847: authenticate dispatch envelopes"`
 - Produces: current-generation `candidate_replicas` including ready and cold assigned replicas.
 - Produces: `ManagedReplicaRouter::ordered_candidates(view, deployment, input)` and `ReplicaSelectionTrace`.
 
-- [ ] **Step 1: Write failing directory projection tests**
+- [x] **Step 1: Write failing directory projection tests**
 
 ```rust,no_run
 #[test]
 fn directory_keeps_current_generation_cold_candidates_and_device_utilization() {
-    let view = collect(snapshot_with_loading_replica_and_utilization(0.72));
+    let view = collect(snapshot_with_preparing_replica_and_utilization(0.72));
     let replica = &view.candidate_replicas["qwen"][0];
-    assert_eq!(replica.state, DeploymentRuntimeState::Loading);
+    assert_eq!(replica.state, DeploymentRuntimeState::Preparing);
     assert_eq!(replica.compute_utilization_millis, Some(720));
     assert_eq!(replica.model_plane_health, ModelPlaneHealth::Ready);
 }
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `cargo test -p sbproxy-model-host --test model_directory directory_keeps_current_generation_cold_candidates -- --nocapture`
 
 Expected: FAIL because the snapshot and directory omit those fields/indexes.
 
-- [ ] **Step 3: Extend bounded snapshot truth and normalization**
+- [x] **Step 3: Extend bounded snapshot truth and normalization**
 
 ```rust,no_run
 pub struct NodeDeviceSnapshot {
     // existing fields
-    #[serde(default)]
     pub compute_utilization_millis: Option<u16>,
-    #[serde(default)]
     pub memory_occupancy_millis: Option<u16>,
 }
 
 pub struct NodeHealthSnapshot {
     pub state: NodeHealthState,
     pub reason_codes: Vec<String>,
-    #[serde(default)]
     pub model_plane: ModelPlaneHealth,
 }
 ```
 
 Represent ratios as integer thousandths so equality, schema, and JavaScript safety remain exact. Bump the node snapshot schema and normalize the prior schema by treating missing utilization as unknown and the prior advertised endpoint as model-plane `Unavailable` until a listener reports ready.
 
-- [ ] **Step 4: Write failing router tests**
+- [x] **Step 4: Write failing router tests**
 
 ```rust,no_run
 #[test]
-fn ready_adapter_region_and_queue_precede_local_tie_break() {
+fn ready_adapter_region_and_queue_precede_remote_ties() {
     let ordered = route(candidates(), input("gateway-a", Some("finance"), Some("us-central1")));
     assert_eq!(ordered[0].node_id, "worker-ready-adapter-low-queue");
 }
@@ -357,13 +354,13 @@ fn equivalent_local_replica_wins_without_peer_hop() {
 }
 ```
 
-- [ ] **Step 5: Run router tests and verify RED**
+- [x] **Step 5: Run router tests and verify RED**
 
 Run: `cargo test -p sbproxy-ai --test managed_replica_routing -- --nocapture`
 
 Expected: compile failure because the router module does not exist.
 
-- [ ] **Step 6: Implement deterministic ordered selection**
+- [x] **Step 6: Implement deterministic ordered selection**
 
 ```rust,no_run
 pub struct ManagedReplicaInput<'a> {
@@ -383,9 +380,9 @@ pub struct ReplicaSelectionTrace {
 }
 ```
 
-Filter before scoring. Rank readiness, adapter match, region match, known compute, queue depth, active requests, compute utilization, prefix rendezvous score, local equivalence, then stable node ID. Unknown utilization receives the maximum utilization penalty, never zero. Return all distinct eligible candidates in retry order plus bounded exclusion counts.
+Filter generation, health, endpoint, lifecycle, and adapter requirements before scoring. Rank readiness, model-plane health, region match, queue depth, active requests, known compute and memory utilization, local equivalence, prefix rendezvous score, then stable node ID. Unknown utilization receives the maximum utilization penalty, never zero. Return all distinct eligible candidates in retry order plus bounded exclusion counts.
 
-- [ ] **Step 7: Run focused tests and commit**
+- [x] **Step 7: Run focused tests and commit**
 
 Run: `cargo test -p sbproxy-model-host --test model_directory && cargo test -p sbproxy-ai --test managed_replica_routing`
 

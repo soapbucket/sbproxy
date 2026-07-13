@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current node model snapshot schema.
-pub const NODE_MODEL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const NODE_MODEL_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// Typed cluster-state namespace used for node snapshots.
 pub const NODE_MODEL_SNAPSHOT_NAMESPACE: &str = "model-snapshots";
 /// Maximum accepted serialized snapshot size.
@@ -105,6 +105,19 @@ pub enum NodeHealthState {
     Unhealthy,
 }
 
+/// Health of the authenticated private model-plane listener.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPlaneHealth {
+    /// Authenticated dispatch is accepting requests normally.
+    Ready,
+    /// Dispatch is accepting requests with a bounded impairment.
+    Degraded,
+    /// No safe model-plane listener is currently available.
+    #[default]
+    Unavailable,
+}
+
 /// Worker health and stable redacted reason codes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +126,8 @@ pub struct NodeHealthSnapshot {
     pub state: NodeHealthState,
     /// Machine-stable reasons, never raw error text.
     pub reason_codes: Vec<String>,
+    /// Private model-plane listener health, independent of membership.
+    pub model_plane: ModelPlaneHealth,
 }
 
 /// Engine availability and placement capabilities visible to peers.
@@ -224,6 +239,10 @@ pub struct NodeDeviceSnapshot {
     pub compute_capability: Option<NodeComputeCapability>,
     /// Whether the device supports usable FP8 kernels.
     pub supports_fp8: bool,
+    /// Compute-engine utilization in integer thousandths, when reported.
+    pub compute_utilization_millis: Option<u16>,
+    /// Device-memory occupancy in integer thousandths, when reported.
+    pub memory_occupancy_millis: Option<u16>,
 }
 
 impl TryFrom<GpuDescriptor> for NodeDeviceSnapshot {
@@ -255,6 +274,14 @@ impl TryFrom<&GpuDescriptor> for NodeDeviceSnapshot {
                 .compute_capability
                 .map(|(major, minor)| NodeComputeCapability { major, minor }),
             supports_fp8: value.supports_fp8,
+            compute_utilization_millis: ratio_millis(
+                "device compute utilization",
+                value.compute_utilization,
+            )?,
+            memory_occupancy_millis: ratio_millis(
+                "device memory occupancy",
+                value.memory_occupancy,
+            )?,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -279,8 +306,29 @@ impl NodeDeviceSnapshot {
         if self.compute_capability.is_some() && self.vendor != GpuVendor::Nvidia {
             return invalid("compute capability is valid only for NVIDIA devices");
         }
+        if self
+            .compute_utilization_millis
+            .is_some_and(|value| value > 1_000)
+            || self
+                .memory_occupancy_millis
+                .is_some_and(|value| value > 1_000)
+        {
+            return invalid("device utilization must be between 0 and 1000 thousandths");
+        }
         Ok(())
     }
+}
+
+fn ratio_millis(field: &str, ratio: Option<f64>) -> Result<Option<u16>, NodeSnapshotError> {
+    let Some(ratio) = ratio else {
+        return Ok(None);
+    };
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return invalid(format!(
+            "{field} must be a finite ratio between zero and one"
+        ));
+    }
+    Ok(Some((ratio * 1_000.0).round() as u16))
 }
 
 /// Public cache state for one immutable artifact.

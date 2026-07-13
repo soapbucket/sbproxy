@@ -984,6 +984,7 @@ impl ProductionModelRuntime {
             health: NodeHealthSnapshot {
                 state: health_state,
                 reason_codes: health_reasons.into_iter().collect(),
+                model_plane: sbproxy_model_host::node_snapshot::ModelPlaneHealth::Unavailable,
             },
             engines: inventory.engines,
             devices: inventory.devices,
@@ -2064,6 +2065,8 @@ mod tests {
                 available_memory_bytes: 64_000_000_000,
                 compute_capability: None,
                 supports_fp8: false,
+                compute_utilization_millis: None,
+                memory_occupancy_millis: None,
             }],
             artifacts: Vec::new(),
         }

@@ -8,14 +8,13 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use sbproxy_model_host::node_snapshot::{
-    NodeArtifactSnapshot, NodeDeviceSnapshot, NodeEngineSnapshot, NodeHealthSnapshot,
-    NodeHealthState, NodeIdentitySnapshot, NodeModelSnapshot, NodeReplicaSnapshot, NodeRole,
-    NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+    ModelPlaneHealth, NodeHealthSnapshot, NodeHealthState, NodeModelSnapshot, NodeReplicaSnapshot,
+    NodeRole, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
 };
 use sbproxy_model_host::{DeploymentGenerationFence, DeploymentRuntimeState};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-const DIRECTORY_SCHEMA_VERSION: u32 = 1;
+const DIRECTORY_SCHEMA_VERSION: u32 = 2;
 const MAX_DIRECTORY_MEMBERS: usize = 1_024;
 const MAX_DIRECTORY_ROSTER: usize = 4_096;
 const MAX_NODE_ID_BYTES: usize = 128;
@@ -185,7 +184,7 @@ pub enum ModelDirectoryHealth {
     Unhealthy,
 }
 
-/// One eligible ready replica indexed for later peer routing.
+/// One current-generation replica candidate indexed for local or peer routing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelDirectoryReplica {
     /// Worker node ID.
@@ -206,6 +205,16 @@ pub struct ModelDirectoryReplica {
     pub active_requests: u64,
     /// Admission queue depth.
     pub queue_depth: u64,
+    /// Public adapter names supported by this replica.
+    pub adapters: Vec<String>,
+    /// Placement and failure-domain labels inherited from the worker identity.
+    pub node_labels: BTreeMap<String, String>,
+    /// Highest known compute utilization across selected devices, in thousandths.
+    pub compute_utilization_millis: Option<u16>,
+    /// Highest known memory occupancy across selected devices, in thousandths.
+    pub memory_occupancy_millis: Option<u16>,
+    /// Health of the worker's authenticated private model plane.
+    pub model_plane_health: ModelPlaneHealth,
 }
 
 /// One member in the immutable directory view.
@@ -292,6 +301,8 @@ pub struct ModelDirectoryView {
     pub nodes: Vec<ModelDirectoryNode>,
     /// Ready current-generation replicas by deployment.
     pub eligible_replicas: BTreeMap<String, Vec<ModelDirectoryReplica>>,
+    /// Current-generation ready and explicitly cold candidates by deployment.
+    pub candidate_replicas: BTreeMap<String, Vec<ModelDirectoryReplica>>,
     /// Monotonic generation fences retained even when the newest replica is unavailable.
     pub deployment_generation_fences: BTreeMap<String, DeploymentGenerationFence>,
 }
@@ -304,6 +315,7 @@ impl Default for ModelDirectoryView {
             summary: ModelDirectorySummary::default(),
             nodes: Vec::new(),
             eligible_replicas: BTreeMap::new(),
+            candidate_replicas: BTreeMap::new(),
             deployment_generation_fences: BTreeMap::new(),
         }
     }
@@ -468,7 +480,8 @@ impl ModelDirectory {
         } else {
             fence_replica_generations(&mut nodes, &writer.deployment_generation_fences)
         };
-        let eligible_replicas = build_replica_index(&nodes, &active_generations);
+        let candidate_replicas = build_replica_index(&nodes, &active_generations);
+        let eligible_replicas = build_eligible_replica_index(&candidate_replicas);
         let summary = summarize(&nodes, &eligible_replicas, deployment_digest_mismatch);
         let view = Arc::new(ModelDirectoryView {
             schema_version: DIRECTORY_SCHEMA_VERSION,
@@ -476,6 +489,7 @@ impl ModelDirectory {
             summary,
             nodes,
             eligible_replicas,
+            candidate_replicas,
             deployment_generation_fences: writer.deployment_generation_fences.clone(),
         });
         self.view.store(Arc::clone(&view));
@@ -830,11 +844,30 @@ fn apply_snapshot(
             return;
         }
     }
+    match snapshot.health.model_plane {
+        ModelPlaneHealth::Ready => {}
+        ModelPlaneHealth::Degraded => {
+            node.health = ModelDirectoryHealth::Degraded;
+            add_unhealthy_reason(node, "model_plane_degraded");
+        }
+        ModelPlaneHealth::Unavailable => {
+            node.health = ModelDirectoryHealth::Degraded;
+            add_unhealthy_reason(node, "model_plane_unavailable");
+        }
+    }
     if snapshot.node.roles.contains(&NodeRole::Worker) {
         node.model_eligible = true;
     } else {
         node.exclusion_reason = Some(ModelDirectoryExclusionReason::NotWorker);
         node.model_eligible = false;
+    }
+}
+
+fn add_unhealthy_reason(node: &mut ModelDirectoryNode, reason: &str) {
+    let reason = reason.to_string();
+    if !node.unhealthy_reasons.contains(&reason) {
+        node.unhealthy_reasons.push(reason);
+        node.unhealthy_reasons.sort();
     }
 }
 
@@ -951,8 +984,11 @@ fn build_replica_index(
 ) -> BTreeMap<String, Vec<ModelDirectoryReplica>> {
     let mut index = BTreeMap::<String, Vec<ModelDirectoryReplica>>::new();
     for node in nodes.iter().filter(|node| node.model_eligible) {
+        let Some(snapshot) = node.snapshot.as_ref() else {
+            continue;
+        };
         for replica in node.replicas.iter().filter(|replica| {
-            replica.state == DeploymentRuntimeState::Ready
+            is_routing_candidate_state(replica.state)
                 && active_generations
                     .get(&replica.deployment)
                     .is_some_and(|active| replica.deployment_generation == *active)
@@ -970,6 +1006,19 @@ fn build_replica_index(
                     state: replica.state,
                     active_requests: replica.active_requests,
                     queue_depth: replica.queue_depth,
+                    adapters: replica.adapters.clone(),
+                    node_labels: node.labels.clone(),
+                    compute_utilization_millis: selected_device_utilization(
+                        snapshot,
+                        &replica.selected_devices,
+                        |device| device.compute_utilization_millis,
+                    ),
+                    memory_occupancy_millis: selected_device_utilization(
+                        snapshot,
+                        &replica.selected_devices,
+                        |device| device.memory_occupancy_millis,
+                    ),
+                    model_plane_health: snapshot.health.model_plane,
                 });
         }
     }
@@ -977,6 +1026,53 @@ fn build_replica_index(
         replicas.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     }
     index
+}
+
+fn is_routing_candidate_state(state: DeploymentRuntimeState) -> bool {
+    matches!(
+        state,
+        DeploymentRuntimeState::Assigned
+            | DeploymentRuntimeState::Cached
+            | DeploymentRuntimeState::Preparing
+            | DeploymentRuntimeState::Ready
+    )
+}
+
+fn selected_device_utilization(
+    snapshot: &NodeModelSnapshot,
+    selected_devices: &[u32],
+    value: impl Fn(&sbproxy_model_host::node_snapshot::NodeDeviceSnapshot) -> Option<u16>,
+) -> Option<u16> {
+    selected_devices
+        .iter()
+        .filter_map(|selected| {
+            snapshot
+                .devices
+                .iter()
+                .find(|device| device.index == *selected)
+                .and_then(&value)
+        })
+        .max()
+}
+
+fn build_eligible_replica_index(
+    candidates: &BTreeMap<String, Vec<ModelDirectoryReplica>>,
+) -> BTreeMap<String, Vec<ModelDirectoryReplica>> {
+    candidates
+        .iter()
+        .filter_map(|(deployment, replicas)| {
+            let eligible = replicas
+                .iter()
+                .filter(|replica| {
+                    replica.state == DeploymentRuntimeState::Ready
+                        && replica.endpoint.is_some()
+                        && replica.model_plane_health != ModelPlaneHealth::Unavailable
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (!eligible.is_empty()).then(|| (deployment.clone(), eligible))
+        })
+        .collect()
 }
 
 fn summarize(
@@ -1018,49 +1114,83 @@ fn normalize_snapshot(
                 serde_json::to_vec(&envelope.payload).map_err(|_| NormalizeError::Malformed)?;
             NodeModelSnapshot::from_json(&bytes).map_err(|_| NormalizeError::Malformed)
         }
-        0 => {
-            let previous: NodeModelSnapshotV0 = serde_json::from_value(envelope.payload.clone())
-                .map_err(|_| NormalizeError::Malformed)?;
-            if previous.schema_version != 0 {
-                return Err(NormalizeError::Malformed);
-            }
-            let normalized = NodeModelSnapshot {
-                schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
-                node: previous.node,
-                health: NodeHealthSnapshot {
-                    state: NodeHealthState::Ready,
-                    reason_codes: Vec::new(),
-                },
-                engines: previous.engines,
-                devices: previous.devices,
-                artifacts: previous.artifacts,
-                replicas: previous.replicas,
-                placement_weight: previous.placement_weight,
-                active_deployment_digest: None,
-                generation: previous.generation,
-                published_at_unix_ms: previous.published_at_unix_ms,
-                expires_at_unix_ms: previous.expires_at_unix_ms,
-            };
-            normalized
-                .validate()
-                .map_err(|_| NormalizeError::Malformed)?;
-            Ok(normalized)
-        }
+        0 | 1 => normalize_legacy_snapshot(envelope),
         _ => Err(NormalizeError::Incompatible),
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NodeModelSnapshotV0 {
-    schema_version: u32,
-    node: NodeIdentitySnapshot,
-    engines: Vec<NodeEngineSnapshot>,
-    devices: Vec<NodeDeviceSnapshot>,
-    artifacts: Vec<NodeArtifactSnapshot>,
-    replicas: Vec<NodeReplicaSnapshot>,
-    placement_weight: u32,
-    generation: u64,
-    published_at_unix_ms: u64,
-    expires_at_unix_ms: u64,
+fn normalize_legacy_snapshot(
+    envelope: &DirectorySnapshotEnvelope,
+) -> Result<NodeModelSnapshot, NormalizeError> {
+    let mut payload = envelope.payload.clone();
+    let object = payload.as_object_mut().ok_or(NormalizeError::Malformed)?;
+    if object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(u64::from(envelope.schema_version))
+    {
+        return Err(NormalizeError::Malformed);
+    }
+    object.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(NODE_MODEL_SNAPSHOT_SCHEMA_VERSION),
+    );
+
+    if envelope.schema_version == 0 {
+        if object.contains_key("health") || object.contains_key("active_deployment_digest") {
+            return Err(NormalizeError::Malformed);
+        }
+        object.insert(
+            "health".to_string(),
+            serde_json::json!({
+                "state": "ready",
+                "reason_codes": [],
+                "model_plane": "unavailable"
+            }),
+        );
+        object.insert(
+            "active_deployment_digest".to_string(),
+            serde_json::Value::Null,
+        );
+    } else {
+        let health = object
+            .get_mut("health")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(NormalizeError::Malformed)?;
+        if health
+            .insert(
+                "model_plane".to_string(),
+                serde_json::Value::String("unavailable".to_string()),
+            )
+            .is_some()
+        {
+            return Err(NormalizeError::Malformed);
+        }
+    }
+
+    let devices = object
+        .get_mut("devices")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or(NormalizeError::Malformed)?;
+    for device in devices {
+        let device = device.as_object_mut().ok_or(NormalizeError::Malformed)?;
+        if device
+            .insert(
+                "compute_utilization_millis".to_string(),
+                serde_json::Value::Null,
+            )
+            .is_some()
+            || device
+                .insert(
+                    "memory_occupancy_millis".to_string(),
+                    serde_json::Value::Null,
+                )
+                .is_some()
+        {
+            return Err(NormalizeError::Malformed);
+        }
+    }
+
+    let bytes = serde_json::to_vec(&payload).map_err(|_| NormalizeError::Malformed)?;
+    NodeModelSnapshot::from_json(&bytes).map_err(|_| NormalizeError::Malformed)
 }

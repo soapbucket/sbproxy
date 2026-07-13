@@ -351,6 +351,8 @@ fn assert_cluster_placement_converges() -> Result<(), String> {
             available_memory_bytes: 64_000_000_000,
             compute_capability: None,
             supports_fp8: false,
+            compute_utilization_millis: None,
+            memory_occupancy_millis: None,
         }],
         artifacts: Vec::new(),
     };

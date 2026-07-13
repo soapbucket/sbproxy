@@ -120,6 +120,7 @@ cluster:
         health: NodeHealthSnapshot {
             state: NodeHealthState::Unhealthy,
             reason_codes: vec!["fixture_unhealthy".to_string()],
+            model_plane: sbproxy_model_host::node_snapshot::ModelPlaneHealth::Unavailable,
         },
         engines: Vec::new(),
         devices: Vec::new(),

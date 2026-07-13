@@ -750,8 +750,8 @@ mod tests {
             DirectorySnapshotRead, ModelDirectory,
         };
         use sbproxy_model_host::node_snapshot::{
-            NodeHealthSnapshot, NodeHealthState, NodeIdentitySnapshot, NodeModelSnapshot, NodeRole,
-            NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+            ModelPlaneHealth, NodeHealthSnapshot, NodeHealthState, NodeIdentitySnapshot,
+            NodeModelSnapshot, NodeRole, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
         };
 
         let identity = ClusterIdentity {
@@ -774,6 +774,7 @@ mod tests {
             health: NodeHealthSnapshot {
                 state: NodeHealthState::Unhealthy,
                 reason_codes: vec!["engine_unhealthy".to_string()],
+                model_plane: ModelPlaneHealth::Unavailable,
             },
             engines: Vec::new(),
             devices: Vec::new(),
