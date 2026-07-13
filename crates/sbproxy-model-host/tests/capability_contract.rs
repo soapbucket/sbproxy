@@ -69,9 +69,11 @@ fn model_host_capabilities_match_the_cluster_control_plane_boundary() {
     ] {
         assert_eq!(status(id), SupportLevel::Preview, "{id}");
     }
-    for id in ["cluster.remote_dispatch"] {
-        assert_eq!(status(id), SupportLevel::Unsupported, "{id}");
-    }
+    assert_eq!(
+        status("cluster.remote_dispatch"),
+        SupportLevel::Unsupported,
+        "cluster.remote_dispatch"
+    );
 }
 
 #[test]
