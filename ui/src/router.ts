@@ -44,6 +44,18 @@ const routes = [
     meta: { title: "Spend" },
   },
   {
+    path: "/ai-performance",
+    name: "ai-performance",
+    component: () => import("./views/AiPerformanceView.vue"),
+    meta: { title: "AI performance" },
+  },
+  {
+    path: "/guardrails",
+    name: "guardrails",
+    component: () => import("./views/GuardrailsView.vue"),
+    meta: { title: "Guardrails" },
+  },
+  {
     path: "/prompts",
     name: "prompts",
     component: () => import("./views/PromptsView.vue"),
