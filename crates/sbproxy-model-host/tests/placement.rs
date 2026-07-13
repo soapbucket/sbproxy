@@ -77,6 +77,7 @@ fn deployment(replicas: u32) -> ModelDeployment {
         spread_by: Vec::new(),
         pull: PullPolicy::OnDemand,
         warm: false,
+        cold_start: sbproxy_model_host::ColdStartPolicy::Wait,
         keep_alive_secs: None,
         max_concurrency: Some(8),
         max_queue_depth: 128,

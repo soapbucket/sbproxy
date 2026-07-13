@@ -12,8 +12,9 @@ pub(crate) use request::{multipart_model, rewrite_engine_model};
 
 pub use client::{ModelPlaneClient, ModelPlaneClientSecurity, ModelPlaneResponse};
 pub use dispatch::{
-    dispatch_managed_candidates, ManagedAttemptResponse, ManagedAttemptTrace,
-    ManagedDispatchFailure, ManagedDispatchOutcome, ManagedReplicaExecutor, ManagedRouteTrace,
+    choose_cold_start_candidates, dispatch_managed_candidates, ManagedAttemptResponse,
+    ManagedAttemptTrace, ManagedColdStartDecision, ManagedDispatchFailure, ManagedDispatchOutcome,
+    ManagedReplicaExecutor, ManagedRouteTrace,
 };
 pub use envelope::{
     body_sha256_hex, DispatchAuthProof, DispatchEnvelope, DispatchEnvelopeError, DispatchSigner,

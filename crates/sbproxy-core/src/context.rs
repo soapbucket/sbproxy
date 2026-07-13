@@ -693,6 +693,8 @@ pub struct RequestContext {
     /// the access log records the resolved model even when the
     /// upstream errors before returning a body.
     pub ai_model: Option<String>,
+    /// Public logical model after caller and gateway policy, before provider mapping.
+    pub ai_logical_model: Option<String>,
     /// Set when the dispatched provider hosts its model on this box
     /// (a `serve:` provider): the serve-entry name the client asked
     /// for. The response handler rewrites the upstream body's `model`
@@ -734,6 +736,8 @@ pub struct RequestContext {
     pub managed_route_trace: Option<crate::model_plane::ManagedRouteTrace>,
     /// Direct local or authenticated peer route selected for a managed request.
     pub managed_route_class: Option<sbproxy_ai::managed_replica::ManagedRouteClass>,
+    /// Stable managed-model reason retained while a fallback provider is attempted.
+    pub managed_fallback_reason: Option<&'static str>,
     /// Derived AI request cost in micro-USD (`1e-6` USD), computed
     /// from the same pricing catalog used by AI billing metrics.
     pub ai_cost_usd_micros: Option<u64>,
@@ -1125,6 +1129,7 @@ impl RequestContext {
             principal: sbproxy_plugin::Principal::anonymous(),
             attribution_tags: sbproxy_ai::attribution::AttributionTags::default(),
             ai_model: None,
+            ai_logical_model: None,
             ai_serve_model: None,
             ai_tokens_in: None,
             ai_prompt_tokens_est: None,
@@ -1135,6 +1140,7 @@ impl RequestContext {
             managed_model_permit: None,
             managed_route_trace: None,
             managed_route_class: None,
+            managed_fallback_reason: None,
             ai_cost_usd_micros: None,
             ai_surface: None,
             ai_outcome: None,

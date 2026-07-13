@@ -22,6 +22,7 @@ fn deployment(model: &str) -> ModelDeployment {
         spread_by: vec!["zone".to_string()],
         pull: PullPolicy::OnDemand,
         warm: true,
+        cold_start: sbproxy_model_host::ColdStartPolicy::Wait,
         keep_alive_secs: Some(300),
         max_concurrency: Some(8),
         max_queue_depth: 128,

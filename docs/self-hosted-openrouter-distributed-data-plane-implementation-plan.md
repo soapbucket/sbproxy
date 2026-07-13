@@ -640,7 +640,7 @@ Commit: `git commit -m "WOR-1850: dispatch managed replica pools"`
 - Produces: stable OpenAI-style error body with `type`, `code`, `request_id`, `retryable`, and `sbproxy_reason`.
 - Produces: `x-sbproxy-logical-model` and `x-sbproxy-route-class` allowlisted response headers.
 
-- [ ] **Step 1: Write failing cold-start policy tests**
+- [x] **Step 1: Write failing cold-start policy tests**
 
 ```rust,no_run
 #[test]
@@ -658,13 +658,13 @@ async fn reject_returns_retry_after_without_starting_the_engine() {
 }
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `cargo test -p sbproxy-model-host cold_start && cargo test -p sbproxy-core --test managed_replica_dispatch cold_start -- --nocapture`
 
 Expected: FAIL because deployments have no cold-start policy.
 
-- [ ] **Step 3: Add explicit policy to every desired-state surface**
+- [x] **Step 3: Add explicit policy to every desired-state surface**
 
 ```rust,no_run
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -674,7 +674,7 @@ pub enum ColdStartPolicy { Wait, Reject, Fallback }
 
 Config carries `Option<ColdStartPolicy>` until compilation can apply the security-profile default. Signed bundles and the durable admin store carry the concrete value. This PR preserves the merged admin UI and API compatibility; UI selection of the new policy remains outside this data-plane batch. `Wait` selects assigned cold candidates and attaches to the existing job; `Reject` returns a stable retryable refusal; `Fallback` skips cold candidates and advances the provider chain.
 
-- [ ] **Step 4: Write failing logical model and safe-header tests**
+- [x] **Step 4: Write failing logical model and safe-header tests**
 
 ```rust,no_run
 #[tokio::test]
@@ -694,7 +694,7 @@ async fn route_headers_are_logical_and_allowlisted() {
 }
 ```
 
-- [ ] **Step 5: Run and verify RED**
+- [x] **Step 5: Run and verify RED**
 
 Run: `cargo test -p sbproxy-core --test managed_replica_dispatch managed_models_listing_contains_availability_but_no_topology -- --nocapture`
 
@@ -702,7 +702,7 @@ Run: `cargo test -p sbproxy-core --test managed_replica_dispatch route_headers_a
 
 Expected: FAIL because canonical managed providers are not synthesized by `/v1/models` and route headers do not exist.
 
-- [ ] **Step 6: Implement logical discovery, stable errors, and safe headers**
+- [x] **Step 6: Implement logical discovery, stable errors, and safe headers**
 
 Aggregate configured public model names after the caller's provider/model policy filter. Availability is `ready`, `cold`, or `unavailable` with ready/desired counts, capabilities, and no worker identity. Use one error renderer:
 
@@ -721,7 +721,7 @@ Aggregate configured public model names after the caller's provider/model policy
 
 Add only `local`, `peer`, or `external` route class and the logical model header after selection. Key introspection remains gated on the governance batch and must not be claimed stable here.
 
-- [ ] **Step 7: Run focused Rust tests and commit**
+- [x] **Step 7: Run focused Rust tests and commit**
 
 Run: `cargo test -p sbproxy-model-host deployment`
 

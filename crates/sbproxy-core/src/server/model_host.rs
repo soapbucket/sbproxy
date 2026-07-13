@@ -1514,6 +1514,7 @@ fn compile_runtime_candidate(
         None => Arc::new(Catalog::builtin()),
     };
     let mut canonical = pipeline.config.server.model_host.clone();
+    apply_security_profile_cold_start_defaults(&pipeline.config.server, &mut canonical);
     let mut authority_bundle = None;
     if canonical.as_ref().is_some_and(|control| {
         control.authority == sbproxy_config::ModelHostAuthority::ClusterAuthority
@@ -1582,6 +1583,25 @@ fn compile_runtime_candidate(
     })
 }
 
+fn apply_security_profile_cold_start_defaults(
+    server: &sbproxy_config::ProxyServerConfig,
+    canonical: &mut Option<sbproxy_config::ModelHostControlConfig>,
+) {
+    let default =
+        if server.cluster.as_ref().is_some_and(|cluster| {
+            cluster.security.mode == sbproxy_config::ClusterSecurityMode::Mtls
+        }) {
+            sbproxy_config::ManagedColdStartPolicy::Fallback
+        } else {
+            sbproxy_config::ManagedColdStartPolicy::Wait
+        };
+    if let Some(control) = canonical.as_mut() {
+        for deployment in control.deployments.values_mut() {
+            deployment.cold_start.get_or_insert(default);
+        }
+    }
+}
+
 fn managed_deployment_from_model(
     deployment: sbproxy_model_host::ModelDeployment,
 ) -> anyhow::Result<sbproxy_config::ManagedDeploymentConfig> {
@@ -1606,6 +1626,17 @@ fn managed_deployment_from_model(
             sbproxy_model_host::PullPolicy::Manual => sbproxy_config::ManagedPullPolicy::Manual,
         },
         warm: deployment.warm,
+        cold_start: Some(match deployment.cold_start {
+            sbproxy_model_host::ColdStartPolicy::Wait => {
+                sbproxy_config::ManagedColdStartPolicy::Wait
+            }
+            sbproxy_model_host::ColdStartPolicy::Reject => {
+                sbproxy_config::ManagedColdStartPolicy::Reject
+            }
+            sbproxy_model_host::ColdStartPolicy::Fallback => {
+                sbproxy_config::ManagedColdStartPolicy::Fallback
+            }
+        }),
         keep_alive_secs: deployment.keep_alive_secs,
         max_concurrency: deployment.max_concurrency,
         max_queue_depth: deployment.max_queue_depth,
@@ -1943,7 +1974,7 @@ pub struct ManagedDistributedUpstream {
     /// Local admission ownership, absent for peer responses.
     pub local_permit: Option<ManagedModelPermit>,
     /// Selected direct local call or authenticated peer hop.
-    pub route_class: sbproxy_ai::managed_replica::ManagedRouteClass,
+    pub route_class: Option<sbproxy_ai::managed_replica::ManagedRouteClass>,
     /// Bounded non-sensitive route explanation.
     pub trace: crate::model_plane::ManagedRouteTrace,
 }
@@ -1954,6 +1985,12 @@ pub enum ManagedDistributedError {
     /// The committed public route or cluster client state was inconsistent.
     #[error("managed route resolution failed: {0}")]
     Resolution(String),
+    /// The deployment explicitly advances to another provider while cold.
+    #[error("managed model has no ready replica; cold-start policy requires provider fallback")]
+    ColdStartFallback {
+        /// Candidate filtering trace with no executed attempts.
+        trace: crate::model_plane::ManagedRouteTrace,
+    },
     /// Every safe current replica attempt failed.
     #[error(transparent)]
     Dispatch(#[from] crate::model_plane::ManagedDispatchFailure),
@@ -1964,9 +2001,54 @@ impl ManagedDistributedError {
     pub fn trace(&self) -> Option<&crate::model_plane::ManagedRouteTrace> {
         match self {
             Self::Resolution(_) => None,
+            Self::ColdStartFallback { trace } => Some(trace),
             Self::Dispatch(failure) => Some(&failure.trace),
         }
     }
+
+    /// Stable public reason retained if every configured provider fails.
+    pub const fn public_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::ColdStartFallback { .. } => Some("no_ready_replica"),
+            Self::Dispatch(failure)
+                if matches!(
+                    failure.source,
+                    crate::model_plane::ModelPlaneError::NoEligibleReplica
+                ) =>
+            {
+                Some("no_eligible_replica")
+            }
+            Self::Resolution(_) | Self::Dispatch(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagedTerminalResponse;
+
+/// Whether a synthetic managed response must not advance to another provider.
+pub fn is_terminal_managed_response(response: &reqwest::Response) -> bool {
+    response
+        .extensions()
+        .get::<ManagedTerminalResponse>()
+        .is_some()
+}
+
+/// Stable OpenAI-style managed-model error payload.
+pub fn managed_error_body(request_id: &str, code: &'static str, retryable: bool) -> Bytes {
+    crate::model_discovery::managed_error_body(request_id, code, retryable)
+}
+
+fn cold_start_rejection_response(request_id: &str) -> reqwest::Response {
+    let body = managed_error_body(request_id, "no_ready_replica", true);
+    let mut response = http::Response::builder()
+        .status(http::StatusCode::SERVICE_UNAVAILABLE)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::RETRY_AFTER, "1")
+        .body(body)
+        .expect("static cold-start response");
+    response.extensions_mut().insert(ManagedTerminalResponse);
+    response.into()
 }
 
 struct ProductionManagedReplicaExecutor {
@@ -2147,6 +2229,92 @@ pub fn distributed_managed_provider(provider: &sbproxy_ai::provider::ProviderCon
             .is_some_and(|settings| settings.model_control_enabled)
 }
 
+/// Snapshot topology-free availability for every committed managed deployment.
+pub async fn current_managed_model_availability(
+) -> BTreeMap<String, crate::model_discovery::ManagedDeploymentAvailability> {
+    let runtime = model_runtime_manager();
+    let mut availability = if let Some(placement) = runtime.cluster_placement_state() {
+        let view = crate::cluster::current_model_directory()
+            .map(|directory| directory.load())
+            .unwrap_or_else(
+                || Arc::new(sbproxy_ai::model_directory::ModelDirectoryView::default()),
+            );
+        placement
+            .deployments()
+            .iter()
+            .map(|(deployment_id, deployment)| {
+                let ready_replicas = view
+                    .eligible_replicas
+                    .get(deployment_id)
+                    .map_or(0, Vec::len);
+                let cold_replicas = view
+                    .candidate_replicas
+                    .get(deployment_id)
+                    .map(|replicas| {
+                        replicas
+                            .iter()
+                            .filter(|replica| {
+                                replica.state != sbproxy_model_host::DeploymentRuntimeState::Ready
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                (
+                    deployment_id.clone(),
+                    crate::model_discovery::ManagedDeploymentAvailability {
+                        ready_replicas: u32::try_from(ready_replicas).unwrap_or(u32::MAX),
+                        cold_replicas: u32::try_from(cold_replicas).unwrap_or(u32::MAX),
+                        desired_replicas: deployment.target.desired_replicas,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        runtime
+            .current_desired()
+            .deployments
+            .iter()
+            .map(|(deployment_id, deployment)| {
+                (
+                    deployment_id.clone(),
+                    crate::model_discovery::ManagedDeploymentAvailability {
+                        desired_replicas: deployment.desired.replicas,
+                        ..crate::model_discovery::ManagedDeploymentAvailability::default()
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    let local_deployments = runtime.current_desired();
+    for deployment_id in local_deployments.deployments.keys() {
+        let Some(deployment_availability) = availability.get_mut(deployment_id) else {
+            continue;
+        };
+        if deployment_availability.ready_replicas > 0 || deployment_availability.cold_replicas > 0 {
+            continue;
+        }
+        let Some(status) = runtime.status(deployment_id).await else {
+            continue;
+        };
+        match status.state {
+            sbproxy_model_host::DeploymentRuntimeState::Ready => {
+                deployment_availability.ready_replicas = 1;
+            }
+            sbproxy_model_host::DeploymentRuntimeState::Assigned
+            | sbproxy_model_host::DeploymentRuntimeState::Cached
+            | sbproxy_model_host::DeploymentRuntimeState::Preparing => {
+                deployment_availability.cold_replicas = 1;
+            }
+            sbproxy_model_host::DeploymentRuntimeState::Configured
+            | sbproxy_model_host::DeploymentRuntimeState::Draining
+            | sbproxy_model_host::DeploymentRuntimeState::Stopped
+            | sbproxy_model_host::DeploymentRuntimeState::Failed => {}
+        }
+    }
+    availability
+}
+
 /// Resolve one directory snapshot and dispatch through current replicas.
 pub async fn distributed_managed_upstream(
     request: ManagedDistributedRequest<'_>,
@@ -2194,6 +2362,13 @@ pub async fn distributed_managed_upstream(
             "provider deployment differs from its committed route".to_string(),
         ));
     }
+    let deployment_id = route.deployment.clone();
+    let deployment = desired.deployments.get(&deployment_id).ok_or_else(|| {
+        ManagedDistributedError::Resolution("committed route has no global deployment".to_string())
+    })?;
+    let deployment_policy = deployment.desired.cold_start;
+    let deployment_model = deployment.desired.model.clone();
+    let deployment_variant = deployment.desired.variant.clone();
     let client_config =
         crate::cluster::current_process_model_plane_client_config().ok_or_else(|| {
             ManagedDistributedError::Resolution(
@@ -2204,51 +2379,111 @@ pub async fn distributed_managed_upstream(
     let view = crate::cluster::current_model_directory()
         .map(|directory| directory.load())
         .unwrap_or_else(|| Arc::new(sbproxy_ai::model_directory::ModelDirectoryView::default()));
-    let mut selection = sbproxy_ai::managed_replica::ManagedReplicaRouter::ordered_candidates(
+    let input = |allow_cold| sbproxy_ai::managed_replica::ManagedReplicaInput {
+        local_node_id,
+        requested_adapter: request.requested_adapter,
+        preferred_region: request.preferred_region,
+        prefix_key: request.prefix_key,
+        allow_cold,
+    };
+    let mut ready_selection = sbproxy_ai::managed_replica::ManagedReplicaRouter::ordered_candidates(
         &view,
-        &route.deployment,
-        sbproxy_ai::managed_replica::ManagedReplicaInput {
-            local_node_id,
-            requested_adapter: request.requested_adapter,
-            preferred_region: request.preferred_region,
-            prefix_key: request.prefix_key,
-            allow_cold: true,
-        },
+        &deployment_id,
+        input(false),
     );
-    if selection.candidates.is_empty() {
+    let mut cold_selection = sbproxy_ai::managed_replica::ManagedReplicaRouter::ordered_candidates(
+        &view,
+        &deployment_id,
+        input(true),
+    );
+    if cold_selection.candidates.is_empty() {
         if let Some(generation) =
-            runtime.cluster_assignment_generation(local_node_id, &route.deployment)
+            runtime.cluster_assignment_generation(local_node_id, &deployment_id)
         {
-            let deployment = desired.deployments.get(&route.deployment).ok_or_else(|| {
-                ManagedDistributedError::Resolution(
-                    "local assignment has no global deployment".to_string(),
-                )
-            })?;
-            selection
-                .candidates
-                .push(sbproxy_ai::managed_replica::ManagedReplicaCandidate {
-                    replica: sbproxy_ai::model_directory::ModelDirectoryReplica {
-                        node_id: local_node_id.to_string(),
-                        deployment: route.deployment.clone(),
-                        deployment_generation: generation,
-                        model: deployment.desired.model.clone(),
-                        variant: deployment.desired.variant.clone(),
-                        endpoint: client_config.cluster.identity().model_endpoint.clone(),
-                        state: sbproxy_model_host::DeploymentRuntimeState::Assigned,
-                        active_requests: 0,
-                        queue_depth: 0,
-                        adapters: Vec::new(),
-                        node_labels: client_config.cluster.identity().labels.clone(),
-                        compute_utilization_millis: None,
-                        memory_occupancy_millis: None,
-                        model_plane_health: runtime.model_plane_health(),
-                    },
-                    route_class: sbproxy_ai::managed_replica::ManagedRouteClass::Local,
-                });
-            selection.trace.eligible_candidates = 1;
-            selection.trace.selected_reason = Some("local_assignment");
+            let state = runtime
+                .status(&deployment_id)
+                .await
+                .map(|status| status.state)
+                .unwrap_or(sbproxy_model_host::DeploymentRuntimeState::Assigned);
+            let candidate = sbproxy_ai::managed_replica::ManagedReplicaCandidate {
+                replica: sbproxy_ai::model_directory::ModelDirectoryReplica {
+                    node_id: local_node_id.to_string(),
+                    deployment: deployment_id.clone(),
+                    deployment_generation: generation,
+                    model: deployment_model,
+                    variant: deployment_variant,
+                    endpoint: client_config.cluster.identity().model_endpoint.clone(),
+                    state,
+                    active_requests: 0,
+                    queue_depth: 0,
+                    adapters: Vec::new(),
+                    node_labels: client_config.cluster.identity().labels.clone(),
+                    compute_utilization_millis: None,
+                    memory_occupancy_millis: None,
+                    model_plane_health: runtime.model_plane_health(),
+                },
+                route_class: sbproxy_ai::managed_replica::ManagedRouteClass::Local,
+            };
+            if state == sbproxy_model_host::DeploymentRuntimeState::Ready {
+                ready_selection.candidates.push(candidate.clone());
+                ready_selection.trace.eligible_candidates = 1;
+                ready_selection.trace.selected_reason = Some("local_assignment");
+            }
+            if matches!(
+                state,
+                sbproxy_model_host::DeploymentRuntimeState::Ready
+                    | sbproxy_model_host::DeploymentRuntimeState::Preparing
+                    | sbproxy_model_host::DeploymentRuntimeState::Cached
+                    | sbproxy_model_host::DeploymentRuntimeState::Assigned
+            ) {
+                cold_selection.candidates.push(candidate);
+                cold_selection.trace.eligible_candidates = 1;
+                cold_selection.trace.selected_reason = Some("local_assignment");
+            }
         }
     }
+    let selection = match crate::model_plane::choose_cold_start_candidates(
+        ready_selection,
+        cold_selection,
+        deployment_policy,
+    ) {
+        crate::model_plane::ManagedColdStartDecision::Dispatch(selection) => selection,
+        crate::model_plane::ManagedColdStartDecision::Reject(selection) => {
+            let trace = empty_managed_route_trace(selection);
+            sbproxy_observe::metrics::record_model_plane_rejection(
+                "cold_start_rejected",
+                "readiness",
+            );
+            record_managed_route_trace(request.provider.name.as_str(), &deployment_id, &trace);
+            return Ok(Some(ManagedDistributedUpstream {
+                response: cold_start_rejection_response(request.request_id),
+                public_model,
+                local_permit: None,
+                route_class: None,
+                trace,
+            }));
+        }
+        crate::model_plane::ManagedColdStartDecision::Fallback(selection) => {
+            let trace = empty_managed_route_trace(selection);
+            sbproxy_observe::metrics::record_managed_replica_failover(
+                request.provider.name.as_str(),
+                &deployment_id,
+                "cold_start_fallback",
+            );
+            record_managed_route_trace(request.provider.name.as_str(), &deployment_id, &trace);
+            return Err(ManagedDistributedError::ColdStartFallback { trace });
+        }
+        crate::model_plane::ManagedColdStartDecision::Unavailable(selection) => {
+            let trace = empty_managed_route_trace(selection);
+            record_managed_route_trace(request.provider.name.as_str(), &deployment_id, &trace);
+            return Err(ManagedDistributedError::Dispatch(
+                crate::model_plane::ManagedDispatchFailure {
+                    source: crate::model_plane::ModelPlaneError::NoEligibleReplica,
+                    trace,
+                },
+            ));
+        }
+    };
     let executor = ProductionManagedReplicaExecutor {
         runtime,
         client_config,
@@ -2263,7 +2498,7 @@ pub async fn distributed_managed_upstream(
         priority: request.priority,
         max_body_bytes: request.max_body_bytes,
     };
-    let deployment = route.deployment.clone();
+    let deployment = deployment_id;
     match crate::model_plane::dispatch_managed_candidates(selection, &executor).await {
         Ok(outcome) => {
             record_managed_route_trace(request.provider.name.as_str(), &deployment, &outcome.trace);
@@ -2271,7 +2506,7 @@ pub async fn distributed_managed_upstream(
                 response: outcome.response,
                 public_model,
                 local_permit: outcome.local_permit,
-                route_class: outcome.route_class,
+                route_class: Some(outcome.route_class),
                 trace: outcome.trace,
             }))
         }
@@ -2279,6 +2514,17 @@ pub async fn distributed_managed_upstream(
             record_managed_route_trace(request.provider.name.as_str(), &deployment, &failure.trace);
             Err(ManagedDistributedError::Dispatch(failure))
         }
+    }
+}
+
+fn empty_managed_route_trace(
+    selection: sbproxy_ai::managed_replica::ManagedReplicaSelection,
+) -> crate::model_plane::ManagedRouteTrace {
+    crate::model_plane::ManagedRouteTrace {
+        selection: selection.trace,
+        attempts: Vec::new(),
+        failovers: 0,
+        truncated_candidates: selection.candidates.len().saturating_sub(8),
     }
 }
 
@@ -2395,7 +2641,77 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cold_start_rejection_is_terminal_retryable_and_stable() {
+        let response = cold_start_rejection_response("req_cold");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert!(is_terminal_managed_response(&response));
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.bytes().await.expect("cold-start rejection body"))
+                .expect("cold-start rejection JSON");
+        assert_eq!(body["error"]["code"], "no_ready_replica");
+        assert_eq!(body["error"]["request_id"], "req_cold");
+        assert_eq!(body["error"]["retryable"], true);
+    }
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[test]
+    fn cold_start_defaults_follow_cluster_security_profile() {
+        let control = || {
+            serde_yaml::from_str::<sbproxy_config::ModelHostControlConfig>(
+                r#"
+deployments:
+  coder:
+    model: qwen2.5-0.5b-instruct
+    variant: q4_k_m
+"#,
+            )
+            .expect("model host control")
+        };
+        let development: sbproxy_config::ProxyServerConfig =
+            serde_yaml::from_str("{}").expect("development server");
+        let production: sbproxy_config::ProxyServerConfig = serde_yaml::from_str(
+            r#"
+cluster:
+  cluster_id: production
+  security:
+    mode: mtls
+"#,
+        )
+        .expect("production server");
+
+        let mut development_control = Some(control());
+        apply_security_profile_cold_start_defaults(&development, &mut development_control);
+        assert_eq!(
+            development_control.unwrap().deployments["coder"].cold_start,
+            Some(sbproxy_config::ManagedColdStartPolicy::Wait)
+        );
+
+        let mut production_control = Some(control());
+        apply_security_profile_cold_start_defaults(&production, &mut production_control);
+        assert_eq!(
+            production_control.unwrap().deployments["coder"].cold_start,
+            Some(sbproxy_config::ManagedColdStartPolicy::Fallback)
+        );
+
+        let mut explicit = control();
+        explicit.deployments.get_mut("coder").unwrap().cold_start =
+            Some(sbproxy_config::ManagedColdStartPolicy::Reject);
+        let mut explicit = Some(explicit);
+        apply_security_profile_cold_start_defaults(&production, &mut explicit);
+        assert_eq!(
+            explicit.unwrap().deployments["coder"].cold_start,
+            Some(sbproxy_config::ManagedColdStartPolicy::Reject)
+        );
+    }
 
     #[derive(Debug, Default)]
     struct ClusterFixtureProcess;

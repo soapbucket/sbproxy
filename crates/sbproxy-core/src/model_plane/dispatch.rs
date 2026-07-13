@@ -8,6 +8,47 @@ use crate::server::model_host::ManagedModelPermit;
 
 const MAX_REPLICA_ATTEMPTS: usize = 8;
 
+/// Result of applying one deployment's concrete cold-start policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedColdStartDecision {
+    /// Dispatch through the contained ready or explicitly cold candidates.
+    Dispatch(ManagedReplicaSelection),
+    /// Return a retryable refusal without executing a candidate.
+    Reject(ManagedReplicaSelection),
+    /// Advance to another provider without executing a candidate.
+    Fallback(ManagedReplicaSelection),
+    /// No ready or cold current candidate exists.
+    Unavailable(ManagedReplicaSelection),
+}
+
+/// Apply a concrete deployment policy to ready-only and cold-capable selections.
+pub fn choose_cold_start_candidates(
+    ready: ManagedReplicaSelection,
+    with_cold: ManagedReplicaSelection,
+    policy: sbproxy_model_host::ColdStartPolicy,
+) -> ManagedColdStartDecision {
+    if !ready.candidates.is_empty() {
+        return ManagedColdStartDecision::Dispatch(ready);
+    }
+    match policy {
+        sbproxy_model_host::ColdStartPolicy::Wait if !with_cold.candidates.is_empty() => {
+            ManagedColdStartDecision::Dispatch(with_cold)
+        }
+        sbproxy_model_host::ColdStartPolicy::Wait => {
+            ManagedColdStartDecision::Unavailable(with_cold)
+        }
+        sbproxy_model_host::ColdStartPolicy::Reject if !with_cold.candidates.is_empty() => {
+            ManagedColdStartDecision::Reject(with_cold)
+        }
+        sbproxy_model_host::ColdStartPolicy::Reject => {
+            ManagedColdStartDecision::Unavailable(with_cold)
+        }
+        sbproxy_model_host::ColdStartPolicy::Fallback => {
+            ManagedColdStartDecision::Fallback(with_cold)
+        }
+    }
+}
+
 /// Result of opening one local or authenticated peer response.
 #[derive(Debug)]
 pub struct ManagedAttemptResponse {

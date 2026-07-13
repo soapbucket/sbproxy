@@ -169,6 +169,8 @@ struct StrictModelDeployment {
     #[serde(default)]
     warm: bool,
     #[serde(default)]
+    cold_start: sbproxy_model_host::ColdStartPolicy,
+    #[serde(default)]
     keep_alive_secs: Option<u64>,
     #[serde(default)]
     max_concurrency: Option<u32>,
@@ -193,6 +195,7 @@ impl From<StrictModelDeployment> for sbproxy_model_host::ModelDeployment {
             spread_by: deployment.spread_by,
             pull: deployment.pull,
             warm: deployment.warm,
+            cold_start: deployment.cold_start,
             keep_alive_secs: deployment.keep_alive_secs,
             max_concurrency: deployment.max_concurrency,
             max_queue_depth: deployment.max_queue_depth,
@@ -1028,6 +1031,7 @@ mod tests {
             spread_by: Vec::new(),
             pull: PullPolicy::OnDemand,
             warm: false,
+            cold_start: sbproxy_model_host::ColdStartPolicy::Wait,
             keep_alive_secs: None,
             max_concurrency: None,
             max_queue_depth: 128,

@@ -67,6 +67,7 @@ pub mod key_plane;
 pub mod mesh_cache;
 /// WOR-1563: distributed per-key spend + rate counters via mesh CRDTs.
 pub mod mesh_counters;
+pub mod model_discovery;
 /// Authenticated private model-plane dispatch primitives.
 pub mod model_plane;
 /// Managed-model runtime integration exposed for lifecycle adapters and

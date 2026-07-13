@@ -338,6 +338,30 @@ pub(super) async fn handle_ai_proxy(
 
     // Handle GET requests (e.g. /v1/models) by forwarding to first enabled provider.
     if method == http::Method::GET {
+        if matches!(
+            path.split('?')
+                .next()
+                .unwrap_or(path.as_str())
+                .trim_end_matches('/'),
+            "/v1/models" | "/models"
+        ) {
+            let allowed_providers = ctx
+                .principal
+                .virtual_key
+                .as_ref()
+                .map(|key| key.allowed_providers.as_slice())
+                .unwrap_or(&[]);
+            let availability =
+                crate::server::model_host::current_managed_model_availability().await;
+            let body = crate::model_discovery::logical_model_listing(
+                config,
+                allowed_providers,
+                &availability,
+            );
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            send_response(session, 200, "application/json", &bytes).await?;
+            return Ok(());
+        }
         // LiteLLM-parity read-only endpoints served locally from config.
         if let Some(body) = ai_management_response(&path, config) {
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
@@ -592,6 +616,7 @@ pub(super) async fn handle_ai_proxy(
             idem_capture,
             ctx.ai_inbound_format.as_deref(),
             Vec::new(),
+            Vec::new(),
         )
         .await;
     }
@@ -797,9 +822,10 @@ pub(super) async fn handle_ai_proxy(
                 .await
                 {
                     Ok(Some(upstream)) => {
+                        ctx.ai_logical_model = Some(upstream.public_model.clone());
                         ctx.ai_serve_model = Some(upstream.public_model);
                         ctx.managed_model_permit = upstream.local_permit;
-                        ctx.managed_route_class = Some(upstream.route_class);
+                        ctx.managed_route_class = upstream.route_class;
                         ctx.managed_route_trace = Some(upstream.trace);
                         Ok(upstream.response)
                     }
@@ -809,6 +835,9 @@ pub(super) async fn handle_ai_proxy(
                     Err(error) => {
                         if let Some(trace) = error.trace() {
                             ctx.managed_route_trace = Some(trace.clone());
+                        }
+                        if let Some(reason) = error.public_reason() {
+                            ctx.managed_fallback_reason = Some(reason);
                         }
                         Err(anyhow::Error::new(error))
                     }
@@ -861,6 +890,11 @@ pub(super) async fn handle_ai_proxy(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
             let resp_bytes = read_capped_response_body(resp, config.max_body_size).await?;
             record_ai_provider_response_failure(
                 &ai_span,
@@ -896,9 +930,15 @@ pub(super) async fn handle_ai_proxy(
             if cost_micros > 0 {
                 ctx.ai_cost_usd_micros = Some(cost_micros);
             }
-            let extra: Option<(&str, &str)> =
-                idem_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
-            return send_response_with_extra(session, status, &resp_ct, &resp_bytes, extra).await;
+            let mut extras = public_route_headers(ctx);
+            if let Some(reason) = idem_skip_reason {
+                extras.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
+            }
+            if let Some(retry_after) = retry_after {
+                extras.push(("retry-after".to_string(), retry_after));
+            }
+            return send_response_with_extras(session, status, &resp_ct, &resp_bytes, &extras)
+                .await;
         }
 
         emit_ai_billing_event(
@@ -934,6 +974,7 @@ pub(super) async fn handle_ai_proxy(
             idem_skip_reason,
             None,
             ctx.ai_inbound_format.as_deref(),
+            public_route_headers(ctx),
             ctx.ai_reversible_redactions.clone(),
         )
         .await;
@@ -1879,6 +1920,8 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
+    ctx.ai_logical_model = (!model.is_empty()).then(|| model.clone());
+
     // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
     //
     // When the enterprise semantic cache is wired, ask the hook whether
@@ -2541,7 +2584,15 @@ pub(super) async fn handle_ai_proxy(
                     // materialized outside the relay path.
                     let _ = idem_capture.take();
                     let _ = idem_skip_reason;
-                    return send_response(session, o.status, &content_type, &translated).await;
+                    let extras = public_route_headers(ctx);
+                    return send_response_with_extras(
+                        session,
+                        o.status,
+                        &content_type,
+                        &translated,
+                        &extras,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     warn!(
@@ -2686,7 +2737,12 @@ pub(super) async fn handle_ai_proxy(
         if race_mode {
             break;
         }
-        if attempt >= max_attempts {
+        let effective_max_attempts = if ctx.managed_fallback_reason.is_some() {
+            provider_order.len()
+        } else {
+            max_attempts
+        };
+        if attempt >= effective_max_attempts {
             break;
         }
         // A failed prior managed attempt may still hold deployment capacity.
@@ -2923,7 +2979,7 @@ pub(super) async fn handle_ai_proxy(
                         Ok(Some(upstream)) => {
                             local_public_model = Some(upstream.public_model);
                             ctx.managed_model_permit = upstream.local_permit;
-                            ctx.managed_route_class = Some(upstream.route_class);
+                            ctx.managed_route_class = upstream.route_class;
                             ctx.managed_route_trace = Some(upstream.trace);
                             Ok(upstream.response)
                         }
@@ -2933,6 +2989,9 @@ pub(super) async fn handle_ai_proxy(
                         Err(error) => {
                             if let Some(trace) = error.trace() {
                                 ctx.managed_route_trace = Some(trace.clone());
+                            }
+                            if let Some(reason) = error.public_reason() {
+                                ctx.managed_fallback_reason = Some(reason);
                             }
                             Err(anyhow::Error::new(error))
                         }
@@ -2979,7 +3038,13 @@ pub(super) async fn handle_ai_proxy(
                         attempt,
                     )
                 });
-                if is_failover && (retry_by_status || retry_by_policy) && attempt + 1 < max_attempts
+                let terminal_managed =
+                    crate::server::model_host::is_terminal_managed_response(&resp);
+                let managed_provider_fallback = ctx.managed_fallback_reason.is_some();
+                if (is_failover || managed_provider_fallback)
+                    && !terminal_managed
+                    && (retry_by_status || retry_by_policy)
+                    && attempt + 1 < effective_max_attempts
                 {
                     // WOR-1103: record the failed attempt so per-provider
                     // load distribution and failure rates are visible,
@@ -3005,6 +3070,17 @@ pub(super) async fn handle_ai_proxy(
                     // Consume the response body to avoid connection leak.
                     let _ = resp.bytes().await;
                     continue;
+                }
+                if managed_provider_fallback
+                    && !terminal_managed
+                    && (retry_by_status || retry_by_policy)
+                {
+                    sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                    let _ = resp.bytes().await;
+                    last_error = Some(anyhow::anyhow!(
+                        "fallback provider returned retryable HTTP status {status}"
+                    ));
+                    break;
                 }
                 // WOR-1545: content-policy fallback. A 4xx may be a
                 // content-policy / safety refusal rather than a client
@@ -3049,7 +3125,15 @@ pub(super) async fn handle_ai_proxy(
                         continue;
                     }
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
-                    return send_response(session, status, &content_type, &body_bytes).await;
+                    let extras = public_route_headers(ctx);
+                    return send_response_with_extras(
+                        session,
+                        status,
+                        &content_type,
+                        &body_bytes,
+                        &extras,
+                    )
+                    .await;
                 }
                 // WOR-1103: this provider's response is the one we keep.
                 // HTTP error statuses still count as provider-attempt
@@ -3119,7 +3203,7 @@ pub(super) async fn handle_ai_proxy(
                     ai_metric_error_kind_for_span_error_type(last_error_type),
                 );
                 last_error = Some(e);
-                if attempt + 1 >= max_attempts {
+                if attempt + 1 >= effective_max_attempts {
                     break;
                 }
                 // WOR-1535: count the transport-failure handover.
@@ -3349,6 +3433,17 @@ pub(super) async fn handle_ai_proxy(
             )
             .await
         }
+    } else if let Some(reason) = ctx.managed_fallback_reason {
+        sbproxy_ai::tracing_spans::record_error(
+            &ai_span,
+            sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
+            "managed model unavailable after provider fallback",
+        );
+        let body =
+            crate::server::model_host::managed_error_body(ctx.request_id.as_str(), reason, true);
+        let mut extras = public_logical_model_header(ctx);
+        extras.push(("retry-after".to_string(), "1".to_string()));
+        send_response_with_extras(session, 503, "application/json", &body, &extras).await
     } else if let Some(e) = last_error {
         sbproxy_ai::tracing_spans::record_error(
             &ai_span,
@@ -3500,6 +3595,37 @@ fn ai_string_indicates_content_filter(value: &str) -> bool {
         || normalized.contains("responsibleai")
 }
 
+fn public_route_headers(ctx: &RequestContext) -> Vec<(String, String)> {
+    let Some(logical_model) = ctx
+        .ai_serve_model
+        .as_deref()
+        .or(ctx.ai_logical_model.as_deref())
+    else {
+        return Vec::new();
+    };
+    if let Some(route_class) = ctx.managed_route_class {
+        return crate::model_discovery::safe_route_headers(logical_model, route_class.into());
+    }
+    if ctx.managed_route_trace.is_none() {
+        return crate::model_discovery::safe_route_headers(
+            logical_model,
+            crate::model_discovery::PublicRouteClass::External,
+        );
+    }
+    vec![(
+        "x-sbproxy-logical-model".to_string(),
+        logical_model.to_string(),
+    )]
+}
+
+fn public_logical_model_header(ctx: &RequestContext) -> Vec<(String, String)> {
+    ctx.ai_serve_model
+        .as_deref()
+        .or(ctx.ai_logical_model.as_deref())
+        .map(|model| vec![("x-sbproxy-logical-model".to_string(), model.to_string())])
+        .unwrap_or_default()
+}
+
 /// Relay a non-streaming AI response back to the client. When the
 /// upstream provider speaks a non-OpenAI wire format, the response
 /// body is translated back into OpenAI shape so OpenAI SDK clients
@@ -3522,12 +3648,20 @@ pub(super) async fn relay_ai_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
 
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
 
     let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
     let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
-    send_response(session, status, &content_type, &translated).await
+    let extras = retry_after
+        .map(|value| vec![("retry-after".to_string(), value)])
+        .unwrap_or_default();
+    send_response_with_extras(session, status, &content_type, &translated, &extras).await
 }
 
 /// Read the upstream response body with an optional byte cap. When the
@@ -3629,6 +3763,11 @@ pub(super) async fn relay_ai_response_with_cache(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
 
     // Snapshot headers before we consume the response body.
     let mut captured_headers: std::collections::HashMap<String, String> =
@@ -4091,7 +4230,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 }
             }
         }
-    } else if let Some(ctx) = ctx {
+    } else if let Some(ctx) = ctx.as_deref_mut() {
         // Even without a budget recorder we still want the access log
         // to capture token usage when the upstream returned a body.
         if (200..300).contains(&status) {
@@ -4215,8 +4354,14 @@ pub(super) async fn relay_ai_response_with_cache(
         None => idem_skip_reason,
     };
 
-    let extra: Option<(&str, &str)> = final_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
-    send_response_with_extra(session, status, &content_type, &resp_body, extra).await
+    let mut extras = ctx.as_deref().map(public_route_headers).unwrap_or_default();
+    if let Some(reason) = final_skip_reason {
+        extras.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
+    }
+    if let Some(retry_after) = retry_after {
+        extras.push(("retry-after".to_string(), retry_after));
+    }
+    send_response_with_extras(session, status, &content_type, &resp_body, &extras).await
 }
 
 /// WOR-1044: restore reversible PII placeholders. Walks the body and
@@ -4896,7 +5041,8 @@ pub(super) async fn relay_ai_stream(
         };
 
     // Write SSE response headers.
-    let mut header = pingora_http::ResponseHeader::build(status, Some(3))
+    let route_headers = ctx.as_deref().map(public_route_headers).unwrap_or_default();
+    let mut header = pingora_http::ResponseHeader::build(status, Some(3 + route_headers.len()))
         .map_err(|e| Error::because(ErrorType::InternalError, "failed to build SSE header", e))?;
     header
         .insert_header("content-type", "text/event-stream")
@@ -4907,6 +5053,17 @@ pub(super) async fn relay_ai_stream(
     header
         .insert_header("connection", "keep-alive")
         .map_err(|e| Error::because(ErrorType::InternalError, "failed to set connection", e))?;
+    for (name, value) in &route_headers {
+        header
+            .insert_header(name.clone(), value.clone())
+            .map_err(|error| {
+                Error::because(
+                    ErrorType::InternalError,
+                    "failed to set managed route metadata",
+                    error,
+                )
+            })?;
+    }
     session
         .write_response_header(Box::new(header), false)
         .await?;

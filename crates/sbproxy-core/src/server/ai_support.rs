@@ -2265,6 +2265,7 @@ pub(super) async fn relay_ai_response_with_idempotency(
     idem_skip_reason: Option<&'static str>,
     capture: Option<AiIdempotencyCapture>,
     inbound_format: Option<&str>,
+    mut extra_headers: Vec<(String, String)>,
     // WOR-1044 PR3: request-time reversible PII capture. Empty for
     // requests with no reversible rule matches; the restore call
     // then short-circuits with no allocation. Threaded through so
@@ -2280,6 +2281,11 @@ pub(super) async fn relay_ai_response_with_idempotency(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
     let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
     let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
@@ -2313,9 +2319,20 @@ pub(super) async fn relay_ai_response_with_idempotency(
     // Build the outgoing response. We do not relay every upstream
     // header (matches the existing `send_response` contract); we do
     // stamp the skip marker so dashboards see the disengagement.
-    let extra: Option<(&'static str, &'static str)> =
-        final_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
-    send_response_with_extra(session, status, &content_type, &translated_bytes, extra).await?;
+    if let Some(reason) = final_skip_reason {
+        extra_headers.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
+    }
+    if let Some(retry_after) = retry_after {
+        extra_headers.push(("retry-after".to_string(), retry_after));
+    }
+    send_response_with_extras(
+        session,
+        status,
+        &content_type,
+        &translated_bytes,
+        &extra_headers,
+    )
+    .await?;
 
     if let Some(cap) = capture_for_record {
         // Capture the bytes the client actually saw (post-translation,
@@ -2331,33 +2348,50 @@ pub(super) async fn relay_ai_response_with_idempotency(
     Ok(())
 }
 
-/// Variant of [`send_response`] that accepts a single optional extra
-/// header (name, value). Used by the AI gateway path to stamp
-/// `x-sbproxy-idempotency: <reason>` on the outgoing response when
-/// the middleware disengaged.
-pub(super) async fn send_response_with_extra(
+/// Variant of [`send_response`] that accepts allowlisted extra headers.
+pub(super) async fn send_response_with_extras(
     session: &mut Session,
     status: u16,
     content_type: &str,
     body: &[u8],
-    extra: Option<(&str, &str)>,
+    extras: &[(String, String)],
 ) -> Result<()> {
-    let cap = if extra.is_some() { 3 } else { 2 };
-    let mut header = pingora_http::ResponseHeader::build(status, Some(cap)).map_err(|e| {
-        Error::because(
-            ErrorType::InternalError,
-            "failed to build response header",
-            e,
-        )
-    })?;
+    let mut header =
+        pingora_http::ResponseHeader::build(status, Some(2 + extras.len())).map_err(|error| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to build response header",
+                error,
+            )
+        })?;
     header
         .insert_header("content-type", content_type)
-        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-type", e))?;
+        .map_err(|error| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to set content-type",
+                error,
+            )
+        })?;
     header
         .insert_header("content-length", body.len().to_string())
-        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-length", e))?;
-    if let Some((name, value)) = extra {
-        let _ = header.insert_header(name.to_string(), value.to_string());
+        .map_err(|error| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to set content-length",
+                error,
+            )
+        })?;
+    for (name, value) in extras {
+        header
+            .insert_header(name.clone(), value.clone())
+            .map_err(|error| {
+                Error::because(
+                    ErrorType::InternalError,
+                    "failed to set AI response metadata",
+                    error,
+                )
+            })?;
     }
     session
         .write_response_header(Box::new(header), false)
@@ -2366,6 +2400,20 @@ pub(super) async fn send_response_with_extra(
         .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
         .await?;
     Ok(())
+}
+
+/// Compatibility wrapper for call sites with one optional extra header.
+pub(super) async fn send_response_with_extra(
+    session: &mut Session,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra: Option<(&str, &str)>,
+) -> Result<()> {
+    let extras = extra
+        .map(|(name, value)| vec![(name.to_string(), value.to_string())])
+        .unwrap_or_default();
+    send_response_with_extras(session, status, content_type, body, &extras).await
 }
 
 /// Handle an AI proxy request by forwarding to the upstream provider via reqwest.
