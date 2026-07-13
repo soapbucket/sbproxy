@@ -39,6 +39,21 @@ export interface ModelDeploymentEditorState {
   baselineDeploymentFingerprint: string | null;
 }
 
+function apiErrorHasCode(error: ApiError | null, code: string): boolean {
+  if (!error?.body) return false;
+  try {
+    const body: unknown = JSON.parse(error.body);
+    return (
+      typeof body === "object" &&
+      body !== null &&
+      Object.hasOwn(body, "code") &&
+      (body as { code?: unknown }).code === code
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function useModelManagement() {
   const statusReq = useAsync(() => api.modelHostStatus());
   const catalogReq = useAsync(() => api.modelHostCatalog());
@@ -149,6 +164,10 @@ export function useModelManagement() {
   const initialClusterBundleAbsent = computed(
     () =>
       clusterBundleReq.error.value?.status === 404 &&
+      apiErrorHasCode(
+        clusterBundleReq.error.value,
+        "deployment_bundle_missing",
+      ) &&
       !clusterBundleReq.loading.value &&
       clusterAuthorityProofCurrent.value &&
       clusterAuthority.value?.active_revision === null,

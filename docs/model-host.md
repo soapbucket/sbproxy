@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-13*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -27,7 +27,9 @@ The worker-local runtime is complete enough to operate as one coherent system:
 - One process-wide manager owns deployment generations, per-device memory,
   request admission, keep-alive, drain, crash-loop state, and durable jobs.
 - Startup and every reload path prepare the full candidate before changing
-  routes. A bad candidate leaves the last good runtime in place.
+  routes. Parse, validation, and preparation failures do not publish the
+  candidate; activation and rollback failures have the recovery boundary
+  documented under desired-state authority.
 - The CLI can pull, inspect, remove, list running deployments, and stop one.
 - One process-owned cluster handle carries key-cache and model-control state.
   Versioned worker snapshots feed a lock-free directory, deterministic
@@ -302,7 +304,13 @@ curl -u "admin:${SB_ADMIN_PASSWORD}" \
 
 The file watcher and SIGHUP use the same prepare-and-commit transaction.
 Lifecycle actions remain available for deployments already defined by the
-file. A failed reload leaves the prior desired map, routes, and runtimes active.
+file. Parse, validation, and preparation failures happen before runtime or
+request-pipeline publication. A later activation failure can occur after a
+recreate rollout has stopped an old generation. SBproxy attempts to restore
+that generation, but restoration can fail and leave the current runtime
+degraded. Inspect model-host status and logs, correct `sb.yml` or its runtime
+dependencies, and reload again. Restart only after the authoritative file is
+safe to apply.
 
 ### Authenticated catalog and local deployment API
 
@@ -439,10 +447,17 @@ complete runtime candidate before the durable compare-and-swap. A preparation
 failure writes nothing. If another process advances the store during
 preparation, the final compare-and-swap fails and the server tears down the
 staged work. After a successful compare-and-swap, the server activates the
-prepared revision in the live runtime. If that final activation fails, the
-durable revision remains advanced while the last-good runtime stays active.
-Read the deployment document and runtime status before retrying. The persisted
-revision is loaded from `store_path` on restart.
+prepared revision in the live runtime. Activation preserves unaffected
+generations and attempts to restore a stopped recreate generation when an
+error occurs. That rollback can also fail. The durable revision then remains
+advanced while the runtime can be degraded or only partly recovered.
+
+Do not retry from the old cursor. Read the deployment document, runtime status,
+and logs first. Recovery is explicit: repair the reported artifact, engine, or
+capacity problem and submit a corrected complete map using the current durable
+revision. Use Reset or Load when the reported lifecycle state calls for it, or
+restart after confirming the persisted desired map and its dependencies are
+safe. The persisted revision is loaded from `store_path` on restart.
 
 The deployment API owns only `proxy.model_host` desired state. Provider routes
 under `origins[].action.providers` remain configuration-owned and are never
@@ -453,14 +468,14 @@ retarget every provider route before removing or renaming its deployment;
 otherwise PUT returns `400 invalid_desired`. The model-management API never
 rewrites `sb.yml`.
 
-Stable mutation failures use these status and code pairs:
+Mutation failures use these status and code pairs:
 
 | Status | Code | Meaning |
 |---|---|---|
 | `403` | `authority_read_only` | Local deployment replacement is disabled for the current authority. |
 | `409` | `revision_conflict` | `expected_revision` differs from durable state. The response includes `expected_revision` and `actual_revision` when present. |
-| `422` | A bounded preparation, admission, or compatibility reason such as `prepare_failed`, `insufficient_capacity`, `engine_incompatible`, or `artifact_not_ready` | The candidate could not be prepared or activated safely. The last-good runtime remains active. Read the deployment document because the durable revision can advance when final activation fails after the compare-and-swap. |
-| `502` | A bounded infrastructure or runtime reason such as `prepare_infrastructure_failed`, `store_failed`, or an engine failure code | Storage, artifact transport, provisioning, or runtime infrastructure failed. The last-good runtime remains active, but the durable revision can already be advanced after the compare-and-swap. |
+| `422` | A bounded preparation, admission, or compatibility reason such as `prepare_failed`, `insufficient_capacity`, `engine_incompatible`, or `artifact_not_ready` | The candidate could not be prepared or activated safely. A pre-CAS failure leaves the store unchanged. A post-CAS activation failure leaves the durable revision advanced, and failed rollback can leave runtime degraded. Read desired state, status, and logs before explicit recovery. |
+| `502` | A bounded infrastructure or runtime reason such as `prepare_infrastructure_failed`, `store_failed`, or an engine failure code | Storage, artifact transport, provisioning, or runtime infrastructure failed. Determine whether the durable revision advanced; do not infer runtime health from the HTTP status. Read desired state, status, and logs before explicit recovery. |
 
 Malformed bodies, unknown fields, duplicate map keys, invalid desired state,
 and unknown catalog models or variants return `400` with a stable code such as
@@ -506,10 +521,12 @@ again before sending another write.
 
 Cluster-authority bundles contain only the catalog revision, numbered desired
 revision, deployments, and placement rules. Unknown fields and duplicate
-deployment IDs are rejected. The current pointer and content are published
-separately through the authenticated cluster state store, and readers retain
-their last good revision after signature, identity, rollback, or runtime
-prepare failure.
+deployment IDs are rejected. The authority publishes signed content and its
+current pointer through the authenticated cluster state store before any
+worker applies the revision. Each worker then verifies, prepares, fences, and
+activates the candidate locally. Verification or preparation failure prevents
+local application. An activation error attempts to restore prior recreate
+generations, but rollback can fail and leave that worker degraded.
 
 Every node configures the public verification key and durable cursor state. The
 authority alone also configures the private signing key:
@@ -550,19 +567,36 @@ curl -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/admin/cluster/deployments"
 ```
 
-The authority returns `202` with the revision, content digest, signer node, and
-signer key. `GET /admin/cluster/deployments` returns the locally active verified
-bundle and whether this node can publish. A node without the signing key
-returns `403 deployment_authority_read_only` for POST and displays the verified
-map read-only in the UI.
+The authority returns this response shape:
+
+```json
+{
+  "schema_version": 1,
+  "revision": 1,
+  "content_digest": "<64-character SHA-256>",
+  "signer_node_id": "authority-1",
+  "signer_key_id": "<configured verification-key ID>",
+  "status": "published"
+}
+```
+
+`202` confirms only that the authority signed the bundle and published its
+content and current pointer. It does not prove that a worker accepted the
+catalog revision, prepared an engine, received placement, or became ready.
+Use `GET /admin/cluster/status` for worker application, placement, readiness,
+and rollout truth. `GET /admin/cluster/deployments` returns the locally active
+verified bundle and whether this node can publish. A node without the signing
+key returns `403 deployment_authority_read_only` for POST and displays the
+verified map read-only in the UI.
 
 The UI publishes from the signed bundle's complete deployment map, never from a
 worker-local projection. It accepts that map as canonical only when fresh
 cluster status and bundle responses agree on the authority revision, content
 digest, signer node, signer key, and active catalog revision. With no active
-bundle, a fresh `404 deployment_bundle_missing` plus a fresh authority status
-whose active revision is `null` proves an empty canonical map; the first
-publication uses revision `1`.
+bundle, a fresh `404` whose parsed body has
+`code: deployment_bundle_missing`, plus a fresh authority status whose active
+revision is `null`, proves an empty canonical map; the first publication uses
+revision `1`. A generic proxy or intermediary `404` is not publication proof.
 
 The UI uses exactly the next revision. The backend also accepts any higher
 positive revision and treats the same revision with the same digest as an

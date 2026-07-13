@@ -339,12 +339,17 @@ describe("useModelManagement orchestration", () => {
     mockReads({
       document: document("cluster_authority", true),
       clusterStatus: clusterStatus(authority(null)),
-      bundle: new ApiError(404, "no active bundle", "not published"),
+      bundle: new ApiError(
+        404,
+        "no active bundle",
+        JSON.stringify({ code: "deployment_bundle_missing" }),
+      ),
     });
     const management = useModelManagement();
     await loadProof(management);
 
     expect(management.clusterBundleReq.error.value?.status).toBe(404);
+    expect(management.initialClusterBundleAbsent.value).toBe(true);
     expect(management.canMutate.value).toBe(true);
 
     vi.mocked(api.clusterStatus).mockRejectedValueOnce(
@@ -352,6 +357,23 @@ describe("useModelManagement orchestration", () => {
     );
     await management.clusterStatusReq.run();
     expect(management.clusterAuthority.value?.active_revision).toBeNull();
+    expect(management.canMutate.value).toBe(false);
+  });
+
+  it("rejects a generic bundle 404 as proof of first publication", async () => {
+    mockReads({
+      document: document("cluster_authority", true),
+      clusterStatus: clusterStatus(authority(null)),
+      bundle: new ApiError(
+        404,
+        "intermediary route missing",
+        JSON.stringify({ code: "not_found" }),
+      ),
+    });
+    const management = useModelManagement();
+    await loadProof(management);
+
+    expect(management.initialClusterBundleAbsent.value).toBe(false);
     expect(management.canMutate.value).toBe(false);
   });
 
@@ -367,7 +389,11 @@ describe("useModelManagement orchestration", () => {
       clusterStatus(authority(null)),
     );
     vi.mocked(api.clusterDeployments).mockRejectedValueOnce(
-      new ApiError(404, "no active bundle", "not published"),
+      new ApiError(
+        404,
+        "no active bundle",
+        JSON.stringify({ code: "deployment_bundle_missing" }),
+      ),
     );
 
     await Promise.all([
@@ -390,7 +416,11 @@ describe("useModelManagement orchestration", () => {
         ownRecord([["local-only", localOnly]]),
       ),
       clusterStatus: clusterStatus(authority(null)),
-      bundle: new ApiError(404, "no active bundle", "not published"),
+      bundle: new ApiError(
+        404,
+        "no active bundle",
+        JSON.stringify({ code: "deployment_bundle_missing" }),
+      ),
     });
     const publish = vi
       .spyOn(api, "publishClusterDeployments")
@@ -1004,7 +1034,11 @@ describe("useModelManagement orchestration", () => {
         ownRecord([["projection-only", projection]]),
       ),
       clusterStatus: clusterStatus(authority(null)),
-      bundle: new ApiError(404, "no active bundle", "not published"),
+      bundle: new ApiError(
+        404,
+        "no active bundle",
+        JSON.stringify({ code: "deployment_bundle_missing" }),
+      ),
       status: status([runtime("runtime-only", "stopped")]),
     });
     const management = useModelManagement();

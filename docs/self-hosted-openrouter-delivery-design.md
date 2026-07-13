@@ -1,5 +1,5 @@
 # Self-hosted OpenRouter delivery design
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-13*
 
 *Status: Approved delivery design. The implemented operator-product slice is
 labeled below. Remote distributed inference and live hardware certification
@@ -202,8 +202,9 @@ All desired-state sources compile to a versioned `DeploymentRevision` with:
 - Engine overrides and rollout policy.
 - A content digest used for comparison, signing, and audit.
 
-The runtime swaps a revision only after complete validation. Failed validation
-leaves the last-good revision active.
+The runtime publishes a revision only after complete validation. Validation
+failures occur before revision publication and leave the current revision
+pointer unchanged.
 
 ### Operation job
 
@@ -266,21 +267,65 @@ ready, preparing, or draining. Conflict retry repeats the same safety check.
 
 ## Runtime flows
 
-### Desired state
+### File-managed reload
 
-    file, admin mutation, or signed cluster bundle
-      -> schema and capability validation
-      -> versioned DeploymentRevision
-      -> durable desired-state compare-and-swap
-      -> prepared runtime activation
-      -> reconciliation of the active revision
+    read sb.yml
+      -> compile config, routes, catalog, and desired deployments
+      -> prepare the complete runtime candidate
+      -> commit the runtime revision
+      -> publish the request pipeline
 
-Reconciliation preserves unaffected engines. Additions prepare before becoming
-eligible. Replacements become ready before the old generation drains, subject
-to the documented handoff timeout. Removal stops new admissions before bounded
-drain and shutdown. If final activation fails after the durable
-compare-and-swap, the last-good runtime remains active while the durable
-revision stays advanced.
+File reload has no deployment-store compare-and-swap and no signed-bundle
+cursor. Parse, validation, and preparation failures occur before runtime and
+pipeline publication. Runtime commit can stop an old recreate generation;
+SBproxy attempts to restore it if activation fails, but rollback can fail and
+leave the current runtime degraded. The file remains authoritative, so recovery
+means correcting it or its runtime dependencies and reloading explicitly.
+
+### Admin-managed replacement
+
+    authenticate strict full-map PUT
+      -> validate desired state and active catalog references
+      -> compare expected_revision under the commit lock
+      -> prepare the complete runtime candidate
+      -> deployment-store compare-and-swap
+      -> activate the prepared runtime revision
+      -> return the committed revision and plan
+
+Body, validation, cursor, and preparation failures occur before the durable
+compare-and-swap. A race aborts staged work. Activation occurs after the store
+advances. It attempts to preserve unaffected generations and restore prior
+recreate generations on error, but rollback can fail. A failed request can
+therefore leave the durable revision advanced and runtime degraded. Recovery
+starts with the desired-state GET, runtime status, and logs, followed by a
+corrected full-map write from the current revision or a controlled restart.
+
+### Cluster-authority publication and application
+
+    authority POST
+      -> validate the restricted bundle and revision
+      -> sign and verify the envelope
+      -> publish content, then its current pointer
+      -> return 202 published
+
+    each node
+      -> read pointer and content
+      -> verify identity, signature, digest, revision, and catalog
+      -> prepare local placement and runtime
+      -> persist local generation fences and bundle cursor
+      -> activate the local runtime revision
+      -> mark the verified bundle active
+
+The `202` response proves signing and cluster-state publication only. It does
+not prove node application. A node can reject the candidate before activation,
+or its local cursor can advance before an activation failure. Runtime rollback
+can also fail and leave that node degraded. Cluster status, rather than the
+publication response, proves placement, readiness, and rollout.
+
+After a successful runtime activation, reconciliation preserves unaffected
+engines. Additions prepare before becoming eligible. Replacements become ready
+before the old generation drains, subject to the documented handoff timeout.
+Removal stops new admissions before bounded drain and shutdown.
 
 ### Artifact and launch
 

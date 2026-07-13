@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-13*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -215,8 +215,12 @@ curl -u "admin:${SB_ADMIN_PASSWORD}" \
 the latest read after that. A stale value returns `409 revision_conflict`.
 The API validates and prepares the complete candidate before the durable
 compare-and-swap. A race aborts the staged candidate. If final runtime
-activation fails after the store advances, the last-good runtime remains
-active; read desired state and status before retrying.
+activation fails after the store advances, SBproxy attempts to restore prior
+recreate generations. Rollback can fail, leaving the durable revision advanced
+and the runtime degraded. Read the deployment document, runtime status, and
+logs before recovery. Repair the reported dependency and send a corrected full
+map from the current revision, use Reset or Load when status directs it, or
+restart after confirming the persisted desired state is safe.
 
 Under `file_managed` authority, the deployment endpoint is read-only and
 changes continue through reviewed `sb.yml` plus `sbproxy apply -f <path>` or
