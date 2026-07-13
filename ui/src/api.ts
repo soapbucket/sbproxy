@@ -4,8 +4,9 @@
  * Every call is same-origin (the SPA is served by the admin port) and
  * uses absolute paths so the requests resolve regardless of the
  * `/admin/ui/` mount prefix. Response shapes are best effort: the server
- * is not available at build time, so callers should read fields
- * defensively.
+ * is not available at build time, so legacy callers read fields
+ * defensively. Cluster health and model management use strict contracts
+ * that mirror the backend serde types.
  *
  * Auth: the SPA authenticates with a browser session (POST /admin/login)
  * and holds the returned CSRF token in memory (WOR-1758), sent as
@@ -349,6 +350,299 @@ export interface ClusterMetrics {
   metrics?: Record<string, number>;
 }
 
+/* ---- Strict cluster health and model management contracts ---- */
+
+export type ClusterMode = "local" | "distributed";
+export type ClusterNodeHealth = "healthy" | "degraded" | "unhealthy";
+export type ClusterMembershipState =
+  | "alive"
+  | "suspect"
+  | "dead"
+  | "unreachable";
+export type NodeRole = "gateway" | "worker" | "authority";
+export type NodeReportedHealth = "ready" | "degraded" | "unhealthy";
+export type DeploymentRuntimeState =
+  | "configured"
+  | "assigned"
+  | "cached"
+  | "preparing"
+  | "ready"
+  | "draining"
+  | "stopped"
+  | "failed";
+export type RolloutPhase =
+  | "stable"
+  | "starting"
+  | "waiting_for_readiness"
+  | "draining_prior"
+  | "timed_out";
+export type PlacementRejectionReason =
+  | "not_worker"
+  | "node_unhealthy"
+  | "required_labels"
+  | "missing_endpoint"
+  | "no_capacity"
+  | "variant_incompatible"
+  | "accelerator_incompatible"
+  | "insufficient_memory"
+  | "engine_unavailable"
+  | "artifact_not_ready";
+
+export interface ClusterSummary {
+  total_nodes: number;
+  healthy_nodes: number;
+  degraded_nodes: number;
+  unhealthy_nodes: number;
+  eligible_workers: number;
+  eligible_replicas: number;
+  deployment_digest_mismatch: boolean;
+  deployments: number;
+  ready_deployments: number;
+  rollouts_in_progress: number;
+  unplaced_replicas: number;
+}
+
+export interface ClusterDeploymentAuthority {
+  configured: boolean;
+  read_only: boolean;
+  verifying_key_id: string | null;
+  active_revision: number | null;
+  active_content_digest: string | null;
+  signer_node_id: string | null;
+}
+
+export type EngineKind = "vllm" | "llama_cpp" | "embedded";
+export type AcceleratorKind = "cpu" | "metal" | "cuda";
+
+export interface PlacementAssignment {
+  node_id: string;
+  model_endpoint: string;
+  variant_id: string;
+  artifact_digest: string;
+  engine: EngineKind;
+  accelerator: AcceleratorKind;
+  device_index: number;
+  required_memory_bytes: number;
+  available_memory_bytes: number;
+  artifact_cached: boolean;
+  failure_domains: Record<string, string>;
+}
+
+export interface VersionedPlacementAssignment {
+  deployment_generation: number;
+  assignment: PlacementAssignment;
+}
+
+export interface ClusterDeploymentRolloutStatus {
+  deployment_id: string;
+  model: string;
+  generation: number;
+  desired_replicas: number;
+  placed_replicas: number;
+  unplaced_replicas: number;
+  phase: RolloutPhase;
+  target_ready: boolean;
+  timed_out: boolean;
+  handoff_deadline_unix_ms: number;
+  assignments: PlacementAssignment[];
+  retained: VersionedPlacementAssignment[];
+  draining: VersionedPlacementAssignment[];
+  rejections: Record<string, PlacementRejectionReason>;
+}
+
+export interface NodeHealthSnapshot {
+  state: NodeReportedHealth;
+  reason_codes: string[];
+}
+
+export interface NodeReplicaSnapshot {
+  deployment: string;
+  deployment_generation: number;
+  model: string;
+  variant: string | null;
+  engine: EngineKind | null;
+  state: DeploymentRuntimeState;
+  endpoint: string | null;
+  artifact_digest: string | null;
+  selected_devices: number[];
+  reserved_memory_bytes: number | null;
+  active_requests: number;
+  queue_depth: number;
+  adapters: string[];
+  reason_code: string | null;
+}
+
+export interface ClusterNode {
+  node_id: string;
+  local: boolean;
+  membership_state: ClusterMembershipState;
+  address: string | null;
+  last_ack_age_ms: number;
+  incarnation: number;
+  health: ClusterNodeHealth;
+  unhealthy: boolean;
+  unhealthy_reasons: string[];
+  roles: NodeRole[];
+  labels: Record<string, string>;
+  model_endpoint: string | null;
+  model_eligible: boolean;
+  exclusion_reason: string | null;
+  snapshot_age_ms: number | null;
+  snapshot_generation: number | null;
+  observed_schema_version: number | null;
+  normalized_schema_version: number | null;
+  reported_health: NodeHealthSnapshot | null;
+  engine_count: number;
+  device_count: number;
+  ready_artifact_count: number;
+  replicas: NodeReplicaSnapshot[];
+}
+
+export interface ClusterNodeAlert {
+  node_id: string;
+  health: ClusterNodeHealth;
+  reasons: string[];
+  membership_state: ClusterMembershipState;
+  last_ack_age_ms: number;
+  snapshot_age_ms: number | null;
+  model_endpoint: string | null;
+}
+
+export interface ClusterStatusResponse {
+  schema_version: number;
+  configured: boolean;
+  mode: ClusterMode;
+  cluster_id: string;
+  local_node_id: string;
+  generated_at_unix_ms: number;
+  directory_collected_at_unix_ms: number | null;
+  directory_age_ms: number | null;
+  summary: ClusterSummary;
+  deployment_authority: ClusterDeploymentAuthority;
+  deployments: ClusterDeploymentRolloutStatus[];
+  nodes: ClusterNode[];
+  unhealthy_nodes: ClusterNodeAlert[];
+}
+
+export type ArtifactFormat = "safetensors" | "gguf" | "pickle";
+export type SupportLevel =
+  | "stable"
+  | "preview"
+  | "config_only"
+  | "unsupported";
+
+export interface CatalogVariant {
+  id: string;
+  format: ArtifactFormat;
+  quant: string;
+  engines: EngineKind[];
+  accelerators: AcceleratorKind[];
+  min_memory_bytes: number;
+  stability: SupportLevel;
+}
+
+export interface CatalogEntry {
+  params: string;
+  license: string;
+  family: string;
+  context_length: number;
+  variants: CatalogVariant[];
+}
+
+export interface CatalogResponse {
+  schema_version: number;
+  catalog_revision: string;
+  models: Record<string, CatalogEntry>;
+}
+
+export type ModelHostAuthority =
+  | "file_managed"
+  | "admin_managed"
+  | "cluster_authority";
+export type PullPolicy = "on_boot" | "on_demand" | "manual";
+export type EngineChoice = "auto" | EngineKind;
+export type RolloutPolicy = "rolling" | "recreate";
+
+export interface ModelDeployment {
+  model: string;
+  variant: string | null;
+  heterogeneous_variants: boolean;
+  replicas: number;
+  required_labels: Record<string, string>;
+  spread_by: string[];
+  pull: PullPolicy;
+  warm: boolean;
+  keep_alive_secs: number | null;
+  max_concurrency: number | null;
+  max_queue_depth: number;
+  queue_timeout_ms: number;
+  engine: EngineChoice;
+  rollout: RolloutPolicy;
+}
+
+export interface DeploymentDocument {
+  schema_version: number;
+  authority: ModelHostAuthority;
+  read_only: boolean;
+  revision: number | null;
+  content_digest: string | null;
+  deployments: Record<string, ModelDeployment>;
+}
+
+export interface DeploymentReplacementRequest {
+  expected_revision: number | null;
+  deployments: Record<string, ModelDeployment>;
+}
+
+export interface ReconcilePlan {
+  added: string[];
+  changed: string[];
+  removed: string[];
+  preserved: string[];
+}
+
+export interface DeploymentMutationResponse {
+  schema_version: number;
+  revision: number;
+  content_digest: string;
+  plan: ReconcilePlan;
+}
+
+export interface ModelManagementErrorResponse {
+  code: string;
+  error: string;
+  expected_revision?: number;
+  actual_revision?: number;
+}
+
+export interface ClusterDeploymentBundleDraft {
+  catalog_revision: string;
+  revision: number;
+  deployments: Record<string, ModelDeployment>;
+}
+
+export interface ClusterDeploymentBundle extends ClusterDeploymentBundleDraft {
+  schema_version: number;
+  content_digest: string;
+}
+
+export interface ClusterDeploymentDocument {
+  schema_version: number;
+  bundle: ClusterDeploymentBundle;
+  signer_node_id: string;
+  signer_key_id: string;
+  read_only: boolean;
+}
+
+export interface ClusterDeploymentMutationResponse {
+  schema_version: number;
+  revision: number;
+  content_digest: string;
+  signer_node_id: string;
+  signer_key_id: string;
+  status: "published";
+}
+
 export interface WorkspaceStatus {
   workspace?: string;
   tier?: string;
@@ -485,6 +779,16 @@ export const api = {
   health: () => getJson<HealthResponse>("/health"),
   stats: () => getJson<StatsResponse>("/api/stats"),
   modelHostStatus: () => getJson<ModelHostStatus>("/admin/model-host/status"),
+  modelHostCatalog: () =>
+    getJson<CatalogResponse>("/admin/model-host/catalog"),
+  modelHostDeployments: () =>
+    getJson<DeploymentDocument>("/admin/model-host/deployments"),
+  replaceModelHostDeployments: (request: DeploymentReplacementRequest) =>
+    sendJson<DeploymentMutationResponse>(
+      "PUT",
+      "/admin/model-host/deployments",
+      request,
+    ),
   // Load (spawn/ready) or evict (unload to free VRAM) a model (WOR-1765).
   modelHostLoad: (model: string) =>
     sendJson<unknown>("POST", "/admin/model-host/load", { model }),
@@ -573,6 +877,15 @@ export const api = {
 
   // Rate-limit budget audit trail (WOR-1761) + fleet metrics (WOR-1762).
   auditRecent: (limit = 100) => getJson<AuditRow[]>(`/api/audit/recent?limit=${limit}`),
+  clusterStatus: () => getJson<ClusterStatusResponse>("/admin/cluster/status"),
+  clusterDeployments: () =>
+    getJson<ClusterDeploymentDocument>("/admin/cluster/deployments"),
+  publishClusterDeployments: (draft: ClusterDeploymentBundleDraft) =>
+    sendJson<ClusterDeploymentMutationResponse>(
+      "POST",
+      "/admin/cluster/deployments",
+      draft,
+    ),
   clusterMetrics: () => getJson<ClusterMetrics>("/admin/cluster/metrics"),
 
   // Rate-limit budget state + manual resume (WOR-1764).
