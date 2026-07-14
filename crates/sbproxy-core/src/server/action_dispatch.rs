@@ -2436,15 +2436,14 @@ fn emit_mcp_tool_attribution(
         cost_usd: cost.unwrap_or(0.0),
         latency_ms: duration.as_millis() as u64,
         status: if is_error { 500 } else { 200 },
-        key_id: {
-            let sub = ctx.principal.sub.clone();
-            (!sub.is_empty()).then_some(sub)
-        },
+        key_id: (!ctx.principal.api_key_id().is_empty())
+            .then(|| ctx.principal.api_key_id().to_string()),
+        tenant_id: (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.to_string()),
+        project: ctx.principal.attrs.project.clone(),
         user: ctx.principal.attrs.user.clone(),
-        team: {
-            let tenant = ctx.principal.tenant_id.to_string();
-            (!tenant.is_empty()).then_some(tenant)
-        },
+        team: ctx.principal.attrs.team.clone(),
+        tags: ctx.principal.attrs.tags.clone(),
+        metadata: ctx.principal.attrs.metadata.clone(),
         request_id: Some(ctx.request_id.to_string()),
         tag: Some(format!("mcp_tool:{tool_name}")),
         priority: ctx.ai_lane_priority.map(|p| p.as_str().to_string()),

@@ -44,6 +44,34 @@ pub use record::{
 #[cfg(feature = "embedded")]
 pub use embedded::EmbeddedKeyStore;
 
+/// Result of an optimistic key-policy mutation.
+///
+/// Conflict and unsupported outcomes never carry the key record, verifier
+/// hashes, or bearer material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPolicyCasResult {
+    /// The record was atomically written at the returned revision.
+    Applied {
+        /// New monotonic per-record policy revision.
+        policy_revision: u64,
+    },
+    /// The stored record changed after the caller read it.
+    Conflict {
+        /// Current stored revision. No record contents are disclosed.
+        actual_revision: u64,
+    },
+    /// No key exists at the candidate record's `key_id`.
+    NotFound,
+    /// This backend cannot provide an atomic compare-and-swap primitive.
+    Unsupported,
+}
+
+fn next_policy_revision(expected_revision: u64) -> Result<u64> {
+    expected_revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("key policy revision overflow"))
+}
+
 /// A pluggable, mutable store of inbound virtual keys and upstream credentials.
 ///
 /// Implementations are the system-of-record. Lookups are by stable id: inbound
@@ -60,6 +88,18 @@ pub trait KeyStore: Send + Sync {
 
     /// Insert or replace a key record (keyed on `key_id`).
     async fn put_key(&self, record: KeyRecord) -> Result<()>;
+
+    /// Atomically replace an existing key when its policy revision matches.
+    ///
+    /// Implementations set the stored revision to `expected_revision + 1` in
+    /// the same atomic operation as the record write and global revision bump.
+    /// Backends without a safe primitive return
+    /// [`KeyPolicyCasResult::Unsupported`] without writing.
+    async fn put_key_if_revision(
+        &self,
+        record: KeyRecord,
+        expected_revision: u64,
+    ) -> Result<KeyPolicyCasResult>;
 
     /// Delete a key record. Deleting an absent id is not an error.
     async fn delete_key(&self, key_id: &str) -> Result<()>;

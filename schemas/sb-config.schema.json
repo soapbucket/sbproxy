@@ -3526,6 +3526,24 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "max_tokens_per_minute": {
+          "description": "Max input and output tokens per minute.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "priority": {
+          "description": "Served-model admission lane (`interactive`, `standard`, or `batch`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_budget_tokens": {
           "description": "Max total tokens for this key's budget window.",
           "default": null,
@@ -3569,6 +3587,25 @@
             "type": "string"
           }
         },
+        "blocked_providers": {
+          "description": "Providers this key may not use. Blocks override allows.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "description": "Caller-supplied tool allowlist. `None` is unrestricted and an empty list denies every caller-supplied tool.",
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
         "require_pii_redaction": {
           "description": "Named PII redaction rules that must be active before this key can dispatch upstream (empty = none required).",
           "default": [],
@@ -3597,6 +3634,10 @@
           "type": "array",
           "items": true
         },
+        "inject_mcp": {
+          "description": "Federated MCP catalogue reference injected for this key.",
+          "default": null
+        },
         "bypass_prompt_injection": {
           "description": "Skip the body-aware prompt-injection scan for this key. Default false.",
           "default": false,
@@ -3617,6 +3658,22 @@
             "string",
             "null"
           ]
+        },
+        "tags": {
+          "description": "Free-form grouping tags.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "description": "Free-form string metadata for audit and usage attribution.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         },
         "tenant": {
           "description": "Owning tenant.",
@@ -4283,6 +4340,17 @@
           "default": [],
           "type": "array",
           "items": true
+        },
+        "allowed_tools": {
+          "description": "Caller-supplied tool allowlist for this credential. Omitted is unrestricted and an explicit empty list denies every caller tool.",
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
         },
         "inject_mcp": {
           "description": "WOR-1646: inject a federated MCP gateway's live catalogue as this credential's tool surface. Raw passthrough of the `InjectMcpRef` shape (`{ref, format, filter}`) on the underlying `VirtualKeyConfig`; resolved at request time."

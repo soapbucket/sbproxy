@@ -595,8 +595,17 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
                 let key = cred.key.clone().unwrap_or_default();
+                let key_id = format!(
+                    "cfg:{}:{}:{}:{}:{}",
+                    tenant_id.len(),
+                    tenant_id,
+                    hostname.len(),
+                    hostname,
+                    cred.name
+                );
                 let mut vk = json!({
                     "key": key,
+                    "key_id": key_id,
                     "name": cred.name.clone(),
                     "enabled": true,
                     "tags": cred.attrs.tags.clone(),
@@ -666,6 +675,9 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                 }
                 if !cred.inject_tools.is_empty() {
                     vk["inject_tools"] = json!(cred.inject_tools.clone());
+                }
+                if let Some(allowed_tools) = &cred.allowed_tools {
+                    vk["allowed_tools"] = json!(allowed_tools);
                 }
                 // WOR-1646: pass through the federation-injection ref
                 // so the AI dispatch resolves the referenced gateway's
@@ -2044,6 +2056,10 @@ origins:
             .expect("virtual_keys array materialised");
         assert_eq!(vks.len(), 1);
         assert_eq!(vks[0]["name"], "openai-shared");
+        assert_eq!(
+            vks[0]["key_id"],
+            "cfg:11:__default__:8:ai.local:openai-shared"
+        );
         assert_eq!(vks[0]["project"], "shared");
         assert_eq!(vks[0]["allowed_providers"][0], "openai");
         assert_eq!(vks[0]["tags"][0], "tier-shared");
@@ -2065,6 +2081,7 @@ proxy:
       provider: openai
       key: ${OPENAI_API_KEY}
       route_to_model: gpt-4o-mini
+      allowed_tools: []
       inject_tools:
         - type: function
           function:
@@ -2101,6 +2118,11 @@ origins:
             .expect("inject_tools array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "search_docs");
+        assert_eq!(
+            vks[0]["allowed_tools"],
+            serde_json::json!([]),
+            "an explicit empty tool list must remain deny-all"
+        );
     }
 
     #[test]

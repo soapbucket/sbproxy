@@ -196,6 +196,7 @@ base64.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+tracing-subscriber.workspace = true
 tempfile = "3"
 loom = "0.7"
 # WOR-169: hooks tests scrape `sbproxy_hooks_channel_dropped_total` from

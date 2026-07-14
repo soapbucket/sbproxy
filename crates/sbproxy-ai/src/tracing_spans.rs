@@ -48,9 +48,9 @@
 //! | Max tokens               | `gen_ai.request.max_tokens`         | n/a                            |
 //! | Top-p                    | `gen_ai.request.top_p`              | n/a                            |
 //!
-//! sbproxy-internal context (routing surface, guardrail category)
-//! lives under the `sbproxy.ai.*` namespace so it does not clash with
-//! upstream conventions.
+//! sbproxy-internal context (routing surface, guardrail category, and bounded
+//! governed-key attribution) lives under the `sbproxy.*` namespace so it does
+//! not clash with upstream conventions.
 //!
 //! ## Backwards compatibility
 //!
@@ -209,6 +209,13 @@ pub fn ai_request_span(surface: &str, method: &str) -> Span {
         // spans can be filtered by tenant downstream without parsing
         // the event payload.
         "sbproxy.tenant_id" = Empty,
+        // Governed-key route attribution. These four fixed slots are filled
+        // after request policy resolution. Free-form tags and metadata are
+        // deliberately not declared as span fields.
+        "sbproxy.key_id" = Empty,
+        "sbproxy.policy_version" = Empty,
+        "sbproxy.project" = Empty,
+        "sbproxy.user" = Empty,
         "gen_ai.system" = Empty,
         "gen_ai.request.model" = Empty,
         "gen_ai.response.model" = Empty,
@@ -723,6 +730,35 @@ mod tests {
         let spans = snapshot_spans(&layer);
         let span = find_span(&spans, "ai.request");
         assert_field(span, "sbproxy.tenant_id", "acme");
+    }
+
+    #[test]
+    fn ai_request_span_records_only_bounded_key_policy_attribution() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat_completions", "POST");
+            span.record("sbproxy.key_id", "key-public-id");
+            span.record("sbproxy.policy_version", "r7:0123456789abcdef");
+            span.record("sbproxy.project", "foundation");
+            span.record("sbproxy.user", "alice");
+
+            // Arbitrary record metadata and tags are intentionally not span
+            // slots. They remain available to the bounded usage/access-log
+            // surfaces without becoming route-trace labels.
+            span.record("sbproxy.tags", "must-not-be-captured");
+            span.record("sbproxy.metadata", "must-not-be-captured");
+        });
+
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "sbproxy.key_id", "key-public-id");
+        assert_field(span, "sbproxy.policy_version", "r7:0123456789abcdef");
+        assert_field(span, "sbproxy.project", "foundation");
+        assert_field(span, "sbproxy.user", "alice");
+        assert!(!span.fields.contains_key("sbproxy.tags"));
+        assert!(!span.fields.contains_key("sbproxy.metadata"));
     }
 
     #[test]

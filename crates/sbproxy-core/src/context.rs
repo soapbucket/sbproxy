@@ -806,6 +806,10 @@ pub struct RequestContext {
     /// that would otherwise convert an OpenAI Chat body into the
     /// inbound wire shape.
     pub ai_native_bypass: bool,
+    /// Secret-free governed key policy resolved once for this AI request.
+    /// Every downstream key predicate reads this retained snapshot rather
+    /// than resolving mutable key state again.
+    pub effective_key_policy: Option<sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
     /// Pre-flight rate-limit reservation. Stamped by
     /// `handle_ai_proxy` after the prompt has been parsed and the
     /// tiktoken estimator has run; reconciled on the response side
@@ -1153,6 +1157,7 @@ impl RequestContext {
             ai_budget_fraction: 0.0,
             ai_inbound_format: None,
             ai_native_bypass: false,
+            effective_key_policy: None,
             ai_admission: None,
             ai_realtime_session: None,
             ai_realtime_dispatch: None,
@@ -1223,6 +1228,7 @@ mod tests {
         assert!(ctx.response_status.is_none());
         assert!(ctx.rate_limit_info.is_none());
         assert!(ctx.response_body_buf.is_none());
+        assert!(ctx.effective_key_policy.is_none());
         assert!(!ctx.buffering_body);
         assert!(ctx.upstream_content_type.is_none());
         assert!(ctx.forward_rule_idx.is_none());

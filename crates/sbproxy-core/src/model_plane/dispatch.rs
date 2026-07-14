@@ -7,6 +7,8 @@ use super::{ModelPlaneError, ModelPlaneRetryClass};
 use crate::server::model_host::ManagedModelPermit;
 
 const MAX_REPLICA_ATTEMPTS: usize = 8;
+const MAX_ROUTE_IDENTIFIER_BYTES: usize = 128;
+const MAX_ROUTE_POLICY_REVISION_BYTES: usize = 256;
 
 /// Result of applying one deployment's concrete cold-start policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +107,12 @@ pub struct ManagedAttemptTrace {
 /// Bounded route explanation safe for logs and request traces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedRouteTrace {
+    /// Bounded tenant boundary evaluated by the ingress gateway.
+    pub tenant_id: String,
+    /// Immutable, non-secret governed credential identifier.
+    pub governed_key_id: String,
+    /// Bounded effective policy revision evaluated at ingress.
+    pub policy_revision: String,
     /// Candidate filtering and ordering summary.
     pub selection: ReplicaSelectionTrace,
     /// At most eight attempt results in dispatch order.
@@ -113,6 +121,49 @@ pub struct ManagedRouteTrace {
     pub failovers: usize,
     /// Ordered candidates omitted by the hard attempt bound.
     pub truncated_candidates: usize,
+}
+
+impl ManagedRouteTrace {
+    fn new(
+        selection: ReplicaSelectionTrace,
+        attempts: Vec<ManagedAttemptTrace>,
+        failovers: usize,
+        truncated_candidates: usize,
+        tenant_id: &str,
+        governed_key_id: &str,
+        policy_revision: &str,
+    ) -> Self {
+        Self {
+            tenant_id: bounded_route_identifier(tenant_id, "tenant"),
+            governed_key_id: bounded_route_identifier(governed_key_id, "anonymous"),
+            policy_revision: bounded_route_policy_revision(policy_revision),
+            selection,
+            attempts,
+            failovers,
+            truncated_candidates,
+        }
+    }
+
+    pub(crate) fn empty(
+        selection: ManagedReplicaSelection,
+        tenant_id: &str,
+        governed_key_id: &str,
+        policy_revision: &str,
+    ) -> Self {
+        let truncated_candidates = selection
+            .candidates
+            .len()
+            .saturating_sub(MAX_REPLICA_ATTEMPTS);
+        Self::new(
+            selection.trace,
+            Vec::new(),
+            0,
+            truncated_candidates,
+            tenant_id,
+            governed_key_id,
+            policy_revision,
+        )
+    }
 }
 
 /// Selected response and the route that owns it.
@@ -149,14 +200,21 @@ pub struct ManagedDispatchFailure {
 pub async fn dispatch_managed_candidates(
     selection: ManagedReplicaSelection,
     executor: &dyn ManagedReplicaExecutor,
+    tenant_id: &str,
+    governed_key_id: &str,
+    policy_revision: &str,
 ) -> Result<ManagedDispatchOutcome, ManagedDispatchFailure> {
     let attempted = selection.candidates.len().min(MAX_REPLICA_ATTEMPTS);
-    let mut trace = ManagedRouteTrace {
-        selection: selection.trace,
-        attempts: Vec::with_capacity(attempted),
-        failovers: 0,
-        truncated_candidates: selection.candidates.len().saturating_sub(attempted),
-    };
+    let truncated_candidates = selection.candidates.len().saturating_sub(attempted);
+    let mut trace = ManagedRouteTrace::new(
+        selection.trace,
+        Vec::with_capacity(attempted),
+        0,
+        truncated_candidates,
+        tenant_id,
+        governed_key_id,
+        policy_revision,
+    );
     if attempted == 0 {
         return Err(ManagedDispatchFailure {
             source: ModelPlaneError::NoEligibleReplica,
@@ -211,6 +269,33 @@ pub async fn dispatch_managed_candidates(
     }
 
     unreachable!("bounded non-empty candidate loop always returns")
+}
+
+fn bounded_route_identifier(value: &str, fallback: &str) -> String {
+    let candidate = if value.is_empty() { fallback } else { value };
+    if candidate.len() <= MAX_ROUTE_IDENTIFIER_BYTES
+        && candidate.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':' | b'@' | b'/')
+        })
+    {
+        candidate.to_string()
+    } else {
+        use sha2::{Digest as _, Sha256};
+        format!("id:{}", hex::encode(Sha256::digest(candidate.as_bytes())))
+    }
+}
+
+fn bounded_route_policy_revision(value: &str) -> String {
+    if !value.is_empty()
+        && value.len() <= MAX_ROUTE_POLICY_REVISION_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
+    {
+        value.to_string()
+    } else {
+        bounded_route_identifier(value, "unversioned")
+    }
 }
 
 fn retryable_pre_output_status(status: u16) -> bool {

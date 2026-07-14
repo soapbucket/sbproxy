@@ -38,6 +38,13 @@ pub struct AiHandlerConfig {
     /// Virtual API keys mapped to provider keys and scopes.
     #[serde(default)]
     pub virtual_keys: Vec<VirtualKeyConfig>,
+    /// Require this origin to authenticate with a canonical governed key.
+    ///
+    /// The default is `false` for compatibility. When enabled, missing,
+    /// unknown, inactive, malformed, and legacy credentials fail closed before
+    /// model discovery, cache lookup, provider selection, or dispatch.
+    #[serde(default)]
+    pub require_governed_key: bool,
     /// Per-model rate limit overrides keyed by model name.
     #[serde(default)]
     pub model_rate_limits: HashMap<String, ModelRateConfig>,
@@ -1010,6 +1017,7 @@ mod tests {
             guardrails: None,
             budget: None,
             virtual_keys: vec![],
+            require_governed_key: false,
             model_rate_limits: HashMap::new(),
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
@@ -1045,6 +1053,7 @@ mod tests {
             guardrails: None,
             budget: None,
             virtual_keys: vec![],
+            require_governed_key: false,
             model_rate_limits: HashMap::new(),
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
@@ -1080,6 +1089,7 @@ mod tests {
             guardrails: None,
             budget: None,
             virtual_keys: vec![],
+            require_governed_key: false,
             model_rate_limits: HashMap::new(),
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
@@ -1116,6 +1126,7 @@ mod tests {
             guardrails: None,
             budget: None,
             virtual_keys: vec![],
+            require_governed_key: false,
             model_rate_limits: HashMap::new(),
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
@@ -1206,6 +1217,23 @@ mod tests {
         assert!(config.allowed_models.is_empty());
         assert!(config.blocked_models.is_empty());
         assert!(config.max_body_size.is_none());
+        assert!(!config.require_governed_key);
+    }
+
+    #[test]
+    fn governed_key_requirement_is_scoped_to_one_ai_origin() {
+        let required = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "require_governed_key": true
+        }))
+        .expect("origin requiring governed keys");
+        let compatible = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai"}]
+        }))
+        .expect("origin using the compatibility default");
+
+        assert!(required.require_governed_key);
+        assert!(!compatible.require_governed_key);
     }
 
     #[test]

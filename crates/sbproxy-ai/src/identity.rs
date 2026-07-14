@@ -78,6 +78,10 @@ impl KeyPriority {
 pub struct VirtualKeyConfig {
     /// The virtual key string used for authentication.
     pub key: String,
+    /// Immutable, non-secret identifier used for governance, attribution, and
+    /// audit. Legacy inline virtual keys may omit this and remain ungoverned.
+    #[serde(default)]
+    pub key_id: Option<String>,
     /// Human-readable name for this key.
     #[serde(default)]
     pub name: Option<String>,
@@ -90,6 +94,9 @@ pub struct VirtualKeyConfig {
     /// Providers this key is allowed to use (empty = all).
     #[serde(default)]
     pub allowed_providers: Vec<String>,
+    /// Providers this key may not use. Blocks override allows.
+    #[serde(default)]
+    pub blocked_providers: Vec<String>,
     /// Inbound principal selectors allowed to use this key. Empty
     /// means the key is available to every inbound principal.
     #[serde(default)]
@@ -98,6 +105,10 @@ pub struct VirtualKeyConfig {
     /// bodies before this key can dispatch upstream.
     #[serde(default)]
     pub require_pii_redaction: Vec<String>,
+    /// Caller-supplied tool names this key may expose. `None` is unrestricted;
+    /// an empty list denies every caller-supplied tool.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
     /// Maximum requests per minute for this key.
     #[serde(default)]
     pub max_requests_per_minute: Option<u64>,
@@ -176,6 +187,31 @@ pub struct VirtualKeyConfig {
 }
 
 impl VirtualKeyConfig {
+    /// Immutable, non-secret identifier suitable for quotas, audit, and traces.
+    pub fn governance_key_id(&self) -> Option<&str> {
+        self.key_id.as_deref()
+    }
+
+    /// Whether a provider passes this key's allow and block policy.
+    pub fn is_provider_allowed(&self, provider: &str) -> bool {
+        !self
+            .blocked_providers
+            .iter()
+            .any(|blocked| blocked == provider)
+            && (self.allowed_providers.is_empty()
+                || self
+                    .allowed_providers
+                    .iter()
+                    .any(|allowed| allowed == provider))
+    }
+
+    /// Whether a caller-supplied tool name passes this key's tool policy.
+    pub fn is_tool_allowed(&self, tool: &str) -> bool {
+        self.allowed_tools
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|candidate| candidate.as_str() == tool))
+    }
+
     /// Whether this key's principal selectors allow the inbound
     /// principal. An empty selector list is intentionally allow-all.
     pub fn matches_principal(&self, principal: &Principal) -> bool {
@@ -191,6 +227,7 @@ impl VirtualKeyConfig {
 /// block. Fields OR together inside a selector; selector rows OR
 /// together on [`VirtualKeyConfig`].
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalSelectorConfig {
     /// Glob against `Principal.virtual_key.name`.
     #[serde(default)]
@@ -444,12 +481,15 @@ mod tests {
     fn make_key(key: &str, enabled: bool) -> VirtualKeyConfig {
         VirtualKeyConfig {
             key: key.to_string(),
+            key_id: None,
             name: None,
             allowed_models: vec![],
             blocked_models: vec![],
             allowed_providers: vec![],
+            blocked_providers: vec![],
             principal_selectors: vec![],
             require_pii_redaction: vec![],
+            allowed_tools: None,
             max_requests_per_minute: None,
             max_tokens_per_minute: None,
             priority: None,
@@ -469,12 +509,15 @@ mod tests {
     fn make_key_with_models(key: &str, allowed: Vec<&str>, blocked: Vec<&str>) -> VirtualKeyConfig {
         VirtualKeyConfig {
             key: key.to_string(),
+            key_id: None,
             name: None,
             allowed_models: allowed.into_iter().map(String::from).collect(),
             blocked_models: blocked.into_iter().map(String::from).collect(),
             allowed_providers: vec![],
+            blocked_providers: vec![],
             principal_selectors: vec![],
             require_pii_redaction: vec![],
+            allowed_tools: None,
             max_requests_per_minute: None,
             max_tokens_per_minute: None,
             priority: None,
@@ -767,5 +810,46 @@ mod tests {
             config.metadata.get("cost_center").map(String::as_str),
             Some("R-12")
         );
+    }
+
+    #[test]
+    fn governance_identity_never_uses_the_bearer_secret() {
+        let mut config = make_key("sk-secret-that-must-stay-private", true);
+        config.key_id = Some("cfg:tenant-a:origin-a:production".to_string());
+        config.name = Some("production".to_string());
+
+        assert_eq!(
+            config.governance_key_id(),
+            Some("cfg:tenant-a:origin-a:production")
+        );
+        assert_ne!(config.governance_key_id(), Some(config.key.as_str()));
+    }
+
+    #[test]
+    fn provider_blocks_override_allows() {
+        let mut config = make_key("sk-1", true);
+        config.allowed_providers = vec!["openai".into(), "vertex".into()];
+        config.blocked_providers = vec!["vertex".into()];
+
+        assert!(config.is_provider_allowed("openai"));
+        assert!(!config.is_provider_allowed("vertex"));
+        assert!(!config.is_provider_allowed("anthropic"));
+
+        config.allowed_providers.clear();
+        assert!(config.is_provider_allowed("anthropic"));
+        assert!(!config.is_provider_allowed("vertex"));
+    }
+
+    #[test]
+    fn caller_tool_policy_preserves_unrestricted_and_deny_all() {
+        let mut config = make_key("sk-1", true);
+        assert!(config.is_tool_allowed("search"));
+
+        config.allowed_tools = Some(Vec::new());
+        assert!(!config.is_tool_allowed("search"));
+
+        config.allowed_tools = Some(vec!["search".into()]);
+        assert!(config.is_tool_allowed("search"));
+        assert!(!config.is_tool_allowed("shell"));
     }
 }

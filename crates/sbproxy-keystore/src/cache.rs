@@ -271,7 +271,7 @@ fn evict_if_needed<V>(map: &mut HashMap<String, Entry<V>>, max_entries: usize, n
 mod tests {
     use super::*;
     use crate::record::KeyRecord;
-    use crate::MemoryKeyStore;
+    use crate::{KeyPolicyCasResult, MemoryKeyStore};
     use chrono::{DateTime, Utc};
 
     fn ts() -> DateTime<Utc> {
@@ -309,6 +309,15 @@ mod tests {
         async fn put_key(&self, record: KeyRecord) -> Result<()> {
             self.inner.put_key(record).await
         }
+        async fn put_key_if_revision(
+            &self,
+            record: KeyRecord,
+            expected_revision: u64,
+        ) -> Result<KeyPolicyCasResult> {
+            self.inner
+                .put_key_if_revision(record, expected_revision)
+                .await
+        }
         async fn delete_key(&self, key_id: &str) -> Result<()> {
             self.inner.delete_key(key_id).await
         }
@@ -341,6 +350,9 @@ mod tests {
             anyhow::bail!("store down")
         }
         async fn put_key(&self, _: KeyRecord) -> Result<()> {
+            anyhow::bail!("store down")
+        }
+        async fn put_key_if_revision(&self, _: KeyRecord, _: u64) -> Result<KeyPolicyCasResult> {
             anyhow::bail!("store down")
         }
         async fn delete_key(&self, _: &str) -> Result<()> {
