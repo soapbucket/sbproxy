@@ -2850,6 +2850,42 @@ pub fn record_mcp_tool_compat_verdict(grade: &str, outcome: &'static str) {
     counter.with_label_values(&[grade.as_str(), outcome]).inc();
 }
 
+/// Record a rollout-plane tool call on
+/// `sbproxy_mcp_tool_version_calls_total{tool, version, via,
+/// deprecated}`. `via` is the resolution rung that chose the version
+/// (`meta`, `session`, `pin`, `alias`, `default`); `deprecated` is
+/// `yes` once the served version is past its sunset date. The
+/// per-version traffic split is the operator's migration dashboard:
+/// a version whose calls hit zero is safe to retire.
+pub fn record_mcp_tool_version_call(
+    tool: &str,
+    version: &str,
+    via: &'static str,
+    past_sunset: bool,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_tool_version_calls_total",
+            "Rollout-plane tool calls, by tool, served version, resolution rung, and deprecation",
+            &["tool", "version", "via", "deprecated"],
+        )
+        .expect("mcp tool version call counter registers")
+    });
+    let tool = sanitize_label("tool", tool);
+    let version = sanitize_label("version", version);
+    counter
+        .with_label_values(&[
+            tool.as_str(),
+            version.as_str(),
+            via,
+            if past_sunset { "yes" } else { "no" },
+        ])
+        .inc();
+}
+
 /// Record an MCP upstream IO failure on
 /// `sbproxy_mcp_upstream_io_failures_total{kind}`. `kind` is one of
 /// `timeout`, `connect`, `response_cap`, `other`. Lets an operator

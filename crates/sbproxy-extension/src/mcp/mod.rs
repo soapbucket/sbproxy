@@ -30,6 +30,11 @@ pub mod egress;
 pub mod federation;
 pub mod openapi_convert;
 pub mod rest_to_mcp;
+/// Tool rollout plane: multiple live versions of one tool with
+/// per-consumer resolution (call `_meta`, session requirements,
+/// principal pins, catalogue aliases, default), version routing,
+/// adapters, and sunset handling.
+pub mod rollout;
 /// WOR-486: schema-drift detection for converted MCP servers.
 /// Diffs two OpenAPI snapshots and classifies the changes by
 /// severity so a CI gate can refuse to regenerate the MCP tool

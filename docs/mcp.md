@@ -103,7 +103,7 @@ struct is `McpActionConfig` in
 | `upstream_connect_timeout` | duration | `5s` | TCP connect deadline per upstream exchange. |
 | `upstream_timeout` | duration | `30s` | Whole-request deadline per upstream exchange (refreshes, calls, reads). Per-server `timeout:` can only shorten it for `tools/call`. |
 | `max_upstream_response_bytes` | integer | `8388608` | Cap on upstream response bytes buffered per exchange. |
-| `tool_versioning` | object | unset | Contract-versioning gate. See [tool-versioning.md](tool-versioning.md). |
+| `tool_versioning` | object | unset | Version-bump gate plus the tool rollout plane (`rollout:` publishes several versions of one tool, resolved per consumer). See [tool-versioning.md](tool-versioning.md). |
 | `tool_pricing` | map<string, float> | `{}` | Per-tool USD cost for the usage-sink attribution. |
 | `usage_sinks` | list | `[]` | Sinks for MCP tool-call usage rows (same shapes as the AI path). |
 

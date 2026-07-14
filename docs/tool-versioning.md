@@ -4,16 +4,147 @@
 
 An MCP tool has no version field. Its shape is a name, a description, an
 `inputSchema`, and an `outputSchema`, and the only signal that any of them moved
-is an opaque `notifications/tools/list_changed`. So a tool can change under the
-agents that call it with no error: a required argument gets renamed, an enum
-value drops, a description is reworded and the model starts choosing a different
-tool. The change ships quietly and shows up as a behavior regression later.
+is an opaque `notifications/tools/list_changed`. OpenAPI has semantic
+versioning conventions for exactly this; MCP has nothing. So shipping a
+breaking change to a tool means breaking every agent that calls it, at the
+same moment, with no error they can act on.
 
-The compatibility oracle closes that gap at the gateway. It gives every tool a
-content digest, grades a change against semantic versioning, and fails a
-version-bump check when a breaking change ships without a matching major bump.
-It is the MCP counterpart of `cargo-semver-checks` or `elm diff`, with two
-checks a structural tool cannot do, because the consumer here is a model.
+The gateway closes that gap in two halves:
+
+- **The rollout plane** publishes several versions of one tool at once,
+  resolves the right version per consumer, routes or adapts each one, and
+  retires old versions on a sunset date. This is how you ship `search` v2
+  while every v1 caller keeps working.
+- **The compatibility oracle** grades any change against semantic versioning
+  and fails a version-bump check when a breaking change ships without a
+  matching major bump. It is the MCP counterpart of `cargo-semver-checks` or
+  `elm diff`, with checks a structural tool cannot do, because the consumer
+  here is a model.
+
+## Rolling out a new version
+
+The `rollout` block under `tool_versioning` declares the published versions of
+a tool, where each one lives, and who gets which:
+
+```yaml
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      federated_servers:
+        - origin: "legacy.internal"
+          prefix: legacy-api
+        - origin: "new.internal"
+          prefix: new-api
+      tool_versioning:
+        rollout:
+          tools:
+            search:
+              versions:
+                - version: "1.4.0"
+                  server: legacy-api
+                  sunset: "2026-10-01"
+                - version: "2.0.0"
+                  server: new-api
+          pins:
+            - principals:
+                - team: checkout
+              tools:
+                search: "^1"
+```
+
+With that block live, `tools/list` advertises one `search` whose schema is the
+version the consumer resolves to, plus `search_v1` and `search_v2` aliases
+(aliases are on by default; set `aliases: false` per tool to hide them). A
+`tools/call` on `search` routes to the resolved version's server; a call on
+`search_v1` routes to the highest 1.x.
+
+### How a consumer gets a version
+
+Resolution walks a ladder, most specific first:
+
+1. **Call**: a semver range in the request `_meta`, key
+   `sbproxy.dev/version`. Wins over everything.
+2. **Session**: a `{tool: range}` map declared once at `initialize` under
+   `_meta` key `sbproxy.dev/tool_requirements`, held on the MCP session
+   (requires `sessions.enabled`).
+3. **Pin**: the first `pins` entry whose principal selector matches the
+   authenticated caller. Selectors are the same shape as the RBAC
+   `principals` rows; an empty selector list pins everyone. This is the rung
+   that works with every current MCP client, because the operator controls
+   it.
+4. **Alias**: the version-suffixed catalogue name (`search_v1`), for clients
+   that pick tools from the catalogue and cannot send `_meta`.
+5. **Default**: the tool's `default:` version, else its highest.
+
+Ranges are standard semver requirements (`^1`, `~1.4`, `>=1, <2`). Every
+`tools/list` entry carries `_meta` with `sbproxy.dev/version` (what this
+consumer resolved to), `sbproxy.dev/available` (every published version), and
+`sbproxy.dev/sunset` when set, so a capable client can choose without any
+operator involvement.
+
+### Retiring the old upstream: adapters
+
+While both upstreams run, versions route. Once the old server is gone, a
+version can instead carry request/response adapters and be served off the new
+upstream:
+
+```yaml
+versions:
+  - version: "1.4.0"
+    sunset: "2026-10-01"
+    adapter:
+      request: "js:adapters/search-v1.js"
+      response: "js:adapters/search-v1.js"
+    contract:
+      name: search
+      description: Search repositories
+      inputSchema:
+        type: object
+        properties:
+          q: { type: string }
+        required: [q]
+  - version: "2.0.0"
+    server: new-api
+```
+
+The reference is `js:` plus a file path. The file defines `request(args)`
+and/or `response(result)` and returns the transformed value; the same file
+can serve both fields. A version with an adapter and no `server` dispatches
+to the default version's server. The inline `contract` is what `tools/list`
+advertises for the version once no live upstream serves it; without one the
+gateway falls back to a live entry and skips the alias when none exists, so
+it never advertises a schema it cannot honor. JavaScript is the supported
+adapter runtime today.
+
+An adapter failure fails the call with a typed JSON-RPC error (code
+`-32098`) rather than passing the untranslated shape through: a silent
+contract break is the exact thing this plane exists to prevent.
+
+### Sunset
+
+A version with a `sunset: YYYY-MM-DD` date is annotated as deprecated in the
+catalogue (description suffix plus `_meta`), and every call it serves is
+counted and logged. Past the date, `after_sunset: warn` (the default) keeps
+serving; `after_sunset: block` fails calls with the sunset in the error.
+
+Migration is observable on
+`sbproxy_mcp_tool_version_calls_total{tool, version, via, deprecated}`: when
+a version's traffic hits zero, it is safe to remove from the config. Results
+served by the plane carry `_meta.sbproxy.dev/version` so a caller can always
+tell which version answered.
+
+RBAC, quotas, guardrails, and per-server timeouts apply to versioned calls
+exactly as to any other: the gates run against the resolved server after the
+version rewrite.
+
+See `examples/mcp-tool-rollout/` for a runnable two-version configuration
+with a pin and an adapter.
+
+## Grading changes: the compatibility oracle
+
+The second half is knowing when a change *needs* a new version. The oracle
+gives every tool a content digest and grades every change.
 
 ## What it produces
 
