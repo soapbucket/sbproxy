@@ -25,7 +25,7 @@ services:
     # In a real enclave this image arrives through your registry mirror,
     # the same way the weights arrive: vetted on the connected side,
     # carried across, served locally.
-    image: ghcr.io/soapbucket/sbproxy:latest
+    image: soapbucket/sbproxy:latest
     command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
     volumes:
       - ./sb.yml:/etc/sbproxy/sb.yml:ro

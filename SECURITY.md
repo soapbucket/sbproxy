@@ -53,7 +53,7 @@ If you are pulling SBproxy into production, **verify before you run**. Four comm
 
 ```bash
 # 1. Download the artifact and its cosign bundle
-VERSION=1.0.0
+VERSION=1.5.0
 PLATFORM=linux_amd64
 BASE="https://github.com/soapbucket/sbproxy/releases/download/v${VERSION}"
 curl -fsSL -o sbproxy.tar.gz       "${BASE}/sbproxy_${PLATFORM}.tar.gz"
@@ -67,7 +67,7 @@ cosign verify-blob \
   sbproxy.tar.gz
 
 # 3. Verify the container image signature
-cosign verify ghcr.io/soapbucket/sbproxy:${VERSION} \
+cosign verify docker.io/soapbucket/sbproxy:${VERSION} \
   --certificate-identity "https://github.com/soapbucket/sbproxy/.github/workflows/release.yml@refs/tags/v${VERSION}" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 
@@ -103,8 +103,8 @@ Anything signed by a different workflow path, repo, or issuer is **not** an offi
 
 Every tagged release (`v*.*.*`) ships:
 
-- **Binaries** for `linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`, each signed with cosign keyless and accompanied by a `.cosign.bundle` file containing the signature, certificate, and Rekor inclusion proof
-- **Container image** at `ghcr.io/soapbucket/sbproxy:<version>` (and `:<major>` for the latest in a major line), signed via cosign and pushed with multi-platform manifests
+- **Binaries** for `linux_amd64`, `linux_arm64`, `darwin_arm64`, each signed with cosign keyless and accompanied by a `.cosign.bundle` file containing the signature, certificate, and Rekor inclusion proof
+- **Container image** at `docker.io/soapbucket/sbproxy:<version>` (and `:latest`), mirrored to `ghcr.io/soapbucket/sbproxy` at the same digest, signed via cosign and pushed with multi-platform manifests
 - **CycloneDX SBOM** for source and image, attached as both a release asset (`sbom.cyclonedx.json`) and a cosign attestation on the image
 - **SLSA build provenance** as a GitHub-native attestation, verifiable via `gh attestation verify`
 
@@ -118,14 +118,14 @@ When you deploy SBproxy:
 
 - **Pin the Docker image by digest, not by tag.** Tags can be re-pushed; digests cannot.
   ```yaml
-  image: ghcr.io/soapbucket/sbproxy@sha256:<digest>
+  image: docker.io/soapbucket/sbproxy@sha256:<digest>
   ```
 - **Verify the digest** matches the cosign-signed image before pinning it.
 - **Fetch SBOMs at deploy time** if your security team requires per-deploy artifact inventory. The SBOM is attached to the image as a cosign attestation:
   ```bash
   cosign download attestation \
     --predicate-type=https://cyclonedx.org/bom \
-    ghcr.io/soapbucket/sbproxy:1.0.0 | jq -r .payload | base64 -d > sbom.cyclonedx.json
+    docker.io/soapbucket/sbproxy:1.5.0 | jq -r .payload | base64 -d > sbom.cyclonedx.json
   ```
 - **Store the cert identity** you accept in your CI verification step. Rotating to a different identity (a new workflow file, a new repo) is a deliberate decision, not a silent one.
 - **Run the gateway as non-root.** The container image's default user is non-root; do not override.

@@ -31,7 +31,7 @@ curl -fsSL https://download.sbproxy.dev | sh
 brew install soapbucket/tap/sbproxy
 
 # Docker:
-docker pull ghcr.io/soapbucket/sbproxy:latest
+docker pull soapbucket/sbproxy:latest
 ```
 
 For the enclave itself you carry the artifact across the wall the same way you carry the weights: verify it on the connected side, then transfer. The binary is static and needs no toolchain on the target. The full install matrix is in the [manual](manual.md).

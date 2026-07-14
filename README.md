@@ -69,7 +69,7 @@ brew install sbproxy
 Docker:
 
 ```bash
-docker pull ghcr.io/soapbucket/sbproxy:latest
+docker pull soapbucket/sbproxy:latest
 ```
 
 From source (needs Rust 1.82+):

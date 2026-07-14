@@ -26,7 +26,7 @@ Homebrew, Docker, binary downloads, and source builds are in the [runtime manual
 sbproxy serve -f sb.yml
 ```
 
-The same `serve -f <config>` form works for the Docker image (`ghcr.io/soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml`).
+The same `serve -f <config>` form works for the Docker image (`soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml`).
 
 ## Minimal config
 

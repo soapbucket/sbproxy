@@ -23,7 +23,7 @@ services:
   # (`Dockerfile.cloudbuild`) is the reference Dockerfile; it builds a
   # release binary and wraps it in distroless/cc-debian12. Operators
   # who want to pin a specific release can swap `build:` for
-  # `image: ghcr.io/soapbucket/sbproxy:<tag>` once a public image tag
+  # `image: soapbucket/sbproxy:<tag>` once a public image tag
   # is available.
   sbproxy:
     build:

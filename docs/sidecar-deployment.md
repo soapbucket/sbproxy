@@ -74,7 +74,7 @@ spec:
           value: "443,80"
   containers:
     - name: sbproxy
-      image: ghcr.io/soapbucket/sbproxy:1.0.0
+      image: soapbucket/sbproxy:1.5.0
       args: ["--config", "/etc/sbproxy/sb.yml"]
       ports:
         - containerPort: 15001

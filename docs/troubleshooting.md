@@ -307,11 +307,11 @@ the private model endpoint becomes active only with the distributed data plane.
 
 ## An example docker compose stack will not start
 
-The `use-case-*` stacks (and other recent examples) pull the published `ghcr.io/soapbucket/sbproxy` image; some older examples instead build the image from source in the container (`build: ../..`, `Dockerfile.cloudbuild`). Both kinds pull supporting images such as `wiremock/wiremock` from Docker Hub.
+The `use-case-*` stacks (and other recent examples) pull the published `soapbucket/sbproxy` image from Docker Hub; some older examples instead build the image from source in the container (`build: ../..`, `Dockerfile.cloudbuild`). Both kinds pull supporting images such as `wiremock/wiremock` from Docker Hub.
 
 Check:
-- Look for `pull access denied` or `auth.docker.io ... unexpected EOF` in the compose output. That is a registry-connectivity problem (ghcr.io or Docker Hub), not an example defect.
-- Confirm the daemon is up with `docker info`, and that the host can reach ghcr.io and Docker Hub.
+- Look for `pull access denied` or `auth.docker.io ... unexpected EOF` in the compose output. That is a Docker Hub connectivity problem, not an example defect.
+- Confirm the daemon is up with `docker info`, and that the host can reach Docker Hub.
 - Pre-pull the images (or, for the build-from-source examples, build the `sbproxy` image once) so a later `docker compose up` works from cache.
 - The build-from-source examples compile the whole workspace inside the container on first run; a long silent period during `docker compose up` is the Rust build, not a hang.
 

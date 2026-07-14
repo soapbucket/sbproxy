@@ -32,7 +32,7 @@ curl -fsSL https://download.sbproxy.dev | sh
 brew install soapbucket/tap/sbproxy
 
 # Docker:
-docker pull ghcr.io/soapbucket/sbproxy:latest
+docker pull soapbucket/sbproxy:latest
 ```
 
 The full install matrix, packages, and checksums live in the [manual](manual.md).

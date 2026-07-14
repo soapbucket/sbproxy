@@ -72,7 +72,7 @@ The official image runs the statically-linked binary on a distroless base (`gcr.
 
 ```bash
 # Pull the image
-docker pull ghcr.io/soapbucket/sbproxy:latest
+docker pull soapbucket/sbproxy:latest
 
 # Run with a local config directory
 docker run --rm \
@@ -80,13 +80,13 @@ docker run --rm \
   -p 8443:8443 \
   -p 8443:8443/udp \
   -v /path/to/config:/etc/sbproxy \
-  ghcr.io/soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest
 
 # Run with a specific config file
 docker run --rm \
   -p 8080:8080 \
   -v /path/to/sb.yml:/etc/sbproxy/sb.yml:ro \
-  ghcr.io/soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 ### From source
@@ -1325,7 +1325,7 @@ docker run -d \
   -p 8443:8443/udp \
   -v /etc/sbproxy:/etc/sbproxy:ro \
   -e SB_LOG_LEVEL=info \
-  ghcr.io/soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest
 ```
 
 For a read-only config with a writable ACME certificate store (the default `proxy.acme.storage_path` is `/var/lib/sbproxy/certs`):
@@ -1339,7 +1339,7 @@ docker run -d \
   -v /etc/sbproxy/sb.yml:/etc/sbproxy/sb.yml:ro \
   -v sbproxy-acme-certs:/var/lib/sbproxy/certs \
   -e SB_LOG_LEVEL=info \
-  ghcr.io/soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest
 ```
 
 ### Docker Compose stack
@@ -1413,7 +1413,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: sbproxy
-          image: ghcr.io/soapbucket/sbproxy:1.5.0
+          image: soapbucket/sbproxy:1.5.0
           args: ["serve", "-f", "/etc/sbproxy/sb.yaml"]
           env:
             - name: SB_LOG_LEVEL
@@ -1675,7 +1675,7 @@ docker run --rm \
   -p 8443:8443 \
   -p 8443:8443/udp \
   -v /etc/sbproxy:/etc/sbproxy:ro \
-  ghcr.io/soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest
 ```
 
 ### HTTP/3 limitations

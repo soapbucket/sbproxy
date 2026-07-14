@@ -65,7 +65,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: ghcr.io/soapbucket/sbproxy:1.5.0
+  image: soapbucket/sbproxy:1.5.0
   configRef: demo-config
   replicas: 2
   port: 8080
@@ -94,7 +94,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: ghcr.io/soapbucket/sbproxy:1.5.0
+  image: soapbucket/sbproxy:1.5.0
   configRef: demo-config
   replicas: 2
   port: 8080

@@ -9,7 +9,7 @@
 
 services:
   sbproxy:
-    image: ghcr.io/soapbucket/sbproxy:latest
+    image: soapbucket/sbproxy:latest
     command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
     ports:
       - "8080:8080"
