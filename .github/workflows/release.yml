@@ -7,7 +7,7 @@
 # SUPPLY-CHAIN.md.
 #
 # Every publish-side job is guarded by
-# `if: github.repository == 'soapbucket/sbproxy-rust'` so the workflow stays
+# `if: github.repository == 'soapbucket/sbproxy'` so the workflow stays
 # inert on forks.
 
 name: release
@@ -317,19 +317,12 @@ jobs:
             cosign sign --yes "$ref"
           done
 
-      - name: attach sbom attestation to images
-        env:
-          COSIGN_EXPERIMENTAL: '1'
-        run: |
-          for ref in \
-            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}" \
-            "${{ steps.meta.outputs.dockerhub_image }}@${{ steps.push.outputs.digest }}"; do
-            cosign attest --yes \
-              --predicate docker-ctx/sbom.cyclonedx.json \
-              --type cyclonedx \
-              "$ref"
-          done
-
+      # Provenance MUST be pushed before the cosign SBOM attestation.
+      # attest-build-provenance's push-to-registry replaces the image's
+      # sha256-<digest>.att tag wholesale, so any attestation attached
+      # earlier is wiped (v1.5.0 shipped without a registry-visible
+      # CycloneDX attestation because of this). cosign attest appends to
+      # the existing .att manifest, so it must run last.
       - name: attest build provenance for ghcr image
         uses: actions/attest-build-provenance@v2
         with:
@@ -343,3 +336,16 @@ jobs:
           subject-name: ${{ steps.meta.outputs.dockerhub_image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+      - name: attach sbom attestation to images
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          for ref in \
+            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}" \
+            "${{ steps.meta.outputs.dockerhub_image }}@${{ steps.push.outputs.digest }}"; do
+            cosign attest --yes \
+              --predicate docker-ctx/sbom.cyclonedx.json \
+              --type cyclonedx \
+              "$ref"
+          done

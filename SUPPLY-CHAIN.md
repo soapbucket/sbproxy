@@ -1,6 +1,6 @@
 # SBproxy Supply Chain
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-13*
 
 The long-form companion to `SECURITY.md`, intended for security teams, procurement reviewers, and anyone whose job is to answer the question "can we trust this binary?"
 
@@ -24,7 +24,7 @@ If you are looking for the disclosure policy or supported version table, see `SE
 
 ## 1. What we sign
 
-Every git tag matching `v*.*.*` triggers the release workflow defined at `.github/workflows/release.yml`. The workflow runs on GitHub-hosted runners (Ubuntu latest, x86\_64 and arm64 cross-compile via cargo-dist), produces signed artifacts, and publishes them to:
+Every git tag matching `v*.*.*` triggers the release workflow defined at `.github/workflows/release.yml`. The workflow builds natively on GitHub-hosted runners (Ubuntu x86\_64, Ubuntu arm64, and macOS arm64; no cross-compilation), produces signed artifacts, and publishes them to:
 
 | Artifact | Location |
 |---|---|
@@ -57,8 +57,8 @@ If a signature presents any other identity or issuer, **it is not an official SB
 This is the procedure to verify a release before running the binary in production. It assumes you have the [cosign](https://docs.sigstore.dev/cosign/installation/) CLI, the [GitHub CLI](https://cli.github.com/), and [syft](https://github.com/anchore/syft) installed.
 
 ```bash
-VERSION=1.0.0
-PLATFORM=linux_amd64                  # or linux_arm64, darwin_amd64, darwin_arm64
+VERSION=1.5.0
+PLATFORM=linux_amd64                  # or linux_arm64, darwin_arm64
 TAG="v${VERSION}"
 BASE="https://github.com/soapbucket/sbproxy/releases/download/${TAG}"
 IDENTITY="https://github.com/soapbucket/sbproxy/.github/workflows/release.yml@refs/tags/${TAG}"
@@ -92,6 +92,8 @@ This pulls the image manifest, fetches the cosign signature stored in the OCI re
 
 For multi-platform manifests, the verification covers each platform-specific image.
 
+Container images are published for `v1.2.0` and later; earlier tags shipped binaries only. The same image is mirrored to `docker.io/soapbucket/sbproxy` at the same digest, so either registry name verifies with the same command.
+
 ### 2.3 SBOM
 
 The SBOM ships in two forms. Pick whichever fits your tooling.
@@ -122,10 +124,10 @@ The SBOM is in CycloneDX JSON format. It enumerates every Rust crate (with versi
 gh attestation verify sbproxy.tar.gz --repo soapbucket/sbproxy
 ```
 
-This proves that the artifact was produced by a specific workflow run on a specific commit, on a GitHub-hosted runner, with the inputs and environment recorded in the in-toto attestation. The attestation is also visible via the GitHub Attestations API:
+This proves that the artifact was produced by a specific workflow run on a specific commit, on a GitHub-hosted runner, with the inputs and environment recorded in the in-toto attestation. The attestation is also visible via the GitHub Attestations API, which is keyed by the artifact's SHA-256 digest:
 
 ```bash
-gh api /repos/soapbucket/sbproxy/attestations/${TAG}
+gh api "/repos/soapbucket/sbproxy/attestations/sha256:$(shasum -a 256 sbproxy.tar.gz | awk '{print $1}')"
 ```
 
 A successful provenance verification means the artifact came out of the `release.yml` workflow run associated with the tag. Combined with the signature (section 2.1), it means: the artifact was built by our workflow, and the workflow signed it. Both must be true for trust to hold.
@@ -174,7 +176,7 @@ export TUF_ROOT="${HOME}/.sigstore"
 
 cosign verify-blob \
   --bundle sbproxy.tar.gz.bundle \
-  --certificate-identity "https://github.com/soapbucket/sbproxy/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --certificate-identity "https://github.com/soapbucket/sbproxy/.github/workflows/release.yml@refs/tags/v1.5.0" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   --offline \
   sbproxy.tar.gz
@@ -182,24 +184,24 @@ cosign verify-blob \
 
 The `--offline` flag tells cosign to use the Rekor inclusion proof embedded in the bundle rather than calling out to the Rekor API. This works because the proof is part of the bundle.
 
-For SLSA provenance, the GitHub `gh attestation verify` CLI requires online access to the GitHub API. If you cannot reach api.github.com, fetch the attestation on a connected machine:
+For SLSA provenance, `gh attestation verify` normally calls the GitHub API. If the verifying machine cannot reach api.github.com, fetch the attestation bundle and the Sigstore trusted root on a connected machine:
 
 ```bash
 gh attestation download sbproxy.tar.gz --repo soapbucket/sbproxy
-# Produces sbproxy.tar.gz.intoto.jsonl
+# Writes sha256:<digest>.jsonl, named after the artifact digest
+gh attestation trusted-root > trusted-root.jsonl
 ```
 
-Then verify with cosign in offline mode against the in-toto bundle:
+Then verify on the air-gapped machine entirely from local files:
 
 ```bash
-cosign verify-attestation \
-  --type slsaprovenance \
-  --certificate-identity "https://github.com/soapbucket/sbproxy/.github/workflows/release.yml@refs/tags/v1.0.0" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --offline \
-  --bundle sbproxy.tar.gz.intoto.jsonl \
-  sbproxy.tar.gz
+gh attestation verify sbproxy.tar.gz \
+  --repo soapbucket/sbproxy \
+  --bundle "sha256:<digest>.jsonl" \
+  --custom-trusted-root trusted-root.jsonl
 ```
+
+With `--bundle` and `--custom-trusted-root` supplied, `gh` performs no network calls; the bundle carries the certificate, signature, and Rekor inclusion proof, and the trusted root anchors the chain.
 
 ---
 
@@ -343,4 +345,4 @@ This is the point. The supply chain is verifiable end to end without our coopera
 - **Supply-chain questions or audit support:** security@soapbucket.com, subject line "Supply chain audit"
 - **Public advisories:** https://github.com/soapbucket/sbproxy/security/advisories
 - **Sigstore Rekor lookups:** https://rekor.sigstore.dev/
-- **GitHub attestation API:** `gh api /repos/soapbucket/sbproxy/attestations/<tag>`
+- **GitHub attestation API:** `gh api /repos/soapbucket/sbproxy/attestations/sha256:<artifact-digest>`
