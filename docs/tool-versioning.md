@@ -1,6 +1,6 @@
 # SBproxy tool versioning
 
-*Last modified: 2026-06-30*
+*Last modified: 2026-07-13*
 
 An MCP tool has no version field. Its shape is a name, a description, an
 `inputSchema`, and an `outputSchema`, and the only signal that any of them moved
@@ -129,45 +129,17 @@ error, and the metric records `outcome="lockfile_error"`. Tools present in the
 lockfile but missing from the live catalogue are reported as
 `outcome="removed_tool"` and never block anything else.
 
-See `examples/mcp-tool-versioning/` for a runnable configuration.
-
-## The CI gate
-
-`sbproxy-mcp-drift` generates and checks lockfiles, so the same oracle that
-guards the gateway can fail a pull request. Both flows take a `tools/list`
-dump: the full JSON-RPC response, the bare result object, or a plain tools
-array, from a file or stdin.
-
-```bash
-# Snapshot the live catalogue into a committed lockfile.
-curl -s https://mcp.example.com/ -H 'content-type: application/json' \
-     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-     | sbproxy-mcp-drift --lock-tools - --lockfile tool-versions.lock.yaml
-
-# CI: fail the build on an under-bumped contract change.
-curl -s https://mcp.example.com/ -H 'content-type: application/json' \
-     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-     | sbproxy-mcp-drift --check-tools - --lockfile tool-versions.lock.yaml
-```
-
-`--check-tools` exits 0 when every tool is unchanged or every change carries
-a covering bump, 1 when the only findings are new or removed tools, and 2 on
-a version-bump violation, printing the tool and the grade it required.
-Declared bumps come from `--declared versions.yaml` (a `tool: semver` map);
-without it, changes are linted against the lockfile versions, meaning "no
-bump declared". Regenerating a lockfile carries prior versions over for
-existing tools, so a snapshot refresh never invents a bump.
+See `examples/mcp-tool-versioning/` for a runnable configuration, including
+a complete `tool-versions.lock.yaml` to copy the format from. The lockfile is
+a committed YAML baseline: one entry per advertised tool carrying a declared
+semver, a contract digest, and optionally the embedded contract itself. The
+`contract` field is optional: a digest-only baseline still detects changes,
+graded as at least a patch.
 
 ## Status
 
-The oracle engine, the `sb.yml` gate, the runtime enforcement, and the
-lockfile CLI all ship today. The embedded `contract` field in the lockfile is
-optional: a digest-only baseline still detects changes, graded as at least a
-patch.
+The oracle engine, the `sb.yml` gate, and the runtime enforcement ship today.
 
 ## Related
 
 - [mcp.md](mcp.md) - the MCP gateway this grades tools for.
-- [mcp-schema-drift.md](mcp-schema-drift.md) - CI schema-drift detection for
-  converted MCP servers, which detects that a tool changed. Tool versioning
-  grades the change and gates the bump.

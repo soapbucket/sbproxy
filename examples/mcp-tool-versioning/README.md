@@ -24,7 +24,7 @@ What proves it is working:
 - Declare the matching bump under `declared_versions` and the next
   refresh clears the violation.
 
-Generate a fresh lockfile from your live gateway with the
-`sbproxy-mcp-drift` CLI (see `docs/tool-versioning.md`). An unreadable
-lockfile fails open: nothing is blocked and the gateway logs a loud
-`lockfile_error`.
+The lockfile is a committed YAML baseline; copy the format from
+`tool-versions.lock.yaml` here (see `docs/tool-versioning.md` for the
+field reference). An unreadable lockfile fails open: nothing is
+blocked and the gateway logs a loud `lockfile_error`.

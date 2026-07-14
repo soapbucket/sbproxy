@@ -7,7 +7,7 @@
 # it, `mode: block` removes the tool from tools/list and fails its
 # tools/call with an error naming the grade the change required.
 #
-# Generate the lockfile with sbproxy-mcp-drift against your live
+# Author the lockfile from your live
 # gateway, commit it next to this config, and declare bumps here as
 # your upstreams evolve. Proof it works: change a tool description
 # upstream and watch sbproxy_mcp_tool_compat_verdicts_total pick up a
