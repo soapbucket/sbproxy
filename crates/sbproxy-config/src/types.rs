@@ -1032,6 +1032,12 @@ pub struct SeedKeyConfig {
     /// Max requests per minute.
     #[serde(default)]
     pub max_requests_per_minute: Option<u64>,
+    /// Max input and output tokens per minute.
+    #[serde(default)]
+    pub max_tokens_per_minute: Option<u64>,
+    /// Served-model admission lane (`interactive`, `standard`, or `batch`).
+    #[serde(default)]
+    pub priority: Option<String>,
     /// Max total tokens for this key's budget window.
     #[serde(default)]
     pub max_budget_tokens: Option<u64>,
@@ -1047,6 +1053,13 @@ pub struct SeedKeyConfig {
     /// Providers this key may use (empty = all).
     #[serde(default)]
     pub allowed_providers: Vec<String>,
+    /// Providers this key may not use. Blocks override allows.
+    #[serde(default)]
+    pub blocked_providers: Vec<String>,
+    /// Caller-supplied tool allowlist. `None` is unrestricted and an empty
+    /// list denies every caller-supplied tool.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
     /// Named PII redaction rules that must be active before this key can
     /// dispatch upstream (empty = none required).
     #[serde(default)]
@@ -1064,6 +1077,9 @@ pub struct SeedKeyConfig {
     /// authenticates, replacing any client-supplied tools.
     #[serde(default)]
     pub inject_tools: Vec<serde_json::Value>,
+    /// Federated MCP catalogue reference injected for this key.
+    #[serde(default)]
+    pub inject_mcp: Option<serde_json::Value>,
     /// Skip the body-aware prompt-injection scan for this key. Default false.
     #[serde(default)]
     pub bypass_prompt_injection: bool,
@@ -1073,6 +1089,12 @@ pub struct SeedKeyConfig {
     /// User attribution.
     #[serde(default)]
     pub user: Option<String>,
+    /// Free-form grouping tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Free-form string metadata for audit and usage attribution.
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
     /// Owning tenant.
     #[serde(default)]
     pub tenant: Option<String>,
@@ -3219,6 +3241,10 @@ pub struct CredentialBlock {
     /// Mirrors `inject_tools` on the underlying `VirtualKeyConfig`.
     #[serde(default)]
     pub inject_tools: Vec<serde_json::Value>,
+    /// Caller-supplied tool allowlist for this credential. Omitted is
+    /// unrestricted and an explicit empty list denies every caller tool.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
     /// WOR-1646: inject a federated MCP gateway's live catalogue as
     /// this credential's tool surface. Raw passthrough of the
     /// `InjectMcpRef` shape (`{ref, format, filter}`) on the

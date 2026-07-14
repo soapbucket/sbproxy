@@ -113,10 +113,10 @@ pub use peer_pricing_preflight::{
     NO_MANIFEST_TTL as PEER_PRICING_NO_MANIFEST_TTL,
 };
 pub use prompt_injection_v2::{
-    classification_cache_stats, evaluate_body, reset_classification_cache, BodyAwareConfig,
-    BodyAwareOutcome, ClassificationCacheStats, DetectionLabel, DetectionResult, Detector,
-    PromptInjectionAction, PromptInjectionV2Outcome, PromptInjectionV2Policy,
-    HEURISTIC_DETECTOR_NAME,
+    classification_cache_stats, evaluate_body, evaluate_body_with_audit,
+    reset_classification_cache, BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome,
+    ClassificationCacheStats, DetectionLabel, DetectionResult, Detector, PromptInjectionAction,
+    PromptInjectionV2Outcome, PromptInjectionV2Policy, HEURISTIC_DETECTOR_NAME,
 };
 pub use quote_token::{
     InMemoryNonceStore, IssuedQuote, NonceCheck, NonceContext, NonceError, NonceStore, QuoteClaims,

@@ -338,6 +338,8 @@ fn lower_seed_key(
     rec.source = RecordSource::Config;
     rec.name = seed.name.clone();
     rec.max_requests_per_minute = seed.max_requests_per_minute;
+    rec.max_tokens_per_minute = seed.max_tokens_per_minute;
+    rec.priority = seed.priority.clone();
     if seed.max_budget_tokens.is_some() || seed.max_budget_usd.is_some() {
         rec.budget = Some(RecordBudget {
             max_tokens: seed.max_budget_tokens,
@@ -347,13 +349,18 @@ fn lower_seed_key(
     rec.allowed_models = seed.allowed_models.clone();
     rec.blocked_models = seed.blocked_models.clone();
     rec.allowed_providers = seed.allowed_providers.clone();
+    rec.blocked_providers = seed.blocked_providers.clone();
+    rec.allowed_tools = seed.allowed_tools.clone();
     rec.require_pii_redaction = seed.require_pii_redaction.clone();
     rec.principal_selectors = seed.principal_selectors.clone();
     rec.route_to_model = seed.route_to_model.clone();
     rec.inject_tools = seed.inject_tools.clone();
+    rec.inject_mcp = seed.inject_mcp.clone();
     rec.bypass_prompt_injection = seed.bypass_prompt_injection;
     rec.project = seed.project.clone();
     rec.user = seed.user.clone();
+    rec.tags = seed.tags.clone();
+    rec.metadata = seed.metadata.clone();
     rec.tenant_id = seed.tenant.clone();
     rec.expires_at = seed.expires_at.as_deref().and_then(parse_rfc3339);
     Some(rec)
@@ -604,18 +611,27 @@ mod tests {
                 secret_hash: None,
                 name: Some("seeded".into()),
                 max_requests_per_minute: Some(10),
+                max_tokens_per_minute: Some(2_000),
+                priority: Some("interactive".into()),
                 max_budget_tokens: Some(1000),
                 max_budget_usd: None,
                 allowed_models: vec![],
                 blocked_models: vec![],
-                allowed_providers: vec![],
+                allowed_providers: vec!["openai".into(), "vertex".into()],
+                blocked_providers: vec!["vertex".into()],
+                allowed_tools: Some(vec!["search".into()]),
                 require_pii_redaction: vec![],
                 principal_selectors: vec![],
                 route_to_model: None,
                 inject_tools: vec![],
+                inject_mcp: Some(serde_json::json!({ "ref": "toolhub" })),
                 bypass_prompt_injection: false,
                 project: None,
                 user: None,
+                tags: vec!["production".into()],
+                metadata: [("cost_center".into(), "cc-42".into())]
+                    .into_iter()
+                    .collect(),
                 tenant: None,
                 expires_at: None,
             }],
@@ -640,6 +656,20 @@ mod tests {
             .expect("seeded key present");
         assert_eq!(rec.name.as_deref(), Some("seeded"));
         assert_eq!(rec.max_requests_per_minute, Some(10));
+        assert_eq!(rec.max_tokens_per_minute, Some(2_000));
+        assert_eq!(rec.priority.as_deref(), Some("interactive"));
+        assert_eq!(rec.allowed_providers, ["openai", "vertex"]);
+        assert_eq!(rec.blocked_providers, ["vertex"]);
+        assert_eq!(rec.allowed_tools, Some(vec!["search".to_string()]));
+        assert_eq!(
+            rec.inject_mcp,
+            Some(serde_json::json!({ "ref": "toolhub" }))
+        );
+        assert_eq!(rec.tags, ["production"]);
+        assert_eq!(
+            rec.metadata.get("cost_center").map(String::as_str),
+            Some("cc-42")
+        );
         assert!(rec.verify_secret("s3cr3t", b"test-pepper", Utc::now()));
         assert_eq!(rec.source, RecordSource::Config);
 
@@ -698,18 +728,25 @@ mod tests {
                 secret_hash: None,
                 name: Some("sm-seeded".into()),
                 max_requests_per_minute: None,
+                max_tokens_per_minute: None,
+                priority: None,
                 max_budget_tokens: None,
                 max_budget_usd: None,
                 allowed_models: vec![],
                 blocked_models: vec![],
                 allowed_providers: vec![],
+                blocked_providers: vec![],
+                allowed_tools: None,
                 require_pii_redaction: vec![],
                 principal_selectors: vec![],
                 route_to_model: None,
                 inject_tools: vec![],
+                inject_mcp: None,
                 bypass_prompt_injection: false,
                 project: None,
                 user: None,
+                tags: vec![],
+                metadata: Default::default(),
                 tenant: None,
                 expires_at: None,
             }],

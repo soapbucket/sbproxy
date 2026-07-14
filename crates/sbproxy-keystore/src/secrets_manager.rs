@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use sbproxy_vault::VaultBackend;
 
 use crate::record::{CredentialRecord, KeyRecord};
-use crate::KeyStore;
+use crate::{KeyPolicyCasResult, KeyStore};
 
 /// Sentinel written in place of a deleted secret, since the backend has no
 /// delete. A `get` returning this is treated as absent.
@@ -234,6 +234,17 @@ impl KeyStore for SecretsManagerKeyStore {
         self.bump_revision().await
     }
 
+    async fn put_key_if_revision(
+        &self,
+        _record: KeyRecord,
+        _expected_revision: u64,
+    ) -> Result<KeyPolicyCasResult> {
+        // VaultBackend exposes get/set but no conditional write or version
+        // precondition shared by every provider. A read-then-set sequence would
+        // lose concurrent updates, so policy mutation fails closed.
+        Ok(KeyPolicyCasResult::Unsupported)
+    }
+
     async fn delete_key(&self, key_id: &str) -> Result<()> {
         self.set_raw(self.key_path(key_id), TOMBSTONE.to_string())
             .await?;
@@ -288,6 +299,7 @@ impl KeyStore for SecretsManagerKeyStore {
 mod tests {
     use super::*;
     use crate::record::{CredentialMaterial, RecordStatus};
+    use crate::KeyPolicyCasResult;
     use chrono::{DateTime, Utc};
     use sbproxy_vault::LocalVault;
 
@@ -357,5 +369,22 @@ mod tests {
         assert_eq!(s.list_credentials().await.unwrap().len(), 1);
         s.delete_credential("c1").await.unwrap();
         assert!(s.get_credential("c1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn key_policy_cas_fails_closed_when_backend_has_no_atomic_primitive() {
+        let s = store();
+        s.put_key(KeyRecord::new("k1", "hash", ts())).await.unwrap();
+        let mut candidate = s.get_key("k1").await.unwrap().unwrap();
+        candidate.name = Some("unsafe update".into());
+
+        assert_eq!(
+            s.put_key_if_revision(candidate, 1).await.unwrap(),
+            KeyPolicyCasResult::Unsupported
+        );
+        let stored = s.get_key("k1").await.unwrap().unwrap();
+        assert_eq!(stored.policy_revision, 1);
+        assert!(stored.name.is_none());
+        assert_eq!(s.revision().await.unwrap(), 1);
     }
 }

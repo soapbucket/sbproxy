@@ -38,12 +38,25 @@ pub struct LlmUsageEvent {
     /// Authenticated key identifier, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+    /// Origin tenant boundary accepted for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Governed project attribution, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// End-user identifier, when supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// Team / tenant identifier, when known.
+    /// Governed team attribution, when configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
+    /// Operator-supplied grouping tags copied from the governed key policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// String-only governed metadata. This is retained in usage records but
+    /// deliberately excluded from metric labels.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata: std::collections::BTreeMap<String, String>,
     /// Stable per-request identifier. The verifiable ledger uses it as
     /// the dedup key so an at-least-once delivery collapses to
     /// exactly-once on replay. `None` events are never deduplicated.
@@ -183,6 +196,8 @@ pub fn langfuse_ingestion_body(
     metadata.insert("status".into(), serde_json::json!(event.status));
     for (k, v) in [
         ("key_id", &event.key_id),
+        ("tenant_id", &event.tenant_id),
+        ("project", &event.project),
         ("user", &event.user),
         ("team", &event.team),
         ("tag", &event.tag),
@@ -190,6 +205,12 @@ pub fn langfuse_ingestion_body(
         if let Some(val) = v {
             metadata.insert(k.into(), serde_json::json!(val));
         }
+    }
+    if !event.tags.is_empty() {
+        metadata.insert("tags".into(), serde_json::json!(event.tags));
+    }
+    if !event.metadata.is_empty() {
+        metadata.insert("metadata".into(), serde_json::json!(event.metadata));
     }
     serde_json::json!({
         "batch": [{
@@ -239,6 +260,8 @@ pub fn datadog_log_body(event: &LlmUsageEvent, service: &str) -> serde_json::Val
     log.insert("status".into(), serde_json::json!(event.status));
     for (k, v) in [
         ("key_id", &event.key_id),
+        ("tenant_id", &event.tenant_id),
+        ("project", &event.project),
         ("user", &event.user),
         ("team", &event.team),
         ("tag", &event.tag),
@@ -246,6 +269,12 @@ pub fn datadog_log_body(event: &LlmUsageEvent, service: &str) -> serde_json::Val
         if let Some(val) = v {
             log.insert(k.into(), serde_json::json!(val));
         }
+    }
+    if !event.tags.is_empty() {
+        log.insert("tags".into(), serde_json::json!(event.tags));
+    }
+    if !event.metadata.is_empty() {
+        log.insert("metadata".into(), serde_json::json!(event.metadata));
     }
     serde_json::Value::Array(vec![serde_json::Value::Object(log)])
 }
@@ -455,8 +484,12 @@ mod tests {
             latency_ms: 200,
             status: 200,
             key_id: Some("k1".into()),
+            tenant_id: None,
+            project: None,
             user: None,
             team: None,
+            tags: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
             request_id: None,
             tag: None,
             priority: None,
@@ -480,6 +513,37 @@ mod tests {
         // None fields are omitted, not serialized as null.
         assert!(parsed.get("user").is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn usage_event_preserves_safe_governed_attribution_fields() {
+        let event: LlmUsageEvent = serde_json::from_value(serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "cost_usd": 0.001,
+            "latency_ms": 200,
+            "status": 200,
+            "key_id": "key-public-id",
+            "tenant_id": "tenant-a",
+            "project": "search",
+            "user": "alice",
+            "team": "platform",
+            "tags": ["production", "chat"],
+            "metadata": {"cost_center": "cc-42"}
+        }))
+        .expect("usage event with governed attribution");
+
+        let value = serde_json::to_value(event).expect("serialize usage event");
+        assert_eq!(value["key_id"], "key-public-id");
+        assert_eq!(value["tenant_id"], "tenant-a");
+        assert_eq!(value["project"], "search");
+        assert_eq!(value["user"], "alice");
+        assert_eq!(value["team"], "platform");
+        assert_eq!(value["tags"], serde_json::json!(["production", "chat"]));
+        assert_eq!(value["metadata"]["cost_center"], "cc-42");
     }
 
     #[test]

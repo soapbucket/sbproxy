@@ -2455,7 +2455,12 @@ pub async fn distributed_managed_upstream(
     ) {
         crate::model_plane::ManagedColdStartDecision::Dispatch(selection) => selection,
         crate::model_plane::ManagedColdStartDecision::Reject(selection) => {
-            let trace = empty_managed_route_trace(selection);
+            let trace = empty_managed_route_trace(
+                selection,
+                request.tenant_id,
+                request.governed_key_id,
+                request.policy_revision,
+            );
             sbproxy_observe::metrics::record_model_plane_rejection(
                 "cold_start_rejected",
                 "readiness",
@@ -2470,7 +2475,12 @@ pub async fn distributed_managed_upstream(
             }));
         }
         crate::model_plane::ManagedColdStartDecision::Fallback(selection) => {
-            let trace = empty_managed_route_trace(selection);
+            let trace = empty_managed_route_trace(
+                selection,
+                request.tenant_id,
+                request.governed_key_id,
+                request.policy_revision,
+            );
             sbproxy_observe::metrics::record_managed_replica_failover(
                 request.provider.name.as_str(),
                 &deployment_id,
@@ -2480,7 +2490,12 @@ pub async fn distributed_managed_upstream(
             return Err(ManagedDistributedError::ColdStartFallback { trace });
         }
         crate::model_plane::ManagedColdStartDecision::Unavailable(selection) => {
-            let trace = empty_managed_route_trace(selection);
+            let trace = empty_managed_route_trace(
+                selection,
+                request.tenant_id,
+                request.governed_key_id,
+                request.policy_revision,
+            );
             record_managed_route_trace(request.provider.name.as_str(), &deployment_id, &trace);
             return Err(ManagedDistributedError::Dispatch(
                 crate::model_plane::ManagedDispatchFailure {
@@ -2505,7 +2520,15 @@ pub async fn distributed_managed_upstream(
         max_body_bytes: request.max_body_bytes,
     };
     let deployment = deployment_id;
-    match crate::model_plane::dispatch_managed_candidates(selection, &executor).await {
+    match crate::model_plane::dispatch_managed_candidates(
+        selection,
+        &executor,
+        request.tenant_id,
+        request.governed_key_id,
+        request.policy_revision,
+    )
+    .await
+    {
         Ok(outcome) => {
             record_managed_route_trace(request.provider.name.as_str(), &deployment, &outcome.trace);
             Ok(Some(ManagedDistributedUpstream {
@@ -2525,13 +2548,16 @@ pub async fn distributed_managed_upstream(
 
 fn empty_managed_route_trace(
     selection: sbproxy_ai::managed_replica::ManagedReplicaSelection,
+    tenant_id: &str,
+    governed_key_id: &str,
+    policy_revision: &str,
 ) -> crate::model_plane::ManagedRouteTrace {
-    crate::model_plane::ManagedRouteTrace {
-        selection: selection.trace,
-        attempts: Vec::new(),
-        failovers: 0,
-        truncated_candidates: selection.candidates.len().saturating_sub(8),
-    }
+    crate::model_plane::ManagedRouteTrace::empty(
+        selection,
+        tenant_id,
+        governed_key_id,
+        policy_revision,
+    )
 }
 
 fn record_managed_route_trace(
@@ -2561,6 +2587,9 @@ fn record_managed_route_trace(
     tracing::debug!(
         provider,
         deployment,
+        tenant_id = %trace.tenant_id,
+        governed_key_id = %trace.governed_key_id,
+        policy_revision = %trace.policy_revision,
         candidates = trace.selection.total_candidates,
         eligible = trace.selection.eligible_candidates,
         attempts = trace.attempts.len(),
@@ -2647,6 +2676,86 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct SharedLogGuard(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogGuard(std::sync::Arc::clone(&self.0))
+        }
+    }
+
+    impl std::io::Write for SharedLogGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log capture").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cold_start_route_trace_carries_governed_attribution() {
+        let selection = sbproxy_ai::managed_replica::ManagedReplicaSelection {
+            candidates: Vec::new(),
+            trace: sbproxy_ai::managed_replica::ReplicaSelectionTrace::default(),
+        };
+
+        let trace = empty_managed_route_trace(
+            selection,
+            "tenant-a",
+            "key-public-id",
+            "r7:0123456789abcdef",
+        );
+
+        assert_eq!(trace.tenant_id, "tenant-a");
+        assert_eq!(trace.governed_key_id, "key-public-id");
+        assert_eq!(trace.policy_revision, "r7:0123456789abcdef");
+        assert!(trace.attempts.is_empty());
+    }
+
+    #[test]
+    fn emitted_managed_route_trace_carries_governed_attribution() {
+        let selection = sbproxy_ai::managed_replica::ManagedReplicaSelection {
+            candidates: Vec::new(),
+            trace: sbproxy_ai::managed_replica::ReplicaSelectionTrace::default(),
+        };
+        let trace = empty_managed_route_trace(
+            selection,
+            "tenant-a",
+            "key-public-id",
+            "r7:0123456789abcdef",
+        );
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(SharedLogWriter(std::sync::Arc::clone(&captured)))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_managed_route_trace("managed", "coder", &trace);
+        });
+
+        let output = String::from_utf8(captured.lock().expect("log capture").clone())
+            .expect("UTF-8 trace output");
+        assert!(output.contains("tenant_id=tenant-a"), "{output}");
+        assert!(output.contains("governed_key_id=key-public-id"), "{output}");
+        assert!(
+            output.contains("policy_revision=r7:0123456789abcdef"),
+            "{output}"
+        );
+        assert!(!output.contains("secret"), "{output}");
+        assert!(!output.contains("metadata"), "{output}");
+    }
 
     #[test]
     fn synthetic_local_candidate_requires_no_requested_adapter() {

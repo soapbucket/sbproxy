@@ -152,6 +152,76 @@ fn selection(candidates: Vec<ManagedReplicaCandidate>) -> ManagedReplicaSelectio
 }
 
 #[tokio::test]
+async fn every_dispatch_outcome_carries_governed_route_attribution() {
+    let success = dispatch_managed_candidates(
+        selection(vec![candidate("worker-a", ManagedRouteClass::Local)]),
+        &ScriptedExecutor::new([ScriptedResult::Response(200)]),
+        "tenant-a",
+        "key-public-id",
+        "r7:0123456789abcdef",
+    )
+    .await
+    .expect("managed dispatch succeeds");
+
+    assert_eq!(success.trace.tenant_id, "tenant-a");
+    assert_eq!(success.trace.governed_key_id, "key-public-id");
+    assert_eq!(success.trace.policy_revision, "r7:0123456789abcdef");
+
+    let failure = dispatch_managed_candidates(
+        selection(vec![candidate("worker-b", ManagedRouteClass::Peer)]),
+        &ScriptedExecutor::new([ScriptedResult::Error(ModelPlaneError::Tls(
+            "wrong peer".to_string(),
+        ))]),
+        "tenant-a",
+        "key-public-id",
+        "r7:0123456789abcdef",
+    )
+    .await
+    .expect_err("managed dispatch fails");
+
+    assert_eq!(failure.trace.tenant_id, "tenant-a");
+    assert_eq!(failure.trace.governed_key_id, "key-public-id");
+    assert_eq!(failure.trace.policy_revision, "r7:0123456789abcdef");
+    let trace = format!("{:?}", failure.trace);
+    assert!(!trace.contains("secret"));
+    assert!(!trace.contains("tags"));
+    assert!(!trace.contains("metadata"));
+}
+
+#[tokio::test]
+async fn managed_route_attribution_is_bounded_and_control_free() {
+    let tenant_id = format!("tenant\n{}", "x".repeat(256));
+    let governed_key_id = format!("key id {}", "y".repeat(256));
+    let policy_revision = format!("revision\n{}", "z".repeat(512));
+    let outcome = dispatch_managed_candidates(
+        selection(vec![candidate("worker-a", ManagedRouteClass::Local)]),
+        &ScriptedExecutor::new([ScriptedResult::Response(200)]),
+        &tenant_id,
+        &governed_key_id,
+        &policy_revision,
+    )
+    .await
+    .expect("managed dispatch succeeds");
+
+    assert!(outcome.trace.tenant_id.len() <= 128);
+    assert!(outcome.trace.governed_key_id.len() <= 128);
+    assert!(outcome.trace.policy_revision.len() <= 256);
+    for value in [
+        &outcome.trace.tenant_id,
+        &outcome.trace.governed_key_id,
+        &outcome.trace.policy_revision,
+    ] {
+        assert!(!value.is_empty());
+        assert!(value
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_control()));
+    }
+    assert_ne!(outcome.trace.tenant_id, tenant_id);
+    assert_ne!(outcome.trace.governed_key_id, governed_key_id);
+    assert_ne!(outcome.trace.policy_revision, policy_revision);
+}
+
+#[tokio::test]
 async fn retries_capacity_failure_on_the_next_current_replica() {
     let executor = Arc::new(ScriptedExecutor::new([
         ScriptedResult::Error(ModelPlaneError::Remote {
@@ -166,6 +236,9 @@ async fn retries_capacity_failure_on_the_next_current_replica() {
             candidate("worker-b", ManagedRouteClass::Peer),
         ]),
         executor.as_ref(),
+        "tenant-a",
+        "key-public-id",
+        "r7:0123456789abcdef",
     )
     .await
     .expect("peer succeeds");
@@ -189,6 +262,9 @@ async fn security_failure_never_moves_to_another_replica() {
             candidate("worker-b", ManagedRouteClass::Peer),
         ]),
         executor.as_ref(),
+        "tenant-a",
+        "key-public-id",
+        "r7:0123456789abcdef",
     )
     .await
     .expect_err("security failure is terminal");
@@ -210,6 +286,9 @@ async fn retryable_status_fails_over_before_output() {
             candidate("worker-b", ManagedRouteClass::Peer),
         ]),
         executor.as_ref(),
+        "tenant-a",
+        "key-public-id",
+        "r7:0123456789abcdef",
     )
     .await
     .expect("second replica succeeds");
@@ -231,6 +310,9 @@ async fn stream_failure_after_response_selection_is_never_replayed() {
             candidate("worker-b", ManagedRouteClass::Peer),
         ]),
         executor.as_ref(),
+        "tenant-a",
+        "key-public-id",
+        "r7:0123456789abcdef",
     )
     .await
     .expect("headers select the first response");
@@ -252,9 +334,15 @@ async fn route_trace_is_bounded_and_contains_no_endpoint() {
     let executor = Arc::new(ScriptedExecutor::new(
         (0..8).map(|_| ScriptedResult::Response(503)),
     ));
-    let outcome = dispatch_managed_candidates(selection(candidates), executor.as_ref())
-        .await
-        .expect("last bounded response is returned");
+    let outcome = dispatch_managed_candidates(
+        selection(candidates),
+        executor.as_ref(),
+        "tenant-a",
+        "key-public-id",
+        "r7:0123456789abcdef",
+    )
+    .await
+    .expect("last bounded response is returned");
 
     assert_eq!(outcome.trace.attempts.len(), 8);
     assert_eq!(outcome.trace.truncated_candidates, 4);

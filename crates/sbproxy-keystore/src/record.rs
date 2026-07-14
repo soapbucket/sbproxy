@@ -53,12 +53,19 @@ fn default_hash_alg() -> String {
     "hmac-sha256.v1".to_string()
 }
 
+fn default_policy_revision() -> u64 {
+    1
+}
+
 /// An inbound virtual-key record. The plaintext secret is never stored: only
 /// `secret_hash` (and, during a rotation grace window, `prev_secret_hash`) is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyRecord {
     /// Stable public identifier and the token prefix (`sk-<key_id>-<secret>`).
     pub key_id: String,
+    /// Monotonic revision of this key's policy, starting at one.
+    #[serde(default = "default_policy_revision")]
+    pub policy_revision: u64,
     /// `HMAC-SHA256(secret, pepper)`, hex. The at-rest verifier.
     pub secret_hash: String,
     /// A second hash accepted during a rotation grace window (the prior secret).
@@ -100,6 +107,9 @@ pub struct KeyRecord {
     /// Providers this key may use (empty = all).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_providers: Vec<String>,
+    /// Providers this key may not use. Blocks take precedence over allows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_providers: Vec<String>,
     /// Named PII redaction rules that must be active on the request body before
     /// this key can dispatch upstream (empty = none required).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -115,6 +125,10 @@ pub struct KeyRecord {
     /// different one. `None` leaves the client's choice unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_to_model: Option<String>,
+    /// Tool names this key may expose. None is unrestricted, an empty list
+    /// denies every caller-supplied tool, and a non-empty list is an allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
     /// Provider tool definitions injected into the request when this key
     /// authenticates, replacing any client-supplied tools. Opaque,
     /// provider-shaped JSON. Empty leaves the request's tools untouched.
@@ -169,6 +183,7 @@ impl KeyRecord {
     ) -> Self {
         Self {
             key_id: key_id.into(),
+            policy_revision: default_policy_revision(),
             secret_hash: secret_hash.into(),
             prev_secret_hash: None,
             prev_hash_expires_at: None,
@@ -182,9 +197,11 @@ impl KeyRecord {
             allowed_models: Vec::new(),
             blocked_models: Vec::new(),
             allowed_providers: Vec::new(),
+            blocked_providers: Vec::new(),
             require_pii_redaction: Vec::new(),
             principal_selectors: Vec::new(),
             route_to_model: None,
+            allowed_tools: None,
             inject_tools: Vec::new(),
             inject_mcp: None,
             bypass_prompt_injection: false,
@@ -376,6 +393,52 @@ mod tests {
         assert_eq!(r.status, RecordStatus::Active);
         assert_eq!(r.source, RecordSource::Api);
         assert_eq!(r.hash_alg, "hmac-sha256.v1");
+    }
+
+    #[test]
+    fn key_policy_contract_defaults_are_backward_compatible() {
+        let created = KeyRecord::new("abcd", "deadbeef", now());
+        assert_eq!(created.policy_revision, 1);
+        assert!(created.blocked_providers.is_empty());
+        assert!(created.allowed_tools.is_none());
+
+        let legacy_json = serde_json::json!({
+            "key_id": "abcd",
+            "secret_hash": "deadbeef",
+            "created_at": "2023-11-14T22:13:20Z",
+            "updated_at": "2023-11-14T22:13:20Z"
+        });
+        let restored: KeyRecord = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(restored.policy_revision, 1);
+        assert!(restored.blocked_providers.is_empty());
+        assert!(restored.allowed_tools.is_none());
+    }
+
+    #[test]
+    fn key_policy_contract_fields_roundtrip() {
+        let mut record = KeyRecord::new("abcd", "deadbeef", now());
+        record.policy_revision = 9;
+        record.blocked_providers = vec!["vertex".into(), "bedrock".into()];
+        record.allowed_tools = Some(vec!["search".into(), "calculator".into()]);
+
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["policy_revision"], 9);
+        assert_eq!(
+            json["blocked_providers"],
+            serde_json::json!(["vertex", "bedrock"])
+        );
+        assert_eq!(
+            json["allowed_tools"],
+            serde_json::json!(["search", "calculator"])
+        );
+
+        let restored: KeyRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.policy_revision, 9);
+        assert_eq!(restored.blocked_providers, ["vertex", "bedrock"]);
+        assert_eq!(
+            restored.allowed_tools,
+            Some(vec!["search".to_string(), "calculator".to_string()])
+        );
     }
 
     #[test]

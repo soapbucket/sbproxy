@@ -792,6 +792,32 @@ impl AiClient {
         tags: &crate::attribution::AttributionTags,
         surface: &str,
     ) -> Result<CascadeOutcome> {
+        self.forward_cascade_with_policy(
+            config,
+            cascade,
+            allowed_providers,
+            &[],
+            path,
+            body,
+            tags,
+            surface,
+        )
+        .await
+    }
+
+    /// Dispatch a confidence cascade constrained by credential provider policy.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_cascade_with_policy(
+        &self,
+        config: &AiHandlerConfig,
+        cascade: &crate::routing::CascadeConfig,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        path: &str,
+        body: &serde_json::Value,
+        tags: &crate::attribution::AttributionTags,
+        surface: &str,
+    ) -> Result<CascadeOutcome> {
         if cascade.tiers.is_empty() {
             return Err(anyhow::anyhow!("cascade has no tiers"));
         }
@@ -825,11 +851,7 @@ impl AiClient {
             // Find the provider config for this tier.
             let provider = match config.providers.iter().find(|p| {
                 p.name == tier.provider_id
-                    && p.enabled
-                    && (allowed_providers.is_empty()
-                        || allowed_providers
-                            .iter()
-                            .any(|allowed| allowed == p.name.as_str()))
+                    && cascade_provider_is_eligible(p, allowed_providers, blocked_providers)
             }) {
                 Some(p) => p,
                 None => {
@@ -1233,6 +1255,15 @@ fn parse_shadow_metadata(body: &[u8]) -> (Option<u64>, Option<u64>, Option<Strin
     (prompt, completion, finish)
 }
 
+fn cascade_provider_is_eligible(
+    provider: &ProviderConfig,
+    allowed: &[String],
+    blocked: &[String],
+) -> bool {
+    provider.enabled
+        && crate::routing::provider_allowed_by_policy(provider.name.as_str(), allowed, blocked)
+}
+
 impl Default for AiClient {
     fn default() -> Self {
         Self::new()
@@ -1373,6 +1404,19 @@ mod tests {
             "second retry should be 200ms plus <=25% jitter, got {second_max:?}"
         );
         assert!(provider_retry_backoff_with_jitter(99, u64::MAX) <= Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn cascade_provider_blocklist_overrides_allowlist() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai",
+            "api_key": "test-key"
+        }))
+        .expect("provider fixture");
+        let allowed = vec!["openai".to_string()];
+        let blocked = vec!["openai".to_string()];
+
+        assert!(!cascade_provider_is_eligible(&provider, &allowed, &blocked));
     }
 
     // --- Shadow supervisor tests ---

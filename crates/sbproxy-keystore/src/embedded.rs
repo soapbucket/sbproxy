@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::record::{CredentialRecord, KeyRecord};
-use crate::KeyStore;
+use crate::{KeyPolicyCasResult, KeyStore};
 
 const KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("keys");
 const CREDS: TableDefinition<&str, &[u8]> = TableDefinition::new("credentials");
@@ -99,6 +99,41 @@ impl KeyStore for EmbeddedKeyStore {
         txn.commit().context("commit put_key")
     }
 
+    async fn put_key_if_revision(
+        &self,
+        mut record: KeyRecord,
+        expected_revision: u64,
+    ) -> Result<KeyPolicyCasResult> {
+        let txn = self.db.begin_write().context("begin policy CAS write")?;
+        let policy_revision = {
+            let mut table = txn.open_table(KEYS).context("open keys table")?;
+            let current = match table
+                .get(record.key_id.as_str())
+                .context("get key for CAS")?
+            {
+                Some(value) => serde_json::from_slice::<KeyRecord>(value.value())
+                    .context("decode key record for CAS")?,
+                None => return Ok(KeyPolicyCasResult::NotFound),
+            };
+            if current.policy_revision != expected_revision {
+                return Ok(KeyPolicyCasResult::Conflict {
+                    actual_revision: current.policy_revision,
+                });
+            }
+
+            let policy_revision = crate::next_policy_revision(expected_revision)?;
+            record.policy_revision = policy_revision;
+            let bytes = serde_json::to_vec(&record).context("encode key record for CAS")?;
+            table
+                .insert(record.key_id.as_str(), bytes.as_slice())
+                .context("replace key with CAS")?;
+            policy_revision
+        };
+        Self::bump_revision(&txn)?;
+        txn.commit().context("commit key policy CAS")?;
+        Ok(KeyPolicyCasResult::Applied { policy_revision })
+    }
+
     async fn delete_key(&self, key_id: &str) -> Result<()> {
         let txn = self.db.begin_write().context("begin write")?;
         {
@@ -171,6 +206,7 @@ impl KeyStore for EmbeddedKeyStore {
 mod tests {
     use super::*;
     use crate::record::RecordStatus;
+    use crate::KeyPolicyCasResult;
     use chrono::{DateTime, Utc};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -235,6 +271,36 @@ mod tests {
         let got = store.get_key("persist").await.unwrap().unwrap();
         assert_eq!(got.status, RecordStatus::Blocked);
         assert_eq!(store.revision().await.unwrap(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn key_policy_cas_is_transactional_and_monotonic() {
+        let path = temp_path();
+        let store = EmbeddedKeyStore::open(&path).unwrap();
+        store
+            .put_key(KeyRecord::new("k1", "hash", now()))
+            .await
+            .unwrap();
+
+        let mut first = store.get_key("k1").await.unwrap().unwrap();
+        first.blocked_providers = vec!["vertex".into()];
+        assert_eq!(
+            store.put_key_if_revision(first, 1).await.unwrap(),
+            KeyPolicyCasResult::Applied { policy_revision: 2 }
+        );
+
+        let mut stale = store.get_key("k1").await.unwrap().unwrap();
+        stale.blocked_providers = vec!["bedrock".into()];
+        assert_eq!(
+            store.put_key_if_revision(stale, 1).await.unwrap(),
+            KeyPolicyCasResult::Conflict { actual_revision: 2 }
+        );
+
+        let stored = store.get_key("k1").await.unwrap().unwrap();
+        assert_eq!(stored.policy_revision, 2);
+        assert_eq!(stored.blocked_providers, ["vertex"]);
+        assert_eq!(store.revision().await.unwrap(), 2);
         std::fs::remove_file(&path).ok();
     }
 }
