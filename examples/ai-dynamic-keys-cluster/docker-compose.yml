@@ -35,7 +35,7 @@ services:
 
   sb1:
     # Build the image once; sb2 reuses it. To pin a published image instead,
-    # swap `build:` for `image: ghcr.io/soapbucket/sbproxy:<tag>` on both.
+    # swap `build:` for `image: soapbucket/sbproxy:<tag>` on both.
     build:
       context: ../..
       dockerfile: Dockerfile.cloudbuild

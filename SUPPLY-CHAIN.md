@@ -30,7 +30,7 @@ Every git tag matching `v*.*.*` triggers the release workflow defined at `.githu
 |---|---|
 | Binaries (tarballs) | GitHub Releases on `soapbucket/sbproxy` |
 | Cosign signature bundles | Same GitHub Release, alongside each tarball |
-| Container images | `ghcr.io/soapbucket/sbproxy` and `docker.io/soapbucket/sbproxy` (same digest; cosign-signed on both) |
+| Container images | `docker.io/soapbucket/sbproxy` and `ghcr.io/soapbucket/sbproxy` (same digest; cosign-signed on both) |
 | CycloneDX SBOM | GitHub Release asset (`sbom.cyclonedx.json`) and cosign attestation on the image |
 | SLSA build provenance | GitHub native attestation (visible via `gh attestation` and the API) |
 
@@ -83,7 +83,7 @@ A successful verification prints `Verified OK`. The `.cosign.bundle` file contai
 ### 2.2 Container image signature
 
 ```bash
-cosign verify ghcr.io/soapbucket/sbproxy:${VERSION} \
+cosign verify docker.io/soapbucket/sbproxy:${VERSION} \
   --certificate-identity "${IDENTITY}" \
   --certificate-oidc-issuer "${ISSUER}"
 ```
@@ -92,7 +92,7 @@ This pulls the image manifest, fetches the cosign signature stored in the OCI re
 
 For multi-platform manifests, the verification covers each platform-specific image.
 
-Container images are published for `v1.2.0` and later; earlier tags shipped binaries only. The same image is mirrored to `docker.io/soapbucket/sbproxy` at the same digest, so either registry name verifies with the same command.
+Container images are published for `v1.2.0` and later; earlier tags shipped binaries only. The same image is also pushed to `ghcr.io/soapbucket/sbproxy` at the same digest.
 
 ### 2.3 SBOM
 
@@ -112,7 +112,7 @@ cosign verify-attestation \
   --type cyclonedx \
   --certificate-identity "${IDENTITY}" \
   --certificate-oidc-issuer "${ISSUER}" \
-  ghcr.io/soapbucket/sbproxy:${VERSION} \
+  docker.io/soapbucket/sbproxy:${VERSION} \
   | jq -r '.payload' | base64 -d | jq '.predicate.metadata.component, (.predicate.components | length)'
 ```
 

@@ -25,7 +25,7 @@ For a single-node smoke check without the operator, run the data plane directly:
 ```bash
 docker run --rm -p 8080:8080 -p 9090:9090 \
   -v "$PWD/sb.yml:/etc/sbproxy/sb.yml:ro" \
-  ghcr.io/soapbucket/sbproxy:v1.5.0 \
+  soapbucket/sbproxy:1.5.0 \
   serve -f /etc/sbproxy/sb.yml
 ```
 

@@ -9,14 +9,14 @@ The v0.1.x Go binary continues to be available at `github.com/soapbucket/sbproxy
 ## TL;DR
 
 - Your `sb.yml` is mostly portable. Field names match. Most operators upgrade by swapping the binary and re-deploying.
-- The install command and binary name are unchanged (`sbproxy`, `brew install sbproxy`, `ghcr.io/soapbucket/sbproxy:latest`).
+- The install command and binary name are unchanged (`sbproxy`, `brew install sbproxy`, `soapbucket/sbproxy:latest`).
 - A handful of v0.1.x flags were renamed or removed in v1.0. See `Breaking changes` below.
 - Performance improves substantially (3x throughput, 3-4x lower p99 on the AI path) with no config changes required.
 
 ## What's the same
 
 - **Config language**. `sb.yml` field names, structure, and semantics are preserved across the proxy, AI gateway, auth, policy, transform, and modifier surfaces.
-- **Binary name and install paths**. The binary is still `sbproxy`. `brew install sbproxy/sbproxy` and `docker pull ghcr.io/soapbucket/sbproxy:latest` continue to work.
+- **Binary name and install paths**. The binary is still `sbproxy`. `brew install sbproxy/sbproxy` and `docker pull soapbucket/sbproxy:latest` continue to work.
 - **Hot reload**. Send `SIGHUP` (or save the config file when watcher mode is on) and the new pipeline atomically swaps in.
 - **Admin endpoint**. `/api/health`, `/api/metrics`, `/api/openapi.{json,yaml}` work the same way.
 - **CEL and Lua scripts**. Existing CEL expressions and Lua transform scripts run unchanged on the Rust extension engine.

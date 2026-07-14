@@ -28,7 +28,7 @@ brew install soapbucket/tap/sbproxy
 
 # Docker
 docker run --rm -p 8080:8080 -v "$PWD/sb.yml:/etc/sbproxy/sb.yml" \
-  ghcr.io/soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest
 ```
 
 Binary downloads and the rest of the install matrix are in the

@@ -26,7 +26,7 @@ curl -fsSL https://download.sbproxy.dev | sh
 brew install soapbucket/tap/sbproxy
 
 # Docker / Kubernetes:
-docker pull ghcr.io/soapbucket/sbproxy:latest
+docker pull soapbucket/sbproxy:latest
 ```
 
 The full install matrix, including checksums and air-gapped installs, is in the [manual](manual.md).

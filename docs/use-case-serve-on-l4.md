@@ -65,7 +65,7 @@ curl -fsSL https://download.sbproxy.dev | sh
 brew install soapbucket/tap/sbproxy
 
 # Docker:
-docker pull ghcr.io/soapbucket/sbproxy:latest
+docker pull soapbucket/sbproxy:latest
 ```
 
 The [manual](manual.md) covers checksums, packages, and the rest of the install matrix. `sbproxy doctor` reports which engines resolve on `PATH` and, for a missing one, the acquisition paths viable on this host.

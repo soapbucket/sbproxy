@@ -15,7 +15,7 @@
 services:
 
   sbproxy:
-    image: ghcr.io/soapbucket/sbproxy:latest
+    image: soapbucket/sbproxy:latest
     command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
     volumes:
       - ./sb.yml:/etc/sbproxy/sb.yml:ro
