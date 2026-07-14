@@ -26,11 +26,12 @@ pub use auth::a2a::{detect as detect_a2a, A2AContext, A2ASpec, ChainHop, Detecte
 pub use auth::{ApiKeyAuth, Auth};
 pub use compile::*;
 pub use policy::{
-    classification_cache_stats, evaluate_body, parse_aipref, reset_classification_cache,
-    AgentBudgetDecision, AgentBudgetExceedReason, AgentBudgetGuard, AgentBudgetOnAnonymous,
-    AgentBudgetOnExceed, AgentBudgetPolicy, AiCrawlControlPolicy, AiCrawlDecision, AiCrawlLedger,
-    AiprefParseError, AiprefSignal, AssertionPolicy, BodyAwareConfig, BodyAwareOutcome,
-    BotDetection, ClassificationCacheStats, ContentDigestOnMissing, ContentDigestPolicy,
+    classification_cache_stats, evaluate_body, evaluate_body_with_audit, parse_aipref,
+    reset_classification_cache, AgentBudgetDecision, AgentBudgetExceedReason, AgentBudgetGuard,
+    AgentBudgetOnAnonymous, AgentBudgetOnExceed, AgentBudgetPolicy, AiCrawlControlPolicy,
+    AiCrawlDecision, AiCrawlLedger, AiprefParseError, AiprefSignal, AssertionPolicy,
+    BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome, BotDetection,
+    ClassificationCacheStats, ContentDigestOnMissing, ContentDigestPolicy,
     ContentDigestVerifyOutcome, ContentShape, ContentSignal, ContentSignalParseError,
     DdosCheckResult, DdosPolicy, DetectionLabel, DetectionResult, Detector, DlpAction,
     DlpDirection, DlpPolicy, DlpScanResult, ExposedCredsAction, ExposedCredsPolicy,

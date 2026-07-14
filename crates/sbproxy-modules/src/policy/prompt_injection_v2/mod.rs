@@ -20,8 +20,9 @@ mod inprocess;
 mod sidecar;
 
 pub use body_aware::{
-    classification_cache_stats, evaluate_body, reset_classification_cache, BodyAwareConfig,
-    BodyAwareOutcome, ClassificationCacheStats,
+    classification_cache_stats, evaluate_body, evaluate_body_with_audit,
+    reset_classification_cache, BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome,
+    ClassificationCacheStats,
 };
 pub use detector::{
     lookup_detector, registered_detector_names, DetectionLabel, DetectionResult, Detector,

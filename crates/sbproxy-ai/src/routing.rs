@@ -10,6 +10,17 @@ use serde::Deserialize;
 
 use crate::provider::ProviderConfig;
 
+/// Return whether a provider name satisfies a credential's provider policy.
+/// A block entry always wins, including when the same name is allowed.
+pub fn provider_allowed_by_policy(
+    provider_name: &str,
+    allowed: &[String],
+    blocked: &[String],
+) -> bool {
+    !blocked.iter().any(|name| name == provider_name)
+        && (allowed.is_empty() || allowed.iter().any(|name| name == provider_name))
+}
+
 /// Strategy for selecting a provider.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -425,11 +436,22 @@ impl Router {
         providers: &[ProviderConfig],
         allowed: &[String],
     ) -> Option<usize> {
-        if allowed.is_empty() {
+        self.select_with_policy(providers, allowed, &[])
+    }
+
+    /// Pick an enabled provider permitted by the credential policy.
+    /// Empty allow and block lists preserve unrestricted selection.
+    pub fn select_with_policy(
+        &self,
+        providers: &[ProviderConfig],
+        allowed: &[String],
+        blocked: &[String],
+    ) -> Option<usize> {
+        if allowed.is_empty() && blocked.is_empty() {
             return self.select(providers);
         }
         let picked = self.select_inner_filtered(providers, &|p| {
-            allowed.iter().any(|a| a.as_str() == p.name.as_str())
+            provider_allowed_by_policy(p.name.as_str(), allowed, blocked)
         });
         if let Some(idx) = picked {
             if let Some(p) = providers.get(idx) {
@@ -797,10 +819,25 @@ impl Router {
         providers: &[ProviderConfig],
         prefix_key: &[u8],
     ) -> Option<usize> {
+        self.select_with_prefix_policy(providers, prefix_key, &[], &[])
+    }
+
+    /// Prefix-aware selection constrained by a credential provider policy.
+    /// Policy filtering is applied before affinity hashing, and an empty
+    /// policy-filtered set fails closed instead of falling back.
+    pub fn select_with_prefix_policy(
+        &self,
+        providers: &[ProviderConfig],
+        prefix_key: &[u8],
+        allowed: &[String],
+        blocked: &[String],
+    ) -> Option<usize> {
         let enabled: Vec<(usize, &ProviderConfig)> = providers
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.enabled)
+            .filter(|(_, p)| {
+                p.enabled && provider_allowed_by_policy(p.name.as_str(), allowed, blocked)
+            })
             .collect();
         if enabled.is_empty() {
             return None;
@@ -1852,5 +1889,57 @@ mod tests {
         ];
         let allowed = vec!["nonexistent".to_string()];
         assert!(router.select_with_allowed(&providers, &allowed).is_none());
+    }
+
+    #[test]
+    fn select_with_policy_blocked_provider_overrides_allowlist() {
+        let router = Router::new(RoutingStrategy::RoundRobin, 2);
+        let providers = vec![
+            make_provider("openai", 1, None, true),
+            make_provider("anthropic", 1, None, true),
+        ];
+        let allowed = vec!["openai".to_string(), "anthropic".to_string()];
+        let blocked = vec!["openai".to_string()];
+
+        for _ in 0..4 {
+            let pick = router
+                .select_with_policy(&providers, &allowed, &blocked)
+                .expect("anthropic remains eligible");
+            assert_eq!(providers[pick].name, "anthropic");
+        }
+    }
+
+    #[test]
+    fn select_with_policy_blocklist_applies_without_allowlist() {
+        let router = Router::new(RoutingStrategy::RoundRobin, 2);
+        let providers = vec![
+            make_provider("openai", 1, None, true),
+            make_provider("anthropic", 1, None, true),
+        ];
+        let blocked = vec!["openai".to_string()];
+
+        let pick = router
+            .select_with_policy(&providers, &[], &blocked)
+            .expect("anthropic remains eligible");
+        assert_eq!(providers[pick].name, "anthropic");
+    }
+
+    #[test]
+    fn prefix_affinity_policy_never_selects_a_blocked_provider() {
+        let router = Router::new(RoutingStrategy::PrefixAffinity, 3);
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+            make_provider("c", 1, None, true),
+        ];
+        let allowed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let blocked = vec!["b".to_string(), "c".to_string()];
+
+        for prefix in [b"one".as_slice(), b"two", b"three", b"four"] {
+            let pick = router
+                .select_with_prefix_policy(&providers, prefix, &allowed, &blocked)
+                .expect("a remains eligible");
+            assert_eq!(providers[pick].name, "a");
+        }
     }
 }

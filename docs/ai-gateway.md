@@ -763,6 +763,18 @@ Refresh the vendored file out of band with `scripts/refresh-model-prices.sh /etc
 
 Issue per-team or per-app keys that the gateway validates locally. Each key can pin a provider, restrict models, set its own request rate, carry its own budget ceiling, and tag requests for downstream attribution. The shipped shape is a `credentials:` list of `type: ai_provider` entries next to the origin's `action:` block; the same block also lives at `tenants[].credentials` and `proxy.credentials` scope, with origin shadowing tenant shadowing proxy for entries that share a `name`. The legacy `virtual_keys:` key is rejected at config compile with a pointer to [migration-credentials.md](migration-credentials.md).
 
+Set `action.require_governed_key: true` to reject requests that do not resolve
+to a governed public key identity on that origin. Dynamic mutation, the full
+policy field contract, effective-policy preview, and fail-closed behavior are
+documented in [Dynamic key management](key-management.md).
+
+Stored-key token-per-minute and lifetime token or cost caps currently settle
+only on standard JSON POST inference surfaces when the provider response
+reports parseable usage. Multipart and non-POST requests can dispatch, but do
+not settle those stored-key counters. Settlement for those surfaces and strict
+multi-node reservations are deferred to WOR-1845. Treat the caps as advisory,
+not a strict ceiling, for multipart, non-POST, or concurrent multi-node traffic.
+
 ```yaml
 origins:
   "ai.example.com":
@@ -1022,11 +1034,11 @@ model-list fields are required.
 
 ### Method coverage
 
-The gateway accepts any standard HTTP method for any supported surface. GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS all dispatch through the same provider-selection and observability surface. Methods other than GET/POST forward via `AiClient::forward_with_method` and do not engage the chat-completions body-parse pipeline (no JSON parsing, no budget enforcement, no input guardrails). Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`, `POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work end-to-end.
+The gateway accepts any standard HTTP method for any supported surface. GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS all dispatch through the same provider-selection and observability surface. Non-POST methods do not engage the standard JSON POST inference pipeline, so they do not perform JSON body parsing or stored-key token and cost settlement. Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`, `POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work end-to-end. Strict settlement for these methods is deferred to WOR-1845.
 
 ### Multipart bodies
 
-Image edits, image variations, audio transcription, and audio translation send multipart request bodies. The proxy detects multipart by inspecting the inbound `Content-Type` header; when it starts with `multipart/`, the body is forwarded byte-for-byte via `AiClient::forward_bytes` with the original Content-Type preserved. Provider format translation (Anthropic, etc.) does not run for multipart, since these surfaces are OpenAI-only.
+Image edits, image variations, audio transcription, and audio translation send multipart request bodies. The proxy detects multipart by inspecting the inbound `Content-Type` header; when it starts with `multipart/`, the body is forwarded via `AiClient::forward_bytes` with the original Content-Type preserved. A governed key's `route_to_model` rewrites only the bounded multipart `model` part before forwarding; every other part remains byte-for-byte. Provider format translation (Anthropic, etc.) does not run for multipart, since these surfaces are OpenAI-only. Multipart responses do not currently settle stored-key token-per-minute or lifetime token and cost counters; that work is deferred to WOR-1845.
 
 ### Per-surface configuration
 
@@ -1114,7 +1126,8 @@ The gateway records provider, model, token counts, and estimated cost for every 
 
 ### Authoritative identity: tenant and credential
 
-Every AI spend, token, latency, and outcome metric is partitioned by two authoritative identity dimensions in addition to provider/model:
+The attributed AI request, token, and cost metric families are partitioned by
+two authoritative identity dimensions in addition to provider/model:
 
 - `tenant_id`: the tenant the request resolved to (`__default__` in single-tenant deployments), taken from the matched origin.
 - `api_key_id`: a stable id for the credential (API key) that authenticated the request and injected its policy. This is the join key that ties spend back to the agent routing traffic through the gateway.
@@ -1124,7 +1137,9 @@ Both are sourced from the resolved principal, never from a request header, so a 
 `api_key_id` resolution:
 
 - For an `api_key` auth credential, set a stable id explicitly with `key_id:` on the entry. When omitted, the gateway derives a non-reversible `sk_<hex>` fingerprint of the secret so the key is still attributable. The raw secret never reaches a metric label, span, or log line.
-- For a matched virtual key, the operator-supplied virtual-key `name` is used.
+- For a config-defined virtual key, the operator-supplied virtual-key `name` is
+  used. For an admin-managed governed key, the immutable public `key_id` is
+  used instead of its mutable display name.
 
 ```yaml
 auth:
@@ -1138,7 +1153,12 @@ auth:
       team: growth
 ```
 
-The same `api_key_id` and `tenant_id` are stamped on the access log and the request-event envelope, so a log-based ledger reconciles against the metric rollups.
+The access log stamps both `api_key_id` and `tenant_id`. The request-event
+envelope stamps `api_key_id`; use the access log or usage sink when a durable
+tenant/key join is required. Usage sinks and enabled access logs retain
+operator-supplied project, user, tags, and metadata. Request spans and metrics
+use a smaller fixed field set, and security audit events exclude free-form
+metadata.
 
 ### Request-path prompt accounting
 

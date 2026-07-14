@@ -63,6 +63,8 @@ pub mod hooks;
 pub mod identity;
 /// WOR-1546: dynamic key plane assembly + process-global handle.
 pub mod key_plane;
+/// Canonical, secret-free lowering for governed key policy.
+pub mod key_policy;
 /// WOR-1562: mesh distributed-cache tier for the key plane.
 pub mod mesh_cache;
 /// WOR-1563: distributed per-key spend + rate counters via mesh CRDTs.

@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 
 use crate::cache::{CacheTier, TtlCache};
 use crate::record::{CredentialRecord, KeyRecord};
-use crate::KeyStore;
+use crate::{KeyPolicyCasResult, KeyStore};
 
 const KEYS_HASH: &str = "sbproxy:keystore:keys";
 const CREDS_HASH: &str = "sbproxy:keystore:credentials";
@@ -34,6 +34,29 @@ const CACHE_KEY_PREFIX: &str = "sbproxy:keystore:cache:key:";
 const CACHE_CRED_PREFIX: &str = "sbproxy:keystore:cache:cred:";
 /// Sentinel payload meaning "drop everything".
 const INVALIDATE_ALL: &str = "*";
+
+/// Compare, write, bump the global revision, and publish invalidation as one
+/// Redis server-side operation. Legacy records without `policy_revision`
+/// compare as revision one.
+const KEY_POLICY_CAS_LUA: &str = r#"
+local current = redis.call('HGET', KEYS[1], ARGV[1])
+if not current then
+  return {'not_found', '0'}
+end
+
+local actual = string.match(current, '"policy_revision"%s*:%s*(%d+)')
+if not actual then
+  actual = '1'
+end
+if actual ~= ARGV[2] then
+  return {'conflict', actual}
+end
+
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+redis.call('INCR', KEYS[2])
+redis.call('PUBLISH', KEYS[3], ARGV[1])
+return {'applied', ARGV[4]}
+"#;
 
 /// A lazily-connected, shareable multiplexed Redis link.
 struct RedisLink {
@@ -127,6 +150,41 @@ impl KeyStore for RedisKeyStore {
             .await
             .context("redis HSET key")?;
         self.announce(&mut c, &record.key_id).await
+    }
+
+    async fn put_key_if_revision(
+        &self,
+        mut record: KeyRecord,
+        expected_revision: u64,
+    ) -> Result<KeyPolicyCasResult> {
+        let policy_revision = crate::next_policy_revision(expected_revision)?;
+        record.policy_revision = policy_revision;
+        let encoded = serde_json::to_string(&record).context("encode key record for CAS")?;
+        let mut c = self.link.conn().await?;
+        let (status, revision): (String, String) = redis::cmd("EVAL")
+            .arg(KEY_POLICY_CAS_LUA)
+            .arg(3)
+            .arg(KEYS_HASH)
+            .arg(REVISION_KEY)
+            .arg(INVALIDATE_CHANNEL)
+            .arg(&record.key_id)
+            .arg(expected_revision.to_string())
+            .arg(encoded)
+            .arg(policy_revision.to_string())
+            .query_async(&mut c)
+            .await
+            .context("redis key policy CAS")?;
+
+        match status.as_str() {
+            "applied" => Ok(KeyPolicyCasResult::Applied { policy_revision }),
+            "conflict" => Ok(KeyPolicyCasResult::Conflict {
+                actual_revision: revision
+                    .parse()
+                    .context("decode Redis key policy revision")?,
+            }),
+            "not_found" => Ok(KeyPolicyCasResult::NotFound),
+            other => anyhow::bail!("unexpected Redis key policy CAS result '{other}'"),
+        }
     }
 
     async fn delete_key(&self, key_id: &str) -> Result<()> {
@@ -286,6 +344,7 @@ pub async fn subscribe_invalidations(url: String, cache: Arc<TtlCache>) -> Resul
 mod tests {
     use super::*;
     use crate::cache::TtlCacheConfig;
+    use crate::KeyPolicyCasResult;
     use chrono::{DateTime, Utc};
 
     fn ts() -> DateTime<Utc> {
@@ -317,6 +376,14 @@ mod tests {
         let _ = (&store, &tier);
     }
 
+    #[test]
+    fn key_policy_cas_script_updates_record_revision_and_invalidation_atomically() {
+        for command in ["HGET", "HSET", "INCR", "PUBLISH"] {
+            assert!(KEY_POLICY_CAS_LUA.contains(command), "missing {command}");
+        }
+        assert!(KEY_POLICY_CAS_LUA.contains("policy_revision"));
+    }
+
     #[tokio::test]
     #[ignore = "requires live redis; set REDIS_URL"]
     async fn live_roundtrip_and_invalidate() {
@@ -328,6 +395,18 @@ mod tests {
         let got = store.get_key("live-test").await.unwrap().unwrap();
         assert_eq!(got.name.as_deref(), Some("live"));
         assert!(store.revision().await.unwrap() >= 1);
+
+        let mut updated = store.get_key("live-test").await.unwrap().unwrap();
+        updated.name = Some("updated".into());
+        assert_eq!(
+            store.put_key_if_revision(updated, 1).await.unwrap(),
+            KeyPolicyCasResult::Applied { policy_revision: 2 }
+        );
+        let stale = KeyRecord::new("live-test", "replacement", ts());
+        assert_eq!(
+            store.put_key_if_revision(stale, 1).await.unwrap(),
+            KeyPolicyCasResult::Conflict { actual_revision: 2 }
+        );
         store.delete_key("live-test").await.unwrap();
         assert!(store.get_key("live-test").await.unwrap().is_none());
 

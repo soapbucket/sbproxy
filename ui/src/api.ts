@@ -371,6 +371,7 @@ export interface KeyPolicy {
   blocked_models?: string[];
   allowed_providers?: string[];
   blocked_providers?: string[];
+  allowed_tools?: string[] | null;
   require_pii_redaction?: string[];
   route_to_model?: string;
   inject_tools?: unknown[];
@@ -395,6 +396,8 @@ export interface KeyPolicy {
 export interface AdminKey {
   id?: string;
   key_id?: string;
+  policy_revision: number;
+  policy_digest?: string | null;
   name?: string;
   label?: string;
   prefix?: string;
@@ -410,6 +413,7 @@ export interface AdminKey {
   blocked_models?: string[];
   allowed_providers?: string[];
   blocked_providers?: string[];
+  allowed_tools?: string[] | null;
   require_pii_redaction?: string[];
   route_to_model?: string;
   inject_tools?: unknown[];
@@ -421,6 +425,8 @@ export interface AdminKey {
   inject_mcp?: unknown;
   metadata?: Record<string, string>;
   budget?: unknown;
+  max_budget_tokens?: number;
+  max_budget_usd?: number;
   project?: string;
   user?: string;
   tenant_id?: string;
@@ -428,11 +434,588 @@ export interface AdminKey {
   [k: string]: unknown;
 }
 
-export interface CreatedKey extends AdminKey {
-  token?: string;
-  plaintext?: string;
-  secret?: string;
-  key?: string;
+export interface CreatedKey {
+  token: string;
+  key: AdminKey;
+}
+
+export type KeyPolicyMutationKind = "patch" | "action";
+
+export interface KeyPolicyMutationDescriptor {
+  kind: KeyPolicyMutationKind;
+  fields: string[];
+}
+
+export interface KeyPolicyFieldDescriptor {
+  wire_name: string;
+  mutation: KeyPolicyMutationDescriptor;
+  editor: string;
+  clear_semantics: string;
+  preview_field: string;
+  enforcement_proof: string;
+}
+
+export interface KeyPolicySchema {
+  schema_version: number;
+  fields: KeyPolicyFieldDescriptor[];
+}
+
+export interface EffectivePolicyPreviewEvidence {
+  schema_version: number;
+  key_id: string;
+  display_name?: string | null;
+  source?: string;
+  status: string;
+  expires_at?: string | null;
+  tenant_id: string;
+}
+
+export interface EffectivePolicyDecision {
+  allowed: boolean;
+  reason_code?: string;
+}
+
+export type EffectivePolicyDecisionName =
+  | "lifecycle"
+  | "tenant"
+  | "model"
+  | "provider"
+  | "tools"
+  | "principal"
+  | "rate_limits"
+  | "budget"
+  | "priority"
+  | "guardrails";
+
+export interface EffectivePolicyDecisions {
+  allowed: boolean;
+  lifecycle?: EffectivePolicyDecision;
+  tenant?: EffectivePolicyDecision;
+  model?: EffectivePolicyDecision;
+  provider?: EffectivePolicyDecision;
+  tools?: EffectivePolicyDecision;
+  principal?: EffectivePolicyDecision;
+  rate_limits?: EffectivePolicyDecision;
+  budget?: EffectivePolicyDecision;
+  priority?: EffectivePolicyDecision;
+  guardrails?: EffectivePolicyDecision;
+}
+
+export interface EffectivePolicyPreview {
+  effective_policy: EffectivePolicyPreviewEvidence;
+  policy_version: {
+    revision: number;
+    digest: string;
+  };
+  decisions: EffectivePolicyDecisions;
+}
+
+const EFFECTIVE_POLICY_DECISION_NAMES: readonly EffectivePolicyDecisionName[] = [
+  "lifecycle",
+  "tenant",
+  "model",
+  "provider",
+  "tools",
+  "principal",
+  "rate_limits",
+  "budget",
+  "priority",
+  "guardrails",
+];
+
+function responseObject(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be a JSON object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function responseString(
+  object: Record<string, unknown>,
+  field: string,
+  label: string,
+): string {
+  const value = object[field];
+  if (typeof value !== "string") {
+    throw new TypeError(`${label}.${field} must be a string`);
+  }
+  return value;
+}
+
+function responseSafeInteger(
+  object: Record<string, unknown>,
+  field: string,
+  label: string,
+): number {
+  const value = object[field];
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new TypeError(`${label}.${field} must be a positive safe integer`);
+  }
+  return value as number;
+}
+
+function optionalNullableResponseString(
+  object: Record<string, unknown>,
+  field: string,
+  label: string,
+): string | null | undefined {
+  const value = object[field];
+  if (value === undefined || value === null || typeof value === "string") {
+    return value;
+  }
+  throw new TypeError(`${label}.${field} must be a string or null`);
+}
+
+function decodeKeyPolicySchema(value: unknown): KeyPolicySchema {
+  const document = responseObject(value, "policy schema");
+  const schemaVersion = responseSafeInteger(
+    document,
+    "schema_version",
+    "policy schema",
+  );
+  if (!Array.isArray(document.fields)) {
+    throw new TypeError("policy schema.fields must be an array");
+  }
+  const fields = document.fields.map((value, index): KeyPolicyFieldDescriptor => {
+    const label = `policy schema.fields[${index}]`;
+    const field = responseObject(value, label);
+    const mutation = responseObject(field.mutation, `${label}.mutation`);
+    const kind = mutation.kind;
+    if (kind !== "patch" && kind !== "action") {
+      throw new TypeError(`${label}.mutation.kind is not supported`);
+    }
+    if (
+      !Array.isArray(mutation.fields) ||
+      mutation.fields.some((name) => typeof name !== "string")
+    ) {
+      throw new TypeError(`${label}.mutation.fields must be a string array`);
+    }
+    return {
+      wire_name: responseString(field, "wire_name", label),
+      mutation: {
+        kind,
+        fields: [...mutation.fields] as string[],
+      },
+      editor: responseString(field, "editor", label),
+      clear_semantics: responseString(field, "clear_semantics", label),
+      preview_field: responseString(field, "preview_field", label),
+      enforcement_proof: responseString(field, "enforcement_proof", label),
+    };
+  });
+  return { schema_version: schemaVersion, fields };
+}
+
+function decodeEffectivePolicyPreview(value: unknown): EffectivePolicyPreview {
+  const document = responseObject(value, "effective policy preview");
+  const rawPolicy = responseObject(
+    document.effective_policy,
+    "effective policy preview.effective_policy",
+  );
+  const rawVersion = responseObject(
+    document.policy_version,
+    "effective policy preview.policy_version",
+  );
+  const rawDecisions = responseObject(
+    document.decisions,
+    "effective policy preview.decisions",
+  );
+  if (typeof rawDecisions.allowed !== "boolean") {
+    throw new TypeError(
+      "effective policy preview.decisions.allowed must be a boolean",
+    );
+  }
+
+  const effectivePolicy: EffectivePolicyPreviewEvidence = {
+    schema_version: responseSafeInteger(
+      rawPolicy,
+      "schema_version",
+      "effective policy preview.effective_policy",
+    ),
+    key_id: responseString(
+      rawPolicy,
+      "key_id",
+      "effective policy preview.effective_policy",
+    ),
+    status: responseString(
+      rawPolicy,
+      "status",
+      "effective policy preview.effective_policy",
+    ),
+    tenant_id: responseString(
+      rawPolicy,
+      "tenant_id",
+      "effective policy preview.effective_policy",
+    ),
+  };
+  for (const field of ["display_name", "expires_at"] as const) {
+    const optional = optionalNullableResponseString(
+      rawPolicy,
+      field,
+      "effective policy preview.effective_policy",
+    );
+    if (optional !== undefined) effectivePolicy[field] = optional;
+  }
+  if (rawPolicy.source !== undefined) {
+    effectivePolicy.source = responseString(
+      rawPolicy,
+      "source",
+      "effective policy preview.effective_policy",
+    );
+  }
+
+  const decisions: EffectivePolicyDecisions = {
+    allowed: rawDecisions.allowed,
+  };
+  for (const name of EFFECTIVE_POLICY_DECISION_NAMES) {
+    if (rawDecisions[name] === undefined) continue;
+    const label = `effective policy preview.decisions.${name}`;
+    const rawDecision = responseObject(rawDecisions[name], label);
+    if (typeof rawDecision.allowed !== "boolean") {
+      throw new TypeError(`${label}.allowed must be a boolean`);
+    }
+    const reasonCode = optionalNullableResponseString(
+      rawDecision,
+      "reason_code",
+      label,
+    );
+    decisions[name] = {
+      allowed: rawDecision.allowed,
+      ...(typeof reasonCode === "string" ? { reason_code: reasonCode } : {}),
+    };
+  }
+
+  return {
+    effective_policy: effectivePolicy,
+    policy_version: {
+      revision: responseSafeInteger(
+        rawVersion,
+        "revision",
+        "effective policy preview.policy_version",
+      ),
+      digest: responseString(
+        rawVersion,
+        "digest",
+        "effective policy preview.policy_version",
+      ),
+    },
+    decisions,
+  };
+}
+
+export interface KeyPolicyDraft {
+  name: string | null;
+  expires_at: string | null;
+  allowed_models: string[];
+  blocked_models: string[];
+  allowed_providers: string[];
+  blocked_providers: string[];
+  allowed_tools: string[] | null;
+  require_pii_redaction: string[];
+  route_to_model: string | null;
+  max_requests_per_minute: number | null;
+  max_tokens_per_minute: number | null;
+  priority: string | null;
+  max_budget_tokens: number | null;
+  max_budget_usd: number | null;
+  project: string | null;
+  user: string | null;
+  tenant_id: string | null;
+  bypass_prompt_injection: boolean;
+  principal_selectors: unknown[];
+  inject_tools: unknown[];
+  inject_mcp: Record<string, unknown> | null;
+  metadata: Record<string, string>;
+  tags: string[];
+}
+
+export interface AdminKeyPolicyPatch {
+  expected_revision: number;
+  name?: string | null;
+  expires_at?: string | null;
+  allowed_models?: string[];
+  blocked_models?: string[];
+  allowed_providers?: string[];
+  blocked_providers?: string[];
+  allowed_tools?: string[] | null;
+  require_pii_redaction?: string[];
+  route_to_model?: string | null;
+  max_requests_per_minute?: number | null;
+  max_tokens_per_minute?: number | null;
+  priority?: string | null;
+  max_budget_tokens?: number | null;
+  max_budget_usd?: number | null;
+  project?: string | null;
+  user?: string | null;
+  tenant?: string | null;
+  bypass_prompt_injection?: boolean;
+  principal_selectors?: unknown[];
+  inject_tools?: unknown[];
+  inject_mcp?: Record<string, unknown> | null;
+  metadata?: Record<string, string>;
+  tags?: string[];
+}
+
+function keyPolicyField(key: AdminKey, field: keyof KeyPolicy): unknown {
+  const direct = key[field as keyof AdminKey];
+  return direct !== undefined ? direct : key.policy?.[field];
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function nullableStringList(value: unknown): string[] | null {
+  return Array.isArray(value) ? stringList(value) : null;
+}
+
+function jsonList(value: unknown): unknown[] {
+  return Array.isArray(value) ? cloneJson(value) : [];
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function nullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function jsonObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? cloneJson(value as Record<string, unknown>)
+    : null;
+}
+
+function stringRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+}
+
+function budgetField(key: AdminKey, field: "max_tokens" | "max_cost_usd"): number | null {
+  const budget = keyPolicyField(key, "budget");
+  if (!budget || typeof budget !== "object" || Array.isArray(budget)) return null;
+  return nullableNumber((budget as Record<string, unknown>)[field]);
+}
+
+export function keyPolicyDraft(key: AdminKey): KeyPolicyDraft {
+  const maxBudgetTokens =
+    nullableNumber(keyPolicyField(key, "max_budget_tokens")) ??
+    budgetField(key, "max_tokens");
+  const maxBudgetUsd =
+    nullableNumber(keyPolicyField(key, "max_budget_usd")) ??
+    nullableNumber(keyPolicyField(key, "budget_usd")) ??
+    budgetField(key, "max_cost_usd");
+
+  return {
+    name: nullableString(key.name),
+    expires_at: nullableString(key.expires_at),
+    allowed_models: stringList(keyPolicyField(key, "allowed_models")),
+    blocked_models: stringList(keyPolicyField(key, "blocked_models")),
+    allowed_providers: stringList(keyPolicyField(key, "allowed_providers")),
+    blocked_providers: stringList(keyPolicyField(key, "blocked_providers")),
+    allowed_tools: nullableStringList(keyPolicyField(key, "allowed_tools")),
+    require_pii_redaction: stringList(
+      keyPolicyField(key, "require_pii_redaction"),
+    ),
+    route_to_model: nullableString(keyPolicyField(key, "route_to_model")),
+    max_requests_per_minute: nullableNumber(
+      keyPolicyField(key, "max_requests_per_minute"),
+    ),
+    max_tokens_per_minute: nullableNumber(
+      keyPolicyField(key, "max_tokens_per_minute"),
+    ),
+    priority: nullableString(keyPolicyField(key, "priority")),
+    max_budget_tokens: maxBudgetTokens,
+    max_budget_usd: maxBudgetUsd,
+    project: nullableString(keyPolicyField(key, "project")),
+    user: nullableString(keyPolicyField(key, "user")),
+    tenant_id: nullableString(keyPolicyField(key, "tenant_id")),
+    bypass_prompt_injection:
+      keyPolicyField(key, "bypass_prompt_injection") === true,
+    principal_selectors: jsonList(
+      keyPolicyField(key, "principal_selectors"),
+    ),
+    inject_tools: jsonList(keyPolicyField(key, "inject_tools")),
+    inject_mcp: jsonObject(keyPolicyField(key, "inject_mcp")),
+    metadata: stringRecord(keyPolicyField(key, "metadata")),
+    tags: stringList(keyPolicyField(key, "tags")),
+  };
+}
+
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, canonicalJson(child)]),
+  );
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right));
+}
+
+export function buildKeyPolicyPatch(
+  baseline: AdminKey,
+  draft: KeyPolicyDraft,
+): AdminKeyPolicyPatch {
+  if (!Number.isSafeInteger(baseline.policy_revision) || baseline.policy_revision < 1) {
+    throw new TypeError("policy_revision must be a safe integer of at least 1");
+  }
+  const before = keyPolicyDraft(baseline);
+  const patch: AdminKeyPolicyPatch = {
+    expected_revision: baseline.policy_revision,
+  };
+
+  if (before.name !== draft.name) patch.name = draft.name;
+  if (before.expires_at !== draft.expires_at) {
+    patch.expires_at = draft.expires_at;
+  }
+  if (!sameJson(before.allowed_models, draft.allowed_models)) {
+    patch.allowed_models = [...draft.allowed_models];
+  }
+  if (!sameJson(before.blocked_models, draft.blocked_models)) {
+    patch.blocked_models = [...draft.blocked_models];
+  }
+  if (!sameJson(before.allowed_providers, draft.allowed_providers)) {
+    patch.allowed_providers = [...draft.allowed_providers];
+  }
+  if (!sameJson(before.blocked_providers, draft.blocked_providers)) {
+    patch.blocked_providers = [...draft.blocked_providers];
+  }
+  if (!sameJson(before.allowed_tools, draft.allowed_tools)) {
+    patch.allowed_tools =
+      draft.allowed_tools === null ? null : [...draft.allowed_tools];
+  }
+  if (!sameJson(before.require_pii_redaction, draft.require_pii_redaction)) {
+    patch.require_pii_redaction = [...draft.require_pii_redaction];
+  }
+  if (before.route_to_model !== draft.route_to_model) {
+    patch.route_to_model = draft.route_to_model;
+  }
+  if (before.max_requests_per_minute !== draft.max_requests_per_minute) {
+    patch.max_requests_per_minute = draft.max_requests_per_minute;
+  }
+  if (before.max_tokens_per_minute !== draft.max_tokens_per_minute) {
+    patch.max_tokens_per_minute = draft.max_tokens_per_minute;
+  }
+  if (before.priority !== draft.priority) {
+    patch.priority = draft.priority;
+  }
+  if (before.max_budget_tokens !== draft.max_budget_tokens) {
+    patch.max_budget_tokens = draft.max_budget_tokens;
+  }
+  if (before.max_budget_usd !== draft.max_budget_usd) {
+    patch.max_budget_usd = draft.max_budget_usd;
+  }
+  if (before.project !== draft.project) patch.project = draft.project;
+  if (before.user !== draft.user) patch.user = draft.user;
+  if (before.tenant_id !== draft.tenant_id) patch.tenant = draft.tenant_id;
+  if (before.bypass_prompt_injection !== draft.bypass_prompt_injection) {
+    patch.bypass_prompt_injection = draft.bypass_prompt_injection;
+  }
+  if (!sameJson(before.principal_selectors, draft.principal_selectors)) {
+    patch.principal_selectors = cloneJson(draft.principal_selectors);
+  }
+  if (!sameJson(before.inject_tools, draft.inject_tools)) {
+    patch.inject_tools = cloneJson(draft.inject_tools);
+  }
+  if (!sameJson(before.inject_mcp, draft.inject_mcp)) {
+    patch.inject_mcp = draft.inject_mcp === null ? null : cloneJson(draft.inject_mcp);
+  }
+  if (!sameJson(before.metadata, draft.metadata)) {
+    patch.metadata = { ...draft.metadata };
+  }
+  if (!sameJson(before.tags, draft.tags)) patch.tags = [...draft.tags];
+
+  return patch;
+}
+
+export function rebaseKeyPolicyDraft(
+  current: AdminKey,
+  localPatch: AdminKeyPolicyPatch,
+): KeyPolicyDraft {
+  const draft = keyPolicyDraft(current);
+  if ("name" in localPatch) draft.name = localPatch.name ?? null;
+  if ("expires_at" in localPatch) {
+    draft.expires_at = localPatch.expires_at ?? null;
+  }
+  if (localPatch.allowed_models !== undefined) {
+    draft.allowed_models = [...localPatch.allowed_models];
+  }
+  if (localPatch.blocked_models !== undefined) {
+    draft.blocked_models = [...localPatch.blocked_models];
+  }
+  if (localPatch.allowed_providers !== undefined) {
+    draft.allowed_providers = [...localPatch.allowed_providers];
+  }
+  if (localPatch.blocked_providers !== undefined) {
+    draft.blocked_providers = [...localPatch.blocked_providers];
+  }
+  if ("allowed_tools" in localPatch) {
+    draft.allowed_tools =
+      localPatch.allowed_tools === null || localPatch.allowed_tools === undefined
+        ? null
+        : [...localPatch.allowed_tools];
+  }
+  if (localPatch.require_pii_redaction !== undefined) {
+    draft.require_pii_redaction = [...localPatch.require_pii_redaction];
+  }
+  if ("route_to_model" in localPatch) {
+    draft.route_to_model = localPatch.route_to_model ?? null;
+  }
+  if ("max_requests_per_minute" in localPatch) {
+    draft.max_requests_per_minute = localPatch.max_requests_per_minute ?? null;
+  }
+  if ("max_tokens_per_minute" in localPatch) {
+    draft.max_tokens_per_minute = localPatch.max_tokens_per_minute ?? null;
+  }
+  if ("priority" in localPatch) draft.priority = localPatch.priority ?? null;
+  if ("max_budget_tokens" in localPatch) {
+    draft.max_budget_tokens = localPatch.max_budget_tokens ?? null;
+  }
+  if ("max_budget_usd" in localPatch) {
+    draft.max_budget_usd = localPatch.max_budget_usd ?? null;
+  }
+  if ("project" in localPatch) draft.project = localPatch.project ?? null;
+  if ("user" in localPatch) draft.user = localPatch.user ?? null;
+  if ("tenant" in localPatch) draft.tenant_id = localPatch.tenant ?? null;
+  if (localPatch.bypass_prompt_injection !== undefined) {
+    draft.bypass_prompt_injection = localPatch.bypass_prompt_injection;
+  }
+  if (localPatch.principal_selectors !== undefined) {
+    draft.principal_selectors = cloneJson(localPatch.principal_selectors);
+  }
+  if (localPatch.inject_tools !== undefined) {
+    draft.inject_tools = cloneJson(localPatch.inject_tools);
+  }
+  if ("inject_mcp" in localPatch) {
+    draft.inject_mcp = localPatch.inject_mcp === null || localPatch.inject_mcp === undefined
+      ? null
+      : cloneJson(localPatch.inject_mcp);
+  }
+  if (localPatch.metadata !== undefined) {
+    draft.metadata = { ...localPatch.metadata };
+  }
+  if (localPatch.tags !== undefined) draft.tags = [...localPatch.tags];
+  return draft;
+}
+
+function assertKeyPolicyPatch(patch: AdminKeyPolicyPatch): void {
+  if (!Number.isSafeInteger(patch.expected_revision) || patch.expected_revision < 1) {
+    throw new TypeError("expected_revision must be a safe integer of at least 1");
+  }
 }
 
 export interface Credential {
@@ -1020,9 +1603,34 @@ export const api = {
 
   // Keys
   keys: () => getJson<unknown>("/admin/keys"),
+  keyPolicySchema: async () =>
+    decodeKeyPolicySchema(
+      await getJson<unknown>("/admin/keys/policy-schema"),
+    ),
+  key: async (id: string) => {
+    const document = await getJson<{ key: AdminKey }>(
+      `/admin/keys/${encodeURIComponent(id)}`,
+    );
+    return document.key;
+  },
   createKey: (body: unknown) => sendJson<CreatedKey>("POST", "/admin/keys", body),
-  patchKey: (id: string, body: unknown) =>
-    sendJson<AdminKey>("PATCH", `/admin/keys/${encodeURIComponent(id)}`, body),
+  patchKey: async (id: string, patch: AdminKeyPolicyPatch) => {
+    assertKeyPolicyPatch(patch);
+    const document = await sendJson<{ key: AdminKey }>(
+      "PATCH",
+      `/admin/keys/${encodeURIComponent(id)}`,
+      patch,
+    );
+    return document.key;
+  },
+  previewKeyPolicy: async (id: string) =>
+    decodeEffectivePolicyPreview(
+      await sendJson<unknown>(
+        "POST",
+        `/admin/keys/${encodeURIComponent(id)}/effective-policy/preview`,
+        {},
+      ),
+    ),
   keyAction: (id: string, action: "revoke" | "block" | "unblock" | "rotate") =>
     sendJson<unknown>("POST", `/admin/keys/${encodeURIComponent(id)}/${action}`),
   deleteKey: (id: string) =>
