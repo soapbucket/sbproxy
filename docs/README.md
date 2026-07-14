@@ -1,5 +1,5 @@
 # SBproxy documentation
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-14*
 
 Call any model. Serve your own. Govern both. SBproxy is the open-source OpenRouter alternative: one Apache-2.0 binary that routes to 66 providers or serves the weights on your GPUs, with the guardrails, keys, budgets, and spend ledger applying to every model the same way, and a real Pingora-based reverse proxy underneath for the rest of your traffic.
 
@@ -17,6 +17,7 @@ Each walkthrough takes one problem end to end: a story doc, a runnable example d
 | A LiteLLM proxy you want off of | [Migrate off LiteLLM in an afternoon](migration-litellm.md) |
 | Shadow Ollama under someone's desk | [Guardrails on every prompt, local or hosted](use-case-guardrails-everywhere.md) |
 | AI crawlers eating your content for free | [Meter and monetize the AI that calls you](use-case-meter-crawlers.md) |
+| Internal MCP servers multiplying without an owner | [Federate your MCP tools behind one gateway](mcp.md) |
 | It works on your laptop and on-call starts Monday | [Run it in production](use-case-production-ops.md) |
 
 Broader estate guides, same shape:
@@ -29,11 +30,12 @@ Broader estate guides, same shape:
 
 ## Where to start
 
-New here? Read [manual.md](manual.md) for install and CLI, then [configuration.md](configuration.md) for the schema. The [examples](../examples/) folder has runnable configs you can point the binary at right away.
+New here? Follow the [Getting Started guide](getting-started.md): install, run your first config, validate it, and see where to go next. For the deeper install and CLI reference, see [manual.md](manual.md), then [configuration.md](configuration.md) for the full schema. The [examples](../examples/) folder has runnable configs you can point the binary at right away.
 
 ## Documentation index
 
 ### Getting started
+- [getting-started.md](getting-started.md) - install, run your first config, and where to go next. Start here.
 - [manual.md](manual.md) - install, CLI, runtime, TLS, deployment patterns.
 - [configuration.md](configuration.md) - every `sb.yml` field with examples.
 - [json-schema.md](json-schema.md) - JSON Schema for editor autocomplete + validation of `sb.yml`.

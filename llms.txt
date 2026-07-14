@@ -17,6 +17,7 @@ Most teams run nginx or Traefik for HTTP traffic, then route AI requests through
 
 ### Repo docs
 - README: https://github.com/soapbucket/sbproxy/blob/main/README.md
+- Getting Started: https://github.com/soapbucket/sbproxy/blob/main/docs/getting-started.md
 - Manual: https://github.com/soapbucket/sbproxy/blob/main/docs/manual.md
 - Configuration: https://github.com/soapbucket/sbproxy/blob/main/docs/configuration.md
 - Features: https://github.com/soapbucket/sbproxy/blob/main/docs/features.md

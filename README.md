@@ -4,7 +4,7 @@
 
 <h1 align="center">SBproxy</h1>
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-14*
 
 <h3 align="center">Take control of your AI traffic.</h3>
 
@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> &middot;
+  <a href="#getting-started">Getting started</a> &middot;
   <a href="#serve-your-own-model">Serve your own model</a> &middot;
   <a href="#solve-a-problem">Solve a problem</a> &middot;
   <a href="examples/">Examples</a> &middot;
@@ -53,7 +53,9 @@ Weighing the options? See [how SBproxy compares](docs/comparison.md) and the [be
 
 ---
 
-## Install
+## Getting started
+
+### Install
 
 curl (macOS / Linux):
 
@@ -83,6 +85,38 @@ git clone https://github.com/soapbucket/sbproxy
 cd sbproxy
 make build-release
 ```
+
+### Quick start
+
+We host a public HTTP echo service at `test.sbproxy.dev` (request inspection, like httpbin) so you can wire up a real upstream without leaving the SoapBucket ecosystem. Try it directly:
+
+```bash
+curl https://test.sbproxy.dev/get
+```
+
+Now run the gateway in front of it. Drop this into `sb.yml`:
+
+```yaml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "myapp.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+```
+
+```bash
+sbproxy sb.yml
+curl -H "Host: myapp.example.com" http://127.0.0.1:8080/get
+```
+
+`myapp.example.com` is the host your client sees; SBproxy matches it against `origins:` and forwards to the upstream. Use any hostname you want here; `example.com` is reserved (RFC 2606), so it never collides with anything real.
+
+That's a reverse proxy. Add AI routing, auth, and rate limiting in the same file. See [`examples/`](examples/) for runnable end-to-end configurations covering each feature.
+
+New to SBproxy? The [Getting Started guide](docs/getting-started.md) walks through installing, validating a config, running your first proxy, and where to go next in more depth.
 
 ---
 
@@ -141,38 +175,6 @@ Each of these walks one problem end to end: a story doc, a runnable example, a `
 | AI crawlers eating your content for free | [Meter and monetize the AI that calls you](docs/use-case-meter-crawlers.md) |
 | Internal MCP servers multiplying without an owner | [Federate your MCP tools behind one gateway](docs/mcp.md) |
 | It works on your laptop and on-call starts Monday | [Run it in production](docs/use-case-production-ops.md) |
-
----
-
-## Quick start
-
-We host a public HTTP echo service at `test.sbproxy.dev` (request inspection, like httpbin) so you can wire up a real upstream without leaving the SoapBucket ecosystem. Try it directly:
-
-```bash
-curl https://test.sbproxy.dev/get
-```
-
-Now run the gateway in front of it. Drop this into `sb.yml`:
-
-```yaml
-proxy:
-  http_bind_port: 8080
-
-origins:
-  "myapp.example.com":
-    action:
-      type: proxy
-      url: https://test.sbproxy.dev
-```
-
-```bash
-sbproxy sb.yml
-curl -H "Host: myapp.example.com" http://127.0.0.1:8080/get
-```
-
-`myapp.example.com` is the host your client sees; SBproxy matches it against `origins:` and forwards to the upstream. Use any hostname you want here; `example.com` is reserved (RFC 2606), so it never collides with anything real.
-
-That's a reverse proxy. Add AI routing, auth, and rate limiting in the same file. See [`examples/`](examples/) for runnable end-to-end configurations covering each feature.
 
 ---
 
