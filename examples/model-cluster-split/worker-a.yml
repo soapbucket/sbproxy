@@ -18,6 +18,7 @@ proxy:
     transport_port: 18948
     advertise_addr: 127.0.0.1:17948
     transport_advertise_addr: 127.0.0.1:18948
+    model_bind: 127.0.0.1:19443
     model_endpoint: https://127.0.0.1:19443
     state_dir: ./state/worker-a
     security:

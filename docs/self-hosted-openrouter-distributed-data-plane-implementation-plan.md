@@ -752,7 +752,7 @@ Commit: `git commit -m "WOR-1854: govern cold starts and model discovery"`
 - Produces: fake-engine control modes for unary, SSE, delayed headers, pre-output error, mid-stream error, and cancellation observation.
 - Produces: a three-process cluster fixture with explicit development authentication and managed providers.
 
-- [ ] **Step 1: Write a failing fake-engine behavior test**
+- [x] **Step 1: Write a failing fake-engine behavior test**
 
 ```rust,no_run
 #[tokio::test]
@@ -765,17 +765,17 @@ async fn fake_engine_streams_usage_and_observes_disconnect() {
 }
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `cargo test -p sbproxy-e2e --bin fake_model_engine -- --nocapture`
 
 Expected: FAIL because the fake engine implements readiness only.
 
-- [ ] **Step 3: Add deterministic engine fixtures**
+- [x] **Step 3: Add deterministic engine fixtures**
 
 Keep `/health` unchanged. Add `/v1/chat/completions`, `/v1/models`, and a test-only loopback control endpoint. The completion handler echoes a fixed model and usage object, supports SSE, and records active/cancelled request counts without logging authorization headers or request bodies.
 
-- [ ] **Step 4: Write the failing three-node E2E scenarios**
+- [x] **Step 4: Write the failing three-node E2E scenarios**
 
 ```rust,no_run
 #[test]
@@ -792,17 +792,17 @@ fn remote_stream_failover_and_cancel_are_safe() {
 }
 ```
 
-- [ ] **Step 5: Run and verify RED**
+- [x] **Step 5: Run and verify RED**
 
 Run: `SBPROXY_E2E_BIN=$(pwd)/target/debug/sbproxy cargo test -p sbproxy-e2e --test model_cluster_dispatch -- --nocapture`
 
 Expected: FAIL on the first remote completion before data-plane integration is complete.
 
-- [ ] **Step 6: Complete fixtures and example configuration**
+- [x] **Step 6: Complete fixtures and example configuration**
 
 Use loopback-only engine ports, distinct gateway/worker model-plane ports, explicit shared development secret, finite snapshot intervals, bounded waits, and process-group cleanup. The examples must include a managed provider at the gateway and a curl that proves the selected worker without exposing its address in the public response.
 
-- [ ] **Step 7: Run E2E and commit**
+- [x] **Step 7: Run E2E and commit**
 
 Run: `cargo build -p sbproxy && SBPROXY_E2E_BIN=$(pwd)/target/debug/sbproxy cargo test -p sbproxy-e2e --test model_cluster_dispatch -- --nocapture`
 

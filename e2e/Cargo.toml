@@ -135,6 +135,11 @@ sbproxy-mesh.workspace = true
 name = "rate_limit_budget"
 path = "tests/rate_limit_budget.rs"
 
+# WOR-1850: authenticated three-process managed-model data-plane proof.
+[[test]]
+name = "model_cluster_dispatch"
+path = "tests/model_cluster_dispatch.rs"
+
 [build-dependencies]
 # Compiles the in-tree `proto/echo.proto` for the gRPC e2e test. Kept
 # pinned to the same major as `tonic` above.
