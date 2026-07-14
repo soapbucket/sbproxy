@@ -143,7 +143,7 @@ with a pin and an adapter.
 
 ## Grading changes: the compatibility oracle
 
-The second half is knowing when a change NEEDS a new version. The oracle
+The second half is knowing when a change *needs* a new version. The oracle
 gives every tool a content digest and grades every change.
 
 ## What it produces

@@ -25,9 +25,9 @@ What proves it is working:
   `sbproxy_mcp_tool_version_calls_total{tool,version,via,deprecated}`;
   the per-version split is the migration dashboard. Results carry
   `_meta.sbproxy.dev/version` naming the version that served them.
-- Calls to the deprecated 1.4.0 log a warning; flip its
-  `after_sunset:` to `block` and, past the date, they fail with a
-  typed error naming the sunset.
+- Calls to the deprecated 1.4.0 log a warning; set
+  `after_sunset: block` on that version and, past the date, they fail
+  with a typed error naming the sunset.
 
 When the legacy upstream is retired, swap its `server:` for the
 `adapter:` in `adapters/search-v1.js` plus an inline `contract:`; v1
