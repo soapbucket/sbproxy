@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use sbproxy_e2e::ProxyHarness;
+use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -47,6 +47,14 @@ struct ChatResponse {
     body: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+struct NodeConfigPolicy<'a> {
+    cold_start: &'a str,
+    routing: &'a str,
+    fallback_url: Option<&'a str>,
+    placeable: bool,
+}
+
 struct ThreeNodeCluster {
     _root: tempfile::TempDir,
     nodes: Vec<NodeSpec>,
@@ -56,6 +64,7 @@ struct ThreeNodeCluster {
     engine_ports: BTreeMap<&'static str, u16>,
     primary_worker: Option<&'static str>,
     failover_prompt: Option<String>,
+    fallback_upstream: Option<MockUpstream>,
 }
 
 fn reserve_tcp_port() -> u16 {
@@ -149,6 +158,7 @@ fn node_config(
     catalog_path: &Path,
     fake_engine_path: &Path,
     replicas: u32,
+    policy: NodeConfigPolicy<'_>,
 ) -> String {
     let seeds = if node.role == "gateway" {
         "[]".to_string()
@@ -158,6 +168,22 @@ fn node_config(
     let model_plane = node.model_port.map_or_else(String::new, |port| {
         format!("\n    model_bind: 127.0.0.1:{port}\n    model_endpoint: http://127.0.0.1:{port}")
     });
+    let fallback_provider = policy.fallback_url.map_or_else(String::new, |base_url| {
+        format!(
+            r#"
+        - name: external
+          provider_type: openai
+          api_key: fixture
+          base_url: "{base_url}"
+          allow_private_base_url: true
+          models: [{LOGICAL_MODEL}]"#
+        )
+    });
+    let required_labels = if policy.placeable {
+        "{}"
+    } else {
+        "{accelerator: unavailable}"
+    };
     format!(
         r#"
 proxy:
@@ -201,10 +227,11 @@ proxy:
         model: {LOGICAL_MODEL}
         variant: q4
         replicas: {replicas}
+        required_labels: {required_labels}
         spread_by: [zone]
         pull: on_demand
         warm: false
-        cold_start: wait
+        cold_start: {cold_start}
         max_concurrency: 1
         max_queue_depth: 8
         queue_timeout_ms: 3000
@@ -214,13 +241,14 @@ origins:
   "{HOST}":
     action:
       type: ai_proxy
-      routing: fallback_chain
+      routing: {routing}
       providers:
         - name: managed
           provider_type: managed_model
           deployment: {DEPLOYMENT}
           models: [{LOGICAL_MODEL}]
           default_model: {LOGICAL_MODEL}
+{fallback_provider}
 "#,
         admin_port = node.admin_port,
         node_id = node.node_id,
@@ -233,6 +261,10 @@ origins:
         cache_dir = node.cache_dir.display(),
         fake_engine_path = fake_engine_path.display(),
         replicas = replicas,
+        cold_start = policy.cold_start,
+        routing = policy.routing,
+        fallback_provider = fallback_provider,
+        required_labels = required_labels,
     )
 }
 
@@ -255,6 +287,15 @@ fn validate_config(root: &Path, index: usize, config: &str) -> Result<()> {
 
 impl ThreeNodeCluster {
     fn start() -> Result<Self> {
+        Self::start_with_policy("wait", "fallback_chain", None, true)
+    }
+
+    fn start_with_policy(
+        cold_start: &str,
+        routing: &str,
+        fallback_upstream: Option<MockUpstream>,
+        placeable: bool,
+    ) -> Result<Self> {
         let root = tempfile::tempdir().context("create model dispatch fixture")?;
         let catalog_path = write_model_fixture(root.path())?;
         let fake_engine_path = Path::new(env!("CARGO_BIN_EXE_fake_model_engine"));
@@ -264,6 +305,13 @@ impl ThreeNodeCluster {
             node_spec(root.path(), "worker-b", "worker", "zone-b"),
         ];
         let gateway_gossip_port = nodes[0].gossip_port;
+        let fallback_url = fallback_upstream.as_ref().map(MockUpstream::base_url);
+        let policy = NodeConfigPolicy {
+            cold_start,
+            routing,
+            fallback_url: fallback_url.as_deref(),
+            placeable,
+        };
         let configs = nodes
             .iter()
             .map(|node| {
@@ -273,6 +321,7 @@ impl ThreeNodeCluster {
                     &catalog_path,
                     fake_engine_path,
                     1,
+                    policy,
                 )
             })
             .collect::<Vec<_>>();
@@ -285,6 +334,7 @@ impl ThreeNodeCluster {
                     &catalog_path,
                     fake_engine_path,
                     2,
+                    policy,
                 )
             })
             .collect::<Vec<_>>();
@@ -318,8 +368,9 @@ impl ThreeNodeCluster {
             engine_ports: BTreeMap::new(),
             primary_worker: None,
             failover_prompt: None,
+            fallback_upstream,
         };
-        cluster.wait_for_assignments(1, Duration::from_secs(40))?;
+        cluster.wait_for_assignments(usize::from(placeable), Duration::from_secs(40))?;
         Ok(cluster)
     }
 
@@ -822,6 +873,21 @@ impl ThreeNodeCluster {
     }
 }
 
+fn external_chat_reply() -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-external",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": LOGICAL_MODEL,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "external-ready"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+}
+
 impl Drop for ThreeNodeCluster {
     fn drop(&mut self) {
         for process in self.processes.values_mut() {
@@ -934,4 +1000,73 @@ fn remote_stream_failover_and_cancel_are_safe() -> Result<()> {
         cluster.dump_logs();
     }
     result
+}
+
+#[test]
+fn managed_cold_fallback_advances_a_non_fallback_router() -> Result<()> {
+    let upstream = MockUpstream::start(external_chat_reply()).context("fallback upstream")?;
+    let cluster =
+        ThreeNodeCluster::start_with_policy("fallback", "round_robin", Some(upstream), false)?;
+
+    let response = cluster.send_chat("cold-fallback", false)?;
+    anyhow::ensure!(
+        response.status == 200,
+        "fallback status {}",
+        response.status
+    );
+    let body: Value = serde_json::from_slice(&response.body).context("fallback response JSON")?;
+    anyhow::ensure!(
+        body["choices"][0]["message"]["content"] == "external-ready",
+        "managed cold fallback did not reach the external provider: {body}"
+    );
+    let upstream = cluster
+        .fallback_upstream
+        .as_ref()
+        .context("fallback upstream retained")?;
+    anyhow::ensure!(
+        !upstream.captured().is_empty(),
+        "external fallback provider was not called"
+    );
+    Ok(())
+}
+
+#[test]
+fn multipart_managed_cold_fallback_advances_provider() -> Result<()> {
+    let upstream = MockUpstream::start(external_chat_reply()).context("fallback upstream")?;
+    let cluster =
+        ThreeNodeCluster::start_with_policy("fallback", "fallback_chain", Some(upstream), false)?;
+
+    let boundary = "sbproxy-cold-fallback";
+    let multipart = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{LOGICAL_MODEL}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.wav\"\r\nContent-Type: audio/wav\r\n\r\nfixture\r\n--{boundary}--\r\n"
+    );
+    let response = cluster
+        .client
+        .post(format!(
+            "{}/v1/chat/completions",
+            cluster.gateway().base_url()
+        ))
+        .header("host", HOST)
+        .header("authorization", format!("Bearer {PUBLIC_KEY}"))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(multipart)
+        .send()
+        .context("multipart cold fallback")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "multipart fallback status {}",
+        response.status()
+    );
+    let upstream = cluster
+        .fallback_upstream
+        .as_ref()
+        .context("fallback upstream retained")?;
+    anyhow::ensure!(
+        !upstream.captured().is_empty(),
+        "multipart managed fallback did not advance to the external provider"
+    );
+    Ok(())
 }

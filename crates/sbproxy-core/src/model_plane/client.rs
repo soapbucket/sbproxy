@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
@@ -19,6 +20,7 @@ use super::{
 
 const ERROR_CODE_HEADER: &str = "x-sbproxy-error-code";
 const ERROR_RETRYABLE_HEADER: &str = "x-sbproxy-error-retryable";
+const ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 trait ModelPlaneIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> ModelPlaneIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -145,44 +147,51 @@ impl ModelPlaneClient {
         let port = url.port_or_known_default().ok_or_else(|| {
             ModelPlaneError::InvalidConfiguration("model endpoint port is absent".to_string())
         })?;
-        let tcp = TcpStream::connect((host.as_str(), port))
-            .await
-            .map_err(|error| ModelPlaneError::Transport(error.to_string()))?;
-        let io: BoxedIo = match &self.security {
-            ModelPlaneClientSecurity::Mtls { tls, server_name } => {
-                if url.scheme() != "https" {
-                    return Err(ModelPlaneError::InvalidConfiguration(
-                        "mTLS model endpoint must use https".to_string(),
-                    ));
-                }
-                let connector = build_http2_connector(tls)
-                    .map_err(|error| ModelPlaneError::Tls(error.to_string()))?;
-                let server_name = rustls::pki_types::ServerName::try_from(server_name.clone())
-                    .map_err(|error| ModelPlaneError::InvalidConfiguration(error.to_string()))?;
-                let tls = connector
-                    .connect(server_name, tcp)
-                    .await
-                    .map_err(|error| ModelPlaneError::Tls(error.to_string()))?;
-                if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-                    return Err(ModelPlaneError::Tls(
-                        "HTTP/2 ALPN was not negotiated".to_string(),
-                    ));
-                }
-                Box::new(tls)
-            }
-            ModelPlaneClientSecurity::DevelopmentSharedKey { key } => {
-                if url.scheme() != "http" || key.len() < 16 {
-                    return Err(ModelPlaneError::InvalidConfiguration(
-                        "development model endpoint requires h2c and a bounded key".to_string(),
-                    ));
-                }
-                Box::new(tcp)
-            }
-        };
-        let (mut sender, connection) =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
+        let (mut sender, connection) = tokio::time::timeout(ESTABLISHMENT_TIMEOUT, async {
+            let tcp = TcpStream::connect((host.as_str(), port))
                 .await
                 .map_err(|error| ModelPlaneError::Transport(error.to_string()))?;
+            let io: BoxedIo = match &self.security {
+                ModelPlaneClientSecurity::Mtls { tls, server_name } => {
+                    if url.scheme() != "https" {
+                        return Err(ModelPlaneError::InvalidConfiguration(
+                            "mTLS model endpoint must use https".to_string(),
+                        ));
+                    }
+                    let connector = build_http2_connector(tls)
+                        .map_err(|error| ModelPlaneError::Tls(error.to_string()))?;
+                    let server_name = rustls::pki_types::ServerName::try_from(server_name.clone())
+                        .map_err(|error| {
+                            ModelPlaneError::InvalidConfiguration(error.to_string())
+                        })?;
+                    let tls = connector
+                        .connect(server_name, tcp)
+                        .await
+                        .map_err(|error| ModelPlaneError::Tls(error.to_string()))?;
+                    if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+                        return Err(ModelPlaneError::Tls(
+                            "HTTP/2 ALPN was not negotiated".to_string(),
+                        ));
+                    }
+                    Box::new(tls)
+                }
+                ModelPlaneClientSecurity::DevelopmentSharedKey { key } => {
+                    if url.scheme() != "http" || key.len() < 16 {
+                        return Err(ModelPlaneError::InvalidConfiguration(
+                            "development model endpoint requires h2c and a bounded key".to_string(),
+                        ));
+                    }
+                    Box::new(tcp)
+                }
+            };
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
+                .await
+                .map_err(|error| ModelPlaneError::Transport(error.to_string()))
+        })
+        .await
+        .map_err(|_| {
+            ModelPlaneError::Transport("model-plane establishment timed out".to_string())
+        })??;
         tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::debug!(%error, "private model-plane client connection closed");

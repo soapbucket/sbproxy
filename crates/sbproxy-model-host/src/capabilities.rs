@@ -1202,17 +1202,27 @@ const CAPABILITIES: &[CapabilityEntry] = &[
     CapabilityEntry {
         id: "cluster.remote_dispatch",
         domain: CapabilityDomain::Cluster,
-        status: SupportLevel::Unsupported,
-        summary: "Remote inference dispatch and streaming over the private model plane land in the distributed data-plane PR.",
-        evidence: &[],
+        status: SupportLevel::Preview,
+        summary: "Authenticated HTTP/2 local and peer dispatch, coordinated cold starts, streaming cancellation, and pre-output failover have local test coverage; a dedicated executable consumer contract and live production certification remain incomplete.",
+        evidence: &[
+            "test.model_plane_envelope",
+            "test.model_plane_transport",
+            "test.managed_replica_routing",
+            "test.managed_replica_dispatch",
+            "test.model_cluster_dispatch",
+        ],
         consumer: None,
     },
     CapabilityEntry {
         id: "policy.local_provider_governance",
         domain: CapabilityDomain::Policy,
         status: SupportLevel::Preview,
-        summary: "Local providers remain behind the existing gateway policy path.",
-        evidence: &[],
+        summary: "Managed routes preserve gateway provider and model policy, expose topology-free logical discovery, and emit bounded route metadata; strict distributed limits and full key introspection remain deferred.",
+        evidence: &[
+            "test.managed_replica_dispatch",
+            "test.admin_model_host",
+            "test.model_cluster_dispatch",
+        ],
         consumer: None,
     },
     CapabilityEntry {

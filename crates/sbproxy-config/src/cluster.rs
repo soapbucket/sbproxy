@@ -239,7 +239,7 @@ impl ClusterConfig {
             validate_host_port("transport_advertise_addr", address)?;
         }
         if let Some(endpoint) = self.model_endpoint.as_deref() {
-            validate_model_endpoint(endpoint, self.security.mode == ClusterSecurityMode::Mtls)?;
+            validate_model_endpoint(endpoint, self.security.mode)?;
         }
         if let Some(bind) = self.model_bind.as_deref() {
             if !self.roles.contains(&ClusterRole::Worker) {
@@ -391,17 +391,28 @@ fn validate_host_port(field: &str, value: &str) -> Result<(), ClusterConfigError
     Ok(())
 }
 
-fn validate_model_endpoint(endpoint: &str, production: bool) -> Result<(), ClusterConfigError> {
+fn validate_model_endpoint(
+    endpoint: &str,
+    security_mode: ClusterSecurityMode,
+) -> Result<(), ClusterConfigError> {
     let uri = endpoint.parse::<Uri>().map_err(|error| {
         ClusterConfigError::invalid(format!("model_endpoint {endpoint:?} is invalid: {error}"))
     })?;
-    let scheme = uri.scheme_str();
+    let expected_scheme = match security_mode {
+        ClusterSecurityMode::Mtls => "https",
+        ClusterSecurityMode::SharedKey => "http",
+    };
     if uri.authority().is_none()
-        || !matches!(scheme, Some("http" | "https"))
-        || (production && scheme != Some("https"))
+        || uri.scheme_str() != Some(expected_scheme)
+        || uri.path() != "/"
+        || uri.query().is_some()
+        || endpoint.contains('#')
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
     {
         return Err(ClusterConfigError::invalid(
-            "model_endpoint must be an absolute HTTP URL and production mTLS clusters require HTTPS",
+            "model_endpoint must be an absolute origin using HTTPS for mTLS or HTTP for development shared_key mode",
         ));
     }
     Ok(())

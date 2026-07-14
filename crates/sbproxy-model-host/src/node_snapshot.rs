@@ -918,8 +918,15 @@ fn validate_optional_endpoint(endpoint: Option<&str>) -> Result<(), NodeSnapshot
     }
     let endpoint = url::Url::parse(endpoint)
         .map_err(|_| NodeSnapshotError::Invalid("model endpoint is not an absolute URL".into()))?;
-    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
-        return invalid("model endpoint must be an absolute HTTP URL");
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.path() != "/"
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return invalid("model endpoint must be an absolute HTTP origin");
     }
     Ok(())
 }

@@ -100,6 +100,21 @@ fn snapshot_schema_v2_round_trips_every_operational_field() {
 }
 
 #[test]
+fn snapshot_model_endpoint_must_be_an_absolute_origin() {
+    for endpoint in [
+        "https://worker-a.internal:9443/models",
+        "https://worker-a.internal:9443?debug=1",
+        "https://worker-a.internal:9443#fragment",
+    ] {
+        let mut snapshot = fixture();
+        snapshot.node.model_endpoint = Some(endpoint.to_string());
+        snapshot.replicas[0].endpoint = Some(endpoint.to_string());
+
+        assert!(snapshot.validate().is_err(), "{endpoint}");
+    }
+}
+
+#[test]
 fn strict_decode_and_validation_reject_unknown_unbounded_or_unsafe_state() {
     let snapshot = fixture();
     let mut value: serde_json::Value =

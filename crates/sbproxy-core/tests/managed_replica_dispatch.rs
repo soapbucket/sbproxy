@@ -291,7 +291,8 @@ fn managed_models_listing_contains_availability_but_no_topology() {
         },
     )]);
 
-    let response = logical_model_listing(&config, &["managed".to_string()], &availability);
+    let response =
+        logical_model_listing(&config, &["managed".to_string()], &[], &[], &availability);
 
     assert_eq!(response["object"], "list");
     assert_eq!(response["data"][0]["id"], "qwen");

@@ -109,11 +109,17 @@ impl ClusterIdentity {
         }
         if let Some(endpoint) = self.model_endpoint.as_deref() {
             let valid = url::Url::parse(endpoint).is_ok_and(|url| {
-                matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
             });
             if !valid || endpoint.len() > 2048 || endpoint.chars().any(char::is_control) {
                 return Err(ClusterStateError::InvalidIdentity(
-                    "model_endpoint must be a bounded absolute HTTP URL".to_string(),
+                    "model_endpoint must be a bounded absolute HTTP origin".to_string(),
                 ));
             }
         }
@@ -903,6 +909,26 @@ mod tests {
             member_from_peer(&peer, true).state,
             ClusterMemberState::Dead
         );
+    }
+
+    #[test]
+    fn model_endpoint_identity_must_be_an_absolute_origin() {
+        for endpoint in [
+            "https://worker-a.internal:9443/models",
+            "https://worker-a.internal:9443?debug=1",
+            "https://worker-a.internal:9443#fragment",
+        ] {
+            let identity = ClusterIdentity {
+                cluster_id: "cluster-a".to_string(),
+                node_id: "worker-a".to_string(),
+                roles: BTreeSet::from([ClusterNodeRole::Worker]),
+                labels: BTreeMap::new(),
+                peer_address: None,
+                model_endpoint: Some(endpoint.to_string()),
+            };
+
+            assert!(identity.validate().is_err(), "{endpoint}");
+        }
     }
 
     #[tokio::test]

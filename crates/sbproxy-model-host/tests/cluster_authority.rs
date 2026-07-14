@@ -44,6 +44,13 @@ fn bundle(revision: u64) -> RestrictedDeploymentBundle {
 #[test]
 fn strict_bundle_rejects_unknown_privileged_fields_and_duplicate_deployments() {
     let valid: serde_json::Value = serde_json::from_slice(&bundle(1).to_json().unwrap()).unwrap();
+    let mut missing_cold_start = valid.clone();
+    missing_cold_start["deployments"]["coder"]
+        .as_object_mut()
+        .unwrap()
+        .remove("cold_start");
+    RestrictedDeploymentBundle::from_json(&serde_json::to_vec(&missing_cold_start).unwrap())
+        .expect_err("cluster-authority deployments require explicit cold_start");
     for field in ["secrets", "proxy", "private_key"] {
         let mut malicious = valid.clone();
         malicious

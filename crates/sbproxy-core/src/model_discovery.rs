@@ -61,6 +61,8 @@ struct LogicalModelAggregate {
 pub fn logical_model_listing(
     config: &sbproxy_ai::handler::AiHandlerConfig,
     allowed_providers: &[String],
+    allowed_models: &[String],
+    blocked_models: &[String],
     managed: &BTreeMap<String, ManagedDeploymentAvailability>,
 ) -> serde_json::Value {
     let mut models = BTreeMap::<String, LogicalModelAggregate>::new();
@@ -88,7 +90,11 @@ pub fn logical_model_listing(
         }
 
         for public_model in public_models {
-            if !config.is_model_allowed(public_model) {
+            if !config.is_model_allowed(public_model)
+                || blocked_models.iter().any(|blocked| blocked == public_model)
+                || (!allowed_models.is_empty()
+                    && !allowed_models.iter().any(|allowed| allowed == public_model))
+            {
                 continue;
             }
             let aggregate = models.entry(public_model.to_string()).or_default();

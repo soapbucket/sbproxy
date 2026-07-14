@@ -176,6 +176,136 @@ async fn resolve_dynamic_virtual_key(
     }
 }
 
+async fn resolve_request_virtual_key(
+    session: &Session,
+    config: &AiHandlerConfig,
+    principal: &sbproxy_plugin::Principal,
+) -> std::result::Result<Option<sbproxy_ai::identity::VirtualKeyConfig>, (u16, String)> {
+    let auth_value = req_header_value(session, "authorization");
+    let raw_key = auth_value.as_deref().map(|header| {
+        header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))
+            .unwrap_or(header)
+            .trim()
+            .to_string()
+    });
+    if let Some(plane) = crate::key_plane::current_key_plane() {
+        return match resolve_dynamic_virtual_key(&plane, raw_key.as_deref()).await {
+            DynamicKeyOutcome::Resolved(key) => Ok(Some(*key)),
+            DynamicKeyOutcome::NotApplicable => {
+                match resolve_oidc_mapped_key(&plane, principal).await {
+                    DynamicKeyOutcome::Resolved(key) => Ok(Some(*key)),
+                    DynamicKeyOutcome::NotApplicable => Ok(None),
+                    DynamicKeyOutcome::Deny(status, message) => Err((status, message)),
+                }
+            }
+            DynamicKeyOutcome::Deny(status, message) => Err((status, message)),
+        };
+    }
+    Ok(raw_key.as_deref().and_then(|key| {
+        config
+            .virtual_keys
+            .iter()
+            .find(|candidate| candidate.enabled && candidate.key == key)
+            .cloned()
+    }))
+}
+
+const UNNAMED_VIRTUAL_KEY_PRINCIPAL: &str = "<unnamed>";
+
+fn principal_for_resolved_virtual_key(
+    tenant_id: &str,
+    key: &sbproxy_ai::identity::VirtualKeyConfig,
+) -> sbproxy_plugin::Principal {
+    let attrs = sbproxy_plugin::PrincipalAttrs {
+        project: key.project.clone(),
+        user: key.user.clone(),
+        team: None,
+        tags: key.tags.clone(),
+        metadata: key
+            .metadata
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        roles: Vec::new(),
+        claims: None,
+        // The operator-supplied stable name only; never the raw key secret.
+        key_id: key.name.clone(),
+    };
+    let key_name = key
+        .name
+        .clone()
+        .unwrap_or_else(|| UNNAMED_VIRTUAL_KEY_PRINCIPAL.to_string());
+    sbproxy_plugin::Principal {
+        tenant_id: sbproxy_plugin::TenantId::from(tenant_id),
+        sub: key_name.clone(),
+        source: sbproxy_plugin::PrincipalSource::VirtualKey,
+        virtual_key: Some(sbproxy_plugin::VirtualKeyRef {
+            name: key_name,
+            allowed_providers: key.allowed_providers.clone(),
+        }),
+        attrs,
+    }
+}
+
+/// Apply the request-wide identity and governance carried by a resolved virtual
+/// key before dispatch can branch into local discovery, multipart forwarding,
+/// or JSON-specific processing.
+fn apply_resolved_virtual_key_context(
+    session: &Session,
+    config: &AiHandlerConfig,
+    ctx: &mut RequestContext,
+    key: &sbproxy_ai::identity::VirtualKeyConfig,
+) -> std::result::Result<(), (u16, &'static str)> {
+    if !key.matches_principal(&ctx.principal) {
+        let key_name = key.name.as_deref().unwrap_or("<unnamed>");
+        warn!(
+            credential = %key_name,
+            principal_source = %ctx.principal.source.as_str(),
+            principal_sub = %ctx.principal.sub,
+            "AI proxy: credential principal selector miss"
+        );
+        return Err((403, "credential is not allowed for this principal"));
+    }
+    if !key.require_pii_redaction.is_empty()
+        && !config.satisfies_pii_redaction_requirement(&key.require_pii_redaction)
+    {
+        let key_name = key.name.as_deref().unwrap_or("<unnamed>");
+        warn!(
+            credential = %key_name,
+            required_rules = ?key.require_pii_redaction,
+            "AI proxy: credential requires request PII redaction but origin redaction is inactive or missing required rules"
+        );
+        return Err((500, "credential requires active request PII redaction"));
+    }
+
+    // Stamp one unified principal before any dispatch path reads provider
+    // policy, governed-key identity, attribution, or scheduling priority.
+    ctx.principal = principal_for_resolved_virtual_key(ctx.tenant_id.as_str(), key);
+    ctx.attribution_tags =
+        crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
+
+    if (key.max_requests_per_minute.is_some() || key.max_tokens_per_minute.is_some())
+        && !key_rate_limiter().check_rate(&key.key, key)
+    {
+        warn!(
+            key = %key.name.as_deref().unwrap_or(UNNAMED_VIRTUAL_KEY_PRINCIPAL),
+            "AI proxy: per-key rate limit exceeded (requests or tokens per minute)"
+        );
+        return Err((429, "rate limit exceeded for this key"));
+    }
+    if key.max_tokens_per_minute.is_some() {
+        ctx.ai_key_tpm_bucket = Some(key.key.clone());
+    }
+    ctx.ai_lane_priority = key.priority;
+    if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
+        counters.record_request(&key.key);
+    }
+
+    Ok(())
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -335,8 +465,25 @@ pub(super) async fn handle_ai_proxy(
     // survives across requests. A per-request router would reset that
     // state every call and make the latency/usage-aware strategies inert.
     let router = config.router();
+    let resolved_request_vk =
+        match resolve_request_virtual_key(session, config, &ctx.principal).await {
+            Ok(key) => key,
+            Err((status, message)) => {
+                warn!(status, reason = %message, "AI proxy: virtual key denied");
+                send_error(session, status, &message).await?;
+                return Ok(());
+            }
+        };
+    if let Some(key) = resolved_request_vk.as_ref() {
+        if let Err((status, message)) =
+            apply_resolved_virtual_key_context(session, config, ctx, key)
+        {
+            send_error(session, status, message).await?;
+            return Ok(());
+        }
+    }
 
-    // Handle GET requests (e.g. /v1/models) by forwarding to first enabled provider.
+    // Serve model discovery locally; other GET surfaces use ordinary dispatch.
     if method == http::Method::GET {
         if matches!(
             path.split('?')
@@ -345,17 +492,25 @@ pub(super) async fn handle_ai_proxy(
                 .trim_end_matches('/'),
             "/v1/models" | "/models"
         ) {
-            let allowed_providers = ctx
-                .principal
-                .virtual_key
+            let allowed_providers = resolved_request_vk
                 .as_ref()
                 .map(|key| key.allowed_providers.as_slice())
+                .unwrap_or(&[]);
+            let allowed_models = resolved_request_vk
+                .as_ref()
+                .map(|key| key.allowed_models.as_slice())
+                .unwrap_or(&[]);
+            let blocked_models = resolved_request_vk
+                .as_ref()
+                .map(|key| key.blocked_models.as_slice())
                 .unwrap_or(&[]);
             let availability =
                 crate::server::model_host::current_managed_model_availability().await;
             let body = crate::model_discovery::logical_model_listing(
                 config,
                 allowed_providers,
+                allowed_models,
+                blocked_models,
                 &availability,
             );
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
@@ -757,27 +912,76 @@ pub(super) async fn handle_ai_proxy(
     };
 
     if is_multipart_request {
-        let provider_idx = router
-            .select_with_allowed(
-                &config.providers,
-                ctx.principal
-                    .virtual_key
-                    .as_ref()
-                    .map(|vk| vk.allowed_providers.as_slice())
-                    .unwrap_or(&[]),
-            )
+        let requested_model =
+            crate::model_plane::multipart_model(body_bytes.as_ref(), &request_content_type)
+                .map_err(|error| {
+                    Error::because(ErrorType::HTTPStatus(400), "invalid multipart model", error)
+                })?;
+        if let Some(model) = requested_model.as_deref() {
+            let key_allows_model = resolved_request_vk.as_ref().is_none_or(|key| {
+                !key.blocked_models.iter().any(|blocked| blocked == model)
+                    && (key.allowed_models.is_empty()
+                        || key.allowed_models.iter().any(|allowed| allowed == model))
+            });
+            if !config.is_model_allowed(model) || !key_allows_model {
+                send_error(session, 403, "model is not allowed for this credential").await?;
+                return Ok(());
+            }
+        }
+        let allowed_providers = ctx
+            .principal
+            .virtual_key
+            .as_ref()
+            .map(|key| key.allowed_providers.as_slice())
+            .unwrap_or(&[]);
+        let primary_idx = router
+            .select_with_allowed(&config.providers, allowed_providers)
             .ok_or_else(|| {
                 warn!("AI proxy: no enabled providers");
                 Error::new(ErrorType::HTTPStatus(502))
             })?;
-        let provider = &config.providers[provider_idx];
+        let mut provider_order = config
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| {
+                provider.enabled
+                    && (allowed_providers.is_empty()
+                        || allowed_providers
+                            .iter()
+                            .any(|allowed| allowed == provider.name.as_str()))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let Some(model) = requested_model.as_deref() {
+            if let Some(eligible) =
+                model_eligible_providers(&provider_order, &config.providers, model)
+            {
+                provider_order = eligible;
+            }
+        }
+        let is_failover = matches!(config.routing, sbproxy_ai::RoutingStrategy::FallbackChain);
+        if is_failover {
+            provider_order
+                .sort_by_key(|&index| config.providers[index].priority.unwrap_or(u32::MAX));
+        } else if let Some(position) = provider_order
+            .iter()
+            .position(|&index| index == primary_idx)
+        {
+            let primary = provider_order.remove(position);
+            provider_order.insert(0, primary);
+        }
 
-        let distributed_managed = crate::server::model_host::distributed_managed_provider(provider);
-        let response_result: anyhow::Result<reqwest::Response> = if distributed_managed {
-            async {
-                let requested_model =
-                    crate::model_plane::multipart_model(body_bytes.as_ref(), &request_content_type)
-                        .map_err(anyhow::Error::new)?;
+        let mut selected = None;
+        let mut last_error = None;
+        for (attempt, &provider_idx) in provider_order.iter().enumerate() {
+            if attempt > 0 && !is_failover && ctx.managed_fallback_reason.is_none() {
+                break;
+            }
+            let provider = &config.providers[provider_idx];
+            let distributed_managed =
+                crate::server::model_host::distributed_managed_provider(provider);
+            let response_result: anyhow::Result<reqwest::Response> = if distributed_managed {
                 let origin = ctx
                     .origin_idx
                     .and_then(|index| ctx.pipeline.config.origins.get(index))
@@ -810,7 +1014,7 @@ pub(super) async fn handle_ai_proxy(
                         governed_key_id: ctx.principal.api_key_id(),
                         policy_revision: &pipeline.config_revision,
                         path: &path,
-                        body: body_bytes,
+                        body: body_bytes.clone(),
                         content_type: Some(&request_content_type),
                         priority: crate::server::model_host::lane_class_for(ctx.ai_lane_priority),
                         prefix_key: prefix_key.as_bytes(),
@@ -842,36 +1046,62 @@ pub(super) async fn handle_ai_proxy(
                         Err(anyhow::Error::new(error))
                     }
                 }
+            } else {
+                AI_CLIENT
+                    .load()
+                    .forward_bytes(
+                        provider,
+                        &method_str,
+                        &path,
+                        body_bytes.clone(),
+                        &request_content_type,
+                    )
+                    .await
+            };
+            match response_result {
+                Ok(response) => {
+                    let retryable_status = matches!(response.status().as_u16(), 500 | 502 | 503);
+                    let has_next = attempt + 1 < provider_order.len();
+                    if is_failover
+                        && has_next
+                        && retryable_status
+                        && !crate::server::model_host::is_terminal_managed_response(&response)
+                    {
+                        let _ = response.bytes().await;
+                        continue;
+                    }
+                    selected = Some((provider_idx, response));
+                    break;
+                }
+                Err(error) => {
+                    record_ai_transport_failure(
+                        &ai_span,
+                        Some(provider.name.as_str()),
+                        &error,
+                        "AI upstream multipart request failed",
+                    );
+                    last_error = Some(error);
+                    if attempt + 1 < provider_order.len()
+                        && (is_failover || ctx.managed_fallback_reason.is_some())
+                    {
+                        continue;
+                    }
+                    break;
+                }
             }
-            .await
-        } else {
-            AI_CLIENT
-                .load()
-                .forward_bytes(
-                    provider,
-                    &method_str,
-                    &path,
-                    body_bytes,
-                    &request_content_type,
-                )
-                .await
-        };
-        let resp = response_result.map_err(|e| {
-            record_ai_transport_failure(
-                &ai_span,
-                Some(provider.name.as_str()),
-                &e,
-                "AI upstream multipart request failed",
-            );
+        }
+        let (provider_idx, resp) = selected.ok_or_else(|| {
+            let error = last_error.unwrap_or_else(|| anyhow::anyhow!("no eligible provider"));
             warn!(
-                error = %e,
+                error = %error,
                 method = %method_str,
                 ai.surface = surface_label,
                 content_type = %request_content_type,
                 "AI proxy: upstream multipart request failed"
             );
-            Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+            Error::because(ErrorType::ConnectError, "AI upstream request failed", error)
         })?;
+        let provider = &config.providers[provider_idx];
 
         let format = sbproxy_ai::client::provider_format(provider);
 
@@ -1082,250 +1312,78 @@ pub(super) async fn handle_ai_proxy(
         return Ok(());
     }
 
-    // --- WOR-894: virtual-key identity resolution ---
-    //
-    // When the request's `Authorization: Bearer <key>` (or bare key)
-    // matches a configured virtual key, surface that key's `project`,
-    // `user`, and `metadata` onto the request context so the access log
-    // can attribute spend / usage to them. Missing / unknown keys
-    // silently no-op (auth itself is enforced by the configured auth
-    // provider, not here). Skipped when no virtual_keys are declared.
-    {
-        let auth_value = req_header_value(session, "authorization");
-        let raw_key = auth_value.as_deref().map(|h| {
-            h.strip_prefix("Bearer ")
-                .or_else(|| h.strip_prefix("bearer "))
-                .unwrap_or(h)
-                .trim()
-                .to_string()
-        });
-        // Resolve the inbound virtual key. When the dynamic key plane is
-        // enabled it is the source of truth (hashed at rest, instant revoke,
-        // per-request cache->store); otherwise fall back to the compiled
-        // `virtual_keys:` list.
-        let resolved_vk: Option<sbproxy_ai::identity::VirtualKeyConfig> =
-            if let Some(plane) = crate::key_plane::current_key_plane() {
-                match resolve_dynamic_virtual_key(&plane, raw_key.as_deref()).await {
-                    DynamicKeyOutcome::Resolved(vk) => Some(*vk),
-                    // No virtual-key bearer token: fall back to OIDC/JWT claim
-                    // mapping so a verified identity resolves the same record.
-                    DynamicKeyOutcome::NotApplicable => {
-                        match resolve_oidc_mapped_key(&plane, &ctx.principal).await {
-                            DynamicKeyOutcome::Resolved(vk) => Some(*vk),
-                            DynamicKeyOutcome::NotApplicable => None,
-                            DynamicKeyOutcome::Deny(status, msg) => {
-                                warn!(
-                                    status,
-                                    reason = %msg,
-                                    "AI proxy: OIDC-mapped virtual key denied"
-                                );
-                                send_error(session, status, &msg).await?;
-                                return Ok(());
-                            }
-                        }
-                    }
-                    DynamicKeyOutcome::Deny(status, msg) => {
-                        warn!(status, reason = %msg, "AI proxy: dynamic virtual key denied");
-                        send_error(session, status, &msg).await?;
-                        return Ok(());
-                    }
+    // The common resolved-key identity and governance was applied before any
+    // early-return dispatch surface. Only JSON-body policy remains here.
+    if let Some(vk) = resolved_request_vk.as_ref() {
+        // WOR-893: per-key model routing. When the key pins a
+        // model, overwrite the request body's `model` field so
+        // the downstream allow/block, routing, budget, and
+        // model-extraction steps all see the pinned value (and
+        // a client-supplied `model` is ignored). Composes
+        // naturally with `allowed_models` / `blocked_models`:
+        // if the pinned model is itself blocked or not on the
+        // allow-list, the existing gate still rejects.
+        if let Some(route_to) = &vk.route_to_model {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(route_to.clone()),
+                );
+            }
+        }
+        // WOR-893 PR2 + WOR-1646: per-key tool injection. The
+        // key's tool set REPLACES any client-supplied `tools`
+        // so the key fully owns the tool surface the caller
+        // exposes. Static `inject_tools` JSON and a
+        // federation-sourced `inject_mcp` compose: the live
+        // MCP catalogue (RBAC-filtered by this principal,
+        // converted to the requested provider shape) is
+        // appended to the static set.
+        let mut injected: Vec<serde_json::Value> = vk.inject_tools.clone();
+        if let Some(inject) = &vk.inject_mcp {
+            match sbproxy_modules::action::lookup_inject_source(&inject.reference) {
+                Some(source) => {
+                    injected.extend(source.resolve_tools(
+                        &ctx.principal,
+                        &inject.filter,
+                        inject.format,
+                    ));
                 }
-            } else if !config.virtual_keys.is_empty() {
-                raw_key.as_deref().and_then(|key| {
-                    config
-                        .virtual_keys
-                        .iter()
-                        .find(|vk| vk.enabled && vk.key == key)
-                        .cloned()
-                })
-            } else {
-                None
-            };
-        if let Some(vk) = resolved_vk {
-            {
-                if !vk.matches_principal(&ctx.principal) {
-                    let vk_name = vk.name.as_deref().unwrap_or("<unnamed>");
+                None => {
                     warn!(
-                        credential = %vk_name,
-                        principal_source = %ctx.principal.source.as_str(),
-                        principal_sub = %ctx.principal.sub,
-                        "AI proxy: credential principal selector miss"
+                        mcp_ref = %inject.reference,
+                        "AI proxy: inject_mcp references an unknown MCP gateway; no tools injected"
                     );
-                    send_error(session, 403, "credential is not allowed for this principal")
-                        .await?;
-                    return Ok(());
                 }
-                if !vk.require_pii_redaction.is_empty()
-                    && !config.satisfies_pii_redaction_requirement(&vk.require_pii_redaction)
-                {
-                    let vk_name = vk.name.as_deref().unwrap_or("<unnamed>");
-                    warn!(
-                        credential = %vk_name,
-                        required_rules = ?vk.require_pii_redaction,
-                        "AI proxy: credential requires request PII redaction but origin redaction is inactive or missing required rules"
-                    );
-                    send_error(
-                        session,
-                        500,
-                        "credential requires active request PII redaction",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                // Stamp the matched VK onto the unified Principal so
-                // the rest of the pipeline (access log, attribution
-                // metric, policy scripts, MCP RBAC) all read through
-                // one shape. The Principal carries the attribution
-                // attrs plus a `virtual_key` reference that downstream
-                // code uses to enforce `allowed_providers`.
-                let mut attrs = sbproxy_plugin::PrincipalAttrs {
-                    project: vk.project.clone(),
-                    user: vk.user.clone(),
-                    team: None,
-                    tags: vk.tags.clone(),
-                    metadata: vk
-                        .metadata
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                    roles: Vec::new(),
-                    claims: None,
-                    // Per-credential reporting id for the virtual key.
-                    // The operator-supplied stable name only; never the
-                    // raw `vk.key` secret. `None` when the key is
-                    // unnamed so the metric falls back to the
-                    // un-credentialed bucket rather than leaking key
-                    // material.
-                    key_id: vk.name.clone(),
-                };
-                // Reflect the matched key name into `sub` so the
-                // access-log + principal_kind columns can show which
-                // VK served the request.
-                let vk_name = vk.name.clone().unwrap_or_else(|| vk.key.clone());
-                let _ = &mut attrs;
-                ctx.principal = sbproxy_plugin::Principal {
-                    tenant_id: sbproxy_plugin::TenantId::from(ctx.tenant_id.as_str()),
-                    sub: vk_name.clone(),
-                    source: sbproxy_plugin::PrincipalSource::VirtualKey,
-                    virtual_key: Some(sbproxy_plugin::VirtualKeyRef {
-                        name: vk_name,
-                        allowed_providers: vk.allowed_providers.clone(),
-                    }),
-                    attrs,
-                };
-                // Resolve business attribution tags once now that the
-                // credential principal is set: credential `attrs:`
-                // defaults merged with the inbound SB-Attr-* headers.
-                // Fanned out to the per-attribution spend metric and the
-                // access log so spend pivots on project / feature / team
-                // / customer / environment / agent_type / risk_tier.
-                ctx.attribution_tags =
-                    crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
-                // WOR-1558: enforce the key's live requests-per-minute limit,
-                // and (WOR-1833) its tokens-per-minute window. The limits are
-                // read from the resolved record (via the cache), so a PATCH to
-                // a dynamic key's caps takes effect on the next request
-                // without a reload. The bucket is keyed by the stable key id,
-                // never the secret.
-                if (vk.max_requests_per_minute.is_some() || vk.max_tokens_per_minute.is_some())
-                    && !key_rate_limiter().check_rate(&vk.key, &vk)
-                {
-                    warn!(
-                        key = %vk.name.as_deref().unwrap_or(&vk.key),
-                        "AI proxy: per-key rate limit exceeded (requests or tokens per minute)"
-                    );
-                    send_error(session, 429, "rate limit exceeded for this key").await?;
-                    return Ok(());
-                }
-                // Remember the limiter bucket so the completion path can
-                // charge this response's token usage into the key's
-                // one-minute window (WOR-1833).
-                if vk.max_tokens_per_minute.is_some() {
-                    ctx.ai_key_tpm_bucket = Some(vk.key.clone());
-                }
-                // WOR-1679: remember the key's scheduling lane so the
-                // served-model admission gate can order the queue and
-                // decide spill behavior. Lane comes from the key record
-                // only, never from a client header.
-                ctx.ai_lane_priority = vk.priority;
-                // WOR-1563: record the request into the cross-replica rate
-                // counter (mesh CRDT) so a key's fleet-wide rate is visible to
-                // every replica. No-op unless the mesh tier is enabled.
-                if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
-                    counters.record_request(&vk.key);
-                }
-                // WOR-893: per-key model routing. When the key pins a
-                // model, overwrite the request body's `model` field so
-                // the downstream allow/block, routing, budget, and
-                // model-extraction steps all see the pinned value (and
-                // a client-supplied `model` is ignored). Composes
-                // naturally with `allowed_models` / `blocked_models`:
-                // if the pinned model is itself blocked or not on the
-                // allow-list, the existing gate still rejects.
-                if let Some(route_to) = &vk.route_to_model {
-                    if let Some(obj) = body.as_object_mut() {
-                        obj.insert(
-                            "model".to_string(),
-                            serde_json::Value::String(route_to.clone()),
-                        );
-                    }
-                }
-                // WOR-893 PR2 + WOR-1646: per-key tool injection. The
-                // key's tool set REPLACES any client-supplied `tools`
-                // so the key fully owns the tool surface the caller
-                // exposes. Static `inject_tools` JSON and a
-                // federation-sourced `inject_mcp` compose: the live
-                // MCP catalogue (RBAC-filtered by this principal,
-                // converted to the requested provider shape) is
-                // appended to the static set.
-                let mut injected: Vec<serde_json::Value> = vk.inject_tools.clone();
-                if let Some(inject) = &vk.inject_mcp {
-                    match sbproxy_modules::action::lookup_inject_source(&inject.reference) {
-                        Some(source) => {
-                            injected.extend(source.resolve_tools(
-                                &ctx.principal,
-                                &inject.filter,
-                                inject.format,
-                            ));
-                        }
-                        None => {
-                            warn!(
-                                mcp_ref = %inject.reference,
-                                "AI proxy: inject_mcp references an unknown MCP gateway; no tools injected"
-                            );
-                        }
-                    }
-                }
-                if !injected.is_empty() {
-                    if let Some(obj) = body.as_object_mut() {
-                        obj.insert("tools".to_string(), serde_json::Value::Array(injected));
-                    }
-                }
-                // Per-key model gate. Enforce the matched key's
-                // `allowed_models` / `blocked_models` against the
-                // effective model (after any `route_to_model` rewrite),
-                // mirroring the action-level gate above but scoped to
-                // this virtual key. A key allow-listed to a subset of
-                // the gateway's models is rejected with 403 when it asks
-                // for a model outside that subset; the block-list takes
-                // precedence over the allow-list.
-                let effective_model = body
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !effective_model.is_empty() {
-                    let blocked = vk.blocked_models.iter().any(|m| m == &effective_model);
-                    let allowed = vk.allowed_models.is_empty()
-                        || vk.allowed_models.iter().any(|m| m == &effective_model);
-                    if blocked || !allowed {
-                        let msg =
-                            format!("model '{}' is not allowed for this key", effective_model);
-                        warn!(model = %effective_model, "AI proxy: model blocked for virtual key");
-                        send_error(session, 403, &msg).await?;
-                        return Ok(());
-                    }
-                }
+            }
+        }
+        if !injected.is_empty() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("tools".to_string(), serde_json::Value::Array(injected));
+            }
+        }
+        // Per-key model gate. Enforce the matched key's
+        // `allowed_models` / `blocked_models` against the
+        // effective model (after any `route_to_model` rewrite),
+        // mirroring the action-level gate above but scoped to
+        // this virtual key. A key allow-listed to a subset of
+        // the gateway's models is rejected with 403 when it asks
+        // for a model outside that subset; the block-list takes
+        // precedence over the allow-list.
+        let effective_model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !effective_model.is_empty() {
+            let blocked = vk.blocked_models.iter().any(|m| m == &effective_model);
+            let allowed = vk.allowed_models.is_empty()
+                || vk.allowed_models.iter().any(|m| m == &effective_model);
+            if blocked || !allowed {
+                let msg = format!("model '{}' is not allowed for this key", effective_model);
+                warn!(model = %effective_model, "AI proxy: model blocked for virtual key");
+                send_error(session, 403, &msg).await?;
+                return Ok(());
             }
         }
     }
@@ -2365,6 +2423,32 @@ pub(super) async fn handle_ai_proxy(
         .map(|(i, _)| i)
         .collect();
 
+    // Credential provider policy constrains the entire candidate set, not
+    // only primary selection. Every strategy below, including fallback,
+    // cascade, and race, derives from this filtered order.
+    let allowed_providers = ctx
+        .principal
+        .virtual_key
+        .as_ref()
+        .map(|key| key.allowed_providers.as_slice())
+        .unwrap_or(&[]);
+    if !allowed_providers.is_empty() {
+        provider_order.retain(|&index| {
+            allowed_providers
+                .iter()
+                .any(|allowed| allowed == config.providers[index].name.as_str())
+        });
+        if provider_order.is_empty() {
+            send_error(
+                session,
+                403,
+                "credential is not allowed to use any configured provider",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     // WOR-799: disallow_prompt_training routing filter. When the
     // request opts out of training (header
     // `x-sbproxy-disallow-prompt-training: true`), route only to
@@ -2484,10 +2568,10 @@ pub(super) async fn handle_ai_proxy(
     if let Some(cascade_cfg) = router.cascade_config().filter(|_| !disallow_training) {
         if is_stream {
             if let Some(first_tier) = cascade_cfg.tiers.first() {
-                if let Some(idx) = config
-                    .providers
+                if let Some(idx) = provider_order
                     .iter()
-                    .position(|p| p.enabled && p.name == first_tier.provider_id)
+                    .copied()
+                    .find(|&index| config.providers[index].name == first_tier.provider_id)
                 {
                     provider_order = vec![idx];
                     if let Some(obj) = body.as_object_mut() {
@@ -2544,6 +2628,7 @@ pub(super) async fn handle_ai_proxy(
                 .forward_cascade(
                     config,
                     cascade_cfg,
+                    allowed_providers,
                     &path,
                     &body,
                     &ctx.attribution_tags,
@@ -3203,6 +3288,18 @@ pub(super) async fn handle_ai_proxy(
                     ai_metric_error_kind_for_span_error_type(last_error_type),
                 );
                 last_error = Some(e);
+                if ctx.managed_fallback_reason.is_some() && attempt + 1 < provider_order.len() {
+                    let to_provider = provider_order
+                        .get(attempt + 1)
+                        .map(|&i| config.providers[i].name.clone())
+                        .unwrap_or_default();
+                    sbproxy_ai::ai_metrics::record_failover(
+                        &provider.name,
+                        &to_provider,
+                        "managed_cold_fallback",
+                    );
+                    continue;
+                }
                 if attempt + 1 >= effective_max_attempts {
                     break;
                 }
@@ -6366,6 +6463,30 @@ mod dynamic_key_resolution_tests {
             "the malformed entry is dropped, the resolve still succeeds"
         );
         assert_eq!(vk.principal_selectors[0].user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn unnamed_virtual_key_principal_never_contains_the_raw_secret() {
+        let secret = "sk-live-raw-secret-material";
+        let rec = KeyRecord::new("unused", "hash", chrono::Utc::now());
+        let mut key = key_record_to_virtual_key(&rec);
+        key.key = secret.to_string();
+        key.name = None;
+
+        let principal = principal_for_resolved_virtual_key("tenant-a", &key);
+
+        assert_eq!(principal.sub, "<unnamed>");
+        assert_eq!(
+            principal.virtual_key.as_ref().map(|key| key.name.as_str()),
+            Some("<unnamed>")
+        );
+        assert_eq!(principal.api_key_id(), "");
+        assert!(
+            !serde_json::to_string(&principal)
+                .expect("serialize principal")
+                .contains(secret),
+            "the raw credential must not reach any serialized principal field"
+        );
     }
 
     #[tokio::test]

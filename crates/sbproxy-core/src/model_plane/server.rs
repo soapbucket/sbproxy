@@ -1,4 +1,6 @@
 use std::convert::Infallible;
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,9 +18,10 @@ use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Instant, Sleep};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +42,8 @@ pub const MODEL_PLANE_DISPATCH_PATH: &str = "/_sbproxy/model-plane/v1/dispatch";
 const MAX_HEADER_COUNT: usize = 16;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const DEFAULT_REPLAY_CAPACITY: usize = 65_536;
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
+const DEFAULT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const ERROR_CODE_HEADER: &str = "x-sbproxy-error-code";
 const ERROR_RETRYABLE_HEADER: &str = "x-sbproxy-error-retryable";
@@ -48,6 +53,92 @@ type ServerBody = UnsyncBoxBody<Bytes, ModelPlaneError>;
 trait ModelPlaneIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> ModelPlaneIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 type BoxedIo = Box<dyn ModelPlaneIo>;
+
+struct IdleTimeoutIo<T> {
+    inner: T,
+    timeout: Duration,
+    idle: Pin<Box<Sleep>>,
+}
+
+impl<T> IdleTimeoutIo<T> {
+    fn new(inner: T, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            idle: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.idle.as_mut().reset(Instant::now() + self.timeout);
+    }
+
+    fn poll_timeout(&mut self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.idle.as_mut().poll(context) {
+            Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "private model-plane connection idle timeout",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for IdleTimeoutIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let filled = buffer.filled().len();
+        match Pin::new(&mut this.inner).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) if buffer.filled().len() > filled => {
+                this.reset();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => this.poll_timeout(context),
+        }
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(context, buffer) {
+            Poll::Ready(Ok(written)) if written > 0 => {
+                this.reset();
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => match this.poll_timeout(context) {
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) | Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_flush(context) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => this.poll_timeout(context),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_shutdown(context) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => this.poll_timeout(context),
+        }
+    }
+}
 
 /// Listener bounds and local authenticated audience.
 #[derive(Debug, Clone)]
@@ -60,6 +151,10 @@ pub struct ModelPlaneServerConfig {
     pub max_request_body_bytes: usize,
     /// Maximum live replay entries before failing closed.
     pub replay_capacity: usize,
+    /// Maximum private TCP connections served concurrently.
+    pub max_connections: usize,
+    /// Maximum period without connection read or write progress.
+    pub connection_idle_timeout: Duration,
     /// Maximum graceful wait for active peer streams.
     pub shutdown_timeout: Duration,
 }
@@ -76,6 +171,8 @@ impl ModelPlaneServerConfig {
             node_id: node_id.into(),
             max_request_body_bytes,
             replay_capacity: DEFAULT_REPLAY_CAPACITY,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            connection_idle_timeout: DEFAULT_CONNECTION_IDLE_TIMEOUT,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
@@ -90,6 +187,8 @@ impl ModelPlaneServerConfig {
             || self.max_request_body_bytes == 0
             || self.max_request_body_bytes > 1024 * 1024 * 1024
             || self.replay_capacity == 0
+            || self.max_connections == 0
+            || self.connection_idle_timeout.is_zero()
             || self.shutdown_timeout.is_zero()
         {
             return Err(ModelPlaneError::InvalidConfiguration(
@@ -196,6 +295,8 @@ impl ModelPlaneServer {
         });
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
+        let max_connections = config.max_connections;
+        let connection_idle_timeout = config.connection_idle_timeout;
         let shutdown_timeout = config.shutdown_timeout;
         let task = tokio::spawn(async move {
             run_listener(
@@ -203,6 +304,8 @@ impl ModelPlaneServer {
                 acceptor,
                 state,
                 task_cancellation,
+                max_connections,
+                connection_idle_timeout,
                 shutdown_timeout,
             )
             .await
@@ -283,13 +386,20 @@ async fn run_listener(
     acceptor: Option<TlsAcceptor>,
     state: Arc<ServerState>,
     cancellation: CancellationToken,
+    max_connections: usize,
+    connection_idle_timeout: Duration,
     shutdown_timeout: Duration,
 ) -> Result<(), ModelPlaneError> {
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => break,
-            accepted = listener.accept() => {
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "private model-plane connection task failed");
+                }
+            }
+            accepted = listener.accept(), if connections.len() < max_connections => {
                 let (tcp, _) = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => return Err(ModelPlaneError::Transport(error.to_string())),
@@ -303,6 +413,7 @@ async fn run_listener(
                         acceptor,
                         state,
                         connection_cancellation,
+                        connection_idle_timeout,
                         shutdown_timeout,
                     ).await {
                         tracing::warn!(code = error.code(), "private model-plane connection failed");
@@ -325,8 +436,10 @@ async fn serve_connection(
     acceptor: Option<TlsAcceptor>,
     state: Arc<ServerState>,
     cancellation: CancellationToken,
+    connection_idle_timeout: Duration,
     shutdown_timeout: Duration,
 ) -> Result<(), ModelPlaneError> {
+    let tcp = IdleTimeoutIo::new(tcp, connection_idle_timeout);
     let (io, tls_peer_certificate_sha256): (BoxedIo, Option<String>) = match acceptor {
         Some(acceptor) => {
             let tls = acceptor

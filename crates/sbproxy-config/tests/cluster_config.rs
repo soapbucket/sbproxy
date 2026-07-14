@@ -205,6 +205,82 @@ security:
 }
 
 #[test]
+fn model_plane_endpoint_scheme_matches_cluster_security_mode() {
+    let development: sbproxy_config::ClusterConfig = serde_yaml::from_str(
+        r#"
+cluster_id: dev-a
+node_id: worker-a
+roles: [worker]
+model_endpoint: https://127.0.0.1:9443
+state_dir: ./cluster-state
+security:
+  mode: shared_key
+  development: true
+  shared_key: local-development-secret
+"#,
+    )
+    .expect("development endpoint fixture");
+    assert!(development
+        .validate()
+        .expect_err("development model plane requires h2c")
+        .to_string()
+        .contains("model_endpoint"));
+
+    let production: sbproxy_config::ClusterConfig = serde_yaml::from_str(
+        r#"
+cluster_id: prod-a
+node_id: worker-a
+roles: [worker]
+model_endpoint: http://127.0.0.1:9443
+state_dir: ./cluster-state
+security:
+  mode: mtls
+  shared_key: authenticated-gossip-secret
+  cert_file: node.pem
+  key_file: node-key.pem
+  ca_file: ca.pem
+"#,
+    )
+    .expect("production endpoint fixture");
+    assert!(production
+        .validate()
+        .expect_err("production model plane requires TLS")
+        .to_string()
+        .contains("model_endpoint"));
+}
+
+#[test]
+fn model_plane_endpoint_must_be_an_absolute_origin() {
+    for model_endpoint in [
+        "http://127.0.0.1:9443/models",
+        "http://127.0.0.1:9443?debug=1",
+        "http://127.0.0.1:9443#fragment",
+    ] {
+        let cluster: sbproxy_config::ClusterConfig = serde_yaml::from_str(&format!(
+            r#"
+cluster_id: dev-a
+node_id: worker-a
+roles: [worker]
+model_endpoint: "{model_endpoint}"
+state_dir: ./cluster-state
+security:
+  mode: shared_key
+  development: true
+  shared_key: local-development-secret
+"#
+        ))
+        .expect("non-origin endpoint fixture");
+        let Err(error) = cluster.validate() else {
+            panic!("model endpoint must be an absolute origin: {model_endpoint}");
+        };
+        assert!(
+            error.to_string().contains("model_endpoint"),
+            "{model_endpoint}"
+        );
+    }
+}
+
+#[test]
 fn canonical_cluster_validation_rejects_unsafe_or_unbounded_inputs() {
     let invalid = [
         (

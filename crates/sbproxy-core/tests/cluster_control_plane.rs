@@ -91,7 +91,7 @@ cluster:
   node_id: worker-a
   roles: [worker]
   labels: {{zone: a}}
-  model_endpoint: https://127.0.0.1:9443
+  model_endpoint: http://127.0.0.1:9443
   state_dir: {}
   security:
     mode: shared_key

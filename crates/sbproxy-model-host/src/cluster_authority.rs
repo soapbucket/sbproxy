@@ -52,7 +52,6 @@ struct RestrictedModelDeployment {
     pull: PullPolicy,
     #[serde(default)]
     warm: bool,
-    #[serde(default)]
     cold_start: ColdStartPolicy,
     #[serde(default)]
     keep_alive_secs: Option<u64>,

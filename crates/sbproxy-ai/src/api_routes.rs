@@ -154,16 +154,14 @@ pub fn provider_supports_realtime(provider: &str) -> bool {
 /// |---|---|
 /// | `chat_completions` | translated to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
 /// | `messages` / `responses` | native-format inbound shims that translate down to the same hub shape as chat |
-/// | `models` | **passthrough only**: the response body is the upstream's native model-list shape, not normalised to the OpenAI `{"object": "list", "data": [...]}` envelope. Clients hitting a non-OpenAI provider via this surface MUST handle the upstream's shape directly. See `docs/ai-gateway.md` for the per-provider example. |
+/// | `models` | `GET /v1/models` and `GET /models` return SBproxy's OpenAI-compatible, topology-free logical model aggregate for every AI origin. Ordinary provider discovery endpoints are not called. See `docs/ai-gateway.md`. |
 /// | everything else | passthrough on the providers that support the OpenAI shape (openai, vertex, cohere where applicable); unsupported elsewhere |
 ///
-/// Documenting Models as passthrough-only is the deliberate close of
-/// audit Finding C: response normalisation for the universal Models
-/// surface is not implemented because the OpenAI / Anthropic / Google
-/// model-list shapes diverge enough that a lossy normalisation would
-/// mislead callers. Operators that need a unified shape should use a
-/// dedicated discovery endpoint (the proxy's own model registry) rather
-/// than the passthrough.
+/// Native provider model-list passthrough is deliberately absent because the
+/// OpenAI, Anthropic, and Google shapes diverge enough that a lossy
+/// normalisation would mislead callers. The gateway instead lists only the
+/// public logical names it is configured to serve and adds bounded aggregate
+/// availability for managed deployments without exposing topology.
 pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSurface) -> bool {
     // Per-provider narrowings: the wire-format default would admit
     // more surfaces than the upstream actually exposes. Listed

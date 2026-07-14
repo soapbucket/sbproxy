@@ -2315,6 +2315,10 @@ pub async fn current_managed_model_availability(
     availability
 }
 
+const fn can_synthesize_local_assignment(requested_adapter: Option<&str>) -> bool {
+    requested_adapter.is_none()
+}
+
 /// Resolve one directory snapshot and dispatch through current replicas.
 pub async fn distributed_managed_upstream(
     request: ManagedDistributedRequest<'_>,
@@ -2396,7 +2400,9 @@ pub async fn distributed_managed_upstream(
         &deployment_id,
         input(true),
     );
-    if cold_selection.candidates.is_empty() {
+    if cold_selection.candidates.is_empty()
+        && can_synthesize_local_assignment(request.requested_adapter)
+    {
         if let Some(generation) =
             runtime.cluster_assignment_generation(local_node_id, &deployment_id)
         {
@@ -2641,6 +2647,12 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_local_candidate_requires_no_requested_adapter() {
+        assert!(can_synthesize_local_assignment(None));
+        assert!(!can_synthesize_local_assignment(Some("sql")));
+    }
 
     #[tokio::test]
     async fn cold_start_rejection_is_terminal_retryable_and_stable() {
