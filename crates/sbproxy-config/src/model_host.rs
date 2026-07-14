@@ -59,6 +59,18 @@ pub enum ManagedRolloutPolicy {
     Recreate,
 }
 
+/// Request behavior when a managed deployment has no ready replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedColdStartPolicy {
+    /// Queue on an assigned replica and share its coordinated engine start.
+    Wait,
+    /// Return a retryable refusal without starting an engine.
+    Reject,
+    /// Advance to another configured provider without starting an engine.
+    Fallback,
+}
+
 /// One desired local model deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ManagedDeploymentConfig {
@@ -85,6 +97,9 @@ pub struct ManagedDeploymentConfig {
     /// Prepare the deployment during startup or reload.
     #[serde(default)]
     pub warm: bool,
+    /// Behavior when no current replica is ready. Omission uses the security-profile default.
+    #[serde(default)]
+    pub cold_start: Option<ManagedColdStartPolicy>,
     /// Idle lifetime in seconds after the last completed request.
     #[serde(default)]
     pub keep_alive_secs: Option<u64>,

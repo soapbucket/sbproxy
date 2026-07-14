@@ -126,8 +126,9 @@ pub use cuda_build::{
     MAX_LLAMA_SOURCE_BYTES,
 };
 pub use deployment::{
-    DeploymentError, DeploymentRevision, DeploymentRevisionDraft, DeploymentSourceMode,
-    ModelDeployment, RolloutPolicy, DEPLOYMENT_SCHEMA_VERSION, MAX_SAFE_JSON_INTEGER,
+    ColdStartPolicy, DeploymentError, DeploymentRevision, DeploymentRevisionDraft,
+    DeploymentSourceMode, ModelDeployment, RolloutPolicy, DEPLOYMENT_SCHEMA_VERSION,
+    MAX_SAFE_JSON_INTEGER,
 };
 pub use deployment_store::{DeploymentStoreError, FileDeploymentRevisionStore};
 pub use desired::{

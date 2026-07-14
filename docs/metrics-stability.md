@@ -1,6 +1,6 @@
 # Metrics stability
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-13*
 
 Naming conventions, stability guarantees, and the full catalogue of metrics emitted by SBproxy.
 
@@ -915,8 +915,71 @@ the cardinality limiter.
 
 ### Model host
 
-The local model host (`serve:`) publishes these. All **alpha** while the
-engine-runtime phases land; names may change before they graduate.
+Canonical `proxy.model_host` and compatibility `serve:` deployments publish
+these. The distributed-routing metrics are **beta**. The legacy engine metrics
+below remain **alpha** while their runtime surfaces converge.
+
+#### `sbproxy_managed_replica_attempts_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Current-generation managed replica attempts, including the selected attempt and bounded pre-output failures. |
+
+**Labels:** `provider`, `deployment`, `route_class` (`local`, `peer`), and
+`outcome` (`selected`, a stable failure code, or a bounded `http_<status>`).
+Provider and deployment are configured identifiers. Outcome values pass through
+the global label-cardinality limiter. Worker identity and endpoint are absent.
+
+#### `sbproxy_managed_replica_failovers_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Safe managed handovers performed before response headers or tokens reach the client. |
+
+**Labels:** `provider`, `deployment`, and `reason`. Reasons are stable model
+plane codes, bounded HTTP status classes, or `cold_start_fallback`, with the
+global cardinality limiter as a backstop. A mid-stream failure never increments
+this counter because it is not replayed.
+
+#### `sbproxy_model_plane_peer_dispatch_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **beta** |
+| Description | Time from starting a private peer attempt until response headers or an error. |
+
+**Labels:** `outcome` (`success`, `error`).
+
+**Bucket schedule:** `0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+1.0, 2.5, 5.0, 10.0, 30.0`.
+
+#### `sbproxy_model_plane_stream_cancellations_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Managed response streams dropped before their terminal frame. |
+
+**Labels:** `route_class` (`peer`; reserved for other bounded route classes).
+
+#### `sbproxy_model_plane_rejections_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Private model-plane or cold-start refusals by stable public-safe code and retry class. |
+
+**Labels:** `code` and `retry_class` (`security`, `capacity`, `readiness`,
+`transport`, `terminal`). Code values use the stable model-plane taxonomy and
+the global cardinality limiter. Neither label includes raw error text, a node
+ID, an endpoint, a request ID, or a credential.
 
 #### `sbproxy_model_host_time_to_ready_seconds`
 

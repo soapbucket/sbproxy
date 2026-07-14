@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-13*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -385,6 +385,7 @@ proxy:
     transport_port: 8946
     advertise_addr: 10.10.0.21:7946
     transport_advertise_addr: 10.10.0.21:8946
+    model_bind: 0.0.0.0:9443
     model_endpoint: https://10.10.0.21:9443
     state_dir: /var/lib/sbproxy/cluster
     snapshot_ttl_secs: 30
@@ -410,7 +411,8 @@ proxy:
 | `transport_port` | int | `8946` | TCP typed-state and cache transport listener. |
 | `advertise_addr` | string | observed address | Gossip address advertised to peers. Enrolled mTLS startup requires an explicit routable IP and port. |
 | `transport_advertise_addr` | string | advertised host plus transport port | mTLS typed-state address advertised to peers. |
-| `model_endpoint` | HTTPS URL | unset | Private model-plane endpoint advertised by workers. Required for placement eligibility. |
+| `model_bind` | IP:port | unset | Dedicated private HTTP/2 model-plane listener. Worker role only; requires `model_endpoint`. |
+| `model_endpoint` | absolute HTTP URL | unset | Private model-plane origin advertised by workers. Production mTLS requires `https://`; explicit shared-key development requires `http://`. Required for peer placement eligibility. |
 | `state_dir` | path | required | Installed identity plus durable boot, peer-identity high-water, snapshot generation, deployment generation, and authority cursor state. |
 | `snapshot_ttl_secs` | int | `30` | Worker snapshot lifetime; at least two publish intervals. |
 | `publish_interval_secs` | int | `5` | Snapshot publication cadence. |
@@ -439,6 +441,10 @@ placement commit, so an unplaced or fully drained deployment cannot reset after
 restart. Identity, roles, labels, discovery, listeners, advertised endpoints,
 security, state, dead-peer GC, and authority changes require restart. Snapshot
 cadence reloads in place.
+The model plane accepts only its internal versioned dispatch path. Production
+uses mTLS with HTTP/2 ALPN and peer-identity proofs; explicit development mode
+uses h2c plus HMAC. `model_bind` is never an engine port and should be reachable
+only from cluster gateways.
 See [model-host.md](model-host.md#cluster-configuration) for enrollment,
 placement, signed bundle, and admin status workflows.
 
@@ -468,14 +474,23 @@ proxy:
         spread_by: [zone]
         pull: on_boot
         warm: true
+        cold_start: fallback
         engine: llama_cpp
         rollout: rolling
 ```
 
 Authority values are `file_managed`, `admin_managed`, and
 `cluster_authority`. Deployment pull values are `on_boot`, `on_demand`, and
-`manual`; rollout values are `rolling` and `recreate`. Replicated homogeneous
-deployments must pin a variant unless `heterogeneous_variants: true` is set.
+`manual`; cold-start values are `wait`, `reject`, and `fallback`; rollout values
+are `rolling` and `recreate`. `wait` coordinates a bounded launch per selected
+replica generation, `reject`
+returns a retryable `503` with `Retry-After: 1`, and `fallback` advances to the
+next provider without launching. For `authority: file_managed`, omission
+follows the security profile: production mTLS clusters use `fallback`, while
+development and non-clustered runtimes use `wait`. Admin-managed and
+cluster-authority deployments must set `cold_start` explicitly. Replicated
+homogeneous deployments must pin a variant unless
+`heterogeneous_variants: true` is set.
 `catalog_file` selects a catalog v2 document and resolves relative paths from
 the directory containing `sb.yml`; omission uses the built-in catalog. A
 canonical `catalog_file` takes precedence over compatibility provider
@@ -1063,6 +1078,7 @@ Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowe
 |-------|------|---------|-------------|
 | `name` | string | required | Unique provider name used to reference this entry. |
 | `provider_type` | string | inferred from `name` | Provider type (`openai`, `anthropic`, `google`, etc.). |
+| `deployment` | string | required for `managed_model` | Canonical `proxy.model_host.deployments` ID. Valid only when `provider_type: managed_model`. |
 | `api_key` | string | | API key used to authenticate with the upstream. |
 | `base_url` | string | provider default | Override the upstream base URL. Validated at config load: non-`http(s)` schemes and private/loopback targets are rejected as SSRF risks unless `allow_private_base_url` is set. |
 | `allow_private_base_url` | bool | `false` | Allow `base_url` to point at a loopback/private address (a local model server). The scheme check still applies. |
@@ -1077,6 +1093,11 @@ Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowe
 | `organization` | string | | Organization identifier for providers that scope keys per org. |
 | `api_version` | string | | API version header value (e.g. for Anthropic and Azure OpenAI). |
 | `no_prompt_training` | bool | `false` | Marks the provider safe for training-sensitive prompts. Requests carrying the `x-sbproxy-disallow-prompt-training: true` header only route to providers with this flag; a request with the header and no marked provider in the chain gets a 400 `no_compliant_provider`. |
+
+A `managed_model` provider must set a non-empty `deployment` and must not set
+`api_key`, `base_url`, or the legacy `serve` block. Conversely, `deployment` is
+rejected for every other provider type. Managed traffic resolves through the
+deployment runtime rather than an operator-supplied upstream URL.
 
 #### Credentials
 

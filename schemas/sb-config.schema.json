@@ -1793,6 +1793,18 @@
           "default": false,
           "type": "boolean"
         },
+        "cold_start": {
+          "description": "Behavior when no current replica is ready. Omission uses the security-profile default.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ManagedColdStartPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "keep_alive_secs": {
           "description": "Idle lifetime in seconds after the last completed request.",
           "default": null,
@@ -1869,6 +1881,32 @@
           "type": "string",
           "enum": [
             "manual"
+          ]
+        }
+      ]
+    },
+    "ManagedColdStartPolicy": {
+      "description": "Request behavior when a managed deployment has no ready replica.",
+      "oneOf": [
+        {
+          "description": "Queue on an assigned replica and share its coordinated engine start.",
+          "type": "string",
+          "enum": [
+            "wait"
+          ]
+        },
+        {
+          "description": "Return a retryable refusal without starting an engine.",
+          "type": "string",
+          "enum": [
+            "reject"
+          ]
+        },
+        {
+          "description": "Advance to another configured provider without starting an engine.",
+          "type": "string",
+          "enum": [
+            "fallback"
           ]
         }
       ]
@@ -1984,6 +2022,14 @@
         },
         "transport_advertise_addr": {
           "description": "Typed-state transport address advertised to peers in `host:port` form. Defaults to the gossip-advertised host and `transport_port`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_bind": {
+          "description": "Private model-plane listener in IP:port form.",
           "default": null,
           "type": [
             "string",

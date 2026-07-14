@@ -31,9 +31,10 @@ The worker-local runtime is complete enough to operate as one coherent system:
   candidate; activation and rollback failures have the recovery boundary
   documented under desired-state authority.
 - The CLI can pull, inspect, remove, list running deployments, and stop one.
-- One process-owned cluster handle carries key-cache and model-control state.
-  Versioned worker snapshots feed a lock-free directory, deterministic
-  placement, failure-domain spread, and readiness-gated rollout.
+- One process-owned cluster handle carries key-cache, model-control, and
+  private model-plane state. Versioned worker snapshots feed a lock-free
+  directory, deterministic placement, failure-domain spread, readiness-gated
+  rollout, and authenticated local or peer dispatch.
 - An authenticated admin status contract lists every member and separates
   unhealthy-node alerts from the complete node roster.
 - File-managed clusters report deployment digest drift. Cluster-authority mode
@@ -43,11 +44,14 @@ The worker-local runtime is complete enough to operate as one coherent system:
   can replace the complete admin-managed map, publish a signed map from an
   authority node, run lifecycle actions, and inspect cluster operations.
 
-The cluster control plane and operator product do not include the distributed
-inference data plane. A gateway can inspect placement and operate a co-located
-assigned replica, but it does not dispatch a request to a remote worker. Live
-hardware support remains governed by executable evidence. The generated
-[capability matrix](model-host-capabilities.md) records this boundary.
+The preview distributed data plane has local coverage for authenticated HTTP/2
+dispatch, unary and streaming responses, cancellation, bounded worker
+admission, coordinated cold starts, and failover before client output. A
+dedicated executable consumer contract, strict distributed budget reservation,
+complete dynamic-key introspection, and live NVIDIA multi-node certification
+remain later gates. Live hardware support remains governed by executable
+evidence. The generated [capability matrix](model-host-capabilities.md) records
+this boundary.
 
 ## Canonical configuration
 
@@ -141,6 +145,7 @@ proxy:
     transport_port: 8946
     advertise_addr: 10.10.0.21:7946
     transport_advertise_addr: 10.10.0.21:8946
+    model_bind: 0.0.0.0:9443
     model_endpoint: https://10.10.0.21:9443
     state_dir: /var/lib/sbproxy/cluster
     snapshot_ttl_secs: 30
@@ -164,12 +169,14 @@ Roles are independent and may be combined:
 `advertise_addr` is the authenticated UDP gossip address. Enrolled mTLS nodes
 must advertise an explicit routable IP and port so later SWIM traffic can be
 matched to the signed join.
-`transport_advertise_addr` is the mTLS typed-state address. A worker also needs
-an HTTPS `model_endpoint`; the control plane records it for placement, but the
-current runtime does not dispatch inference to remote workers. Identity, roles,
-labels, listeners, seeds, endpoints, security material, state directory,
-enrollment authority, and signing authority are restart-required fields.
-Snapshot cadence can reload in place.
+`transport_advertise_addr` is the mTLS typed-state address. `model_bind` is the
+worker's dedicated private HTTP/2 listener. `model_endpoint` is the absolute
+origin advertised in authenticated worker state and used by gateways. A worker
+with `model_bind` must also advertise `model_endpoint`; production mTLS requires
+`https://`, while explicit shared-key development mode requires `http://` h2c.
+Identity, roles, labels, listeners, seeds, endpoints, security material, state
+directory, enrollment authority, and signing authority are restart-required
+fields. Snapshot cadence can reload in place.
 
 Production mode requires mTLS plus a separate authenticated gossip key. Shared
 key mode must set `development: true` and is for local fixtures only. Canonical
@@ -178,6 +185,77 @@ carry an authority-signed manifest; manual-PKI identities carry the same strict
 claims in an SBproxy URI SAN. Every leaf carries its unique node ID as a DNS
 SAN, and outbound transport verifies that node ID. A cluster must use one
 attestation mode consistently.
+
+### Managed request dispatch
+
+A `managed_model` request follows one governed path:
+
+```text
+public request
+  -> authenticate caller and compile provider/model policy
+  -> resolve the logical model to a deployment
+  -> snapshot current-generation eligible replicas
+  -> prefer a ready local or peer candidate
+  -> acquire worker-local admission and ensure the generation is ready
+  -> call the loopback engine and stream with backpressure
+```
+
+Local candidates use the same execution and admission contract without a
+network hop. Peer candidates use the dedicated HTTP/2 model plane. The gateway
+creates a fresh signed envelope for each peer attempt. The envelope binds the
+gateway and worker node IDs, request ID, nonce, issue and expiry time, one-hop
+count, tenant and governed key IDs, policy revision, deployment and generation,
+logical model, priority, method, path, content type, and exact body SHA-256. It
+never includes the public bearer value. The worker rejects unknown paths,
+public authorization headers, wrong audiences, stale generations, expired or
+replayed nonces, body mismatches, and envelopes whose hop count is not one.
+
+Production dispatch requires mTLS with HTTP/2 ALPN. The peer proof is bound to
+the negotiated leaf-certificate fingerprint, the issuer must have the gateway
+role, and the configured cluster CA and server-name SAN must verify. Explicit
+`security.mode: shared_key` plus `development: true` uses h2c and an HMAC only
+for local fixtures. The modes cannot be mixed.
+
+Replica admission is authoritative at the worker. `max_concurrency`,
+`max_queue_depth`, `queue_timeout_ms`, drain state, crash-loop state, and the
+deployment generation are rechecked there. Concurrent requests for one cold
+replica generation share its worker-local launch. `cold_start` controls what a
+gateway does when no replica is ready:
+
+- `wait` dispatches to an assigned cold replica and waits through bounded
+  preparation and admission;
+- `reject` returns `503` with `Retry-After: 1` and does not start an engine;
+- `fallback` advances to the next configured provider without starting the
+  managed deployment.
+
+For `authority: file_managed`, an omitted policy follows the security profile:
+production mTLS clusters use `fallback`, while development and non-clustered
+runtimes use `wait`. Admin-managed and cluster-authority deployments must set
+`cold_start` explicitly. A retryable candidate failure may move to another
+current replica only before response headers reach the client. Once a stream
+begins, SBproxy relays partial output and never replays the request. A partial
+SSE stream closes without `data: [DONE]`. Dropping the client response drops
+the peer and engine streams and releases the admission permit.
+
+Every AI origin serves `GET /v1/models` and `GET /models` locally as one
+OpenAI-compatible logical list built from configured eligible providers and
+models. Managed entries include `ready`, `cold`, or `unavailable` state, ready
+and desired replica counts, and bounded capability names. The listing does not
+call ordinary provider discovery endpoints and does not include node IDs,
+engine ports, certificate data, or model endpoints. Successful inference
+responses add only:
+
+```text
+x-sbproxy-logical-model: qwen
+x-sbproxy-route-class: local | peer | external
+```
+
+Managed availability and cold-start errors that expose a public reason use one
+OpenAI-style body with `type: managed_model_error`, a stable `code`,
+`request_id`, `retryable`, and matching `sbproxy_reason`. The
+`no_ready_replica` rejection is a retryable `503`. Other resolution,
+authentication, TLS, and transport failures use the gateway's generic error
+path; private detail stays in bounded logs and metrics.
 
 ### Initialize and enroll
 
@@ -661,6 +739,15 @@ and reload the authoritative file, submit a corrected admin map from the
 current revision, or repair the cluster worker and reconcile the signed bundle,
 depending on the active authority.
 
+`cold_start` is `wait`, `reject`, or `fallback`. `wait` coordinates one launch
+per selected cold replica generation and holds callers within admission bounds.
+`reject` starts nothing and returns a retryable `503` with `Retry-After: 1`.
+`fallback` starts nothing and advances to the next provider in the route. With
+`authority: file_managed`, omission follows the security profile: production
+mTLS clusters use `fallback`, while development and non-clustered runtimes use
+`wait`. Admin-managed and cluster-authority deployments must set the field
+explicitly.
+
 `rollout: rolling` starts target assignments before draining losing
 assignments. The old generation remains retained until every target reports the
 exact generation, variant, artifact digest, and ready state, or until
@@ -924,8 +1011,15 @@ roster, alert, or rollout state.
 Useful metrics include `sbproxy_model_host_active_requests`,
 `sbproxy_model_host_queued_requests`, `sbproxy_model_host_deployment_state`,
 `sbproxy_model_host_admission_rejections_total`, GPU VRAM, compute utilization,
-and memory occupancy. Unknown compute utilization stays absent; memory occupancy
-is a separate measurement and never masquerades as compute activity.
+and memory occupancy. Distributed request signals are
+`sbproxy_managed_replica_attempts_total`,
+`sbproxy_managed_replica_failovers_total`,
+`sbproxy_model_plane_peer_dispatch_seconds`,
+`sbproxy_model_plane_stream_cancellations_total`, and
+`sbproxy_model_plane_rejections_total`. Their route, outcome, reason, and retry
+labels are bounded, and no label contains a node ID or endpoint. Unknown compute
+utilization stays absent; memory occupancy is a separate measurement and never
+masquerades as compute activity.
 
 ## Reload behavior
 

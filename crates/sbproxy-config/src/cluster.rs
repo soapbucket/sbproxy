@@ -144,6 +144,9 @@ pub struct ClusterConfig {
     /// Defaults to the gossip-advertised host and `transport_port`.
     #[serde(default)]
     pub transport_advertise_addr: Option<String>,
+    /// Private model-plane listener in IP:port form.
+    #[serde(default)]
+    pub model_bind: Option<String>,
     /// Private model-plane endpoint advertised by worker nodes.
     #[serde(default)]
     pub model_endpoint: Option<String>,
@@ -236,7 +239,20 @@ impl ClusterConfig {
             validate_host_port("transport_advertise_addr", address)?;
         }
         if let Some(endpoint) = self.model_endpoint.as_deref() {
-            validate_model_endpoint(endpoint, self.security.mode == ClusterSecurityMode::Mtls)?;
+            validate_model_endpoint(endpoint, self.security.mode)?;
+        }
+        if let Some(bind) = self.model_bind.as_deref() {
+            if !self.roles.contains(&ClusterRole::Worker) {
+                return Err(ClusterConfigError::invalid(
+                    "model_bind requires the worker role",
+                ));
+            }
+            if self.model_endpoint.is_none() {
+                return Err(ClusterConfigError::invalid(
+                    "model_bind requires model_endpoint for peer discovery",
+                ));
+            }
+            validate_model_bind(bind)?;
         }
         let state_dir = self.state_dir.as_deref().ok_or_else(|| {
             ClusterConfigError::invalid(
@@ -375,17 +391,40 @@ fn validate_host_port(field: &str, value: &str) -> Result<(), ClusterConfigError
     Ok(())
 }
 
-fn validate_model_endpoint(endpoint: &str, production: bool) -> Result<(), ClusterConfigError> {
+fn validate_model_endpoint(
+    endpoint: &str,
+    security_mode: ClusterSecurityMode,
+) -> Result<(), ClusterConfigError> {
     let uri = endpoint.parse::<Uri>().map_err(|error| {
         ClusterConfigError::invalid(format!("model_endpoint {endpoint:?} is invalid: {error}"))
     })?;
-    let scheme = uri.scheme_str();
+    let expected_scheme = match security_mode {
+        ClusterSecurityMode::Mtls => "https",
+        ClusterSecurityMode::SharedKey => "http",
+    };
     if uri.authority().is_none()
-        || !matches!(scheme, Some("http" | "https"))
-        || (production && scheme != Some("https"))
+        || uri.scheme_str() != Some(expected_scheme)
+        || uri.path() != "/"
+        || uri.query().is_some()
+        || endpoint.contains('#')
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
     {
         return Err(ClusterConfigError::invalid(
-            "model_endpoint must be an absolute HTTP URL and production mTLS clusters require HTTPS",
+            "model_endpoint must be an absolute origin using HTTPS for mTLS or HTTP for development shared_key mode",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model_bind(bind: &str) -> Result<(), ClusterConfigError> {
+    let address = bind.parse::<std::net::SocketAddr>().map_err(|_| {
+        ClusterConfigError::invalid("model_bind must use an IP:port socket address")
+    })?;
+    if address.port() == 0 {
+        return Err(ClusterConfigError::invalid(
+            "model_bind port must be positive",
         ));
     }
     Ok(())
@@ -547,6 +586,8 @@ pub struct EffectiveClusterConfig {
     pub advertise_addr: Option<String>,
     /// Advertised typed-state transport address.
     pub transport_advertise_addr: Option<String>,
+    /// Private model-plane listener.
+    pub model_bind: Option<String>,
     /// Private model-plane endpoint.
     pub model_endpoint: Option<String>,
     /// Writable node-identity state directory.
@@ -588,6 +629,8 @@ pub struct ClusterRestartFingerprint {
     pub advertise_addr: Option<String>,
     /// Advertised typed-state transport address.
     pub transport_advertise_addr: Option<String>,
+    /// Private model-plane listener.
+    pub model_bind: Option<String>,
     /// Advertised private model endpoint.
     pub model_endpoint: Option<String>,
     /// Writable node-identity state directory.
@@ -615,6 +658,7 @@ impl EffectiveClusterConfig {
             transport_port: self.transport_port,
             advertise_addr: self.advertise_addr.clone(),
             transport_advertise_addr: self.transport_advertise_addr.clone(),
+            model_bind: self.model_bind.clone(),
             model_endpoint: self.model_endpoint.clone(),
             state_dir: self.state_dir.clone(),
             dead_peer_gc_secs: self.dead_peer_gc_secs,
@@ -691,6 +735,7 @@ fn lower_canonical(config: &ClusterConfig, source: ClusterConfigSource) -> Effec
         transport_port: config.transport_port,
         advertise_addr: config.advertise_addr.clone(),
         transport_advertise_addr: config.transport_advertise_addr.clone(),
+        model_bind: config.model_bind.clone(),
         model_endpoint: config.model_endpoint.clone(),
         state_dir: config.state_dir.clone(),
         security: lower_canonical_security(&config.security),
@@ -731,6 +776,7 @@ fn lower_legacy(node_id: Option<&str>, mesh: &MeshClusterConfig) -> EffectiveClu
         transport_port: mesh.transport_port,
         advertise_addr: mesh.advertise_addr.clone(),
         transport_advertise_addr: mesh.transport_advertise_addr.clone(),
+        model_bind: None,
         model_endpoint: None,
         state_dir: None,
         security: lower_legacy_security(mesh),

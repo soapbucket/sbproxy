@@ -20,8 +20,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    DeploymentRevisionDraft, DeploymentSourceMode, EngineChoice, ModelDeployment, PullPolicy,
-    RolloutPolicy,
+    ColdStartPolicy, DeploymentRevisionDraft, DeploymentSourceMode, EngineChoice, ModelDeployment,
+    PullPolicy, RolloutPolicy,
 };
 
 /// Current restricted deployment-bundle schema.
@@ -52,6 +52,7 @@ struct RestrictedModelDeployment {
     pull: PullPolicy,
     #[serde(default)]
     warm: bool,
+    cold_start: ColdStartPolicy,
     #[serde(default)]
     keep_alive_secs: Option<u64>,
     #[serde(default)]
@@ -89,6 +90,7 @@ impl From<ModelDeployment> for RestrictedModelDeployment {
             spread_by: deployment.spread_by,
             pull: deployment.pull,
             warm: deployment.warm,
+            cold_start: deployment.cold_start,
             keep_alive_secs: deployment.keep_alive_secs,
             max_concurrency: deployment.max_concurrency,
             max_queue_depth: deployment.max_queue_depth,
@@ -110,6 +112,7 @@ impl From<RestrictedModelDeployment> for ModelDeployment {
             spread_by: deployment.spread_by,
             pull: deployment.pull,
             warm: deployment.warm,
+            cold_start: deployment.cold_start,
             keep_alive_secs: deployment.keep_alive_secs,
             max_concurrency: deployment.max_concurrency,
             max_queue_depth: deployment.max_queue_depth,

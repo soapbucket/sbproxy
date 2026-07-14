@@ -168,6 +168,7 @@ struct StrictModelDeployment {
     pull: sbproxy_model_host::PullPolicy,
     #[serde(default)]
     warm: bool,
+    cold_start: sbproxy_model_host::ColdStartPolicy,
     #[serde(default)]
     keep_alive_secs: Option<u64>,
     #[serde(default)]
@@ -193,6 +194,7 @@ impl From<StrictModelDeployment> for sbproxy_model_host::ModelDeployment {
             spread_by: deployment.spread_by,
             pull: deployment.pull,
             warm: deployment.warm,
+            cold_start: deployment.cold_start,
             keep_alive_secs: deployment.keep_alive_secs,
             max_concurrency: deployment.max_concurrency,
             max_queue_depth: deployment.max_queue_depth,
@@ -1028,6 +1030,7 @@ mod tests {
             spread_by: Vec::new(),
             pull: PullPolicy::OnDemand,
             warm: false,
+            cold_start: sbproxy_model_host::ColdStartPolicy::Wait,
             keep_alive_secs: None,
             max_concurrency: None,
             max_queue_depth: 128,
@@ -1108,6 +1111,7 @@ models:
                         "replicas": 1,
                         "pull": "on_demand",
                         "warm": false,
+                        "cold_start": "wait",
                         "engine": "auto",
                         "rollout": "rolling"
                     }}
@@ -1298,6 +1302,7 @@ models:
             r#"{"deployments":{}}"#,
             r#"{"expected_revision":null,"deployments":{},"extra":true}"#,
             r#"{"expected_revision":null,"deployments":{"local-qwen":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m","mystery":true}}}"#,
+            r#"{"expected_revision":null,"deployments":{"local-qwen":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m"}}}"#,
             r#"{"expected_revision":null,"deployments":{"duplicate":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m"},"duplicate":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m"}}}"#,
             r#"{"expected_revision":null,"deployments":{"local-qwen":{"model":"qwen2.5-0.5b-instruct","variant":"q4_k_m","required_labels":{"pool":"cpu","pool":"gpu"}}}}"#,
         ] {
@@ -1364,6 +1369,7 @@ models:
             "deployments": {
                 "local-qwen": {
                     "model": "qwen2.5-0.5b-instruct",
+                    "cold_start": "wait",
                     "replicas": 2
                 }
             }
@@ -1405,6 +1411,7 @@ models:
             let mut deployment = serde_json::json!({
                 "model": "qwen2.5-0.5b-instruct",
                 "variant": "q4_k_m",
+                "cold_start": "wait",
                 "replicas": 1,
             });
             deployment[field] = value;

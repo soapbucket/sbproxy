@@ -77,6 +77,7 @@ fn deployment(replicas: u32) -> ModelDeployment {
         spread_by: Vec::new(),
         pull: PullPolicy::OnDemand,
         warm: false,
+        cold_start: sbproxy_model_host::ColdStartPolicy::Wait,
         keep_alive_secs: None,
         max_concurrency: Some(8),
         max_queue_depth: 128,
@@ -116,6 +117,8 @@ fn cuda_node(node_id: &str, zone: &str, memory: u64) -> PlacementNode {
             available_memory_bytes: memory,
             compute_capability: Some(NodeComputeCapability { major: 8, minor: 9 }),
             supports_fp8: true,
+            compute_utilization_millis: None,
+            memory_occupancy_millis: None,
         }],
         artifacts: Vec::new(),
     }
@@ -151,6 +154,8 @@ fn cpu_node(node_id: &str, zone: &str, memory: u64) -> PlacementNode {
             available_memory_bytes: memory,
             compute_capability: None,
             supports_fp8: false,
+            compute_utilization_millis: None,
+            memory_occupancy_millis: None,
         }],
         artifacts: Vec::new(),
     }

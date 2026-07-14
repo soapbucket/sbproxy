@@ -1,5 +1,5 @@
 # Troubleshooting
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-13*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -27,6 +27,7 @@ Jump by symptom:
 | No HTTP/3 | [HTTP/3 requests fall back to HTTP/2](#http3-requests-fall-back-to-http2) |
 | Local model never becomes ready | [A local model will not serve](#a-local-model-will-not-serve) |
 | Cluster node unhealthy or placement differs | [The model cluster does not converge](#the-model-cluster-does-not-converge) |
+| Managed peer request fails or stalls | [Managed model dispatch fails](#managed-model-dispatch-fails) |
 | Example compose stack broken | [An example docker compose stack will not start](#an-example-docker-compose-stack-will-not-start) |
 
 ## A config setting seems to be ignored
@@ -284,9 +285,12 @@ Check in this order:
   normalized `proxy.model_host` deployment revision on every node. The cluster
   reports drift; it never overwrites a local file.
 - For unplaced replicas, inspect each deployment's `rejections`. Fix missing
-  labels/endpoints, incompatible variants or engines, insufficient memory, or
-  manual-pull cache misses. A replicated homogeneous deployment must pin a
-  variant unless `heterogeneous_variants: true` is explicit.
+  required labels, a missing advertised `model_endpoint`, an unhealthy node,
+  incompatible variants or engines, insufficient capacity, or manual-pull
+  cache misses. Placement requires a worker role and advertised endpoint; it
+  does not probe `model_bind` or require model-plane health to be ready. A
+  replicated homogeneous deployment must pin a variant unless
+  `heterogeneous_variants: true` is explicit.
 - During rolling replacement, `retained` is expected until all targets report
   exact generation, variant, artifact digest, and ready state. `timed_out: true`
   means `handoff_timeout_ms` elapsed; inspect the target workers before retrying.
@@ -302,8 +306,70 @@ Check in this order:
 
 A partition may temporarily overprovision because each side places only on its
 reachable directory. That is an availability tradeoff. It must not produce a
-cross-partition eligible route. Remote request dispatch is not part of this PR;
-the private model endpoint becomes active only with the distributed data plane.
+cross-partition eligible route. Peer dispatch uses only the current eligible
+directory and exact deployment generation.
+
+## Managed model dispatch fails
+
+First distinguish logical discovery, placement, the private model plane, and
+the worker engine:
+
+```bash
+curl --include "${SB_PUBLIC_URL}/v1/models" -H "host: ${SB_PUBLIC_HOST}"
+curl --include "${SB_PUBLIC_URL}/v1/chat/completions" \
+  -H "host: ${SB_PUBLIC_HOST}" \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"health check"}]}'
+
+sbproxy cluster status --format json \
+  | jq '{summary,unhealthy_nodes,deployments,nodes:[.nodes[] | {node_id,health,model_eligible,model_plane:.reported_health.model_plane,exclusion_reason}]}'
+sbproxy models ps --format json
+```
+
+Check these signals:
+
+- If `/v1/models` omits the logical model, verify the origin's
+  `managed_model` provider, deployment ID, provider allowlist, and model
+  allowlist. An entry with `availability.state: unavailable` means discovery
+  succeeded but no current ready or cold replica is eligible.
+- A successful response should carry `x-sbproxy-logical-model` and
+  `x-sbproxy-route-class`. `peer` proves private dispatch without exposing a
+  worker ID or endpoint. Missing headers usually means a non-managed route was
+  selected or the request failed before selection.
+- `503` plus `code: no_ready_replica` and `Retry-After: 1` is the explicit
+  `cold_start: reject` contract. Use `wait`, warm the deployment, or add a
+  fallback provider if rejection is not desired. With `cold_start: fallback`,
+  inspect provider-attempt metrics because the managed lane intentionally
+  starts no engine.
+- After placement, a worker with model-plane health unavailable cannot receive
+  peer work. This is a routability failure, not an unplaced-replica reason.
+  Check that `model_bind` is an unused IP socket, `model_endpoint` is reachable
+  from gateways, and the endpoint scheme matches the security mode. Production
+  is `https://` with mTLS; explicit development is `http://` h2c.
+- For production TLS failures, verify the same cluster CA and server-name SAN
+  on both nodes, a current enrolled identity, the target node-ID SAN, HTTP/2
+  ALPN, and system clocks within five seconds. Restart after changing identity,
+  listener, endpoint, or security fields.
+- `replay_detected`, `replay_fence_full`, `peer_authentication_failed`,
+  `request_digest_mismatch`, and `hop_limit_exceeded` are security failures.
+  Do not turn them into capacity retries. Inspect gateway and worker clocks,
+  identity state, and duplicate request generation.
+- `queue_full`, `queue_timeout`, `draining`, `engine_unhealthy`, and
+  `crash_loop` come from worker-local admission or lifecycle. Use the worker's
+  model-host status and the remediation in [A local model will not serve](#a-local-model-will-not-serve).
+- Pre-output transport, readiness, or capacity failures may move to another
+  current replica. Once an SSE frame reaches the client, failure is a partial
+  stream without `[DONE]` and is never replayed. Client cancellation should
+  decrement active work and increase the stream-cancellation counter.
+
+Query the metrics endpoint for
+`sbproxy_managed_replica_attempts_total`,
+`sbproxy_managed_replica_failovers_total`,
+`sbproxy_model_plane_peer_dispatch_seconds`,
+`sbproxy_model_plane_stream_cancellations_total`, and
+`sbproxy_model_plane_rejections_total`. Their labels contain bounded route and
+reason classes, never worker topology. Enable debug logs only long enough to
+trace a request ID; do not log public bearer values or request bodies.
 
 ## An example docker compose stack will not start
 

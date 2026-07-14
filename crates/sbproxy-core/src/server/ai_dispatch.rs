@@ -176,6 +176,136 @@ async fn resolve_dynamic_virtual_key(
     }
 }
 
+async fn resolve_request_virtual_key(
+    session: &Session,
+    config: &AiHandlerConfig,
+    principal: &sbproxy_plugin::Principal,
+) -> std::result::Result<Option<sbproxy_ai::identity::VirtualKeyConfig>, (u16, String)> {
+    let auth_value = req_header_value(session, "authorization");
+    let raw_key = auth_value.as_deref().map(|header| {
+        header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))
+            .unwrap_or(header)
+            .trim()
+            .to_string()
+    });
+    if let Some(plane) = crate::key_plane::current_key_plane() {
+        return match resolve_dynamic_virtual_key(&plane, raw_key.as_deref()).await {
+            DynamicKeyOutcome::Resolved(key) => Ok(Some(*key)),
+            DynamicKeyOutcome::NotApplicable => {
+                match resolve_oidc_mapped_key(&plane, principal).await {
+                    DynamicKeyOutcome::Resolved(key) => Ok(Some(*key)),
+                    DynamicKeyOutcome::NotApplicable => Ok(None),
+                    DynamicKeyOutcome::Deny(status, message) => Err((status, message)),
+                }
+            }
+            DynamicKeyOutcome::Deny(status, message) => Err((status, message)),
+        };
+    }
+    Ok(raw_key.as_deref().and_then(|key| {
+        config
+            .virtual_keys
+            .iter()
+            .find(|candidate| candidate.enabled && candidate.key == key)
+            .cloned()
+    }))
+}
+
+const UNNAMED_VIRTUAL_KEY_PRINCIPAL: &str = "<unnamed>";
+
+fn principal_for_resolved_virtual_key(
+    tenant_id: &str,
+    key: &sbproxy_ai::identity::VirtualKeyConfig,
+) -> sbproxy_plugin::Principal {
+    let attrs = sbproxy_plugin::PrincipalAttrs {
+        project: key.project.clone(),
+        user: key.user.clone(),
+        team: None,
+        tags: key.tags.clone(),
+        metadata: key
+            .metadata
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        roles: Vec::new(),
+        claims: None,
+        // The operator-supplied stable name only; never the raw key secret.
+        key_id: key.name.clone(),
+    };
+    let key_name = key
+        .name
+        .clone()
+        .unwrap_or_else(|| UNNAMED_VIRTUAL_KEY_PRINCIPAL.to_string());
+    sbproxy_plugin::Principal {
+        tenant_id: sbproxy_plugin::TenantId::from(tenant_id),
+        sub: key_name.clone(),
+        source: sbproxy_plugin::PrincipalSource::VirtualKey,
+        virtual_key: Some(sbproxy_plugin::VirtualKeyRef {
+            name: key_name,
+            allowed_providers: key.allowed_providers.clone(),
+        }),
+        attrs,
+    }
+}
+
+/// Apply the request-wide identity and governance carried by a resolved virtual
+/// key before dispatch can branch into local discovery, multipart forwarding,
+/// or JSON-specific processing.
+fn apply_resolved_virtual_key_context(
+    session: &Session,
+    config: &AiHandlerConfig,
+    ctx: &mut RequestContext,
+    key: &sbproxy_ai::identity::VirtualKeyConfig,
+) -> std::result::Result<(), (u16, &'static str)> {
+    if !key.matches_principal(&ctx.principal) {
+        let key_name = key.name.as_deref().unwrap_or("<unnamed>");
+        warn!(
+            credential = %key_name,
+            principal_source = %ctx.principal.source.as_str(),
+            principal_sub = %ctx.principal.sub,
+            "AI proxy: credential principal selector miss"
+        );
+        return Err((403, "credential is not allowed for this principal"));
+    }
+    if !key.require_pii_redaction.is_empty()
+        && !config.satisfies_pii_redaction_requirement(&key.require_pii_redaction)
+    {
+        let key_name = key.name.as_deref().unwrap_or("<unnamed>");
+        warn!(
+            credential = %key_name,
+            required_rules = ?key.require_pii_redaction,
+            "AI proxy: credential requires request PII redaction but origin redaction is inactive or missing required rules"
+        );
+        return Err((500, "credential requires active request PII redaction"));
+    }
+
+    // Stamp one unified principal before any dispatch path reads provider
+    // policy, governed-key identity, attribution, or scheduling priority.
+    ctx.principal = principal_for_resolved_virtual_key(ctx.tenant_id.as_str(), key);
+    ctx.attribution_tags =
+        crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
+
+    if (key.max_requests_per_minute.is_some() || key.max_tokens_per_minute.is_some())
+        && !key_rate_limiter().check_rate(&key.key, key)
+    {
+        warn!(
+            key = %key.name.as_deref().unwrap_or(UNNAMED_VIRTUAL_KEY_PRINCIPAL),
+            "AI proxy: per-key rate limit exceeded (requests or tokens per minute)"
+        );
+        return Err((429, "rate limit exceeded for this key"));
+    }
+    if key.max_tokens_per_minute.is_some() {
+        ctx.ai_key_tpm_bucket = Some(key.key.clone());
+    }
+    ctx.ai_lane_priority = key.priority;
+    if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
+        counters.record_request(&key.key);
+    }
+
+    Ok(())
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -335,9 +465,58 @@ pub(super) async fn handle_ai_proxy(
     // survives across requests. A per-request router would reset that
     // state every call and make the latency/usage-aware strategies inert.
     let router = config.router();
+    let resolved_request_vk =
+        match resolve_request_virtual_key(session, config, &ctx.principal).await {
+            Ok(key) => key,
+            Err((status, message)) => {
+                warn!(status, reason = %message, "AI proxy: virtual key denied");
+                send_error(session, status, &message).await?;
+                return Ok(());
+            }
+        };
+    if let Some(key) = resolved_request_vk.as_ref() {
+        if let Err((status, message)) =
+            apply_resolved_virtual_key_context(session, config, ctx, key)
+        {
+            send_error(session, status, message).await?;
+            return Ok(());
+        }
+    }
 
-    // Handle GET requests (e.g. /v1/models) by forwarding to first enabled provider.
+    // Serve model discovery locally; other GET surfaces use ordinary dispatch.
     if method == http::Method::GET {
+        if matches!(
+            path.split('?')
+                .next()
+                .unwrap_or(path.as_str())
+                .trim_end_matches('/'),
+            "/v1/models" | "/models"
+        ) {
+            let allowed_providers = resolved_request_vk
+                .as_ref()
+                .map(|key| key.allowed_providers.as_slice())
+                .unwrap_or(&[]);
+            let allowed_models = resolved_request_vk
+                .as_ref()
+                .map(|key| key.allowed_models.as_slice())
+                .unwrap_or(&[]);
+            let blocked_models = resolved_request_vk
+                .as_ref()
+                .map(|key| key.blocked_models.as_slice())
+                .unwrap_or(&[]);
+            let availability =
+                crate::server::model_host::current_managed_model_availability().await;
+            let body = crate::model_discovery::logical_model_listing(
+                config,
+                allowed_providers,
+                allowed_models,
+                blocked_models,
+                &availability,
+            );
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            send_response(session, 200, "application/json", &bytes).await?;
+            return Ok(());
+        }
         // LiteLLM-parity read-only endpoints served locally from config.
         if let Some(body) = ai_management_response(&path, config) {
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
@@ -592,6 +771,7 @@ pub(super) async fn handle_ai_proxy(
             idem_capture,
             ctx.ai_inbound_format.as_deref(),
             Vec::new(),
+            Vec::new(),
         )
         .await;
     }
@@ -732,47 +912,196 @@ pub(super) async fn handle_ai_proxy(
     };
 
     if is_multipart_request {
-        let provider_idx = router
-            .select_with_allowed(
-                &config.providers,
-                ctx.principal
-                    .virtual_key
-                    .as_ref()
-                    .map(|vk| vk.allowed_providers.as_slice())
-                    .unwrap_or(&[]),
-            )
+        let requested_model =
+            crate::model_plane::multipart_model(body_bytes.as_ref(), &request_content_type)
+                .map_err(|error| {
+                    Error::because(ErrorType::HTTPStatus(400), "invalid multipart model", error)
+                })?;
+        if let Some(model) = requested_model.as_deref() {
+            let key_allows_model = resolved_request_vk.as_ref().is_none_or(|key| {
+                !key.blocked_models.iter().any(|blocked| blocked == model)
+                    && (key.allowed_models.is_empty()
+                        || key.allowed_models.iter().any(|allowed| allowed == model))
+            });
+            if !config.is_model_allowed(model) || !key_allows_model {
+                send_error(session, 403, "model is not allowed for this credential").await?;
+                return Ok(());
+            }
+        }
+        let allowed_providers = ctx
+            .principal
+            .virtual_key
+            .as_ref()
+            .map(|key| key.allowed_providers.as_slice())
+            .unwrap_or(&[]);
+        let primary_idx = router
+            .select_with_allowed(&config.providers, allowed_providers)
             .ok_or_else(|| {
                 warn!("AI proxy: no enabled providers");
                 Error::new(ErrorType::HTTPStatus(502))
             })?;
-        let provider = &config.providers[provider_idx];
+        let mut provider_order = config
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| {
+                provider.enabled
+                    && (allowed_providers.is_empty()
+                        || allowed_providers
+                            .iter()
+                            .any(|allowed| allowed == provider.name.as_str()))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let Some(model) = requested_model.as_deref() {
+            if let Some(eligible) =
+                model_eligible_providers(&provider_order, &config.providers, model)
+            {
+                provider_order = eligible;
+            }
+        }
+        let is_failover = matches!(config.routing, sbproxy_ai::RoutingStrategy::FallbackChain);
+        if is_failover {
+            provider_order
+                .sort_by_key(|&index| config.providers[index].priority.unwrap_or(u32::MAX));
+        } else if let Some(position) = provider_order
+            .iter()
+            .position(|&index| index == primary_idx)
+        {
+            let primary = provider_order.remove(position);
+            provider_order.insert(0, primary);
+        }
 
-        let resp = AI_CLIENT
-            .load()
-            .forward_bytes(
-                provider,
-                &method_str,
-                &path,
-                body_bytes,
-                &request_content_type,
-            )
-            .await
-            .map_err(|e| {
-                record_ai_transport_failure(
-                    &ai_span,
-                    Some(provider.name.as_str()),
-                    &e,
-                    "AI upstream multipart request failed",
+        let mut selected = None;
+        let mut last_error = None;
+        for (attempt, &provider_idx) in provider_order.iter().enumerate() {
+            if attempt > 0 && !is_failover && ctx.managed_fallback_reason.is_none() {
+                break;
+            }
+            let provider = &config.providers[provider_idx];
+            let distributed_managed =
+                crate::server::model_host::distributed_managed_provider(provider);
+            let response_result: anyhow::Result<reqwest::Response> = if distributed_managed {
+                let origin = ctx
+                    .origin_idx
+                    .and_then(|index| ctx.pipeline.config.origins.get(index))
+                    .map(|origin| origin.origin_id.to_string())
+                    .unwrap_or_else(|| ctx.hostname.to_string());
+                let preferred_region = ctx
+                    .principal
+                    .attrs
+                    .metadata
+                    .get("region")
+                    .cloned()
+                    .or_else(|| ctx.request_geo.clone());
+                let prefix_key = format!(
+                    "{}:{}",
+                    ctx.tenant_id,
+                    requested_model.as_deref().unwrap_or_default()
                 );
-                warn!(
-                    error = %e,
-                    method = %method_str,
-                    ai.surface = surface_label,
-                    content_type = %request_content_type,
-                    "AI proxy: upstream multipart request failed"
-                );
-                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-            })?;
+                let maximum = config
+                    .max_body_size
+                    .filter(|maximum| *maximum > 0)
+                    .unwrap_or(64 * 1024 * 1024)
+                    .min(1024 * 1024 * 1024);
+                match crate::server::model_host::distributed_managed_upstream(
+                    crate::server::model_host::ManagedDistributedRequest {
+                        origin: &origin,
+                        provider,
+                        requested_model: requested_model.as_deref(),
+                        request_id: ctx.request_id.as_str(),
+                        tenant_id: ctx.tenant_id.as_str(),
+                        governed_key_id: ctx.principal.api_key_id(),
+                        policy_revision: &pipeline.config_revision,
+                        path: &path,
+                        body: body_bytes.clone(),
+                        content_type: Some(&request_content_type),
+                        priority: crate::server::model_host::lane_class_for(ctx.ai_lane_priority),
+                        prefix_key: prefix_key.as_bytes(),
+                        preferred_region: preferred_region.as_deref(),
+                        requested_adapter: None,
+                        max_body_bytes: maximum,
+                    },
+                )
+                .await
+                {
+                    Ok(Some(upstream)) => {
+                        ctx.ai_logical_model = Some(upstream.public_model.clone());
+                        ctx.ai_serve_model = Some(upstream.public_model);
+                        ctx.managed_model_permit = upstream.local_permit;
+                        ctx.managed_route_class = upstream.route_class;
+                        ctx.managed_route_trace = Some(upstream.trace);
+                        Ok(upstream.response)
+                    }
+                    Ok(None) => Err(anyhow::anyhow!(
+                        "distributed managed provider did not produce an attempt"
+                    )),
+                    Err(error) => {
+                        if let Some(trace) = error.trace() {
+                            ctx.managed_route_trace = Some(trace.clone());
+                        }
+                        if let Some(reason) = error.public_reason() {
+                            ctx.managed_fallback_reason = Some(reason);
+                        }
+                        Err(anyhow::Error::new(error))
+                    }
+                }
+            } else {
+                AI_CLIENT
+                    .load()
+                    .forward_bytes(
+                        provider,
+                        &method_str,
+                        &path,
+                        body_bytes.clone(),
+                        &request_content_type,
+                    )
+                    .await
+            };
+            match response_result {
+                Ok(response) => {
+                    let retryable_status = matches!(response.status().as_u16(), 500 | 502 | 503);
+                    let has_next = attempt + 1 < provider_order.len();
+                    if is_failover
+                        && has_next
+                        && retryable_status
+                        && !crate::server::model_host::is_terminal_managed_response(&response)
+                    {
+                        let _ = response.bytes().await;
+                        continue;
+                    }
+                    selected = Some((provider_idx, response));
+                    break;
+                }
+                Err(error) => {
+                    record_ai_transport_failure(
+                        &ai_span,
+                        Some(provider.name.as_str()),
+                        &error,
+                        "AI upstream multipart request failed",
+                    );
+                    last_error = Some(error);
+                    if attempt + 1 < provider_order.len()
+                        && (is_failover || ctx.managed_fallback_reason.is_some())
+                    {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        let (provider_idx, resp) = selected.ok_or_else(|| {
+            let error = last_error.unwrap_or_else(|| anyhow::anyhow!("no eligible provider"));
+            warn!(
+                error = %error,
+                method = %method_str,
+                ai.surface = surface_label,
+                content_type = %request_content_type,
+                "AI proxy: upstream multipart request failed"
+            );
+            Error::because(ErrorType::ConnectError, "AI upstream request failed", error)
+        })?;
+        let provider = &config.providers[provider_idx];
 
         let format = sbproxy_ai::client::provider_format(provider);
 
@@ -791,6 +1120,11 @@ pub(super) async fn handle_ai_proxy(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
             let resp_bytes = read_capped_response_body(resp, config.max_body_size).await?;
             record_ai_provider_response_failure(
                 &ai_span,
@@ -826,9 +1160,15 @@ pub(super) async fn handle_ai_proxy(
             if cost_micros > 0 {
                 ctx.ai_cost_usd_micros = Some(cost_micros);
             }
-            let extra: Option<(&str, &str)> =
-                idem_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
-            return send_response_with_extra(session, status, &resp_ct, &resp_bytes, extra).await;
+            let mut extras = public_route_headers(ctx);
+            if let Some(reason) = idem_skip_reason {
+                extras.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
+            }
+            if let Some(retry_after) = retry_after {
+                extras.push(("retry-after".to_string(), retry_after));
+            }
+            return send_response_with_extras(session, status, &resp_ct, &resp_bytes, &extras)
+                .await;
         }
 
         emit_ai_billing_event(
@@ -864,6 +1204,7 @@ pub(super) async fn handle_ai_proxy(
             idem_skip_reason,
             None,
             ctx.ai_inbound_format.as_deref(),
+            public_route_headers(ctx),
             ctx.ai_reversible_redactions.clone(),
         )
         .await;
@@ -971,250 +1312,78 @@ pub(super) async fn handle_ai_proxy(
         return Ok(());
     }
 
-    // --- WOR-894: virtual-key identity resolution ---
-    //
-    // When the request's `Authorization: Bearer <key>` (or bare key)
-    // matches a configured virtual key, surface that key's `project`,
-    // `user`, and `metadata` onto the request context so the access log
-    // can attribute spend / usage to them. Missing / unknown keys
-    // silently no-op (auth itself is enforced by the configured auth
-    // provider, not here). Skipped when no virtual_keys are declared.
-    {
-        let auth_value = req_header_value(session, "authorization");
-        let raw_key = auth_value.as_deref().map(|h| {
-            h.strip_prefix("Bearer ")
-                .or_else(|| h.strip_prefix("bearer "))
-                .unwrap_or(h)
-                .trim()
-                .to_string()
-        });
-        // Resolve the inbound virtual key. When the dynamic key plane is
-        // enabled it is the source of truth (hashed at rest, instant revoke,
-        // per-request cache->store); otherwise fall back to the compiled
-        // `virtual_keys:` list.
-        let resolved_vk: Option<sbproxy_ai::identity::VirtualKeyConfig> =
-            if let Some(plane) = crate::key_plane::current_key_plane() {
-                match resolve_dynamic_virtual_key(&plane, raw_key.as_deref()).await {
-                    DynamicKeyOutcome::Resolved(vk) => Some(*vk),
-                    // No virtual-key bearer token: fall back to OIDC/JWT claim
-                    // mapping so a verified identity resolves the same record.
-                    DynamicKeyOutcome::NotApplicable => {
-                        match resolve_oidc_mapped_key(&plane, &ctx.principal).await {
-                            DynamicKeyOutcome::Resolved(vk) => Some(*vk),
-                            DynamicKeyOutcome::NotApplicable => None,
-                            DynamicKeyOutcome::Deny(status, msg) => {
-                                warn!(
-                                    status,
-                                    reason = %msg,
-                                    "AI proxy: OIDC-mapped virtual key denied"
-                                );
-                                send_error(session, status, &msg).await?;
-                                return Ok(());
-                            }
-                        }
-                    }
-                    DynamicKeyOutcome::Deny(status, msg) => {
-                        warn!(status, reason = %msg, "AI proxy: dynamic virtual key denied");
-                        send_error(session, status, &msg).await?;
-                        return Ok(());
-                    }
+    // The common resolved-key identity and governance was applied before any
+    // early-return dispatch surface. Only JSON-body policy remains here.
+    if let Some(vk) = resolved_request_vk.as_ref() {
+        // WOR-893: per-key model routing. When the key pins a
+        // model, overwrite the request body's `model` field so
+        // the downstream allow/block, routing, budget, and
+        // model-extraction steps all see the pinned value (and
+        // a client-supplied `model` is ignored). Composes
+        // naturally with `allowed_models` / `blocked_models`:
+        // if the pinned model is itself blocked or not on the
+        // allow-list, the existing gate still rejects.
+        if let Some(route_to) = &vk.route_to_model {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(route_to.clone()),
+                );
+            }
+        }
+        // WOR-893 PR2 + WOR-1646: per-key tool injection. The
+        // key's tool set REPLACES any client-supplied `tools`
+        // so the key fully owns the tool surface the caller
+        // exposes. Static `inject_tools` JSON and a
+        // federation-sourced `inject_mcp` compose: the live
+        // MCP catalogue (RBAC-filtered by this principal,
+        // converted to the requested provider shape) is
+        // appended to the static set.
+        let mut injected: Vec<serde_json::Value> = vk.inject_tools.clone();
+        if let Some(inject) = &vk.inject_mcp {
+            match sbproxy_modules::action::lookup_inject_source(&inject.reference) {
+                Some(source) => {
+                    injected.extend(source.resolve_tools(
+                        &ctx.principal,
+                        &inject.filter,
+                        inject.format,
+                    ));
                 }
-            } else if !config.virtual_keys.is_empty() {
-                raw_key.as_deref().and_then(|key| {
-                    config
-                        .virtual_keys
-                        .iter()
-                        .find(|vk| vk.enabled && vk.key == key)
-                        .cloned()
-                })
-            } else {
-                None
-            };
-        if let Some(vk) = resolved_vk {
-            {
-                if !vk.matches_principal(&ctx.principal) {
-                    let vk_name = vk.name.as_deref().unwrap_or("<unnamed>");
+                None => {
                     warn!(
-                        credential = %vk_name,
-                        principal_source = %ctx.principal.source.as_str(),
-                        principal_sub = %ctx.principal.sub,
-                        "AI proxy: credential principal selector miss"
+                        mcp_ref = %inject.reference,
+                        "AI proxy: inject_mcp references an unknown MCP gateway; no tools injected"
                     );
-                    send_error(session, 403, "credential is not allowed for this principal")
-                        .await?;
-                    return Ok(());
                 }
-                if !vk.require_pii_redaction.is_empty()
-                    && !config.satisfies_pii_redaction_requirement(&vk.require_pii_redaction)
-                {
-                    let vk_name = vk.name.as_deref().unwrap_or("<unnamed>");
-                    warn!(
-                        credential = %vk_name,
-                        required_rules = ?vk.require_pii_redaction,
-                        "AI proxy: credential requires request PII redaction but origin redaction is inactive or missing required rules"
-                    );
-                    send_error(
-                        session,
-                        500,
-                        "credential requires active request PII redaction",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                // Stamp the matched VK onto the unified Principal so
-                // the rest of the pipeline (access log, attribution
-                // metric, policy scripts, MCP RBAC) all read through
-                // one shape. The Principal carries the attribution
-                // attrs plus a `virtual_key` reference that downstream
-                // code uses to enforce `allowed_providers`.
-                let mut attrs = sbproxy_plugin::PrincipalAttrs {
-                    project: vk.project.clone(),
-                    user: vk.user.clone(),
-                    team: None,
-                    tags: vk.tags.clone(),
-                    metadata: vk
-                        .metadata
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                    roles: Vec::new(),
-                    claims: None,
-                    // Per-credential reporting id for the virtual key.
-                    // The operator-supplied stable name only; never the
-                    // raw `vk.key` secret. `None` when the key is
-                    // unnamed so the metric falls back to the
-                    // un-credentialed bucket rather than leaking key
-                    // material.
-                    key_id: vk.name.clone(),
-                };
-                // Reflect the matched key name into `sub` so the
-                // access-log + principal_kind columns can show which
-                // VK served the request.
-                let vk_name = vk.name.clone().unwrap_or_else(|| vk.key.clone());
-                let _ = &mut attrs;
-                ctx.principal = sbproxy_plugin::Principal {
-                    tenant_id: sbproxy_plugin::TenantId::from(ctx.tenant_id.as_str()),
-                    sub: vk_name.clone(),
-                    source: sbproxy_plugin::PrincipalSource::VirtualKey,
-                    virtual_key: Some(sbproxy_plugin::VirtualKeyRef {
-                        name: vk_name,
-                        allowed_providers: vk.allowed_providers.clone(),
-                    }),
-                    attrs,
-                };
-                // Resolve business attribution tags once now that the
-                // credential principal is set: credential `attrs:`
-                // defaults merged with the inbound SB-Attr-* headers.
-                // Fanned out to the per-attribution spend metric and the
-                // access log so spend pivots on project / feature / team
-                // / customer / environment / agent_type / risk_tier.
-                ctx.attribution_tags =
-                    crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
-                // WOR-1558: enforce the key's live requests-per-minute limit,
-                // and (WOR-1833) its tokens-per-minute window. The limits are
-                // read from the resolved record (via the cache), so a PATCH to
-                // a dynamic key's caps takes effect on the next request
-                // without a reload. The bucket is keyed by the stable key id,
-                // never the secret.
-                if (vk.max_requests_per_minute.is_some() || vk.max_tokens_per_minute.is_some())
-                    && !key_rate_limiter().check_rate(&vk.key, &vk)
-                {
-                    warn!(
-                        key = %vk.name.as_deref().unwrap_or(&vk.key),
-                        "AI proxy: per-key rate limit exceeded (requests or tokens per minute)"
-                    );
-                    send_error(session, 429, "rate limit exceeded for this key").await?;
-                    return Ok(());
-                }
-                // Remember the limiter bucket so the completion path can
-                // charge this response's token usage into the key's
-                // one-minute window (WOR-1833).
-                if vk.max_tokens_per_minute.is_some() {
-                    ctx.ai_key_tpm_bucket = Some(vk.key.clone());
-                }
-                // WOR-1679: remember the key's scheduling lane so the
-                // served-model admission gate can order the queue and
-                // decide spill behavior. Lane comes from the key record
-                // only, never from a client header.
-                ctx.ai_lane_priority = vk.priority;
-                // WOR-1563: record the request into the cross-replica rate
-                // counter (mesh CRDT) so a key's fleet-wide rate is visible to
-                // every replica. No-op unless the mesh tier is enabled.
-                if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
-                    counters.record_request(&vk.key);
-                }
-                // WOR-893: per-key model routing. When the key pins a
-                // model, overwrite the request body's `model` field so
-                // the downstream allow/block, routing, budget, and
-                // model-extraction steps all see the pinned value (and
-                // a client-supplied `model` is ignored). Composes
-                // naturally with `allowed_models` / `blocked_models`:
-                // if the pinned model is itself blocked or not on the
-                // allow-list, the existing gate still rejects.
-                if let Some(route_to) = &vk.route_to_model {
-                    if let Some(obj) = body.as_object_mut() {
-                        obj.insert(
-                            "model".to_string(),
-                            serde_json::Value::String(route_to.clone()),
-                        );
-                    }
-                }
-                // WOR-893 PR2 + WOR-1646: per-key tool injection. The
-                // key's tool set REPLACES any client-supplied `tools`
-                // so the key fully owns the tool surface the caller
-                // exposes. Static `inject_tools` JSON and a
-                // federation-sourced `inject_mcp` compose: the live
-                // MCP catalogue (RBAC-filtered by this principal,
-                // converted to the requested provider shape) is
-                // appended to the static set.
-                let mut injected: Vec<serde_json::Value> = vk.inject_tools.clone();
-                if let Some(inject) = &vk.inject_mcp {
-                    match sbproxy_modules::action::lookup_inject_source(&inject.reference) {
-                        Some(source) => {
-                            injected.extend(source.resolve_tools(
-                                &ctx.principal,
-                                &inject.filter,
-                                inject.format,
-                            ));
-                        }
-                        None => {
-                            warn!(
-                                mcp_ref = %inject.reference,
-                                "AI proxy: inject_mcp references an unknown MCP gateway; no tools injected"
-                            );
-                        }
-                    }
-                }
-                if !injected.is_empty() {
-                    if let Some(obj) = body.as_object_mut() {
-                        obj.insert("tools".to_string(), serde_json::Value::Array(injected));
-                    }
-                }
-                // Per-key model gate. Enforce the matched key's
-                // `allowed_models` / `blocked_models` against the
-                // effective model (after any `route_to_model` rewrite),
-                // mirroring the action-level gate above but scoped to
-                // this virtual key. A key allow-listed to a subset of
-                // the gateway's models is rejected with 403 when it asks
-                // for a model outside that subset; the block-list takes
-                // precedence over the allow-list.
-                let effective_model = body
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !effective_model.is_empty() {
-                    let blocked = vk.blocked_models.iter().any(|m| m == &effective_model);
-                    let allowed = vk.allowed_models.is_empty()
-                        || vk.allowed_models.iter().any(|m| m == &effective_model);
-                    if blocked || !allowed {
-                        let msg =
-                            format!("model '{}' is not allowed for this key", effective_model);
-                        warn!(model = %effective_model, "AI proxy: model blocked for virtual key");
-                        send_error(session, 403, &msg).await?;
-                        return Ok(());
-                    }
-                }
+            }
+        }
+        if !injected.is_empty() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("tools".to_string(), serde_json::Value::Array(injected));
+            }
+        }
+        // Per-key model gate. Enforce the matched key's
+        // `allowed_models` / `blocked_models` against the
+        // effective model (after any `route_to_model` rewrite),
+        // mirroring the action-level gate above but scoped to
+        // this virtual key. A key allow-listed to a subset of
+        // the gateway's models is rejected with 403 when it asks
+        // for a model outside that subset; the block-list takes
+        // precedence over the allow-list.
+        let effective_model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !effective_model.is_empty() {
+            let blocked = vk.blocked_models.iter().any(|m| m == &effective_model);
+            let allowed = vk.allowed_models.is_empty()
+                || vk.allowed_models.iter().any(|m| m == &effective_model);
+            if blocked || !allowed {
+                let msg = format!("model '{}' is not allowed for this key", effective_model);
+                warn!(model = %effective_model, "AI proxy: model blocked for virtual key");
+                send_error(session, 403, &msg).await?;
+                return Ok(());
             }
         }
     }
@@ -1809,6 +1978,8 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
+    ctx.ai_logical_model = (!model.is_empty()).then(|| model.clone());
+
     // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
     //
     // When the enterprise semantic cache is wired, ask the hook whether
@@ -2252,6 +2423,32 @@ pub(super) async fn handle_ai_proxy(
         .map(|(i, _)| i)
         .collect();
 
+    // Credential provider policy constrains the entire candidate set, not
+    // only primary selection. Every strategy below, including fallback,
+    // cascade, and race, derives from this filtered order.
+    let allowed_providers = ctx
+        .principal
+        .virtual_key
+        .as_ref()
+        .map(|key| key.allowed_providers.as_slice())
+        .unwrap_or(&[]);
+    if !allowed_providers.is_empty() {
+        provider_order.retain(|&index| {
+            allowed_providers
+                .iter()
+                .any(|allowed| allowed == config.providers[index].name.as_str())
+        });
+        if provider_order.is_empty() {
+            send_error(
+                session,
+                403,
+                "credential is not allowed to use any configured provider",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     // WOR-799: disallow_prompt_training routing filter. When the
     // request opts out of training (header
     // `x-sbproxy-disallow-prompt-training: true`), route only to
@@ -2371,10 +2568,10 @@ pub(super) async fn handle_ai_proxy(
     if let Some(cascade_cfg) = router.cascade_config().filter(|_| !disallow_training) {
         if is_stream {
             if let Some(first_tier) = cascade_cfg.tiers.first() {
-                if let Some(idx) = config
-                    .providers
+                if let Some(idx) = provider_order
                     .iter()
-                    .position(|p| p.enabled && p.name == first_tier.provider_id)
+                    .copied()
+                    .find(|&index| config.providers[index].name == first_tier.provider_id)
                 {
                     provider_order = vec![idx];
                     if let Some(obj) = body.as_object_mut() {
@@ -2431,6 +2628,7 @@ pub(super) async fn handle_ai_proxy(
                 .forward_cascade(
                     config,
                     cascade_cfg,
+                    allowed_providers,
                     &path,
                     &body,
                     &ctx.attribution_tags,
@@ -2471,7 +2669,15 @@ pub(super) async fn handle_ai_proxy(
                     // materialized outside the relay path.
                     let _ = idem_capture.take();
                     let _ = idem_skip_reason;
-                    return send_response(session, o.status, &content_type, &translated).await;
+                    let extras = public_route_headers(ctx);
+                    return send_response_with_extras(
+                        session,
+                        o.status,
+                        &content_type,
+                        &translated,
+                        &extras,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     warn!(
@@ -2616,16 +2822,27 @@ pub(super) async fn handle_ai_proxy(
         if race_mode {
             break;
         }
-        if attempt >= max_attempts {
+        let effective_max_attempts = if ctx.managed_fallback_reason.is_some() {
+            provider_order.len()
+        } else {
+            max_attempts
+        };
+        if attempt >= effective_max_attempts {
             break;
         }
         // A failed prior managed attempt may still hold deployment capacity.
         // Release it before this attempt queues or dispatches.
         ctx.managed_model_permit = None;
+        ctx.managed_route_trace = None;
+        ctx.managed_route_class = None;
         let mut resolved_provider = config.providers[provider_idx].clone();
         let mut local_public_model = None;
         let mut local_engine_model = None;
-        if resolved_provider.serve.is_some() || resolved_provider.is_managed_model() {
+        let distributed_managed =
+            crate::server::model_host::distributed_managed_provider(&resolved_provider);
+        if (resolved_provider.serve.is_some() || resolved_provider.is_managed_model())
+            && !distributed_managed
+        {
             let requested = (!model.is_empty()).then_some(model.as_str());
             let origin = ctx
                 .origin_idx
@@ -2646,6 +2863,8 @@ pub(super) async fn handle_ai_proxy(
                     local_public_model = Some(upstream.public_model);
                     local_engine_model = Some(upstream.engine_model);
                     ctx.managed_model_permit = Some(upstream.permit);
+                    ctx.managed_route_class =
+                        Some(sbproxy_ai::managed_replica::ManagedRouteClass::Local);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -2697,7 +2916,7 @@ pub(super) async fn handle_ai_proxy(
         // engine reports its weights file path there) back to the
         // public name the client asked for. Reset per attempt so
         // a failover to a hosted lane clears it.
-        ctx.ai_serve_model = local_public_model;
+        ctx.ai_serve_model = local_public_model.clone();
         ai_span.record("gen_ai.system", provider.name.as_str());
         ai_span.record("llm.provider", provider.name.as_str());
         if !resolved_model.is_empty() {
@@ -2789,21 +3008,100 @@ pub(super) async fn handle_ai_proxy(
             provider = %provider.name,
             attempt = attempt,
         );
-        let result = async {
-            if let Some((bypass_body, native_path)) = upstream_call {
-                AI_CLIENT
-                    .load()
-                    .forward_native_bypass(provider, &method_str, native_path, bypass_body)
-                    .await
-            } else {
-                AI_CLIENT
-                    .load()
-                    .forward_request(provider, &path, &attempt_body)
-                    .await
+        let result: anyhow::Result<reqwest::Response> = if distributed_managed {
+            let managed_body = serde_json::to_vec(&attempt_body)
+                .map(bytes::Bytes::from)
+                .map_err(anyhow::Error::from);
+            match managed_body {
+                Ok(managed_body) => {
+                    let origin = ctx
+                        .origin_idx
+                        .and_then(|index| ctx.pipeline.config.origins.get(index))
+                        .map(|origin| origin.origin_id.to_string())
+                        .unwrap_or_else(|| ctx.hostname.to_string());
+                    let prefix_key = extract_prefix_key(&attempt_body, 1024);
+                    let requested_adapter = attempt_body
+                        .get("adapter")
+                        .or_else(|| attempt_body.get("lora_adapter"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let preferred_region = ctx
+                        .principal
+                        .attrs
+                        .metadata
+                        .get("region")
+                        .cloned()
+                        .or_else(|| ctx.request_geo.clone());
+                    let maximum = config
+                        .max_body_size
+                        .filter(|maximum| *maximum > 0)
+                        .unwrap_or(64 * 1024 * 1024)
+                        .min(1024 * 1024 * 1024);
+                    let managed = crate::server::model_host::distributed_managed_upstream(
+                        crate::server::model_host::ManagedDistributedRequest {
+                            origin: &origin,
+                            provider,
+                            requested_model: (!model.is_empty()).then_some(model.as_str()),
+                            request_id: ctx.request_id.as_str(),
+                            tenant_id: ctx.tenant_id.as_str(),
+                            governed_key_id: ctx.principal.api_key_id(),
+                            policy_revision: &pipeline.config_revision,
+                            path: &path,
+                            body: managed_body,
+                            content_type: Some("application/json"),
+                            priority: crate::server::model_host::lane_class_for(
+                                ctx.ai_lane_priority,
+                            ),
+                            prefix_key: &prefix_key,
+                            preferred_region: preferred_region.as_deref(),
+                            requested_adapter: requested_adapter.as_deref(),
+                            max_body_bytes: maximum,
+                        },
+                    )
+                    .instrument(attempt_span)
+                    .await;
+                    match managed {
+                        Ok(Some(upstream)) => {
+                            local_public_model = Some(upstream.public_model);
+                            ctx.managed_model_permit = upstream.local_permit;
+                            ctx.managed_route_class = upstream.route_class;
+                            ctx.managed_route_trace = Some(upstream.trace);
+                            Ok(upstream.response)
+                        }
+                        Ok(None) => Err(anyhow::anyhow!(
+                            "distributed managed provider did not produce an attempt"
+                        )),
+                        Err(error) => {
+                            if let Some(trace) = error.trace() {
+                                ctx.managed_route_trace = Some(trace.clone());
+                            }
+                            if let Some(reason) = error.public_reason() {
+                                ctx.managed_fallback_reason = Some(reason);
+                            }
+                            Err(anyhow::Error::new(error))
+                        }
+                    }
+                }
+                Err(error) => Err(error),
             }
-        }
-        .instrument(attempt_span)
-        .await;
+        } else {
+            async {
+                if let Some((bypass_body, native_path)) = upstream_call {
+                    AI_CLIENT
+                        .load()
+                        .forward_native_bypass(provider, &method_str, native_path, bypass_body)
+                        .await
+                } else {
+                    AI_CLIENT
+                        .load()
+                        .forward_request(provider, &path, &attempt_body)
+                        .await
+                }
+            }
+            .instrument(attempt_span)
+            .await
+        };
+        ctx.ai_serve_model = local_public_model.clone();
 
         match result {
             Ok(resp) => {
@@ -2825,7 +3123,13 @@ pub(super) async fn handle_ai_proxy(
                         attempt,
                     )
                 });
-                if is_failover && (retry_by_status || retry_by_policy) && attempt + 1 < max_attempts
+                let terminal_managed =
+                    crate::server::model_host::is_terminal_managed_response(&resp);
+                let managed_provider_fallback = ctx.managed_fallback_reason.is_some();
+                if (is_failover || managed_provider_fallback)
+                    && !terminal_managed
+                    && (retry_by_status || retry_by_policy)
+                    && attempt + 1 < effective_max_attempts
                 {
                     // WOR-1103: record the failed attempt so per-provider
                     // load distribution and failure rates are visible,
@@ -2851,6 +3155,17 @@ pub(super) async fn handle_ai_proxy(
                     // Consume the response body to avoid connection leak.
                     let _ = resp.bytes().await;
                     continue;
+                }
+                if managed_provider_fallback
+                    && !terminal_managed
+                    && (retry_by_status || retry_by_policy)
+                {
+                    sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                    let _ = resp.bytes().await;
+                    last_error = Some(anyhow::anyhow!(
+                        "fallback provider returned retryable HTTP status {status}"
+                    ));
+                    break;
                 }
                 // WOR-1545: content-policy fallback. A 4xx may be a
                 // content-policy / safety refusal rather than a client
@@ -2895,7 +3210,15 @@ pub(super) async fn handle_ai_proxy(
                         continue;
                     }
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
-                    return send_response(session, status, &content_type, &body_bytes).await;
+                    let extras = public_route_headers(ctx);
+                    return send_response_with_extras(
+                        session,
+                        status,
+                        &content_type,
+                        &body_bytes,
+                        &extras,
+                    )
+                    .await;
                 }
                 // WOR-1103: this provider's response is the one we keep.
                 // HTTP error statuses still count as provider-attempt
@@ -2965,7 +3288,19 @@ pub(super) async fn handle_ai_proxy(
                     ai_metric_error_kind_for_span_error_type(last_error_type),
                 );
                 last_error = Some(e);
-                if attempt + 1 >= max_attempts {
+                if ctx.managed_fallback_reason.is_some() && attempt + 1 < provider_order.len() {
+                    let to_provider = provider_order
+                        .get(attempt + 1)
+                        .map(|&i| config.providers[i].name.clone())
+                        .unwrap_or_default();
+                    sbproxy_ai::ai_metrics::record_failover(
+                        &provider.name,
+                        &to_provider,
+                        "managed_cold_fallback",
+                    );
+                    continue;
+                }
+                if attempt + 1 >= effective_max_attempts {
                     break;
                 }
                 // WOR-1535: count the transport-failure handover.
@@ -3195,6 +3530,17 @@ pub(super) async fn handle_ai_proxy(
             )
             .await
         }
+    } else if let Some(reason) = ctx.managed_fallback_reason {
+        sbproxy_ai::tracing_spans::record_error(
+            &ai_span,
+            sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
+            "managed model unavailable after provider fallback",
+        );
+        let body =
+            crate::server::model_host::managed_error_body(ctx.request_id.as_str(), reason, true);
+        let mut extras = public_logical_model_header(ctx);
+        extras.push(("retry-after".to_string(), "1".to_string()));
+        send_response_with_extras(session, 503, "application/json", &body, &extras).await
     } else if let Some(e) = last_error {
         sbproxy_ai::tracing_spans::record_error(
             &ai_span,
@@ -3346,6 +3692,37 @@ fn ai_string_indicates_content_filter(value: &str) -> bool {
         || normalized.contains("responsibleai")
 }
 
+fn public_route_headers(ctx: &RequestContext) -> Vec<(String, String)> {
+    let Some(logical_model) = ctx
+        .ai_serve_model
+        .as_deref()
+        .or(ctx.ai_logical_model.as_deref())
+    else {
+        return Vec::new();
+    };
+    if let Some(route_class) = ctx.managed_route_class {
+        return crate::model_discovery::safe_route_headers(logical_model, route_class.into());
+    }
+    if ctx.managed_route_trace.is_none() {
+        return crate::model_discovery::safe_route_headers(
+            logical_model,
+            crate::model_discovery::PublicRouteClass::External,
+        );
+    }
+    vec![(
+        "x-sbproxy-logical-model".to_string(),
+        logical_model.to_string(),
+    )]
+}
+
+fn public_logical_model_header(ctx: &RequestContext) -> Vec<(String, String)> {
+    ctx.ai_serve_model
+        .as_deref()
+        .or(ctx.ai_logical_model.as_deref())
+        .map(|model| vec![("x-sbproxy-logical-model".to_string(), model.to_string())])
+        .unwrap_or_default()
+}
+
 /// Relay a non-streaming AI response back to the client. When the
 /// upstream provider speaks a non-OpenAI wire format, the response
 /// body is translated back into OpenAI shape so OpenAI SDK clients
@@ -3368,12 +3745,20 @@ pub(super) async fn relay_ai_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
 
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
 
     let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
     let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
-    send_response(session, status, &content_type, &translated).await
+    let extras = retry_after
+        .map(|value| vec![("retry-after".to_string(), value)])
+        .unwrap_or_default();
+    send_response_with_extras(session, status, &content_type, &translated, &extras).await
 }
 
 /// Read the upstream response body with an optional byte cap. When the
@@ -3475,6 +3860,11 @@ pub(super) async fn relay_ai_response_with_cache(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
 
     // Snapshot headers before we consume the response body.
     let mut captured_headers: std::collections::HashMap<String, String> =
@@ -3937,7 +4327,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 }
             }
         }
-    } else if let Some(ctx) = ctx {
+    } else if let Some(ctx) = ctx.as_deref_mut() {
         // Even without a budget recorder we still want the access log
         // to capture token usage when the upstream returned a body.
         if (200..300).contains(&status) {
@@ -4061,8 +4451,14 @@ pub(super) async fn relay_ai_response_with_cache(
         None => idem_skip_reason,
     };
 
-    let extra: Option<(&str, &str)> = final_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
-    send_response_with_extra(session, status, &content_type, &resp_body, extra).await
+    let mut extras = ctx.as_deref().map(public_route_headers).unwrap_or_default();
+    if let Some(reason) = final_skip_reason {
+        extras.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
+    }
+    if let Some(retry_after) = retry_after {
+        extras.push(("retry-after".to_string(), retry_after));
+    }
+    send_response_with_extras(session, status, &content_type, &resp_body, &extras).await
 }
 
 /// WOR-1044: restore reversible PII placeholders. Walks the body and
@@ -4742,7 +5138,8 @@ pub(super) async fn relay_ai_stream(
         };
 
     // Write SSE response headers.
-    let mut header = pingora_http::ResponseHeader::build(status, Some(3))
+    let route_headers = ctx.as_deref().map(public_route_headers).unwrap_or_default();
+    let mut header = pingora_http::ResponseHeader::build(status, Some(3 + route_headers.len()))
         .map_err(|e| Error::because(ErrorType::InternalError, "failed to build SSE header", e))?;
     header
         .insert_header("content-type", "text/event-stream")
@@ -4753,6 +5150,17 @@ pub(super) async fn relay_ai_stream(
     header
         .insert_header("connection", "keep-alive")
         .map_err(|e| Error::because(ErrorType::InternalError, "failed to set connection", e))?;
+    for (name, value) in &route_headers {
+        header
+            .insert_header(name.clone(), value.clone())
+            .map_err(|error| {
+                Error::because(
+                    ErrorType::InternalError,
+                    "failed to set managed route metadata",
+                    error,
+                )
+            })?;
+    }
     session
         .write_response_header(Box::new(header), false)
         .await?;
@@ -6055,6 +6463,30 @@ mod dynamic_key_resolution_tests {
             "the malformed entry is dropped, the resolve still succeeds"
         );
         assert_eq!(vk.principal_selectors[0].user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn unnamed_virtual_key_principal_never_contains_the_raw_secret() {
+        let secret = "sk-live-raw-secret-material";
+        let rec = KeyRecord::new("unused", "hash", chrono::Utc::now());
+        let mut key = key_record_to_virtual_key(&rec);
+        key.key = secret.to_string();
+        key.name = None;
+
+        let principal = principal_for_resolved_virtual_key("tenant-a", &key);
+
+        assert_eq!(principal.sub, "<unnamed>");
+        assert_eq!(
+            principal.virtual_key.as_ref().map(|key| key.name.as_str()),
+            Some("<unnamed>")
+        );
+        assert_eq!(principal.api_key_id(), "");
+        assert!(
+            !serde_json::to_string(&principal)
+                .expect("serialize principal")
+                .contains(secret),
+            "the raw credential must not reach any serialized principal field"
+        );
     }
 
     #[tokio::test]

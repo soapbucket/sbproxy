@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use sbproxy_config::{
-    ManagedDeploymentConfig, ManagedEngineChoice, ManagedPullPolicy, ManagedRolloutPolicy,
-    ModelHostAuthority, ModelHostControlConfig,
+    ManagedColdStartPolicy, ManagedDeploymentConfig, ManagedEngineChoice, ManagedPullPolicy,
+    ManagedRolloutPolicy, ModelHostAuthority, ModelHostControlConfig,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -494,6 +494,11 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
             ManagedPullPolicy::Manual => PullPolicy::Manual,
         },
         warm: config.warm,
+        cold_start: match config.cold_start.unwrap_or(ManagedColdStartPolicy::Wait) {
+            ManagedColdStartPolicy::Wait => crate::ColdStartPolicy::Wait,
+            ManagedColdStartPolicy::Reject => crate::ColdStartPolicy::Reject,
+            ManagedColdStartPolicy::Fallback => crate::ColdStartPolicy::Fallback,
+        },
         keep_alive_secs: config.keep_alive_secs,
         max_concurrency: config.max_concurrency,
         max_queue_depth: config.max_queue_depth,
@@ -537,6 +542,7 @@ fn lower_legacy_deployment(
         spread_by: Vec::new(),
         pull,
         warm: pull == PullPolicy::OnBoot,
+        cold_start: crate::ColdStartPolicy::Wait,
         keep_alive_secs: entry
             .keep_alive_duration()
             .map(|duration| duration.as_secs()),

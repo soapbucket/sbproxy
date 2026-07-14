@@ -54,4 +54,12 @@ proxy:
 
 origins:
   "gateway.local":
-    action: {type: static, status_code: 200, body: gateway}
+    action:
+      type: ai_proxy
+      routing: fallback_chain
+      providers:
+        - name: local-cluster
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
+          default_model: qwen

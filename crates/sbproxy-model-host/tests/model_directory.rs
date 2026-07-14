@@ -8,9 +8,9 @@ use sbproxy_ai::model_directory::{
     ModelDirectoryExclusionReason, ModelDirectoryHealth,
 };
 use sbproxy_model_host::node_snapshot::{
-    NodeArtifactSnapshot, NodeEngineSnapshot, NodeHealthSnapshot, NodeHealthState,
-    NodeIdentitySnapshot, NodeModelSnapshot, NodeReplicaSnapshot, NodeRole, NodeSnapshotGeneration,
-    RuntimeReplicaIdentity, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+    ModelPlaneHealth, NodeArtifactSnapshot, NodeEngineSnapshot, NodeHealthSnapshot,
+    NodeHealthState, NodeIdentitySnapshot, NodeModelSnapshot, NodeReplicaSnapshot, NodeRole,
+    NodeSnapshotGeneration, RuntimeReplicaIdentity, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
 };
 use sbproxy_model_host::{
     AcceleratorKind, ArtifactCacheState, ArtifactFormat, DeploymentRuntimeState,
@@ -33,6 +33,7 @@ fn fixture() -> NodeModelSnapshot {
         health: NodeHealthSnapshot {
             state: NodeHealthState::Ready,
             reason_codes: Vec::new(),
+            model_plane: ModelPlaneHealth::Ready,
         },
         engines: vec![NodeEngineSnapshot {
             engine: EngineKind::Vllm,
@@ -80,7 +81,7 @@ fn fixture() -> NodeModelSnapshot {
 }
 
 #[test]
-fn snapshot_schema_v1_round_trips_every_operational_field() {
+fn snapshot_schema_v2_round_trips_every_operational_field() {
     let snapshot = fixture();
     snapshot.validate().expect("valid snapshot");
     let encoded = snapshot.to_json().expect("encode snapshot");
@@ -93,6 +94,24 @@ fn snapshot_schema_v1_round_trips_every_operational_field() {
         23 * 1024 * 1024 * 1024
     );
     assert_eq!(decoded.artifacts[0].state.as_str(), "ready");
+    assert_eq!(decoded.health.model_plane, ModelPlaneHealth::Ready);
+    assert_eq!(decoded.devices[0].compute_utilization_millis, None);
+    assert_eq!(decoded.devices[0].memory_occupancy_millis, Some(42));
+}
+
+#[test]
+fn snapshot_model_endpoint_must_be_an_absolute_origin() {
+    for endpoint in [
+        "https://worker-a.internal:9443/models",
+        "https://worker-a.internal:9443?debug=1",
+        "https://worker-a.internal:9443#fragment",
+    ] {
+        let mut snapshot = fixture();
+        snapshot.node.model_endpoint = Some(endpoint.to_string());
+        snapshot.replicas[0].endpoint = Some(endpoint.to_string());
+
+        assert!(snapshot.validate().is_err(), "{endpoint}");
+    }
 }
 
 #[test]
@@ -310,6 +329,30 @@ fn directory_joins_every_member_and_calls_out_unhealthy_nodes() {
 }
 
 #[test]
+fn directory_keeps_current_generation_cold_candidates_and_device_utilization() {
+    let directory = ModelDirectory::new();
+    let mut snapshot = snapshot_for("worker-a", 10);
+    snapshot.replicas[0].state = DeploymentRuntimeState::Preparing;
+    snapshot.devices[0].compute_utilization_millis = Some(720);
+    snapshot.devices[0].memory_occupancy_millis = Some(640);
+    let view = directory
+        .refresh(
+            snapshot.published_at_unix_ms + 1_000,
+            vec![member("worker-a", DirectoryMemberState::Alive)],
+            BTreeMap::from([("worker-a".to_string(), observed(&snapshot))]),
+        )
+        .expect("directory refresh");
+
+    assert!(!view.eligible_replicas.contains_key("coder"));
+    let replica = &view.candidate_replicas["coder"][0];
+    assert_eq!(replica.state, DeploymentRuntimeState::Preparing);
+    assert_eq!(replica.compute_utilization_millis, Some(720));
+    assert_eq!(replica.memory_occupancy_millis, Some(640));
+    assert_eq!(replica.model_plane_health, ModelPlaneHealth::Ready);
+    assert_eq!(replica.adapters, vec!["sql".to_string()]);
+}
+
+#[test]
 fn directory_reports_snapshot_failure_classes_without_raw_details() {
     let directory = ModelDirectory::new();
     let now = fixture().published_at_unix_ms + 1_000;
@@ -425,6 +468,16 @@ fn schema_zero_normalizes_and_readers_hold_immutable_views() {
         .as_object_mut()
         .unwrap()
         .remove("active_deployment_digest");
+    for device in payload["devices"].as_array_mut().unwrap() {
+        device
+            .as_object_mut()
+            .unwrap()
+            .remove("compute_utilization_millis");
+        device
+            .as_object_mut()
+            .unwrap()
+            .remove("memory_occupancy_millis");
+    }
     let old = directory.load();
     let current = directory
         .refresh(
@@ -451,6 +504,65 @@ fn schema_zero_normalizes_and_readers_hold_immutable_views() {
     assert_eq!(
         current.node("worker-a").unwrap().normalized_schema_version,
         Some(NODE_MODEL_SNAPSHOT_SCHEMA_VERSION)
+    );
+}
+
+#[test]
+fn schema_one_normalizes_without_claiming_model_plane_readiness() {
+    let directory = ModelDirectory::new();
+    let snapshot = snapshot_for("worker-a", 6);
+    let mut payload = serde_json::to_value(&snapshot).expect("snapshot value");
+    payload["schema_version"] = serde_json::json!(1);
+    payload["health"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model_plane");
+    for device in payload["devices"].as_array_mut().unwrap() {
+        device
+            .as_object_mut()
+            .unwrap()
+            .remove("compute_utilization_millis");
+        device
+            .as_object_mut()
+            .unwrap()
+            .remove("memory_occupancy_millis");
+    }
+
+    let current = directory
+        .refresh(
+            snapshot.published_at_unix_ms + 100,
+            vec![member("worker-a", DirectoryMemberState::Alive)],
+            BTreeMap::from([(
+                "worker-a".to_string(),
+                DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+                    publisher_node_id: "worker-a".to_string(),
+                    schema_version: 1,
+                    generation: snapshot.generation,
+                    published_at_unix_ms: snapshot.published_at_unix_ms,
+                    expires_at_unix_ms: snapshot.expires_at_unix_ms,
+                    authenticated_identity: None,
+                    payload,
+                }),
+            )]),
+        )
+        .expect("v1 refresh");
+
+    let node = current.node("worker-a").expect("normalized worker");
+    assert_eq!(node.observed_schema_version, Some(1));
+    assert_eq!(
+        node.normalized_schema_version,
+        Some(NODE_MODEL_SNAPSHOT_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        node.reported_health.as_ref().unwrap().model_plane,
+        ModelPlaneHealth::Unavailable
+    );
+    assert_eq!(node.health, ModelDirectoryHealth::Degraded);
+    assert!(node.model_eligible);
+    assert!(!current.eligible_replicas.contains_key("coder"));
+    assert_eq!(
+        current.candidate_replicas["coder"][0].model_plane_health,
+        ModelPlaneHealth::Unavailable
     );
 }
 

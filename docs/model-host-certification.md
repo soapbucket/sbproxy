@@ -1,6 +1,6 @@
 # Model host hardware certification
 
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-13*
 
 This page separates evidence already produced by deterministic tests from work
 that requires a real accelerator. It is an evidence ledger and a repeatable
@@ -16,12 +16,47 @@ certification.
 | NVIDIA CUDA single node | pending final GCP PR | Deterministic T4/L4 descriptors, vLLM plans, container isolation, and CUDA llama.cpp source-build tests exist. No live claim is made in this PR. |
 | NVIDIA multi-GPU | pending final GCP PR | Placement and device-scoping tests only. |
 | Local multi-process cluster control | passed 2026-07-11 | Four real processes, enrolled identities, signed gossip and state, node-specific mTLS, controller restart fencing, rolling and recreate transitions, worker loss, post-GC tombstone, partition callout, digest mismatch and recovery, and child cleanup. |
-| Three-node GCP runtime | pending final GCP PR | Local control-plane convergence is complete. Live GCP membership, remote inference dispatch, streaming failure drills, and hardware evidence remain pending. |
+| Local three-process data plane | passed 2026-07-13 | A gateway and two workers prove authenticated HTTP/2 dispatch, logical discovery, unary and SSE responses, coordinated cold start, pre-output failover, no mid-stream replay, cancellation, permit release, and absence of the bearer sentinel from worker logs. |
+| Three-node GCP runtime | pending final GCP PR | Local control and data planes are complete. Live GCP networking, NVIDIA engines, and hardware evidence remain pending. |
 
 The generated [capability matrix](model-host-capabilities.md) records Apple
-Metal and the deterministic cluster control plane as stable. NVIDIA stays at
-`preview`, and remote dispatch stays `unsupported`, until their owning gates are
-recorded.
+Metal and the deterministic cluster control plane as stable. Remote dispatch,
+NVIDIA, and GCP multi-node certification stay at `preview` until their owning
+executable and live gates are recorded.
+
+### Local data-plane evidence from 2026-07-13
+
+The hermetic fixture runs a gateway and two worker processes with distinct
+gossip, typed-state, admin, model-plane, and loopback engine ports. It uses an
+explicit development shared key so it can run in CI without an enrollment
+authority. Production mTLS authentication has separate envelope, HTTP/2, TLS,
+and peer-identity tests.
+
+```bash
+cargo build -p sbproxy
+SBPROXY_E2E_BIN=target/debug/sbproxy \
+  cargo test -p sbproxy-e2e --test model_cluster_dispatch -- --nocapture
+```
+
+The gate proves:
+
+- `/v1/models` exposes one logical model with aggregate availability and no
+  node ID, endpoint, or loopback address;
+- two concurrent cold requests share one assigned engine launch;
+- live reload expands the deployment to two current replicas before failure
+  drills begin;
+- unary and SSE requests traverse a peer, preserve usage and safe route
+  headers, and leave no public bearer sentinel in worker stdout or stderr;
+- a retryable failure before output selects the other current replica;
+- a worker failure after the first SSE frame produces partial output without
+  replaying on the second replica;
+- dropping a client stream cancels the peer and engine work, then a following
+  request proves the admission permit was released;
+- graceful fixture shutdown reaps every proxy and engine process.
+
+This is executable local distributed-serving evidence, not live GCP or NVIDIA
+certification. The split-role example separately documents the production mTLS
+configuration.
 
 ### Local multi-process evidence from 2026-07-11
 
@@ -98,8 +133,12 @@ cargo test -p sbproxy-model-host --test local_admission
 cargo test -p sbproxy-core --test model_host_reload
 cargo test -p sbproxy --test models_lifecycle_cli
 cargo test -p sbproxy-model-host --test placement
+cargo test -p sbproxy-model-host --test capability_contract
+cargo test -p sbproxy-ai --test managed_replica_routing
 cargo test -p sbproxy-core --test cluster_control_plane
+cargo test -p sbproxy-core --test model_plane_envelope --test model_plane_transport --test managed_replica_dispatch
 cargo test -p sbproxy-e2e --test model_cluster_control -- --nocapture
+cargo test -p sbproxy-e2e --test model_cluster_dispatch -- --nocapture
 ```
 
 They prove immutable artifact selection, process argv, container isolation,
@@ -153,21 +192,29 @@ governance, and operator-product slices have landed.
 ### Provision an L4 worker
 
 ```bash
+export SBPROXY_GCP_PROJECT="your-gcp-project-id"
+: "${SBPROXY_GCP_PROJECT:?export SBPROXY_GCP_PROJECT first}"
 gcloud auth login
 scripts/provision-l4.sh up
 scripts/provision-l4.sh ssh
 ```
 
+Set `SBPROXY_GCP_PROJECT` explicitly in every certification shell before using
+the provisioning script. Do not rely on the script's development project
+default for a billable hardware run.
+
 Check regional quota if provisioning fails:
 
 ```bash
 gcloud compute regions describe us-central1 \
+  --project="${SBPROXY_GCP_PROJECT}" \
   --format='value(quotas)'
 ```
 
 Tear the VM down after the run:
 
 ```bash
+: "${SBPROXY_GCP_PROJECT:?export SBPROXY_GCP_PROJECT first}"
 scripts/provision-l4.sh down
 ```
 

@@ -43,6 +43,19 @@ pub enum RolloutPolicy {
     Recreate,
 }
 
+/// Concrete request behavior when a deployment has no ready replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ColdStartPolicy {
+    /// Queue on an assigned replica and share its coordinated engine start.
+    #[default]
+    Wait,
+    /// Return a retryable refusal without launching an engine.
+    Reject,
+    /// Advance to another provider without launching an engine.
+    Fallback,
+}
+
 /// Desired state for one public model deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelDeployment {
@@ -69,6 +82,9 @@ pub struct ModelDeployment {
     /// Warm the deployment before it receives traffic.
     #[serde(default)]
     pub warm: bool,
+    /// Concrete behavior when no current replica is ready.
+    #[serde(default)]
+    pub cold_start: ColdStartPolicy,
     /// Idle lifetime override in seconds.
     #[serde(default)]
     pub keep_alive_secs: Option<u64>,

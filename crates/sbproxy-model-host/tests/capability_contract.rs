@@ -36,7 +36,7 @@ fn registry_covers_every_domain_and_validates() {
 }
 
 #[test]
-fn model_host_capabilities_match_the_cluster_control_plane_boundary() {
+fn model_host_capabilities_match_the_distributed_data_plane_boundary() {
     let registry = capability_registry();
     let status = |id: &str| {
         registry
@@ -64,16 +64,13 @@ fn model_host_capabilities_match_the_cluster_control_plane_boundary() {
     for id in [
         "engine.vllm_uv",
         "engine.vllm_container",
+        "cluster.remote_dispatch",
+        "policy.local_provider_governance",
         "admin.model_management",
         "platform.nvidia_cuda",
     ] {
         assert_eq!(status(id), SupportLevel::Preview, "{id}");
     }
-    assert_eq!(
-        status("cluster.remote_dispatch"),
-        SupportLevel::Unsupported,
-        "cluster.remote_dispatch"
-    );
 }
 
 #[test]
@@ -186,9 +183,10 @@ fn markdown_is_deterministic_and_exposes_all_support_levels() {
     assert_eq!(first, second);
     assert!(first.starts_with("# Model-host capability matrix\n*Last modified: 2026-07-13*\n"));
     assert!(first.contains("Registry version: `1`"));
-    for status in ["stable", "preview", "config_only", "unsupported"] {
+    for status in ["stable", "preview", "config_only"] {
         assert!(first.contains(&format!("`{status}`")), "missing {status}");
     }
+    assert!(first.contains("| `cluster.remote_dispatch` | `cluster` | `preview` |"));
     assert!(
         !first.contains('\u{2014}'),
         "generated docs must not use em dashes"

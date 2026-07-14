@@ -23,7 +23,8 @@ proxy:
     transport_port: ${SB_TRANSPORT_PORT:-18946}
     advertise_addr: "127.0.0.1:${SB_GOSSIP_PORT:-17946}"
     transport_advertise_addr: "127.0.0.1:${SB_TRANSPORT_PORT:-18946}"
-    model_endpoint: "https://127.0.0.1:${SB_MODEL_PORT:-19443}"
+    model_bind: "127.0.0.1:${SB_MODEL_PORT:-19443}"
+    model_endpoint: "http://127.0.0.1:${SB_MODEL_PORT:-19443}"
     state_dir: "${SB_STATE_DIR:-./state/node-a}"
     snapshot_ttl_secs: 10
     publish_interval_secs: 2
@@ -81,6 +82,7 @@ origins:
   "localhost":
     action:
       type: ai_proxy
+      routing: fallback_chain
       providers:
         - name: local
           provider_type: managed_model

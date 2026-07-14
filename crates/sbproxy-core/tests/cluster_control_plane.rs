@@ -91,7 +91,7 @@ cluster:
   node_id: worker-a
   roles: [worker]
   labels: {{zone: a}}
-  model_endpoint: https://127.0.0.1:9443
+  model_endpoint: http://127.0.0.1:9443
   state_dir: {}
   security:
     mode: shared_key
@@ -120,6 +120,7 @@ cluster:
         health: NodeHealthSnapshot {
             state: NodeHealthState::Unhealthy,
             reason_codes: vec!["fixture_unhealthy".to_string()],
+            model_plane: sbproxy_model_host::node_snapshot::ModelPlaneHealth::Unavailable,
         },
         engines: Vec::new(),
         devices: Vec::new(),

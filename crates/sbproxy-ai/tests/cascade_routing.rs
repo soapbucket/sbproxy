@@ -159,6 +159,7 @@ async fn cascade_below_threshold_falls_through_to_next_tier() {
         .forward_cascade(
             &cfg,
             &cascade,
+            &[],
             "/v1/chat/completions",
             &chat_body("hi"),
             &sbproxy_ai::attribution::AttributionTags::default(),
@@ -217,6 +218,7 @@ async fn cascade_above_threshold_short_circuits() {
         .forward_cascade(
             &cfg,
             &cascade,
+            &[],
             "/v1/chat/completions",
             &chat_body("hi"),
             &sbproxy_ai::attribution::AttributionTags::default(),
@@ -275,6 +277,7 @@ async fn cascade_cost_cap_stops_retry_mid_cascade() {
         .forward_cascade(
             &cfg,
             &cascade,
+            &[],
             "/v1/chat/completions",
             &chat_body("hi"),
             &sbproxy_ai::attribution::AttributionTags::default(),
@@ -330,6 +333,7 @@ async fn cascade_empty_response_falls_through() {
         .forward_cascade(
             &cfg,
             &cascade,
+            &[],
             "/v1/chat/completions",
             &chat_body("hi"),
             &sbproxy_ai::attribution::AttributionTags::default(),
@@ -379,6 +383,7 @@ async fn cascade_metric_increments_per_tier_outcome() {
         .forward_cascade(
             &cfg,
             &cascade,
+            &[],
             "/v1/chat/completions",
             &chat_body("hi"),
             &sbproxy_ai::attribution::AttributionTags::default(),

@@ -916,6 +916,21 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     super::model_host::reconcile_model_runtime_blocking(&pipeline, config_dir)
         .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
     let _model_runtime_shutdown = ModelRuntimeShutdownGuard;
+    let model_plane_body_limit = pipeline
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::AiProxy(action) => Some(
+                action
+                    .config
+                    .max_body_size
+                    .unwrap_or(DEFAULT_MODEL_PLANE_BODY_LIMIT),
+            ),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(DEFAULT_MODEL_PLANE_BODY_LIMIT);
+    let _model_plane_shutdown = start_process_model_plane(model_plane_body_limit)?;
 
     // Store in hot-reload slot.
     reload::load_pipeline(pipeline);
@@ -1541,11 +1556,132 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // subprocesses. `run()` returns after the same signal-driven lifecycle,
     // allowing the model-runtime guard below to stop every engine first.
     server.run(pingora_core::server::RunArgs::default());
+    drop(_model_plane_shutdown);
     drop(_model_runtime_shutdown);
     Ok(())
 }
 
 struct ModelRuntimeShutdownGuard;
+
+const DEFAULT_MODEL_PLANE_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+struct ModelPlaneShutdownGuard {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn start_process_model_plane(
+    max_request_body_bytes: usize,
+) -> anyhow::Result<Option<ModelPlaneShutdownGuard>> {
+    use sbproxy_model_host::node_snapshot::ModelPlaneHealth;
+
+    let runtime = super::model_host::model_runtime_manager();
+    let Some(config) = crate::cluster::current_process_model_plane_config() else {
+        runtime.set_model_plane_health(ModelPlaneHealth::Unavailable);
+        return Ok(None);
+    };
+    runtime.set_model_plane_health(ModelPlaneHealth::Degraded);
+    let local_node_id = config.cluster.identity().node_id.clone();
+    let execution = crate::model_plane::WorkerModelExecution::production(
+        runtime.clone(),
+        local_node_id.clone(),
+    );
+    let security = match config.security.as_ref() {
+        crate::cluster::ModelPlaneSecurity::Mtls { tls, .. } => {
+            crate::model_plane::ModelPlaneServerSecurity::Mtls {
+                tls: tls.clone(),
+                cluster: config.cluster.clone(),
+            }
+        }
+        crate::cluster::ModelPlaneSecurity::DevelopmentSharedKey { key } => {
+            crate::model_plane::ModelPlaneServerSecurity::DevelopmentSharedKey {
+                key: std::sync::Arc::from(key.as_bytes()),
+            }
+        }
+    };
+    let max_request_body_bytes = if max_request_body_bytes == 0 {
+        DEFAULT_MODEL_PLANE_BODY_LIMIT
+    } else {
+        max_request_body_bytes.min(1024 * 1024 * 1024)
+    };
+    let server_config = crate::model_plane::ModelPlaneServerConfig::new(
+        config.bind_addr,
+        local_node_id,
+        max_request_body_bytes,
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let thread_runtime = runtime.clone();
+    let thread = std::thread::Builder::new()
+        .name("sbproxy-model-plane".to_string())
+        .spawn(move || {
+            let executor = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(executor) => executor,
+                Err(error) => {
+                    thread_runtime.set_model_plane_health(ModelPlaneHealth::Unavailable);
+                    let _ = ready_tx.send(Err(format!("build model-plane runtime: {error}")));
+                    return;
+                }
+            };
+            executor.block_on(async move {
+                let server = match crate::model_plane::ModelPlaneServer::start(
+                    server_config,
+                    security,
+                    execution,
+                )
+                .await
+                {
+                    Ok(server) => server,
+                    Err(error) => {
+                        thread_runtime.set_model_plane_health(ModelPlaneHealth::Unavailable);
+                        let _ = ready_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                thread_runtime.set_model_plane_health(ModelPlaneHealth::Ready);
+                let _ = ready_tx.send(Ok(server.local_addr()));
+                if let Err(error) = server.shutdown_on(shutdown_rx).await {
+                    tracing::error!(code = error.code(), "private model-plane listener stopped");
+                }
+                thread_runtime.set_model_plane_health(ModelPlaneHealth::Unavailable);
+            });
+        })
+        .map_err(|error| anyhow::anyhow!("spawn model-plane listener: {error}"))?;
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Ok(local_addr)) => {
+            tracing::info!(%local_addr, "private model-plane listener ready");
+            Ok(Some(ModelPlaneShutdownGuard {
+                shutdown: Some(shutdown_tx),
+                thread: Some(thread),
+            }))
+        }
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            anyhow::bail!("start private model-plane listener: {error}")
+        }
+        Err(error) => {
+            let _ = shutdown_tx.send(());
+            let _ = thread.join();
+            anyhow::bail!("wait for private model-plane listener: {error}")
+        }
+    }
+}
+
+impl Drop for ModelPlaneShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::error!("private model-plane listener thread panicked");
+            }
+        }
+    }
+}
 
 impl Drop for ModelRuntimeShutdownGuard {
     fn drop(&mut self) {

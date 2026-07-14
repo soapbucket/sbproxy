@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-13*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -37,6 +37,61 @@ API keys support environment variable interpolation with `${VAR_NAME}` syntax. N
 66 native providers ship in-tree alongside native translators for Anthropic, Gemini, and Bedrock. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
 
 Any model a listed provider serves works without extra config. For a self-hosted or proprietary endpoint, point `vllm` or any provider at it with a custom `base_url`. `openrouter` is available as one of the providers when you want many vendors behind a single key. See `providers.md` for the full per-provider table.
+
+### Managed local and cluster models
+
+Use `provider_type: managed_model` to route a public model name to a deployment
+owned by `proxy.model_host`:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      routing: fallback_chain
+      providers:
+        - name: managed-qwen
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
+          default_model: qwen
+        - name: openrouter
+          api_key: ${OPENROUTER_API_KEY}
+          models: [qwen]
+```
+
+The normal caller authentication, provider allowlist, model allowlist, policy,
+budget, and routing stages run before managed replica selection. A ready
+co-located replica uses the local fast path. A ready remote replica uses the
+authenticated private HTTP/2 model plane. Public bearer credentials stop at
+the gateway and are not sent to workers or engines.
+
+Every AI origin serves `GET /v1/models` and `GET /models` locally as an
+OpenAI-compatible logical list built from its configured eligible providers and
+models. Managed entries report aggregate `ready`, `cold`, or `unavailable`
+state, ready and desired replica counts, and bounded capability names. The list
+omits worker identity, engine ports, and private endpoints. It does not call an
+ordinary provider's native model-list endpoint or reproduce provider-specific
+model metadata.
+
+Successful completions add `x-sbproxy-logical-model` and an allowlisted
+`x-sbproxy-route-class` of `local`, `peer`, or `external`. Managed availability
+and cold-start failures that expose a public reason use an OpenAI-style
+`managed_model_error` body with a stable code, request ID, retryable flag, and
+`sbproxy_reason`. Other resolution, authentication, TLS, and transport failures
+use the gateway's generic error path; private detail remains in bounded logs
+and metrics. Replica failover is permitted only before client output. A partial
+stream is never replayed on another worker, and client cancellation propagates
+to the selected engine.
+
+Deployment `cold_start` chooses how a no-ready-replica state behaves. `wait`
+coordinates one bounded launch per selected replica generation, `reject`
+returns a retryable `503` with
+`Retry-After: 1`, and `fallback` advances to the next provider without
+launching. For `authority: file_managed`, omission follows the security
+profile: production mTLS clusters use `fallback`, while development and
+single-process runtimes use `wait`. Admin-managed and cluster-authority
+deployments must set `cold_start` explicitly.
 
 ## Model-based provider selection
 
@@ -957,10 +1012,13 @@ Provider capability is the source of truth for which surfaces a configured provi
 |---|---|
 | `chat_completions` | normalised to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
 | `messages`, `responses` | native-format inbound shims that translate down to the same hub shape as chat completions |
-| `models` | **passthrough only**: the gateway forwards the upstream's native model-list body unchanged. Clients calling `/v1/models` through a non-OpenAI provider see the upstream's shape, not the OpenAI `{"object": "list", "data": [...]}` envelope |
+| `models` | `GET /v1/models` and `GET /models` are served locally for every AI origin as an OpenAI `{"object": "list", "data": [...]}` logical listing. Other model endpoints use the ordinary GET dispatch path and have no unified response shape. |
 | everything else | passthrough on the providers listed in the table; clients see the upstream's native response shape |
 
-The Models passthrough decision is deliberate. OpenAI returns `{"object": "list", "data": [{"id": "...", "owned_by": "..."}]}`; Anthropic returns `{"data": [{"id": "...", "display_name": "..."}], "has_more": false}`; Google's `models.list` returns `{"models": [{"name": "models/...", "displayName": "..."}]}`. A lossy normalisation would conflate these and mislead clients about per-model metadata. Callers that need a unified shape across providers should consume the proxy's own model registry instead of the passthrough.
+The local list contract is deliberate: it gives clients one topology-free
+discovery shape across ordinary and managed providers without pretending to
+preserve provider-specific metadata. Call the provider directly when native
+model-list fields are required.
 
 ### Method coverage
 

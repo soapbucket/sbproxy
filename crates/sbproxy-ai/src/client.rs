@@ -779,10 +779,14 @@ impl AiClient {
     ///
     /// Streaming requests are out of scope: callers should detect
     /// `body.stream == true` and skip this method.
+    // The cascade boundary deliberately receives policy, request, attribution,
+    // and routing context together so every tier is governed consistently.
+    #[allow(clippy::too_many_arguments)]
     pub async fn forward_cascade(
         &self,
         config: &AiHandlerConfig,
         cascade: &crate::routing::CascadeConfig,
+        allowed_providers: &[String],
         path: &str,
         body: &serde_json::Value,
         tags: &crate::attribution::AttributionTags,
@@ -819,11 +823,14 @@ impl AiClient {
             }
 
             // Find the provider config for this tier.
-            let provider = match config
-                .providers
-                .iter()
-                .find(|p| p.name == tier.provider_id && p.enabled)
-            {
+            let provider = match config.providers.iter().find(|p| {
+                p.name == tier.provider_id
+                    && p.enabled
+                    && (allowed_providers.is_empty()
+                        || allowed_providers
+                            .iter()
+                            .any(|allowed| allowed == p.name.as_str()))
+            }) {
                 Some(p) => p,
                 None => {
                     warn!(

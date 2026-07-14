@@ -1,6 +1,6 @@
 # Model host security
 
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-13*
 
 The model host starts inference processes beside a gateway that may hold cloud
 provider credentials. Treat write access to `sb.yml`, the deployment revision
@@ -19,8 +19,9 @@ Five inputs matter:
 2. The catalog identifies immutable model artifacts and allowed formats.
 3. Engine acquisition selects an executable, uv environment, or container image.
 4. Requests arrive through the gateway and must stay outside process control.
-5. Cluster identity, membership, snapshots, and signed desired state determine
-   which worker may prepare a replica.
+5. Cluster identity, membership, snapshots, signed desired state, and the
+   private dispatch envelope determine which worker may prepare and execute a
+   replica request.
 
 The first three and cluster identity are operator-controlled supply-chain
 inputs. Request callers are untrusted. They may choose only a public model
@@ -236,11 +237,58 @@ expiry, and a durable monotonic cursor before runtime preparation. Failed
 verification or preparation retains the last good bundle. Non-authority admin
 writes fail with `deployment_authority_read_only`.
 
-PR 3 does not carry inference requests between nodes. The advertised private
-model endpoint is authenticated placement data, not yet a dispatch channel.
-Request-envelope signing, replay protection, cancellation, and remote streaming
-belong to the distributed data-plane PR and must land before any remote serving
-claim is promoted.
+## Private model-plane dispatch
+
+Each worker may bind one dedicated `model_bind` socket and advertise one
+`model_endpoint`. The listener accepts only HTTP/2 requests on
+`/_sbproxy/model-plane/v1/dispatch`. It rejects public `Authorization` and
+`x-api-key` headers, non-POST methods, other paths, oversized headers or bodies,
+and non-HTTP/2 requests. The engine still binds to loopback, and the worker
+forwards only the allowlisted content type plus the verified request body with
+its model field rewritten to the deployment's engine model.
+
+Production uses mutual TLS with HTTP/2 ALPN. Both sides verify the cluster CA
+and configured server-name SAN. The signed dispatch proof is also bound to the
+negotiated client leaf fingerprint, and its authenticated issuer must have the
+gateway role. The audience is the exact worker node ID. A valid TLS connection
+without a valid peer proof cannot dispatch. An enrolled peer proof presented on
+the development transport, or a development HMAC presented on mTLS, also fails.
+
+Explicit development mode uses h2c plus HMAC-SHA256 under the configured shared
+key. It requires `security.mode: shared_key` and `development: true`. Production
+mTLS endpoints must use `https://`; development endpoints must use `http://`.
+Do not expose either transport to a public network.
+
+The strict signed envelope authenticates:
+
+- issuer and audience node IDs, request ID, and a unique nonce;
+- issue and expiry time, with at most 30 seconds of lifetime and 5 seconds of
+  future clock skew; gateways currently issue a 10-second lifetime;
+- a hop count of exactly one;
+- bounded tenant ID, governed key ID, and evaluated policy revision;
+- deployment ID and current generation, public logical model, and priority;
+- allowlisted POST path, content type, and SHA-256 of the exact body.
+
+The worker rechecks audience, generation assignment, admission, engine state,
+and body digest. Its replay fence atomically tracks up to 65,536 live
+issuer/nonce pairs, prunes expired entries, rejects duplicates, and fails closed
+when full. Authentication, replay, TLS, and policy-context errors are terminal
+security failures and are not retried as capacity. Stale assignments, queue
+pressure, or pre-output transport failures may advance to another current
+replica when their bounded retry class permits it.
+
+The gateway may retry only before any downstream response header or token. Once
+output begins, a broken upstream produces a partial stream and is never replayed
+on another worker. Client cancellation drops the HTTP/2 stream, the worker's
+loopback engine request, and its held admission permit. This bounds abandoned
+work without forwarding the caller's bearer credential.
+
+Public response metadata is limited to the logical model and route class
+`local`, `peer`, or `external`. Logical model discovery publishes aggregate
+availability and capabilities, not worker IDs, certificates, engine ports, or
+private endpoints. Private failure codes and retry classes are bounded metric
+labels. Raw keys, prompts, bodies, and peer addresses do not enter those labels
+or route traces.
 
 ## Remaining hardening
 
@@ -253,7 +301,8 @@ contract:
 - signature verification for every engine release and package index;
 - a rootless container requirement;
 - persistent desired-state mutation with review and approval in the admin UI;
-- authenticated request authorization for multi-node model dispatch.
+- strict distributed budget reservation and lease recovery across gateways;
+- complete server-derived key introspection for every managed route decision.
 
 Live NVIDIA and multi-node validation runs on GCP in the final PR group. Until
 that evidence is recorded, NVIDIA uv, container, and CUDA source-build paths

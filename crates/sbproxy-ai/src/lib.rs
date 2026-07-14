@@ -33,6 +33,7 @@ pub mod image;
 pub mod judge;
 pub mod key_scoping;
 pub mod local_host;
+pub mod managed_replica;
 pub mod model_alias;
 pub mod model_directory;
 pub mod multimodal;

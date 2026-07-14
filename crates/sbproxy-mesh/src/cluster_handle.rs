@@ -109,11 +109,17 @@ impl ClusterIdentity {
         }
         if let Some(endpoint) = self.model_endpoint.as_deref() {
             let valid = url::Url::parse(endpoint).is_ok_and(|url| {
-                matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
             });
             if !valid || endpoint.len() > 2048 || endpoint.chars().any(char::is_control) {
                 return Err(ClusterStateError::InvalidIdentity(
-                    "model_endpoint must be a bounded absolute HTTP URL".to_string(),
+                    "model_endpoint must be a bounded absolute HTTP origin".to_string(),
                 ));
             }
         }
@@ -201,6 +207,12 @@ pub enum ClusterStateError {
     /// System clock could not produce a Unix timestamp.
     #[error("cluster state clock is before the Unix epoch")]
     Clock,
+    /// This handle has no enrolled peer identity authenticator.
+    #[error("cluster peer authentication is unavailable")]
+    AuthenticationUnavailable,
+    /// A peer identity payload could not be signed or verified.
+    #[error("cluster peer authentication failed: {0}")]
+    Authentication(String),
 }
 
 /// Validated typed state and its transport metadata.
@@ -370,6 +382,32 @@ impl ClusterHandle {
     /// Immutable installed identity.
     pub fn identity(&self) -> &ClusterIdentity {
         &self.inner.identity
+    }
+
+    /// Sign a domain-separated application payload with this node's enrolled identity.
+    pub fn sign_peer_payload(
+        &self,
+        context: &str,
+        payload: &[u8],
+    ) -> Result<crate::peer_identity::PeerIdentityProof, ClusterStateError> {
+        self.identity_authenticator()
+            .ok_or(ClusterStateError::AuthenticationUnavailable)?
+            .sign(context, payload)
+            .map_err(|error| ClusterStateError::Authentication(error.to_string()))
+    }
+
+    /// Verify a domain-separated application payload and return enrolled peer claims.
+    pub fn verify_peer_payload(
+        &self,
+        context: &str,
+        payload: &[u8],
+        expected_node_id: Option<&str>,
+        proof: &crate::peer_identity::PeerIdentityProof,
+    ) -> Result<crate::peer_identity::AuthenticatedPeerIdentity, ClusterStateError> {
+        self.identity_authenticator()
+            .ok_or(ClusterStateError::AuthenticationUnavailable)?
+            .verify(context, payload, expected_node_id, proof)
+            .map_err(|error| ClusterStateError::Authentication(error.to_string()))
     }
 
     /// Selected local or distributed implementation.
@@ -873,6 +911,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_endpoint_identity_must_be_an_absolute_origin() {
+        for endpoint in [
+            "https://worker-a.internal:9443/models",
+            "https://worker-a.internal:9443?debug=1",
+            "https://worker-a.internal:9443#fragment",
+        ] {
+            let identity = ClusterIdentity {
+                cluster_id: "cluster-a".to_string(),
+                node_id: "worker-a".to_string(),
+                roles: BTreeSet::from([ClusterNodeRole::Worker]),
+                labels: BTreeMap::new(),
+                peer_address: None,
+                model_endpoint: Some(endpoint.to_string()),
+            };
+
+            assert!(identity.validate().is_err(), "{endpoint}");
+        }
+    }
+
     #[tokio::test]
     async fn malformed_envelope_is_reported_without_raw_bytes() {
         let handle = ClusterHandle::local(ClusterIdentity {
@@ -951,6 +1009,45 @@ mod tests {
         assert!(matches!(
             recovered,
             ClusterStateRead::Present(ClusterStateRecord { generation: 8, .. })
+        ));
+    }
+
+    #[test]
+    fn handle_signs_and_verifies_a_domain_separated_peer_payload() {
+        let (_temp, handle) = enrolled_handle();
+        let proof = handle
+            .sign_peer_payload("sbproxy.model-dispatch.v1", b"payload")
+            .expect("sign peer payload");
+        let identity = handle
+            .verify_peer_payload(
+                "sbproxy.model-dispatch.v1",
+                b"payload",
+                Some("authority-a"),
+                &proof,
+            )
+            .expect("verify peer payload");
+        assert!(identity.roles.contains(&ClusterNodeRole::Gateway));
+        assert!(handle
+            .verify_peer_payload(
+                "sbproxy.other-context.v1",
+                b"payload",
+                Some("authority-a"),
+                &proof,
+            )
+            .is_err());
+
+        let local = ClusterHandle::local(ClusterIdentity {
+            cluster_id: "cluster-a".to_string(),
+            node_id: "worker-a".to_string(),
+            roles: BTreeSet::from([ClusterNodeRole::Worker]),
+            labels: BTreeMap::new(),
+            peer_address: None,
+            model_endpoint: None,
+        })
+        .expect("local handle");
+        assert!(matches!(
+            local.sign_peer_payload("sbproxy.model-dispatch.v1", b"payload"),
+            Err(ClusterStateError::AuthenticationUnavailable)
         ));
     }
 }
