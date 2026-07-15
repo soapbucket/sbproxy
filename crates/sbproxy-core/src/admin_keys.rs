@@ -1868,6 +1868,9 @@ mod tests {
         let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
         let store: Arc<dyn KeyStore> = store;
         let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        // `governance_store` here is a test double (`RecordingGovernanceStore`),
+        // never the concrete `InMemoryGovernanceStore`, so there is no
+        // approximate store to hand off for dissemination.
         let plane = Arc::new(crate::key_plane::KeyPlane::from_parts_with_governance(
             crypto,
             cache,
@@ -1876,6 +1879,7 @@ mod tests {
             None,
             sbproxy_config::KeyGovernanceConfig::default(),
             governance_store,
+            None,
         ));
         crate::key_plane::install_key_plane(plane);
     }

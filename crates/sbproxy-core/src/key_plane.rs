@@ -41,6 +41,7 @@ pub struct KeyPlane {
     oidc_claim_field: Option<String>,
     governance: KeyGovernanceConfig,
     governance_store: Arc<dyn GovernanceStore>,
+    approximate_store: Option<Arc<InMemoryGovernanceStore>>,
 }
 
 impl KeyPlane {
@@ -54,7 +55,7 @@ impl KeyPlane {
         oidc_claim_field: Option<String>,
     ) -> Self {
         let governance = KeyGovernanceConfig::default();
-        let governance_store = build_governance_store(&governance)
+        let (governance_store, approximate_store) = build_governance_store(&governance)
             .expect("default governance store configuration is valid");
         Self::from_parts_with_governance(
             crypto,
@@ -64,10 +65,18 @@ impl KeyPlane {
             oidc_claim_field,
             governance,
             governance_store,
+            approximate_store,
         )
     }
 
     /// Assemble a plane with explicit governed key runtime controls.
+    ///
+    /// `approximate_store` carries the concrete in-memory counter store when
+    /// `governance_store` is backed by it (approximate consistency mode), so
+    /// cross-node dissemination can be spawned against the concrete type.
+    /// Pass `None` for strict (Redis) governance or when `governance_store`
+    /// is not actually an `InMemoryGovernanceStore` (for example, a test
+    /// double).
     pub(crate) fn from_parts_with_governance(
         crypto: KeyCrypto,
         cache: Arc<TtlCache>,
@@ -76,6 +85,7 @@ impl KeyPlane {
         oidc_claim_field: Option<String>,
         governance: KeyGovernanceConfig,
         governance_store: Arc<dyn GovernanceStore>,
+        approximate_store: Option<Arc<InMemoryGovernanceStore>>,
     ) -> Self {
         Self {
             crypto,
@@ -85,6 +95,7 @@ impl KeyPlane {
             oidc_claim_field,
             governance,
             governance_store,
+            approximate_store,
         }
     }
 
@@ -125,6 +136,12 @@ impl KeyPlane {
     /// Shared admission and accounting store for governed requests.
     pub fn governance_store(&self) -> Arc<dyn GovernanceStore> {
         Arc::clone(&self.governance_store)
+    }
+
+    /// The concrete approximate counter store, present only in approximate
+    /// consistency mode. Used to spawn cross-node dissemination.
+    pub fn approximate_store(&self) -> Option<Arc<InMemoryGovernanceStore>> {
+        self.approximate_store.clone()
     }
 
     /// Runtime consistency guarantee mapped explicitly from operator config.
@@ -367,7 +384,15 @@ fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCa
 
 /// Build the governance accounting backend without opening a network
 /// connection. The Redis client connects lazily on the first operation.
-fn build_governance_store(cfg: &KeyGovernanceConfig) -> Result<Arc<dyn GovernanceStore>> {
+///
+/// Returns both the trait-object handle used for admission/accounting and,
+/// only in approximate consistency mode, the concrete `InMemoryGovernanceStore`
+/// (WOR-1835: needed to spawn cross-node counter dissemination, which applies
+/// solely to the approximate tier; strict/Redis governance owns its own
+/// coherence and the second element is `None`).
+fn build_governance_store(
+    cfg: &KeyGovernanceConfig,
+) -> Result<(Arc<dyn GovernanceStore>, Option<Arc<InMemoryGovernanceStore>>)> {
     cfg.validate()
         .map_err(|error| anyhow::anyhow!("validate key_management.governance: {error}"))?;
     let reservation_ttl_millis = cfg
@@ -379,12 +404,14 @@ fn build_governance_store(cfg: &KeyGovernanceConfig) -> Result<Arc<dyn Governanc
 
     match cfg.consistency {
         ConfigGovernanceConsistency::Approximate => {
-            let store = InMemoryGovernanceStore::new(InMemoryGovernanceConfig {
-                reservation_ttl_millis,
-                terminal_retention_millis,
-            })
-            .context("build approximate governance store")?;
-            Ok(Arc::new(store))
+            let store = Arc::new(
+                InMemoryGovernanceStore::new(InMemoryGovernanceConfig {
+                    reservation_ttl_millis,
+                    terminal_retention_millis,
+                })
+                .context("build approximate governance store")?,
+            );
+            Ok((store.clone(), Some(store)))
         }
         ConfigGovernanceConsistency::Strict => {
             let url = match cfg.backend.as_ref() {
@@ -403,7 +430,7 @@ fn build_governance_store(cfg: &KeyGovernanceConfig) -> Result<Arc<dyn Governanc
                 },
             )
             .context("build strict Redis governance store")?;
-            Ok(Arc::new(store))
+            Ok((Arc::new(store), None))
         }
     }
 }
@@ -553,7 +580,7 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
-    let governance_store = build_governance_store(&cfg.governance)?;
+    let (governance_store, approximate_store) = build_governance_store(&cfg.governance)?;
     let crypto = build_crypto(cfg)?;
     let store = build_store(cfg)?;
     let cache = build_cache(cfg, store.clone());
@@ -579,6 +606,7 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
         cfg.oidc_claim_map.as_ref().map(|m| m.claim_field.clone()),
         cfg.governance.clone(),
         governance_store,
+        approximate_store,
     ));
     install_key_plane(plane);
 
@@ -753,6 +781,13 @@ mod tests {
         assert_eq!(plane_health.consistency, direct_health.consistency);
         assert_eq!(plane_health.backend, direct_health.backend);
 
+        // WOR-1835: approximate mode retains the concrete counter store so
+        // cross-node dissemination can be spawned against it.
+        assert!(
+            plane.approximate_store().is_some(),
+            "approximate consistency must expose the concrete in-memory store"
+        );
+
         std::fs::remove_file(&path).ok();
     }
 
@@ -776,6 +811,13 @@ mod tests {
         );
         assert_eq!(plane.governance().lease_ttl_secs, 3);
         assert_eq!(plane.governance().terminal_retention_secs, 9);
+
+        // WOR-1835: strict (Redis) governance owns its own coherence and
+        // must not expose a concrete store for dissemination to spawn.
+        assert!(
+            plane.approximate_store().is_none(),
+            "strict consistency must not expose an in-memory store"
+        );
 
         std::fs::remove_file(&path).ok();
     }
