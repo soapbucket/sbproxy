@@ -839,6 +839,12 @@ fn main() {
     let runtime_telemetry = runtime_telemetry_config_for_cli(&cli);
     init_tracing(log_filter, log_format, runtime_telemetry.as_ref());
 
+    // Resolve secret references in the alert channels and hand the finished set
+    // to the boot-time dispatcher in sbproxy-core (WOR-1884). Done here, in the
+    // binary, because secret resolution owns the vault backends and core does
+    // not depend on them, mirroring how OTLP header secrets resolve above.
+    install_alerting_channels_for_cli(&cli);
+
     // Resolve the graceful-shutdown grace period from the CLI flags / env
     // the operator set (`--grace-time` / `SB_GRACE_TIME`, and
     // `--shutdown-grace-ms` / `SBPROXY_SHUTDOWN_GRACE_MS`) and pass it
@@ -1443,6 +1449,87 @@ fn runtime_telemetry_config(
         export_metrics: raw.export_metrics,
         metrics_interval_secs: raw.metrics_interval_secs,
         headers: resolve_telemetry_headers(&raw.headers),
+    }
+}
+
+/// Resolve secret references in `proxy.alerting.channels` and install the
+/// finished channel set for sbproxy-core's boot-time alert dispatcher (WOR-1884).
+///
+/// Runs only on the serve path. Follows the WOR-1767 fail-loud convention: a
+/// recognized secret reference in `url` / `routing_key` that cannot be resolved
+/// aborts startup rather than reaching PagerDuty or a webhook verbatim.
+fn install_alerting_channels_for_cli(cli: &Cli) {
+    if cli.check || !matches!(cli.cmd, None | Some(Cmd::Serve(_))) {
+        return;
+    }
+    let Some(path) = pick_run_path(cli) else {
+        return;
+    };
+    let Ok(yaml) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(compiled) = sbproxy_config::compile_config(&yaml) else {
+        return;
+    };
+    let Some(alerting) = compiled.server.alerting.as_ref() else {
+        return;
+    };
+    if alerting.channels.is_empty() {
+        return;
+    }
+
+    // Install the process resolver when any channel carries a provider-URI
+    // secret reference; the same idempotent installer telemetry headers use.
+    let has_reference = alerting.channels.iter().any(|c| {
+        [c.url.as_deref(), c.routing_key.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(sbproxy_vault::looks_like_secret_reference_uri)
+    });
+    if has_reference {
+        install_secret_resolver(&path);
+    }
+
+    let channels = alerting
+        .channels
+        .iter()
+        .map(map_alert_channel)
+        .collect::<Vec<_>>();
+    sbproxy_observe::alerting::install_channels(channels);
+}
+
+/// Map a config alert channel to the observe dispatcher shape, resolving any
+/// secret references in `url` / `routing_key`.
+fn map_alert_channel(
+    channel: &sbproxy_config::AlertChannelConfig,
+) -> sbproxy_observe::alerting::AlertChannelConfig {
+    sbproxy_observe::alerting::AlertChannelConfig {
+        channel_type: channel.channel_type.clone(),
+        url: channel.url.as_deref().map(resolve_alerting_secret),
+        headers: channel
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secret: None,
+        routing_key: channel.routing_key.as_deref().map(resolve_alerting_secret),
+    }
+}
+
+/// Resolve a single alert-channel secret value, aborting on a reference that
+/// cannot be resolved. Mirrors [`resolve_telemetry_headers`].
+fn resolve_alerting_secret(value: &str) -> String {
+    let resolver = sbproxy_vault::process_resolver();
+    let resolved = match resolver.as_deref() {
+        Some(r) => r.resolve(value),
+        None => sbproxy_vault::SecretResolver::new().resolve(value),
+    };
+    match resolved {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Fatal: alerting channel secret: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
 

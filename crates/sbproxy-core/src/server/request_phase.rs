@@ -2991,6 +2991,10 @@ pub(super) async fn request_filter(
                                 )
                                 .await?;
                             ctx.served_from_cache = true;
+                            sbproxy_observe::metrics::record_cache(
+                                origin.origin_id.as_ref(),
+                                "hit",
+                            );
 
                             // --- SWR revalidation ---
                             // On a stale serve, kick off a background fetch
@@ -3120,6 +3124,10 @@ pub(super) async fn request_filter(
                                             .await?;
                                         session.write_response_body(Some(body), true).await?;
                                         ctx.served_from_cache = true;
+                                        sbproxy_observe::metrics::record_cache(
+                                            origin.origin_id.as_ref(),
+                                            "hit",
+                                        );
                                         sbproxy_observe::metrics()
                                             .cache_reserve_hits
                                             .with_label_values(&[lookup_origin.as_str()])
@@ -3157,6 +3165,13 @@ pub(super) async fn request_filter(
                         warn!(error = %e, "cache lookup error, bypassing cache");
                     }
                 }
+
+                // Every cache hit above serves the response and returns, so
+                // reaching here means the lookup did not produce a live entry
+                // to serve: a hot miss, a stale entry past the SWR window, a
+                // cold-reserve miss, or a lookup error. All fall through to the
+                // upstream fetch, which is what a cache miss is.
+                sbproxy_observe::metrics::record_cache(origin.origin_id.as_ref(), "miss");
             }
         }
     }

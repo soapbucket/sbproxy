@@ -21,26 +21,15 @@ use sbproxy_capability::{ConfigKeyCapability, SupportLevel};
 /// Kept deliberately short. An entry is a promise that the key is inert *and*
 /// that boot warns when it is set; the moment a key's consumer lands, its entry
 /// is deleted and the warning stops.
-pub const INERT_CONFIG_KEYS: &[ConfigKeyCapability] = &[
-    ConfigKeyCapability {
-        path: "proxy.alerting",
-        support: SupportLevel::ConfigOnly,
-        consumer: None,
-        note: Some(
-            "Channels parse and validate, but no dispatcher is wired at boot, so no \
-             alert is delivered. WOR-1884 wires the dispatcher.",
-        ),
-    },
-    ConfigKeyCapability {
-        path: "proxy.http3",
-        support: SupportLevel::ConfigOnly,
-        consumer: None,
-        note: Some(
-            "Parsed and ignored: HTTP/3 is disabled until native QUIC support lands \
+pub const INERT_CONFIG_KEYS: &[ConfigKeyCapability] = &[ConfigKeyCapability {
+    path: "proxy.http3",
+    support: SupportLevel::ConfigOnly,
+    consumer: None,
+    note: Some(
+        "Parsed and ignored: HTTP/3 is disabled until native QUIC support lands \
              in the proxy engine. Enabling it starts no listener.",
-        ),
-    },
-];
+    ),
+}];
 
 /// Every top-level `proxy:` key the schema actually declares.
 ///
@@ -96,11 +85,11 @@ mod tests {
     }
 
     #[test]
-    fn alerting_is_a_real_key_and_is_classified_inert() {
-        // Guards the exact regression: proxy.alerting must be both a real
-        // schema key and listed here as inert, so the boot warning fires. If
-        // WOR-1884 wires it, this test is what reminds you to delete the entry.
+    fn alerting_is_wired_and_no_longer_classified_inert() {
+        // WOR-1884 wired the dispatcher: proxy.alerting is a real schema key
+        // and is now stable, so it must NOT appear in the inert registry (a
+        // stable key needs no entry) and the boot warning for it is gone.
         assert!(declared_top_level_keys().contains(&"proxy.alerting".to_string()));
-        assert!(INERT_CONFIG_KEYS.iter().any(|k| k.path == "proxy.alerting"));
+        assert!(!INERT_CONFIG_KEYS.iter().any(|k| k.path == "proxy.alerting"));
     }
 }

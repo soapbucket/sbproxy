@@ -403,7 +403,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(sbproxy_cache_hits_total{result=\"hit\"}[5m]) / (rate(sbproxy_cache_hits_total{result=\"hit\"}[5m]) + rate(sbproxy_cache_hits_total{result=\"miss\"}[5m]))",
+          "expr": "rate(sbproxy_cache_results_total{result=\"hit\"}[5m]) / (rate(sbproxy_cache_results_total{result=\"hit\"}[5m]) + rate(sbproxy_cache_results_total{result=\"miss\"}[5m]))",
           "legendFormat": "Hit Ratio",
           "datasource": {
             "type": "prometheus",

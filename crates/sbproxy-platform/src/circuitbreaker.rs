@@ -23,6 +23,18 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+impl CircuitState {
+    /// Stable snake-case name, used as the `from_state` / `to_state` label on
+    /// `sbproxy_circuit_breaker_transitions_total`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::HalfOpen => "half_open",
+        }
+    }
+}
+
 /// A lock-free circuit breaker that protects upstream services from cascading failures.
 ///
 /// State transitions:
@@ -96,19 +108,28 @@ impl CircuitBreaker {
     /// In Closed state, resets the failure counter.
     /// In HalfOpen state, increments success count and closes the circuit once the
     /// success threshold is reached.
-    pub fn record_success(&self) {
+    ///
+    /// Returns the `(from, to)` transition when this call moved the breaker
+    /// (HalfOpen to Closed), or `None` when the state was unchanged, so a
+    /// caller that knows the origin can record it on
+    /// `sbproxy_circuit_breaker_transitions_total`.
+    pub fn record_success(&self) -> Option<(CircuitState, CircuitState)> {
         let current = self.state.load(Ordering::Acquire);
         match current {
             STATE_CLOSED => {
                 self.failure_count.store(0, Ordering::Release);
+                None
             }
             STATE_HALF_OPEN => {
                 let prev = self.success_count.fetch_add(1, Ordering::AcqRel);
                 if prev + 1 >= self.success_threshold {
                     self.transition_to_closed();
+                    Some((CircuitState::HalfOpen, CircuitState::Closed))
+                } else {
+                    None
                 }
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -116,7 +137,13 @@ impl CircuitBreaker {
     ///
     /// In Closed state, increments failure count and opens the circuit if the
     /// threshold is reached. In HalfOpen state, immediately transitions back to Open.
-    pub fn record_failure(&self) {
+    ///
+    /// Returns the `(from, to)` transition when this call opened the breaker
+    /// (Closed to Open on crossing the threshold, or HalfOpen to Open on a
+    /// probe failure), or `None` when the state was unchanged, so a caller
+    /// that knows the origin can record it on
+    /// `sbproxy_circuit_breaker_transitions_total`.
+    pub fn record_failure(&self) -> Option<(CircuitState, CircuitState)> {
         self.last_failure_time
             .store(Self::now_millis(), Ordering::Release);
 
@@ -126,12 +153,16 @@ impl CircuitBreaker {
                 let prev = self.failure_count.fetch_add(1, Ordering::AcqRel);
                 if prev + 1 >= self.failure_threshold {
                     self.transition_to_open();
+                    Some((CircuitState::Closed, CircuitState::Open))
+                } else {
+                    None
                 }
             }
             STATE_HALF_OPEN => {
                 self.transition_to_open();
+                Some((CircuitState::HalfOpen, CircuitState::Open))
             }
-            _ => {}
+            _ => None,
         }
     }
 

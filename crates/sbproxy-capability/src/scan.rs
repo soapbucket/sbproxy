@@ -375,6 +375,70 @@ fn count_tokens(haystack: &str, needle: &str) -> usize {
     count
 }
 
+/// Local names a `use` statement binds a recorder to via `... as <alias>`.
+///
+/// A file may rename a recorder on import:
+///
+/// ```text
+/// use sbproxy_observe::metrics::{record_rate_limit, record_rate_limit_suspend as record_suspend};
+/// ...
+/// record_suspend(workspace);
+/// ```
+///
+/// The call site then reads `record_suspend(`, and a text search for the real
+/// symbol `record_rate_limit_suspend(` never sees it, so a metric with a
+/// genuine production writer is reported dead. `sbproxy_rate_limit_suspend_total`
+/// was exactly this: written on every auto-suspend, invisible to the scanner.
+///
+/// Following the alias is narrow on purpose. It only fires on an explicit
+/// `<symbol> as <ident>` rebinding of the very symbol the registry names, and
+/// the returned alias is counted only in the file that declares it, since a
+/// `use` alias is scoped to its module. It does not chase glob imports or
+/// re-exports.
+fn recorder_aliases(text: &str, symbol: &str) -> Vec<String> {
+    fn ident(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(found) = text[from..].find(symbol) {
+        let at = from + found;
+        let mut i = at + symbol.len();
+        from = i;
+
+        // The symbol must be a whole token, not a suffix of a longer name.
+        let whole = (at == 0 || !ident(bytes[at - 1])) && (i >= bytes.len() || !ident(bytes[i]));
+        if !whole {
+            continue;
+        }
+
+        // Expect `as`, as its own token, then the alias identifier.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if !text[i..].starts_with("as") {
+            continue;
+        }
+        i += 2;
+        if i < bytes.len() && ident(bytes[i]) {
+            continue;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let alias_start = i;
+        while i < bytes.len() && ident(bytes[i]) {
+            i += 1;
+        }
+        if i > alias_start {
+            out.push(text[alias_start..i].to_string());
+        }
+    }
+    out
+}
+
 /// Prove that every metric the registry calls live is driven by production
 /// code, and that every metric it calls dead really is.
 ///
@@ -393,11 +457,18 @@ pub fn verify_writers(metrics: &[MetricCapability], root: &Path) -> Vec<Registry
             Writer::Field(name) => (name, format!(".{name}"), None),
             Writer::Nothing => continue,
         };
+        // A recorder can be called under an import alias; a field cannot.
+        let follow_aliases = matches!(metric.writer, Writer::Recorder(_));
 
         let mut calls = 0usize;
         let mut defined = define.is_none();
         for source in &sources {
             calls += count_tokens(&source.text, &call);
+            if follow_aliases {
+                for alias in recorder_aliases(&source.text, symbol) {
+                    calls += count_tokens(&source.text, &format!("{alias}("));
+                }
+            }
             if let Some(define) = &define {
                 if source.text.contains(define.as_str()) {
                     defined = true;
@@ -810,6 +881,38 @@ pub fn live() { record_thing("a"); }
         // metric dead. A suffix after it is still a different field.
         assert_eq!(count_tokens("metrics().cache_hits.inc()", ".cache_hits"), 1);
         assert_eq!(count_tokens("m.cache_hits_by_tier.inc()", ".cache_hits"), 0);
+    }
+
+    #[test]
+    fn a_recorder_called_only_through_an_alias_is_live() {
+        // rate_limit_budget.rs imports the recorder aliased and only ever calls
+        // the alias, so a search for the real symbol reported a metric that is
+        // written on every auto-suspend as dead.
+        let src = r#"
+use sbproxy_observe::metrics::{record_rate_limit, record_rate_limit_suspend as record_suspend};
+
+fn emit_suspend(ws: &str) {
+    record_suspend(ws);
+}
+"#;
+        assert_eq!(count_tokens(src, "record_rate_limit_suspend("), 0);
+        assert_eq!(
+            recorder_aliases(src, "record_rate_limit_suspend"),
+            vec!["record_suspend".to_string()]
+        );
+        // The aliased call is what makes it live.
+        assert_eq!(count_tokens(src, "record_suspend("), 1);
+    }
+
+    #[test]
+    fn a_bare_symbol_reference_is_not_read_as_an_alias() {
+        // `Writer::Recorder("record_rate_limit_suspend")` and `fn record_rate_limit_suspend(`
+        // both contain the symbol but neither rebinds it, so neither yields an alias.
+        let src = r#"
+writer: Writer::Recorder("record_rate_limit_suspend"),
+pub fn record_rate_limit_suspend(ws: &str) {}
+"#;
+        assert!(recorder_aliases(src, "record_rate_limit_suspend").is_empty());
     }
 
     #[test]
