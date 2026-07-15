@@ -1943,6 +1943,8 @@ origins:
 
 The action speaks JSON-RPC 2.0: `initialize` returns the configured `server_info`, `tools/list` aggregates the federated catalogue, `tools/call` enforces the allowlist guardrail and routes to the upstream that owns the prefix. Tool aggregation, name-collision handling, and the upstream transports (`streamable_http`, `sse`) live in the federation library at `crates/sbproxy-extension/src/mcp/`. See [examples/mcp-federation/](../examples/mcp-federation/) for a runnable config.
 
+The action also carries the tool rollout plane: a `rollout:` block under `tool_versioning` publishes several versions of one tool at once, resolves the right one per consumer (call `_meta`, session requirements, principal pins, `search_v1` aliases, default), routes or adapts each version, and sunsets old ones on a date, with per-version call metrics for migration. See [tool-versioning.md](tool-versioning.md) and [examples/mcp-tool-rollout/](../examples/mcp-tool-rollout/).
+
 ### Listings
 
 A `Listing` is a published, versioned view of an existing Resource (an origin, an MCP server, or a docs surface). Listings live in `listings/*.yaml` alongside `sb.yml`, are version-controlled with the rest of the Repo, and validate through `sbproxy plan`. Each Listing pins its underlying Resource via one of three pinning modes (`pin` for a commit SHA, `track-branch` for a moving branch, `tag` for a release tag).

@@ -1,5 +1,5 @@
 # SBproxy documentation
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-14*
 
 Call any model. Serve your own. Govern both. SBproxy is the open-source OpenRouter alternative: one Apache-2.0 binary that routes to 66 providers or serves the weights on your GPUs, with the guardrails, keys, budgets, and spend ledger applying to every model the same way, and a real Pingora-based reverse proxy underneath for the rest of your traffic.
 
@@ -17,6 +17,7 @@ Each walkthrough takes one problem end to end: a story doc, a runnable example d
 | A LiteLLM proxy you want off of | [Migrate off LiteLLM in an afternoon](migration-litellm.md) |
 | Shadow Ollama under someone's desk | [Guardrails on every prompt, local or hosted](use-case-guardrails-everywhere.md) |
 | AI crawlers eating your content for free | [Meter and monetize the AI that calls you](use-case-meter-crawlers.md) |
+| Internal MCP servers multiplying without an owner | [Federate your MCP tools behind one gateway](mcp.md) |
 | It works on your laptop and on-call starts Monday | [Run it in production](use-case-production-ops.md) |
 
 Broader estate guides, same shape:
@@ -29,15 +30,15 @@ Broader estate guides, same shape:
 
 ## Where to start
 
-New here? Read [manual.md](manual.md) for install and CLI, then [configuration.md](configuration.md) for the schema. The [examples](../examples/) folder has runnable configs you can point the binary at right away.
+New here? Follow the [Getting Started guide](getting-started.md): install, run your first config, validate it, and see where to go next. For the deeper install and CLI reference, see [manual.md](manual.md), then [configuration.md](configuration.md) for the full schema. The [examples](../examples/) folder has runnable configs you can point the binary at right away.
 
 ## Documentation index
 
 ### Getting started
+- [getting-started.md](getting-started.md) - install, run your first config, and where to go next. Start here.
 - [manual.md](manual.md) - install, CLI, runtime, TLS, deployment patterns.
 - [configuration.md](configuration.md) - every `sb.yml` field with examples.
 - [json-schema.md](json-schema.md) - JSON Schema for editor autocomplete + validation of `sb.yml`.
-- [mcp-schema-drift.md](mcp-schema-drift.md) - CI-friendly schema-drift detection for converted MCP servers (the `sbproxy-mcp-drift` CLI).
 - [features.md](features.md) - tour of every feature with copy-paste configs.
 - [admin.md](admin.md) - the admin server: enable it, TLS, the built-in web UI, and the control-plane endpoints (keys, config, metrics, logs, prompts).
 - [troubleshooting.md](troubleshooting.md) - common failure modes and fixes.
@@ -69,7 +70,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [wasm-development.md](wasm-development.md) - writing WebAssembly modules for the `wasm` transform against the WASI preview-1 contract.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
 - [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md) - Archestra-derived MCP guardrails: egress, session risk, quarantine, stdio, run-as-user, and compaction.
-- [tool-versioning.md](tool-versioning.md) - the compatibility oracle: a contract digest and a semver grade per tool (structural, behavioral, and judged), with a version-bump linter that fails an under-bump.
+- [tool-versioning.md](tool-versioning.md) - the rollout plane (publish several versions of one tool, resolve per consumer, adapt, sunset) plus the compatibility oracle: a contract digest and a semver grade per tool, with a version-bump linter that fails an under-bump.
 - [a2a-gateway.md](a2a-gateway.md) - the `a2a` action: typed AgentCard, capability discovery, and modality negotiation helpers.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.
 - [cloudflare-code-mode.md](cloudflare-code-mode.md) - typed TypeScript module emission for Cloudflare Code Mode agents over the MCP federation registry.

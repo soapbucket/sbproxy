@@ -428,13 +428,16 @@ mod tests {
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata, Subscriber};
 
+    type AuditFields = HashMap<String, String>;
+    type CapturedAuditEvents = Vec<(String, AuditFields)>;
+
     #[derive(Clone, Default)]
     struct AuditCapture {
-        events: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+        events: Arc<Mutex<CapturedAuditEvents>>,
     }
 
     struct AuditVisitor<'a> {
-        fields: &'a mut HashMap<String, String>,
+        fields: &'a mut AuditFields,
     }
 
     impl Visit for AuditVisitor<'_> {

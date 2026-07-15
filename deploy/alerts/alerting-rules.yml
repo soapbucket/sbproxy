@@ -134,8 +134,8 @@ groups:
         annotations:
           summary: "Ledger redeem failing fast (14.4x burn over 1h)"
           description: |
-            sbproxy_ledger_redeem_total{result="success"} ratio dropped
-            below the burn threshold. Page ledger operator.
+            The ledger redeem success ratio dropped below the burn
+            threshold. Page ledger operator.
           runbook_url: "https://docs.sbproxy.dev/runbook#rb-ledger-redeem"
 
       - alert: SBPROXY-LEDGER-REDEEM-6H
@@ -180,7 +180,7 @@ groups:
       # .
       - alert: SBPROXY-AUDIT-WRITE-FAILURE
         expr: |
-          increase(sbproxy_audit_emit_total{result="failure"}[5m]) > 0
+          increase(sbproxy_audit_emit_duration_seconds_count{outcome!="ok"}[5m]) > 0
         for: 5m
         labels:
           severity: page
@@ -190,9 +190,9 @@ groups:
         annotations:
           summary: "Audit-log write failures (immediate page)"
           description: |
-            sbproxy_audit_emit_total{result="failure"} incremented in
-            the last 5 minutes. Audit emission must be 100%; sustained
-            failure breaks the SOC 2 compliance contract.
+            A non-ok sbproxy_audit_emit_duration_seconds outcome was
+            recorded in the last 5 minutes. Audit emission must be 100%;
+            sustained failure breaks the SOC 2 compliance contract.
           runbook_url: "https://docs.sbproxy.dev/runbook#rb-audit-write"
 
       - alert: SBPROXY-AUDIT-LATENCY-P99
@@ -229,21 +229,15 @@ groups:
             past it. Log-only.
           runbook_url: "https://docs.sbproxy.dev/runbook#rb-card-budget"
 
-      - alert: SBPROXY-DEPRECATED-FLAG-USE
-        expr: |
-          increase(sbproxy_deprecated_flag_use_total[1h]) > 0
-        for: 1h
-        labels:
-          severity: log
-          slo_id: SLO-DEPRECATION
-          runbook_id: RB-DEPRECATION
-          window: 1h
-        annotations:
-          summary: "Deprecated config flag in use (log-only)"
-          description: |
-            sbproxy_deprecated_flag_use_total incremented in the last 1h.
-            Schedule a config sweep; flag will be removed at next major.
-          runbook_url: "https://docs.sbproxy.dev/runbook#rb-deprecation"
+      # SBPROXY-DEPRECATED-FLAG-USE is deleted, not disabled.
+      #
+      # It alerted on sbproxy_deprecated_flag_use_total, a metric no crate has
+      # ever declared. It could not fire, and a rule that cannot fire is worse
+      # than no rule: it occupies the slot where a working one would go, and it
+      # reads to anyone auditing the file as though deprecation is covered.
+      #
+      # Restoring it means emitting the counter first. The alert can come back
+      # in the same commit that does.
 
   # --- Forward stubs (Waves 2-5) ---
   #

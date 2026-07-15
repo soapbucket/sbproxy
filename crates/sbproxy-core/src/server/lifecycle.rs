@@ -1536,6 +1536,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
              in the proxy engine."
         );
     }
+    warn_on_inert_config_keys(&server_config);
     // if let Some(ref tls) = tls_state {
     //     if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
     //         // Wire the real pipeline dispatch into the H3 listener.
@@ -1849,6 +1850,35 @@ pub(crate) static OP_REDACT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 ///
 /// Called once at boot (from `run`) and on every config reload (from
 /// `reload_from_config_path`) so SIGHUP picks up new tenant caps.
+/// Warn at boot for every top-level config key that parses but does nothing.
+///
+/// The HTTP/3 warning just above is the honest precedent, and this generalizes
+/// it. `proxy.alerting` is the case that motivated the ticket: a config block
+/// that accepts a full PagerDuty routing key, validates it, and then has no
+/// consumer anywhere in the boot path. The operator who set it believes they
+/// are paged. They are not, and until now nothing told them so.
+///
+/// The rule this enforces (`ConfigOnly` keys warn at boot) is registered in
+/// `sbproxy_capability`, and `crates/sbproxy-config/tests/config_key_registry.rs`
+/// checks that every key listed here is genuinely inert and every stable key is
+/// not. The moment WOR-1884 wires alerting, its entry moves to `Stable` and the
+/// warning stops on its own.
+fn warn_on_inert_config_keys(server: &sbproxy_config::ProxyServerConfig) {
+    if server
+        .alerting
+        .as_ref()
+        .is_some_and(|a| !a.channels.is_empty())
+    {
+        tracing::warn!(
+            key = "proxy.alerting",
+            "proxy.alerting.channels is configured but no alert dispatcher is wired \
+             in this build, so no alert will ever be delivered. The channels parse \
+             and are then ignored. Track WOR-1884 for the dispatcher that activates \
+             them."
+        );
+    }
+}
+
 fn install_tenant_cardinality_state(server: &sbproxy_config::ProxyServerConfig) {
     use sbproxy_config::TENANT_CARDINALITY_DEFAULT_MAX_SERIES;
     let limiter = sbproxy_observe::metrics::global_limiter();

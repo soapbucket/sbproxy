@@ -107,9 +107,9 @@ SBproxy reaches 200+ models through 66 native providers behind one OpenAI-compat
 | Virtual keys hashed at rest + runtime revoke | Yes (HMAC + pepper, admin API) | Varies |
 | Upstream creds encrypted at rest | Yes (AEAD envelope or vault ref) | Varies |
 | Verifiable, signed usage ledger | Yes | No |
-| OSS clustering substrate (gossip + CRDTs) | Yes | No |
+| OSS clustering substrate (gossip mesh, no Postgres) | Yes | No |
 | Scripting | CEL + Lua + WASM + JS | No |
-| Rate limiting | Built-in, distributed | Built-in |
+| Rate limiting | Built-in (node-local; cluster-wide needs a shared backend) | Built-in |
 | Response caching | Built-in (memory, file, memcached, redis) | 7 backends |
 | Guardrails | 9 built-in types (PII, injection, ...) | External integrations |
 | P99 proxy overhead | < 1 ms | 240-1200 ms |

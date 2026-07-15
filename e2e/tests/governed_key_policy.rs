@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use jsonwebtoken::{encode, EncodingKey, Header};
 use reqwest::blocking::Client;
 use sbproxy_e2e::{CapturedRequest, MockUpstream, ProxyHarness, Response};
+use serde::Serialize;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -18,6 +20,8 @@ const MCP_HOST: &str = "mcp-policy.localhost";
 const STRICT_A_HOST: &str = "strict-a.localhost";
 const STRICT_B_HOST: &str = "strict-b.localhost";
 const COMPAT_HOST: &str = "compat.localhost";
+const SELECTOR_HOST: &str = "selector.localhost";
+const JWT_SECRET: &str = "governed-key-policy-jwt-secret";
 
 struct TestWorld {
     proxy: ProxyHarness,
@@ -25,6 +29,7 @@ struct TestWorld {
     vertex: MockUpstream,
     admin_port: u16,
     usage_path: PathBuf,
+    access_path: PathBuf,
     _temp: TempDir,
 }
 
@@ -67,6 +72,7 @@ fn test_config(
     admin_port: u16,
     store_path: &Path,
     usage_path: &Path,
+    access_path: &Path,
     openai_base: &str,
     vertex_base: &str,
 ) -> String {
@@ -93,6 +99,16 @@ proxy:
       pepper: governed-key-policy-e2e-pepper
       master_key: governed-key-policy-e2e-master
     failure_mode_allow: false
+    oidc_claim_map:
+      claim_field: key_ref
+access_log:
+  enabled: true
+  sample_rate: 1.0
+  status_codes: [200]
+  methods: [POST]
+  output:
+    type: file
+    path: "{access_path}"
 origins:
   "{MCP_HOST}":
     action:
@@ -185,9 +201,27 @@ origins:
           allow_private_base_url: true
           default_model: gpt-client
           models: [gpt-client]
+  "{SELECTOR_HOST}":
+    tenant_id: tenant-a
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: sk-openai
+          base_url: "{openai_base}"
+          allow_private_base_url: true
+          default_model: gpt-client
+          models: [gpt-client]
+    authentication:
+      type: jwt
+      secret: {JWT_SECRET}
+      algorithms: [HS256]
 "#,
         store_path = store_path.display(),
         usage_path = usage_path.display(),
+        access_path = access_path.display(),
     )
 }
 
@@ -197,11 +231,13 @@ fn start_world() -> TestWorld {
     let temp = tempfile::tempdir().expect("temporary policy workspace");
     let store_path = temp.path().join("keys.redb");
     let usage_path = temp.path().join("usage.jsonl");
+    let access_path = temp.path().join("access.jsonl");
     let admin_port = pick_port();
     let yaml = test_config(
         admin_port,
         &store_path,
         &usage_path,
+        &access_path,
         &openai.base_url(),
         &vertex.base_url(),
     );
@@ -215,6 +251,7 @@ fn start_world() -> TestWorld {
         vertex,
         admin_port,
         usage_path,
+        access_path,
         _temp: temp,
     }
 }
@@ -264,6 +301,28 @@ fn chat_body(model: &str, content: &str) -> Value {
         "model": model,
         "messages": [{"role": "user", "content": content}]
     })
+}
+
+#[derive(Serialize)]
+struct JwtClaims<'a> {
+    sub: &'a str,
+    exp: i64,
+    key_ref: &'a str,
+    department: &'a str,
+}
+
+fn jwt_for(key_id: &str, department: &str) -> String {
+    encode(
+        &Header::default(),
+        &JwtClaims {
+            sub: "alice",
+            exp: 9_999_999_999,
+            key_ref: key_id,
+            department,
+        },
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+    )
+    .expect("JWT encode")
 }
 
 fn chat(world: &TestWorld, host: &str, token: Option<&str>, body: &Value) -> Response {
@@ -344,6 +403,65 @@ fn wait_for_usage(path: &Path, key_id: &str) -> Value {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn wait_for_access_log(path: &Path, key_id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if let Some(row) = contents.lines().find_map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .filter(|row| row["api_key_id"] == key_id)
+            }) {
+                return row;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "access-log row for governed key {key_id} was not written"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn dynamic_principal_selectors_gate_live_jwt_requests() {
+    let world = start_world();
+    let selector = mint(
+        &world,
+        json!({
+            "name": "principal-selector",
+            "principal_selectors": [{"claim": {"department": "platform"}}]
+        }),
+    );
+    let body = chat_body("gpt-client", "hello");
+
+    let matching_jwt = jwt_for(&selector.key_id, "platform");
+    let before = total_captures(&world);
+    assert_status(
+        &chat(&world, SELECTOR_HOST, Some(&matching_jwt), &body),
+        200,
+        "a matching JWT claim must pass the stored principal selector",
+    );
+    assert_eq!(
+        total_captures(&world),
+        before + 1,
+        "a matching principal must reach the provider"
+    );
+
+    let mismatched_jwt = jwt_for(&selector.key_id, "finance");
+    let before = total_captures(&world);
+    assert_status(
+        &chat(&world, SELECTOR_HOST, Some(&mismatched_jwt), &body),
+        403,
+        "a mismatched JWT claim must be denied before provider dispatch",
+    );
+    assert_eq!(
+        total_captures(&world),
+        before,
+        "a principal selector denial must not reach the provider"
+    );
 }
 
 #[test]
@@ -993,6 +1111,28 @@ fn dynamic_record_enforces_prompt_rates_budget_and_safe_attribution() {
     assert_ne!(
         usage["key_id"], "mutable-display-name",
         "usage attribution must use the immutable id, not the mutable name"
+    );
+
+    let access = wait_for_access_log(&world.access_path, &attributed.key_id);
+    assert_eq!(access["origin"], POLICY_HOST);
+    assert_eq!(access["method"], "POST");
+    assert_eq!(access["path"], "/v1/chat/completions");
+    assert_eq!(access["status"], 200);
+    assert_eq!(access["principal_kind"], "virtual_key");
+    assert_eq!(access["api_key_id"], attributed.key_id);
+    assert_eq!(access["tenant_id"], "tenant-a");
+    assert_eq!(access["project"], "recommendations");
+    assert_eq!(access["user"], "alice");
+    assert_eq!(access["tags"], json!(["production", "trusted"]));
+    assert_eq!(
+        access["metadata"],
+        json!({"owner": "platform", "cost_center": "cc-42"})
+    );
+    assert_eq!(access["attribution"]["project"], "recommendations");
+    assert!(access.get("team").is_none());
+    assert_ne!(
+        access["api_key_id"], "mutable-display-name",
+        "access-log attribution must use the immutable id, not the mutable name"
     );
 
     let metrics = world

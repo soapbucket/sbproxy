@@ -29,6 +29,7 @@ members = [
     "crates/sbproxy-classifier-client",
     "crates/sbproxy-agent-detect",
     "crates/sbproxy-model-host",
+    "crates/sbproxy-capability",
     "e2e",
 ]
 # The k8s operator pulls kube + k8s-openapi, which adds ~30-60s to a cold
@@ -103,6 +104,7 @@ sbproxy-openapi = { path = "crates/sbproxy-openapi" }
 sbproxy-classifiers = { path = "crates/sbproxy-classifiers" }
 sbproxy-classifier-client = { path = "crates/sbproxy-classifier-client" }
 sbproxy-agent-detect = { path = "crates/sbproxy-agent-detect" }
+sbproxy-capability = { path = "crates/sbproxy-capability" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+sbproxy-capability.workspace = true
 sbproxy-plugin.workspace = true
 sbproxy-util.workspace = true
 # SSRF guard for alert webhook URLs (WOR-604). No cycle: sbproxy-security

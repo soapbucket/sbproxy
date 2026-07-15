@@ -180,12 +180,53 @@ mod tests {
     }
 
     #[test]
-    fn local_snapshot_covers_published_names() {
-        // Every published name is present (0.0 when unrecorded), so peers
-        // always deserialize a full map.
-        let snap = local_snapshot();
+    fn local_snapshot_reports_a_real_value_for_a_macro_registered_family() {
+        // The test this replaces asserted only that each published name was a
+        // *key* in the returned map. `snapshot_named` pre-seeds every requested
+        // name to 0.0, so `contains_key` was true by construction and the
+        // assertion restated the pre-seed. It could not fail, and it did not:
+        // `sbproxy_ai_tokens_attributed_total` is registered by a
+        // `register_counter_vec!` macro onto the process-global default
+        // registry, `snapshot_named` gathered only the private one, and every
+        // node in every fleet reported zero AI tokens forever while this test
+        // stayed green.
+        //
+        // So: drive the real recorder, then demand a number.
+        let before = local_snapshot()
+            .get("sbproxy_ai_tokens_attributed_total")
+            .copied()
+            .unwrap_or(0.0);
+
+        sbproxy_ai::ai_metrics::record_ai_request_attributed(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            "tenant-a",
+            "key-1",
+            &sbproxy_ai::attribution::AttributionTags::default(),
+            120, // input
+            34,  // output
+            0,
+            0,
+            0,
+            0.0,
+        );
+
+        let after = local_snapshot();
+        let tokens = after
+            .get("sbproxy_ai_tokens_attributed_total")
+            .copied()
+            .unwrap_or(0.0);
+
+        assert!(
+            tokens >= before + 154.0,
+            "snapshot_named must see macro-registered families; got {tokens} (was {before})"
+        );
+
+        // The rest of the allow-list still has to resolve, or the fleet
+        // endpoint silently publishes a partial map.
         for name in PUBLISHED_METRICS {
-            assert!(snap.contains_key(*name), "missing {name}");
+            assert!(after.contains_key(*name), "missing {name}");
         }
     }
 }

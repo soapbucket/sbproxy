@@ -12,6 +12,22 @@ the next version cut.
 
 ### Added
 
+- **MCP tool rollout plane.** Publish several versions of one tool at once
+  and roll out breaking changes without breaking callers: a `rollout:` block
+  under the `mcp` action's `tool_versioning` declares versions, where each
+  routes, and who gets which. Resolution walks a ladder (per-call `_meta`
+  requirement, per-session requirements declared at `initialize`, operator
+  pins on the authenticated principal, `search_v1`-style catalogue aliases,
+  then the default), all as semver ranges. Old versions can route to the
+  upstream that still serves them or run JavaScript request/response
+  adapters against the new one, carry a sunset date that warns or blocks
+  past it, and every versioned call lands on
+  `sbproxy_mcp_tool_version_calls_total{tool, version, via, deprecated}` so
+  migration is observable. `tools/list` advertises the consumer's resolved
+  version per tool with the available versions and sunset in `_meta`;
+  results carry the version that served them. The `tool_versioning.lockfile`
+  is now optional so the rollout plane works without the version-bump gate.
+  See `docs/tool-versioning.md` and `examples/mcp-tool-rollout/`.
 - **Model deployment management in the built-in admin UI.** Operators can
   browse catalog evidence, add or edit the complete desired deployment map,
   resolve revision conflicts explicitly, and run Load, Stop, or Reset. The
@@ -375,11 +391,13 @@ default-off.
   pinned model, injected tools, and an injection-scan bypass. Pluggable
   stores: embedded (redb), Redis, or a secrets manager. OIDC and JWT claims
   can map to a key. New `key_management:` config block. (#542, #543)
-- **Open-source mesh clustering.** The mesh layer (SWIM gossip, CRDTs, a
+- **Open-source mesh clustering.** The mesh layer (SWIM gossip, a
   consistent-hash distributed cache) is now Apache-2.0 in this repository.
-  Setting `cache.tier: mesh` keeps the key plane, budgets, and per-key spend
-  and rate counters coherent across a replica fleet, so the cluster
-  coordinates itself with no external Redis in the path. (#542)
+  Setting `cache.tier: mesh` keeps the key plane coherent across a replica
+  fleet: a key minted on one replica is usable on any, and a revocation on
+  one denies on the rest, with no external control plane in the path. Per-key
+  spend and rate counters remain node-local; cluster-wide budget enforcement
+  uses a shared backend. (#542)
 - **State-of-the-art AI-gateway differentiation.** A verifiable, hash-chained
   and optionally Ed25519-signed usage ledger; a single sandboxed CEL policy
   plane over guardrails, budgets, routing, and principal; a guardrail mesh

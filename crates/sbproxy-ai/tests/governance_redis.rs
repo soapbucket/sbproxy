@@ -1,9 +1,7 @@
 //! Contract tests for strict Redis governance accounting.
 
-#[path = "../src/governance.rs"]
-mod governance;
-#[path = "../src/governance_redis.rs"]
-mod governance_redis;
+use sbproxy_ai::governance;
+use sbproxy_ai::governance_redis;
 
 use std::{sync::Arc, time::Duration};
 

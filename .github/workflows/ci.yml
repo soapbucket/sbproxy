@@ -179,6 +179,23 @@ jobs:
         if: steps.filter.outputs.code == 'true'
         run: bash scripts/check-model-host-capabilities.sh
 
+      - name: metrics stability catalogue is current (WOR-1897)
+        if: steps.filter.outputs.code == 'true'
+        run: bash scripts/check-metrics-stability.sh
+
+      - name: install.sh verifies its download (WOR-1914)
+        if: steps.filter.outputs.code == 'true'
+        run: sh scripts/tests/install_verify.sh
+
+      - name: prometheus rules validate and the SLO burns (WOR-1894)
+        if: steps.filter.outputs.code == 'true'
+        run: |
+          PROMTOOL_VERSION=2.53.1
+          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz" \
+            | tar xz -C /tmp
+          sudo install "/tmp/prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          bash scripts/check-prometheus-rules.sh
+
       - name: cleanup build artifacts
         if: always() && steps.filter.outputs.code == 'true'
         run: bash scripts/cleanup-build-artifacts.sh --ci

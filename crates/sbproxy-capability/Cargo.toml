@@ -1,0 +1,10 @@
+[package]
+name = "sbproxy-capability"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+schemars.workspace = true

@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# MCP tool rollout: publish v2 of a tool while v1 callers keep working.
+#
+# Two versions of `search` are live at once. The default consumer gets
+# 2.0.0 from the new upstream; the checkout team is pinned to `^1` and
+# keeps getting 1.4.0 from the legacy upstream, deprecated with a
+# sunset date. The catalogue also advertises `search_v1` / `search_v2`
+# aliases so a client can pick a major explicitly, and every entry
+# carries `_meta` with the resolved version, the available versions,
+# and the sunset.
+#
+# A caller can also choose per session (`initialize` `_meta`
+# `sbproxy.dev/tool_requirements`) or per call (`tools/call` `_meta`
+# `sbproxy.dev/version`), which win over the pin, in that order.
+#
+# Once the legacy upstream is retired, replace its `server:` with an
+# `adapter:` (see adapters/search-v1.js) and an inline `contract:`;
+# v1 calls are then translated onto the new upstream. Migration is
+# observable on
+# sbproxy_mcp_tool_version_calls_total{tool,version,via,deprecated}:
+# retire a version when its traffic hits zero.
+proxy:
+  http_bind_port: 8080
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: rollout-gateway
+        version: "1.0.0"
+      refresh_interval: "60s"
+      tool_versioning:
+        rollout:
+          tools:
+            search:
+              versions:
+                - version: "1.4.0"
+                  server: legacy-api
+                  sunset: "2026-10-01"
+                - version: "2.0.0"
+                  server: new-api
+          pins:
+            - principals:
+                - team: checkout
+              tools:
+                search: "^1"
+      federated_servers:
+        - origin: "test.sbproxy.dev"
+          prefix: legacy-api
+        - origin: "test.sbproxy.dev"
+          prefix: new-api

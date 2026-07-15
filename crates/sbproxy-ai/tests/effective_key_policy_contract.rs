@@ -204,6 +204,12 @@ fn registered_enforcement_test(proof: PolicyEnforcementProof) -> EnforcementTest
                 "assert_eq!(usage[\"user\"], \"alice\")",
                 "assert_eq!(usage[\"tags\"], json!([\"production\", \"trusted\"]))",
                 "usage[\"metadata\"]",
+                "assert_eq!(access[\"api_key_id\"], attributed.key_id)",
+                "assert_eq!(access[\"tenant_id\"], \"tenant-a\")",
+                "assert_eq!(access[\"project\"], \"recommendations\")",
+                "assert_eq!(access[\"user\"], \"alice\")",
+                "access[\"metadata\"]",
+                "access-log attribution must use the immutable id",
                 "bounded security audit must not persist attribution canary",
                 "attributed_line.contains(\"tenant_id=\\\"tenant-a\\\"\")",
                 "high-cardinality user and metadata values must stay out of metric labels",
@@ -256,12 +262,13 @@ fn registered_enforcement_test(proof: PolicyEnforcementProof) -> EnforcementTest
             ],
             |policy| assert_eq!(policy.route_to_model.as_deref(), Some("gpt-4.1")),
         ),
-        PolicyEnforcementProof::PrincipalGate => ai_dispatch_test(
-            "dynamic_principal_selectors_gate_the_request_principal",
+        PolicyEnforcementProof::PrincipalGate => governed_key_e2e_test(
+            "dynamic_principal_selectors_gate_live_jwt_requests",
             &[
-                "record.principal_selectors",
-                "assert!(resolved.matches_principal(&matching))",
-                "assert!(!resolved.matches_principal(&denied))",
+                "\"principal_selectors\": [{\"claim\": {\"department\": \"platform\"}}]",
+                "jwt_for(&selector.key_id, \"platform\")",
+                "a matching JWT claim must pass the stored principal selector",
+                "a mismatched JWT claim must be denied before provider dispatch",
             ],
             |policy| {
                 let principal = sbproxy_plugin::Principal {

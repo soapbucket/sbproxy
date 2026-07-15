@@ -1305,6 +1305,26 @@ pub(super) async fn handle_mcp_action(
             // response header, per the streamable HTTP transport.
             if let Some(store) = mcp.sessions.as_deref() {
                 issued_session = Some(store.create());
+                // Rollout plane, session rung: requirements declared
+                // once at initialize apply to every later request on
+                // this session.
+                if mcp.rollout_plan.is_some() {
+                    let declared = request
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("_meta"))
+                        .and_then(|m| m.get(sbproxy_extension::mcp::rollout::META_REQUIREMENTS_KEY))
+                        .and_then(|v| v.as_object());
+                    if let (Some(reqs), Some(sid)) = (declared, issued_session.as_deref()) {
+                        let map: std::collections::HashMap<String, String> = reqs
+                            .iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect();
+                        if !map.is_empty() {
+                            store.set_tool_requirements(sid, map);
+                        }
+                    }
+                }
             }
             // WOR-1641: spec-correct negotiation. Echo the client's
             // requested revision when supported; otherwise answer
@@ -1371,9 +1391,36 @@ pub(super) async fn handle_mcp_action(
                 // WOR-1635: tools blocked by the version gate are
                 // filtered out of the catalogue entirely.
                 let version_blocked = mcp.federation.version_blocked();
+                // Rollout plane: compute the per-consumer patch
+                // (managed entries to hide, versioned entries to
+                // advertise instead) before the filter loop runs.
+                let rollout_patch = mcp.rollout_plan.as_ref().map(|plan| {
+                    let session_reqs = mcp_session_id.as_deref().and_then(|sid| {
+                        mcp.sessions
+                            .as_deref()
+                            .and_then(|s| s.tool_requirements(sid))
+                    });
+                    let entries: Vec<mcp_rollout::CatalogueEntry<'_>> = snapshot
+                        .entries
+                        .iter()
+                        .map(|e| mcp_rollout::CatalogueEntry {
+                            name: &e.name,
+                            server: &e.server_name,
+                            json: &e.json,
+                        })
+                        .collect();
+                    mcp_rollout::synthesize_view(
+                        plan,
+                        &entries,
+                        session_reqs.as_deref(),
+                        Some(&ctx.principal),
+                        chrono::Utc::now().date_naive(),
+                    )
+                });
                 let needs_filter = mcp.tool_allowlist.is_some()
                     || mcp.has_principal_scoped_tools
-                    || !version_blocked.is_empty();
+                    || !version_blocked.is_empty()
+                    || rollout_patch.is_some();
                 let tools_json: std::borrow::Cow<'_, str> = if !needs_filter {
                     std::borrow::Cow::Borrowed(snapshot.full_array.as_str())
                 } else {
@@ -1381,6 +1428,13 @@ pub(super) async fn handle_mcp_action(
                     out.push('[');
                     let mut first = true;
                     for entry in &snapshot.entries {
+                        if let Some(patch) = &rollout_patch {
+                            // Managed tools are advertised through
+                            // their synthesized versioned entries.
+                            if patch.hidden.contains(&entry.name) {
+                                continue;
+                            }
+                        }
                         if version_blocked.contains_key(&entry.name) {
                             continue;
                         }
@@ -1400,6 +1454,29 @@ pub(super) async fn handle_mcp_action(
                         }
                         first = false;
                         out.push_str(&entry.json);
+                    }
+                    if let Some(patch) = &rollout_patch {
+                        // Versioned entries the managed tools
+                        // advertise in place of the hidden ones. RBAC
+                        // stays enforced at call time on the resolved
+                        // server; the allowlist applies here by name.
+                        for tool in &patch.synthesized {
+                            let allowed = tool
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|n| mcp.is_tool_allowed(n))
+                                .unwrap_or(false);
+                            if !allowed {
+                                continue;
+                            }
+                            if let Ok(json) = serde_json::to_string(tool) {
+                                if !first {
+                                    out.push(',');
+                                }
+                                first = false;
+                                out.push_str(&json);
+                            }
+                        }
                     }
                     out.push(']');
                     std::borrow::Cow::Owned(out)
@@ -1536,10 +1613,140 @@ pub(super) async fn handle_mcp_action(
                         "tools/call requires a 'name' parameter",
                     ),
                     Some(name) => {
+                        // Rollout plane: resolve the requested version
+                        // before any gate runs, because the caller may
+                        // use an alias (`search_v1`) or carry a `_meta`
+                        // requirement, and every later check must see
+                        // the concrete catalogue name it rewrites to.
+                        let mut name = name;
+                        let mut arguments = arguments;
+                        let mut rollout_route: Option<mcp_rollout::RoutedCall> = None;
+                        let mut rollout_reject: Option<JsonRpcResponse> = None;
+                        if let Some(plan) = mcp.rollout_plan.as_ref() {
+                            let call_req = request
+                                .params
+                                .as_ref()
+                                .and_then(|p| p.get("_meta"))
+                                .and_then(|m| {
+                                    m.get(sbproxy_extension::mcp::rollout::META_VERSION_KEY)
+                                })
+                                .and_then(|v| v.as_str());
+                            let session_reqs = mcp_session_id.as_deref().and_then(|sid| {
+                                mcp.sessions
+                                    .as_deref()
+                                    .and_then(|s| s.tool_requirements(sid))
+                            });
+                            match mcp_rollout::plan_call(
+                                plan,
+                                &name,
+                                call_req,
+                                session_reqs.as_deref(),
+                                Some(&ctx.principal),
+                                chrono::Utc::now().date_naive(),
+                            ) {
+                                mcp_rollout::CallPlan::Unmanaged => {}
+                                mcp_rollout::CallPlan::Reject { code, message } => {
+                                    tracing::warn!(
+                                        target: "sbproxy::mcp::rollout",
+                                        tool = %name,
+                                        %message,
+                                        "MCP tools/call rejected by the rollout plane",
+                                    );
+                                    rollout_reject = Some(JsonRpcResponse::error(
+                                        request.id.clone(),
+                                        code as i32,
+                                        &message,
+                                    ));
+                                }
+                                mcp_rollout::CallPlan::Routed(route) => {
+                                    let mapped = mcp_rollout::catalogue_name_for(
+                                        |n| mcp.federation.resolve_tool(n).map(|t| t.server_name),
+                                        &route.server,
+                                        &route.base,
+                                    );
+                                    match mapped {
+                                        None => {
+                                            rollout_reject = Some(JsonRpcResponse::error(
+                                                request.id.clone(),
+                                                mcp_rollout::ROLLOUT_ERROR_CODE as i32,
+                                                &format!(
+                                                    "tool '{}' version {} resolves to \
+                                                     server '{}' which does not \
+                                                     currently serve it",
+                                                    route.base, route.version, route.server
+                                                ),
+                                            ));
+                                        }
+                                        Some(catalogue_name) => {
+                                            let mut adapter_failed = false;
+                                            if let Some(req_ref) = &route.request_adapter {
+                                                match mcp_rollout::run_adapter(
+                                                    req_ref,
+                                                    "request",
+                                                    arguments.clone(),
+                                                ) {
+                                                    Ok(adapted) => arguments = adapted,
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            target: "sbproxy::mcp::rollout",
+                                                            tool = %route.base,
+                                                            version = %route.version,
+                                                            error = %e,
+                                                            "MCP rollout request adapter failed",
+                                                        );
+                                                        rollout_reject =
+                                                            Some(JsonRpcResponse::error(
+                                                                request.id.clone(),
+                                                                mcp_rollout::ROLLOUT_ERROR_CODE
+                                                                    as i32,
+                                                                &format!(
+                                                                    "request adapter failed: {e}"
+                                                                ),
+                                                            ));
+                                                        adapter_failed = true;
+                                                    }
+                                                }
+                                            }
+                                            if !adapter_failed {
+                                                let past_sunset = route
+                                                    .deprecation
+                                                    .as_ref()
+                                                    .map(|d| d.1)
+                                                    .unwrap_or(false);
+                                                sbproxy_observe::metrics::record_mcp_tool_version_call(
+                                                    &route.base,
+                                                    &route.version,
+                                                    route.via,
+                                                    past_sunset,
+                                                );
+                                                if past_sunset {
+                                                    tracing::warn!(
+                                                        target: "sbproxy::mcp::rollout",
+                                                        tool = %route.base,
+                                                        version = %route.version,
+                                                        sunset = %route
+                                                            .deprecation
+                                                            .as_ref()
+                                                            .map(|d| d.0.as_str())
+                                                            .unwrap_or(""),
+                                                        "MCP tools/call served a version past its sunset",
+                                                    );
+                                                }
+                                                name = catalogue_name;
+                                                rollout_route = Some(*route);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // WOR-1635: version-gate check first; a
                         // blocked tool is invisible in tools/list and
                         // must fail calls with the violation detail.
-                        if let Some(denial) = mcp_lethal_trifecta_denial(
+                        if let Some(reject) = rollout_reject {
+                            reject
+                        } else if let Some(denial) = mcp_lethal_trifecta_denial(
                             mcp,
                             &name,
                             mcp_session_id.as_deref(),
@@ -1833,8 +2040,35 @@ pub(super) async fn handle_mcp_action(
                                                 &message,
                                             )
                                         } else {
-                                            let value = mcp_compact_tool_result(mcp, value);
-                                            JsonRpcResponse::success(request.id.clone(), value)
+                                            // Rollout plane: translate the
+                                            // result back into the caller's
+                                            // version shape and stamp the
+                                            // served version on `_meta`.
+                                            match mcp_rollout::finish_response(
+                                                rollout_route.as_ref(),
+                                                value,
+                                            ) {
+                                                Err(message) => {
+                                                    tracing::warn!(
+                                                        target: "sbproxy::mcp::rollout",
+                                                        tool = %name,
+                                                        %message,
+                                                        "MCP rollout response adapter failed",
+                                                    );
+                                                    JsonRpcResponse::error(
+                                                        request.id.clone(),
+                                                        mcp_rollout::ROLLOUT_ERROR_CODE as i32,
+                                                        &message,
+                                                    )
+                                                }
+                                                Ok(value) => {
+                                                    let value = mcp_compact_tool_result(mcp, value);
+                                                    JsonRpcResponse::success(
+                                                        request.id.clone(),
+                                                        value,
+                                                    )
+                                                }
+                                            }
                                         }
                                     }
                                     Err(e) => JsonRpcResponse::error(

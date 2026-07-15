@@ -12,6 +12,7 @@
 pub mod cluster;
 pub mod compiler;
 pub mod duration;
+pub mod key_registry;
 pub mod listing;
 pub mod litellm;
 pub mod model_host;

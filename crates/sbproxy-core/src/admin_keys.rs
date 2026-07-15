@@ -653,7 +653,7 @@ fn parse_policy_preview_sample(body: Option<&str>) -> Result<PolicyPreviewSample
         serde_json::from_str::<PolicyPreviewSample>(body)
             .map_err(|_| bad_request("invalid policy preview sample"))?
     };
-    validate_policy_preview_sample(&sample).map_err(|error| bad_request(error))?;
+    validate_policy_preview_sample(&sample).map_err(bad_request)?;
     Ok(sample)
 }
 

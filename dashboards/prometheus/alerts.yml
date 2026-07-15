@@ -28,17 +28,21 @@ groups:
           summary: "AI provider {{ $labels.provider }} returning only errors"
           description: "Provider {{ $labels.provider }} has had zero successful requests and non-zero errors for the last 2 minutes."
 
+      # sbproxy_ai_guardrail_triggers_total has never existed. The counter is
+      # sbproxy_ai_guardrail_blocks_total, and it carries `category`, not
+      # `action`. Until this commit nothing incremented it either, so the alert
+      # was doubly dead.
       - alert: SBProxyGuardrailSpike
-        expr: rate(sbproxy_ai_guardrail_triggers_total{action="block"}[1m]) > 10
+        expr: sum(rate(sbproxy_ai_guardrail_blocks_total[1m])) > 10
         for: 1m
         labels:
           severity: warning
         annotations:
           summary: "High guardrail block rate (> 10/min)"
-          description: "Guardrail blocks are firing at a high rate. Type: {{ $labels.type }}. Current rate: {{ $value }}/sec."
+          description: "Guardrail blocks are firing at a high rate. Current rate: {{ $value }}/sec."
 
       - alert: SBProxyHighTokenUsage
-        expr: increase(sbproxy_ai_tokens_output_total[1h]) > 1000000
+        expr: increase(sbproxy_ai_tokens_attributed_total{direction="output"}[1h]) > 1000000
         for: 0m
         labels:
           severity: info

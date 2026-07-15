@@ -3269,6 +3269,10 @@ pub(crate) mod model_host;
 mod action_dispatch;
 use action_dispatch::*;
 
+// Dispatch-side glue for the MCP tool rollout plane (versioned
+// catalogue views, per-consumer routing, adapters, sunset).
+pub(crate) mod mcp_rollout;
+
 // The ProxyHttp trait impl lives in the `proxy_http` submodule
 //. A trait impl needs no re-import to take effect.
 mod proxy_http;

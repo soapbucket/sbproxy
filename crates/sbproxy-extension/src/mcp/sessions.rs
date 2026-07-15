@@ -45,10 +45,14 @@ impl SessionRisk {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SessionEntry {
     expires_at: Instant,
     risk: SessionRisk,
+    /// Version requirements declared at `initialize` via
+    /// `_meta.tool_requirements` (the rollout plane's session rung).
+    /// `Arc` so reads hand back a cheap clone under the lock.
+    tool_requirements: Option<std::sync::Arc<HashMap<String, String>>>,
 }
 
 /// In-memory session table with a sliding idle TTL.
@@ -81,9 +85,53 @@ impl SessionStore {
             SessionEntry {
                 expires_at: Instant::now() + self.ttl,
                 risk: SessionRisk::default(),
+                tool_requirements: None,
             },
         );
         id
+    }
+
+    /// Attach the rollout plane's per-session version requirements
+    /// (`{tool: semver range}`) to a live session. True on success;
+    /// false when the session is unknown or expired. Renews the
+    /// sliding TTL like every other successful access.
+    pub fn set_tool_requirements(&self, id: &str, reqs: HashMap<String, String>) -> bool {
+        let mut map = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match map.get_mut(id) {
+            Some(entry) if entry.expires_at > Instant::now() => {
+                entry.expires_at = Instant::now() + self.ttl;
+                entry.tool_requirements = Some(std::sync::Arc::new(reqs));
+                true
+            }
+            Some(_) => {
+                map.remove(id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Version requirements declared on a live session, when any.
+    /// Renews the sliding TTL.
+    pub fn tool_requirements(&self, id: &str) -> Option<std::sync::Arc<HashMap<String, String>>> {
+        let mut map = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match map.get_mut(id) {
+            Some(entry) if entry.expires_at > Instant::now() => {
+                entry.expires_at = Instant::now() + self.ttl;
+                entry.tool_requirements.clone()
+            }
+            Some(_) => {
+                map.remove(id);
+                None
+            }
+            None => None,
+        }
     }
 
     /// True when the id names a live session. A successful check
@@ -237,5 +285,26 @@ mod tests {
             )
             .expect("live session");
         assert!(second.is_lethal_trifecta());
+    }
+
+    #[test]
+    fn tool_requirements_roundtrip() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let id = store.create();
+        assert!(store.tool_requirements(&id).is_none());
+        let reqs = std::collections::HashMap::from([("search".to_string(), "^1".to_string())]);
+        assert!(store.set_tool_requirements(&id, reqs.clone()));
+        let got = store.tool_requirements(&id).expect("live session");
+        assert_eq!(got.as_ref(), &reqs);
+    }
+
+    #[test]
+    fn tool_requirements_unknown_session_is_rejected() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        assert!(!store.set_tool_requirements(
+            "nope",
+            std::collections::HashMap::from([("a".to_string(), "^1".to_string())])
+        ));
+        assert!(store.tool_requirements("nope").is_none());
     }
 }
