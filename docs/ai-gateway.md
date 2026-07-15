@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-14*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -654,7 +654,18 @@ The action table, the full `ai.*` namespace, and the fail-open semantics are in 
 
 Set token or dollar caps that apply across a workspace, a single virtual key, an end user, a model, an origin, or a metadata tag. The `budget` block sits under `action` and is parsed by `BudgetConfig` in `crates/sbproxy-ai/src/budget.rs`.
 
-By default the counters are per-instance (an in-process tracker), so a cluster of N replicas enforces roughly N times a given cap. When the key store runs on Redis (a `key_management` Redis backend, which is the clustered deployment shape), the same Redis also accumulates the spend and enforcement reads the shared total, so the fleet enforces one budget. Nothing extra is configured: cluster-shared budgets turn on whenever a Redis key store is present. If Redis is briefly unreachable the shared read fails open to the local tracker, so the per-instance count stays the floor.
+This `action.budget` block owns windowed workspace, user, model, origin, tag,
+and legacy API-key scopes. Its in-process counters are per-instance. When the
+key store uses Redis, its older shared-budget writer can provide a fleet-wide
+post-flight view, but it is advisory: a backend outage falls back to local
+counters and concurrent requests can pass before usage is written.
+
+Dynamic governed-key fields use a different path. Configure
+`proxy.key_management.governance` for pre-dispatch reservations. `strict` with
+an explicit Redis backend atomically reserves RPM, TPM, lifetime tokens, and
+lifetime micro-USD across gateway nodes. `approximate` is process-local. A
+Redis key store or mesh CRDT counter alone does not make a governed-key ceiling
+strict. See [Governed accounting consistency](key-management.md#governed-accounting-consistency).
 
 ```yaml
 action:
@@ -759,6 +770,20 @@ Or point at an external rate card in the LiteLLM `model_prices_and_context_windo
 
 Refresh the vendored file out of band with `scripts/refresh-model-prices.sh /etc/sbproxy/model_prices.json`; the gateway loads it at config load and never fetches at runtime, so an egress-restricted host is unaffected. Resolution order for a model's price is: `model_prices` (highest), then the rate card, then the built-in catalog, then the $5 / $5 fallback. A missing or malformed rate card is logged and skipped, not fatal. Cache-read and cache-write rates carry through from both sources; the built-in catalog does not yet include them.
 
+Every inline or rate-card token price used for governance must be finite,
+nonnegative, and no greater than `9,007,199,254,740,991` after conversion to
+USD per million tokens (numerically micro-USD per token). A syntactically valid
+rate card with an unsafe numeric price fails config activation; a zero price is
+valid for a model with no marginal token cost.
+
+Governed-key admission does not use the unknown-model $5 / $5 fallback. It
+uses a configured, rate-card, or built-in price for both hosted and self-hosted
+routes. An unpriced route follows `key_management.governance.missing_rate`:
+`zero_cost` charges zero monetary units while token and request limits remain
+active; `require_rate` rejects before dispatch. Governed monetary values are
+rounded up once per request to integer micro-USD, so the rounding unit is one
+micro-USD.
+
 ## Virtual API keys (`credentials:`)
 
 Issue per-team or per-app keys that the gateway validates locally. Each key can pin a provider, restrict models, set its own request rate, carry its own budget ceiling, and tag requests for downstream attribution. The shipped shape is a `credentials:` list of `type: ai_provider` entries next to the origin's `action:` block; the same block also lives at `tenants[].credentials` and `proxy.credentials` scope, with origin shadowing tenant shadowing proxy for entries that share a `name`. The legacy `virtual_keys:` key is rejected at config compile with a pointer to [migration-credentials.md](migration-credentials.md).
@@ -768,12 +793,21 @@ to a governed public key identity on that origin. Dynamic mutation, the full
 policy field contract, effective-policy preview, and fail-closed behavior are
 documented in [Dynamic key management](key-management.md).
 
-Stored-key token-per-minute and lifetime token or cost caps currently settle
-only on standard JSON POST inference surfaces when the provider response
-reports parseable usage. Multipart and non-POST requests can dispatch, but do
-not settle those stored-key counters. Settlement for those surfaces and strict
-multi-node reservations are deferred to WOR-1845. Treat the caps as advisory,
-not a strict ceiling, for multipart, non-POST, or concurrent multi-node traffic.
+Stored-key RPM and TPM use fixed 60-second windows. Stored-key token and cost
+budgets are lifetime caps. The ingress gateway reserves their conservative
+maximum before provider or managed-replica selection, then settles actual usage
+or releases unused capacity exactly once. It owns the reservation across local,
+peer, unmanaged, external, fallback, streaming, cancellation, and failure
+paths. Peer workers do not receive the store handle and cannot charge again.
+Choose `approximate` or cluster-wide `strict` consistency under
+`proxy.key_management.governance`; the full lifecycle and outage behavior are
+documented in [Dynamic key management](key-management.md).
+
+Governed JSON mutation surfaces currently use POST. A governed request using
+PUT, PATCH, DELETE, HEAD, or OPTIONS is rejected with 501 before provider
+selection because those method-aware paths do not yet run the complete model,
+tool, PII, guardrail, and AI-policy rewrite pipeline. Ungoverned passthrough
+behavior is unchanged.
 
 ```yaml
 origins:
@@ -1034,11 +1068,29 @@ model-list fields are required.
 
 ### Method coverage
 
-The gateway accepts any standard HTTP method for any supported surface. GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS all dispatch through the same provider-selection and observability surface. Non-POST methods do not engage the standard JSON POST inference pipeline, so they do not perform JSON body parsing or stored-key token and cost settlement. Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`, `POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work end-to-end. Strict settlement for these methods is deferred to WOR-1845.
+The gateway accepts any standard HTTP method for any supported surface. GET,
+POST, PUT, DELETE, PATCH, HEAD, and OPTIONS all dispatch through the same
+provider-selection and observability surface. Non-POST methods do not engage
+the standard JSON POST inference pipeline, so they do not perform JSON body
+translation. A governed request still has one ingress reservation. A surface
+with no billable work releases it; output without parseable usage settles the
+conservative admitted ceiling once. Method-aware dispatch is what makes
+`DELETE /v1/assistants/{id}`, `POST /v1/threads/{id}/runs/{id}/cancel`, and the
+other non-POST verbs work end-to-end.
 
 ### Multipart bodies
 
-Image edits, image variations, audio transcription, and audio translation send multipart request bodies. The proxy detects multipart by inspecting the inbound `Content-Type` header; when it starts with `multipart/`, the body is forwarded via `AiClient::forward_bytes` with the original Content-Type preserved. A governed key's `route_to_model` rewrites only the bounded multipart `model` part before forwarding; every other part remains byte-for-byte. Provider format translation (Anthropic, etc.) does not run for multipart, since these surfaces are OpenAI-only. Multipart responses do not currently settle stored-key token-per-minute or lifetime token and cost counters; that work is deferred to WOR-1845.
+Image edits, image variations, audio transcription, and audio translation send
+multipart request bodies. The proxy detects multipart by inspecting the
+inbound `Content-Type` header; when it starts with `multipart/`, the body is
+forwarded via `AiClient::forward_bytes` with the original Content-Type
+preserved. A governed key's `route_to_model` rewrites only the bounded
+multipart `model` part before forwarding; every other part remains
+byte-for-byte. Provider format translation (Anthropic, etc.) does not run for
+multipart, since these surfaces are OpenAI-only. Governed admission uses the
+bounded request and output ceiling. Ingress settles reported usage, releases
+when no billable work occurred, or settles that ceiling when output occurred
+without parseable usage.
 
 ### Per-surface configuration
 

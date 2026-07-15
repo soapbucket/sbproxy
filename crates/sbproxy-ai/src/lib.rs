@@ -25,6 +25,8 @@ pub mod failure_cause;
 pub mod fill_first;
 pub mod finetune;
 pub mod format;
+pub mod governance;
+pub mod governance_redis;
 pub mod guardrails;
 pub mod handler;
 pub mod hierarchical_budget;
@@ -106,6 +108,8 @@ pub use semantic_cache::{
 pub use session::{ConversationSession, SessionStore};
 pub use streaming::*;
 pub use streaming_analytics::{StreamRegistry, StreamTracker};
-pub use token_estimate::{estimate_tokens, estimate_tokens_heuristic};
+pub use token_estimate::{
+    estimate_tokens, estimate_tokens_for_reservation, estimate_tokens_heuristic,
+};
 pub use types::*;
 pub use usage_parser::{select_parser, SseUsageParser, UsageParserHints, UsageTokens};

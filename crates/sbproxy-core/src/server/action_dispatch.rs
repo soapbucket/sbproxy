@@ -109,6 +109,26 @@ pub(super) async fn handle_action(
                 ctx.ai_surface = Some(surface_label.to_string());
                 sbproxy_ai::ai_metrics::record_surface_request(surface_label, method.as_str());
 
+                // Realtime currently bypasses the request-body AI handler
+                // where governed credentials and atomic reservations are
+                // resolved. Never silently turn that bypass into unauthenticated
+                // access to an upstream provider credential. Re-enable only
+                // after the WebSocket session owns the common policy and
+                // reservation lifecycle.
+                if ai.config.require_governed_key {
+                    warn!(
+                        ai.surface = surface_label,
+                        "AI realtime: governed-key origins reject the unsupported bypass"
+                    );
+                    send_error(
+                        session,
+                        501,
+                        "realtime is not supported on governed-key origins",
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+
                 // Per-surface rate limit gate.
                 if let Some(rate_cfg) = ai.config.per_surface_rate_limits.get(surface_label) {
                     if !AI_SURFACE_RATE_LIMITER.check_rate(surface_label, rate_cfg) {

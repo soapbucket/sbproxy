@@ -284,28 +284,13 @@ fn bounded_config_revision(config_revision: &str) -> String {
 
 fn merged_request_budget<'a>(
     origin: Option<&'a sbproxy_ai::BudgetConfig>,
-    policy: Option<&sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
+    _policy: Option<&sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
 ) -> Option<std::borrow::Cow<'a, sbproxy_ai::BudgetConfig>> {
-    let key_budget = policy
-        .and_then(|policy| policy.budget.as_ref())
-        .filter(|budget| budget.max_tokens.is_some() || budget.max_cost_usd.is_some());
-    let Some(key_budget) = key_budget else {
-        return origin.map(std::borrow::Cow::Borrowed);
-    };
-
-    let mut merged = origin.cloned().unwrap_or_else(|| sbproxy_ai::BudgetConfig {
-        limits: Vec::new(),
-        on_exceed: sbproxy_ai::OnExceedAction::Block,
-        soft_landing: None,
-    });
-    merged.limits.push(sbproxy_ai::budget::BudgetLimit {
-        scope: sbproxy_ai::budget::BudgetScope::ApiKey,
-        max_tokens: key_budget.max_tokens,
-        max_cost_usd: key_budget.max_cost_usd,
-        period: Some("total".to_string()),
-        downgrade_to: None,
-    });
-    Some(std::borrow::Cow::Owned(merged))
+    // Governed key budgets are exclusively enforced by the atomic
+    // reservation backend. Feeding them into the legacy process-local
+    // tracker as well would debit the same completion twice and make strict
+    // enforcement depend on which ingress replica handled the request.
+    origin.map(std::borrow::Cow::Borrowed)
 }
 
 fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
@@ -570,7 +555,12 @@ fn apply_resolved_virtual_key_context(
     ctx.attribution_tags =
         crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
 
-    if (key.max_requests_per_minute.is_some() || key.max_tokens_per_minute.is_some())
+    // Canonical governed policies enter the reservation backend after request
+    // parsing, when a conservative token and cost ceiling is available. Keep
+    // the legacy limiter only for configured credentials without a public
+    // immutable key id.
+    if resolved.policy().is_none()
+        && (key.max_requests_per_minute.is_some() || key.max_tokens_per_minute.is_some())
         && !key_rate_limiter().check_rate(safe_runtime_key_id(key), key)
     {
         warn!(
@@ -579,7 +569,7 @@ fn apply_resolved_virtual_key_context(
         );
         return Err((429, "rate limit exceeded for this key"));
     }
-    if key.max_tokens_per_minute.is_some() {
+    if resolved.policy().is_none() && key.max_tokens_per_minute.is_some() {
         ctx.ai_key_tpm_bucket = Some(safe_runtime_key_id(key).to_string());
     }
     apply_resolved_key_lane(ctx, resolved);
@@ -588,6 +578,603 @@ fn apply_resolved_virtual_key_context(
     }
 
     Ok(())
+}
+
+async fn admit_governed_request(
+    session: &mut Session,
+    hostname: &str,
+    ctx: &mut RequestContext,
+    model: &str,
+    price: Option<sbproxy_ai::budget::ModelPrice>,
+    prompt_token_ceiling: u64,
+    output_token_ceiling: u64,
+) -> Result<bool> {
+    if ctx.governance_lease.is_some() {
+        return Ok(true);
+    }
+    let Some(policy) = ctx.effective_key_policy.clone() else {
+        return Ok(true);
+    };
+    let plane = crate::key_plane::governance_plane();
+    match crate::server::governance_admission::reserve(
+        plane.config(),
+        plane.store(),
+        &policy,
+        model,
+        price,
+        prompt_token_ceiling,
+        output_token_ceiling,
+    )
+    .await
+    {
+        Ok(crate::server::governance_admission::GovernanceAdmission::Reserved(charge)) => {
+            ctx.governance_lease = Some(charge);
+            Ok(true)
+        }
+        Ok(crate::server::governance_admission::GovernanceAdmission::NotLimited) => Ok(true),
+        Ok(crate::server::governance_admission::GovernanceAdmission::Unreserved { backend }) => {
+            let audit_reason = format!(
+                "backend_unavailable:{backend}:key={}:revision={}",
+                policy.key_id, policy.policy_revision
+            );
+            sbproxy_observe::SecurityAuditEntry::policy_violation(
+                "governance_allow_unreserved",
+                audit_reason,
+                200,
+                Some(hostname.to_string()),
+                None,
+                Some(ctx.request_id.to_string()),
+                Some(session.req_header().method.as_str().to_string()),
+            )
+            .with_tenant_id(ctx.tenant_id.to_string())
+            .emit();
+            sbproxy_observe::metrics::record_policy(hostname, "governance", "allow_unreserved");
+            Ok(true)
+        }
+        Err(error) => {
+            sbproxy_observe::metrics::record_policy(hostname, "governance", error.code);
+            let mut body = serde_json::json!({
+                "error": {
+                    "message": error.message,
+                    "type": "governance_error",
+                    "code": error.code,
+                }
+            });
+            if let Some(denial) = error.denial {
+                body["error"]["limit"] = serde_json::json!({
+                    "dimension": denial.dimension,
+                    "limit": denial.limit,
+                    "used": denial.used,
+                    "reserved": denial.reserved,
+                    "requested": denial.requested,
+                    "remaining": denial.remaining,
+                    "reset_at_millis": denial.reset_at_millis,
+                });
+            }
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            send_response(session, error.status, "application/json", &bytes).await?;
+            Ok(false)
+        }
+    }
+}
+
+fn arm_governance_ceiling(ctx: &mut RequestContext) {
+    if let Some(charge) = ctx.governance_lease.as_mut() {
+        let _ = charge.arm_conservative_drop_settlement();
+    }
+}
+
+async fn settle_governance_tokens(ctx: &mut RequestContext, input_tokens: u64, output_tokens: u64) {
+    if let Some(charge) = ctx.governance_lease.as_mut() {
+        if let Err(error) = charge.settle_tokens(input_tokens, output_tokens).await {
+            warn!(error = %error, "AI governance settlement failed");
+        }
+    }
+}
+
+async fn settle_governance_ceiling(ctx: &mut RequestContext) {
+    if let Some(charge) = ctx.governance_lease.as_mut() {
+        if let Err(error) = charge.settle_ceiling().await {
+            warn!(error = %error, "AI governance ceiling settlement failed");
+        }
+    }
+}
+
+async fn release_governance(ctx: &mut RequestContext) {
+    if let Some(charge) = ctx.governance_lease.as_mut() {
+        if let Err(error) = charge.release().await {
+            warn!(error = %error, "AI governance release failed");
+        }
+    }
+}
+
+fn accumulate_governance_retry_usage(ctx: &mut RequestContext, body: &[u8]) {
+    if ctx.governance_lease.is_none() {
+        return;
+    }
+    let Some((input, output)) = extract_governance_usage(body) else {
+        ctx.governance_retry_usage_missing = true;
+        return;
+    };
+    ctx.governance_retry_usage_observed = true;
+    match (
+        ctx.governance_retry_input_tokens.checked_add(input),
+        ctx.governance_retry_output_tokens.checked_add(output),
+    ) {
+        (Some(input_total), Some(output_total)) => {
+            ctx.governance_retry_input_tokens = input_total;
+            ctx.governance_retry_output_tokens = output_total;
+        }
+        _ => ctx.governance_retry_usage_missing = true,
+    }
+}
+
+async fn settle_governance_failed_attempts(ctx: &mut RequestContext) {
+    if ctx.governance_retry_usage_missing {
+        settle_governance_ceiling(ctx).await;
+    } else if ctx.governance_retry_usage_observed {
+        settle_governance_tokens(
+            ctx,
+            ctx.governance_retry_input_tokens,
+            ctx.governance_retry_output_tokens,
+        )
+        .await;
+    } else if governance_billable_work_started(ctx) {
+        settle_governance_ceiling(ctx).await;
+    } else {
+        release_governance(ctx).await;
+    }
+}
+
+fn mark_governance_retry_usage_missing(ctx: &mut RequestContext) {
+    if ctx.governance_lease.is_some() {
+        ctx.governance_retry_usage_missing = true;
+    }
+}
+
+fn governance_billable_work_started(ctx: &RequestContext) -> bool {
+    ctx.governance_lease
+        .as_ref()
+        .is_some_and(|charge| charge.conservative_drop_settlement_armed())
+}
+
+async fn settle_governance_buffered_response(ctx: &mut RequestContext, status: u16, body: &[u8]) {
+    let final_usage = extract_governance_usage(body);
+    if ctx.governance_retry_usage_missing || (final_usage.is_none() && (200..300).contains(&status))
+    {
+        settle_governance_ceiling(ctx).await;
+    } else if let Some((input, output)) = final_usage {
+        match (
+            ctx.governance_retry_input_tokens.checked_add(input),
+            ctx.governance_retry_output_tokens.checked_add(output),
+        ) {
+            (Some(input), Some(output)) => settle_governance_tokens(ctx, input, output).await,
+            _ => settle_governance_ceiling(ctx).await,
+        }
+    } else if ctx.governance_retry_usage_observed {
+        settle_governance_tokens(
+            ctx,
+            ctx.governance_retry_input_tokens,
+            ctx.governance_retry_output_tokens,
+        )
+        .await;
+    } else if governance_billable_work_started(ctx) {
+        settle_governance_ceiling(ctx).await;
+    } else {
+        release_governance(ctx).await;
+    }
+}
+
+fn mark_governance_output(ctx: &mut Option<&mut RequestContext>, output_emitted: &mut bool) {
+    if *output_emitted {
+        return;
+    }
+    *output_emitted = true;
+    if let Some(ctx) = ctx {
+        arm_governance_ceiling(ctx);
+    }
+}
+
+fn governance_reservation_ceiling(
+    surface: &sbproxy_ai::handler::AiSurface,
+    model: &str,
+    body: &serde_json::Value,
+    encoded_body_len: usize,
+    default_max_output_tokens: u64,
+    attempt_bound: u64,
+) -> Option<(u64, u64)> {
+    let messages = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value::<sbproxy_ai::Message>(item.clone()).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut prompt =
+        sbproxy_ai::estimate_tokens_for_reservation(model, &messages, encoded_body_len);
+    // Reserve the complete encoded request, not only message text. This covers
+    // tools, response schemas, instructions, multimodal parts, and future
+    // prompt-bearing fields that a message-only tokenizer cannot see. The
+    // one-token-per-byte ceiling is intentionally conservative; optimize
+    // schema-complete exact tokenizers without weakening this invariant.
+    prompt = prompt.max(encoded_body_len as u64);
+    let generates_tokens = matches!(
+        surface,
+        sbproxy_ai::handler::AiSurface::ChatCompletions
+            | sbproxy_ai::handler::AiSurface::Messages
+            | sbproxy_ai::handler::AiSurface::Responses
+    );
+    let output_per_choice = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .or_else(|| body.get("max_output_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(if generates_tokens {
+            default_max_output_tokens
+        } else {
+            0
+        });
+    let choices = if generates_tokens {
+        body.get("n")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1)
+            .max(1)
+    } else {
+        1
+    };
+    let prompt = prompt.checked_mul(attempt_bound)?;
+    let output = output_per_choice
+        .checked_mul(choices)?
+        .checked_mul(attempt_bound)?;
+    Some((prompt, output))
+}
+
+fn governance_attempt_bound(
+    config: &sbproxy_ai::handler::AiHandlerConfig,
+    model: &str,
+    body: &serde_json::Value,
+    allowed_providers: &[String],
+    blocked_providers: &[String],
+) -> Option<u64> {
+    let is_stream = body
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let policy_candidates = config
+        .providers
+        .iter()
+        .filter(|provider| {
+            provider.enabled
+                && sbproxy_ai::routing::provider_allowed_by_policy(
+                    provider.name.as_str(),
+                    allowed_providers,
+                    blocked_providers,
+                )
+        })
+        .collect::<Vec<_>>();
+    let declared_matches = policy_candidates
+        .iter()
+        .filter(|provider| {
+            model.is_empty()
+                || provider.models.is_empty()
+                || provider.models.iter().any(|candidate| candidate == model)
+        })
+        .count();
+    // Routing deliberately treats a model that no provider enumerates as a
+    // pass-through model and leaves the full policy-filtered order intact.
+    // Mirror that wildcard behavior here so fallback/race reservations cover
+    // every provider that can actually receive billable work.
+    let eligible = if declared_matches == 0 {
+        policy_candidates.len()
+    } else {
+        declared_matches
+    }
+    .max(1);
+    let content_policy_fallback = config
+        .resilience
+        .as_ref()
+        .is_some_and(|resilience| resilience.content_policy_fallback);
+    let has_managed_fallback = config.providers.iter().any(|provider| {
+        provider.enabled && (provider.serve.is_some() || provider.is_managed_model())
+    });
+    let base = match &config.routing {
+        sbproxy_ai::RoutingStrategy::Race if !is_stream => eligible,
+        sbproxy_ai::RoutingStrategy::Cascade(cascade) if !is_stream => cascade.tiers.len().max(1),
+        sbproxy_ai::RoutingStrategy::FallbackChain => eligible,
+        _ if content_policy_fallback || has_managed_fallback => eligible,
+        _ => 1,
+    };
+    // This dispatch path does not invoke the library client's shadow hook.
+    // Do not reserve or price work that cannot be dispatched here.
+    u64::try_from(base).ok()
+}
+
+fn governance_route_price(
+    config: &sbproxy_ai::handler::AiHandlerConfig,
+    model: &str,
+    allowed_providers: &[String],
+    blocked_providers: &[String],
+    require_every_rate: bool,
+) -> Option<sbproxy_ai::budget::ModelPrice> {
+    if model.is_empty() {
+        return None;
+    }
+    let policy_candidates = config
+        .providers
+        .iter()
+        .filter(|provider| {
+            provider.enabled
+                && sbproxy_ai::routing::provider_allowed_by_policy(
+                    provider.name.as_str(),
+                    allowed_providers,
+                    blocked_providers,
+                )
+        })
+        .collect::<Vec<_>>();
+    let declared_matches = policy_candidates
+        .iter()
+        .copied()
+        .filter(|provider| {
+            provider.models.is_empty() || provider.models.iter().any(|candidate| candidate == model)
+        })
+        .collect::<Vec<_>>();
+    let priced_candidates = if declared_matches.is_empty() {
+        policy_candidates
+    } else {
+        declared_matches
+    };
+    let mut route_models = priced_candidates
+        .into_iter()
+        .map(|provider| provider.map_model(model))
+        .collect::<Vec<_>>();
+    if let sbproxy_ai::RoutingStrategy::Cascade(cascade) = &config.routing {
+        route_models.extend(cascade.tiers.iter().filter_map(|tier| {
+            config
+                .providers
+                .iter()
+                .find(|provider| {
+                    provider.name == tier.provider_id
+                        && provider.enabled
+                        && sbproxy_ai::routing::provider_allowed_by_policy(
+                            provider.name.as_str(),
+                            allowed_providers,
+                            blocked_providers,
+                        )
+                })
+                .map(|_| tier.model.clone())
+        }));
+    }
+    if route_models.is_empty() {
+        route_models.push(model.to_string());
+    }
+
+    let mut greatest: Option<sbproxy_ai::budget::ModelPrice> = None;
+    for route_model in route_models {
+        let Some(price) = config.governance_model_price(&route_model) else {
+            if require_every_rate {
+                return None;
+            }
+            continue;
+        };
+        greatest = Some(match greatest {
+            None => price,
+            Some(current) => sbproxy_ai::budget::ModelPrice {
+                input_per_million: current.input_per_million.max(price.input_per_million),
+                output_per_million: current.output_per_million.max(price.output_per_million),
+                cache_read_per_million: current
+                    .cache_read_per_million
+                    .max(price.cache_read_per_million),
+                cache_write_per_million: current
+                    .cache_write_per_million
+                    .max(price.cache_write_per_million),
+            },
+        });
+    }
+    greatest
+}
+
+fn validate_effective_route_models(
+    config: &sbproxy_ai::handler::AiHandlerConfig,
+    key: Option<&ResolvedRequestKey>,
+    model: &str,
+    allowed_providers: &[String],
+    blocked_providers: &[String],
+) -> Result<(), String> {
+    let mut candidates = Vec::new();
+    if !model.is_empty() {
+        candidates.push(model);
+    }
+    if let sbproxy_ai::RoutingStrategy::Cascade(cascade) = &config.routing {
+        candidates.extend(
+            cascade
+                .tiers
+                .iter()
+                .filter(|tier| {
+                    config.providers.iter().any(|provider| {
+                        provider.name == tier.provider_id
+                            && provider.enabled
+                            && sbproxy_ai::routing::provider_allowed_by_policy(
+                                provider.name.as_str(),
+                                allowed_providers,
+                                blocked_providers,
+                            )
+                    })
+                })
+                .map(|tier| tier.model.as_str())
+                .filter(|candidate| !candidate.is_empty()),
+        );
+    }
+
+    for candidate in candidates {
+        if !config.is_model_allowed(candidate) {
+            return Err(format!("model '{candidate}' is not allowed"));
+        }
+        if key.is_some_and(|key| !key.is_model_allowed(candidate)) {
+            return Err(format!("model '{candidate}' is not allowed for this key"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod governance_ceiling_tests {
+    use super::{
+        governance_attempt_bound, governance_reservation_ceiling, validate_effective_route_models,
+    };
+    use sbproxy_ai::handler::AiSurface;
+
+    #[test]
+    fn tools_choices_and_fallback_attempts_expand_the_hard_ceiling() {
+        let body = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "description": "a deliberately nontrivial schema",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+            }}],
+            "max_completion_tokens": 10,
+            "n": 2
+        });
+        let encoded_len = serde_json::to_vec(&body).unwrap().len();
+
+        let (prompt, output) = governance_reservation_ceiling(
+            &AiSurface::ChatCompletions,
+            "gpt-4o-mini",
+            &body,
+            encoded_len,
+            4_096,
+            3,
+        )
+        .unwrap();
+
+        assert!(prompt >= (encoded_len as u64) * 3);
+        assert_eq!(output, 60);
+    }
+
+    #[test]
+    fn responses_and_non_generation_surfaces_reserve_the_complete_payload() {
+        let responses = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": "response API input",
+            "max_output_tokens": 7
+        });
+        let response_len = serde_json::to_vec(&responses).unwrap().len();
+        assert_eq!(
+            governance_reservation_ceiling(
+                &AiSurface::Responses,
+                "gpt-4o-mini",
+                &responses,
+                response_len,
+                4_096,
+                2,
+            )
+            .unwrap(),
+            ((response_len as u64) * 2, 14)
+        );
+
+        let embeddings = serde_json::json!({"model": "embed-local", "input": ["a", "b"]});
+        let embeddings_len = serde_json::to_vec(&embeddings).unwrap().len();
+        assert_eq!(
+            governance_reservation_ceiling(
+                &AiSurface::Embeddings,
+                "embed-local",
+                &embeddings,
+                embeddings_len,
+                4_096,
+                1,
+            )
+            .unwrap(),
+            (embeddings_len as u64, 0)
+        );
+    }
+
+    #[test]
+    fn reservation_ceiling_overflow_fails_closed() {
+        let body = serde_json::json!({"input": "x"});
+        assert!(governance_reservation_ceiling(
+            &AiSurface::Responses,
+            "gpt-4o-mini",
+            &body,
+            2,
+            u64::MAX,
+            2,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn unenumerated_fallback_model_reserves_every_dispatch_candidate() {
+        let config: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(
+            serde_json::json!({
+                "providers": [
+                    {"name": "one", "api_key": "k", "provider_type": "openai", "models": ["known-one"]},
+                    {"name": "two", "api_key": "k", "provider_type": "openai", "models": ["known-two"]},
+                    {"name": "three", "api_key": "k", "provider_type": "openai", "models": ["known-three"]}
+                ],
+                "routing": "fallback_chain",
+                "shadow": {"provider": "two"}
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            governance_attempt_bound(
+                &config,
+                "unlisted-model",
+                &serde_json::json!({}),
+                &[],
+                &[],
+            ),
+            Some(3),
+            "routing keeps all providers for an unenumerated model and this path does not dispatch shadow work",
+        );
+        assert_eq!(
+            governance_attempt_bound(
+                &config,
+                "unlisted-model",
+                &serde_json::json!({}),
+                &["one".to_string(), "three".to_string()],
+                &[],
+            ),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn rewritten_and_cascade_models_are_rechecked_against_origin_policy() {
+        let config = sbproxy_ai::handler::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "cheap", "api_key": "k"},
+                {"name": "smart", "api_key": "k"}
+            ],
+            "allowed_models": ["requested", "cheap-model"],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [
+                    {"provider_id": "cheap", "model": "cheap-model", "quality_threshold": 0.5},
+                    {"provider_id": "smart", "model": "blocked-model", "quality_threshold": 0.9}
+                ]
+            }
+        }))
+        .unwrap();
+
+        assert!(validate_effective_route_models(&config, None, "requested", &[], &[]).is_err());
+        assert!(
+            validate_effective_route_models(&config, None, "policy-rewrite", &[], &[]).is_err()
+        );
+        assert!(validate_effective_route_models(
+            &config,
+            None,
+            "requested",
+            &[],
+            &["smart".to_string()],
+        )
+        .is_ok());
+    }
 }
 
 struct AiBodyPromptBlock {
@@ -876,16 +1463,19 @@ pub(super) async fn handle_ai_proxy(
     if let Some(user) = trace_user {
         ai_span.record("sbproxy.user", user);
     }
+    // Own the principal fallback so the provider policy does not keep an
+    // immutable borrow of `ctx` alive across governance admission and stream
+    // settlement, both of which mutate request-scoped lease state.
+    let principal_allowed_providers = ctx
+        .principal
+        .virtual_key
+        .as_ref()
+        .map(|key| key.allowed_providers.clone())
+        .unwrap_or_default();
     let allowed_providers = resolved_request_vk
         .as_ref()
         .map(ResolvedRequestKey::allowed_providers)
-        .or_else(|| {
-            ctx.principal
-                .virtual_key
-                .as_ref()
-                .map(|key| key.allowed_providers.as_slice())
-        })
-        .unwrap_or(&[]);
+        .unwrap_or(principal_allowed_providers.as_slice());
     let blocked_providers = resolved_request_vk
         .as_ref()
         .map(ResolvedRequestKey::blocked_providers)
@@ -993,6 +1583,11 @@ pub(super) async fn handle_ai_proxy(
     let router = config.router();
     // Serve model discovery locally; other GET surfaces use ordinary dispatch.
     if method == http::Method::GET {
+        if ctx.effective_key_policy.is_some()
+            && !admit_governed_request(session, hostname, ctx, "", None, 0, 0).await?
+        {
+            return Ok(());
+        }
         if matches!(
             path.split('?')
                 .next()
@@ -1019,6 +1614,7 @@ pub(super) async fn handle_ai_proxy(
                 )
             };
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            settle_governance_tokens(ctx, 0, 0).await;
             send_response(session, 200, "application/json", &bytes).await?;
             return Ok(());
         }
@@ -1032,6 +1628,7 @@ pub(super) async fn handle_ai_proxy(
             blocked_models,
         ) {
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            settle_governance_tokens(ctx, 0, 0).await;
             send_response(session, 200, "application/json", &bytes).await?;
             return Ok(());
         }
@@ -1065,6 +1662,7 @@ pub(super) async fn handle_ai_proxy(
                     .collect();
                 let body = serde_json::json!({ "object": "list", "data": data });
                 let bytes = serde_json::to_vec(&body).unwrap_or_default();
+                settle_governance_tokens(ctx, 0, 0).await;
                 send_response(session, 200, "application/json", &bytes).await?;
                 return Ok(());
             }
@@ -1079,10 +1677,12 @@ pub(super) async fn handle_ai_proxy(
                 }
             });
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            release_governance(ctx).await;
             send_response(session, 503, "application/json", &bytes).await?;
             return Ok(());
         }
 
+        arm_governance_ceiling(ctx);
         let resp = AI_CLIENT
             .load()
             .forward_get_request(provider, &path)
@@ -1120,6 +1720,7 @@ pub(super) async fn handle_ai_proxy(
             ctx.principal.api_key_id(),
             &ai_span,
         );
+        settle_governance_tokens(ctx, 0, 0).await;
         return relay_ai_response(
             session,
             resp,
@@ -1144,6 +1745,19 @@ pub(super) async fn handle_ai_proxy(
             | http::Method::PATCH
             | http::Method::OPTIONS
     ) {
+        // These mutation surfaces do not yet run the JSON rewrite, tool,
+        // PII, guardrail, and AI-policy pipeline below. A governed request
+        // must never silently bypass those controls merely because it uses a
+        // non-POST verb, so reject it before provider selection or billing.
+        if ctx.effective_key_policy.is_some() {
+            send_error(
+                session,
+                501,
+                "governed AI requests do not support this HTTP method",
+            )
+            .await?;
+            return Ok(());
+        }
         let provider_idx = router
             .select_with_policy(&config.providers, allowed_providers, blocked_providers)
             .ok_or_else(|| {
@@ -1194,7 +1808,12 @@ pub(super) async fn handle_ai_proxy(
         // fall through unchanged.
         let (idem_skip_reason, idem_capture) =
             match engage_ai_idempotency(session, pipeline, origin_idx, &body_raw, false).await? {
-                AiIdempotencyEngagement::Replayed | AiIdempotencyEngagement::Conflict => {
+                AiIdempotencyEngagement::Replayed => {
+                    settle_governance_tokens(ctx, 0, 0).await;
+                    return Ok(());
+                }
+                AiIdempotencyEngagement::Conflict => {
+                    release_governance(ctx).await;
                     return Ok(());
                 }
                 AiIdempotencyEngagement::NotApplicable => (None, None),
@@ -1217,6 +1836,7 @@ pub(super) async fn handle_ai_proxy(
                 ),
             };
 
+        arm_governance_ceiling(ctx);
         let resp = AI_CLIENT
             .load()
             .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
@@ -1256,6 +1876,7 @@ pub(super) async fn handle_ai_proxy(
             ctx.principal.api_key_id(),
             &ai_span,
         );
+        settle_governance_tokens(ctx, 0, 0).await;
         // WOR-1044 PR3: the GET-method-aware path runs before the
         // request body is read, so there is no reversible PII
         // capture yet. Pass an empty pairs vector; restore is a
@@ -1378,37 +1999,46 @@ pub(super) async fn handle_ai_proxy(
     // logic. Multipart bodies are explicitly skipped for v1
     // (see `engage_ai_idempotency`); the marker stamps the response
     // so operators can spot the case in dashboards.
-    let (idem_skip_reason, mut idem_capture) = match engage_ai_idempotency(
-        session,
-        pipeline,
-        origin_idx,
-        body_bytes.as_ref(),
-        is_multipart_request,
-    )
-    .await?
-    {
-        AiIdempotencyEngagement::Replayed | AiIdempotencyEngagement::Conflict => {
-            return Ok(());
-        }
-        AiIdempotencyEngagement::NotApplicable => (None, None),
-        AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
-        AiIdempotencyEngagement::Miss {
-            idem,
-            workspace_id,
-            key,
-            body_hash,
-            permit,
-        } => (
-            None,
-            Some(AiIdempotencyCapture {
-                idem,
-                workspace_id,
-                key,
-                body_hash,
-                _permit: permit,
-            }),
-        ),
-    };
+    // Governed JSON requests engage idempotency after their atomic
+    // reservation below, so replays still consume an RPM unit while refunding
+    // all token/spend holds. Multipart is always explicitly skipped and
+    // ungoverned requests retain the legacy early engagement order.
+    let (mut idem_skip_reason, mut idem_capture) =
+        if is_multipart_request || ctx.effective_key_policy.is_none() {
+            match engage_ai_idempotency(
+                session,
+                pipeline,
+                origin_idx,
+                body_bytes.as_ref(),
+                is_multipart_request,
+            )
+            .await?
+            {
+                AiIdempotencyEngagement::Replayed | AiIdempotencyEngagement::Conflict => {
+                    return Ok(());
+                }
+                AiIdempotencyEngagement::NotApplicable => (None, None),
+                AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
+                AiIdempotencyEngagement::Miss {
+                    idem,
+                    workspace_id,
+                    key,
+                    body_hash,
+                    permit,
+                } => (
+                    None,
+                    Some(AiIdempotencyCapture {
+                        idem,
+                        workspace_id,
+                        key,
+                        body_hash,
+                        _permit: permit,
+                    }),
+                ),
+            }
+        } else {
+            (None, None)
+        };
 
     if is_multipart_request {
         let maximum = config
@@ -1456,6 +2086,34 @@ pub(super) async fn handle_ai_proxy(
                 .is_none_or(|key| key.is_model_allowed(model));
             if !config.is_model_allowed(model) || !key_allows_model {
                 send_error(session, 403, "model is not allowed for this credential").await?;
+                return Ok(());
+            }
+        }
+        if ctx.effective_key_policy.is_some() {
+            let model = requested_model.as_deref().unwrap_or("");
+            let attempt_bound = governance_attempt_bound(
+                config,
+                model,
+                &serde_json::Value::Null,
+                allowed_providers,
+                blocked_providers,
+            )
+            .and_then(|bound| u64::try_from(forwarded_body.len()).ok()?.checked_mul(bound));
+            let Some(prompt_ceiling) = attempt_bound else {
+                send_error(session, 500, "governance reservation ceiling overflow").await?;
+                return Ok(());
+            };
+            let governance = crate::key_plane::governance_plane();
+            let price = governance_route_price(
+                config,
+                model,
+                allowed_providers,
+                blocked_providers,
+                governance.config().missing_rate == sbproxy_config::MissingRatePolicy::RequireRate,
+            );
+            if !admit_governed_request(session, hostname, ctx, model, price, prompt_ceiling, 0)
+                .await?
+            {
                 return Ok(());
             }
         }
@@ -1507,6 +2165,7 @@ pub(super) async fn handle_ai_proxy(
             let provider = &config.providers[provider_idx];
             let distributed_managed =
                 crate::server::model_host::distributed_managed_provider(provider);
+            arm_governance_ceiling(ctx);
             let response_result: anyhow::Result<reqwest::Response> = if distributed_managed {
                 let origin = ctx
                     .origin_idx
@@ -1681,6 +2340,7 @@ pub(super) async fn handle_ai_proxy(
             if cost_micros > 0 {
                 ctx.ai_cost_usd_micros = Some(cost_micros);
             }
+            settle_governance_tokens(ctx, 0, 0).await;
             let mut extras = public_route_headers(ctx);
             if let Some(reason) = idem_skip_reason {
                 extras.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
@@ -1710,6 +2370,7 @@ pub(super) async fn handle_ai_proxy(
             resp.status().as_u16(),
             None,
         );
+        settle_governance_tokens(ctx, 0, 0).await;
         // Multipart never captures for idempotency (engagement
         // skipped with SKIPPED-MULTIPART). Pass the skip reason
         // through so the marker still lands on the response.
@@ -2566,7 +3227,119 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
+    // Budget soft-landing, hard-budget downgrade, and AI policy can all
+    // rewrite the effective model after the early model checks. Re-run both
+    // origin and governed-key policy against every model that this route can
+    // dispatch, including cascade substitutions, before reservation.
+    if let Err(message) = validate_effective_route_models(
+        config,
+        resolved_request_vk.as_ref(),
+        &model,
+        allowed_providers,
+        blocked_providers,
+    ) {
+        warn!(model = %model, reason = %message, "AI proxy: rewritten route model blocked");
+        send_error(session, 403, &message).await?;
+        return Ok(());
+    }
+
     ctx.ai_logical_model = (!model.is_empty()).then(|| model.clone());
+
+    // Reserve after every request rewrite and policy/guardrail gate, but
+    // before any semantic-cache lookup or provider/local/peer selection. One
+    // immutable reservation therefore owns every possible dispatch attempt;
+    // cache hits settle only the request unit and refund token/spend holds.
+    if ctx.effective_key_policy.is_some() {
+        let governance = crate::key_plane::governance_plane();
+        let encoded_governance_body_len = match serde_json::to_vec(&body) {
+            // Native Anthropic/Responses bypass may forward the original
+            // wire body after only remapping its model. Reserve against the
+            // larger representation so omitted translation fields, tools,
+            // system instructions, and thinking config cannot understate the
+            // strict byte ceiling.
+            Ok(encoded) => encoded.len().max(native_request_bytes_for_bypass.len()),
+            Err(_) => {
+                send_error(session, 500, "failed to encode governed request").await?;
+                return Ok(());
+            }
+        };
+        let attempt_bound = match governance_attempt_bound(
+            config,
+            &model,
+            &body,
+            allowed_providers,
+            blocked_providers,
+        ) {
+            Some(bound) => bound,
+            None => {
+                send_error(session, 500, "governance attempt bound overflow").await?;
+                return Ok(());
+            }
+        };
+        let Some((prompt_ceiling, output_ceiling)) = governance_reservation_ceiling(
+            &surface,
+            &model,
+            &body,
+            encoded_governance_body_len,
+            governance.config().default_max_output_tokens,
+            attempt_bound,
+        ) else {
+            send_error(session, 500, "governance reservation ceiling overflow").await?;
+            return Ok(());
+        };
+        let price = governance_route_price(
+            config,
+            &model,
+            allowed_providers,
+            blocked_providers,
+            governance.config().missing_rate == sbproxy_config::MissingRatePolicy::RequireRate,
+        );
+        if !admit_governed_request(
+            session,
+            hostname,
+            ctx,
+            &model,
+            price,
+            prompt_ceiling,
+            output_ceiling,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+
+        match engage_ai_idempotency(session, pipeline, origin_idx, body_bytes.as_ref(), false)
+            .await?
+        {
+            AiIdempotencyEngagement::Replayed => {
+                settle_governance_tokens(ctx, 0, 0).await;
+                return Ok(());
+            }
+            AiIdempotencyEngagement::Conflict => {
+                release_governance(ctx).await;
+                return Ok(());
+            }
+            AiIdempotencyEngagement::NotApplicable => {}
+            AiIdempotencyEngagement::Skipped { reason } => {
+                idem_skip_reason = Some(reason);
+            }
+            AiIdempotencyEngagement::Miss {
+                idem,
+                workspace_id,
+                key,
+                body_hash,
+                permit,
+            } => {
+                idem_capture = Some(AiIdempotencyCapture {
+                    idem,
+                    workspace_id,
+                    key,
+                    body_hash,
+                    _permit: permit,
+                });
+            }
+        }
+    }
 
     // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
     //
@@ -2642,6 +3415,11 @@ pub(super) async fn handle_ai_proxy(
                 // response. Matches OSS `x-sbproxy-cache: HIT` convention.
                 let _ = header.insert_header("x-semcache", "HIT");
 
+                // A cache replay consumes one request-rate unit but no model
+                // tokens or spend. Settle before the first response byte so a
+                // client disconnect cannot leave the full token hold behind.
+                settle_governance_tokens(ctx, 0, 0).await;
+
                 session
                     .write_response_header(Box::new(header), false)
                     .await?;
@@ -2686,7 +3464,18 @@ pub(super) async fn handle_ai_proxy(
                 // Provider hits the embedding API (costs money, egresses the
                 // prompt); sidecar uses the local classifier sidecar (free, no
                 // egress). Any error falls through to an uncached upstream call.
+                let strict_governance = ctx.governance_lease.is_some()
+                    && crate::key_plane::governance_plane().config().consistency
+                        == sbproxy_config::GovernanceConsistency::Strict;
                 let query_vec_result: anyhow::Result<Vec<f32>> = match cache.source() {
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Provider
+                    | sbproxy_ai::semantic_cache::EmbeddingSource::Openai
+                        if strict_governance =>
+                    {
+                        Err(anyhow::anyhow!(
+                            "external semantic-cache embeddings are disabled under strict governance"
+                        ))
+                    }
                     sbproxy_ai::semantic_cache::EmbeddingSource::Provider => {
                         match config.providers.iter().find(|provider| {
                             provider.name == cache.provider()
@@ -2837,6 +3626,7 @@ pub(super) async fn handle_ai_proxy(
                                 &body,
                                 &ctx.attribution_tags,
                             );
+                            settle_governance_tokens(ctx, 0, 0).await;
                             session
                                 .write_response_header(Box::new(header), false)
                                 .await?;
@@ -3199,6 +3989,10 @@ pub(super) async fn handle_ai_proxy(
         let provider = &config.providers[index];
         provider.serve.is_some() || provider.is_managed_model()
     });
+    // From this point forward every branch may initiate provider or managed
+    // worker computation. Unknown transport/cancellation outcomes must retain
+    // the conservative reservation rather than default-release it.
+    arm_governance_ceiling(ctx);
 
     // --- Cascade routing ---
     //
@@ -3259,6 +4053,16 @@ pub(super) async fn handle_ai_proxy(
                         ctx.principal.api_key_id(),
                         &ai_span,
                     );
+                    if o.billable_usage_missing {
+                        settle_governance_ceiling(ctx).await;
+                    } else {
+                        settle_governance_tokens(
+                            ctx,
+                            o.aggregate_input_tokens,
+                            o.aggregate_output_tokens,
+                        )
+                        .await;
+                    }
                     // Drop any idempotency capture: cascade does not
                     // engage the idempotency cache write in v1
                     // because the response body is already
@@ -3308,6 +4112,12 @@ pub(super) async fn handle_ai_proxy(
     let race_mode =
         router.is_race() && !is_stream && provider_order.len() >= 2 && !has_managed_local;
     if race_mode {
+        // Loser responses are cancelled without a trustworthy usage record.
+        // The reservation already covers every eligible leg, so retain that
+        // full ceiling instead of settling only the winning provider and
+        // silently refunding potentially billable work.
+        mark_governance_retry_usage_missing(ctx);
+        arm_governance_ceiling(ctx);
         use futures::stream::{FuturesUnordered, StreamExt as _};
         let client = AI_CLIENT.load();
         let race_start = std::time::Instant::now();
@@ -3748,8 +4558,13 @@ pub(super) async fn handle_ai_proxy(
                         attempt = %attempt,
                         "AI proxy: provider returned error, trying next"
                     );
-                    // Consume the response body to avoid connection leak.
-                    let _ = resp.bytes().await;
+                    // Consume the response body to avoid a connection leak and
+                    // retain any billable usage for the one terminal ingress
+                    // settlement after fallback completes.
+                    match resp.bytes().await {
+                        Ok(body) => accumulate_governance_retry_usage(ctx, &body),
+                        Err(_) => mark_governance_retry_usage_missing(ctx),
+                    }
                     continue;
                 }
                 if managed_provider_fallback
@@ -3757,7 +4572,10 @@ pub(super) async fn handle_ai_proxy(
                     && (retry_by_status || retry_by_policy)
                 {
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
-                    let _ = resp.bytes().await;
+                    match resp.bytes().await {
+                        Ok(body) => accumulate_governance_retry_usage(ctx, &body),
+                        Err(_) => mark_governance_retry_usage_missing(ctx),
+                    }
                     last_error = Some(anyhow::anyhow!(
                         "fallback provider returned retryable HTTP status {status}"
                     ));
@@ -3803,10 +4621,12 @@ pub(super) async fn handle_ai_proxy(
                             to = %to_provider,
                             "AI proxy: content-policy refusal, failing over to a more permissive provider"
                         );
+                        accumulate_governance_retry_usage(ctx, &body_bytes);
                         continue;
                     }
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
                     let extras = public_route_headers(ctx);
+                    settle_governance_buffered_response(ctx, status, &body_bytes).await;
                     return send_response_with_extras(
                         session,
                         status,
@@ -4136,6 +4956,7 @@ pub(super) async fn handle_ai_proxy(
             crate::server::model_host::managed_error_body(ctx.request_id.as_str(), reason, true);
         let mut extras = public_logical_model_header(ctx);
         extras.push(("retry-after".to_string(), "1".to_string()));
+        settle_governance_failed_attempts(ctx).await;
         send_response_with_extras(session, 503, "application/json", &body, &extras).await
     } else if let Some(e) = last_error {
         sbproxy_ai::tracing_spans::record_error(
@@ -4143,6 +4964,7 @@ pub(super) async fn handle_ai_proxy(
             last_error_type,
             "AI upstream request failed (all providers)",
         );
+        settle_governance_failed_attempts(ctx).await;
         Err(Error::because(
             ErrorType::ConnectError,
             "AI upstream request failed (all providers)",
@@ -4155,6 +4977,7 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
             "no enabled AI providers",
         );
+        release_governance(ctx).await;
         Err(Error::new(ErrorType::HTTPStatus(502)))
     }
 }
@@ -4443,6 +5266,14 @@ pub(super) async fn relay_ai_response_with_cache(
     output_external: Vec<sbproxy_ai::external_guardrail::ExternalGuardrailConfig>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
+    if (200..300).contains(&status) {
+        if let Some(ctx) = ctx.as_deref_mut() {
+            // Once a successful provider response exists, a body read/client
+            // failure may hide usage. Drop must conservatively settle the
+            // admitted ceiling rather than refunding the reservation.
+            arm_governance_ceiling(ctx);
+        }
+    }
 
     // Collect relevant headers from upstream. We preserve the full header
     // map (lossy to String/String) for the cache entry separately from
@@ -4560,6 +5391,10 @@ pub(super) async fn relay_ai_response_with_cache(
 
     if (200..300).contains(&status) {
         record_ai_response_span_metadata(&ai_span, &resp_body);
+    }
+
+    if let Some(ctx) = ctx.as_deref_mut() {
+        settle_governance_buffered_response(ctx, status, &resp_body).await;
     }
 
     // --- WOR-1141: enforce OUTPUT guardrails ---
@@ -5782,12 +6617,16 @@ pub(super) async fn relay_ai_stream(
     // `sbproxy_ai_output_throughput_tokens_per_second` at stream close.
     let stream_started = std::time::Instant::now();
     let mut first_token_at: Option<std::time::Instant> = None;
+    let mut output_emitted = false;
     // Build the per-stream usage parser when a budget recorder is
     // wired. `select_parser` returns `None` only when the operator
     // sets `usage_parser: none`; every other branch yields a live
     // parser whose snapshot is read at stream close.
-    let mut usage_parser: Option<Box<dyn sbproxy_ai::SseUsageParser>> = if budget_recorder.is_some()
-    {
+    let needs_usage_parser = budget_recorder.is_some()
+        || ctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.governance_lease.is_some() || ctx.ai_admission.is_some());
+    let mut usage_parser: Option<Box<dyn sbproxy_ai::SseUsageParser>> = if needs_usage_parser {
         let hints = sbproxy_ai::UsageParserHints {
             upstream_host: parser_args.upstream_host.as_deref(),
             content_type: parser_args.content_type.as_deref(),
@@ -5886,7 +6725,8 @@ pub(super) async fn relay_ai_stream(
     // violating output does not reach the client.
     let mut output_guard_blocked = false;
     'relay: loop {
-        match stream.next().await {
+        let next_chunk = stream.next().await;
+        match next_chunk {
             Some(Ok(chunk)) => {
                 let chunk_bytes = Bytes::copy_from_slice(&chunk);
                 // WOR-895: first non-empty chunk marks TTFT.
@@ -6089,6 +6929,7 @@ pub(super) async fn relay_ai_stream(
                 session
                     .write_response_body(Some(outbound_bytes), false)
                     .await?;
+                mark_governance_output(&mut ctx, &mut output_emitted);
             }
             Some(Err(e)) => {
                 let kind = if e.is_timeout() {
@@ -6196,7 +7037,13 @@ pub(super) async fn relay_ai_stream(
                             if let Some(trace) = trace_stream_content.as_mut() {
                                 trace.feed(&bytes);
                             }
-                            let _ = session.write_response_body(Some(bytes), false).await;
+                            if session
+                                .write_response_body(Some(bytes), false)
+                                .await
+                                .is_ok()
+                            {
+                                mark_governance_output(&mut ctx, &mut output_emitted);
+                            }
                         }
                     }
                 }
@@ -6213,7 +7060,9 @@ pub(super) async fn relay_ai_stream(
                     if let Some(trace) = trace_stream_content.as_mut() {
                         trace.feed(&tail);
                     }
-                    let _ = session.write_response_body(Some(tail), false).await;
+                    if session.write_response_body(Some(tail), false).await.is_ok() {
+                        mark_governance_output(&mut ctx, &mut output_emitted);
+                    }
                 }
                 break;
             }
@@ -6224,6 +7073,41 @@ pub(super) async fn relay_ai_stream(
     // as a partial recording: we let the guard drop emit
     // `End { complete: false }`.
     session.write_response_body(None, true).await?;
+
+    let parsed_usage = usage_parser.as_ref().and_then(|parser| parser.snapshot());
+    if let Some(ctx) = ctx {
+        if let Some(tokens) = parsed_usage.as_ref() {
+            if let Some(admission) = ctx.ai_admission.take() {
+                admission.reconcile(tokens.prompt_tokens as u64);
+            }
+        }
+        if ctx.governance_retry_usage_missing {
+            settle_governance_ceiling(ctx).await;
+        } else if let Some(tokens) = parsed_usage.as_ref() {
+            match (
+                ctx.governance_retry_input_tokens
+                    .checked_add(tokens.prompt_tokens as u64),
+                ctx.governance_retry_output_tokens
+                    .checked_add(tokens.completion_tokens as u64),
+            ) {
+                (Some(input), Some(output)) => settle_governance_tokens(ctx, input, output).await,
+                _ => settle_governance_ceiling(ctx).await,
+            }
+        } else if output_emitted && (200..300).contains(&status) {
+            settle_governance_ceiling(ctx).await;
+        } else if ctx.governance_retry_usage_observed {
+            settle_governance_tokens(
+                ctx,
+                ctx.governance_retry_input_tokens,
+                ctx.governance_retry_output_tokens,
+            )
+            .await;
+        } else if governance_billable_work_started(ctx) {
+            settle_governance_ceiling(ctx).await;
+        } else {
+            release_governance(ctx).await;
+        }
+    }
 
     if safety_blocked {
         // WOR-1144: the stream was cut short by an output-safety verdict.
@@ -7891,62 +8775,14 @@ mod effective_key_budget_tests {
         key_record_to_effective_policy(&record, "tenant-a").expect("valid governed policy")
     }
 
-    fn scope_keys(config: &BudgetConfig, key_id: &str, workspace: &str) -> Vec<(usize, String)> {
-        budget_scope_keys(
-            config,
-            workspace,
-            Some(key_id),
-            None,
-            Some("gpt-4.1"),
-            Some(workspace),
-            None,
-        )
-    }
-
     #[test]
-    fn record_budget_creates_a_blocking_lifetime_api_key_limit() {
+    fn record_budget_is_not_duplicated_in_the_legacy_tracker() {
         let policy = governed_policy("budget-block-key", Some(100), None);
-        let merged = merged_request_budget(None, Some(&policy))
-            .expect("record budget creates config")
-            .into_owned();
-
-        assert_eq!(merged.on_exceed, OnExceedAction::Block);
-        assert_eq!(merged.limits.len(), 1);
-        assert_eq!(merged.limits[0].scope, BudgetScope::ApiKey);
-        assert_eq!(merged.limits[0].max_tokens, Some(100));
-        assert_eq!(merged.limits[0].period.as_deref(), Some("total"));
-
-        let keys = scope_keys(&merged, &policy.key_id, "budget-block-origin");
-        BUDGET_TRACKER.record_usage(&keys[0].1, 100, 0.0);
-        assert!(matches!(
-            budget_preflight(&merged, &keys, &[], &std::collections::HashMap::new()),
-            BudgetGate::Block { status: 402, .. }
-        ));
+        assert!(merged_request_budget(None, Some(&policy)).is_none());
     }
 
     #[test]
-    fn record_budgets_are_independent_by_immutable_key_id() {
-        let policy = governed_policy("budget-independent-a", Some(50), None);
-        let merged = merged_request_budget(None, Some(&policy))
-            .expect("record budget creates config")
-            .into_owned();
-        let keys_a = scope_keys(&merged, "budget-independent-a", "budget-independent-origin");
-        let keys_b = scope_keys(&merged, "budget-independent-b", "budget-independent-origin");
-        assert_ne!(keys_a[0].1, keys_b[0].1);
-
-        BUDGET_TRACKER.record_usage(&keys_a[0].1, 50, 0.0);
-        assert!(matches!(
-            budget_preflight(&merged, &keys_a, &[], &std::collections::HashMap::new()),
-            BudgetGate::Block { .. }
-        ));
-        assert!(matches!(
-            budget_preflight(&merged, &keys_b, &[], &std::collections::HashMap::new()),
-            BudgetGate::Allow
-        ));
-    }
-
-    #[test]
-    fn origin_and_record_budget_limits_compose_in_one_snapshot() {
+    fn origin_budget_remains_on_the_legacy_path_without_record_composition() {
         let origin = BudgetConfig {
             limits: vec![BudgetLimit {
                 scope: BudgetScope::Workspace,
@@ -7961,19 +8797,13 @@ mod effective_key_budget_tests {
         let policy = governed_policy("budget-composed-key", Some(500), Some(2.5));
 
         let merged = merged_request_budget(Some(&origin), Some(&policy))
-            .expect("origin and record budgets compose")
+            .expect("origin budget remains configured")
             .into_owned();
 
-        assert_eq!(merged.limits.len(), 2);
+        assert_eq!(merged.on_exceed, OnExceedAction::Block);
+        assert_eq!(merged.limits.len(), 1);
         assert_eq!(merged.limits[0].scope, BudgetScope::Workspace);
-        assert_eq!(merged.limits[1].scope, BudgetScope::ApiKey);
-        assert_eq!(merged.limits[1].max_tokens, Some(500));
-        assert_eq!(merged.limits[1].max_cost_usd, Some(2.5));
-        assert_eq!(merged.limits[1].period.as_deref(), Some("total"));
-        assert_eq!(
-            scope_keys(&merged, &policy.key_id, "composed-origin").len(),
-            2
-        );
+        assert_eq!(merged.limits[0].max_tokens, Some(10_000));
     }
 }
 

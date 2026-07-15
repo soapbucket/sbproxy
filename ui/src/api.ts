@@ -510,6 +510,62 @@ export interface EffectivePolicyPreview {
   decisions: EffectivePolicyDecisions;
 }
 
+export type KeyUsageConsistency = "approximate" | "strict";
+export type KeyUsageBackendStatus = "healthy" | "degraded" | "unavailable";
+
+export interface KeyUsageDimension {
+  limit: number;
+  used: number;
+  reserved: number;
+  remaining: number;
+  reset_at: string | null;
+}
+
+export interface KeyUsageDimensions {
+  requests_per_minute: KeyUsageDimension | null;
+  tokens_per_minute: KeyUsageDimension | null;
+  budget_tokens: KeyUsageDimension | null;
+  budget_micro_usd: KeyUsageDimension | null;
+}
+
+export interface KeyUsageSnapshot {
+  key_id: string;
+  policy_version: {
+    revision: number;
+    digest: string;
+  };
+  consistency: KeyUsageConsistency;
+  backend: {
+    name: string;
+    status: KeyUsageBackendStatus;
+    checked_at: string;
+  };
+  dimensions: KeyUsageDimensions;
+}
+
+export interface KeyUsageBackendUnavailable {
+  error: {
+    code: "governance_backend_unavailable";
+    message: string;
+  };
+  consistency: "strict";
+  backend: {
+    name: string;
+    status: "unavailable";
+    checked_at: string;
+  };
+}
+
+export class KeyUsageUnavailableError extends ApiError {
+  readonly outage: KeyUsageBackendUnavailable;
+
+  constructor(error: ApiError, outage: KeyUsageBackendUnavailable) {
+    super(error.status, error.message, JSON.stringify(outage));
+    this.name = "KeyUsageUnavailableError";
+    this.outage = outage;
+  }
+}
+
 const EFFECTIVE_POLICY_DECISION_NAMES: readonly EffectivePolicyDecisionName[] = [
   "lifecycle",
   "tenant",
@@ -552,6 +608,39 @@ function responseSafeInteger(
     throw new TypeError(`${label}.${field} must be a positive safe integer`);
   }
   return value as number;
+}
+
+function responseNonNegativeSafeInteger(
+  object: Record<string, unknown>,
+  field: string,
+  label: string,
+): number {
+  const value = object[field];
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError(`${label}.${field} must be a non-negative safe integer`);
+  }
+  return value as number;
+}
+
+function responseIsoTimestamp(
+  object: Record<string, unknown>,
+  field: string,
+  label: string,
+): string {
+  const value = responseString(object, field, label);
+  if (value.length === 0 || Number.isNaN(Date.parse(value))) {
+    throw new TypeError(`${label}.${field} must be an ISO timestamp`);
+  }
+  return value;
+}
+
+function responseNullableIsoTimestamp(
+  object: Record<string, unknown>,
+  field: string,
+  label: string,
+): string | null {
+  if (object[field] === null) return null;
+  return responseIsoTimestamp(object, field, label);
 }
 
 function optionalNullableResponseString(
@@ -700,6 +789,130 @@ function decodeEffectivePolicyPreview(value: unknown): EffectivePolicyPreview {
     },
     decisions,
   };
+}
+
+const KEY_USAGE_DIMENSION_NAMES = [
+  "requests_per_minute",
+  "tokens_per_minute",
+  "budget_tokens",
+  "budget_micro_usd",
+] as const satisfies readonly (keyof KeyUsageDimensions)[];
+
+function decodeKeyUsageDimension(
+  value: unknown,
+  label: string,
+  lifetime: boolean,
+): KeyUsageDimension | null {
+  if (value === null) return null;
+  const dimension = responseObject(value, label);
+  return {
+    limit: responseNonNegativeSafeInteger(dimension, "limit", label),
+    used: responseNonNegativeSafeInteger(dimension, "used", label),
+    reserved: responseNonNegativeSafeInteger(dimension, "reserved", label),
+    remaining: responseNonNegativeSafeInteger(dimension, "remaining", label),
+    reset_at: lifetime
+      ? responseNullableIsoTimestamp(dimension, "reset_at", label)
+      : responseIsoTimestamp(dimension, "reset_at", label),
+  };
+}
+
+function decodeKeyUsageSnapshot(value: unknown): KeyUsageSnapshot {
+  const document = responseObject(value, "key usage");
+  const version = responseObject(document.policy_version, "key usage.policy_version");
+  const backend = responseObject(document.backend, "key usage.backend");
+  const rawDimensions = responseObject(document.dimensions, "key usage.dimensions");
+
+  const consistency = document.consistency;
+  if (consistency !== "approximate" && consistency !== "strict") {
+    throw new TypeError("key usage.consistency is not supported");
+  }
+  const backendStatus = backend.status;
+  if (
+    backendStatus !== "healthy" &&
+    backendStatus !== "degraded" &&
+    backendStatus !== "unavailable"
+  ) {
+    throw new TypeError("key usage.backend.status is not supported");
+  }
+
+  const dimensions = {} as KeyUsageDimensions;
+  for (const name of KEY_USAGE_DIMENSION_NAMES) {
+    if (!(name in rawDimensions)) {
+      throw new TypeError(`key usage.dimensions.${name} is required`);
+    }
+    dimensions[name] = decodeKeyUsageDimension(
+      rawDimensions[name],
+      `key usage.dimensions.${name}`,
+      name === "budget_tokens" || name === "budget_micro_usd",
+    );
+  }
+
+  return {
+    key_id: responseString(document, "key_id", "key usage"),
+    policy_version: {
+      revision: responseSafeInteger(version, "revision", "key usage.policy_version"),
+      digest: responseString(version, "digest", "key usage.policy_version"),
+    },
+    consistency,
+    backend: {
+      name: responseString(backend, "name", "key usage.backend"),
+      status: backendStatus,
+      checked_at: responseIsoTimestamp(backend, "checked_at", "key usage.backend"),
+    },
+    dimensions,
+  };
+}
+
+function decodeKeyUsageBackendUnavailable(
+  value: unknown,
+): KeyUsageBackendUnavailable {
+  const document = responseObject(value, "key usage outage");
+  const error = responseObject(document.error, "key usage outage.error");
+  const backend = responseObject(document.backend, "key usage outage.backend");
+  if (error.code !== "governance_backend_unavailable") {
+    throw new TypeError("key usage outage.error.code is not supported");
+  }
+  if (document.consistency !== "strict") {
+    throw new TypeError("key usage outage.consistency must be strict");
+  }
+  if (backend.status !== "unavailable") {
+    throw new TypeError("key usage outage.backend.status must be unavailable");
+  }
+  const backendName = responseString(backend, "name", "key usage outage.backend");
+  if (
+    backendName.length === 0 ||
+    backendName.length > 64 ||
+    !/^[a-z0-9_-]+$/.test(backendName)
+  ) {
+    throw new TypeError("key usage outage.backend.name is not a bounded identifier");
+  }
+  const message = responseString(error, "message", "key usage outage.error");
+  if (message.length === 0 || message.length > 128) {
+    throw new TypeError("key usage outage.error.message is not bounded");
+  }
+
+  return {
+    error: {
+      code: "governance_backend_unavailable",
+      message,
+    },
+    consistency: "strict",
+    backend: {
+      name: backendName,
+      status: "unavailable",
+      checked_at: responseIsoTimestamp(backend, "checked_at", "key usage outage.backend"),
+    },
+  };
+}
+
+function keyUsageOutage(error: ApiError): KeyUsageBackendUnavailable | null {
+  if (error.status !== 503) return null;
+  try {
+    assertSafeJsonIntegers(error.body);
+    return decodeKeyUsageBackendUnavailable(JSON.parse(error.body) as unknown);
+  } catch {
+    return null;
+  }
 }
 
 export interface KeyPolicyDraft {
@@ -1612,6 +1825,19 @@ export const api = {
       `/admin/keys/${encodeURIComponent(id)}`,
     );
     return document.key;
+  },
+  keyUsage: async (id: string) => {
+    try {
+      return decodeKeyUsageSnapshot(
+        await getJson<unknown>(`/admin/keys/${encodeURIComponent(id)}/usage`),
+      );
+    } catch (error) {
+      if (error instanceof ApiError) {
+        const outage = keyUsageOutage(error);
+        if (outage) throw new KeyUsageUnavailableError(error, outage);
+      }
+      throw error;
+    }
   },
   createKey: (body: unknown) => sendJson<CreatedKey>("POST", "/admin/keys", body),
   patchKey: async (id: string, patch: AdminKeyPolicyPatch) => {

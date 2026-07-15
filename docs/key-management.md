@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-14*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -42,6 +42,16 @@ proxy:
       master_key: env:SBPROXY_KEY_MASTER   # envelope key for upstream creds
     failure_mode_allow: false        # fail closed when the store is down
     allow_api_override: false        # config records win on reload
+    governance:
+      consistency: approximate       # approximate | strict
+      # backend:                     # required only for strict
+      #   type: redis
+      #   url: redis://redis:6379/4
+      lease_ttl_secs: 120
+      terminal_retention_secs: 300
+      failure_mode: closed            # closed | allow_unreserved
+      missing_rate: zero_cost         # zero_cost | require_rate
+      default_max_output_tokens: 4096
     oidc_claim_map:
       claim_field: virtual_key       # JWT/OIDC claim that names the record
     seed:
@@ -86,15 +96,130 @@ Creation and deletion are separate operations. In particular,
 `DELETE /admin/keys/{id}` is not guarded by `policy_revision`; coordinate
 destructive deletion separately from policy editing.
 
-This compare-and-swap protects the key policy document. It does not make
-runtime RPM, TPM, or budget accounting strictly atomic across gateway nodes.
-Cluster-wide strict Redis reservations are deferred to WOR-1845. Authenticated
-caller introspection is separate rollout work and is not documented as
-available here.
+This compare-and-swap protects the key policy document. Runtime RPM, TPM, and
+budget consistency are selected separately under `key_management.governance`.
 
 ![a key minted on node A, read immediately from node B, then revoked with both replicas seeing it, no reload](assets/ai-dynamic-keys-cluster.gif)
 
 Two replicas share a Redis store with a mesh cache in front ([config](../examples/ai-dynamic-keys-cluster/)).
+
+## Governed accounting consistency
+
+Dynamic-key rate and budget fields use one reservation lifecycle at the
+ingress gateway. Choose its consistency explicitly:
+
+| Mode | Guarantee | Backend |
+|---|---|---|
+| `approximate` | Exact inside one process. Multiple gateways can each admit from their local view, so a fleet can oversubscribe a key. This is the compatibility default. | None. Configuring a backend in this mode is rejected. |
+| `strict` | Atomic admission across every gateway that uses the same Redis database. Used plus active reservations cannot exceed a configured key limit beyond the one-micro-USD rounding unit. | An explicit `backend: { type: redis, url: ... }` is required. Missing or unsupported strict backends fail config validation. |
+
+The strict client supports a standard Redis endpoint, including a managed
+primary/HA endpoint such as non-cluster-mode GCP Memorystore. Redis Cluster
+endpoints that require `MOVED`/`ASK` redirection are not supported in this
+release; do not point governance at a cluster-mode endpoint.
+
+The governance backend is independent of `key_management.store`. The key store
+holds policy records; the governance backend owns reservations and usage. A
+deployment may point both at the same Redis service, but strict mode still
+requires its own explicit backend declaration:
+
+```yaml
+proxy:
+  key_management:
+    governance:
+      consistency: strict
+      backend:
+        type: redis
+        url: redis://redis:6379/4
+      lease_ttl_secs: 120
+      terminal_retention_secs: 300
+      failure_mode: closed
+      missing_rate: require_rate
+      default_max_output_tokens: 4096
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `consistency` | `approximate` | Process-local approximate accounting or cluster-wide strict accounting. |
+| `backend` | unset | Tagged shared backend. Only `type: redis` is supported, and only with `strict`. |
+| `lease_ttl_secs` | `120` | Maximum time a reservation can remain stranded without renewal. Must be positive. |
+| `terminal_retention_secs` | `300` | How long settled, released, and expired outcomes remain available for idempotent retries. Must be at least the lease TTL and the 60-second rate window. |
+| `failure_mode` | `closed` | Strict-backend outage behavior: reject, or explicitly admit without a reservation. |
+| `missing_rate` | `zero_cost` | Behavior for a model with no configured, rate-card, or built-in token price. |
+| `default_max_output_tokens` | `4096` | Conservative output reservation when the request omits `max_tokens`. |
+
+### Reservation lifecycle and failure behavior
+
+The ingress gateway resolves the effective key policy, estimates the maximum
+tokens and cost, and atomically reserves RPM, TPM, lifetime tokens, and lifetime
+spend before choosing a provider or managed replica. It renews an active lease
+before half the TTL elapses while provider work or a stream is still running.
+Completion replaces the reservation with actual usage once. A refusal with no
+billable work releases it once. Repeated settle or release calls return the
+retained terminal outcome without changing counters.
+
+If a gateway crashes, renewal stops and Redis reclaims the reservation after
+`lease_ttl_secs`. A healthy long stream remains admitted because ingress keeps
+renewing its lease. Workers never receive the governance-store handle and never
+charge the caller. Local, peer, unmanaged, external, fallback, streaming, and
+cancellation paths all settle or release at the ingress boundary, so forwarding
+to a worker cannot double-charge a key.
+
+The prompt hold is deliberately conservative: it is at least the larger of the
+recognized-model tokenizer estimate and the complete encoded request-body byte
+length. Native-format pass-through also includes the original wire length. This
+covers tools, response schemas, top-level instructions, multimodal parts, and
+future prompt-bearing fields without trusting a partial schema parser. Choice
+count and the maximum number of billable fallback, race, or cascade attempts
+multiply the hold. This can reject a request earlier than an exact tokenizer
+would, but cannot weaken the configured hard cap.
+
+With `failure_mode: closed`, an unavailable strict backend rejects admission
+with `503` and `governance_backend_unavailable`. This is the production-safe
+default. `allow_unreserved` admits the request without silently switching to
+approximate counters. It marks backend health unavailable and emits one bounded
+audit event identifying the public key, policy version, and request, plus a
+bounded outage metric without key-cardinality labels. Neither records the bearer
+token or prompt. Use it only as an explicit outage
+policy.
+
+Rate-window denials return `429`. Lifetime token or monetary denials return
+`402`. RPM and TPM use fixed 60-second windows aligned to Unix epoch boundaries.
+Their usage snapshots include the next reset time. `max_budget_tokens` and
+`max_budget_usd` remain lifetime limits, so their reset is `null`.
+
+Monetary accounting uses the AI origin's `model_prices`, optional rate card, or
+built-in model catalog for hosted and self-hosted routes. The gateway converts
+USD to integer micro-USD and rounds up once per request; the documented rounding
+unit is one micro-USD. Floating-point values never enter Redis. With
+`missing_rate: zero_cost`, an unpriced model settles zero micro-USD while RPM,
+TPM, and token budgets still apply. With `missing_rate: require_rate`, an
+unpriced model is rejected before dispatch.
+
+Config compilation rejects governed integer limits outside `1` through
+`9,007,199,254,740,991`. USD limits must be finite, positive, represent at
+least one whole micro-USD, and remain in that exact range after conversion.
+These checks apply both to `key_management.seed.keys` and to `ai_provider`
+credential RPM and budget fields at proxy, tenant, and origin scope.
+
+For a heterogeneous fallback or cascade, admission and final aggregate-token
+settlement use the component-wise greatest eligible rate. The result is a
+conservative upper charge, never an underestimate of configured spend. Split
+per-attempt exact-cost attribution is a separate billing enhancement and is not
+part of this hard-cap contract.
+
+### Migrating advisory distributed counters
+
+Existing mesh CRDT counters and the older Redis shared-budget writer remain
+legacy, advisory data sources for deployments that expose their metrics. They
+are not strict admission mechanisms. The governed reservation path does not
+read or increment them for enforcement, so it cannot stack those post-flight
+charges on top of the ingress settlement.
+
+For a multi-gateway key that must not oversubscribe, configure
+`consistency: strict` with Redis. Leaving the default `approximate` is an
+explicit choice to accept process-local enforcement. A Redis key store or mesh
+cache alone does not upgrade governed limits to strict consistency.
 
 ## The policy cache
 
@@ -116,9 +241,10 @@ The mesh tier makes the L2 a gossip cluster instead of Redis: a SWIM membership
 protocol feeds a consistent-hash ring, and reads and writes route to the replica
 that owns a key, so the resolution order is L1, then the mesh cache, then the
 store. A durable shared store still sits behind it as the source of truth (Redis,
-or a secrets manager for a Redis-free fleet); the mesh keeps the cache coherent
-and carries CRDT-based per-key spend and rate counters across replicas. Bootstrap
-it with a `cache.mesh:` block of seed peers plus gossip and transport ports:
+or a secrets manager for a Redis-free fleet); the mesh keeps the policy cache
+coherent. Its CRDT spend and rate counters are advisory and do not replace the
+strict Redis governance backend. Bootstrap it with a `cache.mesh:` block of seed
+peers plus gossip and transport ports:
 
 ```yaml
 cache:
@@ -162,6 +288,8 @@ and encrypted credentials will not survive a restart.
 By default the plane fails closed. If the store cannot be reached, a request
 carrying a virtual key is denied. Set `failure_mode_allow: true` only if you have
 weighed an outage of the store against an outage of your gateway.
+This key-record lookup switch is separate from
+`governance.failure_mode`, which controls strict reservation-backend outages.
 
 ## Key identity and policy revisions
 
@@ -216,6 +344,7 @@ The plaintext token appears once at mint; list calls only ever show the key_id (
 | `GET /admin/keys` | List keys (no secrets) |
 | `GET /admin/keys/policy-schema` | Fetch the server-driven field, editor, clear, and enforcement contract |
 | `GET /admin/keys/{id}` | Fetch one key |
+| `GET /admin/keys/{id}/usage` | Fetch current limits, usage, reservations, reset times, consistency, and backend health |
 | `POST /admin/keys/{id}/effective-policy/preview` | Evaluate a bounded sample without dispatching or changing counters |
 | `PATCH /admin/keys/{id}` | Update policy with required `expected_revision` |
 | `DELETE /admin/keys/{id}` | Delete a key |
@@ -232,7 +361,8 @@ The plaintext token appears once at mint; list calls only ever show the key_id (
 
 The PATCH body is flat. Do not wrap fields under `policy` or `budget`.
 
-- `expected_revision` is required and must be at least `1`.
+- `expected_revision` is required and must be between `1` and
+  `9,007,199,254,740,991`.
 - An absent field is unchanged.
 - JSON `null` clears a nullable field such as `name`, `route_to_model`, a limit,
   a budget cap, attribution, `inject_mcp`, or `expires_at`.
@@ -249,11 +379,11 @@ field leaves it unchanged.
 | PATCH field | Replacement value | Clear or reset value | Read response |
 |---|---|---|---|
 | `name` | string | `null` | `name` |
-| `max_requests_per_minute` | non-negative integer | `null` | same field |
-| `max_tokens_per_minute` | non-negative integer | `null` | same field |
+| `max_requests_per_minute` | integer from 1 to 9,007,199,254,740,991 | `null` | same field |
+| `max_tokens_per_minute` | integer from 1 to 9,007,199,254,740,991 | `null` | same field |
 | `priority` | `interactive`, `standard`, or `batch` | `null` | same field |
-| `max_budget_tokens` | non-negative integer | `null` | `budget.max_tokens` |
-| `max_budget_usd` | finite non-negative number | `null` | `budget.max_cost_usd` |
+| `max_budget_tokens` | integer from 1 to 9,007,199,254,740,991 | `null` | `budget.max_tokens` |
+| `max_budget_usd` | finite positive value representing 1 to 9,007,199,254,740,991 whole micro-USD | `null` | `budget.max_cost_usd` |
 | `allowed_models` | string list | `[]` | same field |
 | `blocked_models` | string list | `[]` | same field |
 | `allowed_providers` | string list | `[]` | same field |
@@ -393,6 +523,61 @@ resource kind, and public record id. The event does not contain a plaintext
 secret or verifier hash. Route that tracing target to a protected audit sink and
 apply normal operational-log access controls. See [Audit log](audit-log.md).
 
+### Usage and backend health
+
+Read one key's current reservation state with:
+
+```bash
+curl -s -u admin:change-me \
+  http://127.0.0.1:9090/admin/keys/ab12cd34/usage | jq .
+```
+
+The response includes the effective policy revision and digest, `approximate`
+or `strict` consistency, secret-free backend name and health, and four possible
+dimensions: `requests_per_minute`, `tokens_per_minute`, `budget_tokens`, and
+`budget_micro_usd`. An unconfigured dimension is `null`; otherwise it includes
+`limit`, `used`, `reserved`, `remaining`, and `reset_at`:
+
+```json
+{
+  "key_id": "ab12cd34",
+  "policy_version": { "revision": 4, "digest": "sha256:..." },
+  "consistency": "strict",
+  "backend": {
+    "name": "redis",
+    "status": "healthy",
+    "checked_at": "2026-07-14T18:30:00Z"
+  },
+  "dimensions": {
+    "requests_per_minute": {
+      "limit": 60,
+      "used": 12,
+      "reserved": 3,
+      "remaining": 45,
+      "reset_at": "2026-07-14T18:31:00Z"
+    },
+    "tokens_per_minute": null,
+    "budget_tokens": {
+      "limit": 100000,
+      "used": 25000,
+      "reserved": 5000,
+      "remaining": 70000,
+      "reset_at": null
+    },
+    "budget_micro_usd": null
+  }
+}
+```
+
+The endpoint never returns a bearer token, verifier hash, Redis URL, worker
+identity, or private model endpoint. The Keys page renders the same snapshot and
+calls out degraded or unavailable strict backends.
+
+When the strict backend cannot serve the snapshot, the endpoint returns 503
+with `error.code: governance_backend_unavailable`, `consistency: strict`, and a
+sanitized backend object whose status is `unavailable`. The checked timestamp
+remains visible, but the Redis URL and connection error are never returned.
+
 ## Live policy
 
 A key is not just an auth token; it carries its own policy. Everything below
@@ -405,18 +590,13 @@ accounting are different guarantees; see
   `allowed_providers`, and `blocked_providers`. Empty allow-lists mean "all".
   A matching block takes precedence over an allow.
 - **Rate and budget:** `max_requests_per_minute` and `max_tokens_per_minute`
-  cap the key's one-minute windows (requests admitted, then tokens actually
-  consumed by responses). `max_budget_tokens` and `max_budget_usd` are the flat
-  mutation fields for lifetime caps. Read responses return those caps in the
-  key's `budget.max_tokens` and `budget.max_cost_usd` fields.
-
-  Stored-key token and cost settlement currently applies only to standard JSON
-  POST inference surfaces when the provider response reports parseable usage.
-  Multipart and non-POST requests can still dispatch, but they do not settle
-  `max_tokens_per_minute`, `max_budget_tokens`, or `max_budget_usd` counters.
-  Extending settlement to those surfaces, together with strict multi-node
-  reservations, is deferred to WOR-1845. Until then, do not treat these caps as
-  a strict ceiling for multipart, non-POST, or concurrent multi-node traffic.
+  cap fixed one-minute windows. `max_budget_tokens` and `max_budget_usd` are the
+  flat mutation fields for lifetime caps. Read responses return those caps in
+  the key's `budget.max_tokens` and `budget.max_cost_usd` fields. Admission
+  reserves a conservative ceiling before routing and ingress settles actual
+  usage once across local, peer, unmanaged, external, fallback, streaming,
+  cancellation, and failure paths. See
+  [Governed accounting consistency](#governed-accounting-consistency).
 - **Scheduling lane:** `priority` (`interactive`, `standard`, or `batch`)
   places the key's requests in a lane on the locally served model's admission
   queue. Unset means standard. See the model host doc for how lanes queue and

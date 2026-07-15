@@ -17,8 +17,15 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
+use sbproxy_ai::governance::{
+    GovernanceBackendHealth, GovernanceConsistency as RuntimeGovernanceConsistency,
+    GovernanceStore, InMemoryGovernanceConfig, InMemoryGovernanceStore,
+};
+use sbproxy_ai::governance_redis::{RedisGovernanceConfig, RedisGovernanceStore};
 use sbproxy_config::types::{
-    KeyCacheTier, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig, SeedKeyConfig,
+    GovernanceBackendConfig, GovernanceConfig,
+    GovernanceConsistency as ConfigGovernanceConsistency, KeyCacheTier, KeyManagementConfig,
+    KeyStoreBackend, SeedCredentialConfig, SeedKeyConfig,
 };
 use sbproxy_keystore::crypto::KeyCrypto;
 use sbproxy_keystore::record::{
@@ -33,6 +40,40 @@ pub struct KeyPlane {
     failure_mode_allow: bool,
     allow_api_override: bool,
     oidc_claim_field: Option<String>,
+}
+
+/// Live governed-key reservation backend, independent of mutable key storage.
+///
+/// Keeping this plane separate allows configured virtual keys to use governed
+/// accounting even when dynamic key administration is disabled.
+pub struct GovernancePlane {
+    config: GovernanceConfig,
+    store: Arc<dyn GovernanceStore>,
+}
+
+impl GovernancePlane {
+    /// Validated operator configuration installed with this backend.
+    pub fn config(&self) -> &GovernanceConfig {
+        &self.config
+    }
+
+    /// Shared request admission and accounting store.
+    pub fn store(&self) -> Arc<dyn GovernanceStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// Runtime consistency label exposed to admin and metrics surfaces.
+    pub fn consistency(&self) -> RuntimeGovernanceConsistency {
+        match self.config.consistency {
+            ConfigGovernanceConsistency::Approximate => RuntimeGovernanceConsistency::Approximate,
+            ConfigGovernanceConsistency::Strict => RuntimeGovernanceConsistency::Strict,
+        }
+    }
+
+    /// Secret-free backend health snapshot.
+    pub async fn health(&self) -> GovernanceBackendHealth {
+        self.store.health().await
+    }
 }
 
 impl KeyPlane {
@@ -88,6 +129,45 @@ fn plane_slot() -> &'static ArcSwapOption<KeyPlane> {
     SLOT.get_or_init(|| ArcSwapOption::from(None))
 }
 
+fn governance_plane_slot() -> &'static ArcSwapOption<GovernancePlane> {
+    static SLOT: OnceLock<ArcSwapOption<GovernancePlane>> = OnceLock::new();
+    SLOT.get_or_init(|| ArcSwapOption::from(None))
+}
+
+/// The currently installed governed-key accounting backend.
+pub fn current_governance_plane() -> Option<Arc<GovernancePlane>> {
+    governance_plane_slot().load_full()
+}
+
+/// Installed governed accounting, or the process-local compatibility default
+/// when no `key_management` block configured a backend.
+pub fn governance_plane() -> Arc<GovernancePlane> {
+    if let Some(plane) = current_governance_plane() {
+        return plane;
+    }
+    static DEFAULT: OnceLock<Arc<GovernancePlane>> = OnceLock::new();
+    Arc::clone(DEFAULT.get_or_init(|| {
+        Arc::new(
+            build_governance_plane(&GovernanceConfig::default())
+                .expect("default governance configuration is valid"),
+        )
+    }))
+}
+
+fn install_governance_plane(plane: Arc<GovernancePlane>) {
+    governance_plane_slot().store(Some(plane));
+}
+
+fn build_or_reuse_governance_plane(cfg: &GovernanceConfig) -> Result<Arc<GovernancePlane>> {
+    cfg.validate()?;
+    if let Some(current) = current_governance_plane() {
+        if current.config() == cfg {
+            return Ok(current);
+        }
+    }
+    Ok(Arc::new(build_governance_plane(cfg)?))
+}
+
 /// The currently installed key plane, or `None` when the dynamic key plane is
 /// disabled.
 pub fn current_key_plane() -> Option<Arc<KeyPlane>> {
@@ -97,6 +177,17 @@ pub fn current_key_plane() -> Option<Arc<KeyPlane>> {
 /// Install (or replace) the live key plane.
 pub fn install_key_plane(plane: Arc<KeyPlane>) {
     plane_slot().store(Some(plane));
+}
+
+/// Disable dynamic key administration and return governed accounting to the
+/// process-local compatibility default.
+///
+/// The key plane is cleared first so requests fail authentication during the
+/// very small publication window instead of resolving an old key against a
+/// newly reset accounting backend.
+pub fn disable_key_plane() {
+    plane_slot().store(None);
+    governance_plane_slot().store(None);
 }
 
 /// A dedicated, process-lifetime runtime that hosts key-plane async work
@@ -301,6 +392,53 @@ fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCa
     Arc::new(cache)
 }
 
+/// Build governance accounting without opening a network connection. Redis
+/// connects lazily on the first operation.
+fn build_governance_plane(config: &GovernanceConfig) -> Result<GovernancePlane> {
+    config.validate().map_err(|error| anyhow::anyhow!(error))?;
+    let reservation_ttl_millis = config
+        .lease_ttl_millis()
+        .context("convert governance lease TTL")?;
+    let terminal_retention_millis = config
+        .terminal_retention_millis()
+        .context("convert governance terminal retention")?;
+
+    let store: Arc<dyn GovernanceStore> = match config.consistency {
+        ConfigGovernanceConsistency::Approximate => Arc::new(
+            InMemoryGovernanceStore::new(InMemoryGovernanceConfig {
+                reservation_ttl_millis,
+                terminal_retention_millis,
+            })
+            .context("build approximate governance store")?,
+        ),
+        ConfigGovernanceConsistency::Strict => {
+            let url = match config.backend.as_ref() {
+                Some(GovernanceBackendConfig::Redis { url }) => url,
+                None => anyhow::bail!("strict consistency requires a Redis backend"),
+            };
+            let redis = sbproxy_platform::storage::AsyncRedisKVStore::new(
+                sbproxy_platform::storage::AsyncRedisConfig::new(url),
+            );
+            Arc::new(
+                RedisGovernanceStore::new(
+                    redis,
+                    RedisGovernanceConfig {
+                        reservation_ttl_millis,
+                        terminal_retention_millis,
+                        ..RedisGovernanceConfig::default()
+                    },
+                )
+                .context("build strict Redis governance store")?,
+            )
+        }
+    };
+
+    Ok(GovernancePlane {
+        config: config.clone(),
+        store,
+    })
+}
+
 /// The default mesh node id: the `HOSTNAME` environment variable (set per pod
 /// in most container schedulers), falling back to a fixed name. Operators set
 /// `key_management.cache.mesh_node_id` for an explicit, unique id.
@@ -443,7 +581,16 @@ async fn seed_records(
 /// the seed is applied, so seeded keys are usable as soon as the server accepts
 /// traffic.
 pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
+    // A no-op config reload retains the live store, including approximate
+    // counters and active leases. Rebuilding an in-memory store here would
+    // silently reset lifetime budgets on every unrelated reload.
+    let governance = build_or_reuse_governance_plane(&cfg.governance)?;
     if !cfg.enabled {
+        // A reload from enabled to explicitly disabled must not leave the
+        // previous credential store/cache reachable. Clear authentication
+        // first (fail closed), then publish the configured accounting plane.
+        plane_slot().store(None);
+        install_governance_plane(governance);
         return Ok(());
     }
     let crypto = build_crypto(cfg)?;
@@ -470,6 +617,10 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
         cfg.allow_api_override,
         cfg.oidc_claim_map.as_ref().map(|m| m.claim_field.clone()),
     ));
+    // Publish both planes only after every fallible build/seed step succeeds,
+    // so a failed hot reload cannot install new governance while retaining an
+    // old key store and policy cache.
+    install_governance_plane(governance);
     install_key_plane(plane);
 
     // WOR-1563: with the mesh tier, install cross-replica per-key spend + rate
@@ -690,13 +841,18 @@ mod tests {
     }
 
     #[test]
-    fn disabled_block_installs_nothing() {
+    fn disabled_key_store_installs_and_reuses_governance() {
         let _guard = test_plane_guard();
         let path = temp_db();
         let mut cfg = base_cfg(&path);
         cfg.enabled = false;
-        // A fresh slot would be None anyway; assert init is a no-op error-free.
         init_key_plane(&cfg).unwrap();
+        let first = current_governance_plane().expect("governance plane installed");
+        assert!(current_key_plane().is_none());
+
+        init_key_plane(&cfg).unwrap();
+        let second = current_governance_plane().expect("governance plane retained");
+        assert!(Arc::ptr_eq(&first, &second));
         std::fs::remove_file(&path).ok();
     }
 

@@ -105,4 +105,49 @@ describe("KeysView policy editing contract", () => {
     expect(keysView).toContain("statusOf(k) === 'blocked'");
     expect(keysView).toContain("statusOf(k) !== 'revoked'");
   });
+
+  it("loads usage for one selected key without adding caller introspection", () => {
+    expect(keysView).toContain("api.keyUsage");
+    expect(keysView).toContain("openUsage(k)");
+    expect(keysView).toContain("Usage and reservations");
+    expect(keysView).not.toContain("/api/v1/key");
+  });
+
+  it("shows every governed dimension and its reservation arithmetic", () => {
+    for (const value of [
+      "Requests per minute",
+      "Tokens per minute",
+      "Token budget",
+      "Monetary budget",
+      "dimension.snapshot.limit",
+      "dimension.snapshot.used",
+      "dimension.snapshot.reserved",
+      "dimension.snapshot.remaining",
+      "dimension.snapshot.reset_at",
+      "formatUsageReset(dimension.snapshot.reset_at)",
+      'return resetAt ? formatTime(resetAt) : "Never"',
+    ]) {
+      expect(keysView).toContain(value);
+    }
+    expect(keysView).toContain("formatUsageAmount");
+    expect(keysView).toContain("budget_micro_usd");
+  });
+
+  it("renders a typed strict 503 outage before the generic error state", () => {
+    expect(keysView).toContain("KeyUsageUnavailableError");
+    expect(keysView).toContain("KeyUsageBackendUnavailable");
+    expect(keysView).toContain("usageOutage.value = e.outage");
+    expect(keysView).toContain('v-else-if="usage || usageOutage"');
+    const outageState = keysView.indexOf('v-else-if="usage || usageOutage"');
+    const genericError = keysView.indexOf('v-else-if="usageError"');
+    expect(outageState).toBeGreaterThan(-1);
+    expect(genericError).toBeGreaterThan(outageState);
+    expect(keysView).toContain("strictBackendUnavailable");
+    expect(keysView).toContain('role="alert"');
+    expect(keysView).toContain("Strict limits are unavailable");
+    expect(keysView).toContain("usageBackend.status");
+    expect(keysView).toContain("usageBackend.checked_at");
+    expect(keysView).toContain("Policy revision");
+    expect(keysView).toContain("policy_version.digest");
+  });
 });

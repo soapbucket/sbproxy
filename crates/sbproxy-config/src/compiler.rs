@@ -520,14 +520,23 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
     use serde_json::json;
 
     validate_credential_principal_selectors("proxy", &file.proxy.credentials)?;
+    validate_credential_governance_limits("proxy", &file.proxy.credentials)?;
     for tenant in &file.proxy.tenants {
         validate_credential_principal_selectors(
+            &format!("tenant `{}`", tenant.id),
+            &tenant.credentials,
+        )?;
+        validate_credential_governance_limits(
             &format!("tenant `{}`", tenant.id),
             &tenant.credentials,
         )?;
     }
     for (hostname, origin) in &file.origins {
         validate_credential_principal_selectors(
+            &format!("origin `{hostname}`"),
+            &origin.credentials,
+        )?;
+        validate_credential_governance_limits(
             &format!("origin `{hostname}`"),
             &origin.credentials,
         )?;
@@ -716,6 +725,41 @@ fn validate_credential_principal_selectors(
                      omit `principals` or use `principals: []` to match every principal",
                     credential.name
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_credential_governance_limits(
+    scope: &str,
+    credentials: &[crate::types::CredentialBlock],
+) -> Result<()> {
+    for credential in credentials {
+        if credential.kind != "ai_provider" {
+            continue;
+        }
+        let prefix = format!("credential {:?} at {scope}", credential.name);
+        if let Some(budget) = &credential.attrs.budget {
+            if let Some(value) = budget.max_tokens {
+                crate::types::validate_governance_integer(
+                    &format!("{prefix} attrs.budget.max_tokens"),
+                    value,
+                )?;
+            }
+            if let Some(value) = budget.max_cost_usd {
+                crate::types::validate_governance_usd(
+                    &format!("{prefix} attrs.budget.max_cost_usd"),
+                    value,
+                )?;
+            }
+        }
+        for (index, policy) in credential.policies.iter().enumerate() {
+            if let crate::types::CredentialPolicy::RateLimit { rpm: Some(value) } = policy {
+                crate::types::validate_governance_integer(
+                    &format!("{prefix} policies[{index}].rpm"),
+                    *value,
+                )?;
             }
         }
     }
@@ -1030,6 +1074,12 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
                 }
             }
         }
+    }
+
+    if let Some(key_management) = &config_file.proxy.key_management {
+        key_management
+            .validate()
+            .context("config compile: proxy.key_management.governance")?;
     }
 
     if let Some(log) = config_file

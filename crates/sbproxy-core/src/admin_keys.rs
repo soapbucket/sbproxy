@@ -7,6 +7,7 @@
 //! GET    /admin/keys                      list keys (no secrets)
 //! GET    /admin/keys/policy-schema        fetch the server-driven policy contract
 //! GET    /admin/keys/{id}                 fetch one key
+//! GET    /admin/keys/{id}/usage           fetch governed usage and backend health
 //! POST   /admin/keys/{id}/effective-policy/preview
 //!                                            evaluate policy without dispatch or reserve
 //! PATCH  /admin/keys/{id}                 update policy/attribution
@@ -31,10 +32,13 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use sbproxy_ai::governance::{
+    CounterSnapshot, GovernanceBackendHealth, GovernanceError, GovernanceSnapshot, SnapshotKey,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::key_plane::{block_on_keystore, current_key_plane, KeyPlane};
+use crate::key_plane::{block_on_keystore, current_key_plane, governance_plane, KeyPlane};
 use sbproxy_keystore::record::{
     CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordStatus,
 };
@@ -101,6 +105,8 @@ fn key_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
         Some("effective-policy/preview") if method.eq_ignore_ascii_case("POST") => {
             preview_effective_key_policy(id, body)
         }
+        Some("usage") if method.eq_ignore_ascii_case("GET") => get_key_usage(id),
+        Some("usage") => method_not_allowed(),
         Some(action) if method.eq_ignore_ascii_case("POST") => match action {
             "revoke" => set_key_status(id, RecordStatus::Revoked, body),
             "block" => set_key_status(id, RecordStatus::Blocked, body),
@@ -210,8 +216,27 @@ struct KeyMutation {
 /// the required `ref` string. Runs before [`apply_key_mutation`] so a bad
 /// PATCH is a 400, never a silently-stored record the AI seam later drops.
 fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
-    if let Some(0) = m.expected_revision {
-        return Err("expected_revision must be at least 1".to_string());
+    const MAX_GOVERNANCE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    if let Some(revision) = m.expected_revision {
+        if revision == 0 || revision > MAX_GOVERNANCE_INTEGER {
+            return Err(format!(
+                "expected_revision must be between 1 and {MAX_GOVERNANCE_INTEGER}"
+            ));
+        }
+    }
+    for (field, value) in [
+        ("max_requests_per_minute", &m.max_requests_per_minute),
+        ("max_tokens_per_minute", &m.max_tokens_per_minute),
+        ("max_budget_tokens", &m.max_budget_tokens),
+    ] {
+        if let Patch::Value(value) = value {
+            if *value == 0 || *value > MAX_GOVERNANCE_INTEGER {
+                return Err(format!(
+                    "{field} must be between 1 and {MAX_GOVERNANCE_INTEGER}"
+                ));
+            }
+        }
     }
     if let Patch::Value(p) = &m.priority {
         if sbproxy_ai::identity::KeyPriority::parse(p).is_none() {
@@ -243,8 +268,16 @@ fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
         }
     }
     if let Patch::Value(value) = &m.max_budget_usd {
-        if !value.is_finite() || *value < 0.0 {
-            return Err("max_budget_usd must be a finite non-negative number".to_string());
+        let micro_usd = *value * 1_000_000.0;
+        if !value.is_finite()
+            || *value <= 0.0
+            || !micro_usd.is_finite()
+            || micro_usd.floor() < 1.0
+            || micro_usd.floor() > MAX_GOVERNANCE_INTEGER as f64
+        {
+            return Err(format!(
+                "max_budget_usd must represent between 1 and {MAX_GOVERNANCE_INTEGER} integer micro-USD"
+            ));
         }
     }
     for (field, is_null) in [
@@ -395,6 +428,193 @@ fn get_key(id: &str) -> Resp {
         Ok(Some(rec)) => ok(json!({ "key": KeyView::from(&rec) })),
         Ok(None) => not_found("key not found"),
         Err(e) => internal_error(&e),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct KeyUsageView {
+    key_id: String,
+    policy_version: sbproxy_ai::effective_key_policy::PolicyVersion,
+    consistency: sbproxy_ai::governance::GovernanceConsistency,
+    backend: KeyUsageBackendView,
+    dimensions: KeyUsageDimensionsView,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyUsageBackendView {
+    name: String,
+    status: sbproxy_ai::governance::GovernanceBackendStatus,
+    checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyUsageUnavailableView {
+    error: KeyUsageUnavailableErrorView,
+    consistency: sbproxy_ai::governance::GovernanceConsistency,
+    backend: KeyUsageBackendView,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyUsageUnavailableErrorView {
+    code: &'static str,
+    message: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyUsageDimensionsView {
+    requests_per_minute: Option<KeyUsageDimensionView>,
+    tokens_per_minute: Option<KeyUsageDimensionView>,
+    budget_tokens: Option<KeyUsageDimensionView>,
+    budget_micro_usd: Option<KeyUsageDimensionView>,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyUsageDimensionView {
+    limit: u64,
+    used: u64,
+    reserved: u64,
+    remaining: u64,
+    reset_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UsageReset {
+    FixedWindow,
+    Lifetime,
+}
+
+fn get_key_usage(id: &str) -> Resp {
+    let key_plane = match plane_or_err() {
+        Ok(plane) => plane,
+        Err(response) => return response,
+    };
+    let record = match load_key(&key_plane, id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return not_found("key not found"),
+        Err(_) => return internal_error("key usage record lookup failed"),
+    };
+
+    // Tenantless keys inherit the request origin at dispatch. Admin usage has
+    // no caller origin, so use the same explicit default origin as policy
+    // preview while deriving limits and the displayed policy version.
+    let policy_origin = record.tenant_id.as_deref().unwrap_or("__default__");
+    let policy = match crate::key_policy::key_record_to_effective_policy(&record, policy_origin) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(
+                reason = error.safe_reason(),
+                "admin key usage: stored policy rejected"
+            );
+            return internal_error("stored key policy is invalid");
+        }
+    };
+    let policy_version = match policy.policy_version() {
+        Ok(version) => version,
+        Err(_) => return internal_error("effective policy serialization failed"),
+    };
+    let limits = match crate::server::governance_admission::limits_for_policy(&policy) {
+        Ok(limits) => limits,
+        Err(_) => return internal_error("effective policy governance limits are invalid"),
+    };
+
+    let governance = governance_plane();
+    let store = governance.store();
+    let expected_key_id = policy.key_id.clone();
+    let snapshot_key = SnapshotKey {
+        key_id: expected_key_id.clone(),
+        policy_revision: policy.policy_revision,
+        limits,
+    };
+    let snapshot = match block_on_keystore(async move { store.snapshot(snapshot_key).await }) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return governance_snapshot_error(error),
+    };
+    let view = match key_usage_view(snapshot, &expected_key_id, policy_version) {
+        Ok(view) => view,
+        Err(reason) => return internal_error(reason),
+    };
+    match serde_json::to_value(view) {
+        Ok(value) => ok(value),
+        Err(_) => internal_error("key usage response serialization failed"),
+    }
+}
+
+fn key_usage_view(
+    snapshot: GovernanceSnapshot,
+    expected_key_id: &str,
+    policy_version: sbproxy_ai::effective_key_policy::PolicyVersion,
+) -> Result<KeyUsageView, &'static str> {
+    if snapshot.key_id != expected_key_id || snapshot.policy_revision != policy_version.revision {
+        return Err("governance snapshot identity mismatch");
+    }
+    let GovernanceBackendHealth {
+        backend,
+        consistency,
+        status,
+        checked_at_millis,
+    } = snapshot.backend;
+    Ok(KeyUsageView {
+        key_id: snapshot.key_id,
+        policy_version,
+        consistency,
+        backend: KeyUsageBackendView {
+            name: backend,
+            status,
+            checked_at: millis_to_datetime(checked_at_millis)?,
+        },
+        dimensions: KeyUsageDimensionsView {
+            requests_per_minute: usage_dimension(
+                snapshot.requests_per_window,
+                UsageReset::FixedWindow,
+            )?,
+            tokens_per_minute: usage_dimension(
+                snapshot.tokens_per_window,
+                UsageReset::FixedWindow,
+            )?,
+            budget_tokens: usage_dimension(snapshot.total_tokens, UsageReset::Lifetime)?,
+            budget_micro_usd: usage_dimension(snapshot.total_micro_usd, UsageReset::Lifetime)?,
+        },
+    })
+}
+
+fn usage_dimension(
+    snapshot: CounterSnapshot,
+    reset: UsageReset,
+) -> Result<Option<KeyUsageDimensionView>, &'static str> {
+    let Some(limit) = snapshot.limit else {
+        return Ok(None);
+    };
+    let remaining = snapshot
+        .remaining
+        .ok_or("configured governance dimension has no remaining value")?;
+    let reset_at = match (reset, snapshot.reset_at_millis) {
+        (UsageReset::FixedWindow, Some(value)) => Some(millis_to_datetime(value)?),
+        (UsageReset::FixedWindow, None) => {
+            return Err("configured rate dimension has no reset time");
+        }
+        (UsageReset::Lifetime, None) => None,
+        (UsageReset::Lifetime, Some(_)) => {
+            return Err("configured lifetime dimension has a reset time");
+        }
+    };
+    Ok(Some(KeyUsageDimensionView {
+        limit,
+        used: snapshot.used,
+        reserved: snapshot.reserved,
+        remaining,
+        reset_at,
+    }))
+}
+
+fn millis_to_datetime(value: u64) -> Result<DateTime<Utc>, &'static str> {
+    let value = i64::try_from(value).map_err(|_| "governance timestamp exceeds ISO range")?;
+    DateTime::<Utc>::from_timestamp_millis(value).ok_or("governance timestamp is outside ISO range")
+}
+
+fn governance_snapshot_error(error: GovernanceError) -> Resp {
+    match error {
+        GovernanceError::BackendUnavailable { backend } => service_unavailable(backend),
+        _ => internal_error("governance snapshot failed"),
     }
 }
 
@@ -988,12 +1208,13 @@ fn policy_preview_limits(record: &KeyRecord) -> Result<PolicyPreviewLimits, &'st
 
 fn policy_preview_usd_to_micro_usd(value: f64) -> Result<u64, &'static str> {
     const MICRO_USD_PER_USD: f64 = 1_000_000.0;
+    const MAX_GOVERNANCE_INTEGER: u64 = 9_007_199_254_740_991;
 
-    if !value.is_finite() || value < 0.0 {
-        return Err("stored max_budget_usd is not a finite non-negative number");
+    if !value.is_finite() || value <= 0.0 {
+        return Err("stored max_budget_usd is not a finite positive number");
     }
-    let rounded = (value * MICRO_USD_PER_USD).round();
-    if !rounded.is_finite() || rounded < 0.0 || rounded >= u64::MAX as f64 {
+    let rounded = (value * MICRO_USD_PER_USD).floor();
+    if !rounded.is_finite() || rounded < 1.0 || rounded > MAX_GOVERNANCE_INTEGER as f64 {
         return Err("stored max_budget_usd cannot be represented as integer micro-USD");
     }
     Ok(rounded as u64)
@@ -1672,6 +1893,29 @@ fn method_not_allowed() -> Resp {
     )
 }
 
+fn service_unavailable(backend: &'static str) -> Resp {
+    let backend = match backend {
+        "redis" => "redis",
+        _ => "unknown",
+    };
+    let view = KeyUsageUnavailableView {
+        error: KeyUsageUnavailableErrorView {
+            code: "governance_backend_unavailable",
+            message: "governance backend unavailable",
+        },
+        consistency: sbproxy_ai::governance::GovernanceConsistency::Strict,
+        backend: KeyUsageBackendView {
+            name: backend.to_string(),
+            status: sbproxy_ai::governance::GovernanceBackendStatus::Unavailable,
+            checked_at: Utc::now(),
+        },
+    };
+    match serde_json::to_string(&view) {
+        Ok(body) => (503, "application/json", body),
+        Err(_) => internal_error("key usage outage response serialization failed"),
+    }
+}
+
 fn internal_error(msg: &str) -> Resp {
     tracing::warn!(error = %msg, "admin key API: internal error");
     (
@@ -1905,6 +2149,190 @@ mod tests {
 
         let fetched = parse(&dispatch("GET", &format!("/admin/keys/{key_id}"), None).unwrap());
         assert_eq!(fetched["key"]["policy_digest"], patched_digest);
+    }
+
+    #[test]
+    fn governed_key_usage_via_dispatch_has_exact_secret_free_contract() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+
+        let created = dispatch(
+            "POST",
+            "/admin/keys",
+            Some(
+                r#"{"name":"governed","tenant":"tenant-a",
+                    "max_requests_per_minute":60,"max_tokens_per_minute":50000,
+                    "max_budget_tokens":1000000,"max_budget_usd":25.0}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(created.0, 201, "create failed: {}", created.2);
+        let created_json = parse(&created);
+        let key_id = created_json["key"]["key_id"].as_str().unwrap();
+        let token = created_json["token"].as_str().unwrap();
+
+        let usage = dispatch("GET", &format!("/admin/keys/{key_id}/usage"), None).unwrap();
+        assert_eq!(usage.0, 200, "usage failed: {}", usage.2);
+        let value = parse(&usage);
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "backend",
+                "consistency",
+                "dimensions",
+                "key_id",
+                "policy_version"
+            ]
+        );
+        assert_eq!(value["key_id"], key_id);
+        assert_eq!(value["policy_version"]["revision"], 1);
+        assert!(value["policy_version"]["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
+        assert_eq!(value["consistency"], "approximate");
+        assert_eq!(value["backend"]["name"], "memory");
+        assert_eq!(value["backend"]["status"], "healthy");
+        DateTime::parse_from_rfc3339(value["backend"]["checked_at"].as_str().unwrap())
+            .expect("backend check time is ISO 8601");
+
+        for (name, limit, reset) in [
+            ("requests_per_minute", 60, true),
+            ("tokens_per_minute", 50_000, true),
+            ("budget_tokens", 1_000_000, false),
+            ("budget_micro_usd", 25_000_000, false),
+        ] {
+            let dimension = &value["dimensions"][name];
+            assert_eq!(dimension["limit"], limit, "{name}");
+            assert_eq!(dimension["used"], 0, "{name}");
+            assert_eq!(dimension["reserved"], 0, "{name}");
+            assert_eq!(dimension["remaining"], limit, "{name}");
+            if reset {
+                DateTime::parse_from_rfc3339(dimension["reset_at"].as_str().unwrap())
+                    .expect("rate reset is ISO 8601");
+            } else {
+                assert!(dimension["reset_at"].is_null(), "{name}");
+            }
+        }
+        assert!(!usage.2.contains(token));
+        assert!(!usage.2.contains("secret_hash"));
+
+        assert_eq!(
+            dispatch("POST", &format!("/admin/keys/{key_id}/usage"), None)
+                .unwrap()
+                .0,
+            405
+        );
+    }
+
+    #[test]
+    fn key_usage_view_preserves_integer_counters_and_unconfigured_dimensions() {
+        let view = key_usage_view(
+            GovernanceSnapshot {
+                key_id: "key-public-id".to_string(),
+                policy_revision: 7,
+                requests_per_window: CounterSnapshot {
+                    limit: Some(10),
+                    used: 3,
+                    reserved: 2,
+                    remaining: Some(5),
+                    reset_at_millis: Some(1_700_000_060_000),
+                },
+                tokens_per_window: CounterSnapshot {
+                    limit: None,
+                    used: 0,
+                    reserved: 0,
+                    remaining: None,
+                    reset_at_millis: Some(1_700_000_060_000),
+                },
+                total_tokens: CounterSnapshot {
+                    limit: Some(100),
+                    used: 20,
+                    reserved: 10,
+                    remaining: Some(70),
+                    reset_at_millis: None,
+                },
+                total_micro_usd: CounterSnapshot {
+                    limit: None,
+                    used: 0,
+                    reserved: 0,
+                    remaining: None,
+                    reset_at_millis: None,
+                },
+                backend: GovernanceBackendHealth {
+                    backend: "memory".to_string(),
+                    consistency: sbproxy_ai::governance::GovernanceConsistency::Approximate,
+                    status: sbproxy_ai::governance::GovernanceBackendStatus::Degraded,
+                    checked_at_millis: 1_700_000_000_000,
+                },
+            },
+            "key-public-id",
+            sbproxy_ai::effective_key_policy::PolicyVersion {
+                revision: 7,
+                digest: "sha256:policy".to_string(),
+            },
+        )
+        .unwrap();
+        let value = serde_json::to_value(view).unwrap();
+
+        assert_eq!(value["backend"]["status"], "degraded");
+        assert_eq!(value["dimensions"]["requests_per_minute"]["used"], 3);
+        assert_eq!(value["dimensions"]["requests_per_minute"]["reserved"], 2);
+        assert_eq!(value["dimensions"]["requests_per_minute"]["remaining"], 5);
+        assert!(value["dimensions"]["tokens_per_minute"].is_null());
+        assert_eq!(value["dimensions"]["budget_tokens"]["used"], 20);
+        assert_eq!(value["dimensions"]["budget_tokens"]["reserved"], 10);
+        assert!(value["dimensions"]["budget_tokens"]["reset_at"].is_null());
+        assert!(value["dimensions"]["budget_micro_usd"].is_null());
+    }
+
+    #[test]
+    fn unavailable_governance_snapshot_is_a_bounded_503() {
+        let response =
+            governance_snapshot_error(GovernanceError::BackendUnavailable { backend: "redis" });
+
+        assert_eq!(response.0, 503);
+        let value = parse(&response);
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["backend", "consistency", "error"]
+        );
+        assert_eq!(value["consistency"], "strict");
+        assert_eq!(value["backend"]["name"], "redis");
+        assert_eq!(value["backend"]["status"], "unavailable");
+        DateTime::parse_from_rfc3339(value["backend"]["checked_at"].as_str().unwrap())
+            .expect("backend check time is ISO 8601");
+        assert_eq!(
+            value["error"],
+            json!({
+                "code": "governance_backend_unavailable",
+                "message": "governance backend unavailable",
+            })
+        );
+        assert!(!response.2.contains("url"));
+        assert!(!response.2.contains("password"));
+    }
+
+    #[test]
+    fn unavailable_governance_snapshot_bounds_an_unexpected_backend_label() {
+        let response = governance_snapshot_error(GovernanceError::BackendUnavailable {
+            backend: "redis://admin:password@private.example:6379/0",
+        });
+        let value = parse(&response);
+
+        assert_eq!(value["backend"]["name"], "unknown");
+        assert!(!response.2.contains("admin"));
+        assert!(!response.2.contains("password"));
+        assert!(!response.2.contains("private.example"));
     }
 
     #[test]
@@ -2594,5 +3022,38 @@ mod tests {
         assert_eq!(missing.0, 404);
         assert_eq!(parse(&missing), json!({"error": "key not found"}));
         assert_eq!(dispatch("GET", &path, None).unwrap().0, 405);
+    }
+
+    #[test]
+    fn key_mutations_reject_zero_and_non_exact_governance_limits_before_write() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+
+        for body in [
+            r#"{"max_requests_per_minute":0}"#,
+            r#"{"max_tokens_per_minute":9007199254740992}"#,
+            r#"{"max_budget_tokens":0}"#,
+            r#"{"max_budget_usd":0}"#,
+            r#"{"max_budget_usd":0.0000001}"#,
+            r#"{"max_budget_usd":10000000000}"#,
+        ] {
+            let response = dispatch("POST", "/admin/keys", Some(body)).unwrap();
+            assert_eq!(response.0, 400, "body was accepted: {body}");
+            assert!(dispatch("GET", "/admin/keys", None)
+                .unwrap()
+                .2
+                .contains("\"keys\":[]"));
+        }
+
+        let valid = dispatch(
+            "POST",
+            "/admin/keys",
+            Some(
+                r#"{"max_requests_per_minute":1,"max_tokens_per_minute":1,
+                    "max_budget_tokens":1,"max_budget_usd":0.000001}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(valid.0, 201, "minimum positive limits failed: {}", valid.2);
     }
 }

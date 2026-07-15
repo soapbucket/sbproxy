@@ -3261,6 +3261,9 @@ use ai_dispatch::*;
 // WOR-1722: cluster-shared AI budget counters (optional Redis backend).
 pub(crate) mod budget_share;
 
+// WOR-1845: ingress-owned governed request, token, and spend reservations.
+pub(crate) mod governance_admission;
+
 // WOR-1680: process-global local model host for serve: providers.
 pub(crate) mod model_host;
 

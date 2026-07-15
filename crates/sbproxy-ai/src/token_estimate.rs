@@ -85,6 +85,22 @@ pub fn estimate_tokens(model: &str, messages: &[Message]) -> u64 {
     estimate_tokens_heuristic(messages)
 }
 
+/// Conservative prompt ceiling used by strict governed admission.
+///
+/// Recognized models use their exact BPE count. Unknown and self-hosted
+/// models reserve at least one token per raw UTF-8 request byte, which cannot
+/// under-reserve a byte-pair encoded prompt.
+pub fn estimate_tokens_for_reservation(
+    model: &str,
+    messages: &[Message],
+    request_body_bytes: usize,
+) -> u64 {
+    if tiktoken_rs::bpe_for_model(model).is_ok() {
+        return estimate_tokens(model, messages);
+    }
+    estimate_tokens_heuristic(messages).max(request_body_bytes as u64)
+}
+
 /// Heuristic estimator: `chars / 4 + 1` per message, plus per-message
 /// framing and reply priming. Exported under the same name pattern as the
 /// model-specific path so call sites that want to bypass BPE lookup (e.g.
@@ -264,5 +280,23 @@ mod tests {
         }];
         let est = estimate_tokens("some-self-hosted-model", &messages);
         assert!(est > 0);
+    }
+
+    #[test]
+    fn strict_unknown_model_reserves_at_least_one_token_per_request_byte() {
+        let messages = vec![msg("user", "short")];
+        assert_eq!(
+            estimate_tokens_for_reservation("local-unknown", &messages, 4_096),
+            4_096
+        );
+    }
+
+    #[test]
+    fn strict_known_model_keeps_the_exact_bpe_estimate() {
+        let messages = vec![msg("user", "known tokenizer")];
+        assert_eq!(
+            estimate_tokens_for_reservation("gpt-4o", &messages, 65_536),
+            estimate_tokens("gpt-4o", &messages)
+        );
     }
 }

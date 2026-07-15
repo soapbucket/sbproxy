@@ -2446,6 +2446,231 @@ origins:
     );
 }
 
+struct DisableKeyPlaneOnDrop;
+
+impl Drop for DisableKeyPlaneOnDrop {
+    fn drop(&mut self) {
+        crate::key_plane::disable_key_plane();
+    }
+}
+
+fn static_reload_yaml(host: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "{host}":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#
+    )
+}
+
+fn enabled_key_plane_reload_yaml(host: &str, store_path: &std::path::Path) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: "{}"
+    crypto:
+      pepper: reload-test-pepper
+      master_key: reload-test-master-key
+origins:
+  "{host}":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#,
+        store_path.display()
+    )
+}
+
+#[test]
+fn strict_governance_reconciliation_failure_does_not_publish_candidate_pipeline() {
+    let _redact_guard = super::lifecycle::OP_REDACT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let _plane_guard = crate::key_plane::test_plane_guard();
+    let _cleanup = DisableKeyPlaneOnDrop;
+    crate::key_plane::disable_key_plane();
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("sb.yml");
+    let baseline = static_reload_yaml("governance-before.test");
+    super::lifecycle::reload_from_config_yaml(
+        config_path.to_str().expect("utf-8 config path"),
+        &baseline,
+    )
+    .expect("install baseline pipeline");
+    let installed = reload::current_pipeline_full();
+
+    // The strict backend is syntactically valid and lazy-connects, while the
+    // missing crypto file makes key/governance-plane reconciliation fail after
+    // the candidate pipeline has been compiled but before it may be published.
+    let missing_pepper = temp.path().join("missing-pepper");
+    let store_path = temp.path().join("strict-keys.redb");
+    let candidate = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: "{}"
+    crypto:
+      pepper: "file:{}"
+      master_key: reload-test-master-key
+    governance:
+      consistency: strict
+      backend:
+        type: redis
+        url: redis://127.0.0.1:6379/15
+origins:
+  "governance-candidate.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "candidate"
+"#,
+        store_path.display(),
+        missing_pepper.display()
+    );
+
+    let error = super::lifecycle::reload_from_config_yaml(
+        config_path.to_str().expect("utf-8 config path"),
+        &candidate,
+    )
+    .expect_err("failed strict reconciliation must reject the candidate");
+
+    assert!(
+        format!("{error:#}").contains("failed to reconcile dynamic key plane"),
+        "unexpected reconciliation error: {error:#}"
+    );
+    let still_installed = reload::current_pipeline_full();
+    assert!(
+        std::sync::Arc::ptr_eq(&installed, &still_installed),
+        "a failed strict reconciliation must not publish a new pipeline"
+    );
+    assert!(still_installed
+        .config
+        .host_map
+        .contains_key("governance-before.test"));
+    assert!(!still_installed
+        .config
+        .host_map
+        .contains_key("governance-candidate.test"));
+}
+
+#[test]
+fn reload_without_key_management_clears_installed_auth_and_governance_planes() {
+    let _redact_guard = super::lifecycle::OP_REDACT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let _plane_guard = crate::key_plane::test_plane_guard();
+    let _cleanup = DisableKeyPlaneOnDrop;
+    crate::key_plane::disable_key_plane();
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("sb.yml");
+    let enabled = enabled_key_plane_reload_yaml(
+        "key-plane-enabled.test",
+        &temp.path().join("enabled-keys.redb"),
+    );
+    super::lifecycle::reload_from_config_yaml(
+        config_path.to_str().expect("utf-8 config path"),
+        &enabled,
+    )
+    .expect("install enabled key plane");
+    assert!(crate::key_plane::current_key_plane().is_some());
+    assert!(crate::key_plane::current_governance_plane().is_some());
+
+    let without_key_management = static_reload_yaml("key-plane-removed.test");
+    super::lifecycle::reload_from_config_yaml(
+        config_path.to_str().expect("utf-8 config path"),
+        &without_key_management,
+    )
+    .expect("remove key management on reload");
+
+    assert!(
+        crate::key_plane::current_key_plane().is_none(),
+        "removed key_management must not retain stale key authentication"
+    );
+    assert!(
+        crate::key_plane::current_governance_plane().is_none(),
+        "removed key_management must restore the compatibility governance plane"
+    );
+}
+
+#[test]
+fn reload_with_key_management_disabled_clears_installed_auth_plane() {
+    let _redact_guard = super::lifecycle::OP_REDACT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let _plane_guard = crate::key_plane::test_plane_guard();
+    let _cleanup = DisableKeyPlaneOnDrop;
+    crate::key_plane::disable_key_plane();
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("sb.yml");
+    let store_path = temp.path().join("disabled-keys.redb");
+    let enabled = enabled_key_plane_reload_yaml("key-plane-before-disable.test", &store_path);
+    super::lifecycle::reload_from_config_yaml(
+        config_path.to_str().expect("utf-8 config path"),
+        &enabled,
+    )
+    .expect("install enabled key plane");
+    assert!(crate::key_plane::current_key_plane().is_some());
+
+    let disabled = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  key_management:
+    enabled: false
+    store:
+      backend: embedded
+      path: "{}"
+    crypto:
+      pepper: reload-test-pepper
+      master_key: reload-test-master-key
+origins:
+  "key-plane-disabled.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#,
+        store_path.display()
+    );
+    super::lifecycle::reload_from_config_yaml(
+        config_path.to_str().expect("utf-8 config path"),
+        &disabled,
+    )
+    .expect("disable key management on reload");
+
+    assert!(
+        crate::key_plane::current_key_plane().is_none(),
+        "enabled: false must not retain stale key authentication"
+    );
+    assert!(
+        crate::key_plane::current_governance_plane().is_some(),
+        "the explicit block still owns governed accounting for configured keys"
+    );
+}
+
 #[test]
 fn reload_from_config_path_propagates_compile_errors() {
     use std::io::Write as _;

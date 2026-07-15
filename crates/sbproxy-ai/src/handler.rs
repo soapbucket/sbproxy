@@ -139,6 +139,11 @@ pub struct AiHandlerConfig {
     /// runtime. `None` uses only `model_prices` + the built-in catalog.
     #[serde(default)]
     pub rate_card: Option<String>,
+    /// Immutable per-origin model price table. It is initialized at config
+    /// load when possible and lazily for directly-deserialized test or plugin
+    /// configs, so governed admission never consults another origin's table.
+    #[serde(skip)]
+    price_table: OnceLock<crate::budget::PriceTable>,
     /// Lazy-built compiled redactor cached on the per-origin
     /// config. Built on first use so config-load does not pay the
     /// regex-compile cost for origins that never serve a request.
@@ -182,6 +187,18 @@ fn default_usage_parser() -> String {
 }
 
 impl AiHandlerConfig {
+    /// Resolve the configured, rate-card, or built-in model price for this
+    /// origin. Unknown models return `None`; the governance missing-rate
+    /// policy decides whether that means zero cost or a closed admission.
+    pub fn governance_model_price(&self, model: &str) -> Option<crate::budget::ModelPrice> {
+        self.price_table
+            .get_or_init(|| {
+                crate::budget::build_price_table(&self.model_prices, self.rate_card.as_deref())
+            })
+            .resolve_model(model)
+            .map(|(price, _)| price)
+    }
+
     /// Return the compiled PII redactor for this handler, building
     /// it on first call. `None` when redaction is not configured
     /// or the configuration failed to compile (which is logged).
@@ -776,10 +793,15 @@ impl AiHandlerConfig {
         // external rate card) into the process-global consulted by cost
         // estimation. Runs on every config (re)load so prices update
         // with the config; a missing/bad rate card warns and is skipped.
-        crate::budget::set_price_table(crate::budget::build_price_table(
+        crate::budget::validate_governance_price_sources(
             &config.model_prices,
             config.rate_card.as_deref(),
-        ));
+        )
+        .map_err(anyhow::Error::msg)?;
+        let price_table =
+            crate::budget::build_price_table(&config.model_prices, config.rate_card.as_deref());
+        crate::budget::set_price_table(price_table.clone());
+        let _ = config.price_table.set(price_table);
         Ok(config)
     }
 
@@ -989,6 +1011,146 @@ mod tests {
     use super::*;
 
     #[test]
+    fn governed_prices_are_isolated_per_origin() {
+        let first = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [],
+            "model_prices": {
+                "shared-local-model": {
+                    "input_per_million": 1.0,
+                    "output_per_million": 2.0
+                }
+            }
+        }))
+        .expect("first origin config");
+        let second = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [],
+            "model_prices": {
+                "shared-local-model": {
+                    "input_per_million": 10.0,
+                    "output_per_million": 20.0
+                }
+            }
+        }))
+        .expect("second origin config");
+
+        let first_price = first
+            .governance_model_price("shared-local-model")
+            .expect("first origin price");
+        let second_price = second
+            .governance_model_price("shared-local-model")
+            .expect("second origin price");
+
+        assert_eq!(first_price.input_per_million, 1.0);
+        assert_eq!(first_price.output_per_million, 2.0);
+        assert_eq!(second_price.input_per_million, 10.0);
+        assert_eq!(second_price.output_per_million, 20.0);
+    }
+
+    #[test]
+    fn governed_price_layers_inline_over_rate_card_over_catalog() {
+        let rate_card = tempfile::NamedTempFile::new().expect("temporary rate card");
+        std::fs::write(
+            rate_card.path(),
+            r#"{
+                "operator-only": {
+                    "input_cost_per_token": 0.000003,
+                    "output_cost_per_token": 0.000004
+                },
+                "rate-only": {
+                    "input_cost_per_token": 0.000007,
+                    "output_cost_per_token": 0.000008
+                }
+            }"#,
+        )
+        .expect("write rate card");
+        let config: AiHandlerConfig = serde_json::from_value(serde_json::json!({
+            "providers": [],
+            "rate_card": rate_card.path().to_string_lossy(),
+            "model_prices": {
+                "operator-only": {
+                    "input_per_million": 5.0,
+                    "output_per_million": 6.0
+                }
+            }
+        }))
+        .expect("origin config");
+
+        let inline = config
+            .governance_model_price("operator-only")
+            .expect("inline price");
+        let rate = config
+            .governance_model_price("rate-only")
+            .expect("rate card price");
+        let catalog = config
+            .governance_model_price("gpt-4o-mini")
+            .expect("catalog price");
+
+        assert_eq!(inline.input_per_million, 5.0);
+        assert_eq!(inline.output_per_million, 6.0);
+        assert_eq!(rate.input_per_million, 7.0);
+        assert_eq!(rate.output_per_million, 8.0);
+        assert_eq!(catalog.input_per_million, 0.15);
+        assert_eq!(catalog.output_per_million, 0.60);
+    }
+
+    #[test]
+    fn invalid_inline_governance_price_fails_handler_config() {
+        for field in [
+            "input_per_million",
+            "output_per_million",
+            "cache_read_per_million",
+            "cache_write_per_million",
+        ] {
+            let mut price = serde_json::json!({
+                "input_per_million": 1.0,
+                "output_per_million": 2.0
+            });
+            price[field] = serde_json::json!(-1.0);
+            let result = AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [],
+                "model_prices": {"invalid-local-model": price}
+            }));
+            let error = result.expect_err("negative governance price must fail config load");
+            let message = error.to_string();
+            assert!(
+                message.contains("invalid-local-model"),
+                "unexpected error: {message}"
+            );
+            assert!(message.contains(field), "unexpected error: {message}");
+        }
+    }
+
+    #[test]
+    fn invalid_rate_card_governance_price_fails_handler_config() {
+        let rate_card = tempfile::NamedTempFile::new().expect("temporary rate card");
+        std::fs::write(
+            rate_card.path(),
+            r#"{
+                "invalid-rate-model": {
+                    "input_cost_per_token": -0.000001,
+                    "output_cost_per_token": 0.000002
+                }
+            }"#,
+        )
+        .expect("write rate card");
+
+        let result = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [],
+            "rate_card": rate_card.path().to_string_lossy()
+        }));
+        let error = result.expect_err("negative rate-card price must fail config load");
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid-rate-model"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("input_cost_per_token"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
     fn usage_sinks_parse_and_build_from_config() {
         let cfg: AiHandlerConfig = serde_json::from_value(serde_json::json!({
             "providers": [{"name": "openai", "api_key": "k", "models": ["gpt-4o-mini"]}],
@@ -1036,6 +1198,7 @@ mod tests {
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            price_table: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
@@ -1072,6 +1235,7 @@ mod tests {
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            price_table: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
@@ -1108,6 +1272,7 @@ mod tests {
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            price_table: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
@@ -1145,6 +1310,7 @@ mod tests {
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            price_table: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
         };
         // Block list wins

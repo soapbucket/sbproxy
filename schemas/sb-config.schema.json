@@ -3075,6 +3075,23 @@
               "$ref": "#/definitions/KeySeedConfig"
             }
           ]
+        },
+        "governance": {
+          "description": "Governed-key request, token, and monetary reservation policy.\n\nApproximate mode keeps process-local counters. Strict mode requires the configured Redis backend so every gateway reserves against the same atomic state.",
+          "default": {
+            "backend": null,
+            "consistency": "approximate",
+            "default_max_output_tokens": 4096,
+            "failure_mode": "closed",
+            "lease_ttl_secs": 120,
+            "missing_rate": "zero_cost",
+            "terminal_retention_secs": 300
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceConfig"
+            }
+          ]
         }
       }
     },
@@ -3753,6 +3770,154 @@
           ]
         }
       }
+    },
+    "GovernanceConfig": {
+      "description": "Governed-key reservation and accounting behavior.",
+      "type": "object",
+      "properties": {
+        "consistency": {
+          "description": "Process-local approximate or shared atomic strict accounting.",
+          "default": "approximate",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceConsistency"
+            }
+          ]
+        },
+        "backend": {
+          "description": "Shared atomic backend. Required in strict mode and rejected otherwise.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GovernanceBackendConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lease_ttl_secs": {
+          "description": "Reservation lease lifetime. Gateways renew active long-running streams.",
+          "default": 120,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "terminal_retention_secs": {
+          "description": "Lifetime of terminal idempotency records after settle or release.",
+          "default": 300,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "failure_mode": {
+          "description": "Admission behavior while a configured strict backend is unavailable.",
+          "default": "closed",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceFailureMode"
+            }
+          ]
+        },
+        "missing_rate": {
+          "description": "Monetary accounting behavior when a self-hosted model has no rate.",
+          "default": "zero_cost",
+          "allOf": [
+            {
+              "$ref": "#/definitions/MissingRatePolicy"
+            }
+          ]
+        },
+        "default_max_output_tokens": {
+          "description": "Conservative output reservation when a request omits its token ceiling.",
+          "default": 4096,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "GovernanceConsistency": {
+      "description": "Distributed consistency guarantee for governed-key accounting.",
+      "oneOf": [
+        {
+          "description": "Exact within one process, but not coordinated between gateways.",
+          "type": "string",
+          "enum": [
+            "approximate"
+          ]
+        },
+        {
+          "description": "Atomic and cluster-wide through a supported shared backend.",
+          "type": "string",
+          "enum": [
+            "strict"
+          ]
+        }
+      ]
+    },
+    "GovernanceBackendConfig": {
+      "description": "Shared backend for strict governed-key reservations.",
+      "oneOf": [
+        {
+          "description": "Redis backend using atomic scripts for reservation lifecycle changes.",
+          "type": "object",
+          "required": [
+            "type",
+            "url"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "redis"
+              ]
+            },
+            "url": {
+              "description": "Redis connection URL. Debug formatting always redacts this value.",
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "GovernanceFailureMode": {
+      "description": "Behavior when a strict governance backend is unavailable.",
+      "oneOf": [
+        {
+          "description": "Reject governed requests until the shared backend recovers.",
+          "type": "string",
+          "enum": [
+            "closed"
+          ]
+        },
+        {
+          "description": "Admit an explicitly unreserved request and surface degraded health.",
+          "type": "string",
+          "enum": [
+            "allow_unreserved"
+          ]
+        }
+      ]
+    },
+    "MissingRatePolicy": {
+      "description": "Accounting policy for a self-hosted model without a configured rate.",
+      "oneOf": [
+        {
+          "description": "Charge zero monetary units while still enforcing request and token limits.",
+          "type": "string",
+          "enum": [
+            "zero_cost"
+          ]
+        },
+        {
+          "description": "Reject admission until the model has an input and output rate.",
+          "type": "string",
+          "enum": [
+            "require_rate"
+          ]
+        }
+      ]
     },
     "L2CacheConfig": {
       "description": "Top-level shared-state / L2 cache backend configuration.\n\nTurns rate-limit buckets and response-cache entries into cluster-wide shared state so multiple proxy replicas coordinate against the same counters and cache pool. YAML key: `l2_cache_settings`.",

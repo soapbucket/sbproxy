@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-14*
 
 The embedded admin server publishes a small set of HTTP routes for
 operator tooling: liveness probes, request log, per-target health, managed
@@ -357,6 +357,52 @@ or alert pipeline. When `drift: true` is sustained for more than the
 expected reload window, page the operator: either the watcher is
 stuck, the deploy pipeline forgot to call `POST /admin/reload`, or
 someone hand-edited the file out of band.
+
+---
+
+## Governed key usage
+
+### `GET /admin/keys/{id}/usage`
+
+Returns the current secret-free accounting snapshot for one governed key. The
+document includes its effective policy revision and digest, `approximate` or
+`strict` consistency, governance backend name and health, and the following
+dimensions:
+
+- `requests_per_minute`
+- `tokens_per_minute`
+- `budget_tokens`
+- `budget_micro_usd`
+
+An unconfigured dimension is `null`. A configured dimension contains integer
+`limit`, `used`, `reserved`, and `remaining` fields plus `reset_at`. RPM and TPM
+use aligned 60-second windows and return an RFC 3339 reset timestamp. Token and
+micro-USD budgets are lifetime limits and return `reset_at: null`.
+
+The route is read-only and requires normal authenticated admin-server access.
+Unknown keys use the standard bounded error envelope. If a strict snapshot
+cannot reach Redis, the route returns 503 with the same safe state the UI
+renders:
+
+```json
+{
+  "error": {
+    "code": "governance_backend_unavailable",
+    "message": "governance backend unavailable"
+  },
+  "consistency": "strict",
+  "backend": {
+    "name": "redis",
+    "status": "unavailable",
+    "checked_at": "2026-07-14T18:30:00Z"
+  }
+}
+```
+
+Responses never contain a bearer token, verifier hash, Redis URL, worker
+identity, or private model endpoint. See
+[Dynamic key management](key-management.md#usage-and-backend-health) for the
+complete response example and reservation semantics.
 
 ---
 

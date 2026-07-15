@@ -60,6 +60,24 @@ proxy:
       pepper: env:SBPROXY_KEY_PEPPER
       master_key: env:SBPROXY_KEY_MASTER
     failure_mode_allow: false
+    governance:
+      # Strict accounting is separate from the key store and cache. Every
+      # gateway atomically reserves against this Redis database before it
+      # selects a provider, so concurrent replicas cannot oversubscribe a key.
+      consistency: strict
+      backend:
+        type: redis
+        url: redis://redis:6379/4
+      # Active streams renew before half the TTL. If a gateway crashes, its
+      # stranded reservation expires and capacity returns to the key.
+      lease_ttl_secs: 120
+      terminal_retention_secs: 300
+      # Reject while Redis is unavailable instead of admitting unreserved work.
+      failure_mode: closed
+      # This example calls a priced hosted model. Reject an unpriced local model
+      # until its input and output rate is present in model_prices or a rate card.
+      missing_rate: require_rate
+      default_max_output_tokens: 4096
 
 origins:
   "ai.localhost":

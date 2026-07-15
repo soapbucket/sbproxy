@@ -722,6 +722,358 @@ pub struct KeyManagementConfig {
     /// Optional declarative seed of keys and credentials.
     #[serde(default)]
     pub seed: KeySeedConfig,
+    /// Governed-key request, token, and monetary reservation policy.
+    ///
+    /// Approximate mode keeps process-local counters. Strict mode requires the
+    /// configured Redis backend so every gateway reserves against the same
+    /// atomic state.
+    #[serde(default)]
+    pub governance: GovernanceConfig,
+}
+
+impl KeyManagementConfig {
+    /// Validate governed accounting configuration before startup or reload.
+    pub fn validate(&self) -> Result<(), GovernanceConfigError> {
+        self.governance.validate()?;
+        for (index, key) in self.seed.keys.iter().enumerate() {
+            for (field, value) in [
+                ("max_requests_per_minute", key.max_requests_per_minute),
+                ("max_tokens_per_minute", key.max_tokens_per_minute),
+                ("max_budget_tokens", key.max_budget_tokens),
+            ] {
+                if let Some(value) = value {
+                    validate_governed_seed_integer(index, field, value)?;
+                }
+            }
+            if let Some(value) = key.max_budget_usd {
+                validate_governed_seed_usd(index, value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Largest integer represented exactly by the Redis Lua numeric runtime.
+pub const GOVERNANCE_MAX_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Fixed RPM/TPM accounting window retained by terminal idempotency records.
+pub const GOVERNANCE_ACCOUNTING_WINDOW_SECS: u64 = 60;
+
+fn validate_governed_seed_integer(
+    index: usize,
+    field: &'static str,
+    value: u64,
+) -> Result<(), GovernanceConfigError> {
+    let path = format!("seed.keys[{index}].{field}");
+    validate_governance_integer(&path, value)
+}
+
+pub(crate) fn validate_governance_integer(
+    path: &str,
+    value: u64,
+) -> Result<(), GovernanceConfigError> {
+    if value == 0 {
+        return Err(GovernanceConfigError::new(format!(
+            "{path} must be positive"
+        )));
+    }
+    if value > GOVERNANCE_MAX_EXACT_INTEGER {
+        return Err(GovernanceConfigError::new(format!(
+            "{path} exceeds the exact Redis Lua integer range"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_governed_seed_usd(index: usize, value: f64) -> Result<(), GovernanceConfigError> {
+    let path = format!("seed.keys[{index}].max_budget_usd");
+    validate_governance_usd(&path, value)
+}
+
+pub(crate) fn validate_governance_usd(path: &str, value: f64) -> Result<(), GovernanceConfigError> {
+    if !value.is_finite() {
+        return Err(GovernanceConfigError::new(format!("{path} must be finite")));
+    }
+    if value <= 0.0 {
+        return Err(GovernanceConfigError::new(format!(
+            "{path} must be positive"
+        )));
+    }
+    let micro_usd = value * 1_000_000.0;
+    if micro_usd < 1.0 {
+        return Err(GovernanceConfigError::new(format!(
+            "{path} must be at least one micro-USD"
+        )));
+    }
+    if !micro_usd.is_finite() || micro_usd > GOVERNANCE_MAX_EXACT_INTEGER as f64 {
+        return Err(GovernanceConfigError::new(format!(
+            "{path} exceeds the exact Redis Lua integer range after conversion to micro-USD"
+        )));
+    }
+    Ok(())
+}
+
+const fn default_governance_lease_ttl_secs() -> u64 {
+    120
+}
+
+const fn default_governance_terminal_retention_secs() -> u64 {
+    300
+}
+
+const fn default_governance_max_output_tokens() -> u64 {
+    4_096
+}
+
+/// Distributed consistency guarantee for governed-key accounting.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceConsistency {
+    /// Exact within one process, but not coordinated between gateways.
+    #[default]
+    Approximate,
+    /// Atomic and cluster-wide through a supported shared backend.
+    Strict,
+}
+
+/// Behavior when a strict governance backend is unavailable.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceFailureMode {
+    /// Reject governed requests until the shared backend recovers.
+    #[default]
+    Closed,
+    /// Admit an explicitly unreserved request and surface degraded health.
+    AllowUnreserved,
+}
+
+/// Accounting policy for a self-hosted model without a configured rate.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingRatePolicy {
+    /// Charge zero monetary units while still enforcing request and token limits.
+    #[default]
+    ZeroCost,
+    /// Reject admission until the model has an input and output rate.
+    RequireRate,
+}
+
+/// Shared backend for strict governed-key reservations.
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GovernanceBackendConfig {
+    /// Redis backend using atomic scripts for reservation lifecycle changes.
+    Redis {
+        /// Redis connection URL. Debug formatting always redacts this value.
+        url: String,
+    },
+}
+
+impl std::fmt::Debug for GovernanceBackendConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Redis { .. } => formatter
+                .debug_struct("Redis")
+                .field("url", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+impl GovernanceBackendConfig {
+    /// Return the Redis connection URL for runtime backend construction.
+    pub fn redis_url(&self) -> &str {
+        match self {
+            Self::Redis { url } => url,
+        }
+    }
+}
+
+/// Governed-key reservation and accounting behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GovernanceConfig {
+    /// Process-local approximate or shared atomic strict accounting.
+    #[serde(default)]
+    pub consistency: GovernanceConsistency,
+    /// Shared atomic backend. Required in strict mode and rejected otherwise.
+    #[serde(default)]
+    pub backend: Option<GovernanceBackendConfig>,
+    /// Reservation lease lifetime. Gateways renew active long-running streams.
+    #[serde(default = "default_governance_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    /// Lifetime of terminal idempotency records after settle or release.
+    #[serde(default = "default_governance_terminal_retention_secs")]
+    pub terminal_retention_secs: u64,
+    /// Admission behavior while a configured strict backend is unavailable.
+    #[serde(default)]
+    pub failure_mode: GovernanceFailureMode,
+    /// Monetary accounting behavior when a self-hosted model has no rate.
+    #[serde(default)]
+    pub missing_rate: MissingRatePolicy,
+    /// Conservative output reservation when a request omits its token ceiling.
+    #[serde(default = "default_governance_max_output_tokens")]
+    pub default_max_output_tokens: u64,
+}
+
+impl Default for GovernanceConfig {
+    fn default() -> Self {
+        Self {
+            consistency: GovernanceConsistency::Approximate,
+            backend: None,
+            lease_ttl_secs: default_governance_lease_ttl_secs(),
+            terminal_retention_secs: default_governance_terminal_retention_secs(),
+            failure_mode: GovernanceFailureMode::Closed,
+            missing_rate: MissingRatePolicy::ZeroCost,
+            default_max_output_tokens: default_governance_max_output_tokens(),
+        }
+    }
+}
+
+/// Invalid governed-key reservation configuration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid governance configuration: {message}")]
+pub struct GovernanceConfigError {
+    message: String,
+}
+
+impl GovernanceConfigError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl GovernanceConfig {
+    /// Validate consistency, backend, duration, and token-count invariants.
+    pub fn validate(&self) -> Result<(), GovernanceConfigError> {
+        match (self.consistency, &self.backend) {
+            (GovernanceConsistency::Approximate, Some(_)) => {
+                return Err(GovernanceConfigError::new(
+                    "approximate consistency does not accept a backend",
+                ));
+            }
+            (GovernanceConsistency::Strict, None) => {
+                return Err(GovernanceConfigError::new(
+                    "strict consistency requires a Redis backend",
+                ));
+            }
+            _ => {}
+        }
+
+        if self.lease_ttl_secs == 0 {
+            return Err(GovernanceConfigError::new(
+                "lease_ttl_secs must be positive",
+            ));
+        }
+        if self.terminal_retention_secs < self.lease_ttl_secs.max(GOVERNANCE_ACCOUNTING_WINDOW_SECS)
+        {
+            return Err(GovernanceConfigError::new(
+                "terminal_retention_secs must be at least the lease TTL and 60-second accounting window",
+            ));
+        }
+        if self.default_max_output_tokens == 0 {
+            return Err(GovernanceConfigError::new(
+                "default_max_output_tokens must be positive",
+            ));
+        }
+        if self.default_max_output_tokens > u64::from(u32::MAX) {
+            return Err(GovernanceConfigError::new(
+                "default_max_output_tokens must fit in a 32-bit token count",
+            ));
+        }
+
+        checked_redis_milliseconds("lease_ttl_secs", self.lease_ttl_secs)?;
+        checked_redis_milliseconds("terminal_retention_secs", self.terminal_retention_secs)?;
+
+        if let Some(backend) = &self.backend {
+            let url = backend.redis_url();
+            if !is_valid_redis_url(url) {
+                return Err(GovernanceConfigError::new(
+                    "governance Redis backend url must use redis:// or rediss:// and include a valid host",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert the reservation lease to Redis' millisecond time unit.
+    pub fn lease_ttl_millis(&self) -> Result<u64, GovernanceConfigError> {
+        checked_redis_milliseconds("lease_ttl_secs", self.lease_ttl_secs)
+    }
+
+    /// Convert terminal-record retention to Redis' millisecond time unit.
+    pub fn terminal_retention_millis(&self) -> Result<u64, GovernanceConfigError> {
+        checked_redis_milliseconds("terminal_retention_secs", self.terminal_retention_secs)
+    }
+}
+
+fn checked_redis_milliseconds(field: &str, seconds: u64) -> Result<u64, GovernanceConfigError> {
+    let milliseconds = seconds.checked_mul(1_000).ok_or_else(|| {
+        GovernanceConfigError::new(format!("{field} overflows Redis millisecond time"))
+    })?;
+    if milliseconds > i64::MAX as u64 {
+        return Err(GovernanceConfigError::new(format!(
+            "{field} overflows Redis millisecond time"
+        )));
+    }
+    Ok(milliseconds)
+}
+
+fn is_valid_redis_url(url: &str) -> bool {
+    if url.is_empty() || url.trim() != url || url.chars().any(char::is_control) {
+        return false;
+    }
+
+    let Some(remainder) = url
+        .strip_prefix("redis://")
+        .or_else(|| url.strip_prefix("rediss://"))
+    else {
+        return false;
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.matches('@').count() > 1 {
+        return false;
+    }
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        return !host.is_empty()
+            && !host.chars().any(char::is_whitespace)
+            && (suffix.is_empty() || valid_port_suffix(suffix));
+    }
+
+    if host_and_port.matches(':').count() > 1 {
+        return false;
+    }
+    let (host, port) = host_and_port
+        .split_once(':')
+        .map_or((host_and_port, None), |(host, port)| (host, Some(port)));
+    !host.is_empty()
+        && !host
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '[' | ']'))
+        && port.is_none_or(valid_port)
+}
+
+fn valid_port_suffix(suffix: &str) -> bool {
+    suffix.strip_prefix(':').is_some_and(valid_port)
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
 /// Which store backend backs the key plane.

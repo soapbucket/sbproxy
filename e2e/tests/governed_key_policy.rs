@@ -1178,6 +1178,26 @@ fn governed_key_requirement_is_origin_scoped_and_tenant_safe() {
         "strict credential denials must happen before dispatch"
     );
 
+    let realtime = http_client()
+        .get(format!("{}/v1/realtime", world.proxy.base_url()))
+        .header("host", STRICT_A_HOST)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .expect("governed realtime upgrade attempt");
+    assert_eq!(
+        realtime.status().as_u16(),
+        501,
+        "governed realtime must fail closed until it shares common admission"
+    );
+    assert_eq!(
+        total_captures(&world),
+        before,
+        "realtime rejection must not reach an upstream credential"
+    );
+
     assert_status(
         &chat(&world, COMPAT_HOST, None, &body),
         200,
@@ -1185,6 +1205,24 @@ fn governed_key_requirement_is_origin_scoped_and_tenant_safe() {
     );
 
     let lifecycle = mint(&world, json!({"name": "lifecycle"}));
+    let before_method_mutation = total_captures(&world);
+    let method_mutation = http_client()
+        .patch(format!("{}/v1/assistants/asst-1", world.proxy.base_url()))
+        .header("host", STRICT_A_HOST)
+        .header("authorization", format!("Bearer {}", lifecycle.token))
+        .json(&json!({"model": "gpt-client"}))
+        .send()
+        .expect("governed method-aware mutation");
+    assert_eq!(
+        method_mutation.status().as_u16(),
+        501,
+        "governed non-POST mutations must fail closed until they run the full policy pipeline"
+    );
+    assert_eq!(
+        total_captures(&world),
+        before_method_mutation,
+        "method-aware rejection must happen before provider dispatch"
+    );
     assert_status(
         &chat(&world, STRICT_A_HOST, Some(&lifecycle.token), &body),
         200,

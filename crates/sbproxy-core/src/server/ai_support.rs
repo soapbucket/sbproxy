@@ -1070,6 +1070,49 @@ pub(super) fn extract_usage(body: &[u8]) -> (u64, u64) {
     (input, output)
 }
 
+/// Parse provider token usage while preserving the distinction between an
+/// explicit zero and a missing/unparseable usage block. Governance needs that
+/// distinction: zero settles the request unit and refunds token holds, while a
+/// billable response with missing usage must retain the conservative ceiling.
+pub(super) fn extract_governance_usage(body: &[u8]) -> Option<(u64, u64)> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage = parsed.get("usage")?;
+    let prompt = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let completion = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    if prompt.is_none() && completion.is_none() {
+        return None;
+    }
+    let cached = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("cache_read_input_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(0);
+    let creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let input = if usage.get("prompt_tokens").is_some() {
+        prompt.unwrap_or(0)
+    } else {
+        prompt
+            .unwrap_or(0)
+            .saturating_add(cached)
+            .saturating_add(creation)
+    };
+    Some((input, completion.unwrap_or(0)))
+}
+
 /// Parse token usage into `(input, output, cached_input, cache_creation)`
 /// (WOR-1708). `input` is the *true total* prompt volume: OpenAI's
 /// `prompt_tokens` already includes cached tokens, so it is used as-is;
@@ -1126,7 +1169,7 @@ pub(super) fn extract_usage_full(body: &[u8]) -> (u64, u64, u64, u64) {
 
 #[cfg(test)]
 mod usage_extract_tests {
-    use super::extract_usage_full;
+    use super::{extract_governance_usage, extract_usage_full};
 
     #[test]
     fn openai_cached_tokens_are_within_prompt() {
@@ -1136,6 +1179,16 @@ mod usage_extract_tests {
         let body = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":300}}}"#;
         let (input, output, cached, creation) = extract_usage_full(body);
         assert_eq!((input, output, cached, creation), (1000, 50, 300, 0));
+    }
+
+    #[test]
+    fn governance_usage_distinguishes_explicit_zero_from_missing() {
+        assert_eq!(
+            extract_governance_usage(br#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#,),
+            Some((0, 0))
+        );
+        assert_eq!(extract_governance_usage(br#"{"usage":{}}"#), None);
+        assert_eq!(extract_governance_usage(b"not-json"), None);
     }
 
     #[test]
@@ -1628,7 +1681,11 @@ pub(super) fn emit_ai_billing_event(
         sbproxy_ai::budget::AiBillingEvent::from_label(surface_label, provider_name, model, usage)
             .with_cost(cost_usd)
             .with_scope_keys(scope_keys);
-    sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
+    // Enforcement accounting is written by `record_budget_usage` (and, for
+    // governed keys, the reservation store) before this observability event is
+    // emitted. Recording the event into `BUDGET_TRACKER` again double-debits
+    // every configured origin scope. Keep the event as the single telemetry
+    // choke point, but never mutate enforcement state here.
     // WOR-1809: debug, not info. This fires per billing scope, so one
     // completion can emit a burst of identical lines; the ledger sinks
     // and metrics are the durable record, the log line is a trace.

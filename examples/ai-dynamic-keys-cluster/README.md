@@ -12,7 +12,7 @@ which runs the same feature on a single local binary.
 ## How it clusters
 
 Resolution order is L1 in-memory cache, then the mesh distributed cache, then
-the store. Two pieces in `sb.yml` make the key plane coherent across replicas:
+the store. Three pieces in `sb.yml` make the key plane coherent across replicas:
 
 - `store.backend: redis` with `redis_source_of_truth: true` - Redis is the
   durable system of record, so every replica reads and writes the same keys. A
@@ -22,6 +22,14 @@ the store. Two pieces in `sb.yml` make the key plane coherent across replicas:
   the replica that owns a key, so a record cached on one node is reachable from
   the others without a round trip to Redis, and an invalidation on revoke routes
   to the owner. Each replica still keeps a fast in-memory L1 in front of it.
+- `governance.consistency: strict` with an explicit Redis backend - every
+  replica reserves a key's request, token, and monetary allowances against one
+  atomic store before provider selection. The key store and governance backend
+  are separate contracts even when they use the same Redis service.
+
+Use a standard Redis primary/HA endpoint. On GCP, use non-cluster-mode
+Memorystore for this release; Redis Cluster endpoints that answer with
+`MOVED`/`ASK` are not supported by the governance client yet.
 
 Each replica's mesh identity (node id, advertised address, and seed peer) comes
 from the environment, so one `sb.yml` boots every node. The replicas gossip over
@@ -97,9 +105,10 @@ Tear down with `docker compose down -v`.
 ## Going fully Redis-free
 
 This example keeps Redis as the durable store and puts the mesh cache in front of
-it. To drop Redis entirely, point `store.backend` at a shared secrets manager
-(`secrets_manager`) and keep `cache.tier: mesh`; the gossip ring then carries the
-cache, and CRDT-based per-key spend and rate counters keep budgets coherent
-across replicas without a Redis dependency. The Redis-store setup above is the
-runnable multi-container demo; the secrets-manager store is the further step. See
-`docs/key-management.md`.
+it. You can move policy records to a shared secrets manager and keep
+`cache.tier: mesh` for Redis-free key resolution and invalidation. Strict
+governed accounting is different: it requires Redis. Without that backend,
+remove the strict backend block and select `governance.consistency: approximate`;
+each gateway then enforces its local view and the fleet can oversubscribe a key.
+Mesh CRDT counters remain advisory telemetry, not an atomic admission
+mechanism. See `docs/key-management.md`.

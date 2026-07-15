@@ -629,6 +629,15 @@ impl PriceTable {
         self.exact.get(&model.to_ascii_lowercase()).copied()
     }
 
+    /// Resolve one model against this operator table, then the built-in
+    /// catalog. The table itself is immutable after an AI handler publishes
+    /// it, so different origins can resolve prices without sharing mutable
+    /// process-global state.
+    pub fn resolve_model(&self, model: &str) -> Option<(ModelPrice, PriceSource)> {
+        self.get(model)
+            .or_else(|| lookup_price(model).map(|price| (price, PriceSource::Catalog)))
+    }
+
     /// Merge a LiteLLM `model_prices_and_context_window.json` document
     /// into the table (WOR-1707), the ecosystem's canonical rate card.
     /// Its costs are per-token, so they are scaled to per-million here;
@@ -650,23 +659,49 @@ impl PriceTable {
             let Some(entry) = v.as_object() else {
                 continue;
             };
-            let per_token = |k: &str| entry.get(k).and_then(serde_json::Value::as_f64);
-            let (Some(inp), Some(out)) = (
-                per_token("input_cost_per_token"),
-                per_token("output_cost_per_token"),
-            ) else {
+            if !entry.contains_key("input_cost_per_token")
+                || !entry.contains_key("output_cost_per_token")
+            {
                 continue;
+            }
+            let per_token = |field: &str| -> Result<Option<f64>, String> {
+                entry
+                    .get(field)
+                    .map(|value| {
+                        value.as_f64().ok_or_else(|| {
+                            format!("rate-card model {name:?} field {field} must be a number")
+                        })
+                    })
+                    .transpose()
             };
+            let scale = |field: &str, value: f64| -> Result<f64, String> {
+                let per_million = value * 1_000_000.0;
+                validate_governance_price(name, field, per_million)?;
+                Ok(per_million)
+            };
+            let inp = scale(
+                "input_cost_per_token",
+                per_token("input_cost_per_token")?.expect("field presence checked"),
+            )?;
+            let out = scale(
+                "output_cost_per_token",
+                per_token("output_cost_per_token")?.expect("field presence checked"),
+            )?;
+            let cache_read = scale(
+                "cache_read_input_token_cost",
+                per_token("cache_read_input_token_cost")?.unwrap_or(0.0),
+            )?;
+            let cache_write = scale(
+                "cache_creation_input_token_cost",
+                per_token("cache_creation_input_token_cost")?.unwrap_or(0.0),
+            )?;
             self.insert(
                 name.clone(),
                 ModelPrice {
-                    input_per_million: inp * 1_000_000.0,
-                    output_per_million: out * 1_000_000.0,
-                    cache_read_per_million: per_token("cache_read_input_token_cost").unwrap_or(0.0)
-                        * 1_000_000.0,
-                    cache_write_per_million: per_token("cache_creation_input_token_cost")
-                        .unwrap_or(0.0)
-                        * 1_000_000.0,
+                    input_per_million: inp,
+                    output_per_million: out,
+                    cache_read_per_million: cache_read,
+                    cache_write_per_million: cache_write,
                 },
                 PriceSource::RateCard,
             );
@@ -697,12 +732,29 @@ pub fn set_price_table(table: PriceTable) {
 fn resolve_price(model: &str) -> Option<(ModelPrice, PriceSource)> {
     if let Ok(guard) = PRICE_TABLE.read() {
         if let Some(table) = guard.as_ref() {
-            if let Some(hit) = table.get(model) {
-                return Some(hit);
-            }
+            return table.resolve_model(model);
         }
     }
     lookup_price(model).map(|p| (p, PriceSource::Catalog))
+}
+
+/// Convert token usage at one model price to integer micro-USD.
+///
+/// Rates are USD per million tokens, which is numerically micro-USD per token.
+/// Rounding up once per request prevents sub-micro usage from becoming free.
+pub fn governance_micro_usd(price: ModelPrice, input: u64, output: u64) -> Option<u64> {
+    let rates = [price.input_per_million, price.output_per_million];
+    if rates.iter().any(|rate| !rate.is_finite() || *rate < 0.0) {
+        return None;
+    }
+    let value = (input as f64).mul_add(
+        price.input_per_million,
+        (output as f64) * price.output_per_million,
+    );
+    if !value.is_finite() || value > u64::MAX as f64 {
+        return None;
+    }
+    Some(value.ceil() as u64)
 }
 
 /// A config-supplied model price (WOR-1707). Rates are per-million USD
@@ -722,6 +774,44 @@ pub struct ModelPriceConfig {
     pub cache_write_per_million: f64,
 }
 
+impl ModelPriceConfig {
+    /// Validate operator prices before they can participate in governed
+    /// accounting. Rates are numerically micro-USD per token, so keeping
+    /// them in JavaScript/Lua's exact integer range prevents backend
+    /// rounding from weakening a configured limit.
+    pub fn validate(&self, model: &str) -> Result<(), String> {
+        for (field, value) in [
+            ("input_per_million", self.input_per_million),
+            ("output_per_million", self.output_per_million),
+            ("cache_read_per_million", self.cache_read_per_million),
+            ("cache_write_per_million", self.cache_write_per_million),
+        ] {
+            validate_governance_price(model, field, value)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_governance_price(model: &str, field: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err(format!(
+            "model price {model:?} field {field} must be finite"
+        ));
+    }
+    if value < 0.0 {
+        return Err(format!(
+            "model price {model:?} field {field} must be nonnegative"
+        ));
+    }
+    if value > sbproxy_config::GOVERNANCE_MAX_EXACT_INTEGER as f64 {
+        return Err(format!(
+            "model price {model:?} field {field} must not exceed {}",
+            sbproxy_config::GOVERNANCE_MAX_EXACT_INTEGER
+        ));
+    }
+    Ok(())
+}
+
 impl From<&ModelPriceConfig> for ModelPrice {
     fn from(c: &ModelPriceConfig) -> Self {
         ModelPrice {
@@ -731,6 +821,34 @@ impl From<&ModelPriceConfig> for ModelPrice {
             cache_write_per_million: c.cache_write_per_million,
         }
     }
+}
+
+/// Validate only the governance-relevant numeric content of operator price
+/// sources. Unreadable or malformed rate-card files retain the established
+/// warning-and-skip behavior in [`build_price_table`], while a syntactically
+/// valid card with unsafe numeric values fails config activation.
+pub(crate) fn validate_governance_price_sources(
+    prices: &HashMap<String, ModelPriceConfig>,
+    rate_card_path: Option<&str>,
+) -> Result<(), String> {
+    for (name, price) in prices {
+        price.validate(name)?;
+    }
+
+    let Some(path) = rate_card_path else {
+        return Ok(());
+    };
+    let Ok(json) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return Ok(());
+    };
+    if !doc.is_object() {
+        return Ok(());
+    }
+
+    PriceTable::new().merge_litellm_json(&json).map(|_| ())
 }
 
 /// Build the operator [`PriceTable`] from config (WOR-1707): load the
@@ -747,15 +865,24 @@ pub fn build_price_table(
     let mut table = PriceTable::new();
     if let Some(path) = rate_card_path {
         match std::fs::read_to_string(path) {
-            Ok(json) => match table.merge_litellm_json(&json) {
-                Ok(n) => tracing::info!("model prices: loaded {n} models from rate card {path}"),
-                Err(e) => tracing::warn!("model prices: rate card {path} ignored: {e}"),
-            },
+            Ok(json) => {
+                let mut rate_card = PriceTable::new();
+                match rate_card.merge_litellm_json(&json) {
+                    Ok(n) => {
+                        table = rate_card;
+                        tracing::info!("model prices: loaded {n} models from rate card {path}");
+                    }
+                    Err(e) => tracing::warn!("model prices: rate card {path} ignored: {e}"),
+                }
+            }
             Err(e) => tracing::warn!("model prices: cannot read rate card {path}: {e}"),
         }
     }
     for (name, cfg) in prices {
-        table.insert(name.clone(), ModelPrice::from(cfg), PriceSource::Config);
+        match cfg.validate(name) {
+            Ok(()) => table.insert(name.clone(), ModelPrice::from(cfg), PriceSource::Config),
+            Err(error) => tracing::warn!("model prices: inline entry ignored: {error}"),
+        }
     }
     table
 }
@@ -1240,6 +1367,64 @@ mod tests {
         assert!((p.cache_write_per_million - 3.75).abs() < 1e-9);
         // sample_spec and the embedding model (no output cost) are skipped.
         assert!(t.get("text-embedding-3").is_none());
+    }
+
+    #[test]
+    fn inline_governance_prices_reject_nonfinite_negative_and_inexact_rates() {
+        let cases = [
+            ("input_per_million", f64::NAN),
+            ("output_per_million", -0.01),
+            ("cache_read_per_million", f64::INFINITY),
+            ("cache_write_per_million", 9_007_199_254_740_992.0),
+        ];
+
+        for (field, value) in cases {
+            let mut price = ModelPriceConfig {
+                input_per_million: 1.0,
+                output_per_million: 1.0,
+                cache_read_per_million: 0.0,
+                cache_write_per_million: 0.0,
+            };
+            match field {
+                "input_per_million" => price.input_per_million = value,
+                "output_per_million" => price.output_per_million = value,
+                "cache_read_per_million" => price.cache_read_per_million = value,
+                "cache_write_per_million" => price.cache_write_per_million = value,
+                _ => unreachable!(),
+            }
+
+            let error = price
+                .validate("invalid-model")
+                .expect_err("invalid governance price must fail config validation");
+            assert!(error.contains("invalid-model"), "unexpected error: {error}");
+            assert!(error.contains(field), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn litellm_ratecard_rejects_negative_or_overflowing_governance_prices() {
+        for (field, value) in [
+            ("input_cost_per_token", "-0.000001"),
+            ("output_cost_per_token", "10000000000"),
+            ("cache_read_input_token_cost", "-0.000001"),
+            ("cache_creation_input_token_cost", "10000000000"),
+        ] {
+            let json = format!(
+                r#"{{
+                  "invalid-model": {{
+                    "input_cost_per_token": 0.000001,
+                    "output_cost_per_token": 0.000001,
+                    "{field}": {value}
+                  }}
+                }}"#
+            );
+            let mut table = PriceTable::new();
+            let error = table
+                .merge_litellm_json(&json)
+                .expect_err("invalid rate-card price must be rejected");
+            assert!(error.contains("invalid-model"), "unexpected error: {error}");
+            assert!(error.contains(field), "unexpected error: {error}");
+        }
     }
 
     #[test]
@@ -2027,6 +2212,25 @@ mod tests {
         assert!(
             tracker.get_usage(&cumulative).request_count > 0,
             "a cumulative scope must never be evicted"
+        );
+    }
+
+    #[test]
+    fn governance_price_rounds_up_once_to_a_micro_usd() {
+        let price = ModelPrice::tokens(0.15, 0.60);
+        assert_eq!(governance_micro_usd(price, 1, 0), Some(1));
+        assert_eq!(governance_micro_usd(price, 1_000, 500), Some(450));
+    }
+
+    #[test]
+    fn governance_price_rejects_invalid_or_overflowing_rates() {
+        assert_eq!(
+            governance_micro_usd(ModelPrice::tokens(f64::NAN, 1.0), 1, 1),
+            None
+        );
+        assert_eq!(
+            governance_micro_usd(ModelPrice::tokens(f64::MAX, 1.0), u64::MAX, 1),
+            None
         );
     }
 }

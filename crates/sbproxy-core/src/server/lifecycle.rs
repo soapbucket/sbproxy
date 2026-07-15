@@ -298,15 +298,6 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
     // Runs before `compiled` is moved into the pipeline below.
     install_detection_singletons(&compiled);
 
-    // WOR-1546: reconcile the dynamic key plane so a reload that changed
-    // `key_management:` re-seeds config records and swaps the live plane.
-    // Config-seeded records are re-asserted unless `allow_api_override`.
-    if let Some(km) = compiled.server.key_management.as_ref() {
-        if let Err(e) = crate::key_plane::init_key_plane(km) {
-            tracing::error!(error = %e, "failed to reconcile dynamic key plane on reload");
-        }
-    }
-
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
@@ -386,6 +377,17 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
         .unwrap_or_else(|| std::path::Path::new("."));
     super::model_host::reconcile_model_runtime_blocking(&new_pipeline, config_dir)
         .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
+
+    // Reconcile the dynamic key and governance planes only after every other
+    // fallible candidate-build step succeeds. A failure aborts publication so
+    // request policy can never advance while the previous accounting plane is
+    // retained. Removing the block explicitly disables both planes instead of
+    // accidentally keeping stale key policy and leases alive.
+    match new_pipeline.config.server.key_management.as_ref() {
+        Some(key_management) => crate::key_plane::init_key_plane(key_management)
+            .map_err(|error| anyhow::anyhow!("failed to reconcile dynamic key plane: {error}"))?,
+        None => crate::key_plane::disable_key_plane(),
+    }
     reload::load_pipeline(new_pipeline);
     tracing::info!("config reloaded successfully");
     Ok(())
@@ -666,6 +668,22 @@ pub(super) fn spawn_shutdown_phase_logger(
         .ok();
 }
 
+/// Install the startup key and governance planes.
+///
+/// Startup is fail-closed: serving with an invalid configured governance plane
+/// would silently drop strict cluster-wide enforcement. Reload intentionally
+/// keeps its separate best-effort path above so invalid governance cannot
+/// replace the previously installed governance plane.
+fn install_startup_key_plane(
+    server_config: &sbproxy_config::ProxyServerConfig,
+) -> anyhow::Result<()> {
+    if let Some(key_management) = server_config.key_management.as_ref() {
+        crate::key_plane::init_key_plane(key_management)
+            .map_err(|error| anyhow::anyhow!("failed to install dynamic key plane: {error}"))?;
+    }
+    Ok(())
+}
+
 /// Create and start a Pingora server with the given config file path.
 ///
 /// This function:
@@ -788,11 +806,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // cache tier consumes this handle instead of opening duplicate listeners.
     crate::cluster::reconcile_process_cluster(&server_config)?;
 
-    if let Some(km) = server_config.key_management.as_ref() {
-        if let Err(e) = crate::key_plane::init_key_plane(km) {
-            tracing::error!(error = %e, "failed to install dynamic key plane");
-        }
-    }
+    install_startup_key_plane(&server_config)?;
 
     // --- WOR-1186: register the session-ledger sink when enabled ---
     //
@@ -2610,6 +2624,24 @@ fn compile_one_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_rejects_strict_governance_without_a_shared_backend() {
+        let mut server = sbproxy_config::ProxyServerConfig::default();
+        server.key_management = Some(sbproxy_config::types::KeyManagementConfig {
+            governance: sbproxy_config::types::GovernanceConfig {
+                consistency: sbproxy_config::types::GovernanceConsistency::Strict,
+                backend: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let error = install_startup_key_plane(&server).expect_err("startup must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("failed to install dynamic key plane"));
+        assert!(message.contains("strict consistency requires a Redis backend"));
+    }
 
     #[test]
     fn proxy_service_startup_error_preserves_native_cert_hint() {

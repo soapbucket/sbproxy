@@ -810,6 +810,22 @@ pub struct RequestContext {
     /// Every downstream key predicate reads this retained snapshot rather
     /// than resolving mutable key state again.
     pub effective_key_policy: Option<sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
+    /// Accepted ingress governance reservation owned by this request.
+    ///
+    /// The ingress gateway settles or releases this lease. Peer workers never
+    /// receive the store handle and therefore cannot charge the caller again.
+    pub governance_lease: Option<crate::governance_runtime::GovernanceCharge>,
+    /// Parseable usage accumulated from provider attempts that were discarded
+    /// before a fallback produced the response returned to the caller.
+    pub governance_retry_input_tokens: u64,
+    /// Parseable output usage accumulated from discarded fallback attempts.
+    pub governance_retry_output_tokens: u64,
+    /// Whether at least one discarded response carried an explicit usage
+    /// block, including an explicit zero-token usage report.
+    pub governance_retry_usage_observed: bool,
+    /// At least one dispatched fallback response lacked parseable usage, so
+    /// final settlement must use the conservative admitted ceiling.
+    pub governance_retry_usage_missing: bool,
     /// Pre-flight rate-limit reservation. Stamped by
     /// `handle_ai_proxy` after the prompt has been parsed and the
     /// tiktoken estimator has run; reconciled on the response side
@@ -1158,6 +1174,11 @@ impl RequestContext {
             ai_inbound_format: None,
             ai_native_bypass: false,
             effective_key_policy: None,
+            governance_lease: None,
+            governance_retry_input_tokens: 0,
+            governance_retry_output_tokens: 0,
+            governance_retry_usage_observed: false,
+            governance_retry_usage_missing: false,
             ai_admission: None,
             ai_realtime_session: None,
             ai_realtime_dispatch: None,
@@ -1228,6 +1249,7 @@ mod tests {
         assert!(ctx.response_status.is_none());
         assert!(ctx.rate_limit_info.is_none());
         assert!(ctx.response_body_buf.is_none());
+        assert!(ctx.governance_lease.is_none());
         assert!(ctx.effective_key_policy.is_none());
         assert!(!ctx.buffering_body);
         assert!(ctx.upstream_content_type.is_none());

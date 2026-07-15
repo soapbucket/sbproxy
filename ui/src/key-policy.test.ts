@@ -3,18 +3,20 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   api,
   buildKeyPolicyPatch,
+  KeyUsageUnavailableError,
   keyPolicyDraft,
   rebaseKeyPolicyDraft,
   type AdminKey,
   type AdminKeyPolicyPatch,
   type CreatedKey,
+  type KeyUsageSnapshot,
 } from "./api";
 
-function stubFetch(body: unknown) {
+function stubFetch(body: unknown, status = 200) {
   const fetchMock = vi.fn(
     async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response(JSON.stringify(body), {
-        status: 200,
+        status,
         headers: { "content-type": "application/json" },
       }),
   );
@@ -591,6 +593,184 @@ describe("admin key policy mutation contract", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/admin/keys/key%2Fa",
       expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("decodes one key usage snapshot without converting micro-USD", async () => {
+    const snapshot = {
+      key_id: "key/a",
+      policy_version: { revision: 9, digest: "sha256:nine" },
+      consistency: "strict",
+      backend: {
+        name: "redis",
+        status: "healthy",
+        checked_at: "2026-07-14T18:30:00Z",
+      },
+      dimensions: {
+        requests_per_minute: {
+          limit: 60,
+          used: 12,
+          reserved: 3,
+          remaining: 45,
+          reset_at: "2026-07-14T18:31:00Z",
+        },
+        tokens_per_minute: null,
+        budget_tokens: {
+          limit: 100_000,
+          used: 25_000,
+          reserved: 5_000,
+          remaining: 70_000,
+          reset_at: null,
+        },
+        budget_micro_usd: {
+          limit: 50_000_000,
+          used: 12_345_678,
+          reserved: 1_000_000,
+          remaining: 36_654_322,
+          reset_at: null,
+        },
+      },
+      secret: "must-not-survive",
+    };
+    const fetchMock = stubFetch(snapshot);
+
+    const result = await api.keyUsage("key/a");
+
+    expect(result).toEqual({
+      key_id: "key/a",
+      policy_version: { revision: 9, digest: "sha256:nine" },
+      consistency: "strict",
+      backend: {
+        name: "redis",
+        status: "healthy",
+        checked_at: "2026-07-14T18:30:00Z",
+      },
+      dimensions: snapshot.dimensions,
+    });
+    expect(result.dimensions.budget_micro_usd?.used).toBe(12_345_678);
+    expect(result.dimensions.budget_micro_usd?.reset_at).toBeNull();
+    expect(JSON.stringify(result)).not.toContain("must-not-survive");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/admin/keys/key%2Fa/usage",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("decodes a strict backend outage from the 503 response body", async () => {
+    stubFetch(
+      {
+        error: {
+          code: "governance_backend_unavailable",
+          message: "governance backend unavailable",
+        },
+        consistency: "strict",
+        backend: {
+          name: "redis",
+          status: "unavailable",
+          checked_at: "2026-07-14T18:30:00Z",
+        },
+        redis_url: "redis://admin:secret@private.example:6379/0",
+      },
+      503,
+    );
+
+    const error = await api.keyUsage("key-1").catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(KeyUsageUnavailableError);
+    expect(error).toMatchObject({
+      status: 503,
+      outage: {
+        consistency: "strict",
+        backend: {
+          name: "redis",
+          status: "unavailable",
+          checked_at: "2026-07-14T18:30:00Z",
+        },
+      },
+    });
+    expect(JSON.stringify((error as KeyUsageUnavailableError).outage)).not.toContain(
+      "private.example",
+    );
+    expect((error as KeyUsageUnavailableError).body).not.toContain("private.example");
+  });
+
+  it("rejects malformed usage health and accounting counters", async () => {
+    stubFetch({
+      key_id: "key-1",
+      policy_version: { revision: 2, digest: "sha256:two" },
+      consistency: "strict",
+      backend: {
+        name: "redis",
+        status: "offline",
+        checked_at: "not-a-timestamp",
+      },
+      dimensions: {
+        requests_per_minute: {
+          limit: 10,
+          used: -1,
+          reserved: 0,
+          remaining: 11,
+          reset_at: "2026-07-14T18:31:00Z",
+        },
+        tokens_per_minute: null,
+        budget_tokens: null,
+        budget_micro_usd: null,
+      },
+    });
+
+    await expect(api.keyUsage("key-1")).rejects.toThrow("key usage");
+  });
+
+  it("types usage dimensions as safe integer reservation snapshots", () => {
+    const usage: KeyUsageSnapshot = {
+      key_id: "key-1",
+      policy_version: { revision: 1, digest: "sha256:one" },
+      consistency: "approximate",
+      backend: {
+        name: "memory",
+        status: "healthy",
+        checked_at: "2026-07-14T18:30:00Z",
+      },
+      dimensions: {
+        requests_per_minute: null,
+        tokens_per_minute: null,
+        budget_tokens: null,
+        budget_micro_usd: null,
+      },
+    };
+
+    expectTypeOf(usage.consistency).toMatchTypeOf<"approximate" | "strict">();
+    expectTypeOf(usage.dimensions.budget_micro_usd).toMatchTypeOf<
+      { limit: number; used: number; reserved: number; remaining: number; reset_at: string | null } | null
+    >();
+  });
+
+  it("requires minute dimensions to carry a reset timestamp", async () => {
+    stubFetch({
+      key_id: "key-1",
+      policy_version: { revision: 2, digest: "sha256:two" },
+      consistency: "approximate",
+      backend: {
+        name: "memory",
+        status: "healthy",
+        checked_at: "2026-07-14T18:30:00Z",
+      },
+      dimensions: {
+        requests_per_minute: {
+          limit: 10,
+          used: 1,
+          reserved: 0,
+          remaining: 9,
+          reset_at: null,
+        },
+        tokens_per_minute: null,
+        budget_tokens: null,
+        budget_micro_usd: null,
+      },
+    });
+
+    await expect(api.keyUsage("key-1")).rejects.toThrow(
+      "key usage.dimensions.requests_per_minute.reset_at",
     );
   });
 

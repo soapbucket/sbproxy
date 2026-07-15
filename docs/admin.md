@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-14*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -355,6 +355,7 @@ grace-window rotate.
 |---|---|
 | POST, GET | `/admin/keys` |
 | GET, PATCH, DELETE | `/admin/keys/{id}` |
+| GET | `/admin/keys/{id}/usage` |
 | POST | `/admin/keys/{id}/revoke`, `/block`, `/unblock`, `/rotate` |
 | POST, GET | `/admin/credentials` |
 | GET, PATCH, DELETE | `/admin/credentials/{id}` |
@@ -418,7 +419,12 @@ After sign-in, the Overview page shows live health with per-component checks, ve
 
 ![The Overview page: health ok, per-component checks, a request-log count, and the model host section](assets/admin-overview.png)
 
-The Keys page lists every virtual key with its status, policy, budget, and expiry, and carries the mint, edit, rotate, block, revoke, and delete actions inline:
+The Keys page lists every virtual key with its status, policy, budget, and
+expiry, and carries the mint, edit, rotate, block, revoke, and delete actions
+inline. Key detail also shows each configured limit's used, reserved,
+remaining, and reset values, plus approximate or strict consistency and the
+governance backend's health. An unavailable strict backend is called out as an
+unhealthy state:
 
 ![The Keys page: three active keys in a table with per-key Edit, Rotate, Block, Revoke, and Delete buttons](assets/admin-keys.png)
 

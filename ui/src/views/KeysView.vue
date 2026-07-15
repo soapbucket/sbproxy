@@ -4,6 +4,7 @@ import {
   api,
   asList,
   ApiError,
+  KeyUsageUnavailableError,
   buildKeyPolicyPatch,
   keyPolicyDraft,
   rebaseKeyPolicyDraft,
@@ -12,6 +13,10 @@ import {
   type EffectivePolicyDecisionName,
   type EffectivePolicyPreview,
   type KeyPolicyDraft,
+  type KeyUsageDimension,
+  type KeyUsageDimensions,
+  type KeyUsageBackendUnavailable,
+  type KeyUsageSnapshot,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { formatUsd, formatTime, shortId } from "../lib/format";
@@ -518,6 +523,119 @@ async function submitEdit() {
   }
 }
 
+// ---- usage and reservations ----
+const usageKey = ref<AdminKey | null>(null);
+const usage = ref<KeyUsageSnapshot | null>(null);
+const usageOutage = ref<KeyUsageBackendUnavailable | null>(null);
+const usageBusy = ref(false);
+const usageError = ref<ApiError | null>(null);
+let usageInvocation = 0;
+
+interface UsageDimensionView {
+  name: keyof KeyUsageDimensions;
+  label: string;
+  snapshot: KeyUsageDimension | null;
+}
+
+const usageDimensions = computed<UsageDimensionView[]>(() => {
+  const dimensions = usage.value?.dimensions;
+  return [
+    {
+      name: "requests_per_minute",
+      label: "Requests per minute",
+      snapshot: dimensions?.requests_per_minute ?? null,
+    },
+    {
+      name: "tokens_per_minute",
+      label: "Tokens per minute",
+      snapshot: dimensions?.tokens_per_minute ?? null,
+    },
+    {
+      name: "budget_tokens",
+      label: "Token budget",
+      snapshot: dimensions?.budget_tokens ?? null,
+    },
+    {
+      name: "budget_micro_usd",
+      label: "Monetary budget",
+      snapshot: dimensions?.budget_micro_usd ?? null,
+    },
+  ];
+});
+
+const usageBackend = computed(
+  () => usage.value?.backend ?? usageOutage.value?.backend ?? null,
+);
+const usageConsistency = computed(
+  () => usage.value?.consistency ?? usageOutage.value?.consistency ?? null,
+);
+const backendUnhealthy = computed(
+  () => usageBackend.value !== null && usageBackend.value.status !== "healthy",
+);
+const strictBackendUnavailable = computed(
+  () =>
+    usageConsistency.value === "strict" &&
+    usageBackend.value?.status === "unavailable",
+);
+
+function backendTone(
+  status: KeyUsageSnapshot["backend"]["status"],
+): "ok" | "warn" | "err" {
+  if (status === "healthy") return "ok";
+  if (status === "degraded") return "warn";
+  return "err";
+}
+
+function formatUsageAmount(
+  value: number,
+  dimension: keyof KeyUsageDimensions,
+): string {
+  if (dimension === "budget_micro_usd") return formatUsd(value / 1_000_000);
+  return new Intl.NumberFormat().format(value);
+}
+
+function formatUsageReset(resetAt: string | null): string {
+  return resetAt ? formatTime(resetAt) : "Never";
+}
+
+async function loadUsage(key = usageKey.value) {
+  if (!key) return;
+  const invocation = ++usageInvocation;
+  usageBusy.value = true;
+  usage.value = null;
+  usageOutage.value = null;
+  usageError.value = null;
+  try {
+    const loaded = await api.keyUsage(keyId(key));
+    if (invocation !== usageInvocation) return;
+    usage.value = loaded;
+  } catch (e) {
+    if (invocation !== usageInvocation) return;
+    if (e instanceof KeyUsageUnavailableError) {
+      usageOutage.value = e.outage;
+      usageError.value = null;
+    } else {
+      usageError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
+    }
+  } finally {
+    if (invocation === usageInvocation) usageBusy.value = false;
+  }
+}
+
+function openUsage(k: AdminKey) {
+  usageKey.value = k;
+  void loadUsage(k);
+}
+
+function closeUsage() {
+  usageInvocation += 1;
+  usageKey.value = null;
+  usage.value = null;
+  usageOutage.value = null;
+  usageError.value = null;
+  usageBusy.value = false;
+}
+
 // ---- row actions ----
 const rowBusy = ref<string | null>(null);
 const actionError = ref<string | null>(null);
@@ -716,6 +834,13 @@ function statusOf(k: AdminKey): string {
           <td class="actions">
             <button
               class="sb-btn sb-btn--sm"
+              :disabled="rowBusy !== null"
+              @click="openUsage(k)"
+            >
+              Usage
+            </button>
+            <button
+              class="sb-btn sb-btn--sm"
               :disabled="
                 !policySchemaReq.succeeded.value || statusOf(k) === 'revoked'
               "
@@ -771,6 +896,130 @@ function statusOf(k: AdminKey): string {
       </tbody>
     </table>
   </div>
+
+  <ModalDialog
+    v-if="usageKey"
+    title="Usage and reservations"
+    @close="closeUsage"
+  >
+    <p class="usage-key-evidence">
+      Key <span class="sb-mono">{{ shortId(keyId(usageKey)) }}</span>
+      <template v-if="usage">
+        <span aria-hidden="true"> / </span>
+        Policy revision
+        <span class="sb-mono">{{ usage.policy_version.revision }}</span>
+        <span aria-hidden="true"> / </span>
+        digest
+        <span class="sb-mono digest">{{ usage.policy_version.digest }}</span>
+      </template>
+    </p>
+
+    <p v-if="usageBusy && !usage && !usageOutage" class="sb-faint" aria-live="polite">
+      Loading usage and active reservations...
+    </p>
+    <template v-else-if="usage || usageOutage">
+      <section
+        v-if="usageBackend"
+        class="usage-backend"
+        :class="{ 'usage-backend--unhealthy': backendUnhealthy }"
+        aria-label="Governance backend"
+      >
+        <div>
+          <span class="usage-backend__label">Consistency</span>
+          <strong>{{ usageConsistency }}</strong>
+          <span aria-hidden="true"> / </span>
+          <span class="usage-backend__label">Backend</span>
+          <span class="sb-mono">{{ usageBackend.name }}</span>
+        </div>
+        <div class="usage-backend__health">
+          <StatusBadge
+            :label="usageBackend.status"
+            :tone="backendTone(usageBackend.status)"
+          />
+          <span class="sb-faint">
+            checked {{ formatTime(usageBackend.checked_at) }}
+          </span>
+        </div>
+      </section>
+
+      <section
+        v-if="backendUnhealthy && usageBackend"
+        class="usage-health-alert"
+        :class="{
+          'usage-health-alert--degraded': usageBackend.status === 'degraded',
+        }"
+        role="alert"
+        aria-live="assertive"
+      >
+        <strong v-if="strictBackendUnavailable">Strict limits are unavailable.</strong>
+        <strong v-else>Governance backend is degraded.</strong>
+        <p v-if="strictBackendUnavailable">
+          The configured governance backend is unhealthy. Strict requests fail
+          closed until backend health recovers.
+        </p>
+        <p v-else>
+          Reservation state may be stale or incomplete. Review backend health
+          before relying on the displayed remaining allowance.
+        </p>
+      </section>
+
+      <div
+        v-if="usage"
+        class="usage-dimensions"
+        aria-label="Governed usage dimensions"
+      >
+        <article
+          v-for="dimension in usageDimensions"
+          :key="dimension.name"
+          class="usage-dimension"
+        >
+          <h3>{{ dimension.label }}</h3>
+          <p v-if="!dimension.snapshot" class="sb-faint usage-empty">
+            Not configured for this key.
+          </p>
+          <dl v-else>
+            <div>
+              <dt>Limit</dt>
+              <dd>{{ formatUsageAmount(dimension.snapshot.limit, dimension.name) }}</dd>
+            </div>
+            <div>
+              <dt>Used</dt>
+              <dd>{{ formatUsageAmount(dimension.snapshot.used, dimension.name) }}</dd>
+            </div>
+            <div>
+              <dt>Reserved</dt>
+              <dd>{{ formatUsageAmount(dimension.snapshot.reserved, dimension.name) }}</dd>
+            </div>
+            <div class="usage-remaining">
+              <dt>Remaining</dt>
+              <dd>{{ formatUsageAmount(dimension.snapshot.remaining, dimension.name) }}</dd>
+            </div>
+            <div class="usage-reset">
+              <dt>Reset</dt>
+              <dd>{{ formatUsageReset(dimension.snapshot.reset_at) }}</dd>
+            </div>
+          </dl>
+        </article>
+      </div>
+    </template>
+    <ErrorState
+      v-else-if="usageError"
+      :error="usageError"
+      title="Usage unavailable"
+      @retry="loadUsage()"
+    />
+
+    <template #footer>
+      <button
+        class="sb-btn"
+        :disabled="usageBusy"
+        @click="loadUsage()"
+      >
+        {{ usageBusy ? "Refreshing..." : "Refresh usage" }}
+      </button>
+      <button class="sb-btn sb-btn--primary" @click="closeUsage">Close</button>
+    </template>
+  </ModalDialog>
 
   <!-- Create modal -->
   <ModalDialog v-if="showCreate" title="Create key" @close="showCreate = false">
@@ -1240,6 +1489,107 @@ function statusOf(k: AdminKey): string {
 .policy-evidence {
   margin-top: 3px;
 }
+.usage-key-evidence {
+  color: var(--sb-text-muted);
+  font-size: 0.78rem;
+  margin: 0 0 12px;
+  overflow-wrap: anywhere;
+}
+.usage-backend {
+  align-items: center;
+  background: var(--sb-surface-2);
+  border: 1px solid var(--sb-border);
+  border-radius: var(--sb-radius-sm);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+  gap: 10px 16px;
+  justify-content: space-between;
+  padding: 10px 12px;
+}
+.usage-backend--unhealthy {
+  background: var(--sb-err-bg);
+  border-color: var(--sb-err);
+}
+.usage-backend__label {
+  color: var(--sb-text-muted);
+  margin-right: 5px;
+}
+.usage-backend__health {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.usage-health-alert {
+  background: var(--sb-err-bg);
+  border: 1px solid var(--sb-err);
+  border-radius: var(--sb-radius-sm);
+  color: var(--sb-err);
+  margin-top: 10px;
+  padding: 10px 12px;
+}
+.usage-health-alert p {
+  margin: 5px 0 0;
+}
+.usage-health-alert--degraded {
+  background: var(--sb-warn-bg);
+  border-color: var(--sb-warn-fg);
+  color: var(--sb-warn-fg);
+}
+.usage-dimensions {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 12px;
+}
+.usage-dimension {
+  border: 1px solid var(--sb-border);
+  border-radius: var(--sb-radius-sm);
+  min-width: 0;
+  padding: 12px;
+}
+.usage-dimension h3 {
+  font-size: 0.86rem;
+  margin: 0 0 10px;
+}
+.usage-dimension dl {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+}
+.usage-dimension dl > div {
+  align-items: baseline;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+.usage-dimension dt {
+  color: var(--sb-text-muted);
+  font-size: 0.74rem;
+}
+.usage-dimension dd {
+  font-family: var(--sb-font-mono);
+  font-size: 0.8rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+.usage-dimension .usage-remaining {
+  border-top: 1px solid var(--sb-border);
+  margin-top: 2px;
+  padding-top: 7px;
+}
+.usage-dimension .usage-remaining dd {
+  color: var(--sb-ok);
+  font-weight: 700;
+}
+.usage-dimension .usage-reset {
+  align-items: flex-start;
+}
+.usage-empty {
+  margin: 0;
+}
 .edit-evidence {
   margin-bottom: 12px;
 }
@@ -1335,6 +1685,9 @@ function statusOf(k: AdminKey): string {
 }
 @media (max-width: 560px) {
   .two {
+    grid-template-columns: 1fr;
+  }
+  .usage-dimensions {
     grid-template-columns: 1fr;
   }
   .decision-list li {

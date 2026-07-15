@@ -746,6 +746,18 @@ pub struct CascadeOutcome {
     /// cascade returned the last tier's response after exhausting
     /// tiers without acceptance (cost cap, or no tier met the bar).
     pub accepted: bool,
+    /// Sum of every parseable input-token count reported by an
+    /// upstream response in this cascade, including rejected,
+    /// failed, refused, low-confidence, and returned responses.
+    pub aggregate_input_tokens: u64,
+    /// Sum of every parseable output-token count reported by an
+    /// upstream response in this cascade, including rejected,
+    /// failed, refused, low-confidence, and returned responses.
+    pub aggregate_output_tokens: u64,
+    /// `true` when at least one upstream response was received but
+    /// did not expose any parseable input or output token count.
+    /// Skipped tiers and transport failures do not set this flag.
+    pub billable_usage_missing: bool,
 }
 
 impl AiClient {
@@ -824,6 +836,9 @@ impl AiClient {
 
         let mut last_outcome: Option<CascadeOutcome> = None;
         let mut total_cost_micros: u64 = 0;
+        let mut aggregate_input_tokens: u64 = 0;
+        let mut aggregate_output_tokens: u64 = 0;
+        let mut billable_usage_missing = false;
 
         for (tier_idx, tier) in cascade.tiers.iter().enumerate() {
             // Cost cap gate. Both the cascade-level and per-tier
@@ -930,6 +945,10 @@ impl AiClient {
                         "cascade: body read failed; trying next tier"
                     );
                     ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                    billable_usage_missing = true;
+                    if let Some(outcome) = last_outcome.as_mut() {
+                        outcome.billable_usage_missing = true;
+                    }
                     continue;
                 }
             };
@@ -942,6 +961,14 @@ impl AiClient {
             // gateway speaks OpenAI Chat to clients by default.
             let translated_vec = translators::translate_response_bytes(format, &raw_bytes);
             let translated = bytes::Bytes::from(translated_vec);
+
+            match extract_usage_tokens(&translated) {
+                Some((input_tokens, output_tokens)) => {
+                    aggregate_input_tokens = aggregate_input_tokens.saturating_add(input_tokens);
+                    aggregate_output_tokens = aggregate_output_tokens.saturating_add(output_tokens);
+                }
+                None => billable_usage_missing = true,
+            }
 
             // 5xx responses are treated as failure regardless of
             // body shape. The cascade falls through to the next
@@ -971,6 +998,9 @@ impl AiClient {
                     format,
                     tier_index: tier_idx,
                     accepted: false,
+                    aggregate_input_tokens,
+                    aggregate_output_tokens,
+                    billable_usage_missing,
                 });
                 continue;
             }
@@ -1005,6 +1035,9 @@ impl AiClient {
                     format,
                     tier_index: tier_idx,
                     accepted: false,
+                    aggregate_input_tokens,
+                    aggregate_output_tokens,
+                    billable_usage_missing,
                 });
                 continue;
             }
@@ -1034,6 +1067,9 @@ impl AiClient {
                     format,
                     tier_index: tier_idx,
                     accepted: false,
+                    aggregate_input_tokens,
+                    aggregate_output_tokens,
+                    billable_usage_missing,
                 });
                 continue;
             }
@@ -1049,6 +1085,9 @@ impl AiClient {
                 format,
                 tier_index: tier_idx,
                 accepted: true,
+                aggregate_input_tokens,
+                aggregate_output_tokens,
+                billable_usage_missing,
             });
         }
 
@@ -1069,23 +1108,28 @@ fn estimate_cost_micros(model: &str) -> u64 {
     (cost_dollars * 1_000_000.0).round() as u64
 }
 
-/// Extract OpenAI-shaped `(prompt_tokens, completion_tokens)` from a
-/// translated response body, returning `(0, 0)` when no usage block
-/// is present. The cascade always translates upstream bodies back to
-/// OpenAI Chat before this runs, so the `usage` shape is uniform.
-fn extract_usage_tokens(body: &[u8]) -> (u64, u64) {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("usage").cloned())
-        .map(|u| {
-            let p = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-            let c = u
-                .get("completion_tokens")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0);
-            (p, c)
-        })
-        .unwrap_or((0, 0))
+/// Extract provider-neutral `(input_tokens, output_tokens)` from a
+/// translated response body. OpenAI-shaped field names are preferred;
+/// the input/output aliases preserve accounting if a translator passes
+/// through a provider-native usage block. At least one numeric count is
+/// required, while an explicitly reported zero remains parseable.
+fn extract_usage_tokens(body: &[u8]) -> Option<(u64, u64)> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let usage = value.get("usage")?;
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(serde_json::Value::as_u64);
+
+    if input_tokens.is_none() && output_tokens.is_none() {
+        return None;
+    }
+
+    Some((input_tokens.unwrap_or(0), output_tokens.unwrap_or(0)))
 }
 
 /// WOR-1093: a cascade tier that returned a body but lost (5xx,
@@ -1100,7 +1144,9 @@ fn record_cascade_loser_waste(
     tags: &crate::attribution::AttributionTags,
     body: &[u8],
 ) {
-    let (prompt, completion) = extract_usage_tokens(body);
+    let Some((prompt, completion)) = extract_usage_tokens(body) else {
+        return;
+    };
     let tokens = prompt.saturating_add(completion);
     if tokens == 0 {
         return;
@@ -1417,6 +1463,16 @@ mod tests {
         let blocked = vec!["openai".to_string()];
 
         assert!(!cascade_provider_is_eligible(&provider, &allowed, &blocked));
+    }
+
+    #[test]
+    fn cascade_usage_extraction_distinguishes_zero_usage_from_missing_usage() {
+        assert_eq!(
+            extract_usage_tokens(br#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#),
+            Some((0, 0))
+        );
+        assert_eq!(extract_usage_tokens(br#"{"usage":{}}"#), None);
+        assert_eq!(extract_usage_tokens(b"not-json"), None);
     }
 
     // --- Shadow supervisor tests ---

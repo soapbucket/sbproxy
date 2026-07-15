@@ -58,6 +58,8 @@ pub mod context;
 pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.
 pub mod doctor;
+/// Drop-safe ownership for accepted governance reservations.
+pub mod governance_runtime;
 pub mod hook_registry;
 pub mod hooks;
 pub mod identity;
