@@ -8325,6 +8325,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-capability"
+version = "0.1.0"
+dependencies = [
+ "schemars 0.8.22",
+ "serde",
+]
+
+[[package]]
 name = "sbproxy-classifier-client"
 version = "0.1.0"
 dependencies = [
@@ -8402,6 +8410,7 @@ dependencies = [
  "bytes",
  "compact_str 0.8.1",
  "http 1.4.0",
+ "sbproxy-capability",
  "sbproxy-observe",
  "sbproxy-platform",
  "sbproxy-plugin",
@@ -8830,6 +8839,7 @@ dependencies = [
  "redb",
  "regex",
  "reqwest 0.12.28",
+ "sbproxy-capability",
  "sbproxy-plugin",
  "sbproxy-security",
  "sbproxy-util",

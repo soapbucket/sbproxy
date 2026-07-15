@@ -979,7 +979,11 @@ mod tests {
     /// and stable across the 0.14 line.
     #[allow(deprecated)]
     fn hooks_drop_total(reason: &str) -> u64 {
-        for mf in prometheus::gather() {
+        // Read the canonical scrape registry, not the process-global default:
+        // `record_channel_drop` registers this counter only on
+        // `metrics().registry` (registering on both broke `/metrics` with a
+        // duplicated family), so an ad-hoc `prometheus::gather()` sees nothing.
+        for mf in sbproxy_observe::metrics::metrics().registry.gather() {
             if mf.get_name() != "sbproxy_hooks_channel_dropped_total" {
                 continue;
             }

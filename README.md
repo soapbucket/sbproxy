@@ -47,7 +47,7 @@ Cloudflare's AI Gateway and Vercel's got a lot right: one endpoint in front of e
 
 **Govern both.** Virtual keys mint and revoke at runtime, guardrails screen prompts and completions and can redact a streaming response mid-flight, and every request can emit a signed usage receipt you can verify offline. Inbound, federate your MCP tools behind OAuth2, verify signed agents (RFC 9421), and meter AI crawlers with HTTP 402 Pay Per Crawl.
 
-Underneath sits a real reverse proxy on Pingora: auth, automatic TLS, WAF, rate limiting, and hot reload with no dropped connections. [50,713 rps through the full policy chain at 0.6 ms p99](docs/performance.md). The admin console ships in the binary, and replicas cluster over a built-in gossip mesh, no external Redis.
+Underneath sits a real reverse proxy on Pingora: auth, automatic TLS, WAF, rate limiting, and hot reload with no dropped connections. [50,713 rps through the full policy chain at 0.6 ms p99](docs/performance.md). The admin console ships in the binary, and replicas cluster over a built-in gossip mesh with no Postgres and no external control plane. Cluster-wide budget and rate enforcement still uses a shared backend.
 
 Weighing the options? See [how SBproxy compares](docs/comparison.md) and the [benchmark methodology](https://sbproxy.dev/benchmark).
 

@@ -472,8 +472,10 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     ));
     install_key_plane(plane);
 
-    // WOR-1563: with the mesh tier, install cross-replica per-key spend + rate
-    // counters (CRDTs coherent across the fleet via gossip).
+    // WOR-1563: with the mesh tier, install the per-key spend + rate CRDT
+    // counters. These are node-local writers today; the gossip dissemination
+    // that would make them coherent across the fleet is WOR-1887, still open.
+    // Fleet-wide caps need a shared backend until then.
     if cfg.cache.tier == KeyCacheTier::Mesh {
         let node_id = cfg
             .cache

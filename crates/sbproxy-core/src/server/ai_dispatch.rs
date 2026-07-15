@@ -527,6 +527,26 @@ fn principal_for_resolved_virtual_key(
     }
 }
 
+/// Stamp a guardrail block onto the request context, and count it.
+///
+/// These were two separate concerns until the counter turned out to have no
+/// writer at all. `sbproxy_ai_guardrail_blocks_total` was declared, published
+/// as a stable metric, and drawn on a Grafana panel, while
+/// `record_guardrail_block` was called from nowhere. The panel read a flat
+/// zero, which is indistinguishable from a guardrail that never fires, which
+/// is exactly what an operator would conclude.
+///
+/// Setting the context fields and the counter in one place is the only
+/// arrangement in which the dashboard cannot silently disagree with the access
+/// log: a new block path has to go through here to stamp the context, and
+/// stamping the context increments the counter.
+fn mark_guardrail_block(ctx: &mut RequestContext, category: String) {
+    sbproxy_ai::ai_metrics::record_guardrail_block(&category);
+    ctx.ai_outcome = Some("guardrail_block".to_string());
+    ctx.ai_guardrail_category = Some(category);
+    ctx.ai_guardrail_action = Some("block".to_string());
+}
+
 fn apply_resolved_key_lane(ctx: &mut RequestContext, resolved: &ResolvedRequestKey) {
     ctx.ai_lane_priority = resolved.virtual_key.priority;
 }
@@ -1808,9 +1828,7 @@ pub(super) async fn handle_ai_proxy(
                 sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                 "body-aware prompt injection policy blocked request",
             );
-            ctx.ai_outcome = Some("guardrail_block".to_string());
-            ctx.ai_guardrail_category = Some("prompt_injection_v2".to_string());
-            ctx.ai_guardrail_action = Some("block".to_string());
+            mark_guardrail_block(ctx, "prompt_injection_v2".to_string());
             send_response(session, 403, &block.content_type, block.body.as_bytes()).await?;
             return Ok(());
         }
@@ -2302,9 +2320,7 @@ pub(super) async fn handle_ai_proxy(
                         sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                         &reason,
                     );
-                    ctx.ai_outcome = Some("guardrail_block".to_string());
-                    ctx.ai_guardrail_category = Some(name.to_string());
-                    ctx.ai_guardrail_action = Some("block".to_string());
+                    mark_guardrail_block(ctx, name.to_string());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": reason,
@@ -2362,9 +2378,7 @@ pub(super) async fn handle_ai_proxy(
                             sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                             &reason,
                         );
-                        ctx.ai_outcome = Some("guardrail_block".to_string());
-                        ctx.ai_guardrail_category = Some(decision.labels.join(","));
-                        ctx.ai_guardrail_action = Some("block".to_string());
+                        mark_guardrail_block(ctx, decision.labels.join(","));
                         let error_body = serde_json::json!({
                             "error": {
                                 "message": reason,
@@ -2395,9 +2409,7 @@ pub(super) async fn handle_ai_proxy(
                     // WOR-1496: a guardrail block surfaces as a generic
                     // 400, so stamp the precise outcome for the
                     // value-vs-waste metric.
-                    ctx.ai_outcome = Some("guardrail_block".to_string());
-                    ctx.ai_guardrail_category = Some(block.name.clone());
-                    ctx.ai_guardrail_action = Some("block".to_string());
+                    mark_guardrail_block(ctx, block.name.clone());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -2435,9 +2447,7 @@ pub(super) async fn handle_ai_proxy(
                     // WOR-1496: a guardrail block surfaces as a generic
                     // 400, so stamp the precise outcome for the
                     // value-vs-waste metric.
-                    ctx.ai_outcome = Some("guardrail_block".to_string());
-                    ctx.ai_guardrail_category = Some(block.name.clone());
-                    ctx.ai_guardrail_action = Some("block".to_string());
+                    mark_guardrail_block(ctx, block.name.clone());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -2471,9 +2481,7 @@ pub(super) async fn handle_ai_proxy(
                         );
                         // WOR-1496: stamp the precise outcome (the wire
                         // status is a generic 400).
-                        ctx.ai_outcome = Some("guardrail_block".to_string());
-                        ctx.ai_guardrail_category = Some(block.name.clone());
-                        ctx.ai_guardrail_action = Some("block".to_string());
+                        mark_guardrail_block(ctx, block.name.clone());
                         let error_body = serde_json::json!({
                             "error": {
                                 "message": block.reason,
@@ -4619,9 +4627,7 @@ pub(super) async fn relay_ai_response_with_cache(
         // `auth_denied`; stamp the precise outcome so the
         // value-vs-waste metric attributes it correctly.
         if let Some(c) = ctx.as_mut() {
-            c.ai_outcome = Some("guardrail_block".to_string());
-            c.ai_guardrail_category = Some(block.name.clone());
-            c.ai_guardrail_action = Some("block".to_string());
+            mark_guardrail_block(c, block.name.clone());
         }
         // WOR-1093: the upstream already produced (and
         // billed) this 2xx response; an output guardrail
@@ -6018,9 +6024,7 @@ pub(super) async fn relay_ai_stream(
                         // WOR-1874: stamp the guardrail columns for the
                         // access log and admin request ring.
                         if let Some(c) = ctx.as_deref_mut() {
-                            c.ai_outcome = Some("guardrail_block".to_string());
-                            c.ai_guardrail_category = Some(block.name.clone());
-                            c.ai_guardrail_action = Some("block".to_string());
+                            mark_guardrail_block(c, block.name.clone());
                         }
                         output_guard_blocked = true;
                         break 'relay;
@@ -6160,9 +6164,7 @@ pub(super) async fn relay_ai_stream(
                     // WOR-1874: stamp the guardrail columns for the
                     // access log and admin request ring.
                     if let Some(c) = ctx.as_deref_mut() {
-                        c.ai_outcome = Some("guardrail_block".to_string());
-                        c.ai_guardrail_category = Some(block.name.clone());
-                        c.ai_guardrail_action = Some("block".to_string());
+                        mark_guardrail_block(c, block.name.clone());
                     }
                     output_guard_blocked = true;
                     break;
