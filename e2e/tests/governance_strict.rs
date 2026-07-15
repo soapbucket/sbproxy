@@ -51,7 +51,14 @@ impl RedisGuard {
     fn spawn() -> Option<Self> {
         let port = pick_port();
         let child = match Command::new("redis-server")
-            .args(["--port", &port.to_string(), "--save", "", "--appendonly", "no"])
+            .args([
+                "--port",
+                &port.to_string(),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -78,7 +85,10 @@ impl RedisGuard {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("redis-server did not accept connections on port {}", self.port);
+        panic!(
+            "redis-server did not accept connections on port {}",
+            self.port
+        );
     }
 }
 
@@ -176,7 +186,9 @@ fn chat(base_url: &str, token: &str) -> u16 {
 
 fn admin_usage(admin_port: u16, key_id: &str) -> Value {
     client()
-        .get(format!("http://127.0.0.1:{admin_port}/admin/keys/{key_id}/usage"))
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/admin/keys/{key_id}/usage"
+        ))
         .basic_auth("admin", Some("secret"))
         .send()
         .expect("admin usage request")

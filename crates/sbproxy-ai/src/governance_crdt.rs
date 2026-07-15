@@ -39,7 +39,12 @@ pub struct MergedCounters {
 
 impl MergedCounters {
     /// Cluster-summed usage for one (key, revision, window), zero if absent.
-    pub fn merged_usage(&self, key_id: &str, policy_revision: u64, window_start_millis: u64) -> GovernanceUsage {
+    pub fn merged_usage(
+        &self,
+        key_id: &str,
+        policy_revision: u64,
+        window_start_millis: u64,
+    ) -> GovernanceUsage {
         self.sums
             .get(&(key_id.to_string(), policy_revision, window_start_millis))
             .copied()
@@ -48,7 +53,9 @@ impl MergedCounters {
 }
 
 /// Sum the newest contribution from each node into a read-optimized view.
-pub fn merge_contributions(peers: impl IntoIterator<Item = GovernanceContribution>) -> MergedCounters {
+pub fn merge_contributions(
+    peers: impl IntoIterator<Item = GovernanceContribution>,
+) -> MergedCounters {
     let mut newest: HashMap<String, GovernanceContribution> = HashMap::new();
     for c in peers {
         match newest.get(&c.node_id) {
@@ -61,7 +68,9 @@ pub fn merge_contributions(peers: impl IntoIterator<Item = GovernanceContributio
     let mut sums: HashMap<(String, u64, u64), GovernanceUsage> = HashMap::new();
     for c in newest.into_values() {
         for slot in c.slots {
-            let entry = sums.entry((slot.key_id, slot.policy_revision, slot.window_start_millis)).or_default();
+            let entry = sums
+                .entry((slot.key_id, slot.policy_revision, slot.window_start_millis))
+                .or_default();
             entry.requests = entry.requests.saturating_add(slot.usage.requests);
             entry.tokens = entry.tokens.saturating_add(slot.usage.tokens);
             entry.micro_usd = entry.micro_usd.saturating_add(slot.usage.micro_usd);
@@ -80,14 +89,26 @@ mod tests {
             key_id: key.to_string(),
             policy_revision: rev,
             window_start_millis: win,
-            usage: GovernanceUsage { requests: r, tokens: t, micro_usd: c },
+            usage: GovernanceUsage {
+                requests: r,
+                tokens: t,
+                micro_usd: c,
+            },
         }
     }
 
     #[test]
     fn cluster_usage_is_the_sum_of_per_node_slots() {
-        let a = GovernanceContribution { node_id: "a".into(), generation: 1, slots: vec![slot("k1", 7, 60_000, 3, 300, 30)] };
-        let b = GovernanceContribution { node_id: "b".into(), generation: 1, slots: vec![slot("k1", 7, 60_000, 5, 500, 50)] };
+        let a = GovernanceContribution {
+            node_id: "a".into(),
+            generation: 1,
+            slots: vec![slot("k1", 7, 60_000, 3, 300, 30)],
+        };
+        let b = GovernanceContribution {
+            node_id: "b".into(),
+            generation: 1,
+            slots: vec![slot("k1", 7, 60_000, 5, 500, 50)],
+        };
         let merged = merge_contributions([a, b]);
         let u = merged.merged_usage("k1", 7, 60_000);
         assert_eq!(u.requests, 8);
@@ -97,19 +118,31 @@ mod tests {
 
     #[test]
     fn a_later_generation_replaces_an_earlier_one_for_the_same_node() {
-        let old = GovernanceContribution { node_id: "a".into(), generation: 1, slots: vec![slot("k1", 7, 60_000, 9, 0, 0)] };
-        let new = GovernanceContribution { node_id: "a".into(), generation: 2, slots: vec![slot("k1", 7, 60_000, 2, 0, 0)] };
+        let old = GovernanceContribution {
+            node_id: "a".into(),
+            generation: 1,
+            slots: vec![slot("k1", 7, 60_000, 9, 0, 0)],
+        };
+        let new = GovernanceContribution {
+            node_id: "a".into(),
+            generation: 2,
+            slots: vec![slot("k1", 7, 60_000, 2, 0, 0)],
+        };
         let merged = merge_contributions([old, new]);
         assert_eq!(merged.merged_usage("k1", 7, 60_000).requests, 2);
     }
 
     #[test]
     fn slots_from_other_windows_or_revisions_do_not_leak_in() {
-        let a = GovernanceContribution { node_id: "a".into(), generation: 1, slots: vec![
-            slot("k1", 7, 60_000, 4, 0, 0),
-            slot("k1", 7, 120_000, 99, 0, 0),
-            slot("k1", 8, 60_000, 99, 0, 0),
-        ]};
+        let a = GovernanceContribution {
+            node_id: "a".into(),
+            generation: 1,
+            slots: vec![
+                slot("k1", 7, 60_000, 4, 0, 0),
+                slot("k1", 7, 120_000, 99, 0, 0),
+                slot("k1", 8, 60_000, 99, 0, 0),
+            ],
+        };
         let merged = merge_contributions([a]);
         assert_eq!(merged.merged_usage("k1", 7, 60_000).requests, 4);
     }

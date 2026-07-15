@@ -815,7 +815,9 @@ impl GovernanceStore for InMemoryGovernanceStore {
             ),
             total_tokens: CounterSnapshot::new(
                 key.limits.total_tokens,
-                key_state.total_used_tokens.saturating_add(peer.total_tokens),
+                key_state
+                    .total_used_tokens
+                    .saturating_add(peer.total_tokens),
                 key_state.total_reserved_tokens,
                 None,
             ),
@@ -1618,7 +1620,9 @@ mod tests {
 
     #[tokio::test]
     async fn approximate_admission_counts_peer_usage_against_the_limit() {
-        use crate::governance_crdt::{merge_contributions, GovernanceContribution, NodeCounterSlot};
+        use crate::governance_crdt::{
+            merge_contributions, GovernanceContribution, NodeCounterSlot,
+        };
 
         struct FixedClock(u64);
         impl Clock for FixedClock {
@@ -1668,10 +1672,7 @@ mod tests {
             store.reserve(req("r1")).await.is_ok(),
             "9th cluster-wide request (8 peer + 1) fits under 10"
         );
-        assert!(
-            store.reserve(req("r2")).await.is_ok(),
-            "10th fits exactly"
-        );
+        assert!(store.reserve(req("r2")).await.is_ok(), "10th fits exactly");
         let r3 = store.reserve(req("r3")).await;
         assert!(
             matches!(r3, Err(GovernanceError::LimitExceeded(_))),

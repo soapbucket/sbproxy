@@ -1558,7 +1558,11 @@ pub(crate) fn start_governance_dissemination() {
         return;
     }
     let store = approximate_store.expect("checked Some by should_disseminate_governance");
-    cluster_runtime().spawn(crate::governance_cluster::run_loop(handle.clone(), store, 15));
+    cluster_runtime().spawn(crate::governance_cluster::run_loop(
+        handle.clone(),
+        store,
+        15,
+    ));
 }
 
 /// Dissemination runs only for a clustered node in approximate mode.

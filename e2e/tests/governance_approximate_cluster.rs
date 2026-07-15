@@ -387,8 +387,16 @@ fn approximate_cluster_bounds_admission_to_one_dissemination_intervals_slack() {
     // Repeat a couple more times on each node to make sure the bound holds
     // firmly rather than being a one-shot fluke of timing.
     for _ in 0..2 {
-        assert_eq!(chat(&base_b, &token), 429, "node B must stay denied after convergence");
-        assert_eq!(chat(&base_a, &token), 429, "node A must stay denied after convergence");
+        assert_eq!(
+            chat(&base_b, &token),
+            429,
+            "node B must stay denied after convergence"
+        );
+        assert_eq!(
+            chat(&base_a, &token),
+            429,
+            "node A must stay denied after convergence"
+        );
     }
 
     // No denied request should ever have reached the upstream: only the

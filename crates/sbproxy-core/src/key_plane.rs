@@ -392,7 +392,10 @@ fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCa
 /// coherence and the second element is `None`).
 fn build_governance_store(
     cfg: &KeyGovernanceConfig,
-) -> Result<(Arc<dyn GovernanceStore>, Option<Arc<InMemoryGovernanceStore>>)> {
+) -> Result<(
+    Arc<dyn GovernanceStore>,
+    Option<Arc<InMemoryGovernanceStore>>,
+)> {
     cfg.validate()
         .map_err(|error| anyhow::anyhow!("validate key_management.governance: {error}"))?;
     let reservation_ttl_millis = cfg
