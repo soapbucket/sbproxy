@@ -977,6 +977,7 @@ mod tests {
     /// deprecated `MetricFamily::get_*` calls for label inspection
     /// and silence the warning locally; the bridge is well-defined
     /// and stable across the 0.14 line.
+    #[allow(deprecated)]
     fn hooks_drop_total(reason: &str) -> u64 {
         // Read the canonical scrape registry, not the process-global default:
         // `record_channel_drop` registers this counter only on
