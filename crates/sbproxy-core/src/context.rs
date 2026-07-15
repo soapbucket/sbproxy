@@ -810,6 +810,15 @@ pub struct RequestContext {
     /// Every downstream key predicate reads this retained snapshot rather
     /// than resolving mutable key state again.
     pub effective_key_policy: Option<sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
+    /// Accepted ingress governance reservation owned by this request.
+    ///
+    /// Successful response accounting settles it with actual usage. Paths
+    /// that finish without billable provider usage release it explicitly.
+    /// Dropping the request context with an active lease schedules a
+    /// best-effort release, or settlement after usage is armed, so early
+    /// returns and cancelled streams do not hold capacity until backend
+    /// expiry or silently lose billable usage.
+    pub governance_lease: Option<crate::governance_runtime::GovernanceLease>,
     /// Pre-flight rate-limit reservation. Stamped by
     /// `handle_ai_proxy` after the prompt has been parsed and the
     /// tiktoken estimator has run; reconciled on the response side
@@ -1158,6 +1167,7 @@ impl RequestContext {
             ai_inbound_format: None,
             ai_native_bypass: false,
             effective_key_policy: None,
+            governance_lease: None,
             ai_admission: None,
             ai_realtime_session: None,
             ai_realtime_dispatch: None,
@@ -1228,6 +1238,7 @@ mod tests {
         assert!(ctx.response_status.is_none());
         assert!(ctx.rate_limit_info.is_none());
         assert!(ctx.response_body_buf.is_none());
+        assert!(ctx.governance_lease.is_none());
         assert!(ctx.effective_key_policy.is_none());
         assert!(!ctx.buffering_body);
         assert!(ctx.upstream_content_type.is_none());

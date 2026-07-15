@@ -689,9 +689,185 @@ fn default_key_cache_negative_ttl_secs() -> u64 {
 fn default_key_cache_max_entries() -> usize {
     10_000
 }
+fn default_governance_lease_ttl_secs() -> u64 {
+    120
+}
+fn default_governance_terminal_retention_secs() -> u64 {
+    300
+}
+
+/// Consistency guarantee for governed key admission and accounting.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceConsistency {
+    /// Process-local atomic counters. Fast and safe on one gateway, but totals
+    /// across multiple gateways are approximate.
+    #[default]
+    Approximate,
+    /// Cluster-wide atomic reservations backed by Redis scripts.
+    Strict,
+}
+
+/// Shared backend used for strict governed key accounting.
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GovernanceBackendConfig {
+    /// A dedicated Redis connection. This is intentionally explicit and is not
+    /// inherited from the key store or cache configuration.
+    Redis {
+        /// Redis or TLS-enabled Redis connection URL.
+        url: String,
+    },
+}
+
+impl std::fmt::Debug for GovernanceBackendConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Redis { .. } => formatter
+                .debug_struct("Redis")
+                .field("url", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
+/// `key_management.governance:` admission, accounting, and introspection
+/// controls for governed virtual keys.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyGovernanceConfig {
+    /// Accounting consistency. Approximate is the backward-compatible default.
+    pub consistency: GovernanceConsistency,
+    /// Dedicated backend for strict accounting.
+    pub backend: Option<GovernanceBackendConfig>,
+    /// Reservation lease duration. Expired reservations are released when a
+    /// gateway exits before settling or releasing them.
+    pub lease_ttl_secs: u64,
+    /// Retention for settled, released, and expired reservation outcomes.
+    /// Must be at least the lease duration so retries remain idempotent.
+    pub terminal_retention_secs: u64,
+    /// Admit requests when the governance backend is unavailable. The default
+    /// is fail closed. Strict fail-open decisions must be audited by runtime.
+    pub failure_mode_allow: bool,
+    /// Expose the authenticated caller-only `GET /api/v1/key` endpoint.
+    pub key_introspection: bool,
+    /// Require AI requests to resolve to a governed key instead of accepting
+    /// origin credentials or anonymous access.
+    pub require_governed_key: bool,
+}
+
+impl Default for KeyGovernanceConfig {
+    fn default() -> Self {
+        Self {
+            consistency: GovernanceConsistency::Approximate,
+            backend: None,
+            lease_ttl_secs: default_governance_lease_ttl_secs(),
+            terminal_retention_secs: default_governance_terminal_retention_secs(),
+            failure_mode_allow: false,
+            key_introspection: false,
+            require_governed_key: false,
+        }
+    }
+}
+
+/// Validation failure for governed key admission configuration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid key governance configuration: {message}")]
+pub struct KeyGovernanceConfigError {
+    message: String,
+}
+
+impl KeyGovernanceConfigError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl KeyGovernanceConfig {
+    /// Reservation lease duration converted to runtime milliseconds.
+    pub fn lease_ttl_millis(&self) -> Result<u64, KeyGovernanceConfigError> {
+        self.lease_ttl_secs.checked_mul(1_000).ok_or_else(|| {
+            KeyGovernanceConfigError::invalid("lease_ttl_secs overflows milliseconds")
+        })
+    }
+
+    /// Terminal outcome retention converted to runtime milliseconds.
+    pub fn terminal_retention_millis(&self) -> Result<u64, KeyGovernanceConfigError> {
+        self.terminal_retention_secs
+            .checked_mul(1_000)
+            .ok_or_else(|| {
+                KeyGovernanceConfigError::invalid("terminal_retention_secs overflows milliseconds")
+            })
+    }
+
+    /// Validate governance invariants before pipeline construction or reload.
+    pub fn validate(&self) -> Result<(), KeyGovernanceConfigError> {
+        if self.lease_ttl_secs == 0 {
+            return Err(KeyGovernanceConfigError::invalid(
+                "lease_ttl_secs must be positive",
+            ));
+        }
+        if self.terminal_retention_secs == 0 {
+            return Err(KeyGovernanceConfigError::invalid(
+                "terminal_retention_secs must be positive",
+            ));
+        }
+        if self.terminal_retention_secs < self.lease_ttl_secs {
+            return Err(KeyGovernanceConfigError::invalid(
+                "terminal_retention_secs must be at least lease_ttl_secs",
+            ));
+        }
+        self.lease_ttl_millis()?;
+        self.terminal_retention_millis()?;
+
+        match (self.consistency, &self.backend) {
+            (GovernanceConsistency::Approximate, Some(_)) => {
+                return Err(KeyGovernanceConfigError::invalid(
+                    "redis governance backend requires strict consistency",
+                ));
+            }
+            (GovernanceConsistency::Strict, None) => {
+                return Err(KeyGovernanceConfigError::invalid(
+                    "strict governance requires an explicit redis backend",
+                ));
+            }
+            (GovernanceConsistency::Approximate, None)
+            | (GovernanceConsistency::Strict, Some(_)) => {}
+        }
+
+        if let Some(GovernanceBackendConfig::Redis { url }) = &self.backend {
+            if !url.starts_with("redis://") && !url.starts_with("rediss://") {
+                return Err(KeyGovernanceConfigError::invalid(
+                    "redis backend URL must start with redis:// or rediss://",
+                ));
+            }
+            let authority = url
+                .split_once("://")
+                .map(|(_, authority)| authority)
+                .unwrap_or_default()
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            if host.is_empty() || host.starts_with(':') {
+                return Err(KeyGovernanceConfigError::invalid(
+                    "redis backend URL must include a host",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
 
 /// Top-level `key_management:` block: the runtime key plane (mutable store,
-/// policy cache, at-rest crypto, OIDC claim map, declarative seed).
+/// policy cache, governance, at-rest crypto, OIDC claim map, declarative seed).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KeyManagementConfig {
     /// Turn the dynamic key plane on. When false (default), inbound auth keeps
@@ -704,6 +880,9 @@ pub struct KeyManagementConfig {
     /// In-memory policy cache in front of the store.
     #[serde(default)]
     pub cache: KeyCacheConfig,
+    /// Governed key admission, accounting, and authenticated introspection.
+    #[serde(default)]
+    pub governance: KeyGovernanceConfig,
     /// At-rest crypto material.
     #[serde(default)]
     pub crypto: KeyCryptoConfig,

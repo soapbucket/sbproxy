@@ -7,6 +7,7 @@
 //! GET    /admin/keys                      list keys (no secrets)
 //! GET    /admin/keys/policy-schema        fetch the server-driven policy contract
 //! GET    /admin/keys/{id}                 fetch one key
+//! GET    /admin/keys/{id}/usage           fetch governed usage and backend health
 //! POST   /admin/keys/{id}/effective-policy/preview
 //!                                            evaluate policy without dispatch or reserve
 //! PATCH  /admin/keys/{id}                 update policy/attribution
@@ -35,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::key_plane::{block_on_keystore, current_key_plane, KeyPlane};
+use sbproxy_ai::governance::{GovernanceError, GovernanceLimits, SnapshotKey};
 use sbproxy_keystore::record::{
     CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordStatus,
 };
@@ -98,6 +100,7 @@ fn key_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
                 method_not_allowed()
             }
         }
+        Some("usage") if method.eq_ignore_ascii_case("GET") => get_key_usage(id),
         Some("effective-policy/preview") if method.eq_ignore_ascii_case("POST") => {
             preview_effective_key_policy(id, body)
         }
@@ -1041,6 +1044,63 @@ fn preview_counter(limit: Option<u64>, current: u64, requested: u64) -> PreviewC
     }
 }
 
+fn get_key_usage(id: &str) -> Resp {
+    let plane = match plane_or_err() {
+        Ok(plane) => plane,
+        Err(response) => return response,
+    };
+    let record = match load_key(&plane, id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return not_found("key not found"),
+        Err(error) => return internal_error(&error),
+    };
+    let limits = match governance_limits(&record) {
+        Ok(limits) => limits,
+        Err(error) => return internal_error(error),
+    };
+    let snapshot_key = SnapshotKey {
+        key_id: record.key_id,
+        policy_revision: record.policy_revision,
+        limits,
+    };
+    let store = plane.governance_store();
+    match block_on_keystore(async move { store.snapshot(snapshot_key).await }) {
+        Ok(snapshot) => ok(json!({ "usage": snapshot })),
+        Err(GovernanceError::BackendUnavailable { .. }) => governance_backend_unavailable(),
+        Err(error) => internal_error(&format!("governance snapshot: {error}")),
+    }
+}
+
+fn governance_limits(record: &KeyRecord) -> Result<GovernanceLimits, &'static str> {
+    let total_micro_usd = record
+        .budget
+        .as_ref()
+        .and_then(|budget| budget.max_cost_usd)
+        .map(usd_to_micro_usd)
+        .transpose()?;
+
+    Ok(GovernanceLimits {
+        requests_per_window: record.max_requests_per_minute,
+        tokens_per_window: record.max_tokens_per_minute,
+        total_tokens: record.budget.as_ref().and_then(|budget| budget.max_tokens),
+        total_micro_usd,
+        window_millis: 60_000,
+    })
+}
+
+fn usd_to_micro_usd(value: f64) -> Result<u64, &'static str> {
+    const MICRO_USD_PER_USD: f64 = 1_000_000.0;
+
+    if !value.is_finite() || value < 0.0 {
+        return Err("stored max_budget_usd is not a finite non-negative number");
+    }
+    let rounded = (value * MICRO_USD_PER_USD).round();
+    if !rounded.is_finite() || rounded < 0.0 || rounded >= u64::MAX as f64 {
+        return Err("stored max_budget_usd cannot be represented as integer micro-USD");
+    }
+    Ok(rounded as u64)
+}
+
 fn update_key(id: &str, body: Option<&str>) -> Resp {
     let plane = match plane_or_err() {
         Ok(p) => p,
@@ -1672,6 +1732,14 @@ fn method_not_allowed() -> Resp {
     )
 }
 
+fn governance_backend_unavailable() -> Resp {
+    (
+        503,
+        "application/json",
+        r#"{"error":"governance backend unavailable"}"#.to_string(),
+    )
+}
+
 fn internal_error(msg: &str) -> Resp {
     tracing::warn!(error = %msg, "admin key API: internal error");
     (
@@ -1684,8 +1752,133 @@ fn internal_error(msg: &str) -> Resp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
+    use sbproxy_ai::governance::{
+        CounterSnapshot, GovernanceBackendHealth, GovernanceBackendStatus, GovernanceConsistency,
+        GovernanceError, GovernanceSnapshot, GovernanceStore, Release, ReleaseRequest, Reservation,
+        ReserveRequest, SettleRequest, Settlement, SnapshotKey,
+    };
     use sbproxy_keystore::crypto::KeyCrypto;
     use sbproxy_keystore::{KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig};
+
+    struct RecordingGovernanceStore {
+        snapshots: Mutex<Vec<SnapshotKey>>,
+        unavailable: bool,
+    }
+
+    impl RecordingGovernanceStore {
+        fn healthy() -> Self {
+            Self {
+                snapshots: Mutex::new(Vec::new()),
+                unavailable: false,
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                snapshots: Mutex::new(Vec::new()),
+                unavailable: true,
+            }
+        }
+
+        fn snapshot_requests(&self) -> Vec<SnapshotKey> {
+            self.snapshots.lock().clone()
+        }
+
+        fn backend_health(&self) -> GovernanceBackendHealth {
+            GovernanceBackendHealth {
+                backend: "redis".to_string(),
+                consistency: GovernanceConsistency::Strict,
+                status: if self.unavailable {
+                    GovernanceBackendStatus::Unavailable
+                } else {
+                    GovernanceBackendStatus::Healthy
+                },
+                checked_at_millis: 1_700_000_000_000,
+            }
+        }
+    }
+
+    fn counter(
+        limit: Option<u64>,
+        used: u64,
+        reserved: u64,
+        reset_at_millis: Option<u64>,
+    ) -> CounterSnapshot {
+        CounterSnapshot {
+            limit,
+            used,
+            reserved,
+            remaining: limit.map(|value| value.saturating_sub(used.saturating_add(reserved))),
+            reset_at_millis,
+        }
+    }
+
+    #[async_trait]
+    impl GovernanceStore for RecordingGovernanceStore {
+        async fn reserve(&self, _request: ReserveRequest) -> Result<Reservation, GovernanceError> {
+            Err(GovernanceError::BackendUnavailable { backend: "redis" })
+        }
+
+        async fn settle(&self, _request: SettleRequest) -> Result<Settlement, GovernanceError> {
+            Err(GovernanceError::BackendUnavailable { backend: "redis" })
+        }
+
+        async fn release(&self, _request: ReleaseRequest) -> Result<Release, GovernanceError> {
+            Err(GovernanceError::BackendUnavailable { backend: "redis" })
+        }
+
+        async fn snapshot(&self, key: SnapshotKey) -> Result<GovernanceSnapshot, GovernanceError> {
+            self.snapshots.lock().push(key.clone());
+            if self.unavailable {
+                return Err(GovernanceError::BackendUnavailable { backend: "redis" });
+            }
+
+            Ok(GovernanceSnapshot {
+                key_id: key.key_id,
+                policy_revision: key.policy_revision,
+                requests_per_window: counter(
+                    key.limits.requests_per_window,
+                    2,
+                    1,
+                    Some(1_700_000_040_000),
+                ),
+                tokens_per_window: counter(
+                    key.limits.tokens_per_window,
+                    100,
+                    20,
+                    Some(1_700_000_040_000),
+                ),
+                total_tokens: counter(key.limits.total_tokens, 200, 40, None),
+                total_micro_usd: counter(key.limits.total_micro_usd, 3_000_000, 500_000, None),
+                backend: self.backend_health(),
+            })
+        }
+
+        async fn health(&self) -> GovernanceBackendHealth {
+            self.backend_health()
+        }
+    }
+
+    fn install_test_plane_with_governance(
+        store: Arc<MemoryKeyStore>,
+        governance_store: Arc<dyn GovernanceStore>,
+    ) {
+        let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+        let store: Arc<dyn KeyStore> = store;
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let plane = Arc::new(crate::key_plane::KeyPlane::from_parts_with_governance(
+            crypto,
+            cache,
+            false,
+            false,
+            None,
+            sbproxy_config::KeyGovernanceConfig::default(),
+            governance_store,
+        ));
+        crate::key_plane::install_key_plane(plane);
+    }
 
     fn install_test_plane_with_store(store: Arc<MemoryKeyStore>) {
         let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
@@ -2596,4 +2789,158 @@ mod tests {
         assert_eq!(dispatch("GET", &path, None).unwrap().0, 405);
     }
 
+    #[test]
+    fn key_usage_returns_integer_limits_counters_and_safe_backend_health() {
+        let _g = crate::key_plane::test_plane_guard();
+        let key_store = Arc::new(MemoryKeyStore::new());
+        let governance = Arc::new(RecordingGovernanceStore::healthy());
+        install_test_plane_with_governance(key_store, governance.clone());
+
+        let created = dispatch(
+            "POST",
+            "/admin/keys",
+            Some(
+                r#"{"name":"must-not-appear","max_requests_per_minute":60,
+                    "max_tokens_per_minute":50000,"max_budget_tokens":1000000,
+                    "max_budget_usd":25.1234564,
+                    "metadata":{"redis_url":"redis://operator:top-secret@redis.internal",
+                    "node_id":"node-secret","artifact":"artifact-secret"}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(created.0, 201, "create failed: {}", created.2);
+        let created_json = parse(&created);
+        let key_id = created_json["key"]["key_id"].as_str().unwrap().to_string();
+        let token = created_json["token"].as_str().unwrap().to_string();
+
+        let response = dispatch("GET", &format!("/admin/keys/{key_id}/usage"), None).unwrap();
+        assert_eq!(response.0, 200, "usage failed: {}", response.2);
+        let usage = &parse(&response)["usage"];
+        assert_eq!(usage["key_id"], key_id);
+        assert_eq!(usage["policy_revision"], 1);
+        assert_eq!(
+            usage["requests_per_window"],
+            json!({
+                "limit": 60,
+                "used": 2,
+                "reserved": 1,
+                "remaining": 57,
+                "reset_at_millis": 1_700_000_040_000_u64,
+            })
+        );
+        assert_eq!(usage["tokens_per_window"]["limit"], 50_000);
+        assert_eq!(usage["tokens_per_window"]["used"], 100);
+        assert_eq!(usage["tokens_per_window"]["reserved"], 20);
+        assert_eq!(usage["tokens_per_window"]["remaining"], 49_880);
+        assert_eq!(usage["total_tokens"]["limit"], 1_000_000);
+        assert_eq!(usage["total_tokens"]["reset_at_millis"], json!(null));
+        assert_eq!(usage["total_micro_usd"]["limit"], 25_123_456);
+        assert_eq!(usage["total_micro_usd"]["used"], 3_000_000);
+        assert_eq!(usage["total_micro_usd"]["reserved"], 500_000);
+        assert_eq!(usage["total_micro_usd"]["remaining"], 21_623_456);
+        assert_eq!(usage["backend"]["backend"], "redis");
+        assert_eq!(usage["backend"]["consistency"], "strict");
+        assert_eq!(usage["backend"]["status"], "healthy");
+        assert_eq!(usage["backend"]["checked_at_millis"], 1_700_000_000_000_u64);
+
+        let snapshots = governance.snapshot_requests();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].key_id, key_id);
+        assert_eq!(snapshots[0].policy_revision, 1);
+        assert_eq!(snapshots[0].limits.window_millis, 60_000);
+        assert_eq!(snapshots[0].limits.total_micro_usd, Some(25_123_456));
+
+        for forbidden in [
+            token.as_str(),
+            "must-not-appear",
+            "top-secret",
+            "redis.internal",
+            "node-secret",
+            "artifact-secret",
+            "secret_hash",
+        ] {
+            assert!(
+                !response.2.contains(forbidden),
+                "usage response leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_usage_returns_not_found_without_calling_governance_storage() {
+        let _g = crate::key_plane::test_plane_guard();
+        let key_store = Arc::new(MemoryKeyStore::new());
+        let governance = Arc::new(RecordingGovernanceStore::unavailable());
+        install_test_plane_with_governance(key_store, governance.clone());
+
+        let missing = dispatch("GET", "/admin/keys/missing/usage", None).unwrap();
+        assert_eq!(missing.0, 404);
+        assert_eq!(parse(&missing), json!({ "error": "key not found" }));
+        assert!(governance.snapshot_requests().is_empty());
+    }
+
+    #[test]
+    fn key_usage_returns_generic_secret_free_service_unavailable_for_backend_errors() {
+        let _g = crate::key_plane::test_plane_guard();
+        let key_store = Arc::new(MemoryKeyStore::new());
+        let governance = Arc::new(RecordingGovernanceStore::unavailable());
+        install_test_plane_with_governance(key_store, governance.clone());
+
+        let created = dispatch(
+            "POST",
+            "/admin/keys",
+            Some(r#"{"name":"unavailable-key","max_requests_per_minute":5}"#),
+        )
+        .unwrap();
+        let key_id = parse(&created)["key"]["key_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = dispatch("GET", &format!("/admin/keys/{key_id}/usage"), None).unwrap();
+        assert_eq!(response.0, 503);
+        assert_eq!(
+            parse(&response),
+            json!({ "error": "governance backend unavailable" })
+        );
+        for forbidden in ["redis", "unavailable-key", &key_id] {
+            assert!(
+                !response.2.contains(forbidden),
+                "backend error leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_usage_rejects_malformed_legacy_monetary_limits_before_snapshot() {
+        let _g = crate::key_plane::test_plane_guard();
+        let key_store = Arc::new(MemoryKeyStore::new());
+        let governance = Arc::new(RecordingGovernanceStore::healthy());
+        install_test_plane_with_governance(key_store.clone(), governance.clone());
+
+        for (index, value) in [-1.0, f64::NAN, f64::INFINITY, f64::MAX]
+            .into_iter()
+            .enumerate()
+        {
+            let key_id = format!("legacy-{index}");
+            let mut record =
+                KeyRecord::new(key_id.clone(), "hash-must-not-leak".to_string(), Utc::now());
+            record.budget = Some(RecordBudget {
+                max_tokens: Some(100),
+                max_cost_usd: Some(value),
+            });
+            let store = key_store.clone();
+            block_on_keystore(async move { store.put_key(record).await }).unwrap();
+
+            let response = dispatch("GET", &format!("/admin/keys/{key_id}/usage"), None).unwrap();
+            assert_eq!(response.0, 500, "value {value:?}: {}", response.2);
+            assert_eq!(parse(&response), json!({ "error": "internal error" }));
+            assert!(!response.2.contains("hash-must-not-leak"));
+            assert!(!response.2.contains(&key_id));
+        }
+
+        assert!(
+            governance.snapshot_requests().is_empty(),
+            "malformed monetary policies must not reach governance storage"
+        );
+    }
 }
