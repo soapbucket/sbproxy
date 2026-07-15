@@ -77,6 +77,8 @@ impl KeyPlane {
     /// Pass `None` for strict (Redis) governance or when `governance_store`
     /// is not actually an `InMemoryGovernanceStore` (for example, a test
     /// double).
+    // Wide by design: the key plane wires several independent subsystems in one place.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts_with_governance(
         crypto: KeyCrypto,
         cache: Arc<TtlCache>,
@@ -390,6 +392,9 @@ fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCa
 /// (WOR-1835: needed to spawn cross-node counter dissemination, which applies
 /// solely to the approximate tier; strict/Redis governance owns its own
 /// coherence and the second element is `None`).
+// The trait-object store plus, in approximate mode, the concrete store used to
+// spawn dissemination; the tuple is documented above.
+#[allow(clippy::type_complexity)]
 fn build_governance_store(
     cfg: &KeyGovernanceConfig,
 ) -> Result<(

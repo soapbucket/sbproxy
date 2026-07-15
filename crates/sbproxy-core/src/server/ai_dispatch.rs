@@ -6639,7 +6639,7 @@ pub(super) async fn relay_ai_stream(
                 // responses settle their governance reservation with
                 // actual usage here. Best-effort on error (the lease's
                 // `Drop` repairs a failed settle).
-                if let Some(c) = ctx.as_deref_mut() {
+                if let Some(c) = ctx.as_mut() {
                     if let Some(mut lease) = c.governance_lease.take() {
                         let _ = lease.settle(prompt + completion, cost_micros).await;
                     }
