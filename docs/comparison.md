@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-14*
 
 SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
@@ -52,15 +52,18 @@ self-hosted binary, with no vendor control plane.
 - **One policy over everything.** A single sandboxed CEL expression reads the
   principal, model, guardrail verdicts, and budget state and returns a closed
   action set (allow, deny, redact, route, downgrade). See [ai-policy-cel.md](ai-policy-cel.md).
-- **Clustered with no external control plane.** Replicas form a gossip mesh and
-  the key plane stays coherent across it: mint a key on one replica, use it on
-  any, revoke it on one and the others deny on their next request. Membership, a
-  consistent-hash distributed cache for that key plane, fleet metrics, and a live
-  directory of which models are resident on which node all ride the mesh, open
-  source in this repository, with no Postgres and no vendor control plane. Cluster
-  wide budget and rate enforcement is the exception: it uses a shared backend
-  today, Redis or a secrets manager. See the clustering section of
-  [key-management.md](key-management.md) and
+- **Clustered without an external Redis.** Run a fleet and the key plane stays
+  coherent: mint on one replica, use on any, revoke on one and the others deny
+  on their next request. A gossip mesh with a consistent-hash distributed
+  cache does the coordination, all open source in this repository, backed by
+  a durable shared store, Redis or a secrets manager. Budgets and rate limits
+  ride the same open-source mesh by default: each node disseminates its own
+  settled usage and merges every peer's in, so a governed key's limits are
+  cluster-aware within a bounded staleness window, no external database
+  required. That default tier is approximate, not exact; point a key's
+  governance at Redis for the strict tier when a limit has to be exact under
+  concurrent traffic, and the fleet needs no vendor control plane either way.
+  See the clustering section of [key-management.md](key-management.md) and
   [examples/ai-dynamic-keys-cluster/](../examples/ai-dynamic-keys-cluster/).
 - **Cost and latency stay on-box.** The semantic cache vectorizes prompts on a
   local embedder, so a near-duplicate prompt replays with no per-call cost and

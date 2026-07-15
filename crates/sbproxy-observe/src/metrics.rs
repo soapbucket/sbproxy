@@ -1366,6 +1366,33 @@ pub fn record_object_authz_violation(origin: &str, kind: &'static str) {
         .inc();
 }
 
+/// Count a governed key admission that bypassed reservation because the
+/// governance backend was unavailable and
+/// `key_management.governance.failure_mode` is `allow_unreserved` (WOR-1835).
+///
+/// Exposed on `sbproxy_governance_fail_open_total{key_id}` so an operator
+/// watching a degraded governance backend can see how many requests it let
+/// through unreserved. Every increment here is paired with a
+/// `security_audit` event on the same request (see
+/// `sbproxy_core::server::ai_dispatch`), since a governed limit silently
+/// stopped being enforced. `key_id` is the immutable, non-secret governed
+/// key identifier and is run through the cardinality limiter.
+pub fn record_governance_fail_open(key_id: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_governance_fail_open_total",
+            "Governed key admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved",
+            &["key_id"],
+        )
+        .expect("governance fail-open counter registers")
+    });
+    let key_id_san = sanitize_label("key_id", key_id);
+    counter.with_label_values(&[key_id_san.as_str()]).inc();
+}
+
 /// Record drop counters returned by the capture helpers.
 /// `dimension` is `"property"`, `"session"`, or `"user"`; `reason`
 /// is one of the closed strings each helper exposes (e.g. `count`,

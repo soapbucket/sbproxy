@@ -1517,6 +1517,68 @@ fn start_cluster_metrics(handle: &ClusterHandle) {
     cluster_runtime().spawn(crate::cluster_metrics::run_loop(handle.clone(), 15));
 }
 
+/// Start the cross-node governance-counter dissemination loop, once, for a
+/// clustered node running the in-memory (approximate) governance store.
+///
+/// This is deliberately not part of `start_cluster_metrics`. That function
+/// runs from `reconcile_process_cluster`, which `server::lifecycle` calls
+/// *before* `key_plane::init_key_plane` installs the approximate store, on
+/// both the boot path (`server::lifecycle::run`) and the config-reload path
+/// (`server::lifecycle::reload_from_config_yaml`). A governance check made
+/// inside `start_cluster_metrics` would always observe `current_key_plane()`
+/// as not-yet-updated for this cycle and never spawn. Instead,
+/// `server::lifecycle` calls this function itself, immediately after
+/// `init_key_plane` returns on both paths, once both the process cluster
+/// handle and the key plane are guaranteed installed.
+///
+/// Idempotent: guarded by its own atomic, separate from
+/// `start_cluster_metrics`'s `STARTED` gate, so it does not consume that
+/// gate's one-shot attempt. If the predicate is not satisfied yet (for
+/// example clustering came up before approximate governance was
+/// configured), the gate stays open so a later reload that does satisfy it
+/// can still start the loop; once started, it never spawns a second time.
+pub(crate) fn start_governance_dissemination() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(handle) = current_cluster_handle() else {
+        return;
+    };
+    let clustered = handle.mesh_node().is_some();
+    let approximate_store =
+        crate::key_plane::current_key_plane().and_then(|plane| plane.approximate_store());
+    if !should_disseminate_governance(clustered, approximate_store.is_some()) {
+        return;
+    }
+    if STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let store = approximate_store.expect("checked Some by should_disseminate_governance");
+    cluster_runtime().spawn(crate::governance_cluster::run_loop(
+        handle.clone(),
+        store,
+        15,
+    ));
+}
+
+/// Dissemination runs only for a clustered node in approximate mode.
+///
+/// `clustered` is true once this node has an active mesh node (the same
+/// gate `start_cluster_metrics` uses); `approximate_store_present` is true
+/// only when the installed key plane holds a concrete in-memory governance
+/// store (approximate consistency). Strict (Redis) governance owns its own
+/// cross-node coherence and must never get a dissemination loop.
+pub(crate) fn should_disseminate_governance(
+    clustered: bool,
+    approximate_store_present: bool,
+) -> bool {
+    clustered && approximate_store_present
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1617,5 +1679,13 @@ cluster:
         for secret in ["certificate-secret", "private-key-secret", "ca-secret"] {
             assert!(!debug.contains(secret));
         }
+    }
+
+    #[test]
+    fn should_disseminate_governance_requires_both_clustered_and_approximate() {
+        assert!(should_disseminate_governance(true, true));
+        assert!(!should_disseminate_governance(false, true));
+        assert!(!should_disseminate_governance(true, false));
+        assert!(!should_disseminate_governance(false, false));
     }
 }

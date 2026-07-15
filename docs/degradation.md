@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-14*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -17,7 +17,8 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 |---|---|---|---|---|
 | Upstream target (`proxy` or `load_balancer`) | Connection error / timeout | Active health checks + outlier detection + circuit breaker eject the target. Retries pick the next healthy peer. With every target ejected, the LB falls back to the unfiltered list rather than 502'ing the client. | Auto on next probe success / breaker recovery window | `sbproxy_requests_total{status}`, `sbproxy_origin_requests_total{origin,method,status}` |
 | AI provider (OpenAI, Anthropic, OpenRouter, ...) | 5xx, timeout, rate-limit | Routing strategy picks the next provider in the chain (`fallback_chain` / `cost_optimized`). All-providers-failed returns 502. | Auto on next successful request | `sbproxy_ai_failovers_total`, `sbproxy_ai_provider_errors_total` |
-| Redis (`proxy.l2_cache_settings`) | Connection / command failure | Per-origin in-memory cache and per-process rate-limit counters take over. Cross-replica state is suspended until reconnect. | Auto-reconnect with exponential backoff | None dedicated; the L2 cache path logs connection and command errors |
+| Redis (`proxy.l2_cache_settings`) | Connection / command failure | Per-origin in-memory cache and per-process rate-limit counters take over. Cross-replica state is suspended until reconnect. This is the general request-level rate limiter; it is separate from governed AI key budgets, below. | Auto-reconnect with exponential backoff | None dedicated; the L2 cache path logs connection and command errors |
+| Governed-key budget backend (`key_management.governance.backend`, strict tier only) | Connection / command failure | Only affects keys governed under `consistency: strict`. The default `approximate` tier does not depend on this backend at all; its per-node counters keep disseminating over the cluster mesh. For a strict key, a reserve call that cannot reach the backend denies the request (`503`) by default (`failure_mode: closed`); `failure_mode: allow_unreserved` admits it instead without a reservation. A settle call on an already-admitted request is unaffected by `failure_mode` and stays best-effort. | Auto-reconnect; enforcement resumes on the next successful call | `sbproxy_governance_fail_open_total{key_id}` on `allow_unreserved`; also logged at WARN (fail-open/fail-closed) or DEBUG (other reserve/settle errors) |
 | ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
 | Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None dedicated; resolver failures are logged at WARN |
 | Vault / secrets backend (`proxy.secrets`) | Fetch fails | Secrets resolved at config-load are cached and reused. New rotation calls fail loudly. | Auto-reconnect, re-fetch on recover | `sbproxy_vault_resolution_total{backend,result}` |
@@ -126,6 +127,30 @@ proxy:
     driver: redis
     params:
       dsn: redis://redis.internal:6379/0
+```
+
+---
+
+### Governed-key budget backend (strict tier)
+
+**When down:** the dedicated Redis connection configured under `key_management.governance.backend` fails to connect, or a reserve, settle, or release script call errors.
+
+**Fallback:** this only affects keys governed under `consistency: strict`. The `approximate` tier (the default) never talks to this backend; its per-node counters keep disseminating over the cluster mesh instead, bounded by a staleness window rather than an outage. See [Governed admission: strict and approximate](key-management.md#governed-admission-strict-and-approximate) for both tiers. For a strict key, `key_management.governance.failure_mode` decides what a reserve call does when it cannot reach the backend: the default `closed` denies the request with `503` rather than let the governed limit go unenforced; `allow_unreserved` admits it instead without a reservation, and that decision is always recorded on the `security_audit` channel. A settle call that cannot reach the backend after a reservation already succeeded is unaffected by `failure_mode`; it stays best-effort, and the reservation's own drop-time repair reconciles it later.
+
+**Log level:** `WARN` per fail-open or fail-closed decision on a reserve call; `DEBUG` for other reserve/settle errors.
+
+**Alert:** off by default. `sbproxy_governance_fail_open_total{key_id}` counts fail-open admissions when `failure_mode: allow_unreserved` is set.
+
+**Config:**
+```yaml
+proxy:
+  key_management:
+    governance:
+      consistency: strict
+      backend:
+        type: redis
+        url: rediss://governance.internal:6379/2
+      failure_mode: closed        # closed | allow_unreserved
 ```
 
 ---

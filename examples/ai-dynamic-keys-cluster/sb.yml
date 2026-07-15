@@ -60,6 +60,15 @@ proxy:
       pepper: env:SBPROXY_KEY_PEPPER
       master_key: env:SBPROXY_KEY_MASTER
     failure_mode_allow: false
+    # Governed-key budgets across the fleet. Approximate mode disseminates each
+    # replica's settled usage over the mesh and merges peers back in, so a key's
+    # limit is cluster-aware without an external database. The governance store
+    # fails closed if it cannot serve a reservation. For exact cluster-wide
+    # limits, set consistency: strict and add a redis backend block instead.
+    governance:
+      consistency: approximate
+      failure_mode: closed
+      missing_rate: zero_cost
 
 origins:
   "ai.localhost":

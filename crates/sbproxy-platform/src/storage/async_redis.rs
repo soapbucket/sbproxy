@@ -11,12 +11,12 @@
 //! closes: rate-limit throughput was 98 rps on the sync bridge,
 //! projected to 5-10k rps on the async client.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
+use redis::{aio::MultiplexedConnection, AsyncCommands, Client, ErrorKind};
 use tokio::sync::Mutex;
 
 use super::async_kv::AsyncKVStore;
@@ -45,6 +45,7 @@ impl AsyncRedisConfig {
 pub struct AsyncRedisKVStore {
     config: AsyncRedisConfig,
     conn: Mutex<Option<MultiplexedConnection>>,
+    script_hashes: Mutex<HashMap<String, String>>,
 }
 
 impl AsyncRedisKVStore {
@@ -53,6 +54,7 @@ impl AsyncRedisKVStore {
         Arc::new(Self {
             config,
             conn: Mutex::new(None),
+            script_hashes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -84,6 +86,79 @@ impl AsyncRedisKVStore {
         }
         *guard = Some(c.clone());
         Ok(c)
+    }
+
+    /// Execute a Lua script through `EVALSHA`, loading or reloading it as needed.
+    ///
+    /// Script source is cached with the SHA returned by Redis. A missing cache
+    /// entry is loaded before execution. If Redis loses its script cache after
+    /// a restart or `SCRIPT FLUSH`, a `NOSCRIPT` response reloads the source and
+    /// retries `EVALSHA` once. Results must be a flat array of string-compatible
+    /// values so this seam does not expose Redis crate types to callers.
+    pub async fn evalsha_with_reload(
+        &self,
+        script_source: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<Vec<String>> {
+        let cached_hash = {
+            let hashes = self.script_hashes.lock().await;
+            hashes.get(script_source).cloned()
+        };
+        let script_hash = match cached_hash {
+            Some(value) => value,
+            None => self.load_script(script_source).await?,
+        };
+
+        match self.evalsha(&script_hash, keys, args).await {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind() == ErrorKind::NoScriptError => {
+                let reloaded_hash = self.load_script(script_source).await?;
+                self.evalsha(&reloaded_hash, keys, args)
+                    .await
+                    .context("redis EVALSHA failed after NOSCRIPT reload")
+            }
+            Err(error) => Err(error).context("redis EVALSHA failed"),
+        }
+    }
+
+    async fn load_script(&self, script_source: &str) -> Result<String> {
+        let mut connection = self.conn().await?;
+        let script_hash: String = redis::cmd("SCRIPT")
+            .arg("LOAD")
+            .arg(script_source)
+            .query_async(&mut connection)
+            .await
+            .context("redis SCRIPT LOAD failed")?;
+        self.script_hashes
+            .lock()
+            .await
+            .insert(script_source.to_string(), script_hash.clone());
+        Ok(script_hash)
+    }
+
+    async fn evalsha(
+        &self,
+        script_hash: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> redis::RedisResult<Vec<String>> {
+        let mut connection = self.conn().await.map_err(|error| {
+            redis::RedisError::from((
+                ErrorKind::IoError,
+                "opening multiplexed Redis connection",
+                error.to_string(),
+            ))
+        })?;
+        let mut command = redis::cmd("EVALSHA");
+        command.arg(script_hash).arg(keys.len());
+        for key in keys {
+            command.arg(key);
+        }
+        for arg in args {
+            command.arg(arg);
+        }
+        command.query_async(&mut connection).await
     }
 }
 
@@ -186,5 +261,42 @@ mod tests {
         assert_eq!(n2, n1 + 1);
         store.delete(kb).await.unwrap();
         store.delete(b"cnt-test").await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live redis; set REDIS_URL env"]
+    async fn script_uses_evalsha_and_loads_after_noscript() {
+        let url = std::env::var("REDIS_URL").expect("REDIS_URL must name a disposable Redis");
+        let store = AsyncRedisKVStore::new(AsyncRedisConfig::new(&url));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let script = format!("-- unique {nonce}\nreturn {{ARGV[1], tostring(#KEYS)}}");
+        let keys = vec!["script-test-key".to_string()];
+        let args = vec!["loaded".to_string()];
+
+        let first = store
+            .evalsha_with_reload(&script, &keys, &args)
+            .await
+            .unwrap();
+        let mut conn = store.conn().await.unwrap();
+        let _: () = redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let reloaded = store
+            .evalsha_with_reload(&script, &keys, &args)
+            .await
+            .unwrap();
+        let cached = store
+            .evalsha_with_reload(&script, &keys, &args)
+            .await
+            .unwrap();
+
+        assert_eq!(first, vec!["loaded".to_string(), "1".to_string()]);
+        assert_eq!(reloaded, first);
+        assert_eq!(cached, first);
     }
 }

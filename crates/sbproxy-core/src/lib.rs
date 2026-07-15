@@ -58,6 +58,11 @@ pub mod context;
 pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.
 pub mod doctor;
+/// WOR-1835: disseminate + merge approximate governance counters over the
+/// mesh, so cross-node key budgets work without an external database.
+pub mod governance_cluster;
+/// Drop-safe ownership for accepted governance reservations.
+pub mod governance_runtime;
 pub mod hook_registry;
 pub mod hooks;
 pub mod identity;

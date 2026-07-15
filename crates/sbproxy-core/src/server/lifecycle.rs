@@ -307,6 +307,12 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
         }
     }
 
+    // WOR-1835: same reasoning as the boot path above - retry starting
+    // governance dissemination now that this reload's key plane is
+    // installed. A no-op once the loop is already running, and a no-op
+    // until both clustering and approximate governance are configured.
+    crate::cluster::start_governance_dissemination();
+
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
@@ -793,6 +799,15 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             tracing::error!(error = %e, "failed to install dynamic key plane");
         }
     }
+
+    // WOR-1835: start cross-node governance-counter dissemination now that
+    // both the process cluster handle (reconciled above) and the key plane
+    // (installed just above, when configured) are in place. This cannot run
+    // any earlier: `reconcile_process_cluster` starts cluster metrics before
+    // the key plane exists, so a check made there would never see the
+    // approximate governance store. See `cluster::start_governance_dissemination`
+    // for the idempotency contract.
+    crate::cluster::start_governance_dissemination();
 
     // --- WOR-1186: register the session-ledger sink when enabled ---
     //

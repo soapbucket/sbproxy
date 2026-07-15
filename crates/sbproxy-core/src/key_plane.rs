@@ -17,8 +17,14 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
+use sbproxy_ai::governance::{
+    GovernanceBackendHealth, GovernanceConsistency as RuntimeGovernanceConsistency,
+    GovernanceStore, InMemoryGovernanceConfig, InMemoryGovernanceStore,
+};
+use sbproxy_ai::governance_redis::{RedisGovernanceConfig, RedisGovernanceStore};
 use sbproxy_config::types::{
-    KeyCacheTier, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig, SeedKeyConfig,
+    GovernanceBackendConfig, GovernanceConsistency as ConfigGovernanceConsistency, KeyCacheTier,
+    KeyGovernanceConfig, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig, SeedKeyConfig,
 };
 use sbproxy_keystore::crypto::KeyCrypto;
 use sbproxy_keystore::record::{
@@ -33,11 +39,14 @@ pub struct KeyPlane {
     failure_mode_allow: bool,
     allow_api_override: bool,
     oidc_claim_field: Option<String>,
+    governance: KeyGovernanceConfig,
+    governance_store: Arc<dyn GovernanceStore>,
+    approximate_store: Option<Arc<InMemoryGovernanceStore>>,
 }
 
 impl KeyPlane {
-    /// Assemble a plane from already-built parts. Used by the config-driven
-    /// [`init_key_plane`] and by tests that wire a store directly.
+    /// Assemble a test plane from already-built key-store parts.
+    #[cfg(test)]
     pub(crate) fn from_parts(
         crypto: KeyCrypto,
         cache: Arc<TtlCache>,
@@ -45,12 +54,50 @@ impl KeyPlane {
         allow_api_override: bool,
         oidc_claim_field: Option<String>,
     ) -> Self {
+        let governance = KeyGovernanceConfig::default();
+        let (governance_store, approximate_store) = build_governance_store(&governance)
+            .expect("default governance store configuration is valid");
+        Self::from_parts_with_governance(
+            crypto,
+            cache,
+            failure_mode_allow,
+            allow_api_override,
+            oidc_claim_field,
+            governance,
+            governance_store,
+            approximate_store,
+        )
+    }
+
+    /// Assemble a plane with explicit governed key runtime controls.
+    ///
+    /// `approximate_store` carries the concrete in-memory counter store when
+    /// `governance_store` is backed by it (approximate consistency mode), so
+    /// cross-node dissemination can be spawned against the concrete type.
+    /// Pass `None` for strict (Redis) governance or when `governance_store`
+    /// is not actually an `InMemoryGovernanceStore` (for example, a test
+    /// double).
+    // Wide by design: the key plane wires several independent subsystems in one place.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts_with_governance(
+        crypto: KeyCrypto,
+        cache: Arc<TtlCache>,
+        failure_mode_allow: bool,
+        allow_api_override: bool,
+        oidc_claim_field: Option<String>,
+        governance: KeyGovernanceConfig,
+        governance_store: Arc<dyn GovernanceStore>,
+        approximate_store: Option<Arc<InMemoryGovernanceStore>>,
+    ) -> Self {
         Self {
             crypto,
             cache,
             failure_mode_allow,
             allow_api_override,
             oidc_claim_field,
+            governance,
+            governance_store,
+            approximate_store,
         }
     }
 
@@ -80,6 +127,42 @@ impl KeyPlane {
     /// configured.
     pub fn oidc_claim_field(&self) -> Option<&str> {
         self.oidc_claim_field.as_deref()
+    }
+
+    /// Governed key admission and caller-introspection controls installed with
+    /// this key-plane snapshot.
+    pub fn governance(&self) -> &KeyGovernanceConfig {
+        &self.governance
+    }
+
+    /// Shared admission and accounting store for governed requests.
+    pub fn governance_store(&self) -> Arc<dyn GovernanceStore> {
+        Arc::clone(&self.governance_store)
+    }
+
+    /// The concrete approximate counter store, present only in approximate
+    /// consistency mode. Used to spawn cross-node dissemination.
+    pub fn approximate_store(&self) -> Option<Arc<InMemoryGovernanceStore>> {
+        self.approximate_store.clone()
+    }
+
+    /// Runtime consistency guarantee mapped explicitly from operator config.
+    pub fn governance_consistency(&self) -> RuntimeGovernanceConsistency {
+        runtime_governance_consistency(self.governance.consistency)
+    }
+
+    /// Secret-free health information from the active governance backend.
+    pub async fn governance_health(&self) -> GovernanceBackendHealth {
+        self.governance_store.health().await
+    }
+}
+
+fn runtime_governance_consistency(
+    consistency: ConfigGovernanceConsistency,
+) -> RuntimeGovernanceConsistency {
+    match consistency {
+        ConfigGovernanceConsistency::Approximate => RuntimeGovernanceConsistency::Approximate,
+        ConfigGovernanceConsistency::Strict => RuntimeGovernanceConsistency::Strict,
     }
 }
 
@@ -301,6 +384,65 @@ fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCa
     Arc::new(cache)
 }
 
+/// Build the governance accounting backend without opening a network
+/// connection. The Redis client connects lazily on the first operation.
+///
+/// Returns both the trait-object handle used for admission/accounting and,
+/// only in approximate consistency mode, the concrete `InMemoryGovernanceStore`
+/// (WOR-1835: needed to spawn cross-node counter dissemination, which applies
+/// solely to the approximate tier; strict/Redis governance owns its own
+/// coherence and the second element is `None`).
+// The trait-object store plus, in approximate mode, the concrete store used to
+// spawn dissemination; the tuple is documented above.
+#[allow(clippy::type_complexity)]
+fn build_governance_store(
+    cfg: &KeyGovernanceConfig,
+) -> Result<(
+    Arc<dyn GovernanceStore>,
+    Option<Arc<InMemoryGovernanceStore>>,
+)> {
+    cfg.validate()
+        .map_err(|error| anyhow::anyhow!("validate key_management.governance: {error}"))?;
+    let reservation_ttl_millis = cfg
+        .lease_ttl_millis()
+        .context("convert governance lease TTL")?;
+    let terminal_retention_millis = cfg
+        .terminal_retention_millis()
+        .context("convert governance terminal retention")?;
+
+    match cfg.consistency {
+        ConfigGovernanceConsistency::Approximate => {
+            let store = Arc::new(
+                InMemoryGovernanceStore::new(InMemoryGovernanceConfig {
+                    reservation_ttl_millis,
+                    terminal_retention_millis,
+                })
+                .context("build approximate governance store")?,
+            );
+            Ok((store.clone(), Some(store)))
+        }
+        ConfigGovernanceConsistency::Strict => {
+            let url = match cfg.backend.as_ref() {
+                Some(GovernanceBackendConfig::Redis { url }) => url,
+                None => anyhow::bail!("strict governance requires an explicit redis backend"),
+            };
+            let redis = sbproxy_platform::storage::AsyncRedisKVStore::new(
+                sbproxy_platform::storage::AsyncRedisConfig::new(url),
+            );
+            let store = RedisGovernanceStore::new(
+                redis,
+                RedisGovernanceConfig {
+                    reservation_ttl_millis,
+                    terminal_retention_millis,
+                    ..RedisGovernanceConfig::default()
+                },
+            )
+            .context("build strict Redis governance store")?;
+            Ok((Arc::new(store), None))
+        }
+    }
+}
+
 /// The default mesh node id: the `HOSTNAME` environment variable (set per pod
 /// in most container schedulers), falling back to a fixed name. Operators set
 /// `key_management.cache.mesh_node_id` for an explicit, unique id.
@@ -446,6 +588,7 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
+    let (governance_store, approximate_store) = build_governance_store(&cfg.governance)?;
     let crypto = build_crypto(cfg)?;
     let store = build_store(cfg)?;
     let cache = build_cache(cfg, store.clone());
@@ -463,12 +606,15 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     })
     .context("seed key_management records")?;
 
-    let plane = Arc::new(KeyPlane::from_parts(
+    let plane = Arc::new(KeyPlane::from_parts_with_governance(
         crypto,
         cache.clone(),
         cfg.failure_mode_allow,
         cfg.allow_api_override,
         cfg.oidc_claim_map.as_ref().map(|m| m.claim_field.clone()),
+        cfg.governance.clone(),
+        governance_store,
+        approximate_store,
     ));
     install_key_plane(plane);
 
@@ -602,10 +748,97 @@ mod tests {
     }
 
     #[test]
+    fn strict_governance_without_redis_fails_before_installing_the_plane() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.governance.consistency = sbproxy_config::GovernanceConsistency::Strict;
+
+        let error = init_key_plane(&cfg).expect_err("strict governance needs Redis");
+        assert!(
+            error
+                .to_string()
+                .contains("strict governance requires an explicit redis backend"),
+            "unexpected error: {error}"
+        );
+        assert!(current_key_plane().is_none());
+    }
+
+    #[test]
+    fn approximate_governance_installs_a_healthy_process_local_store() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.governance.lease_ttl_secs = 2;
+        cfg.governance.terminal_retention_secs = 7;
+
+        init_key_plane(&cfg).expect("install approximate governance");
+        let plane = current_key_plane().expect("plane installed");
+
+        assert_eq!(plane.governance().lease_ttl_secs, 2);
+        assert_eq!(plane.governance().terminal_retention_secs, 7);
+        assert_eq!(
+            plane.governance_consistency(),
+            sbproxy_ai::governance::GovernanceConsistency::Approximate
+        );
+        let direct_health = key_runtime().block_on(plane.governance_store().health());
+        assert_eq!(direct_health.backend, "memory");
+        assert_eq!(
+            direct_health.status,
+            sbproxy_ai::governance::GovernanceBackendStatus::Healthy
+        );
+        let plane_health = key_runtime().block_on(plane.governance_health());
+        assert_eq!(plane_health.consistency, direct_health.consistency);
+        assert_eq!(plane_health.backend, direct_health.backend);
+
+        // WOR-1835: approximate mode retains the concrete counter store so
+        // cross-node dissemination can be spawned against it.
+        assert!(
+            plane.approximate_store().is_some(),
+            "approximate consistency must expose the concrete in-memory store"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn strict_governance_constructs_a_lazy_dedicated_redis_store() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.governance.consistency = sbproxy_config::GovernanceConsistency::Strict;
+        cfg.governance.backend = Some(sbproxy_config::GovernanceBackendConfig::Redis {
+            url: "redis://governance.invalid:6379/4".to_string(),
+        });
+        cfg.governance.lease_ttl_secs = 3;
+        cfg.governance.terminal_retention_secs = 9;
+
+        init_key_plane(&cfg).expect("Redis connection must remain lazy during installation");
+        let plane = current_key_plane().expect("plane installed");
+        assert_eq!(
+            plane.governance_consistency(),
+            sbproxy_ai::governance::GovernanceConsistency::Strict
+        );
+        assert_eq!(plane.governance().lease_ttl_secs, 3);
+        assert_eq!(plane.governance().terminal_retention_secs, 9);
+
+        // WOR-1835: strict (Redis) governance owns its own coherence and
+        // must not expose a concrete store for dissemination to spawn.
+        assert!(
+            plane.approximate_store().is_none(),
+            "strict consistency must not expose an in-memory store"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn init_seeds_keys_and_credentials_into_embedded_store() {
         let _guard = test_plane_guard();
         let path = temp_db();
         let mut cfg = base_cfg(&path);
+        cfg.governance.key_introspection = true;
+        cfg.governance.require_governed_key = true;
         cfg.seed = KeySeedConfig {
             keys: vec![SeedKeyConfig {
                 key_id: "seed1".into(),
@@ -650,6 +883,8 @@ mod tests {
 
         init_key_plane(&cfg).unwrap();
         let plane = current_key_plane().expect("plane installed");
+        assert!(plane.governance().key_introspection);
+        assert!(plane.governance().require_governed_key);
 
         // The seeded key resolves and verifies the seeded secret.
         let rec = key_runtime()
