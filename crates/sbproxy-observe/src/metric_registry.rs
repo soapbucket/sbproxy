@@ -841,6 +841,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_governance_fail_open_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_governance_fail_open"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["key_id"],
+        description: "Governed admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_grpc_status_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_grpc_status"),
