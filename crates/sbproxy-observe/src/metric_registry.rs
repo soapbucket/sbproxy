@@ -30,10 +30,20 @@
 //! nobody emits is a guarantee about nothing.
 //!
 //! Adding a metric to the code without adding it here fails the build.
+//!
+//! A second, narrower guard lives at the bottom of this file:
+//! [`TENANT_SCOPED_METRICS`] and [`tenant_label_gaps`] enforce multi-tenant
+//! attribution. A metric can have a live writer, a truthful support level,
+//! and still merge every tenant's spend, tokens, or security verdicts into
+//! one series if nothing on it identifies whose data it is. That is a
+//! quieter failure than a metric nobody writes: the numbers are real, the
+//! panel draws, and the answer it gives is to a question nobody asked. See
+//! `WOR-1896` for the shape of that bug in `snapshot_named`, and the module
+//! doc on `tenant_label_gaps` below for the fix.
 
 use sbproxy_capability::scan::ReferenceExemption;
 use sbproxy_capability::{
-    CompatTier, MetricCapability, MetricKind, Registry, SupportLevel, Writer,
+    CompatTier, MetricCapability, MetricKind, Registry, RegistryError, SupportLevel, Writer,
 };
 
 /// Every Prometheus family declared under `crates/`.
@@ -1942,6 +1952,263 @@ pub const REFERENCE_EXEMPTIONS: &[ReferenceExemption] = &[
                  Wired by WOR-1898 once that clears.",
     },
 ];
+
+// --- Tenant-scoping guard (multi-tenant enforcement) ---
+//
+// The writer-liveness guard above answers "does anything increment this
+// metric." This section answers a different question about the same table:
+// "if this metric holds one tenant's data, can a query actually pull that
+// tenant's slice back out." A counter that mixes every tenant's requests,
+// spend, or security verdicts into a single series is not wrong the way a
+// zero-writer metric is wrong; it has real numbers in it. Those numbers just
+// answer "how much did everyone spend, combined" while sitting under a name
+// that promises "how much did this tenant spend." `WOR-1896` was one
+// instance of that general failure mode: attribution that was declared but
+// not actually reachable through `snapshot_named`. This is the same shape of
+// bug, one level up, in the label set itself.
+
+/// Label names this registry accepts as the tenant / customer boundary.
+///
+/// `tenant_id` and `api_key_id` are the current attribution convention (see
+/// `crates/sbproxy-ai/src/ai_metrics.rs`, the WOR-1493..1501 series). `tenant`
+/// and `workspace` are two earlier spellings of the same boundary that
+/// predate that convention and still back several live counters today.
+/// `crate::cardinality::budget_for_label` already treats `tenant_id`,
+/// `workspace`, and `workspace_id` as one cardinality-budget class, so this
+/// list is the registry side of that same equivalence. A family needs only
+/// one of these names on it, not all four.
+pub const TENANT_LABEL_NAMES: &[&str] = &["tenant_id", "api_key_id", "tenant", "workspace"];
+
+/// Metric families whose observations belong to one tenant or customer, and
+/// therefore must carry a label from [`TENANT_LABEL_NAMES`] naming it, or a
+/// reviewed [`TENANT_LABEL_EXEMPTIONS`] entry explaining why not yet.
+///
+/// This is the opt-in mark [`tenant_label_gaps`] checks against. It is a
+/// claim about a family's *meaning* ("this counts something that belongs to
+/// a specific tenant"), which nothing in `labels` alone can prove, so a
+/// human asserts it here the same way [`REFERENCE_EXEMPTIONS`] is a human
+/// asserting "this dead reference is known and ticketed." Adding a new
+/// per-tenant billing, spend, or security counter to [`METRICS`] without
+/// also listing it here does not fail the build; dropping the tenant label
+/// from one already listed here does.
+pub const TENANT_SCOPED_METRICS: &[&str] = &[
+    "sbproxy_ai_audio_seconds_attributed_total",
+    "sbproxy_ai_cost_dollars_attributed_total",
+    "sbproxy_ai_cost_saved_micros_total",
+    "sbproxy_ai_cost_usd_micros_total",
+    "sbproxy_ai_ratelimit_rejected_total",
+    "sbproxy_ai_request_duration_attributed_seconds",
+    "sbproxy_ai_requests_attributed_total",
+    "sbproxy_ai_tokens_attributed_total",
+    "sbproxy_ai_tokens_saved_total",
+    "sbproxy_capture_budget_dropped_total",
+    "sbproxy_capture_dropped_total",
+    "sbproxy_http_framing_blocks_total",
+    "sbproxy_judge_budget_exhausted_total",
+    "sbproxy_label_cardinality_overflow_per_tenant_total",
+    "sbproxy_outbound_webhook_attempts_total",
+    "sbproxy_policy_audit_events_dropped_total",
+    "sbproxy_rate_limit_suspend_total",
+    "sbproxy_rate_limit_total",
+    "sbproxy_semantic_cache_results_total",
+    "sbproxy_waf_persistent_blocks_total",
+];
+
+/// Tenant-scoped families that are known to lack a tenant label today, and
+/// the ticket that will add one.
+///
+/// Empty today; this is the escape hatch, kept ready rather than deleted,
+/// mirroring [`REFERENCE_EXEMPTIONS`]. `sbproxy_tokens_attributed_total`
+/// (`crates/sbproxy-observe/src/metrics.rs`, `record_tokens_attributed`) is
+/// the one live candidate: its own doc comment already says `tenant_id` is
+/// deliberately absent pending the credentials epic's origin-to-tenant
+/// resolution. It is left out of [`TENANT_SCOPED_METRICS`] entirely rather
+/// than exempted here, because an exemption needs a tracking ticket
+/// (mirroring [`REFERENCE_EXEMPTIONS`]'s own rule below) and none exists
+/// yet; file one, then move the name across and add the entry in the same
+/// commit that adds the label.
+pub const TENANT_LABEL_EXEMPTIONS: &[ReferenceExemption] = &[];
+
+/// Enforce that every family named in `tenant_scoped` carries a label from
+/// [`TENANT_LABEL_NAMES`], unless `exemptions` names it.
+///
+/// Three failure modes, all reported so a single run surfaces everything
+/// wrong at once:
+///
+/// - a name in `tenant_scoped` that is not declared in `metrics` at all (a
+///   typo, or the metric was renamed here and the rename was not mirrored);
+/// - a declared metric whose `labels` carry none of [`TENANT_LABEL_NAMES`]
+///   and which `exemptions` does not cover; a per-tenant metric with no
+///   tenant dimension silently merges every tenant's data into one series,
+///   which is invisible in exactly the way the dead-metric bug was
+///   invisible: the family scrapes, the dashboard draws a line, and the
+///   line answers a different question than its name claims;
+/// - an exemption naming a metric that is not in `tenant_scoped`, which is
+///   either stale (the metric was fixed and the entry should have been
+///   deleted) or was never a real tenant-scoping gap and should not have
+///   been exempted in the first place.
+pub fn tenant_label_gaps(
+    metrics: &[MetricCapability],
+    tenant_scoped: &[&str],
+    exemptions: &[ReferenceExemption],
+) -> Vec<RegistryError> {
+    let mut errors = Vec::new();
+
+    for name in tenant_scoped {
+        let Some(metric) = metrics.iter().find(|m| m.name == *name) else {
+            errors.push(RegistryError {
+                subject: (*name).to_string(),
+                message: "is listed in TENANT_SCOPED_METRICS but is not declared in METRICS"
+                    .to_string(),
+            });
+            continue;
+        };
+
+        let has_tenant_label = metric
+            .labels
+            .iter()
+            .any(|label| TENANT_LABEL_NAMES.contains(label));
+        if has_tenant_label {
+            continue;
+        }
+
+        if exemptions.iter().any(|exemption| exemption.metric == *name) {
+            continue;
+        }
+
+        errors.push(RegistryError {
+            subject: (*name).to_string(),
+            message: format!(
+                "is tenant-scoped but its labels {:?} carry none of {TENANT_LABEL_NAMES:?}; a \
+                 per-tenant metric with no tenant dimension silently merges every tenant's data \
+                 into one series. Add one of those labels, or add a TENANT_LABEL_EXEMPTIONS \
+                 entry naming the ticket that will.",
+                metric.labels
+            ),
+        });
+    }
+
+    for exemption in exemptions {
+        if !tenant_scoped.contains(&exemption.metric) {
+            errors.push(RegistryError {
+                subject: exemption.metric.to_string(),
+                message: "has a TENANT_LABEL_EXEMPTIONS entry but is not listed in \
+                          TENANT_SCOPED_METRICS"
+                    .to_string(),
+            });
+        }
+    }
+
+    errors
+}
+
+#[cfg(test)]
+mod tenant_label_gap_tests {
+    use super::*;
+
+    fn tenant_scoped_metric(
+        name: &'static str,
+        labels: &'static [&'static str],
+    ) -> MetricCapability {
+        MetricCapability {
+            name,
+            kind: MetricKind::Counter,
+            writer: Writer::Recorder("record_thing"),
+            support: SupportLevel::Stable,
+            compat: CompatTier::Beta,
+            registry: Registry::Default,
+            labels,
+            description: "A tenant-attributed thing.",
+            dead_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_metric_with_a_recognized_tenant_label_passes() {
+        let metrics = [tenant_scoped_metric("sbproxy_thing_total", &["tenant_id", "result"])];
+        let errors = tenant_label_gaps(&metrics, &["sbproxy_thing_total"], &[]);
+        assert_eq!(errors, vec![]);
+    }
+
+    #[test]
+    fn each_recognized_label_name_satisfies_the_guard_on_its_own() {
+        for label in TENANT_LABEL_NAMES {
+            let labels = std::slice::from_ref(label);
+            let metrics = [tenant_scoped_metric("sbproxy_thing_total", labels)];
+            let errors = tenant_label_gaps(&metrics, &["sbproxy_thing_total"], &[]);
+            assert_eq!(
+                errors,
+                vec![],
+                "label {label:?} should satisfy the guard on its own"
+            );
+        }
+    }
+
+    #[test]
+    fn a_metric_missing_every_tenant_label_fails_the_build() {
+        let metrics = [tenant_scoped_metric("sbproxy_thing_total", &["result"])];
+        let errors = tenant_label_gaps(&metrics, &["sbproxy_thing_total"], &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.contains("carry none of"),
+            "{:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn a_name_not_declared_in_metrics_is_reported() {
+        let metrics: [MetricCapability; 0] = [];
+        let errors = tenant_label_gaps(&metrics, &["sbproxy_missing_total"], &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.contains("not declared in METRICS"),
+            "{:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn a_declared_exemption_suppresses_the_missing_label_error() {
+        let metrics = [tenant_scoped_metric("sbproxy_thing_total", &["result"])];
+        let exemptions = [ReferenceExemption {
+            metric: "sbproxy_thing_total",
+            reason: "tenant_id lands once the credentials epic ships tenant \
+                      resolution for this call site (WOR-9999).",
+        }];
+        let errors = tenant_label_gaps(&metrics, &["sbproxy_thing_total"], &exemptions);
+        assert_eq!(errors, vec![]);
+    }
+
+    #[test]
+    fn a_stale_exemption_for_an_unlisted_metric_is_reported() {
+        let metrics = [tenant_scoped_metric("sbproxy_thing_total", &["tenant_id"])];
+        let exemptions = [ReferenceExemption {
+            metric: "sbproxy_other_total",
+            reason: "some historical reason that no longer names a tenant-scoped metric.",
+        }];
+        // sbproxy_thing_total already carries tenant_id, so the only
+        // expected error is the stale exemption naming a metric that was
+        // never (or is no longer) in tenant_scoped.
+        let errors = tenant_label_gaps(&metrics, &["sbproxy_thing_total"], &exemptions);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.contains("is not listed in TENANT_SCOPED_METRICS"),
+            "{:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn the_real_tenant_scoped_metrics_carry_a_real_tenant_label() {
+        // The build-time guard: run the actual METRICS table against the
+        // actual TENANT_SCOPED_METRICS list. A future edit that drops
+        // tenant_id/tenant/workspace/api_key_id from one of these families,
+        // or renames the family without updating this list, fails here.
+        let errors = tenant_label_gaps(METRICS, TENANT_SCOPED_METRICS, TENANT_LABEL_EXEMPTIONS);
+        assert_eq!(errors, vec![], "{errors:?}");
+    }
+}
 
 /// Render the catalogue published as `docs/metrics-stability.md`.
 ///

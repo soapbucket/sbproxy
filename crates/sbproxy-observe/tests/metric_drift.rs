@@ -24,7 +24,10 @@
 
 use sbproxy_capability::scan::{self, ReferenceExemption};
 use sbproxy_capability::{validate_metrics, RegistryError};
-use sbproxy_observe::metric_registry::{METRICS, REFERENCE_EXEMPTIONS};
+use sbproxy_observe::metric_registry::{
+    tenant_label_gaps, METRICS, REFERENCE_EXEMPTIONS, TENANT_LABEL_EXEMPTIONS,
+    TENANT_SCOPED_METRICS,
+};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -116,6 +119,26 @@ fn a_dead_metric_reference_needs_a_reason_and_a_ticket() {
             "exemption for {metric} names a metric that is not in the registry"
         );
     }
+}
+
+#[test]
+fn every_tenant_scoped_metric_carries_a_tenant_label() {
+    // Multi-tenant enforcement, metrics half. A metric can have a live
+    // writer and a truthful support level and still merge every tenant's
+    // spend, tokens, or security verdicts into one series if nothing on it
+    // says whose data it is. That failure is quieter than a dead metric:
+    // the numbers are real, the panel draws, and the answer it gives is to
+    // a question nobody asked. WOR-1896 was one instance of this shape of
+    // bug (attribution declared but not reachable through
+    // `snapshot_named`); this guard is the label-set half of the same
+    // concern.
+    report(
+        "A metric is marked tenant-scoped in TENANT_SCOPED_METRICS but its label set \
+         carries none of TENANT_LABEL_NAMES (tenant_id, api_key_id, tenant, workspace), \
+         and TENANT_LABEL_EXEMPTIONS does not cover it. Add the label, or add a reviewed, \
+         ticketed exemption.",
+        &tenant_label_gaps(METRICS, TENANT_SCOPED_METRICS, TENANT_LABEL_EXEMPTIONS),
+    );
 }
 
 #[test]
