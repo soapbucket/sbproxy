@@ -2102,6 +2102,74 @@ pub fn tenant_label_gaps(
     errors
 }
 
+/// Render the catalogue published as `docs/metrics-stability.md`.
+///
+/// Deterministic and byte-stable: `scripts/check-metrics-stability.sh`
+/// regenerates it and diffs, so the committed file cannot drift from the code.
+/// Hand-editing it is not so much forbidden as pointless.
+pub fn render_markdown() -> String {
+    let mut out = String::from(
+        "# Metrics stability\n\
+         *Last modified: 2026-07-14*\n\n\
+         *Generated from the executable metric registry. Do not hand-edit; run \
+         `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
+         docs/metrics-stability.md`.*\n\n\
+         Every metric SBproxy emits, what writes it, and what we promise about \
+         its name.\n\n",
+    );
+
+    out.push_str(
+        "## Support\n\n\
+         `stable` means production code increments the metric, proven by a drift \
+         guard that resolves the writer against the source tree and requires a \
+         call site outside tests.\n\n\
+         `config_only` means the family is declared and scraped but nothing \
+         increments it. It reads zero, always. No dashboard or alert rule may \
+         read one.\n\n\
+         ## Compatibility\n\n\
+         `stable` names will not be renamed or removed without a deprecation \
+         period: the replacement ships alongside the original in a minor \
+         release, and the original is removed no earlier than the next major. \
+         Label sets on stable metrics may gain labels in a minor release; \
+         losing one follows the same deprecation path.\n\n\
+         `beta` names are functional and may still be renamed or relabeled in a \
+         minor release, with a changelog entry.\n\n\
+         `alpha` names may be renamed, relabeled, or removed in any release.\n\n\
+         ## Catalogue\n\n",
+    );
+
+    out.push_str("| Metric | Type | Support | Compat | Labels | Description |\n");
+    out.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for metric in METRICS {
+        let labels = if metric.labels.is_empty() {
+            "none".to_string()
+        } else {
+            metric
+                .labels
+                .iter()
+                .map(|label| format!("`{label}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let support = if metric.dead_reason.is_some() {
+            "`config_only` (nothing emits this yet)".to_string()
+        } else {
+            format!("`{}`", metric.support.as_str())
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} | `{}` | {} | {} |\n",
+            metric.name,
+            metric.kind.as_str(),
+            support,
+            metric.compat.as_str(),
+            labels,
+            metric.description,
+        ));
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tenant_label_gap_tests {
     use super::*;
@@ -2213,72 +2281,4 @@ mod tenant_label_gap_tests {
         let errors = tenant_label_gaps(METRICS, TENANT_SCOPED_METRICS, TENANT_LABEL_EXEMPTIONS);
         assert_eq!(errors, vec![], "{errors:?}");
     }
-}
-
-/// Render the catalogue published as `docs/metrics-stability.md`.
-///
-/// Deterministic and byte-stable: `scripts/check-metrics-stability.sh`
-/// regenerates it and diffs, so the committed file cannot drift from the code.
-/// Hand-editing it is not so much forbidden as pointless.
-pub fn render_markdown() -> String {
-    let mut out = String::from(
-        "# Metrics stability\n\
-         *Last modified: 2026-07-14*\n\n\
-         *Generated from the executable metric registry. Do not hand-edit; run \
-         `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
-         docs/metrics-stability.md`.*\n\n\
-         Every metric SBproxy emits, what writes it, and what we promise about \
-         its name.\n\n",
-    );
-
-    out.push_str(
-        "## Support\n\n\
-         `stable` means production code increments the metric, proven by a drift \
-         guard that resolves the writer against the source tree and requires a \
-         call site outside tests.\n\n\
-         `config_only` means the family is declared and scraped but nothing \
-         increments it. It reads zero, always. No dashboard or alert rule may \
-         read one.\n\n\
-         ## Compatibility\n\n\
-         `stable` names will not be renamed or removed without a deprecation \
-         period: the replacement ships alongside the original in a minor \
-         release, and the original is removed no earlier than the next major. \
-         Label sets on stable metrics may gain labels in a minor release; \
-         losing one follows the same deprecation path.\n\n\
-         `beta` names are functional and may still be renamed or relabeled in a \
-         minor release, with a changelog entry.\n\n\
-         `alpha` names may be renamed, relabeled, or removed in any release.\n\n\
-         ## Catalogue\n\n",
-    );
-
-    out.push_str("| Metric | Type | Support | Compat | Labels | Description |\n");
-    out.push_str("| --- | --- | --- | --- | --- | --- |\n");
-    for metric in METRICS {
-        let labels = if metric.labels.is_empty() {
-            "none".to_string()
-        } else {
-            metric
-                .labels
-                .iter()
-                .map(|label| format!("`{label}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let support = if metric.dead_reason.is_some() {
-            "`config_only` (nothing emits this yet)".to_string()
-        } else {
-            format!("`{}`", metric.support.as_str())
-        };
-        out.push_str(&format!(
-            "| `{}` | {} | {} | `{}` | {} | {} |\n",
-            metric.name,
-            metric.kind.as_str(),
-            support,
-            metric.compat.as_str(),
-            labels,
-            metric.description,
-        ));
-    }
-
-    out
 }
