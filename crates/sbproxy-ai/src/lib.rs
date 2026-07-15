@@ -26,6 +26,7 @@ pub mod fill_first;
 pub mod finetune;
 pub mod format;
 pub mod governance;
+pub mod governance_crdt;
 pub mod governance_redis;
 pub mod guardrails;
 pub mod handler;
