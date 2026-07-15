@@ -9,6 +9,28 @@
 # Every publish-side job is guarded by
 # `if: github.repository == 'soapbucket/sbproxy'` so the workflow stays
 # inert on forks.
+#
+# Model-host certification gate (WOR-1858): `certify-model-host-*`
+# below run scripts/certify-model-host.sh and the deterministic
+# model-host DoD suite on every release tag and dispatch, and the
+# `release` / `image` publish jobs `needs` both. Before WOR-1858,
+# certify-model-host.sh was a script a human had to remember to run by
+# hand against a provisioned GPU box; nothing stopped a release from
+# shipping with zero executable hardware evidence. Arming it here means
+# a failing lane blocks the draft release and the image push, not just
+# a stale doc claim.
+#
+# certify-model-host-apple-silicon runs the real DoD checklist (cold
+# completion, warm completion, kill -9 recovery) against a real
+# `sbproxy run` + managed llama-server on the runner's own Apple
+# Silicon GPU (macos-14 runners are M-series hardware, not emulated).
+# NVIDIA single/multi-GPU certification is NOT included: no
+# GitHub-hosted runner has a GPU, and this repository has no
+# self-hosted GPU runner registered today. Per docs/model-host-capabilities.md,
+# engine.vllm_uv, engine.vllm_container, platform.nvidia_cuda, and
+# cluster.remote_dispatch stay `preview` until a GPU runner exists and
+# a lane is added here to certify them; that is tracked as a follow-up
+# to WOR-1858, not silently claimed as covered by this workflow.
 
 name: release
 
@@ -152,10 +174,162 @@ jobs:
           path: sbom.cyclonedx.json
           retention-days: 7
 
+  certify-model-host-deterministic:
+    name: model-host certification / deterministic gate (WOR-1858)
+    # Arms the "Deterministic gate" from docs/model-host-certification.md
+    # as a required release check. These suites need no GPU: they prove
+    # immutable artifact selection, process argv, container isolation,
+    # source-build publication, per-device capacity, bounded queue
+    # behavior, atomic rollback, status shape, and CLI contracts. They
+    # cannot prove a driver loads a model or returns tokens on real
+    # hardware; certify-model-host-apple-silicon below covers that.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: certify-model-host-deterministic
+
+      - name: install protoc and libclang
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      # The model_cluster_control / model_cluster_dispatch e2e suites
+      # spawn target/debug/sbproxy at runtime; build it before the test
+      # step below so they do not fail with "release binary missing".
+      - name: build sbproxy binary (needed by e2e harness)
+        run: cargo build -p sbproxy --locked
+
+      - name: record version metadata
+        run: |
+          set -euo pipefail
+          echo "git revision: $(git rev-parse HEAD)"
+          echo "git ref:      ${GITHUB_REF_NAME}"
+          echo "runner:       $(uname -srm)"
+
+      - name: deterministic model-host DoD suite
+        run: |
+          set -euo pipefail
+          cargo test -p sbproxy-model-host --test engine_drivers --locked
+          cargo test -p sbproxy-model-host --test cuda_build --locked
+          cargo test -p sbproxy-model-host --test runtime_reconcile --locked
+          cargo test -p sbproxy-model-host --test local_admission --locked
+          cargo test -p sbproxy-core --test model_host_reload --locked
+          cargo test -p sbproxy --test models_lifecycle_cli --locked
+          cargo test -p sbproxy-model-host --test placement --locked
+          cargo test -p sbproxy-model-host --test capability_contract --locked
+          cargo test -p sbproxy-ai --test managed_replica_routing --locked
+          cargo test -p sbproxy-core --test cluster_control_plane --locked
+          cargo test -p sbproxy-core --test model_plane_envelope --test model_plane_transport --test managed_replica_dispatch --locked
+          SBPROXY_E2E_BIN=target/debug/sbproxy cargo test -p sbproxy-e2e --test model_cluster_control --locked -- --nocapture
+          SBPROXY_E2E_BIN=target/debug/sbproxy cargo test -p sbproxy-e2e --test model_cluster_dispatch --locked -- --nocapture
+
+  certify-model-host-apple-silicon:
+    name: model-host certification / Apple Silicon (WOR-1858)
+    # Arms scripts/certify-model-host.sh as a required release check by
+    # running it for real: boots `sbproxy run` with a managed
+    # llama-server on the runner's own Apple Silicon GPU, then drives a
+    # cold completion, a warm completion, and a kill -9 mid-flight
+    # recovery against it. This is the same procedure previously
+    # recorded by hand in docs/model-host-certification.md's "Apple
+    # Metal gate for this PR" section; it now runs on every release
+    # instead of relying on a human to run it before merging a PR.
+    #
+    # `sbproxy run <model>` synthesizes a config with origins
+    # "127.0.0.1" and "localhost" only (crates/sbproxy/src/main.rs
+    # prepare_run()); it does not recognize the "ai.local" hostname
+    # certify-model-host.sh defaults to for `serve:`-block deployments,
+    # so SB_HOST is pinned to 127.0.0.1 below to match.
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: certify-model-host-apple-silicon
+
+      - name: build release binary
+        run: cargo build --release -p sbproxy --locked
+
+      - name: record version metadata
+        run: |
+          set -euo pipefail
+          echo "git revision: $(git rev-parse HEAD)"
+          echo "git ref:      ${GITHUB_REF_NAME}"
+          sw_vers
+          uname -srm
+          sysctl -n machdep.cpu.brand_string || true
+
+      - name: boot sbproxy and certify against it
+        env:
+          MODEL: qwen2.5-0.5b-instruct
+        run: |
+          set -uo pipefail
+          CACHE_DIR="$(mktemp -d)"
+          ./target/release/sbproxy run "${MODEL}" \
+            --variant q4_k_m \
+            --cache-dir "${CACHE_DIR}" \
+            --port 48123 \
+            --admin-port 48124 \
+            > /tmp/sbproxy-cert-boot.log 2>&1 &
+          SB_PID=$!
+
+          # Wait for the HTTP port to accept connections. This only
+          # proves the process is up; certify-model-host.sh's own
+          # cold-call timeout (600s) separately absorbs the time to
+          # load the model on first request.
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -sf -o /dev/null "http://127.0.0.1:48123/v1/models"; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "${SB_PID}" 2>/dev/null; then
+              echo "sbproxy exited before its port came up" >&2
+              break
+            fi
+            sleep 2
+          done
+          if [ "${ready}" -ne 1 ]; then
+            echo "sbproxy never opened :48123" >&2
+            cat /tmp/sbproxy-cert-boot.log >&2 || true
+            kill "${SB_PID}" 2>/dev/null || true
+            exit 1
+          fi
+
+          # Best-effort: find the managed llama-server child so the
+          # kill -9 recovery lane runs too. A miss just SKIPs that one
+          # line in certify-model-host.sh; it does not fail the job.
+          ENGINE_PID="$(pgrep -f llama-server | head -n1 || true)"
+
+          set +e
+          SB_URL="http://127.0.0.1:48123" SB_HOST=127.0.0.1 MODEL="${MODEL}" \
+            ENGINE_PID="${ENGINE_PID}" \
+            bash scripts/certify-model-host.sh
+          CERT_STATUS=$?
+          set -e
+
+          kill "${SB_PID}" 2>/dev/null || true
+          exit "${CERT_STATUS}"
+
+      - name: upload boot log
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: model-host-cert-apple-silicon-log
+          path: /tmp/sbproxy-cert-boot.log
+          retention-days: 14
+
   release:
     name: publish release
     if: github.repository == 'soapbucket/sbproxy' && !inputs.dry_run
-    needs: [build, sbom]
+    needs: [build, sbom, certify-model-host-deterministic, certify-model-host-apple-silicon]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -214,7 +388,7 @@ jobs:
   image:
     name: publish container image
     if: github.repository == 'soapbucket/sbproxy' && !inputs.dry_run
-    needs: [build, sbom]
+    needs: [build, sbom, certify-model-host-deterministic, certify-model-host-apple-silicon]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

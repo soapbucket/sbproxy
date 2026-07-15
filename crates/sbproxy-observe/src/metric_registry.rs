@@ -379,7 +379,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["provider", "direction"],
         description: "Cumulative audio seconds forwarded over Realtime sessions.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it outside crates/sbproxy-ai/src/ai_metrics.rs's own tests. The \
+             family and its recorder (record_realtime_audio_seconds) are both declared in \
+             ai_metrics.rs, which sits outside this lane's file allowlist (metrics.rs, \
+             metric_registry.rs, tests only), so this entry can only be confirmed here, not \
+             wired or deleted. The natural call site is the frame-relay loop in \
+             crates/sbproxy-ai/src/realtime.rs; check first whether \
+             sbproxy_ai_audio_seconds_attributed_total (already Stable, richer attribution \
+             labels) already covers the same forwarded-audio signal from that same loop, in \
+             which case this one should be deleted as a duplicate rather than wired",
+        ),
     },
     MetricCapability {
         name: "sbproxy_ai_realtime_frames_forwarded_total",
@@ -390,7 +400,13 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["provider", "direction", "kind"],
         description: "Cumulative frames forwarded over Realtime sessions.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it outside crates/sbproxy-ai/src/ai_metrics.rs's own tests. Same \
+             out-of-allowlist situation as sbproxy_ai_realtime_audio_seconds_total above: the \
+             family, recorder (record_realtime_frame), and natural call site (the frame-relay \
+             loop in crates/sbproxy-ai/src/realtime.rs) all live in crates outside metrics.rs \
+             and metric_registry.rs. Wire or delete there under WOR-1898",
+        ),
     },
     MetricCapability {
         name: "sbproxy_ai_realtime_session_duration_seconds",
@@ -676,7 +692,15 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Proxy,
         labels: &["hostname", "result"],
         description: "Cache hit/miss counts.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it. Duplicates sbproxy_cache_results_total (also dead; see its \
+             entry), keyed by hostname instead of origin. Should be deleted, but \
+             dashboards/grafana/sbproxy-overview.json still has a panel on this exact name \
+             (see the matching REFERENCE_EXEMPTIONS entry below), and dashboards/ is out of \
+             this lane's file allowlist; deleting this entry without also repointing or \
+             removing that panel breaks the drift guard the other way (an undeclared \
+             reference). Delete both together under WOR-1898 once the panel is dispositioned",
+        ),
     },
     MetricCapability {
         name: "sbproxy_cache_reserve_evictions_total",
@@ -731,7 +755,16 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Proxy,
         labels: &["origin", "result"],
         description: "Cache hit/miss.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it. sbproxy_cache_hits_total (hostname-keyed) covers the same \
+             uninstrumented HTTP response cache and should be deleted alongside this one \
+             once dashboards/grafana/sbproxy-overview.json's panel on that name is \
+             dispositioned (see that entry). Of the two, this is the one worth wiring: the \
+             hit/miss decision is made in crates/sbproxy-core/src/server/request_phase.rs \
+             around the build_response_cache_key call sites; wire \
+             record_cache(origin, \"hit\"|\"miss\") there (out of sbproxy-observe's file \
+             allowlist) or delete both under WOR-1898",
+        ),
     },
     MetricCapability {
         name: "sbproxy_capture_budget_dropped_total",
@@ -775,7 +808,16 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Proxy,
         labels: &["origin", "from_state", "to_state"],
         description: "Circuit breaker state transitions.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it, not even a test. The recorder (record_circuit_breaker, \
+             crates/sbproxy-observe/src/metrics.rs) exists and is unit-tested, but the actual \
+             breaker state machines live in crates/sbproxy-platform/src/circuitbreaker.rs and \
+             adaptive_breaker.rs, which are out of this lane's file allowlist; wire the \
+             transition call there or delete under WOR-1898. docs/events.md:26 currently \
+             points operators at this exact dead metric name for circuit-breaker visibility; \
+             that line needs fixing in the same change that resolves this entry (docs/ is \
+             out of this lane's allowlist too)",
+        ),
     },
     // Found by the drift guard, not by the audit that preceded it: the gauge is
     // set by `ClockSkewMonitor::record_skew`, which is only reachable through
@@ -792,7 +834,12 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Local clock offset from the SNTP reference, in seconds.",
         dead_reason: Some(
             "ClockSkewMonitor is never constructed in production, so nothing runs the \
-             SNTP probe that sets the gauge; wire or delete under WOR-1898",
+             SNTP probe that sets the gauge; wire or delete under WOR-1898. The monitor, \
+             probe, and /readyz Probe impl are fully built in \
+             crates/sbproxy-observe/src/clock_skew.rs; what is missing is a \
+             `ClockSkewMonitor::new(..)` + `tokio::spawn(monitor.clone().run())` call during \
+             server startup, which belongs in the sbproxy binary crate (out of this lane's \
+             file allowlist), not in sbproxy-observe",
         ),
     },
     MetricCapability {
@@ -827,17 +874,6 @@ pub const METRICS: &[MetricCapability] = &[
         labels: &["result"],
         description: "Config reload attempts, by result.",
         dead_reason: None,
-    },
-    MetricCapability {
-        name: "sbproxy_dedup_cache_size",
-        kind: MetricKind::Gauge,
-        writer: Writer::Nothing,
-        support: SupportLevel::ConfigOnly,
-        compat: CompatTier::Alpha,
-        registry: Registry::Proxy,
-        labels: &[],
-        description: "Entries currently held in the request-deduplication cache.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
     },
     MetricCapability {
         name: "sbproxy_errors_total",
@@ -1287,7 +1323,14 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["model"],
         description: "Requests queued while a model loads, by model.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it. The setter (set_model_host_load_queue_depth, \
+             crates/sbproxy-observe/src/metrics.rs) exists and is unit-tested, but the actual \
+             queueing during a cold model load happens in sbproxy-model-host, which WOR-1903 \
+             owns exclusively while a scalar-to-set refactor lands there (see the matching \
+             REFERENCE_EXEMPTIONS entry below for SBProxyModelHostLoadQueueBackedUp). Do not \
+             wire this from this lane; WOR-1898 picks it back up once WOR-1903 clears",
+        ),
     },
     MetricCapability {
         name: "sbproxy_model_host_lora_evictions_total",
@@ -1683,7 +1726,15 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["projection"],
         description: "Well-known projection render failures, by projection.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it, not even a test. WOR-1101 built the recorder \
+             (record_projection_render_failure, crates/sbproxy-observe/src/metrics.rs) so a \
+             failed robots.txt / llms.txt / similar well-known-projection render on config \
+             reload would be visible instead of silently serving stale or empty output. The \
+             projection renderers live in crates/sbproxy-modules/src/projections/ and \
+             crates/sbproxy-modules/src/transform/llms_txt.rs, out of this lane's file \
+             allowlist; wire the failure path there or delete under WOR-1898",
+        ),
     },
     MetricCapability {
         name: "sbproxy_rate_limit_decisions_total",
@@ -1694,7 +1745,15 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["policy", "result"],
         description: "Rate-limit middleware decisions, by policy and outcome.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it, not even a test. This is a finer-grained view than the \
+             already-Stable sbproxy_policy_triggers_total{policy_type=\"rate_limit\"} (which \
+             only distinguishes allow/deny): its allow/throttle_route/throttle_tenant/disabled \
+             result set requires the per-route rate-limit policy in \
+             crates/sbproxy-modules/src/policy/rate_limit.rs (RateLimitPolicy::allow_with_info*) \
+             to call it, which is out of this lane's file allowlist. Wire it there or delete \
+             under WOR-1898",
+        ),
     },
     MetricCapability {
         name: "sbproxy_rate_limit_suspend_total",
@@ -1705,7 +1764,25 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["workspace"],
         description: "Workspace auto-suspend transitions.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "the writer-liveness scanner (crates/sbproxy-capability/src/scan.rs) reports zero \
+             call sites, but that is a false negative, not the truth: \
+             crates/sbproxy-core/src/rate_limit_budget.rs's RateLimitBudget::emit_suspend \
+             (non-test, on the auto-suspend escalation path) genuinely calls this recorder \
+             every time it fires. The scanner searches for the literal token \
+             'record_rate_limit_suspend(' and that file imports it aliased -- \
+             `use sbproxy_observe::metrics::{record_rate_limit, record_rate_limit_suspend as \
+             record_suspend}` -- then calls `record_suspend(workspace)`, so the exact-name \
+             text search never sees it. This metric is not actually dead; it is stuck \
+             ConfigOnly because the alias defeats the guard. Fix is a one-line rename in \
+             rate_limit_budget.rs (drop the `as record_suspend`, call \
+             record_rate_limit_suspend directly), which is out of this lane's file allowlist \
+             (crates/sbproxy-core). Once that lands, flip this entry to \
+             writer: Writer::Recorder(\"record_rate_limit_suspend\"), support: \
+             SupportLevel::Stable, dead_reason: None. Do not 'fix' this by teaching the \
+             scanner to follow import aliases; that widens what the guard accepts workspace- \
+             wide for one call site here",
+        ),
     },
     MetricCapability {
         name: "sbproxy_rate_limit_total",
@@ -1793,7 +1870,15 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["engine", "result"],
         description: "Script-engine hot-reload events, by engine and outcome.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it, not even a test. The sibling sbproxy_script_compile_total is \
+             Stable and called from crates/sbproxy-extension/src/wasm/mod.rs and cel/mod.rs \
+             on cold-start compile; this counter is meant to fire on the separate hot-reload \
+             path (recompiling a running script on config reload without a restart), which \
+             is driven from crates/sbproxy-core/src/reload.rs into those same extension \
+             engines. Both are out of this lane's file allowlist; wire the reload call there \
+             or delete under WOR-1898",
+        ),
     },
     MetricCapability {
         name: "sbproxy_semantic_cache_results_total",
@@ -1815,7 +1900,15 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["priority", "decision"],
         description: "Served-lane admission gate decisions by priority lane.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it, not even a test. WOR-1679 built this to distinguish \
+             admitted/queued_admitted/spilled/timed_out for the interactive/standard/batch \
+             priority lanes. The real admission gate is \
+             crates/sbproxy-core/src/server/model_host.rs's PriorityClass-based admit() path \
+             (see manager.admit(deployment, priority)), which lives in sbproxy-core / \
+             sbproxy-model-host, out of this lane's file allowlist; wire the decision call \
+             there or delete under WOR-1898",
+        ),
     },
     MetricCapability {
         name: "sbproxy_silent_degradations_total",
@@ -1826,7 +1919,14 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["op"],
         description: "Best-effort operations that failed and were previously dropped silently, by op.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it, not even a test. WOR-1104 built this so error paths that used \
+             to be a silent `let _ = ...` would at least surface as a counter. Candidate call \
+             sites already exist: crates/sbproxy-cache/src/store/file.rs:91,109 and \
+             store/redis.rs:56,101 each drop a cleanup error with `let _ = ...`. That crate is \
+             out of this lane's file allowlist; wire record_silent_degradation(op) at those \
+             sites or delete under WOR-1898",
+        ),
     },
     MetricCapability {
         name: "sbproxy_sink_install_failures_total",
@@ -1881,7 +1981,18 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["protocol", "result"],
         description: "Transport-layer request duration, by protocol and outcome.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it, not even a test. Both this histogram and the sibling counter \
+             sbproxy_transport_requests_total are written by the single \
+             record_transport_request(protocol, result, duration_secs) helper \
+             (crates/sbproxy-observe/src/metrics.rs), meant to give protocol-specific \
+             coverage (grpc/grpc_web/graphql/websocket/h3) alongside the already-Stable \
+             per-request generic metrics. The dispatch code for those protocols lives in \
+             crates/sbproxy-transport/src/grpc/ and the websocket/h3/graphql paths in \
+             crates/sbproxy-core/src/server/ (proxy_http.rs, action_dispatch.rs), out of \
+             this lane's file allowlist; wire the call at each protocol's completion point \
+             or delete both metrics under WOR-1898",
+        ),
     },
     MetricCapability {
         name: "sbproxy_transport_requests_total",
@@ -1892,7 +2003,12 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["protocol", "result"],
         description: "Transport-layer requests, by protocol and outcome.",
-        dead_reason: Some("nothing calls it; wire or delete under WOR-1898"),
+        dead_reason: Some(
+            "nothing calls it, not even a test. Written by the same \
+             record_transport_request(...) helper as sbproxy_transport_duration_seconds \
+             above; see that entry for the call-site detail. Wire or delete both together \
+             under WOR-1898",
+        ),
     },
     MetricCapability {
         name: "sbproxy_unrouted_requests_total",
