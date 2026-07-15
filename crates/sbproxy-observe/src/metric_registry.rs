@@ -2125,7 +2125,10 @@ mod tenant_label_gap_tests {
 
     #[test]
     fn a_metric_with_a_recognized_tenant_label_passes() {
-        let metrics = [tenant_scoped_metric("sbproxy_thing_total", &["tenant_id", "result"])];
+        let metrics = [tenant_scoped_metric(
+            "sbproxy_thing_total",
+            &["tenant_id", "result"],
+        )];
         let errors = tenant_label_gaps(&metrics, &["sbproxy_thing_total"], &[]);
         assert_eq!(errors, vec![]);
     }
@@ -2193,7 +2196,9 @@ mod tenant_label_gap_tests {
         let errors = tenant_label_gaps(&metrics, &["sbproxy_thing_total"], &exemptions);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
-            errors[0].message.contains("is not listed in TENANT_SCOPED_METRICS"),
+            errors[0]
+                .message
+                .contains("is not listed in TENANT_SCOPED_METRICS"),
             "{:?}",
             errors[0]
         );
