@@ -7,7 +7,7 @@ publish = false
 description = "Local model-serving subsystem for sbproxy: model catalog, GPU fit planner, and engine supervisor (WOR-1652). Single-node, engine-agnostic, hardware-independent core."
 
 [features]
-default = []
+default = ["tokenizer"]
 # Real NVIDIA GPU discovery via NVML (runtime dlopen, no CUDA toolkit at
 # build time). Off by default at the crate level so library builds stay
 # lean; the `sbproxy` binary enables it by default, which is safe
@@ -25,8 +25,14 @@ gpu-apple = []
 # enabled by default in the `sbproxy` binary.
 weights = ["dep:reqwest"]
 # Accurate token counting (against a model's own tokenizer.json) and
-# chat-template rendering. Off by default; both crates are already in
-# the workspace (extension/classifiers), so this adds no new lock deps.
+# chat-template rendering (WOR-1671). On by default at the crate level:
+# encoding a fixed tokenizer.json is deterministic, so unlike the other
+# optional features here there is no reason to make callers opt in, and
+# both `tokenizers` and `minijinja` are already default dependencies
+# elsewhere in the workspace (classifiers / ai / modules) at these same
+# versions, so this adds no new lock deps. Budgets and context-fit
+# previously had to fall back to a length-based heuristic for want of
+# this one flag; with it on, local-model callers get an exact count.
 tokenizer = ["dep:tokenizers", "dep:minijinja"]
 # In-process embedded engine (WOR-1658): runs a model inside the gateway
 # with no subprocess, for a single-binary / zero-external-engine deploy.

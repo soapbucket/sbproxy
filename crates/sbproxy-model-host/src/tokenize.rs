@@ -7,10 +7,13 @@
 //! count against the model's *own* tokenizer, and a locally-served
 //! model needs its own chat template applied when the engine expects a
 //! preformatted prompt rather than messages. This module is behind the
-//! `tokenizer` feature (it pulls `tokenizers` + `minijinja`, both
-//! already in the workspace). The HF `tokenizers` crate loads the
-//! model's `tokenizer.json`; `minijinja` is what TGI and mistral.rs use
-//! to render the Jinja `chat_template`.
+//! `tokenizer` feature, which is on by default (it pulls `tokenizers` +
+//! `minijinja`, both already default dependencies elsewhere in the
+//! workspace, so enabling it adds no new lock entries). The HF
+//! `tokenizers` crate loads the model's `tokenizer.json`; `minijinja`
+//! is what TGI and mistral.rs use to render the Jinja `chat_template`.
+//! With the feature compiled in, callers get this exact count instead
+//! of a length-based heuristic.
 
 use serde::Serialize;
 
@@ -110,6 +113,26 @@ mod tests {
     #[test]
     fn bad_tokenizer_json_is_an_error() {
         assert!(count_tokens(b"not json", "hi").is_err());
+    }
+
+    #[test]
+    fn real_tokenizer_diverges_from_a_length_heuristic() {
+        // A 20-character single "word" (no whitespace) that is not an
+        // exact vocab entry: the real tokenizer looks it up and falls
+        // back to exactly one `[UNK]` token. A naive length-based
+        // heuristic (`chars / 4`, the kind of estimate used when there
+        // is no local tokenizer.json to load against) would guess 5.
+        // The two numbers disagree, which is the point: this asserts
+        // the exact vocab-lookup path ran, not an approximation.
+        let text = "helloworldhelloworld";
+        assert_eq!(text.len(), 20);
+        let exact = count_tokens(TINY_TOKENIZER.as_bytes(), text).unwrap();
+        let heuristic_guess = text.len() / 4;
+        assert_eq!(exact, 1, "expected a single [UNK] token from real lookup");
+        assert_ne!(
+            exact, heuristic_guess,
+            "real tokenizer count should not match a length-based guess"
+        );
     }
 
     #[test]
