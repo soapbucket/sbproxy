@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-14*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -86,11 +86,13 @@ Creation and deletion are separate operations. In particular,
 `DELETE /admin/keys/{id}` is not guarded by `policy_revision`; coordinate
 destructive deletion separately from policy editing.
 
-This compare-and-swap protects the key policy document. It does not make
-runtime RPM, TPM, or budget accounting strictly atomic across gateway nodes.
-Cluster-wide strict Redis reservations are deferred to WOR-1845. Authenticated
-caller introspection is separate rollout work and is not documented as
-available here.
+This compare-and-swap protects the key policy document, not the runtime usage
+counters. RPM, TPM, and budget accounting for a governed key run through a
+separate ledger with its own consistency guarantee, approximate by default or
+strict against Redis; see
+[Governed admission: strict and approximate](#governed-admission-strict-and-approximate).
+Authenticated caller introspection is separate rollout work and is not
+documented as available here.
 
 ![a key minted on node A, read immediately from node B, then revoked with both replicas seeing it, no reload](assets/ai-dynamic-keys-cluster.gif)
 
@@ -216,6 +218,7 @@ The plaintext token appears once at mint; list calls only ever show the key_id (
 | `GET /admin/keys` | List keys (no secrets) |
 | `GET /admin/keys/policy-schema` | Fetch the server-driven field, editor, clear, and enforcement contract |
 | `GET /admin/keys/{id}` | Fetch one key |
+| `GET /admin/keys/{id}/usage` | Fetch governed usage (used, reserved, remaining) and governance backend health |
 | `POST /admin/keys/{id}/effective-policy/preview` | Evaluate a bounded sample without dispatching or changing counters |
 | `PATCH /admin/keys/{id}` | Update policy with required `expected_revision` |
 | `DELETE /admin/keys/{id}` | Delete a key |
@@ -413,10 +416,12 @@ accounting are different guarantees; see
   Stored-key token and cost settlement currently applies only to standard JSON
   POST inference surfaces when the provider response reports parseable usage.
   Multipart and non-POST requests can still dispatch, but they do not settle
-  `max_tokens_per_minute`, `max_budget_tokens`, or `max_budget_usd` counters.
-  Extending settlement to those surfaces, together with strict multi-node
-  reservations, is deferred to WOR-1845. Until then, do not treat these caps as
-  a strict ceiling for multipart, non-POST, or concurrent multi-node traffic.
+  `max_tokens_per_minute`, `max_budget_tokens`, or `max_budget_usd` counters, so
+  do not treat these caps as a hard ceiling on multipart or non-POST traffic.
+  For standard JSON POST traffic, a governed key reserves against these caps
+  before the request dispatches; see
+  [Governed admission: strict and approximate](#governed-admission-strict-and-approximate)
+  for what "cluster-aware" means under each consistency tier.
 - **Scheduling lane:** `priority` (`interactive`, `standard`, or `batch`)
   places the key's requests in a lane on the locally served model's admission
   queue. Unset means standard. See the model host doc for how lanes queue and
@@ -457,6 +462,72 @@ This field does not control the key-owned definitions in `inject_tools` or
 `inject_mcp`. In the web UI, choose **Unrestricted** for `null`, or **Use
 allowlist** for a list. An empty allowlist intentionally denies every
 caller-supplied tool.
+
+### Governed admission: strict and approximate
+
+A governed key with at least one of `max_requests_per_minute`,
+`max_tokens_per_minute`, `max_budget_tokens`, or `max_budget_usd` set reserves
+against a dedicated governance ledger before the request dispatches, and
+settles the reservation once the provider's response reports usage. A request
+that would exceed a limit is denied before it reaches an upstream.
+`key_management.governance:` picks the consistency guarantee behind that
+ledger:
+
+```yaml
+proxy:
+  key_management:
+    governance:
+      consistency: approximate      # approximate | strict
+      # backend:                    # required only when consistency is strict
+      #   type: redis
+      #   url: rediss://governance.internal:6379/2
+      lease_ttl_secs: 120
+      terminal_retention_secs: 300
+      failure_mode: closed        # closed | allow_unreserved
+      missing_rate: zero_cost     # zero_cost | require_rate
+```
+
+- **`approximate`** (the default) counts requests, tokens, and cost locally on
+  each gateway process. In a cluster, each node periodically publishes its own
+  settled usage and merges every live peer's usage back in, so a governed
+  key's admission check weighs the rest of the fleet's spend, not just this
+  node's own counters. That merged view catches up on a short interval rather
+  than updating instantly, so treat it as cluster-aware within a bounded
+  staleness window, not an exact global total. Only settled usage
+  disseminates; an open reservation stays local until it settles or expires.
+  No external database is required, but the cross-node view only exists when
+  clustering itself is active; an unclustered node in approximate mode counts
+  only its own traffic.
+- **`strict`** reserves and settles against a dedicated Redis backend instead.
+  Every gateway targets the same hash-tagged key, and the reserve, settle, and
+  release operations run as atomic Redis-side scripts, so two nodes cannot
+  both admit a request only one of them has budget for. Set
+  `governance.backend` to `{type: redis, url: ...}` (`redis://` or
+  `rediss://`). `consistency: strict` without a `backend` fails config
+  validation at load and reload rather than silently falling back to per-node
+  enforcement, and a `backend` set under `consistency: approximate` fails
+  validation the same way. This backend is independent of
+  `key_management.store` and `cache.tier: redis`; configure a strict
+  governance URL separately even if you already point those at Redis.
+
+`failure_mode` (default `closed`) decides what happens when a governance
+backend outage stops a reserve call from completing. `closed` denies the
+request with `503` rather than let a governed limit go silently unenforced.
+`allow_unreserved` is the audited escape hatch: it admits the request without
+a reservation instead, and every time it fires the decision is logged,
+recorded on the `security_audit` channel, and counted on
+`sbproxy_governance_fail_open_total{key_id}`, so leaving it off the default
+posture is a deliberate choice you can see in the numbers, not a silent one.
+
+`missing_rate` (default `zero_cost`) governs a key that carries a
+`total_micro_usd` limit when the resolved model has no configured rate.
+`zero_cost` treats the request as free at reserve time and still settles the
+key's cost limit from actually billed usage. `require_rate` denies the request
+instead, so a monetary limit is never left silently unenforced against a model
+whose spend cannot be pre-accounted.
+
+See [Dependency degradation matrix](degradation.md) for current outage
+behavior per backend.
 
 Set policy fields at mint time or with `PATCH /admin/keys/{id}`. Admin writes
 and seed records both use flat `max_budget_tokens`, `max_budget_usd`, and
