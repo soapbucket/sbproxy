@@ -318,6 +318,42 @@ fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
         })
 }
 
+/// Translate a resolved effective key policy into governance limits.
+///
+/// This is the `GovernanceLimits` analog of [`merged_request_budget`]: it
+/// reads the same [`sbproxy_ai::effective_key_policy::EffectiveKeyPolicy`]
+/// fields the process-local rate limiter and budget tracker already read,
+/// but shapes them for [`sbproxy_ai::governance::GovernanceStore::reserve`]
+/// instead. Returns `None` when the policy carries no governed limit at all
+/// (nothing to enforce), so the caller can skip the reserve round-trip
+/// entirely for ungoverned or unlimited keys.
+fn governance_limits_from_policy(
+    policy: &sbproxy_ai::effective_key_policy::EffectiveKeyPolicy,
+) -> Option<sbproxy_ai::governance::GovernanceLimits> {
+    let total_micro_usd = policy
+        .budget
+        .as_ref()
+        .and_then(|budget| budget.max_cost_usd)
+        .map(crate::server::ai_support::cost_usd_to_micros);
+    let total_tokens = policy.budget.as_ref().and_then(|budget| budget.max_tokens);
+    let requests = policy.max_requests_per_minute;
+    let tokens = policy.max_tokens_per_minute;
+    if requests.is_none()
+        && tokens.is_none()
+        && total_tokens.is_none()
+        && total_micro_usd.is_none()
+    {
+        return None;
+    }
+    Some(sbproxy_ai::governance::GovernanceLimits {
+        requests_per_window: requests,
+        tokens_per_window: tokens,
+        total_tokens,
+        total_micro_usd,
+        window_millis: 60_000,
+    })
+}
+
 /// Process-global per-key rate limiter (WOR-1558). Accumulates request counts
 /// per virtual key across requests; the limit itself is read per-request from
 /// the resolved record, so a live PATCH changes enforcement without a reload.
@@ -2105,6 +2141,117 @@ pub(super) async fn handle_ai_proxy(
         body.get("max_tokens").and_then(serde_json::Value::as_u64),
         body.get("top_p").and_then(serde_json::Value::as_f64),
     );
+
+    // --- Governed-key admission (reserve) ---
+    //
+    // WOR-1835: reserve against `GovernanceStore` for keys whose effective
+    // policy carries a governed limit. This runs alongside the three
+    // existing per-key mechanisms above and below (`key_rate_limiter()`,
+    // `merged_request_budget`/`budget_preflight`, and the
+    // `AI_MODEL_RATE_LIMITER` reservation just below) without touching or
+    // replacing any of them; it is intentionally additive for this wiring
+    // pass. Gated on a governance store being configured, an effective key
+    // policy being resolved, and that policy carrying at least one
+    // governed limit (`governance_limits_from_policy` returns `None`
+    // otherwise, so ungoverned/unlimited keys skip the reserve round-trip).
+    // Unlike the `AI_MODEL_RATE_LIMITER` block below, this is NOT gated on
+    // `model_rate_limits` containing the resolved model: governance must
+    // apply to any governed key regardless of that origin-level config.
+    // A backend error here fails OPEN (admits the request) rather than
+    // failing an otherwise-valid request closed on store trouble; strict
+    // fail-closed behavior is a follow-up.
+    if let (Some(store), Some(policy)) = (
+        key_plane.as_ref().map(|plane| plane.governance_store()),
+        ctx.effective_key_policy.as_ref(),
+    ) {
+        if let Some(limits) = governance_limits_from_policy(policy) {
+            // Capture the owned fields we still need before touching `ctx`
+            // again: `policy` is a shared reborrow of `ctx.effective_key_policy`
+            // through the `&mut RequestContext` parameter, so ending its last
+            // use here (rather than reading it again from inside the `match`
+            // arms below, one of which writes `ctx.governance_lease`) keeps
+            // the borrow checker happy without relying on per-arm liveness.
+            let key_id = policy.key_id.clone();
+            let policy_revision = policy.policy_revision;
+            let parsed_messages = body
+                .get("messages")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let token_ceiling = sbproxy_ai::estimate_tokens(&model, &parsed_messages);
+            let reserve = sbproxy_ai::governance::ReserveRequest {
+                reservation_id: ctx.request_id.to_string(),
+                key_id: key_id.clone(),
+                policy_revision,
+                limits,
+                token_ceiling,
+                // Cost-ceiling estimation is a follow-up; settle at the
+                // response side still records the actual cost regardless
+                // of this ceiling being zero.
+                micro_usd_ceiling: 0,
+            };
+            match store.reserve(reserve).await {
+                Ok(reservation) => {
+                    ctx.governance_lease = Some(crate::governance_runtime::GovernanceLease::new(
+                        store,
+                        reservation,
+                    ));
+                }
+                Err(sbproxy_ai::governance::GovernanceError::LimitExceeded(denial)) => {
+                    // Governed limit hit: deny with 429 before contacting
+                    // any upstream, mirroring the `AI_MODEL_RATE_LIMITER`
+                    // 429 shape just below.
+                    warn!(
+                        ai.key_id = %key_id,
+                        dimension = ?denial.dimension,
+                        "AI proxy: governed key limit exceeded pre-flight; returning 429"
+                    );
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
+                        "governed key limit exceeded",
+                    );
+                    let retry_after_secs = denial
+                        .reset_at_millis
+                        .map(|reset_at| {
+                            let now_millis = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|elapsed| elapsed.as_millis() as u64)
+                                .unwrap_or(0);
+                            reset_at.saturating_sub(now_millis) / 1000 + 1
+                        })
+                        .unwrap_or(1)
+                        .max(1);
+                    let retry = retry_after_secs.to_string();
+                    let extra: Option<(&str, &str)> = Some(("retry-after", &retry));
+                    send_response_with_extra(
+                        session,
+                        429,
+                        "application/json",
+                        br#"{"error":{"message":"governed key limit exceeded","type":"rate_limit_error"}}"#,
+                        extra,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    // Backend/other error: this wiring pass fails OPEN
+                    // (admit) and logs. Strict fail-closed behavior is a
+                    // follow-up.
+                    debug!(
+                        %error,
+                        "AI proxy: governance reserve error; admitting (fail-open for now)"
+                    );
+                }
+            }
+        }
+    }
 
     // --- Pre-request token estimate + TPM reservation ---
     //
@@ -4924,6 +5071,17 @@ pub(super) async fn relay_ai_response_with_cache(
                     ctx_ref.ai_cost_usd_micros = Some(cost_micros);
                 }
             }
+            // WOR-1835: governed-key settlement. Charges the reservation
+            // taken at ingress with actual usage now that both token
+            // counts and `cost_micros` are known. Runs alongside the
+            // `ai_admission` reconcile above; best-effort on error (the
+            // lease's `Drop` repairs a failed settle on the eventual
+            // `RequestContext` drop).
+            if let Some(ctx_ref) = ctx.as_mut() {
+                if let Some(mut lease) = ctx_ref.governance_lease.take() {
+                    let _ = lease.settle(prompt_tokens + completion_tokens, cost_micros).await;
+                }
+            }
         }
     } else if let Some(ctx) = ctx.as_deref_mut() {
         // Even without a budget recorder we still want the access log
@@ -4968,6 +5126,14 @@ pub(super) async fn relay_ai_response_with_cache(
                 );
                 if cost_micros > 0 {
                     ctx.ai_cost_usd_micros = Some(cost_micros);
+                }
+                // WOR-1835: governed-key settlement, mirroring the
+                // budget-recorder branch above so origins without a
+                // configured budget still settle a governance reservation
+                // taken at ingress. Best-effort on error (the lease's
+                // `Drop` repairs a failed settle).
+                if let Some(mut lease) = ctx.governance_lease.take() {
+                    let _ = lease.settle(prompt_tokens + completion_tokens, cost_micros).await;
                 }
             }
             // WOR-798: feed the router's per-provider token counter
@@ -6297,7 +6463,11 @@ pub(super) async fn relay_ai_stream(
                 };
                 let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
                 let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
-                emit_ai_billing_event(
+                // WOR-1835: bind the billing event's micro-USD return
+                // (previously discarded here) so a streaming response can
+                // settle its governance reservation with the same figure
+                // just recorded to the budget ledger.
+                let cost_micros = emit_ai_billing_event(
                     args.surface_label,
                     args.provider_name,
                     Some(args.model.to_string()),
@@ -6309,6 +6479,18 @@ pub(super) async fn relay_ai_stream(
                     args.api_key_id.as_str(),
                     &ai_span,
                 );
+                // WOR-1835: governed-key settlement. `ai_admission` never
+                // reconciles on the streaming path (its reservation is
+                // simply refunded in full on drop), a pre-existing gap
+                // this settle deliberately does not inherit: streaming
+                // responses settle their governance reservation with
+                // actual usage here. Best-effort on error (the lease's
+                // `Drop` repairs a failed settle).
+                if let Some(c) = ctx.as_deref_mut() {
+                    if let Some(mut lease) = c.governance_lease.take() {
+                        let _ = lease.settle(prompt + completion, cost_micros).await;
+                    }
+                }
 
                 // WOR-1093: a stream that did not run to a clean
                 // upstream completion still consumed the prompt (and
@@ -7976,6 +8158,86 @@ mod effective_key_budget_tests {
             scope_keys(&merged, &policy.key_id, "composed-origin").len(),
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod governance_limits_from_policy_tests {
+    use super::*;
+    use sbproxy_ai::governance::GovernanceLimits;
+    use sbproxy_keystore::record::{KeyRecord, RecordBudget};
+
+    fn policy_with(
+        max_requests_per_minute: Option<u64>,
+        max_tokens_per_minute: Option<u64>,
+        max_tokens: Option<u64>,
+        max_cost_usd: Option<f64>,
+    ) -> sbproxy_ai::effective_key_policy::EffectiveKeyPolicy {
+        let mut record = KeyRecord::new("governed-key", "secret-hash", chrono::Utc::now());
+        record.max_requests_per_minute = max_requests_per_minute;
+        record.max_tokens_per_minute = max_tokens_per_minute;
+        if max_tokens.is_some() || max_cost_usd.is_some() {
+            record.budget = Some(RecordBudget {
+                max_tokens,
+                max_cost_usd,
+            });
+        }
+        key_record_to_effective_policy(&record, "tenant-a").expect("valid governed policy")
+    }
+
+    #[test]
+    fn returns_none_for_a_policy_with_no_governed_limit() {
+        let policy = policy_with(None, None, None, None);
+        assert!(governance_limits_from_policy(&policy).is_none());
+    }
+
+    #[test]
+    fn maps_request_and_token_window_limits() {
+        let policy = policy_with(Some(60), Some(120_000), None, None);
+        let limits = governance_limits_from_policy(&policy).expect("rpm/tpm limit is governed");
+        assert_eq!(
+            limits,
+            GovernanceLimits {
+                requests_per_window: Some(60),
+                tokens_per_window: Some(120_000),
+                total_tokens: None,
+                total_micro_usd: None,
+                window_millis: 60_000,
+            }
+        );
+    }
+
+    #[test]
+    fn maps_budget_total_tokens_and_converts_max_cost_usd_to_micro_usd() {
+        let policy = policy_with(None, None, Some(1_000_000), Some(12.5));
+        let limits = governance_limits_from_policy(&policy).expect("budget is governed");
+        assert_eq!(
+            limits,
+            GovernanceLimits {
+                requests_per_window: None,
+                tokens_per_window: None,
+                total_tokens: Some(1_000_000),
+                total_micro_usd: Some(crate::server::ai_support::cost_usd_to_micros(12.5)),
+                window_millis: 60_000,
+            }
+        );
+        // `cost_usd_to_micros` rounds to the nearest whole micro-USD; pin the
+        // literal value too so a change to that helper's rounding is caught
+        // here, not just as "some conversion happened".
+        assert_eq!(limits.total_micro_usd, Some(12_500_000));
+    }
+
+    #[test]
+    fn a_single_governed_field_is_enough_to_produce_limits() {
+        // Only `max_requests_per_minute` set: the other three fields stay
+        // `None` in the mapped `GovernanceLimits`, but the policy as a whole
+        // still counts as governed (not skipped).
+        let policy = policy_with(Some(30), None, None, None);
+        let limits = governance_limits_from_policy(&policy).expect("rpm alone is governed");
+        assert_eq!(limits.requests_per_window, Some(30));
+        assert_eq!(limits.tokens_per_window, None);
+        assert_eq!(limits.total_tokens, None);
+        assert_eq!(limits.total_micro_usd, None);
     }
 }
 
