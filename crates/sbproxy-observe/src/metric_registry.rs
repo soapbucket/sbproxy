@@ -13,18 +13,18 @@
 //!
 //! Two fields carry the weight:
 //!
-//! - [`MetricCapability::writer`] names the production code that drives the
+//! - `MetricCapability::writer` names the production code that drives the
 //!   family. The drift guard resolves that symbol against the source tree and
 //!   requires a call site outside `#[cfg(test)]`. A recorder that exists,
 //!   compiles, and is called by nobody is the failure mode this catches, and
 //!   it is invisible to review because the metric still appears in `/metrics`,
 //!   still scrapes, and still renders. It just renders zero.
-//! - [`MetricCapability::support`] is that liveness, made declarable.
+//! - `MetricCapability::support` is that liveness, made declarable.
 //!   `Stable` means something writes it. `ConfigOnly` means nothing does, and
 //!   is an honest and permitted state so long as it is *declared*, carries a
 //!   `dead_reason`, and no dashboard reads it.
 //!
-//! [`MetricCapability::compat`] is a different axis: the promise about the
+//! `MetricCapability::compat` is a different axis: the promise about the
 //! *name*, which is what `docs/metrics-stability.md` publishes. A dead metric
 //! cannot carry a `stable` compat tier, because a naming guarantee on a series
 //! nobody emits is a guarantee about nothing.

@@ -167,7 +167,7 @@ pub enum Writer {
     Field(&'static str),
     /// Nothing writes this family.
     ///
-    /// Requires [`MetricCapability::dead_reason`] and a tracking ticket, and
+    /// Requires `MetricCapability::dead_reason` and a tracking ticket, and
     /// forces [`SupportLevel::ConfigOnly`]. A dead metric may not be
     /// referenced by any dashboard or alert rule.
     Nothing,
