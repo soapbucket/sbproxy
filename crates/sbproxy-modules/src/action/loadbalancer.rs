@@ -427,7 +427,15 @@ impl LoadBalancerAction {
     pub fn record_breaker_success(&self, idx: usize) {
         if let Some(brs) = &self.circuit_breakers {
             if let Some(b) = brs.get(idx) {
-                b.record_success();
+                if let Some((from, to)) = b.record_success() {
+                    if let Some(target) = self.targets.get(idx) {
+                        sbproxy_observe::metrics::record_circuit_breaker(
+                            &target.url,
+                            from.as_str(),
+                            to.as_str(),
+                        );
+                    }
+                }
             }
         }
     }
@@ -439,7 +447,15 @@ impl LoadBalancerAction {
     pub fn record_breaker_failure(&self, idx: usize) {
         if let Some(brs) = &self.circuit_breakers {
             if let Some(b) = brs.get(idx) {
-                b.record_failure();
+                if let Some((from, to)) = b.record_failure() {
+                    if let Some(target) = self.targets.get(idx) {
+                        sbproxy_observe::metrics::record_circuit_breaker(
+                            &target.url,
+                            from.as_str(),
+                            to.as_str(),
+                        );
+                    }
+                }
             }
         }
     }

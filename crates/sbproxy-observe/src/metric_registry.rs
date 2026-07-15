@@ -684,25 +684,6 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
-        name: "sbproxy_cache_hits_total",
-        kind: MetricKind::Counter,
-        writer: Writer::Nothing,
-        support: SupportLevel::ConfigOnly,
-        compat: CompatTier::Alpha,
-        registry: Registry::Proxy,
-        labels: &["hostname", "result"],
-        description: "Cache hit/miss counts.",
-        dead_reason: Some(
-            "nothing calls it. Duplicates sbproxy_cache_results_total (also dead; see its \
-             entry), keyed by hostname instead of origin. Should be deleted, but \
-             dashboards/grafana/sbproxy-overview.json still has a panel on this exact name \
-             (see the matching REFERENCE_EXEMPTIONS entry below), and dashboards/ is out of \
-             this lane's file allowlist; deleting this entry without also repointing or \
-             removing that panel breaks the drift guard the other way (an undeclared \
-             reference). Delete both together under WOR-1898 once the panel is dispositioned",
-        ),
-    },
-    MetricCapability {
         name: "sbproxy_cache_reserve_evictions_total",
         kind: MetricKind::Counter,
         writer: Writer::Field("cache_reserve_evictions"),
@@ -749,22 +730,13 @@ pub const METRICS: &[MetricCapability] = &[
     MetricCapability {
         name: "sbproxy_cache_results_total",
         kind: MetricKind::Counter,
-        writer: Writer::Nothing,
-        support: SupportLevel::ConfigOnly,
-        compat: CompatTier::Alpha,
+        writer: Writer::Recorder("record_cache"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
         registry: Registry::Proxy,
         labels: &["origin", "result"],
-        description: "Cache hit/miss.",
-        dead_reason: Some(
-            "nothing calls it. sbproxy_cache_hits_total (hostname-keyed) covers the same \
-             uninstrumented HTTP response cache and should be deleted alongside this one \
-             once dashboards/grafana/sbproxy-overview.json's panel on that name is \
-             dispositioned (see that entry). Of the two, this is the one worth wiring: the \
-             hit/miss decision is made in crates/sbproxy-core/src/server/request_phase.rs \
-             around the build_response_cache_key call sites; wire \
-             record_cache(origin, \"hit\"|\"miss\") there (out of sbproxy-observe's file \
-             allowlist) or delete both under WOR-1898",
-        ),
+        description: "HTTP response cache outcomes (hit or miss), by origin.",
+        dead_reason: None,
     },
     MetricCapability {
         name: "sbproxy_capture_budget_dropped_total",
@@ -802,22 +774,13 @@ pub const METRICS: &[MetricCapability] = &[
     MetricCapability {
         name: "sbproxy_circuit_breaker_transitions_total",
         kind: MetricKind::Counter,
-        writer: Writer::Nothing,
-        support: SupportLevel::ConfigOnly,
-        compat: CompatTier::Alpha,
+        writer: Writer::Recorder("record_circuit_breaker"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
         registry: Registry::Proxy,
         labels: &["origin", "from_state", "to_state"],
-        description: "Circuit breaker state transitions.",
-        dead_reason: Some(
-            "nothing calls it, not even a test. The recorder (record_circuit_breaker, \
-             crates/sbproxy-observe/src/metrics.rs) exists and is unit-tested, but the actual \
-             breaker state machines live in crates/sbproxy-platform/src/circuitbreaker.rs and \
-             adaptive_breaker.rs, which are out of this lane's file allowlist; wire the \
-             transition call there or delete under WOR-1898. docs/events.md:26 currently \
-             points operators at this exact dead metric name for circuit-breaker visibility; \
-             that line needs fixing in the same change that resolves this entry (docs/ is \
-             out of this lane's allowlist too)",
-        ),
+        description: "Circuit breaker state transitions, by origin and from/to state.",
+        dead_reason: None,
     },
     // Found by the drift guard, not by the audit that preceded it: the gauge is
     // set by `ClockSkewMonitor::record_skew`, which is only reachable through
@@ -1758,31 +1721,13 @@ pub const METRICS: &[MetricCapability] = &[
     MetricCapability {
         name: "sbproxy_rate_limit_suspend_total",
         kind: MetricKind::Counter,
-        writer: Writer::Nothing,
-        support: SupportLevel::ConfigOnly,
-        compat: CompatTier::Alpha,
+        writer: Writer::Recorder("record_rate_limit_suspend"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["workspace"],
         description: "Workspace auto-suspend transitions.",
-        dead_reason: Some(
-            "the writer-liveness scanner (crates/sbproxy-capability/src/scan.rs) reports zero \
-             call sites, but that is a false negative, not the truth: \
-             crates/sbproxy-core/src/rate_limit_budget.rs's RateLimitBudget::emit_suspend \
-             (non-test, on the auto-suspend escalation path) genuinely calls this recorder \
-             every time it fires. The scanner searches for the literal token \
-             'record_rate_limit_suspend(' and that file imports it aliased -- \
-             `use sbproxy_observe::metrics::{record_rate_limit, record_rate_limit_suspend as \
-             record_suspend}` -- then calls `record_suspend(workspace)`, so the exact-name \
-             text search never sees it. This metric is not actually dead; it is stuck \
-             ConfigOnly because the alias defeats the guard. Fix is a one-line rename in \
-             rate_limit_budget.rs (drop the `as record_suspend`, call \
-             record_rate_limit_suspend directly), which is out of this lane's file allowlist \
-             (crates/sbproxy-core). Once that lands, flip this entry to \
-             writer: Writer::Recorder(\"record_rate_limit_suspend\"), support: \
-             SupportLevel::Stable, dead_reason: None. Do not 'fix' this by teaching the \
-             scanner to follow import aliases; that widens what the guard accepts workspace- \
-             wide for one call site here",
-        ),
+        dead_reason: None,
     },
     MetricCapability {
         name: "sbproxy_rate_limit_total",
@@ -2063,22 +2008,13 @@ pub const METRICS: &[MetricCapability] = &[
 /// whole difference between "known dead" as a decision and "known dead" as an
 /// accident. Everything here is a panel or rule that draws a flat zero today
 /// and will draw real data when its ticket lands.
-pub const REFERENCE_EXEMPTIONS: &[ReferenceExemption] = &[
-    ReferenceExemption {
-        metric: "sbproxy_cache_hits_total",
-        reason: "The overview dashboard's cache-hit panel predates any writer. \
-                 Superseded by sbproxy_cache_results_total, which is also unwired. \
-                 The HTTP response cache is genuinely uninstrumented; wiring it is \
-                 WOR-1898, which owns metrics.rs next.",
-    },
-    ReferenceExemption {
-        metric: "sbproxy_model_host_load_queue_depth",
-        reason: "SBProxyModelHostLoadQueueBackedUp alerts on a gauge nobody sets, \
+pub const REFERENCE_EXEMPTIONS: &[ReferenceExemption] = &[ReferenceExemption {
+    metric: "sbproxy_model_host_load_queue_depth",
+    reason: "SBProxyModelHostLoadQueueBackedUp alerts on a gauge nobody sets, \
                  so it cannot fire. The setter lives in sbproxy-model-host, which \
                  WOR-1903 owns exclusively while the scalar-to-set refactor lands. \
                  Wired by WOR-1898 once that clears.",
-    },
-];
+}];
 
 // --- Tenant-scoping guard (multi-tenant enforcement) ---
 //

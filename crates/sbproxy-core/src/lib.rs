@@ -37,6 +37,8 @@ pub mod admin_ui;
 /// and the per-request context. Feature-gated by `agent-class`.
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
+/// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
+pub mod alerting;
 /// Empty-shell registry for built-in policy
 /// enforcer wrappers.
 ///

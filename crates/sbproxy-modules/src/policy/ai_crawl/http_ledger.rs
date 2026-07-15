@@ -270,7 +270,13 @@ impl Ledger for HttpLedger {
                 &signature_header,
             ) {
                 Ok(result) => {
-                    self.breaker.record_success();
+                    if let Some((from, to)) = self.breaker.record_success() {
+                        sbproxy_observe::metrics::record_circuit_breaker(
+                            &self.config.endpoint,
+                            from.as_str(),
+                            to.as_str(),
+                        );
+                    }
                     if let Some(r) = &self.recency {
                         r.mark_success();
                     }
@@ -278,7 +284,13 @@ impl Ledger for HttpLedger {
                 }
                 Err(err) => {
                     if err.retryable {
-                        self.breaker.record_failure();
+                        if let Some((from, to)) = self.breaker.record_failure() {
+                            sbproxy_observe::metrics::record_circuit_breaker(
+                                &self.config.endpoint,
+                                from.as_str(),
+                                to.as_str(),
+                            );
+                        }
                         last_err = Some(err);
                         continue;
                     }

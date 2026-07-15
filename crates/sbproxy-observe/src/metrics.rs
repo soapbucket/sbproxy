@@ -230,8 +230,6 @@ pub struct ProxyMetrics {
     pub errors_total: IntCounterVec,
     /// Gauge `sbproxy_active_connections` of currently active connections.
     pub active_connections: IntGauge,
-    /// Counter `sbproxy_cache_hits_total` of cache hits and misses labelled by hostname.
-    pub cache_hits: IntCounterVec,
     /// Counter `sbproxy_ai_cost_usd_micros_total` of AI request cost in
     /// micro-USD, labelled by provider, model, and tenant.
     pub ai_cost_usd_micros_total: IntCounterVec,
@@ -383,12 +381,6 @@ impl ProxyMetrics {
 
         let active_connections =
             IntGauge::new("sbproxy_active_connections", "Current active connections").unwrap();
-
-        let cache_hits = IntCounterVec::new(
-            Opts::new("sbproxy_cache_hits_total", "Cache hit/miss counts"),
-            &["hostname", "result"], // "hit" or "miss"
-        )
-        .unwrap();
 
         let ai_cost_usd_micros_total = IntCounterVec::new(
             Opts::new(
@@ -662,7 +654,6 @@ impl ProxyMetrics {
         registry
             .register(Box::new(active_connections.clone()))
             .unwrap();
-        registry.register(Box::new(cache_hits.clone())).unwrap();
         registry
             .register(Box::new(ai_cost_usd_micros_total.clone()))
             .unwrap();
@@ -740,7 +731,6 @@ impl ProxyMetrics {
             request_duration,
             errors_total,
             active_connections,
-            cache_hits,
             ai_cost_usd_micros_total,
             semantic_cache_results,
             inference_requests,
@@ -3799,19 +3789,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_hits() {
-        let m = ProxyMetrics::new();
-        m.cache_hits
-            .with_label_values(&["example.com", "hit"])
-            .inc();
-        m.cache_hits
-            .with_label_values(&["example.com", "miss"])
-            .inc_by(3);
-        let output = m.render();
-        assert!(output.contains("sbproxy_cache_hits_total"));
-    }
-
-    #[test]
     fn test_render_contains_all_metric_names() {
         let m = ProxyMetrics::new();
         // Touch each legacy metric so they appear in output.
@@ -3823,7 +3800,6 @@ mod tests {
         m.request_duration.with_label_values(&["h"]).observe(0.1);
         m.errors_total.with_label_values(&["h", "e"]).inc();
         m.active_connections.set(1);
-        m.cache_hits.with_label_values(&["h", "hit"]).inc();
         m.ai_cost_usd_micros_total
             .with_label_values(&["p", "m", "tenant-a"])
             .inc_by(42);
@@ -3856,7 +3832,6 @@ mod tests {
         assert!(output.contains("sbproxy_request_duration_seconds"));
         assert!(output.contains("sbproxy_errors_total"));
         assert!(output.contains("sbproxy_active_connections"));
-        assert!(output.contains("sbproxy_cache_hits_total"));
         assert!(output.contains("sbproxy_ai_cost_usd_micros_total"));
         assert!(output.contains("sbproxy_origin_requests_total"));
         assert!(output.contains("sbproxy_origin_request_duration_seconds"));
