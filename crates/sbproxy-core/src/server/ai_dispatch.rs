@@ -338,10 +338,7 @@ fn governance_limits_from_policy(
     let total_tokens = policy.budget.as_ref().and_then(|budget| budget.max_tokens);
     let requests = policy.max_requests_per_minute;
     let tokens = policy.max_tokens_per_minute;
-    if requests.is_none()
-        && tokens.is_none()
-        && total_tokens.is_none()
-        && total_micro_usd.is_none()
+    if requests.is_none() && tokens.is_none() && total_tokens.is_none() && total_micro_usd.is_none()
     {
         return None;
     }
@@ -352,6 +349,60 @@ fn governance_limits_from_policy(
         total_micro_usd,
         window_millis: 60_000,
     })
+}
+
+/// Decide the pre-request monetary ceiling for a governance reserve
+/// (WOR-1835, task 7), or signal that the request must be denied instead.
+///
+/// `estimated_cost_usd` is [`sbproxy_ai::budget::estimate_cost_for_usage`]
+/// priced against the request's estimated token ceiling. A model the price
+/// catalog and any configured rate card both miss prices at the
+/// pessimistic $5/$1M fallback (never silently $0), so in practice a $0
+/// estimate here means there was nothing to estimate against (an empty or
+/// unparseable `messages` array) rather than a genuinely-unpriced model;
+/// `missing_rate` treats both the same way, since neither can back a real
+/// monetary pre-gate.
+///
+/// [`sbproxy_config::types::GovernanceMissingRatePolicy::ZeroCost`]
+/// (default) admits with a `0` ceiling: no monetary pre-gate applies, but
+/// settlement still records the real cost once it is known.
+/// [`sbproxy_config::types::GovernanceMissingRatePolicy::RequireRate`]
+/// returns `Err(())` instead when `has_total_micro_usd_limit` is true,
+/// since a `0` ceiling cannot actually enforce that limit and silently
+/// admitting would leave it unenforced for the life of the request.
+fn governance_micro_usd_ceiling(
+    estimated_cost_usd: f64,
+    missing_rate: sbproxy_config::types::GovernanceMissingRatePolicy,
+    has_total_micro_usd_limit: bool,
+) -> Result<u64, ()> {
+    if estimated_cost_usd > 0.0 {
+        return Ok(crate::server::ai_support::cost_usd_to_micros(
+            estimated_cost_usd,
+        ));
+    }
+    if has_total_micro_usd_limit
+        && missing_rate == sbproxy_config::types::GovernanceMissingRatePolicy::RequireRate
+    {
+        return Err(());
+    }
+    Ok(0)
+}
+
+/// Whether a `GovernanceError::BackendUnavailable` reserve failure
+/// (WOR-1835, task 8) should admit the request without a reservation,
+/// given the configured [`sbproxy_config::types::GovernanceFailureMode`].
+///
+/// Applies only to that one error variant; every other reserve error
+/// (a real governed limit, a malformed request, a reused reservation id,
+/// arithmetic overflow) is unrelated to backend availability and keeps
+/// failing open unconditionally, unaffected by this setting.
+fn governance_admits_on_backend_unavailable(
+    failure_mode: sbproxy_config::types::GovernanceFailureMode,
+) -> bool {
+    matches!(
+        failure_mode,
+        sbproxy_config::types::GovernanceFailureMode::AllowUnreserved
+    )
 }
 
 /// Process-global per-key rate limiter (WOR-1558). Accumulates request counts
@@ -2157,13 +2208,14 @@ pub(super) async fn handle_ai_proxy(
     // Unlike the `AI_MODEL_RATE_LIMITER` block below, this is NOT gated on
     // `model_rate_limits` containing the resolved model: governance must
     // apply to any governed key regardless of that origin-level config.
-    // A backend error here fails OPEN (admits the request) rather than
-    // failing an otherwise-valid request closed on store trouble; strict
-    // fail-closed behavior is a follow-up.
-    if let (Some(store), Some(policy)) = (
-        key_plane.as_ref().map(|plane| plane.governance_store()),
-        ctx.effective_key_policy.as_ref(),
-    ) {
+    if let (Some(plane), Some(policy)) = (key_plane.as_ref(), ctx.effective_key_policy.as_ref()) {
+        let store = plane.governance_store();
+        // Copy the two `Copy` config knobs out now so nothing below holds
+        // a borrow of `plane` (and transitively of `key_plane`) across the
+        // `store.reserve(..).await` further down.
+        let governance_cfg = plane.governance();
+        let failure_mode = governance_cfg.failure_mode;
+        let missing_rate = governance_cfg.missing_rate;
         if let Some(limits) = governance_limits_from_policy(policy) {
             // Capture the owned fields we still need before touching `ctx`
             // again: `policy` is a shared reborrow of `ctx.effective_key_policy`
@@ -2185,16 +2237,63 @@ pub(super) async fn handle_ai_proxy(
                 })
                 .unwrap_or_default();
             let token_ceiling = sbproxy_ai::estimate_tokens(&model, &parsed_messages);
+            // WOR-1835 (task 7): price the same token ceiling against the
+            // resolved model so a governed key's `total_micro_usd` limit is
+            // pre-gated instead of only caught after the fact at
+            // settlement. `governance_micro_usd_ceiling` folds in the
+            // `missing_rate` policy for the model-has-no-rate case.
+            let estimated_usage = sbproxy_ai::budget::AiUsage::Tokens {
+                input: token_ceiling,
+                output: 0,
+                cached_input: 0,
+                cache_creation: 0,
+            };
+            let estimated_cost_usd =
+                sbproxy_ai::budget::estimate_cost_for_usage(&model, &estimated_usage);
+            let micro_usd_ceiling = match governance_micro_usd_ceiling(
+                estimated_cost_usd,
+                missing_rate,
+                limits.total_micro_usd.is_some(),
+            ) {
+                Ok(ceiling) => ceiling,
+                Err(()) => {
+                    // `missing_rate: require_rate` and this key has a real
+                    // total_micro_usd limit: deny rather than admit with an
+                    // unenforceable $0 ceiling. Mirrors the `budget_preflight`
+                    // 402 `Block` shape above.
+                    warn!(
+                        ai.key_id = %key_id,
+                        model = %model,
+                        "AI proxy: governed key has a total_micro_usd limit but the \
+                         resolved model has no estimable rate; denying (missing_rate: \
+                         require_rate)"
+                    );
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::BUDGET_EXCEEDED,
+                        "governed key cost limit cannot be pre-gated: model has no rate",
+                    );
+                    let deny_body = serde_json::json!({
+                        "error": {
+                            "type": "budget_exceeded",
+                            "scope": "governed_key",
+                            "message": "this key has a monetary limit but the resolved \
+                                model has no estimable rate; denying rather than \
+                                admitting with an unenforced cost limit",
+                        }
+                    });
+                    let bytes = serde_json::to_vec(&deny_body).unwrap_or_default();
+                    send_response(session, 402, "application/json", &bytes).await?;
+                    return Ok(());
+                }
+            };
             let reserve = sbproxy_ai::governance::ReserveRequest {
                 reservation_id: ctx.request_id.to_string(),
                 key_id: key_id.clone(),
                 policy_revision,
                 limits,
                 token_ceiling,
-                // Cost-ceiling estimation is a follow-up; settle at the
-                // response side still records the actual cost regardless
-                // of this ceiling being zero.
-                micro_usd_ceiling: 0,
+                micro_usd_ceiling,
             };
             match store.reserve(reserve).await {
                 Ok(reservation) => {
@@ -2240,10 +2339,60 @@ pub(super) async fn handle_ai_proxy(
                     .await?;
                     return Ok(());
                 }
+                Err(sbproxy_ai::governance::GovernanceError::BackendUnavailable { backend }) => {
+                    // WOR-1835 (task 8): a backend outage is the one reserve
+                    // failure `failure_mode` governs; every other reserve
+                    // error below keeps failing open unconditionally.
+                    if governance_admits_on_backend_unavailable(failure_mode) {
+                        warn!(
+                            ai.key_id = %key_id,
+                            backend,
+                            "AI proxy: governance backend unavailable; admitting without \
+                             a reservation (failure_mode: allow_unreserved)"
+                        );
+                        // Strict fail-open must be audited (governed limits
+                        // silently stopped being enforced for this request)
+                        // and observable as a metric so an operator watching
+                        // a degraded backend can see how often this fires.
+                        sbproxy_observe::SecurityAuditEntry::policy_violation(
+                            "governance_fail_open",
+                            format!(
+                                "governance backend '{backend}' unavailable; admitted \
+                                 without a reservation"
+                            ),
+                            200,
+                            Some(hostname.to_string()),
+                            ctx.client_ip,
+                            Some(ctx.request_id.to_string()),
+                            Some(session.req_header().method.as_str().to_string()),
+                        )
+                        .with_tenant_id(ctx.tenant_id.as_str())
+                        .emit();
+                        sbproxy_observe::metrics::record_governance_fail_open(&key_id);
+                        // No lease: there is no reservation to settle or
+                        // release, so `ctx.governance_lease` stays `None`.
+                    } else {
+                        warn!(
+                            ai.key_id = %key_id,
+                            backend,
+                            "AI proxy: governance backend unavailable; failing closed (503)"
+                        );
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
+                            "governance backend unavailable",
+                        );
+                        send_error(session, 503, "governed key admission backend unavailable")
+                            .await?;
+                        return Ok(());
+                    }
+                }
                 Err(error) => {
-                    // Backend/other error: this wiring pass fails OPEN
-                    // (admit) and logs. Strict fail-closed behavior is a
-                    // follow-up.
+                    // Non-backend error (invalid request shape, a reused
+                    // reservation id with different input, arithmetic
+                    // overflow, internal invariant): unrelated to backend
+                    // availability, so `failure_mode` does not apply here.
+                    // This wiring pass keeps failing OPEN (admit) and logs.
                     debug!(
                         %error,
                         "AI proxy: governance reserve error; admitting (fail-open for now)"
@@ -5079,7 +5228,9 @@ pub(super) async fn relay_ai_response_with_cache(
             // `RequestContext` drop).
             if let Some(ctx_ref) = ctx.as_mut() {
                 if let Some(mut lease) = ctx_ref.governance_lease.take() {
-                    let _ = lease.settle(prompt_tokens + completion_tokens, cost_micros).await;
+                    let _ = lease
+                        .settle(prompt_tokens + completion_tokens, cost_micros)
+                        .await;
                 }
             }
         }
@@ -5133,7 +5284,9 @@ pub(super) async fn relay_ai_response_with_cache(
                 // taken at ingress. Best-effort on error (the lease's
                 // `Drop` repairs a failed settle).
                 if let Some(mut lease) = ctx.governance_lease.take() {
-                    let _ = lease.settle(prompt_tokens + completion_tokens, cost_micros).await;
+                    let _ = lease
+                        .settle(prompt_tokens + completion_tokens, cost_micros)
+                        .await;
                 }
             }
             // WOR-798: feed the router's per-provider token counter
@@ -8238,6 +8391,82 @@ mod governance_limits_from_policy_tests {
         assert_eq!(limits.tokens_per_window, None);
         assert_eq!(limits.total_tokens, None);
         assert_eq!(limits.total_micro_usd, None);
+    }
+}
+
+#[cfg(test)]
+mod governance_reserve_decision_tests {
+    use super::*;
+    use sbproxy_config::types::{GovernanceFailureMode, GovernanceMissingRatePolicy};
+
+    // --- governance_micro_usd_ceiling (WOR-1835, task 7) ---
+
+    #[test]
+    fn a_priced_estimate_converts_to_micro_usd_regardless_of_missing_rate_policy() {
+        // 12.5 USD -> 12_500_000 micro-USD, same conversion pinned in
+        // `governance_limits_from_policy_tests`.
+        for missing_rate in [
+            GovernanceMissingRatePolicy::ZeroCost,
+            GovernanceMissingRatePolicy::RequireRate,
+        ] {
+            assert_eq!(
+                governance_micro_usd_ceiling(12.5, missing_rate, true),
+                Ok(12_500_000)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_cost_policy_admits_a_zero_estimate_with_a_zero_ceiling_even_with_a_dollar_limit() {
+        assert_eq!(
+            governance_micro_usd_ceiling(0.0, GovernanceMissingRatePolicy::ZeroCost, true),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn require_rate_policy_admits_a_zero_estimate_when_the_key_has_no_dollar_limit() {
+        // No `total_micro_usd` limit on the key: nothing for a $0 ceiling
+        // to fail to enforce, so `require_rate` has nothing to require.
+        assert_eq!(
+            governance_micro_usd_ceiling(0.0, GovernanceMissingRatePolicy::RequireRate, false),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn require_rate_policy_denies_a_zero_estimate_when_the_key_has_a_dollar_limit() {
+        assert_eq!(
+            governance_micro_usd_ceiling(0.0, GovernanceMissingRatePolicy::RequireRate, true),
+            Err(())
+        );
+    }
+
+    // --- governance_admits_on_backend_unavailable (WOR-1835, task 8) ---
+
+    #[test]
+    fn closed_failure_mode_denies_on_backend_unavailable() {
+        assert!(!governance_admits_on_backend_unavailable(
+            GovernanceFailureMode::Closed
+        ));
+    }
+
+    #[test]
+    fn allow_unreserved_failure_mode_admits_on_backend_unavailable() {
+        assert!(governance_admits_on_backend_unavailable(
+            GovernanceFailureMode::AllowUnreserved
+        ));
+    }
+
+    #[test]
+    fn default_failure_mode_is_closed() {
+        assert_eq!(
+            GovernanceFailureMode::default(),
+            GovernanceFailureMode::Closed
+        );
+        assert!(!governance_admits_on_backend_unavailable(
+            GovernanceFailureMode::default()
+        ));
     }
 }
 

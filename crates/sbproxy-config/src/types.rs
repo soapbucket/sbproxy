@@ -748,9 +748,22 @@ pub struct KeyGovernanceConfig {
     /// Retention for settled, released, and expired reservation outcomes.
     /// Must be at least the lease duration so retries remain idempotent.
     pub terminal_retention_secs: u64,
-    /// Admit requests when the governance backend is unavailable. The default
-    /// is fail closed. Strict fail-open decisions must be audited by runtime.
-    pub failure_mode_allow: bool,
+    /// Behavior when the governance backend cannot serve a reserve call at
+    /// request time (`GovernanceError::BackendUnavailable`). The default
+    /// denies the request (fail closed): governed limits must not be
+    /// silently bypassed by a backend outage. Setting `allow_unreserved`
+    /// admits the request instead, but every such decision is always
+    /// audited on the `security_audit` channel and counted on
+    /// `sbproxy_governance_fail_open_total`.
+    #[serde(default)]
+    pub failure_mode: GovernanceFailureMode,
+    /// Behavior when a governed key carries a `total_micro_usd` limit but
+    /// the resolved model has no rate to estimate a pre-request cost
+    /// ceiling from. The default (`zero_cost`) admits with no monetary
+    /// pre-gate; `require_rate` denies instead, since a limit that cannot
+    /// be pre-gated must not be silently treated as unlimited.
+    #[serde(default)]
+    pub missing_rate: GovernanceMissingRatePolicy,
     /// Expose the authenticated caller-only `GET /api/v1/key` endpoint.
     pub key_introspection: bool,
     /// Require AI requests to resolve to a governed key instead of accepting
@@ -765,11 +778,55 @@ impl Default for KeyGovernanceConfig {
             backend: None,
             lease_ttl_secs: default_governance_lease_ttl_secs(),
             terminal_retention_secs: default_governance_terminal_retention_secs(),
-            failure_mode_allow: false,
+            failure_mode: GovernanceFailureMode::default(),
+            missing_rate: GovernanceMissingRatePolicy::default(),
             key_introspection: false,
             require_governed_key: false,
         }
     }
+}
+
+/// Behavior when the governance backend cannot serve a reserve call
+/// (`sbproxy_ai::governance::GovernanceStore::reserve`).
+///
+/// Applies only to a reserve call that fails with
+/// `GovernanceError::BackendUnavailable`. Every other reserve error
+/// (invalid request shape, a reservation id reused with different input,
+/// a hit against a real governed limit, arithmetic overflow) is unrelated
+/// to backend availability and is not affected by this setting.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceFailureMode {
+    /// Deny the request (`503`) when the governance backend is
+    /// unavailable.
+    #[default]
+    Closed,
+    /// Admit the request without a governance reservation when the
+    /// backend is unavailable. Always emits a `security_audit` event and
+    /// increments `sbproxy_governance_fail_open_total` so the decision
+    /// stays observable.
+    AllowUnreserved,
+}
+
+/// Behavior when a governed key's monetary limit cannot be pre-gated
+/// because the resolved model has no rate to estimate a cost ceiling
+/// from.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceMissingRatePolicy {
+    /// Treat the estimated cost as zero. No monetary pre-gate applies to
+    /// this request; a key's `total_micro_usd` limit is still enforced at
+    /// settlement, from actually billed usage.
+    #[default]
+    ZeroCost,
+    /// Deny the request when the key carries a `total_micro_usd` limit
+    /// but the resolved model has no rate: a limit that cannot be
+    /// pre-gated must not be silently treated as unlimited.
+    RequireRate,
 }
 
 /// Validation failure for governed key admission configuration.

@@ -1,5 +1,6 @@
 use sbproxy_config::{
-    GovernanceBackendConfig, GovernanceConsistency, KeyGovernanceConfig, ProxyServerConfig,
+    GovernanceBackendConfig, GovernanceConsistency, GovernanceFailureMode,
+    GovernanceMissingRatePolicy, KeyGovernanceConfig, ProxyServerConfig,
 };
 
 fn parse(yaml: &str) -> ProxyServerConfig {
@@ -31,7 +32,11 @@ key_management:
             .expect("retention millis"),
         300_000
     );
-    assert!(!governance.failure_mode_allow);
+    assert_eq!(governance.failure_mode, GovernanceFailureMode::Closed);
+    assert_eq!(
+        governance.missing_rate,
+        GovernanceMissingRatePolicy::ZeroCost
+    );
     assert!(!governance.key_introspection);
     assert!(!governance.require_governed_key);
     governance.validate().expect("default governance config");
@@ -75,7 +80,8 @@ key_management:
       url: rediss://governance.internal:6379/2
     lease_ttl_secs: 180
     terminal_retention_secs: 360
-    failure_mode_allow: false
+    failure_mode: closed
+    missing_rate: zero_cost
     key_introspection: true
     require_governed_key: true
 "#,
@@ -85,6 +91,11 @@ key_management:
     assert_eq!(governance.consistency, GovernanceConsistency::Strict);
     assert_eq!(governance.lease_ttl_secs, 180);
     assert_eq!(governance.terminal_retention_secs, 360);
+    assert_eq!(governance.failure_mode, GovernanceFailureMode::Closed);
+    assert_eq!(
+        governance.missing_rate,
+        GovernanceMissingRatePolicy::ZeroCost
+    );
     assert!(governance.key_introspection);
     assert!(governance.require_governed_key);
     assert_eq!(
@@ -221,10 +232,72 @@ failure_mode_open: true
         "consistency",
         "lease_ttl_secs",
         "terminal_retention_secs",
-        "failure_mode_allow",
+        "failure_mode",
+        "missing_rate",
         "key_introspection",
         "require_governed_key",
     ] {
         assert!(json.contains(&format!("\"{field}\"")), "missing {field}");
     }
+}
+
+/// WOR-1835: `failure_mode` gates a governance backend outage at reserve
+/// time; `missing_rate` gates a governed key's monetary limit when the
+/// resolved model has no rate. Both default to the strict setting
+/// (`closed` / `zero_cost` respectively already covered by
+/// `governance_defaults_to_approximate_fail_closed`); this test pins the
+/// non-default parse of each and confirms they are independent knobs.
+#[test]
+fn failure_mode_and_missing_rate_parse_non_default_values() {
+    let governance: KeyGovernanceConfig = serde_yaml::from_str(
+        r#"
+failure_mode: allow_unreserved
+missing_rate: require_rate
+"#,
+    )
+    .expect("typed governance config");
+    assert_eq!(
+        governance.failure_mode,
+        GovernanceFailureMode::AllowUnreserved
+    );
+    assert_eq!(
+        governance.missing_rate,
+        GovernanceMissingRatePolicy::RequireRate
+    );
+    governance
+        .validate()
+        .expect("non-default enums are still valid");
+
+    // Setting one does not implicitly change the other's default.
+    let governance_partial: KeyGovernanceConfig = serde_yaml::from_str(
+        r#"
+failure_mode: allow_unreserved
+"#,
+    )
+    .expect("typed governance config");
+    assert_eq!(
+        governance_partial.failure_mode,
+        GovernanceFailureMode::AllowUnreserved
+    );
+    assert_eq!(
+        governance_partial.missing_rate,
+        GovernanceMissingRatePolicy::ZeroCost
+    );
+}
+
+/// An unrecognized `failure_mode` / `missing_rate` value must fail to
+/// parse rather than silently falling back to the default; the whole
+/// point of `deny_unknown_fields` plus a closed enum is that a typo in
+/// operator config surfaces at load time, not as quietly-wrong runtime
+/// behavior.
+#[test]
+fn failure_mode_and_missing_rate_reject_unknown_variants() {
+    assert!(
+        serde_yaml::from_str::<KeyGovernanceConfig>("failure_mode: open\n").is_err(),
+        "unknown failure_mode variant must be rejected"
+    );
+    assert!(
+        serde_yaml::from_str::<KeyGovernanceConfig>("missing_rate: ignore\n").is_err(),
+        "unknown missing_rate variant must be rejected"
+    );
 }

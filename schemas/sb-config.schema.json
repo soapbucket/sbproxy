@@ -2981,7 +2981,7 @@
       ]
     },
     "KeyManagementConfig": {
-      "description": "Top-level `key_management:` block: the runtime key plane (mutable store, policy cache, at-rest crypto, OIDC claim map, declarative seed).",
+      "description": "Top-level `key_management:` block: the runtime key plane (mutable store, policy cache, governance, at-rest crypto, OIDC claim map, declarative seed).",
       "type": "object",
       "properties": {
         "enabled": {
@@ -3027,6 +3027,24 @@
           "allOf": [
             {
               "$ref": "#/definitions/KeyCacheConfig"
+            }
+          ]
+        },
+        "governance": {
+          "description": "Governed key admission, accounting, and authenticated introspection.",
+          "default": {
+            "backend": null,
+            "consistency": "approximate",
+            "failure_mode": "closed",
+            "key_introspection": false,
+            "lease_ttl_secs": 120,
+            "missing_rate": "zero_cost",
+            "require_governed_key": false,
+            "terminal_retention_secs": 300
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyGovernanceConfig"
             }
           ]
         },
@@ -3424,6 +3442,159 @@
         }
       }
     },
+    "KeyGovernanceConfig": {
+      "description": "`key_management.governance:` admission, accounting, and introspection controls for governed virtual keys.",
+      "type": "object",
+      "properties": {
+        "consistency": {
+          "description": "Accounting consistency. Approximate is the backward-compatible default.",
+          "default": "approximate",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceConsistency"
+            }
+          ]
+        },
+        "backend": {
+          "description": "Dedicated backend for strict accounting.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GovernanceBackendConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lease_ttl_secs": {
+          "description": "Reservation lease duration. Expired reservations are released when a gateway exits before settling or releasing them.",
+          "default": 120,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "terminal_retention_secs": {
+          "description": "Retention for settled, released, and expired reservation outcomes. Must be at least the lease duration so retries remain idempotent.",
+          "default": 300,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "failure_mode": {
+          "description": "Behavior when the governance backend cannot serve a reserve call at request time (`GovernanceError::BackendUnavailable`). The default denies the request (fail closed): governed limits must not be silently bypassed by a backend outage. Setting `allow_unreserved` admits the request instead, but every such decision is always audited on the `security_audit` channel and counted on `sbproxy_governance_fail_open_total`.",
+          "default": "closed",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceFailureMode"
+            }
+          ]
+        },
+        "missing_rate": {
+          "description": "Behavior when a governed key carries a `total_micro_usd` limit but the resolved model has no rate to estimate a pre-request cost ceiling from. The default (`zero_cost`) admits with no monetary pre-gate; `require_rate` denies instead, since a limit that cannot be pre-gated must not be silently treated as unlimited.",
+          "default": "zero_cost",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceMissingRatePolicy"
+            }
+          ]
+        },
+        "key_introspection": {
+          "description": "Expose the authenticated caller-only `GET /api/v1/key` endpoint.",
+          "default": false,
+          "type": "boolean"
+        },
+        "require_governed_key": {
+          "description": "Require AI requests to resolve to a governed key instead of accepting origin credentials or anonymous access.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GovernanceConsistency": {
+      "description": "Consistency guarantee for governed key admission and accounting.",
+      "oneOf": [
+        {
+          "description": "Process-local atomic counters. Fast and safe on one gateway, but totals across multiple gateways are approximate.",
+          "type": "string",
+          "enum": [
+            "approximate"
+          ]
+        },
+        {
+          "description": "Cluster-wide atomic reservations backed by Redis scripts.",
+          "type": "string",
+          "enum": [
+            "strict"
+          ]
+        }
+      ]
+    },
+    "GovernanceBackendConfig": {
+      "description": "Shared backend used for strict governed key accounting.",
+      "oneOf": [
+        {
+          "description": "A dedicated Redis connection. This is intentionally explicit and is not inherited from the key store or cache configuration.",
+          "type": "object",
+          "required": [
+            "type",
+            "url"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "redis"
+              ]
+            },
+            "url": {
+              "description": "Redis or TLS-enabled Redis connection URL.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GovernanceFailureMode": {
+      "description": "Behavior when the governance backend cannot serve a reserve call (`sbproxy_ai::governance::GovernanceStore::reserve`).\n\nApplies only to a reserve call that fails with `GovernanceError::BackendUnavailable`. Every other reserve error (invalid request shape, a reservation id reused with different input, a hit against a real governed limit, arithmetic overflow) is unrelated to backend availability and is not affected by this setting.",
+      "oneOf": [
+        {
+          "description": "Deny the request (`503`) when the governance backend is unavailable.",
+          "type": "string",
+          "enum": [
+            "closed"
+          ]
+        },
+        {
+          "description": "Admit the request without a governance reservation when the backend is unavailable. Always emits a `security_audit` event and increments `sbproxy_governance_fail_open_total` so the decision stays observable.",
+          "type": "string",
+          "enum": [
+            "allow_unreserved"
+          ]
+        }
+      ]
+    },
+    "GovernanceMissingRatePolicy": {
+      "description": "Behavior when a governed key's monetary limit cannot be pre-gated because the resolved model has no rate to estimate a cost ceiling from.",
+      "oneOf": [
+        {
+          "description": "Treat the estimated cost as zero. No monetary pre-gate applies to this request; a key's `total_micro_usd` limit is still enforced at settlement, from actually billed usage.",
+          "type": "string",
+          "enum": [
+            "zero_cost"
+          ]
+        },
+        {
+          "description": "Deny the request when the key carries a `total_micro_usd` limit but the resolved model has no rate: a limit that cannot be pre-gated must not be silently treated as unlimited.",
+          "type": "string",
+          "enum": [
+            "require_rate"
+          ]
+        }
+      ]
+    },
     "KeyCryptoConfig": {
       "description": "`key_management.crypto:` block. Both values accept a secret reference (`vault://`, `env:`, `file:`, ...) resolved at boot, or an inline value (discouraged outside tests).",
       "type": "object",
@@ -3526,6 +3697,24 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "max_tokens_per_minute": {
+          "description": "Max input and output tokens per minute.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "priority": {
+          "description": "Served-model admission lane (`interactive`, `standard`, or `batch`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_budget_tokens": {
           "description": "Max total tokens for this key's budget window.",
           "default": null,
@@ -3569,6 +3758,25 @@
             "type": "string"
           }
         },
+        "blocked_providers": {
+          "description": "Providers this key may not use. Blocks override allows.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "description": "Caller-supplied tool allowlist. `None` is unrestricted and an empty list denies every caller-supplied tool.",
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
         "require_pii_redaction": {
           "description": "Named PII redaction rules that must be active before this key can dispatch upstream (empty = none required).",
           "default": [],
@@ -3597,6 +3805,10 @@
           "type": "array",
           "items": true
         },
+        "inject_mcp": {
+          "description": "Federated MCP catalogue reference injected for this key.",
+          "default": null
+        },
         "bypass_prompt_injection": {
           "description": "Skip the body-aware prompt-injection scan for this key. Default false.",
           "default": false,
@@ -3617,6 +3829,22 @@
             "string",
             "null"
           ]
+        },
+        "tags": {
+          "description": "Free-form grouping tags.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "description": "Free-form string metadata for audit and usage attribution.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         },
         "tenant": {
           "description": "Owning tenant.",
@@ -4283,6 +4511,17 @@
           "default": [],
           "type": "array",
           "items": true
+        },
+        "allowed_tools": {
+          "description": "Caller-supplied tool allowlist for this credential. Omitted is unrestricted and an explicit empty list denies every caller tool.",
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
         },
         "inject_mcp": {
           "description": "WOR-1646: inject a federated MCP gateway's live catalogue as this credential's tool surface. Raw passthrough of the `InjectMcpRef` shape (`{ref, format, filter}`) on the underlying `VirtualKeyConfig`; resolved at request time."
