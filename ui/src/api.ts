@@ -510,6 +510,39 @@ export interface EffectivePolicyPreview {
   decisions: EffectivePolicyDecisions;
 }
 
+// Governed-key usage (WOR-1845). GET /admin/keys/{id}/usage returns a
+// snapshot of the reserve/settle ledger for one key: four counter
+// dimensions plus the health of the backend that served them. `limit` and
+// `remaining` are null when the dimension has no configured cap; window
+// dimensions carry a `reset_at_millis`, lifetime dimensions do not.
+export type GovernanceConsistency = "approximate" | "strict";
+export type GovernanceBackendStatus = "healthy" | "degraded" | "unavailable";
+
+export interface GovernanceCounterSnapshot {
+  limit: number | null;
+  used: number;
+  reserved: number;
+  remaining: number | null;
+  reset_at_millis: number | null;
+}
+
+export interface GovernanceBackendHealth {
+  backend: string;
+  consistency: GovernanceConsistency;
+  status: GovernanceBackendStatus;
+  checked_at_millis: number;
+}
+
+export interface GovernanceSnapshot {
+  key_id: string;
+  policy_revision: number;
+  requests_per_window: GovernanceCounterSnapshot;
+  tokens_per_window: GovernanceCounterSnapshot;
+  total_tokens: GovernanceCounterSnapshot;
+  total_micro_usd: GovernanceCounterSnapshot;
+  backend: GovernanceBackendHealth;
+}
+
 const EFFECTIVE_POLICY_DECISION_NAMES: readonly EffectivePolicyDecisionName[] = [
   "lifecycle",
   "tenant",
@@ -552,6 +585,27 @@ function responseSafeInteger(
     throw new TypeError(`${label}.${field} must be a positive safe integer`);
   }
   return value as number;
+}
+
+function responseNonNegativeSafeInteger(
+  object: Record<string, unknown>,
+  field: string,
+  label: string,
+): number {
+  const value = object[field];
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError(`${label}.${field} must be a non-negative safe integer`);
+  }
+  return value as number;
+}
+
+function responseNullableNonNegativeSafeInteger(
+  object: Record<string, unknown>,
+  field: string,
+  label: string,
+): number | null {
+  if (object[field] === null) return null;
+  return responseNonNegativeSafeInteger(object, field, label);
 }
 
 function optionalNullableResponseString(
@@ -699,6 +753,89 @@ function decodeEffectivePolicyPreview(value: unknown): EffectivePolicyPreview {
       ),
     },
     decisions,
+  };
+}
+
+const GOVERNANCE_CONSISTENCIES: readonly GovernanceConsistency[] = [
+  "approximate",
+  "strict",
+];
+const GOVERNANCE_BACKEND_STATUSES: readonly GovernanceBackendStatus[] = [
+  "healthy",
+  "degraded",
+  "unavailable",
+];
+
+function decodeGovernanceCounterSnapshot(
+  value: unknown,
+  label: string,
+): GovernanceCounterSnapshot {
+  const counter = responseObject(value, label);
+  return {
+    limit: responseNullableNonNegativeSafeInteger(counter, "limit", label),
+    used: responseNonNegativeSafeInteger(counter, "used", label),
+    reserved: responseNonNegativeSafeInteger(counter, "reserved", label),
+    remaining: responseNullableNonNegativeSafeInteger(counter, "remaining", label),
+    reset_at_millis: responseNullableNonNegativeSafeInteger(
+      counter,
+      "reset_at_millis",
+      label,
+    ),
+  };
+}
+
+function decodeGovernanceBackendHealth(
+  value: unknown,
+  label: string,
+): GovernanceBackendHealth {
+  const backend = responseObject(value, label);
+  const consistency = backend.consistency;
+  if (!GOVERNANCE_CONSISTENCIES.includes(consistency as GovernanceConsistency)) {
+    throw new TypeError(`${label}.consistency is not supported`);
+  }
+  const status = backend.status;
+  if (!GOVERNANCE_BACKEND_STATUSES.includes(status as GovernanceBackendStatus)) {
+    throw new TypeError(`${label}.status is not supported`);
+  }
+  return {
+    backend: responseString(backend, "backend", label),
+    consistency: consistency as GovernanceConsistency,
+    status: status as GovernanceBackendStatus,
+    checked_at_millis: responseNonNegativeSafeInteger(
+      backend,
+      "checked_at_millis",
+      label,
+    ),
+  };
+}
+
+/** Decode GET /admin/keys/{id}/usage's `usage` payload (a GovernanceSnapshot). */
+function decodeGovernanceSnapshot(value: unknown): GovernanceSnapshot {
+  const document = responseObject(value, "governance usage");
+  return {
+    key_id: responseString(document, "key_id", "governance usage"),
+    policy_revision: responseSafeInteger(
+      document,
+      "policy_revision",
+      "governance usage",
+    ),
+    requests_per_window: decodeGovernanceCounterSnapshot(
+      document.requests_per_window,
+      "governance usage.requests_per_window",
+    ),
+    tokens_per_window: decodeGovernanceCounterSnapshot(
+      document.tokens_per_window,
+      "governance usage.tokens_per_window",
+    ),
+    total_tokens: decodeGovernanceCounterSnapshot(
+      document.total_tokens,
+      "governance usage.total_tokens",
+    ),
+    total_micro_usd: decodeGovernanceCounterSnapshot(
+      document.total_micro_usd,
+      "governance usage.total_micro_usd",
+    ),
+    backend: decodeGovernanceBackendHealth(document.backend, "governance usage.backend"),
   };
 }
 
@@ -1612,6 +1749,12 @@ export const api = {
       `/admin/keys/${encodeURIComponent(id)}`,
     );
     return document.key;
+  },
+  keyUsage: async (id: string) => {
+    const document = await getJson<{ usage: unknown }>(
+      `/admin/keys/${encodeURIComponent(id)}/usage`,
+    );
+    return decodeGovernanceSnapshot(document.usage);
   },
   createKey: (body: unknown) => sendJson<CreatedKey>("POST", "/admin/keys", body),
   patchKey: async (id: string, patch: AdminKeyPolicyPatch) => {

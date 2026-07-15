@@ -2,19 +2,21 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import {
   api,
+  ApiError,
   buildKeyPolicyPatch,
   keyPolicyDraft,
   rebaseKeyPolicyDraft,
   type AdminKey,
   type AdminKeyPolicyPatch,
   type CreatedKey,
+  type GovernanceSnapshot,
 } from "./api";
 
-function stubFetch(body: unknown) {
+function stubFetch(body: unknown, status = 200) {
   const fetchMock = vi.fn(
     async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response(JSON.stringify(body), {
-        status: 200,
+        status,
         headers: { "content-type": "application/json" },
       }),
   );
@@ -592,6 +594,214 @@ describe("admin key policy mutation contract", () => {
       "/admin/keys/key%2Fa",
       expect.objectContaining({ method: "GET" }),
     );
+  });
+
+  it("decodes one governed key usage snapshot, converting neither tokens nor micro-USD", async () => {
+    const snapshot = {
+      key_id: "key/a",
+      policy_revision: 4,
+      requests_per_window: {
+        limit: 60,
+        used: 12,
+        reserved: 3,
+        remaining: 45,
+        reset_at_millis: 1_700_000_040_000,
+      },
+      tokens_per_window: {
+        limit: 50_000,
+        used: 100,
+        reserved: 20,
+        remaining: 49_880,
+        reset_at_millis: 1_700_000_040_000,
+      },
+      total_tokens: {
+        limit: 1_000_000,
+        used: 25_000,
+        reserved: 5_000,
+        remaining: 970_000,
+        reset_at_millis: null,
+      },
+      total_micro_usd: {
+        limit: 50_000_000,
+        used: 12_345_678,
+        reserved: 1_000_000,
+        remaining: 36_654_322,
+        reset_at_millis: null,
+      },
+      backend: {
+        backend: "redis",
+        consistency: "strict",
+        status: "healthy",
+        checked_at_millis: 1_700_000_000_000,
+      },
+      secret_hash: "must-not-survive",
+    };
+    const fetchMock = stubFetch({ usage: snapshot });
+
+    const result = await api.keyUsage("key/a");
+
+    expect(result).toEqual({
+      key_id: "key/a",
+      policy_revision: 4,
+      requests_per_window: snapshot.requests_per_window,
+      tokens_per_window: snapshot.tokens_per_window,
+      total_tokens: snapshot.total_tokens,
+      total_micro_usd: snapshot.total_micro_usd,
+      backend: snapshot.backend,
+    });
+    expect(result.total_micro_usd.used).toBe(12_345_678);
+    expect(result.total_tokens.reset_at_millis).toBeNull();
+    expect(JSON.stringify(result)).not.toContain("must-not-survive");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/admin/keys/key%2Fa/usage",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("treats a null limit and remaining as an unconfigured dimension", async () => {
+    stubFetch({
+      usage: {
+        key_id: "key-1",
+        policy_revision: 1,
+        requests_per_window: {
+          limit: null,
+          used: 4,
+          reserved: 0,
+          remaining: null,
+          reset_at_millis: 1_700_000_040_000,
+        },
+        tokens_per_window: {
+          limit: null,
+          used: 0,
+          reserved: 0,
+          remaining: null,
+          reset_at_millis: 1_700_000_040_000,
+        },
+        total_tokens: {
+          limit: null,
+          used: 0,
+          reserved: 0,
+          remaining: null,
+          reset_at_millis: null,
+        },
+        total_micro_usd: {
+          limit: null,
+          used: 0,
+          reserved: 0,
+          remaining: null,
+          reset_at_millis: null,
+        },
+        backend: {
+          backend: "memory",
+          consistency: "approximate",
+          status: "healthy",
+          checked_at_millis: 1_700_000_000_000,
+        },
+      },
+    });
+
+    const result = await api.keyUsage("key-1");
+
+    expect(result.requests_per_window.limit).toBeNull();
+    expect(result.requests_per_window.remaining).toBeNull();
+  });
+
+  it("surfaces a governance backend outage as a plain ApiError", async () => {
+    stubFetch({ error: "governance backend unavailable" }, 503);
+
+    const error = await api.keyUsage("key-1").catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).status).toBe(503);
+  });
+
+  it("rejects malformed usage health and accounting counters", async () => {
+    stubFetch({
+      usage: {
+        key_id: "key-1",
+        policy_revision: 2,
+        requests_per_window: {
+          limit: 10,
+          used: -1,
+          reserved: 0,
+          remaining: 11,
+          reset_at_millis: 1_700_000_040_000,
+        },
+        tokens_per_window: {
+          limit: null,
+          used: 0,
+          reserved: 0,
+          remaining: null,
+          reset_at_millis: 1_700_000_040_000,
+        },
+        total_tokens: {
+          limit: null,
+          used: 0,
+          reserved: 0,
+          remaining: null,
+          reset_at_millis: null,
+        },
+        total_micro_usd: {
+          limit: null,
+          used: 0,
+          reserved: 0,
+          remaining: null,
+          reset_at_millis: null,
+        },
+        backend: {
+          backend: "redis",
+          consistency: "strict",
+          status: "offline",
+          checked_at_millis: 1_700_000_000_000,
+        },
+      },
+    });
+
+    await expect(api.keyUsage("key-1")).rejects.toThrow("governance usage");
+  });
+
+  it("types governance counter snapshots as nullable safe integers", () => {
+    const usage: GovernanceSnapshot = {
+      key_id: "key-1",
+      policy_revision: 1,
+      requests_per_window: {
+        limit: null,
+        used: 0,
+        reserved: 0,
+        remaining: null,
+        reset_at_millis: null,
+      },
+      tokens_per_window: {
+        limit: null,
+        used: 0,
+        reserved: 0,
+        remaining: null,
+        reset_at_millis: null,
+      },
+      total_tokens: {
+        limit: null,
+        used: 0,
+        reserved: 0,
+        remaining: null,
+        reset_at_millis: null,
+      },
+      total_micro_usd: {
+        limit: null,
+        used: 0,
+        reserved: 0,
+        remaining: null,
+        reset_at_millis: null,
+      },
+      backend: {
+        backend: "memory",
+        consistency: "approximate",
+        status: "healthy",
+        checked_at_millis: 1_700_000_000_000,
+      },
+    };
+
+    expectTypeOf(usage.backend.consistency).toMatchTypeOf<"approximate" | "strict">();
+    expectTypeOf(usage.total_micro_usd.limit).toMatchTypeOf<number | null>();
   });
 
   it("types the copy-once create envelope around the server key record", () => {

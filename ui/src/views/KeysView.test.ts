@@ -105,4 +105,53 @@ describe("KeysView policy editing contract", () => {
     expect(keysView).toContain("statusOf(k) === 'blocked'");
     expect(keysView).toContain("statusOf(k) !== 'revoked'");
   });
+
+  it("loads governed usage for one selected key", () => {
+    expect(keysView).toContain("api.keyUsage");
+    expect(keysView).toContain("openUsage(k)");
+    expect(keysView).toContain("Usage and reservations");
+  });
+
+  it("shows every governed dimension with its reservation arithmetic", () => {
+    for (const value of [
+      "Requests per window",
+      "Tokens per window",
+      "Token budget",
+      "Monetary budget",
+      "dimension.snapshot.limit",
+      "dimension.snapshot.used",
+      "dimension.snapshot.reserved",
+      "dimension.snapshot.remaining",
+      "dimension.snapshot.reset_at_millis",
+      "formatUsageReset(dimension.snapshot.reset_at_millis)",
+      'return resetAtMillis === null ? "Never" : formatTime(resetAtMillis)',
+    ]) {
+      expect(keysView).toContain(value);
+    }
+    expect(keysView).toContain("formatUsageUnits");
+    expect(keysView).toContain("formatUsageLimit");
+    expect(keysView).toContain("total_micro_usd");
+  });
+
+  it("shows governance backend health and consistency mode", () => {
+    expect(keysView).toContain("usage.backend.consistency");
+    expect(keysView).toContain("usage.backend.status");
+    expect(keysView).toContain("usage.backend.backend");
+    expect(keysView).toContain("usage.backend.checked_at_millis");
+    expect(keysView).toContain("backendTone");
+    expect(keysView).toContain("backendUnhealthy");
+    expect(keysView).toContain('role="alert"');
+  });
+
+  it("renders a generic error state when governed usage cannot be loaded", () => {
+    expect(keysView).toContain("usageError.value = e instanceof ApiError");
+    expect(keysView).toContain('v-else-if="usageError"');
+    expect(keysView).toContain("Usage unavailable");
+  });
+
+  it("does not let a stale usage request overwrite the selected key", () => {
+    expect(keysView).toContain("let usageInvocation = 0");
+    expect(keysView).toContain("const invocation = ++usageInvocation");
+    expect(keysView).toContain("invocation !== usageInvocation");
+  });
 });
