@@ -2,8 +2,10 @@
 # Exercise the integrity checks in scripts/install.sh against a local fixture.
 #
 # WOR-1914: the installer used to download a binary and never verify it. These
-# cases prove the two things that matter: a tampered download aborts and leaves
-# nothing installed, and a clean download verifies and installs. Run directly:
+# cases prove that a clean download verifies and installs; a tampered download,
+# a missing .sha256, and a malformed .sha256 each abort and leave nothing
+# installed; and an absent cosign is stated in the output, not skipped
+# silently. Run directly:
 #
 #   sh scripts/tests/install_verify.sh
 #
@@ -99,6 +101,44 @@ if SBPROXY_VERSION="v9.9.9" SBPROXY_BASE_URL="file://${RELEASE2}" \
 check "missing checksum exits non-zero" "$([ "$rc" != "0" ] && echo 1 || echo 0)"
 check "missing checksum installs nothing" \
     "$([ ! -e "${DEST3}/sbproxy" ] && echo 1 || echo 0)"
+
+# --- Case 4: a malformed .sha256 (not 64 hex chars) aborts rather than ---
+# --- comparing against garbage and passing vacuously. ---
+RELEASE3="${WORK}/release_badhash"
+mkdir -p "$RELEASE3"
+tar czf "${RELEASE3}/${ARCHIVE}" -C "$WORK" sbproxy
+printf 'not-a-real-checksum  %s\n' "$ARCHIVE" > "${RELEASE3}/${ARCHIVE}.sha256"
+DEST4="${WORK}/bin4"
+if SBPROXY_VERSION="v9.9.9" SBPROXY_BASE_URL="file://${RELEASE3}" \
+   SBPROXY_INSTALL="$DEST4" SBPROXY_SKIP_COSIGN=1 \
+   sh "$INSTALL_SH" >"${WORK}/out4.log" 2>&1; then rc=0; else rc=$?; fi
+check "malformed checksum exits non-zero" "$([ "$rc" != "0" ] && echo 1 || echo 0)"
+check "malformed checksum installs nothing" \
+    "$([ ! -e "${DEST4}/sbproxy" ] && echo 1 || echo 0)"
+check "malformed checksum says so" \
+    "$(grep -q 'checksum is malformed' "${WORK}/out4.log" && echo 1 || echo 0)"
+
+# --- Case 5: cosign absent is stated, not skipped silently ---
+# Uses its own clean fixture rather than $RELEASE, which Case 2 permanently
+# tampers in place. Restrict PATH to the base system dirs so cosign is not
+# found, regardless of whether this host has it installed for other reasons
+# (e.g. local dev machines with SUPPLY-CHAIN.md set up). Do not set
+# SBPROXY_SKIP_COSIGN, since the point is to exercise the "not installed"
+# branch, not the opt-out.
+RELEASE4="${WORK}/release_nocosign"
+mkdir -p "$RELEASE4"
+tar czf "${RELEASE4}/${ARCHIVE}" -C "$WORK" sbproxy
+( cd "$RELEASE4" && sha256_of "$ARCHIVE" | awk -v f="$ARCHIVE" '{print $1"  "f}' \
+    > "${ARCHIVE}.sha256" )
+DEST5="${WORK}/bin5"
+if SBPROXY_VERSION="v9.9.9" SBPROXY_BASE_URL="file://${RELEASE4}" \
+   SBPROXY_INSTALL="$DEST5" PATH="/usr/bin:/bin" \
+   sh "$INSTALL_SH" >"${WORK}/out5.log" 2>&1; then rc=0; else rc=$?; fi
+check "cosign-absent path still exits 0" "$([ "$rc" = "0" ] && echo 1 || echo 0)"
+check "cosign-absent path installs the binary" \
+    "$([ -x "${DEST5}/sbproxy" ] && echo 1 || echo 0)"
+check "cosign-absent path states the gap rather than skipping silently" \
+    "$(grep -q 'cosign is not installed' "${WORK}/out5.log" && echo 1 || echo 0)"
 
 echo ""
 echo "install_verify: ${PASS} passed, ${FAIL} failed"
