@@ -803,7 +803,17 @@ impl ProxyMetrics {
         let mut metric_families = self.registry.gather();
         metric_families.extend(prometheus::gather());
         let mut buffer = Vec::new();
-        if encoder.encode(&metric_families, &mut buffer).is_err() {
+        if let Err(error) = encoder.encode(&metric_families, &mut buffer) {
+            // Returning an empty body here used to be silent, which made an
+            // encode failure indistinguishable from a healthy process that
+            // happens to emit nothing. The scrape succeeded, the dashboards
+            // went flat, and no signal anywhere said why. Say why.
+            tracing::error!(
+                %error,
+                families = metric_families.len(),
+                "failed to encode the Prometheus scrape; /metrics is serving an empty body"
+            );
+            record_render_failure("encode");
             return String::new();
         }
         let raw = String::from_utf8(buffer).unwrap_or_default();
@@ -818,14 +828,28 @@ impl ProxyMetrics {
     /// Sum the current values of the named metric families across all
     /// their label sets, for cluster-metric publication (WOR-1721). Each
     /// requested name maps to the total of its counter / gauge samples
-    /// (histograms contribute their sample sum); a name not present in the
-    /// registry maps to `0.0`. The mesh producer ships this compact
+    /// (histograms contribute their sample sum); a name not present in
+    /// either registry maps to `0.0`. The mesh producer ships this compact
     /// per-node snapshot so one node can report fleet totals without an
     /// external Prometheus.
+    ///
+    /// Gathers **both** registries, mirroring [`Self::render`]. Gathering only
+    /// `self.registry` is what made fleet AI tokens read zero on every node
+    /// forever: `sbproxy_ai_tokens_attributed_total` is registered by a
+    /// `register_counter_vec!` macro, so it lives on the process-global
+    /// default registry and this method could not see it. The pre-seeded
+    /// `0.0` below then supplied a plausible answer instead of an error, and
+    /// the guard test asserted only that the key was present, which the
+    /// pre-seed guarantees. Three layers, each individually reasonable,
+    /// producing a number that was always wrong.
     pub fn snapshot_named(&self, names: &[&str]) -> std::collections::HashMap<String, f64> {
         let mut out: std::collections::HashMap<String, f64> =
             names.iter().map(|n| ((*n).to_string(), 0.0)).collect();
-        for fam in self.registry.gather() {
+
+        let mut families = self.registry.gather();
+        families.extend(prometheus::gather());
+
+        for fam in families {
             let fname = fam.name();
             if !names.contains(&fname) {
                 continue;
@@ -840,10 +864,38 @@ impl ProxyMetrics {
                     total += h.sample_sum();
                 }
             }
-            out.insert(fname.to_string(), total);
+            // A family cannot appear on both registries (the metric registry
+            // declares exactly one per metric, and `metric_drift.rs` enforces
+            // it), so accumulate rather than overwrite and a future double
+            // registration shows up as a doubled value rather than a silent
+            // half.
+            *out.entry(fname.to_string()).or_insert(0.0) += total;
         }
         out
     }
+}
+
+/// Count a failure to serve `/metrics`.
+///
+/// Self-observability: if the scrape endpoint breaks, the only thing that can
+/// report it is the scrape endpoint, so this counter is the one series that
+/// has to survive its own failure mode. It lives on the proxy registry alone.
+fn record_render_failure(reason: &'static str) {
+    use prometheus::IntCounterVec;
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_metrics_render_failures_total",
+                "Failures to encode the Prometheus scrape body",
+            ),
+            &["reason"],
+        )
+        .expect("render failure counter constructs");
+        let _ = metrics().registry.register(Box::new(counter.clone()));
+        counter
+    });
+    counter.with_label_values(&[reason]).inc();
 }
 
 // --- Trace-id helper for exemplars ---
@@ -1450,14 +1502,21 @@ pub fn record_channel_drop(lane: &'static str, reason: &'static str) {
             &["reason"],
         )
         .expect("channel drop counter constructs");
-        // Register on the canonical scrape registry so the metric
-        // reaches a `/metrics` endpoint.
+        // Register on the canonical scrape registry, and *only* there.
+        //
+        // This used to register on the process-global default registry as
+        // well, so that an ad-hoc `prometheus::gather()` would also see the
+        // counter. But `ProxyMetrics::render()` gathers both registries and
+        // concatenates them, so the family came out twice: two `# HELP` and
+        // two `# TYPE` lines for one name. The Prometheus text format forbids
+        // that and the parser rejects the whole scrape.
+        //
+        // The trigger makes it worse than it sounds. This counter does not
+        // exist until something drops a message on a full channel, which
+        // happens when the proxy is saturated. So `/metrics` broke at exactly
+        // the moment an operator needed it, and was fine every time anyone
+        // checked.
         let _ = metrics().registry.register(Box::new(cv.clone()));
-        // Register on the process-global default registry so ad-hoc
-        // `prometheus::gather()` calls (e.g. unit tests, scrapers
-        // that read the default registry directly) also see the
-        // counter.
-        let _ = prometheus::default_registry().register(Box::new(cv.clone()));
         cv
     });
     counter.with_label_values(&[reason]).inc();
@@ -3580,6 +3639,56 @@ pub fn record_reversible_redaction_miss(rule: &str) {
 mod tests {
     use super::*;
     use crate::cardinality::CardinalityConfig;
+
+    /// `/metrics` must stay parseable once a channel drop has been recorded.
+    ///
+    /// `record_channel_drop` used to register its counter on the private
+    /// registry *and* the process-global default, while `render()` gathers and
+    /// concatenates both. The family therefore came out twice, with two
+    /// `# HELP` and two `# TYPE` lines for one name, which the Prometheus text
+    /// format forbids and the parser rejects outright. Not a degraded scrape:
+    /// no scrape.
+    ///
+    /// The trigger is what makes it vicious. The counter does not exist until
+    /// something drops a message on a full channel, which happens when the
+    /// proxy is saturated. So `/metrics` was intact every time anyone looked at
+    /// it and broke at precisely the moment an operator needed it to work.
+    #[test]
+    fn a_channel_drop_does_not_break_the_scrape() {
+        record_channel_drop("hooks", "channel_full");
+
+        let rendered = metrics().render();
+
+        assert!(
+            rendered.contains("sbproxy_hooks_channel_dropped_total"),
+            "the drop counter must reach the scrape at all"
+        );
+
+        let mut types: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut helps: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for line in rendered.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                if let Some(name) = rest.split_whitespace().next() {
+                    *types.entry(name).or_default() += 1;
+                }
+            } else if let Some(rest) = line.strip_prefix("# HELP ") {
+                if let Some(name) = rest.split_whitespace().next() {
+                    *helps.entry(name).or_default() += 1;
+                }
+            }
+        }
+
+        let dupe_types: Vec<_> = types.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            dupe_types.is_empty(),
+            "the Prometheus text format allows one # TYPE per family; duplicates: {dupe_types:?}"
+        );
+        let dupe_helps: Vec<_> = helps.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            dupe_helps.is_empty(),
+            "the Prometheus text format allows one # HELP per family; duplicates: {dupe_helps:?}"
+        );
+    }
 
     // Each test creates its own ProxyMetrics to avoid global state conflicts.
     // Helper functions that call metrics() use the global instance, so those

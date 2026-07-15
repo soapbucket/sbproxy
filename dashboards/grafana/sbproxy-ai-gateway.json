@@ -159,7 +159,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (provider) (rate(sbproxy_ai_tokens_total{direction=\"input\"}[5m]))",
+          "expr": "sum by (provider) (rate(sbproxy_ai_tokens_attributed_total{direction=\"input\"}[5m]))",
           "legendFormat": "Input - {{provider}}",
           "datasource": {
             "type": "prometheus",
@@ -168,7 +168,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (provider) (rate(sbproxy_ai_tokens_total{direction=\"output\"}[5m]))",
+          "expr": "sum by (provider) (rate(sbproxy_ai_tokens_attributed_total{direction=\"output\"}[5m]))",
           "legendFormat": "Output - {{provider}}",
           "datasource": {
             "type": "prometheus",

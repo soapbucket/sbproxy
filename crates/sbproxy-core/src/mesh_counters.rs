@@ -1,15 +1,17 @@
-//! WOR-1563: distributed per-key spend + rate-limit counters via mesh CRDTs.
+//! WOR-1563: per-key spend + rate-limit CRDT counters, local writer only.
 //!
 //! Per-key spend (tokens and cost) is a grow-only `GCounter` and per-key
 //! request rate is a `SlidingWindow`, both keyed by virtual-key id. Each node
-//! increments its own slot locally; the mesh gossip loop disseminates the CRDT
-//! state, and merging is monotone, so a budget cap or a rate ceiling is coherent
-//! across the replica fleet (a key spending on replica A is visible to replica
-//! B). Without a running mesh the counters are simply local.
+//! increments its own slot locally.
 //!
-//! Reconciles with the multi-window budgets: this is the cross-replica spend
-//! substrate the budget windows read so a per-key cap is enforced fleet-wide
-//! rather than per-replica.
+//! The CRDT types are chosen so the counters *can* be gossiped and merged
+//! monotonically, but that dissemination is not built yet: there is no gossip
+//! loop that ships this state and no merge on the receiving side, so a key
+//! spending on replica A is not visible to replica B. Fleet-wide per-key caps
+//! therefore still require a shared backend (Redis or a secrets manager); these
+//! counters are node-local until the merge lands. See WOR-1887 for the
+//! dissemination work, and do not describe this as cluster-coherent in any doc,
+//! README, or comparison table while that ticket is open.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};

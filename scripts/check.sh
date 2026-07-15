@@ -61,4 +61,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "cargo doc"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
+step "generated docs are current"
+bash "$ROOT/scripts/check-metrics-stability.sh"
+bash "$ROOT/scripts/check-model-host-capabilities.sh"
+
+step "install.sh verifies its download"
+sh "$ROOT/scripts/tests/install_verify.sh"
+
+# promtool is not always installed locally; the metric-name and label drift is
+# already gated by the Rust test crates/sbproxy-observe/tests/metric_drift.rs,
+# which runs above. When promtool is present, also check PromQL semantics.
+if command -v promtool >/dev/null 2>&1; then
+  step "prometheus rules validate and the SLO burns"
+  bash "$ROOT/scripts/check-prometheus-rules.sh"
+else
+  printf 'promtool not installed; skipping PromQL-semantics check (drift is still gated in Rust).\n'
+fi
+
 printf '\n\033[1;32mAll checks passed.\033[0m\n'

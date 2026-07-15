@@ -3624,6 +3624,49 @@ mod tests {
     }
 
     #[test]
+    fn spend_totals_reflect_a_real_attributed_request_through_the_live_snapshot() {
+        // The two reducer tests above and below hand-build the HashMap, so
+        // they cover the key-preference logic and nothing else. Neither could
+        // ever observe the actual bug: the names they supply are registered on
+        // the process-global default registry via `register_counter_vec!`,
+        // `snapshot_named` gathered only the private registry, and the real
+        // spend endpoint returned zero tokens no matter the traffic. This one
+        // drives the recorder and reads the same snapshot the handler reads.
+        let before = sbproxy_observe::metrics::metrics()
+            .snapshot_named(&["sbproxy_ai_tokens_attributed_total"]);
+        let (before_tokens, _) = spend_totals_from_snapshot(&before);
+
+        sbproxy_ai::ai_metrics::record_ai_request_attributed(
+            "anthropic",
+            "claude-opus-4-8",
+            "chat_completions",
+            "tenant-spend",
+            "key-spend",
+            &sbproxy_ai::attribution::AttributionTags::default(),
+            200, // input
+            50,  // output
+            0,
+            0,
+            0,
+            0.0,
+        );
+
+        let after = sbproxy_observe::metrics::metrics().snapshot_named(&[
+            "sbproxy_tokens_attributed_total",
+            "sbproxy_ai_tokens_attributed_total",
+            "sbproxy_ai_cost_usd_micros_total",
+            "sbproxy_ai_cost_dollars_attributed_total",
+        ]);
+        let (after_tokens, _) = spend_totals_from_snapshot(&after);
+
+        assert!(
+            after_tokens >= before_tokens + 250.0,
+            "the spend snapshot must reflect a real attributed request; \
+             {after_tokens} is not {before_tokens} + 250"
+        );
+    }
+
+    #[test]
     fn spend_totals_accept_ai_prefixed_attributed_metric_name() {
         let snap = std::collections::HashMap::from([
             ("sbproxy_ai_tokens_attributed_total".to_string(), 44.0),

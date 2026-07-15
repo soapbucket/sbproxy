@@ -1,8 +1,10 @@
 //! Cluster-wide metrics aggregation.
 //!
-//! Each node periodically publishes its local metrics via gossip. This module
-//! aggregates per-node metrics into cluster-wide sums and averages for
-//! monitoring, autoscaling, and alerting.
+//! Each node periodically publishes its local metric snapshot over the
+//! typed-state owner-routed RPC (not SWIM gossip; the data flows, but calling
+//! it gossip misnames the mechanism). This module aggregates per-node metrics
+//! into cluster-wide sums and averages for monitoring, autoscaling, and
+//! alerting.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;

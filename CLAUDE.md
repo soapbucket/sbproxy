@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-06-17*
+*Last modified: 2026-07-14*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -31,6 +31,22 @@ doctests. This keeps the local target directory materially smaller than
 full release/e2e runs. Set `SBPROXY_RELEASE_TESTS=1` to compile test
 binaries in release mode, and `SBPROXY_CHECK_E2E=1` to include the
 `sbproxy-e2e` package.
+
+**Always run the test lane through nextest.** `cargo-nextest` is
+already installed at `~/.cargo/bin/cargo-nextest`. `check.sh` probes
+`cargo nextest --version` and, if it fails, silently falls back to
+serial `cargo test`, which turns a few-minute test lane into a ~90-minute
+one. If `~/.cargo/bin` is not already on your `PATH`, export it before
+running the gate:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Then confirm the run prints the nextest banner, not the
+`cargo-nextest not installed, falling back to cargo test` line. CI always
+uses nextest; a local fallback is a misconfigured shell, never the
+intended path.
 
 By default, `scripts/check.sh` runs `scripts/cleanup-build-artifacts.sh`
 on exit to prune `target/doc`, nextest output, incremental directories,
@@ -201,6 +217,27 @@ pinned by the `v1_compat::v1_fixtures_compile_unmodified` test in
 `crates/sbproxy-config/`. Do not conflate `schema-v1` with binary
 `v1.0`; the schema label predates this rename and is intentionally
 unchanged.
+
+## Cutting a new version
+
+Before tagging a new sbproxy release, update our pinned Pingora fork
+first. All `pingora-*` crates are `[patch]`ed (see `Cargo.toml`) to
+`github.com/soapbucket/pingora`, branch `sbproxy-0.8.0`. That fork carries
+our local patches (for example the dynamic rustls cert resolver) on top of
+Cloudflare's upstream, so a release built against a stale branch silently
+ships without any upstream fixes landed since the last cut.
+
+Re-sync it as the first step of every release:
+
+1. In the `pingora` checkout, fetch upstream (`origin`,
+   `github.com/cloudflare/pingora`) and rebase `sbproxy-0.8.0` onto the
+   target upstream tag, keeping our patch commits on top. Resolve any
+   conflicts against the new upstream.
+2. Push the rebased branch to the `sb` remote
+   (`git@github.com:soapbucket/pingora.git`).
+3. Back in this workspace, refresh `Cargo.lock` so the build resolves to
+   the new fork commit, then run the full gate. Only cut the tag once it
+   is green against the updated fork.
 
 ## License + attribution
 

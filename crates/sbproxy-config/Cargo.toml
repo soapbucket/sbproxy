@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+sbproxy-capability.workspace = true
 sbproxy-plugin.workspace = true
 sbproxy-platform.workspace = true
 sbproxy-observe.workspace = true

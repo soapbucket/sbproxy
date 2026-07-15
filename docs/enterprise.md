@@ -13,9 +13,11 @@ in this repository. There is no feature ceiling on the runtime itself.
 
 The clustering substrate is open source too: gossip mesh membership,
 consistent-hash routing, leader election, federation, service discovery,
-and a distributed cache with CRDT counters all live in the `sbproxy-mesh`
-crate (Apache 2.0). The dynamic key plane uses it for a clusterwide
-policy cache and per-key spend counters.
+and a distributed cache all live in the `sbproxy-mesh` crate (Apache 2.0).
+The dynamic key plane uses it for a clusterwide policy cache, so a key
+minted on one replica is usable on any and a revocation on one denies on
+the rest. Per-key spend counters are node-local today; cluster-wide budget
+coherence uses a shared backend until CRDT-based dissemination lands.
 
 The enterprise tier adds capabilities that only matter once you are
 running SBproxy at organizational scale or under regulator pressure.

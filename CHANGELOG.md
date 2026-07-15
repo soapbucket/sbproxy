@@ -391,11 +391,13 @@ default-off.
   pinned model, injected tools, and an injection-scan bypass. Pluggable
   stores: embedded (redb), Redis, or a secrets manager. OIDC and JWT claims
   can map to a key. New `key_management:` config block. (#542, #543)
-- **Open-source mesh clustering.** The mesh layer (SWIM gossip, CRDTs, a
+- **Open-source mesh clustering.** The mesh layer (SWIM gossip, a
   consistent-hash distributed cache) is now Apache-2.0 in this repository.
-  Setting `cache.tier: mesh` keeps the key plane, budgets, and per-key spend
-  and rate counters coherent across a replica fleet, so the cluster
-  coordinates itself with no external Redis in the path. (#542)
+  Setting `cache.tier: mesh` keeps the key plane coherent across a replica
+  fleet: a key minted on one replica is usable on any, and a revocation on
+  one denies on the rest, with no external control plane in the path. Per-key
+  spend and rate counters remain node-local; cluster-wide budget enforcement
+  uses a shared backend. (#542)
 - **State-of-the-art AI-gateway differentiation.** A verifiable, hash-chained
   and optionally Ed25519-signed usage ledger; a single sandboxed CEL policy
   plane over guardrails, budgets, routing, and principal; a guardrail mesh
