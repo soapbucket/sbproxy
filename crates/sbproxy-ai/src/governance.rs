@@ -1,5 +1,6 @@
 //! Atomic governance accounting contracts and the approximate in-memory store.
 
+use crate::governance_crdt::{MergedCounters, NodeCounterSlot};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -385,6 +386,10 @@ impl Clock for SystemClock {
     }
 }
 
+/// Sentinel window start used to label a key's lifetime counter slot, distinct
+/// from any real fixed-window start in Unix milliseconds.
+pub const GOVERNANCE_LIFETIME_WINDOW: u64 = u64::MAX;
+
 /// Process-local approximate governance store with atomic in-process updates.
 #[derive(Clone)]
 pub struct InMemoryGovernanceStore {
@@ -395,6 +400,7 @@ struct InMemoryInner {
     config: InMemoryGovernanceConfig,
     clock: Arc<dyn Clock>,
     state: Mutex<MemoryState>,
+    peer: Mutex<MergedCounters>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -416,6 +422,9 @@ struct KeyState {
     total_reserved_tokens: u64,
     total_used_micro_usd: u64,
     total_reserved_micro_usd: u64,
+    /// Policy revision this key's counters were most recently updated under,
+    /// used to label locally published counter slots for cluster peers.
+    current_policy_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +504,7 @@ impl InMemoryGovernanceStore {
                 config,
                 clock,
                 state: Mutex::new(MemoryState::default()),
+                peer: Mutex::new(MergedCounters::default()),
             }),
         })
     }
@@ -506,6 +516,40 @@ impl InMemoryGovernanceStore {
             status: GovernanceBackendStatus::Healthy,
             checked_at_millis: now_millis,
         }
+    }
+
+    /// Install the latest merged view of peer usage from the cluster.
+    pub fn set_peer_counters(&self, merged: MergedCounters) {
+        *self.inner.peer.lock() = merged;
+    }
+
+    /// This node's current live counter slots, for cluster publication.
+    pub fn local_slots(&self) -> Vec<NodeCounterSlot> {
+        let state = self.inner.state.lock();
+        let mut slots = Vec::new();
+        for (key_id, ks) in state.keys.iter() {
+            slots.push(NodeCounterSlot {
+                key_id: key_id.clone(),
+                policy_revision: ks.current_policy_revision,
+                window_start_millis: ks.window_start_millis,
+                usage: GovernanceUsage {
+                    requests: ks.window_used_requests,
+                    tokens: ks.window_used_tokens,
+                    micro_usd: 0,
+                },
+            });
+            slots.push(NodeCounterSlot {
+                key_id: key_id.clone(),
+                policy_revision: ks.current_policy_revision,
+                window_start_millis: GOVERNANCE_LIFETIME_WINDOW,
+                usage: GovernanceUsage {
+                    requests: 0,
+                    tokens: ks.total_used_tokens,
+                    micro_usd: ks.total_used_micro_usd,
+                },
+            });
+        }
+        slots
     }
 }
 
@@ -551,7 +595,16 @@ impl GovernanceStore for InMemoryGovernanceStore {
         let (next_key_state, window_start_millis, window_reset_at_millis) = {
             let key_state = state.keys.entry(request.key_id.clone()).or_default();
             ensure_window(key_state, now_millis, request.limits.window_millis)?;
-            let next_key_state = reserve_units(key_state, &request)?;
+            let peer = {
+                let peer_view = self.inner.peer.lock();
+                peer_usage(
+                    &peer_view,
+                    &request.key_id,
+                    request.policy_revision,
+                    key_state.window_start_millis,
+                )
+            };
+            let next_key_state = reserve_units(key_state, &request, &peer)?;
             (
                 next_key_state,
                 key_state.window_start_millis,
@@ -733,31 +786,44 @@ impl GovernanceStore for InMemoryGovernanceStore {
         )?;
         let key_state = state.keys.entry(key.key_id.clone()).or_default();
         ensure_window(key_state, now_millis, key.limits.window_millis)?;
+        let peer = {
+            let peer_view = self.inner.peer.lock();
+            peer_usage(
+                &peer_view,
+                &key.key_id,
+                key.policy_revision,
+                key_state.window_start_millis,
+            )
+        };
 
         Ok(GovernanceSnapshot {
             key_id: key.key_id,
             policy_revision: key.policy_revision,
             requests_per_window: CounterSnapshot::new(
                 key.limits.requests_per_window,
-                key_state.window_used_requests,
+                key_state.window_used_requests.saturating_add(peer.requests),
                 key_state.window_reserved_requests,
                 Some(key_state.window_reset_at_millis),
             ),
             tokens_per_window: CounterSnapshot::new(
                 key.limits.tokens_per_window,
-                key_state.window_used_tokens,
+                key_state
+                    .window_used_tokens
+                    .saturating_add(peer.window_tokens),
                 key_state.window_reserved_tokens,
                 Some(key_state.window_reset_at_millis),
             ),
             total_tokens: CounterSnapshot::new(
                 key.limits.total_tokens,
-                key_state.total_used_tokens,
+                key_state.total_used_tokens.saturating_add(peer.total_tokens),
                 key_state.total_reserved_tokens,
                 None,
             ),
             total_micro_usd: CounterSnapshot::new(
                 key.limits.total_micro_usd,
-                key_state.total_used_micro_usd,
+                key_state
+                    .total_used_micro_usd
+                    .saturating_add(peer.total_micro_usd),
                 key_state.total_reserved_micro_usd,
                 None,
             ),
@@ -834,11 +900,37 @@ fn ensure_window(
     Ok(())
 }
 
-fn reserve_units(state: &KeyState, request: &ReserveRequest) -> Result<KeyState, GovernanceError> {
+/// Cluster-merged peer usage for one key, revision, and window, added to the
+/// used side of every limit check so approximate admission on this node
+/// accounts for usage already settled on other gateway nodes.
+struct PeerUsage {
+    requests: u64,
+    window_tokens: u64,
+    total_tokens: u64,
+    total_micro_usd: u64,
+}
+
+/// Read the merged cluster view for one key's window and lifetime slots.
+fn peer_usage(peer: &MergedCounters, key_id: &str, rev: u64, window_start: u64) -> PeerUsage {
+    let window = peer.merged_usage(key_id, rev, window_start);
+    let lifetime = peer.merged_usage(key_id, rev, GOVERNANCE_LIFETIME_WINDOW);
+    PeerUsage {
+        requests: window.requests,
+        window_tokens: window.tokens,
+        total_tokens: lifetime.tokens,
+        total_micro_usd: lifetime.micro_usd,
+    }
+}
+
+fn reserve_units(
+    state: &KeyState,
+    request: &ReserveRequest,
+    peer: &PeerUsage,
+) -> Result<KeyState, GovernanceError> {
     check_limit(
         GovernanceDimension::RequestsPerWindow,
         request.limits.requests_per_window,
-        state.window_used_requests,
+        state.window_used_requests.saturating_add(peer.requests),
         state.window_reserved_requests,
         1,
         Some(state.window_reset_at_millis),
@@ -846,7 +938,7 @@ fn reserve_units(state: &KeyState, request: &ReserveRequest) -> Result<KeyState,
     check_limit(
         GovernanceDimension::TokensPerWindow,
         request.limits.tokens_per_window,
-        state.window_used_tokens,
+        state.window_used_tokens.saturating_add(peer.window_tokens),
         state.window_reserved_tokens,
         request.token_ceiling,
         Some(state.window_reset_at_millis),
@@ -854,7 +946,7 @@ fn reserve_units(state: &KeyState, request: &ReserveRequest) -> Result<KeyState,
     check_limit(
         GovernanceDimension::TotalTokens,
         request.limits.total_tokens,
-        state.total_used_tokens,
+        state.total_used_tokens.saturating_add(peer.total_tokens),
         state.total_reserved_tokens,
         request.token_ceiling,
         None,
@@ -862,7 +954,9 @@ fn reserve_units(state: &KeyState, request: &ReserveRequest) -> Result<KeyState,
     check_limit(
         GovernanceDimension::TotalMicroUsd,
         request.limits.total_micro_usd,
-        state.total_used_micro_usd,
+        state
+            .total_used_micro_usd
+            .saturating_add(peer.total_micro_usd),
         state.total_reserved_micro_usd,
         request.micro_usd_ceiling,
         None,
@@ -889,6 +983,7 @@ fn reserve_units(state: &KeyState, request: &ReserveRequest) -> Result<KeyState,
         request.micro_usd_ceiling,
         "total_reserved_micro_usd",
     )?;
+    next.current_policy_revision = request.policy_revision;
     Ok(next)
 }
 
@@ -940,6 +1035,7 @@ fn settle_units(
         actual.micro_usd,
         "total_used_micro_usd",
     )?;
+    next.current_policy_revision = record.reservation.policy_revision;
     Ok(next)
 }
 
@@ -1518,5 +1614,109 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn approximate_admission_counts_peer_usage_against_the_limit() {
+        use crate::governance_crdt::{merge_contributions, GovernanceContribution, NodeCounterSlot};
+
+        struct FixedClock(u64);
+        impl Clock for FixedClock {
+            fn now_millis(&self) -> u64 {
+                self.0
+            }
+        }
+
+        let store = InMemoryGovernanceStore::with_clock(
+            InMemoryGovernanceConfig::default(),
+            std::sync::Arc::new(FixedClock(0)),
+        )
+        .unwrap();
+
+        // A peer already used 8 requests this window (window_start = 0, rev = 1).
+        let peer = GovernanceContribution {
+            node_id: "peer".into(),
+            generation: 1,
+            slots: vec![NodeCounterSlot {
+                key_id: "k1".into(),
+                policy_revision: 1,
+                window_start_millis: 0,
+                usage: GovernanceUsage {
+                    requests: 8,
+                    tokens: 0,
+                    micro_usd: 0,
+                },
+            }],
+        };
+        store.set_peer_counters(merge_contributions([peer]));
+
+        let limits = GovernanceLimits {
+            requests_per_window: Some(10),
+            window_millis: 60_000,
+            ..Default::default()
+        };
+        let req = |id: &str| ReserveRequest {
+            reservation_id: id.to_string(),
+            key_id: "k1".to_string(),
+            policy_revision: 1,
+            limits: limits.clone(),
+            token_ceiling: 0,
+            micro_usd_ceiling: 0,
+        };
+
+        assert!(
+            store.reserve(req("r1")).await.is_ok(),
+            "9th cluster-wide request (8 peer + 1) fits under 10"
+        );
+        assert!(
+            store.reserve(req("r2")).await.is_ok(),
+            "10th fits exactly"
+        );
+        let r3 = store.reserve(req("r3")).await;
+        assert!(
+            matches!(r3, Err(GovernanceError::LimitExceeded(_))),
+            "11th cluster-wide request is denied by peer usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_slots_reports_a_window_slot_and_a_lifetime_slot_after_settle() {
+        let (store, _) = store_with_clock(1_000, 100, 500);
+        store
+            .reserve(reservation("request-1", 80, 600))
+            .await
+            .unwrap();
+        store
+            .settle(SettleRequest {
+                reservation_id: "request-1".to_string(),
+                key_id: "key-id-1".to_string(),
+                actual_tokens: 60,
+                actual_micro_usd: 450,
+            })
+            .await
+            .unwrap();
+
+        let slots = store.local_slots();
+        assert_eq!(slots.len(), 2);
+
+        let window_slot = slots
+            .iter()
+            .find(|slot| slot.window_start_millis == 0)
+            .expect("window slot is present");
+        assert_eq!(window_slot.key_id, "key-id-1");
+        assert_eq!(window_slot.policy_revision, 7);
+        assert_eq!(window_slot.usage.requests, 1);
+        assert_eq!(window_slot.usage.tokens, 60);
+        assert_eq!(window_slot.usage.micro_usd, 0);
+
+        let lifetime_slot = slots
+            .iter()
+            .find(|slot| slot.window_start_millis == GOVERNANCE_LIFETIME_WINDOW)
+            .expect("lifetime slot is present");
+        assert_eq!(lifetime_slot.key_id, "key-id-1");
+        assert_eq!(lifetime_slot.policy_revision, 7);
+        assert_eq!(lifetime_slot.usage.requests, 0);
+        assert_eq!(lifetime_slot.usage.tokens, 60);
+        assert_eq!(lifetime_slot.usage.micro_usd, 450);
     }
 }
