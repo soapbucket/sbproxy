@@ -32,7 +32,7 @@
 //! Adding a metric to the code without adding it here fails the build.
 //!
 //! A second, narrower guard lives at the bottom of this file:
-//! [`TENANT_SCOPED_METRICS`] and [`tenant_label_gaps`] enforce multi-tenant
+//! `TENANT_SCOPED_METRICS` and `tenant_label_gaps` enforce multi-tenant
 //! attribution. A metric can have a live writer, a truthful support level,
 //! and still merge every tenant's spend, tokens, or security verdicts into
 //! one series if nothing on it identifies whose data it is. That is a
@@ -1983,7 +1983,7 @@ pub const TENANT_LABEL_NAMES: &[&str] = &["tenant_id", "api_key_id", "tenant", "
 /// therefore must carry a label from [`TENANT_LABEL_NAMES`] naming it, or a
 /// reviewed [`TENANT_LABEL_EXEMPTIONS`] entry explaining why not yet.
 ///
-/// This is the opt-in mark [`tenant_label_gaps`] checks against. It is a
+/// This is the opt-in mark `tenant_label_gaps` checks against. It is a
 /// claim about a family's *meaning* ("this counts something that belongs to
 /// a specific tenant"), which nothing in `labels` alone can prove, so a
 /// human asserts it here the same way [`REFERENCE_EXEMPTIONS`] is a human
@@ -2022,7 +2022,7 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
 /// (`crates/sbproxy-observe/src/metrics.rs`, `record_tokens_attributed`) is
 /// the one live candidate: its own doc comment already says `tenant_id` is
 /// deliberately absent pending the credentials epic's origin-to-tenant
-/// resolution. It is left out of [`TENANT_SCOPED_METRICS`] entirely rather
+/// resolution. It is left out of `TENANT_SCOPED_METRICS` entirely rather
 /// than exempted here, because an exemption needs a tracking ticket
 /// (mirroring [`REFERENCE_EXEMPTIONS`]'s own rule below) and none exists
 /// yet; file one, then move the name across and add the entry in the same
