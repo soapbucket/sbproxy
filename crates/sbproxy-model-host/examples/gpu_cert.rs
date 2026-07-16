@@ -592,6 +592,9 @@ fn probe() {
         kv_heads: 8,
         head_dim: 128,
         max_context: 40960,
+        hidden_size: 0,
+        expert_count: 0,
+        expert_ffn_length: 0,
     };
     let candidates = vec!["FP8".to_string(), "Q4_K_M".to_string()];
     match plan_fit(g, &meta, &candidates, 8192, 1.15) {
@@ -689,6 +692,8 @@ fn serve(repo: &str, port: u16) {
         gpu_indexes: vec![0],
         seq_len: 8192,
         memory: sbproxy_model_host::MemoryEstimate::from_total(0, 4 * 1024 * 1024 * 1024),
+        moe: None,
+        throughput: None,
     };
     let spec = build_launch_spec(
         EngineKind::Vllm,

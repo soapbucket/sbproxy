@@ -1703,6 +1703,9 @@ impl ModelMetadataProvider for ProductionFixtureMetadata {
             kv_heads: 2,
             head_dim: 8,
             max_context: 128,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         })
     }
 }

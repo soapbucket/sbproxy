@@ -62,6 +62,8 @@ fn fit_plan(devices: Vec<u32>) -> FitPlan {
         gpu_indexes: devices.clone(),
         seq_len: 4096,
         memory: zero_memory(devices),
+        moe: None,
+        throughput: None,
     }
 }
 

@@ -1526,6 +1526,9 @@ mod tests {
                 kv_heads: 8,
                 head_dim: 128,
                 max_context: 40960,
+                hidden_size: 0,
+                expert_count: 0,
+                expert_ffn_length: 0,
             })
         }
     }
