@@ -8276,6 +8276,7 @@ dependencies = [
  "parking_lot",
  "prometheus 0.14.0",
  "rand 0.8.6",
+ "redb",
  "regex",
  "reqwest 0.12.28",
  "sbproxy-cache",

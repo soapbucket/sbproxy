@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use crate::hybrid::LaneSplit;
 
 /// One model's line in the value report.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ModelValue {
     /// The advertised model name.
     pub model: String,
@@ -31,7 +31,7 @@ pub struct ModelValue {
 }
 
 /// The aggregate value-delivered report across all local models.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ValueReport {
     /// Per-model lines, sorted by model name for a stable rendering.
     pub models: Vec<ModelValue>,

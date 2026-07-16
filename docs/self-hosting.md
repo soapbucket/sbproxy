@@ -166,10 +166,33 @@ providers:
 Ollama's own FAQ tells you to put nginx in front of it. SBproxy is that
 front, with a ledger and a policy engine behind it: virtual keys,
 per-team quotas, hierarchical budgets, and the guardrail mesh all apply
-to the local model the same way they apply to a hosted one. The usage
-ledger prices each local completion at what the equivalent hosted API
-would have charged and reports dollars saved per model per month, which
-is the number that justifies the GPU.
+to the local model the same way they apply to a hosted one.
+
+It also tells you what the GPU is worth. Give a served model a
+`reference:` block naming the hosted model it displaces and that model's
+per-million-token price, and SBproxy prices every completion it serves
+locally at what the hosted API would have charged. A local completion
+costs nothing at the API, so the whole displaced price is the saving.
+The `reference:` lives on a served model inside a provider `serve:`
+block:
+
+```yaml
+providers:
+  - name: local
+    serve:
+      models:
+        - model: qwen3-32b
+          name: qwen
+          reference:
+            model: gpt-4o
+            prompt_micros_per_mtok: 3000000
+            completion_micros_per_mtok: 15000000
+```
+
+`GET /admin/model-host/value` then reports the running total: local and
+cloud completion counts per model and the dollars each local completion
+saved. Leave `reference:` off and SBproxy makes no savings claim for that
+model; it never guesses a cloud price.
 
 ## A public endpoint with Let's Encrypt
 
@@ -226,7 +249,7 @@ your own GPUs.
 | Model catalog | Model manifest (source, pinning, digests, pull policy) | Curated allowlist, signed |
 | Fallback + provider routing preferences | Fallback chain, cost/latency routing, prefix-affinity, least-token-usage | GPU-aware and prefix-cache-aware routing across a node fleet |
 | Virtual keys | Virtual keys with per-key scopes | Tenants, RBAC |
-| Spend limits and accounting | Budgets, hierarchical quotas, usage ledger, dollars-saved report | Audit trail, per-tenant accounting |
+| Spend limits and accounting | Budgets, hierarchical quotas, usage ledger, dollars-saved report at `/admin/model-host/value` | Audit trail, per-tenant accounting |
 | Zero-data-retention routing | `no_prompt_training` provider flag + `x-sbproxy-disallow-prompt-training` request header | Air-gapped: guardrails, redaction, and generation all local |
 | Bring your own key | Provider keys plus a credential resolver (env, secret stores, vault) | Managed key rotation, mesh-distributed key cache |
 | 400-plus hosted-model marketplace | 66 hosted providers plus models on your GPUs | Same providers, fleet placement |

@@ -34,6 +34,7 @@ Registry version: `1`
 | `platform.nvidia_cuda` | `platform` | `preview` | test.cuda_build<br>test.local_admission | NVIDIA discovery, vLLM, and CUDA llama.cpp have deterministic coverage; live GCP certification is reserved for the final PR group. |
 | `lifecycle.priority_admission` | `lifecycle` | `stable` | contract.priority_gate_changes_dispatch | Configured local concurrency changes request admission. |
 | `lifecycle.model_cli` | `lifecycle` | `stable` | contract.exact_removal_protects_references<br>test.models_lifecycle_cli | Pull, list, show, remove, process status, and stop commands use versioned JSON and shared artifact or runtime contracts. |
+| `admin.value_report` | `admin` | `stable` | contract.reference_price_records_savings<br>test.value_ledger | A configured cloud reference prices each local completion as dollars saved, recorded per model and served on the admin value route. |
 
 ## Configuration fields
 
@@ -64,3 +65,4 @@ Registry version: `1`
 | `serve.models[].cpu_offload_gib` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].max_loras` | `unsupported` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].gguf_file` | `preview` | `artifact.legacy_download` | `none` |
+| `serve.models[].reference` | `stable` | `admin.value_report` | `contract.reference_price_records_savings` |

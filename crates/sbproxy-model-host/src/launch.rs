@@ -928,6 +928,7 @@ mod tests {
             cpu_offload_gib: None,
             max_loras: None,
             gguf_file: None,
+            reference: None,
         }
     }
 

@@ -65,6 +65,7 @@ pub mod types;
 pub mod usage_ledger;
 pub mod usage_parser;
 pub mod usage_sink;
+pub mod value_ledger;
 
 pub use batch::{BatchJob, BatchStatus, BatchStore, MemoryBatchStore};
 pub use budget::{
@@ -112,3 +113,4 @@ pub use streaming_analytics::{StreamRegistry, StreamTracker};
 pub use token_estimate::{estimate_tokens, estimate_tokens_heuristic};
 pub use types::*;
 pub use usage_parser::{select_parser, SseUsageParser, UsageParserHints, UsageTokens};
+pub use value_ledger::{ValueLedger, ValueSink};
