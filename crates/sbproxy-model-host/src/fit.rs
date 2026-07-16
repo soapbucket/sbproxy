@@ -586,6 +586,11 @@ pub enum FitError {
         /// Smallest candidate estimate in GiB.
         smallest_gib: f64,
     },
+    /// A fixed tensor-parallel degree or replica count cannot be placed on
+    /// the available devices (wrong device count, a degree that does not
+    /// divide the KV heads, or more replicas than the node can host).
+    #[error("{0}")]
+    Unsatisfiable(String),
 }
 
 /// Default framework-overhead multiplier on weights + KV.
@@ -903,6 +908,7 @@ pub fn plan_fit_auto_kv_with_margin(
         safety_margin,
         kv_bytes_per_element,
         1,
+        None,
     )
 }
 
@@ -917,6 +923,7 @@ pub fn plan_fit_auto_kv_with_margin_and_concurrency(
     safety_margin: f64,
     kv_bytes_per_element: Option<f64>,
     concurrency: u32,
+    forced_tp: Option<usize>,
 ) -> Result<FitPlan, FitError> {
     plan_fit_over_set(
         &probe.probe(),
@@ -927,6 +934,7 @@ pub fn plan_fit_auto_kv_with_margin_and_concurrency(
         safety_margin,
         kv_bytes_per_element,
         concurrency,
+        forced_tp,
     )
 }
 
@@ -949,13 +957,42 @@ pub fn plan_fit_over_set(
     safety_margin: f64,
     kv_bytes_per_element: Option<f64>,
     concurrency: u32,
+    forced_tp: Option<usize>,
 ) -> Result<FitPlan, FitError> {
     if gpus.is_empty() {
         return Err(FitError::NoGpu);
     }
+    // A fixed degree must be a sane, satisfiable request before searching.
+    if let Some(tp) = forced_tp {
+        if tp == 0 {
+            return Err(FitError::Unsatisfiable(
+                "tensor_parallel must be at least 1".to_string(),
+            ));
+        }
+        if tp > 1 && !meta.kv_heads.is_multiple_of(tp as u64) {
+            return Err(FitError::Unsatisfiable(format!(
+                "tensor_parallel {tp} does not divide the model's {} KV heads",
+                meta.kv_heads
+            )));
+        }
+        if gpus.len() < tp {
+            return Err(FitError::Unsatisfiable(format!(
+                "tensor_parallel {tp} needs {tp} devices, {} available",
+                gpus.len()
+            )));
+        }
+    }
     let mut first_err: Option<FitError> = None;
 
-    for tp in [1usize, 2, 4, 8] {
+    let forced_slot;
+    let tp_candidates: &[usize] = match forced_tp {
+        Some(tp) => {
+            forced_slot = [tp];
+            &forced_slot
+        }
+        None => &[1usize, 2, 4, 8],
+    };
+    for &tp in tp_candidates {
         if tp == 1 {
             // Single GPU: try cards in free-VRAM order, the cheapest placement.
             let mut singles: Vec<&GpuDescriptor> = gpus.iter().collect();
@@ -1029,7 +1066,62 @@ pub fn plan_fit_over_set(
             }
         }
     }
-    Err(first_err.unwrap_or(FitError::NoGpu))
+    Err(first_err.unwrap_or_else(|| match forced_tp {
+        Some(tp) => FitError::Unsatisfiable(format!(
+            "no homogeneous group of {tp} identical devices has enough free VRAM"
+        )),
+        None => FitError::NoGpu,
+    }))
+}
+
+/// Pack `replicas` replicas of one model onto disjoint device sets.
+///
+/// Each replica claims its own device set (of `tensor_parallel` size when
+/// set, else the smallest degree that fits), and no two replicas share a
+/// device, so replicas never contend for VRAM. Devices are consumed
+/// greedily replica by replica; the first replica that cannot fit on the
+/// remaining devices fails with a legible reason instead of silently
+/// dropping replicas. Returns one [`FitPlan`] per replica.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_replica_fits(
+    gpus: &[GpuDescriptor],
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+    replicas: u32,
+    tensor_parallel: Option<usize>,
+) -> Result<Vec<FitPlan>, FitError> {
+    let replicas = replicas.max(1) as usize;
+    let mut remaining: Vec<GpuDescriptor> = gpus.to_vec();
+    let mut plans = Vec::with_capacity(replicas);
+    for replica in 0..replicas {
+        let plan = plan_fit_over_set(
+            &remaining,
+            meta,
+            candidates,
+            seq_len,
+            overhead,
+            safety_margin,
+            kv_bytes_per_element,
+            concurrency,
+            tensor_parallel,
+        )
+        .map_err(|error| {
+            FitError::Unsatisfiable(format!(
+                "cannot place replica {} of {replicas}: {error} ({} device(s) still free)",
+                replica + 1,
+                remaining.len()
+            ))
+        })?;
+        let claimed: std::collections::BTreeSet<u32> = plan.gpu_indexes.iter().copied().collect();
+        remaining.retain(|gpu| !claimed.contains(&gpu.index));
+        plans.push(plan);
+    }
+    Ok(plans)
 }
 
 #[cfg(test)]
@@ -1137,6 +1229,7 @@ mod tests {
             0.0,
             None,
             1,
+            None,
         );
         assert!(
             matches!(single, Err(FitError::TooLarge { .. })),
@@ -1152,6 +1245,7 @@ mod tests {
             0.0,
             None,
             1,
+            None,
         )
         .expect("14B f16 fits two L4 at tp=2");
         assert_eq!(pair.tp_degree(), 2);
@@ -1178,6 +1272,7 @@ mod tests {
             0.0,
             None,
             1,
+            None,
         )
         .expect("0.6B fits one L4");
         assert_eq!(plan.tp_degree(), 1);
@@ -1200,6 +1295,7 @@ mod tests {
             0.0,
             None,
             1,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1230,6 +1326,7 @@ mod tests {
             0.0,
             None,
             1,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1601,5 +1698,147 @@ mod tests {
         assert_eq!(m.kv_heads, 32);
         assert_eq!(m.head_dim, 128);
         assert_eq!(m.max_context, 8192); // fallback
+    }
+
+    fn indexed_l4s(count: u32) -> Vec<GpuDescriptor> {
+        (0..count)
+            .map(|index| {
+                let mut gpu = GpuDescriptor::l4();
+                gpu.index = index;
+                gpu
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_forced_degree_pins_tensor_parallel_even_when_one_card_would_do() {
+        // A 0.6B model fits one L4, but a pinned degree of two shards it
+        // across both cards instead of picking the cheapest single-card fit.
+        let gpus = indexed_l4s(2);
+        let plan = plan_fit_over_set(
+            &gpus,
+            &meta_small(),
+            &["Q4_K_M".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            Some(2),
+        )
+        .expect("0.6B pins to tp=2 across two L4");
+        assert_eq!(plan.tp_degree(), 2);
+        assert_eq!(plan.gpu_indexes, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_forced_degree_that_does_not_divide_kv_heads_is_unsatisfiable() {
+        let mut meta = meta_14b();
+        meta.kv_heads = 3;
+        let gpus = indexed_l4s(2);
+        let error = plan_fit_over_set(
+            &gpus,
+            &meta,
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FitError::Unsatisfiable(_)),
+            "tp=2 cannot divide 3 KV heads: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_forced_degree_larger_than_the_device_count_is_unsatisfiable() {
+        let gpus = indexed_l4s(1);
+        let error = plan_fit_over_set(
+            &gpus,
+            &meta_small(),
+            &["Q4_K_M".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FitError::Unsatisfiable(ref message) if message.contains("needs 2 devices")),
+            "tp=2 needs two devices when only one is present",
+        );
+    }
+
+    #[test]
+    fn packing_replicas_assigns_disjoint_device_sets() {
+        // Four single-card replicas take one distinct device each.
+        let gpus = indexed_l4s(4);
+        let plans = plan_replica_fits(
+            &gpus,
+            &meta_small(),
+            &["Q4_K_M".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            4,
+            Some(1),
+        )
+        .expect("four 0.6B replicas fit four L4");
+        assert_eq!(plans.len(), 4);
+        let mut devices: Vec<u32> = plans.iter().flat_map(|p| p.gpu_indexes.clone()).collect();
+        devices.sort_unstable();
+        assert_eq!(devices, vec![0, 1, 2, 3], "replicas claim distinct devices");
+
+        // Two tp=2 replicas take two disjoint pairs.
+        let pairs = plan_replica_fits(
+            &gpus,
+            &meta_14b(),
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            2,
+            Some(2),
+        )
+        .expect("two 14B replicas fit four L4 at tp=2");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].tp_degree(), 2);
+        let mut paired: Vec<u32> = pairs.iter().flat_map(|p| p.gpu_indexes.clone()).collect();
+        paired.sort_unstable();
+        assert_eq!(paired, vec![0, 1, 2, 3], "the two pairs are disjoint");
+    }
+
+    #[test]
+    fn packing_more_replicas_than_devices_fails_legibly() {
+        // Four L4 at tp=2 host two replicas; a third has no devices left.
+        let gpus = indexed_l4s(4);
+        let error = plan_replica_fits(
+            &gpus,
+            &meta_14b(),
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            4,
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FitError::Unsatisfiable(ref message)
+                if message.contains("replica 3")),
+            "the third replica cannot be placed: {error:?}"
+        );
     }
 }

@@ -18,6 +18,7 @@ fn deployment(model: &str) -> ModelDeployment {
         variant: Some("q4_k_m".to_string()),
         heterogeneous_variants: false,
         replicas: 1,
+        tensor_parallel: None,
         required_labels: BTreeMap::from([("pool".to_string(), "gpu".to_string())]),
         spread_by: vec!["zone".to_string()],
         pull: PullPolicy::OnDemand,

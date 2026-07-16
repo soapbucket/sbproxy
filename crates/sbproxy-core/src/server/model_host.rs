@@ -1618,6 +1618,7 @@ fn managed_deployment_from_model(
         variant: deployment.variant,
         heterogeneous_variants: deployment.heterogeneous_variants,
         replicas: deployment.replicas,
+        tensor_parallel: deployment.tensor_parallel,
         required_labels: deployment.required_labels,
         spread_by: deployment.spread_by,
         pull: match deployment.pull {

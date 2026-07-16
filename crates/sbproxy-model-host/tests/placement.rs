@@ -73,6 +73,7 @@ fn deployment(replicas: u32) -> ModelDeployment {
         variant: None,
         heterogeneous_variants: replicas > 1,
         replicas,
+        tensor_parallel: None,
         required_labels: BTreeMap::new(),
         spread_by: Vec::new(),
         pull: PullPolicy::OnDemand,

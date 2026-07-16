@@ -160,6 +160,8 @@ struct StrictModelDeployment {
     heterogeneous_variants: bool,
     #[serde(default = "one_replica")]
     replicas: u32,
+    #[serde(default)]
+    tensor_parallel: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_unique_btree_map")]
     required_labels: BTreeMap<String, String>,
     #[serde(default)]
@@ -190,6 +192,7 @@ impl From<StrictModelDeployment> for sbproxy_model_host::ModelDeployment {
             variant: deployment.variant,
             heterogeneous_variants: deployment.heterogeneous_variants,
             replicas: deployment.replicas,
+            tensor_parallel: deployment.tensor_parallel,
             required_labels: deployment.required_labels,
             spread_by: deployment.spread_by,
             pull: deployment.pull,
@@ -1026,6 +1029,7 @@ mod tests {
             variant: Some("q4_k_m".to_string()),
             heterogeneous_variants: false,
             replicas: 1,
+            tensor_parallel: None,
             required_labels: BTreeMap::new(),
             spread_by: Vec::new(),
             pull: PullPolicy::OnDemand,

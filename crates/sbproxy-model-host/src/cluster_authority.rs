@@ -108,6 +108,9 @@ impl From<RestrictedModelDeployment> for ModelDeployment {
             variant: deployment.variant,
             heterogeneous_variants: deployment.heterogeneous_variants,
             replicas: deployment.replicas,
+            // Signed cluster bundles do not carry a fixed tensor-parallel
+            // degree yet; the node fit planner picks the degree there.
+            tensor_parallel: None,
             required_labels: deployment.required_labels,
             spread_by: deployment.spread_by,
             pull: deployment.pull,

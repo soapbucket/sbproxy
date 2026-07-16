@@ -70,6 +70,13 @@ pub struct ModelDeployment {
     /// Desired replica count.
     #[serde(default = "one_replica")]
     pub replicas: u32,
+    /// Fixed tensor-parallel degree per replica: the exact number of
+    /// devices each replica spans. `None` lets the fit planner pick the
+    /// smallest degree that fits. When set, N replicas need N disjoint
+    /// device sets of this size, so `replicas * tensor_parallel` must not
+    /// exceed the node's device count.
+    #[serde(default)]
+    pub tensor_parallel: Option<u32>,
     /// Node labels required by placement.
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,

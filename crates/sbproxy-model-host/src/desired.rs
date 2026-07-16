@@ -504,6 +504,7 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
         variant: config.variant.clone(),
         heterogeneous_variants: config.heterogeneous_variants,
         replicas: config.replicas,
+        tensor_parallel: config.tensor_parallel,
         required_labels: config.required_labels.clone(),
         spread_by: config.spread_by.clone(),
         pull: match config.pull {
@@ -556,6 +557,7 @@ fn lower_legacy_deployment(
         variant: entry.variant.clone(),
         heterogeneous_variants: false,
         replicas: 1,
+        tensor_parallel: None,
         required_labels: BTreeMap::new(),
         spread_by: Vec::new(),
         pull,

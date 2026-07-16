@@ -1763,6 +1763,16 @@
           "format": "uint32",
           "minimum": 0.0
         },
+        "tensor_parallel": {
+          "description": "Fixed tensor-parallel degree per replica: the exact number of devices each replica spans. Omit to let the fit planner pick the smallest degree that fits. When set, `replicas * tensor_parallel` devices are needed, since each replica claims a distinct device set.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "required_labels": {
           "description": "Worker labels required by this deployment.",
           "default": {},

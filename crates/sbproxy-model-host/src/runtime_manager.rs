@@ -2927,6 +2927,10 @@ impl ProductionPreparedDeployment {
             self.safety_margin,
             kv_quant.bytes_per_element(),
             concurrency,
+            self.desired
+                .desired
+                .tensor_parallel
+                .map(|degree| degree as usize),
         )
         .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
         let selected_devices = if self.worker.accelerator == AcceleratorKind::Cpu {
