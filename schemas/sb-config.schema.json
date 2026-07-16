@@ -148,6 +148,19 @@
           "type": "null"
         }
       ]
+    },
+    "update": {
+      "description": "WOR-1804: how `sbproxy update` behaves for the binary and the managed inference engines. Optional; an absent block is the same as the defaults (stable channel, no background check).",
+      "default": {
+        "auto": false,
+        "channel": "stable",
+        "check_interval_secs": 86400
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/UpdateConfig"
+        }
+      ]
     }
   },
   "definitions": {
@@ -7606,6 +7619,59 @@
           "type": "string",
           "enum": [
             "file"
+          ]
+        }
+      ]
+    },
+    "UpdateConfig": {
+      "description": "The `update:` block: how `sbproxy update` behaves (WOR-1804).\n\nPinning always wins. A `path` / `brew` / `apt`-managed artifact, or one pinned to an explicit version or digest, is reported but never replaced unless a run explicitly targets it. A background check (see `auto`) only ever reports; applying an update is always an explicit `sbproxy update` run.",
+      "type": "object",
+      "properties": {
+        "channel": {
+          "description": "Release stream the binary and managed engines follow.",
+          "default": "stable",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UpdateChannel"
+            }
+          ]
+        },
+        "auto": {
+          "description": "When true, a background freshness check runs every `check_interval` and reports to `sbproxy doctor` and the logs. A background check never replaces an artifact; it only reports.",
+          "default": false,
+          "type": "boolean"
+        },
+        "check_interval_secs": {
+          "description": "How often the background check runs, in seconds. Accepts a humanized duration (`6h`, `1d`) or bare seconds. Only consulted when `auto` is true. Defaults to once a day.",
+          "default": 86400,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UpdateChannel": {
+      "description": "Which release stream `sbproxy update` follows for the binary and the managed inference engines (WOR-1804).",
+      "oneOf": [
+        {
+          "description": "Track the latest stable release. The default.",
+          "type": "string",
+          "enum": [
+            "stable"
+          ]
+        },
+        {
+          "description": "Track the newest release, pre-releases included.",
+          "type": "string",
+          "enum": [
+            "latest"
+          ]
+        },
+        {
+          "description": "Never move automatically. Every artifact is held; only an `sbproxy update` run that explicitly targets an artifact may replace it.",
+          "type": "string",
+          "enum": [
+            "pinned"
           ]
         }
       ]

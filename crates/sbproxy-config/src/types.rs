@@ -57,6 +57,110 @@ pub struct ConfigFile {
     /// block is present and `enabled: true`.
     #[serde(default)]
     pub session_ledger: Option<SessionLedgerConfig>,
+    /// WOR-1804: how `sbproxy update` behaves for the binary and the
+    /// managed inference engines. Optional; an absent block is the same
+    /// as the defaults (stable channel, no background check).
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// Which release stream `sbproxy update` follows for the binary and the
+/// managed inference engines (WOR-1804).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    /// Track the latest stable release. The default.
+    #[default]
+    Stable,
+    /// Track the newest release, pre-releases included.
+    Latest,
+    /// Never move automatically. Every artifact is held; only an
+    /// `sbproxy update` run that explicitly targets an artifact may
+    /// replace it.
+    Pinned,
+}
+
+/// The `update:` block: how `sbproxy update` behaves (WOR-1804).
+///
+/// Pinning always wins. A `path` / `brew` / `apt`-managed artifact, or
+/// one pinned to an explicit version or digest, is reported but never
+/// replaced unless a run explicitly targets it. A background check (see
+/// `auto`) only ever reports; applying an update is always an explicit
+/// `sbproxy update` run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UpdateConfig {
+    /// Release stream the binary and managed engines follow.
+    #[serde(default)]
+    pub channel: UpdateChannel,
+    /// When true, a background freshness check runs every
+    /// `check_interval` and reports to `sbproxy doctor` and the logs. A
+    /// background check never replaces an artifact; it only reports.
+    #[serde(default)]
+    pub auto: bool,
+    /// How often the background check runs, in seconds. Accepts a
+    /// humanized duration (`6h`, `1d`) or bare seconds. Only consulted
+    /// when `auto` is true. Defaults to once a day.
+    #[serde(
+        default = "default_update_check_interval_secs",
+        deserialize_with = "crate::duration::deserialize_secs"
+    )]
+    pub check_interval_secs: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            channel: UpdateChannel::default(),
+            auto: false,
+            check_interval_secs: default_update_check_interval_secs(),
+        }
+    }
+}
+
+/// Default background freshness-check interval: once a day.
+fn default_update_check_interval_secs() -> u64 {
+    86_400
+}
+
+#[cfg(test)]
+mod update_config_tests {
+    use super::*;
+
+    #[test]
+    fn absent_block_uses_defaults() {
+        // An existing config with no `update:` block parses unchanged and
+        // yields the stable, no-background defaults.
+        let cfg: ConfigFile = serde_yaml::from_str("proxy: {}\n").unwrap();
+        assert_eq!(cfg.update.channel, UpdateChannel::Stable);
+        assert!(!cfg.update.auto);
+        assert_eq!(cfg.update.check_interval_secs, 86_400);
+    }
+
+    #[test]
+    fn empty_update_block_uses_defaults() {
+        let cfg: UpdateConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg, UpdateConfig::default());
+        assert_eq!(cfg.channel, UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn parses_channel_and_auto_and_humanized_interval() {
+        let cfg: UpdateConfig =
+            serde_yaml::from_str("channel: pinned\nauto: true\ncheck_interval_secs: 6h\n").unwrap();
+        assert_eq!(cfg.channel, UpdateChannel::Pinned);
+        assert!(cfg.auto);
+        assert_eq!(cfg.check_interval_secs, 21_600);
+    }
+
+    #[test]
+    fn channel_round_trips_snake_case() {
+        let cfg: UpdateConfig = serde_yaml::from_str("channel: latest\n").unwrap();
+        assert_eq!(cfg.channel, UpdateChannel::Latest);
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["channel"], "latest");
+    }
 }
 
 /// WOR-1130: top-level workspace rate-limit budget configuration.

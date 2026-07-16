@@ -270,7 +270,27 @@ pub fn validate(config: &ConfigFile, opts: &ValidationOptions) -> Vec<PlanFindin
         check_unknown_types(host, origin, opts, &mut findings);
     }
 
+    // -- update-config --
+    check_update_config(&config.update, &mut findings);
+
     findings
+}
+
+/// Flag an `update:` block that turns on the background check but sets a
+/// zero interval, which would poll with no delay. A warning, not an error:
+/// the field is only consulted when a background check is wired.
+fn check_update_config(update: &crate::types::UpdateConfig, out: &mut Vec<PlanFinding>) {
+    if update.auto && update.check_interval_secs == 0 {
+        out.push(PlanFinding {
+            severity: Severity::Warn,
+            rule_id: "update-zero-check-interval".to_string(),
+            path: "update.check_interval_secs".to_string(),
+            message: "update.auto is on but check_interval_secs is 0; set a \
+                      non-zero interval (for example 1d) so the background \
+                      freshness check does not poll without delay"
+                .to_string(),
+        });
+    }
 }
 
 // --- Orphan-ref check ----------------------------------------------
@@ -606,6 +626,38 @@ mod tests {
 
     fn parse(yaml: &str) -> ConfigFile {
         serde_yaml::from_str::<ConfigFile>(yaml).expect("ConfigFile parse")
+    }
+
+    // -- update-config --
+
+    #[test]
+    fn update_auto_with_zero_interval_warns() {
+        let cfg = parse("update:\n  auto: true\n  check_interval_secs: 0\n");
+        let findings = validate(&cfg, &ValidationOptions::default());
+        let zero: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "update-zero-check-interval")
+            .collect();
+        assert_eq!(zero.len(), 1, "got findings: {findings:?}");
+        assert_eq!(zero[0].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn update_auto_with_positive_interval_is_clean() {
+        let cfg = parse("update:\n  auto: true\n  check_interval_secs: 1d\n");
+        let findings = validate(&cfg, &ValidationOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule_id == "update-zero-check-interval"));
+    }
+
+    #[test]
+    fn update_block_absent_is_clean() {
+        let cfg = parse("proxy: {}\n");
+        let findings = validate(&cfg, &ValidationOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule_id == "update-zero-check-interval"));
     }
 
     // -- orphan-ref --

@@ -132,7 +132,8 @@ sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
                            [--cache-dir <path>] [--dry-run]
 sbproxy models [list|show <id>|pull [<id>...]|remove <id>|ps|stop <deployment>]
 sbproxy cluster {init|token create|enroll|status}
-sbproxy update [--self]
+sbproxy update [--self] [--engines] [--models] [--check] [--yes]
+                        [--cache-dir <path>] [--format text|json]
 sbproxy ai ledger <subcommand>
 sbproxy doctor [--format text|json]
 sbproxy completions {bash|zsh|fish|powershell|elvish}
@@ -154,7 +155,7 @@ The full subcommand set, one line each:
 | `run` | Resolve a certified artifact, generate local admin auth, warm a canonical managed deployment, then print an OpenAI-compatible endpoint. |
 | `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, or drain and stop one. |
 | `cluster` | Initialize cluster identity, create one-time enrollment tokens, enroll nodes, or inspect the complete roster, placement, and unhealthy-node alerts. |
-| `update` | Check the engine release feed and cached models for freshness; `--self` also checks the sbproxy binary. Report-only. |
+| `update` | Update the engines and cached models (add `--self` for the binary): check the engine release feed and cached models, then fetch, verify, and swap what is out of date, with confirmation. `--check` reports only. Pinned or `path`/`brew`/`apt`-managed artifacts are reported, never replaced, unless the run targets them. |
 | `ai` | AI gateway tools; `ai ledger` verifies the usage ledger. |
 | `doctor` | Diagnose what this binary can do on the current host. |
 | `completions` | Print a shell-completion script for the requested shell. |
@@ -412,6 +413,61 @@ GPU drivers are never installed by sbproxy; a missing driver is
 reported with guidance only. See [model-host.md](model-host.md) for canonical
 fields, per-engine details, and host prerequisites. Live NVIDIA certification
 remains in the final GCP integration PR.
+
+### `update` - keep the binary, engines, and models current
+
+`sbproxy update` checks the engine release feed and the cached models,
+then fetches, verifies, and swaps what is out of date. With no target
+flag it covers the engines and the cached models; `--self` adds the
+sbproxy binary. `--engines` or `--models` narrow the run to that target.
+
+```bash
+# Report only, mutate nothing (the dry-run freshness report).
+sbproxy update --check
+
+# Update engines and models, confirming each swap.
+sbproxy update
+
+# Update the binary too, without prompts.
+sbproxy update --self --yes
+```
+
+Every swap is verified before it lands. An engine prebuilt and the
+sbproxy release archive are checked against their published SHA-256
+before the atomic replace, and a model re-pull runs through the same
+weight manager (and per-file digest verification) as `models pull`. The
+binary is replaced by writing the new file next to the running one and
+renaming it into place, so the swap is atomic on a POSIX host.
+
+Pinning always wins. An artifact that another tool owns, a binary already
+on `PATH`, or one installed by `brew` or `apt`, is reported as managed
+elsewhere and is never overwritten. An artifact pinned to an explicit
+version or digest is held on a blanket `sbproxy update` and moves only
+when the run names it (for example `sbproxy update --engines`). A newer
+llama.cpp tag has no vendored digest, so pin `engines.llama_cpp.acquire.sha256`
+to verify a moved engine, or leave the engine on its digest-pinned
+default.
+
+Behavior is tuned by the optional `update:` config block:
+
+```yaml
+update:
+  # stable (default) | latest | pinned. `pinned` freezes every artifact;
+  # only a run that explicitly targets one may move it.
+  channel: stable
+  # When true, a background freshness check runs on the interval below and
+  # reports to the logs and `sbproxy doctor`. A background check never
+  # swaps anything; applying an update is always an explicit run.
+  auto: false
+  # How often the background check runs. Humanized (6h, 1d) or bare
+  # seconds. Only consulted when auto is true. Defaults to once a day.
+  check_interval_secs: 1d
+```
+
+With `auto: true`, an `sbproxy update` run reports only and swaps nothing,
+so an unattended host never mutates a binary out from under itself.
+`--format json` always emits the machine-readable freshness report and
+takes no action; the acting path prints its progress on the text path.
 
 ### `completions` - shell tab-completion scripts
 
