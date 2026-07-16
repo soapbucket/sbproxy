@@ -106,10 +106,16 @@ impl From<crate::ArtifactError> for RuntimeManagerError {
 pub struct DeploymentPrepareRequest {
     /// Canonical deployment ID.
     pub deployment_id: String,
+    /// Zero-based replica index within the deployment.
+    pub replica_idx: u32,
     /// Monotonic process-local generation.
     pub generation: u64,
     /// Compiled deployment desired state.
     pub desired: CompiledDeployment,
+    /// Node-level device set assigned to this replica, when a deployment runs
+    /// more than one replica. `None` leaves fit planning to choose devices
+    /// lazily, the single-replica default.
+    pub pinned_fit: Option<crate::FitPlan>,
     /// Canonical host-wide control policy.
     pub control: sbproxy_config::ModelHostControlConfig,
     /// Compatibility host policy for a legacy deployment.
@@ -124,6 +130,25 @@ pub trait DeploymentPreparer: Send + Sync {
         &self,
         request: DeploymentPrepareRequest,
     ) -> Result<Arc<dyn PreparedDeploymentRuntime>, RuntimeManagerError>;
+
+    /// Pack a multi-replica deployment onto disjoint device sets, one
+    /// [`crate::FitPlan`] per replica in replica-index order.
+    ///
+    /// Called once per deployment before per-replica preparation when the
+    /// desired replica count exceeds one. Over-subscription (more replicas,
+    /// or replicas times tensor-parallel degree, than the node has devices)
+    /// must fail here with a legible reason rather than silently dropping
+    /// replicas. The default rejects multi-replica deployments so preparers
+    /// that only ever serve one replica need not implement it.
+    async fn plan_replica_devices(
+        &self,
+        request: &DeploymentPrepareRequest,
+    ) -> Result<Vec<crate::FitPlan>, RuntimeManagerError> {
+        Err(RuntimeManagerError::Prepare(format!(
+            "deployment {:?} requests {} replicas, but this runtime serves a single replica per deployment",
+            request.deployment_id, request.desired.desired.replicas
+        )))
+    }
 }
 
 /// One statically validated deployment generation that can be started and stopped.
@@ -256,6 +281,8 @@ impl DeploymentRuntimeState {
 pub struct DeploymentRuntimeStatus {
     /// Canonical deployment ID.
     pub deployment: String,
+    /// Zero-based replica index within the deployment.
+    pub replica: u32,
     /// Process-local generation.
     pub generation: u64,
     /// Current lifecycle state.
@@ -352,6 +379,7 @@ struct RetiredSlot {
 
 struct DeploymentSlot {
     id: String,
+    replica_idx: u32,
     generation: u64,
     desired: CompiledDeployment,
     preparation_identity: PreparationIdentity,
@@ -375,8 +403,10 @@ impl std::fmt::Debug for DeploymentSlot {
 }
 
 impl DeploymentSlot {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         id: String,
+        replica_idx: u32,
         generation: u64,
         desired: CompiledDeployment,
         preparation_identity: PreparationIdentity,
@@ -393,6 +423,7 @@ impl DeploymentSlot {
         .map_err(RuntimeManagerError::InvalidDesired)?;
         Ok(Self {
             id,
+            replica_idx,
             generation,
             desired,
             preparation_identity,
@@ -1029,6 +1060,7 @@ impl DeploymentSlot {
         };
         DeploymentRuntimeStatus {
             deployment: self.id.clone(),
+            replica: self.replica_idx,
             generation: self.generation,
             state,
             active_requests: counts.active,
@@ -1234,10 +1266,57 @@ impl DeploymentSlot {
     }
 }
 
+/// One or more running replica slots for a single logical deployment.
+///
+/// Replicas share a logical deployment ID and configuration but each holds its
+/// own engine process, generation, and device set, so per-replica keep-alive,
+/// eviction, and admission stay independent. Ordered by replica index; the
+/// primary is index 0 and is the single member in the common one-replica case.
+/// Never empty.
+#[derive(Debug, Clone)]
+struct DeploymentReplicas {
+    replicas: Vec<Arc<DeploymentSlot>>,
+}
+
+impl DeploymentReplicas {
+    fn from_slots(replicas: Vec<Arc<DeploymentSlot>>) -> Self {
+        debug_assert!(
+            !replicas.is_empty(),
+            "a deployment has at least one replica"
+        );
+        Self { replicas }
+    }
+
+    /// The first replica; the sole member in the one-replica case.
+    fn primary(&self) -> &Arc<DeploymentSlot> {
+        &self.replicas[0]
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Arc<DeploymentSlot>> {
+        self.replicas.iter()
+    }
+
+    /// Find the replica running a specific process-local generation.
+    fn by_generation(&self, generation: u64) -> Option<&Arc<DeploymentSlot>> {
+        self.replicas
+            .iter()
+            .find(|slot| slot.generation == generation)
+    }
+
+    /// Preparation identity, shared by every replica of one deployment.
+    fn preparation_identity(&self) -> &PreparationIdentity {
+        &self.primary().preparation_identity
+    }
+
+    fn into_slots(self) -> Vec<Arc<DeploymentSlot>> {
+        self.replicas
+    }
+}
+
 struct RuntimeSnapshot {
     revision: u64,
     desired: Arc<RuntimeDesiredState>,
-    slots: BTreeMap<String, Arc<DeploymentSlot>>,
+    slots: BTreeMap<String, DeploymentReplicas>,
     limiter: Arc<Semaphore>,
 }
 
@@ -1258,8 +1337,9 @@ pub struct PreparedRevision {
     desired: Arc<RuntimeDesiredState>,
     /// Deterministic reconciliation plan.
     pub plan: ReconcilePlan,
-    staged_slots: BTreeMap<String, Arc<DeploymentSlot>>,
-    staged_memory: BTreeMap<String, crate::MemoryEstimate>,
+    staged_slots: BTreeMap<String, DeploymentReplicas>,
+    /// Warm memory estimates keyed by replica generation.
+    staged_memory: BTreeMap<u64, crate::MemoryEstimate>,
     limiter: Arc<Semaphore>,
 }
 
@@ -1438,24 +1518,56 @@ impl ModelRuntimeManager {
 
         let mut requests = Vec::new();
         for id in plan.added.iter().chain(plan.changed.iter()) {
-            let generation = self
-                .generation
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                    current.checked_add(1)
-                })
-                .map_err(|_| RuntimeManagerError::CounterOverflow)?;
             let compiled = desired.deployments.get(id).ok_or_else(|| {
                 RuntimeManagerError::InvalidDesired(format!(
                     "reconcile plan references absent deployment {id:?}"
                 ))
             })?;
-            requests.push(DeploymentPrepareRequest {
-                deployment_id: id.clone(),
-                generation,
-                desired: compiled.clone(),
-                control: desired.control.clone(),
-                legacy_host_policy: desired.legacy_host_policy.clone(),
-            });
+            let replicas = compiled.desired.replicas.max(1);
+            // A deployment with more than one replica has its devices packed at
+            // the node level, so replicas claim disjoint device sets instead of
+            // all landing on device 0. A single replica keeps the lazy path,
+            // choosing its device when it first reaches readiness.
+            let pinned_fits = if replicas > 1 {
+                let probe = DeploymentPrepareRequest {
+                    deployment_id: id.clone(),
+                    replica_idx: 0,
+                    generation: 0,
+                    desired: compiled.clone(),
+                    pinned_fit: None,
+                    control: desired.control.clone(),
+                    legacy_host_policy: desired.legacy_host_policy.clone(),
+                };
+                let fits = self.preparer.plan_replica_devices(&probe).await?;
+                if fits.len() != replicas as usize {
+                    return Err(RuntimeManagerError::Prepare(format!(
+                        "replica device planning for deployment {id:?} returned {} device sets for {replicas} replicas",
+                        fits.len()
+                    )));
+                }
+                Some(fits)
+            } else {
+                None
+            };
+            for replica_idx in 0..replicas {
+                let generation = self
+                    .generation
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                        current.checked_add(1)
+                    })
+                    .map_err(|_| RuntimeManagerError::CounterOverflow)?;
+                requests.push(DeploymentPrepareRequest {
+                    deployment_id: id.clone(),
+                    replica_idx,
+                    generation,
+                    desired: compiled.clone(),
+                    pinned_fit: pinned_fits
+                        .as_ref()
+                        .map(|fits| fits[replica_idx as usize].clone()),
+                    control: desired.control.clone(),
+                    legacy_host_policy: desired.legacy_host_policy.clone(),
+                });
+            }
         }
 
         let parallelism = desired.control.max_parallel_prepares;
@@ -1482,6 +1594,7 @@ impl ModelRuntimeManager {
                 let on_boot = on_boot_ids.contains(&request.deployment_id);
                 async move {
                     let id = request.deployment_id.clone();
+                    let replica_idx = request.replica_idx;
                     let generation = request.generation;
                     let desired = request.desired.clone();
                     let preparation_identity = PreparationIdentity::from_request(&request);
@@ -1495,6 +1608,7 @@ impl ModelRuntimeManager {
                     let engine = runtime.telemetry().await.engine;
                     let slot = Arc::new(DeploymentSlot::new(
                         id.clone(),
+                        replica_idx,
                         generation,
                         desired,
                         preparation_identity,
@@ -1517,30 +1631,45 @@ impl ModelRuntimeManager {
                     } else {
                         None
                     };
-                    Ok::<_, RuntimeManagerError>((id, slot, memory))
+                    Ok::<_, RuntimeManagerError>((id, replica_idx, generation, slot, memory))
                 }
             })
             .buffer_unordered(parallelism);
 
-        let mut staged_slots = BTreeMap::new();
+        // Group prepared replicas under their deployment ID, ordered by replica
+        // index. Warm memory estimates are keyed by generation, unique per
+        // replica, so a multi-replica warm launch reserves each replica's need.
+        let mut staged_replicas: BTreeMap<String, Vec<(u32, Arc<DeploymentSlot>)>> = BTreeMap::new();
         let mut staged_memory = BTreeMap::new();
         let mut first_error = None;
         while let Some(result) = preparations.next().await {
             match result {
-                Ok((id, slot, memory)) => {
+                Ok((id, replica_idx, generation, slot, memory)) => {
                     if let Some(memory) = memory {
-                        staged_memory.insert(id.clone(), memory);
+                        staged_memory.insert(generation, memory);
                     }
-                    staged_slots.insert(id, slot);
+                    staged_replicas
+                        .entry(id)
+                        .or_default()
+                        .push((replica_idx, slot));
                 }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
         }
         drop(preparations);
+        let mut staged_slots = BTreeMap::new();
+        for (id, mut replicas) in staged_replicas {
+            replicas.sort_by_key(|(replica_idx, _)| *replica_idx);
+            let slots = replicas.into_iter().map(|(_, slot)| slot).collect();
+            staged_slots.insert(id, DeploymentReplicas::from_slots(slots));
+        }
         if let Some(error) = first_error {
             teardown_slots(
-                staged_slots.values().cloned().collect(),
+                staged_slots
+                    .values()
+                    .flat_map(|replicas| replicas.iter().cloned())
+                    .collect(),
                 Duration::from_millis(desired.control.shutdown_deadline_ms),
             )
             .await;
@@ -1579,7 +1708,11 @@ impl ModelRuntimeManager {
     /// Tear down a prepared revision without publishing it.
     pub async fn abort_prepared(&self, prepared: PreparedRevision) {
         teardown_slots(
-            prepared.staged_slots.into_values().collect(),
+            prepared
+                .staged_slots
+                .into_values()
+                .flat_map(DeploymentReplicas::into_slots)
+                .collect(),
             Duration::from_millis(prepared.desired.control.shutdown_deadline_ms),
         )
         .await;
@@ -1633,18 +1766,23 @@ impl ModelRuntimeManager {
         expected_start_epoch: Option<u64>,
     ) -> Result<RunningEngine, RuntimeManagerError> {
         let snapshot = self.snapshot.load_full();
-        let slot = snapshot
+        let replicas = snapshot
             .slots
             .get(deployment)
-            .cloned()
             .ok_or_else(|| RuntimeManagerError::UnknownDeployment(deployment.to_string()))?;
+        // A generation names an exact replica; without one, target the primary.
+        let slot = match expected_generation {
+            Some(generation) => replicas
+                .by_generation(generation)
+                .cloned()
+                .ok_or_else(|| RuntimeManagerError::Draining(deployment.to_string()))?,
+            None => replicas.primary().clone(),
+        };
         let start_epoch = match expected_start_epoch {
             Some(start_epoch) => start_epoch,
             None => slot.current_start_epoch().await,
         };
-        if expected_generation.is_some_and(|generation| generation != slot.generation)
-            || !slot.accepts_start_epoch(start_epoch).await
-        {
+        if !slot.accepts_start_epoch(start_epoch).await {
             return Err(RuntimeManagerError::Draining(deployment.to_string()));
         }
         let memory = slot
@@ -1660,7 +1798,7 @@ impl ModelRuntimeManager {
         if current
             .slots
             .get(deployment)
-            .is_none_or(|current_slot| !Arc::ptr_eq(current_slot, &slot))
+            .is_none_or(|replicas| !replicas.iter().any(|current_slot| Arc::ptr_eq(current_slot, &slot)))
         {
             slot.cancel_preparation().await;
             return Err(RuntimeManagerError::Draining(deployment.to_string()));
@@ -1693,8 +1831,12 @@ impl ModelRuntimeManager {
             }
         };
         let mut stopped_victims = Vec::new();
-        for victim in reservation.evicted {
-            if let Some(victim_slot) = current.slots.get(&victim) {
+        for (victim, victim_generation) in reservation.evicted {
+            if let Some(victim_slot) = current
+                .slots
+                .get(&victim)
+                .and_then(|replicas| replicas.by_generation(victim_generation))
+            {
                 let Some(owner_epoch) = victim_slot.begin_idle_eviction().await? else {
                     self.restore_residency_after_failed_eviction(
                         previous_residency,
@@ -1767,10 +1909,12 @@ impl ModelRuntimeManager {
         deployment: &str,
     ) -> Result<crate::MemoryEstimate, RuntimeManagerError> {
         let snapshot = self.snapshot.load_full();
+        // Every replica shares one artifact, so caching the primary caches it
+        // for the whole deployment.
         let slot = snapshot
             .slots
             .get(deployment)
-            .cloned()
+            .map(|replicas| replicas.primary().clone())
             .ok_or_else(|| RuntimeManagerError::UnknownDeployment(deployment.to_string()))?;
         let start_epoch = slot.current_start_epoch().await;
         let memory = slot
@@ -1785,14 +1929,15 @@ impl ModelRuntimeManager {
         Ok(memory)
     }
 
-    /// Acquire one deployment-specific request permit before engine readiness.
+    /// Acquire one request permit against a deployment's least-loaded ready
+    /// replica, or the primary when none is ready yet.
     pub async fn admit(
         &self,
         deployment: &str,
         priority: crate::PriorityClass,
     ) -> Result<DeploymentAdmissionPermit, crate::AdmissionRejection> {
         let snapshot = self.snapshot.load_full();
-        let slot = snapshot.slots.get(deployment).cloned().ok_or_else(|| {
+        let replicas = snapshot.slots.get(deployment).ok_or_else(|| {
             crate::AdmissionRejection::new(
                 crate::AdmissionReason::EngineUnhealthy,
                 format!("managed deployment {deployment:?} is not configured"),
@@ -1800,12 +1945,13 @@ impl ModelRuntimeManager {
                 None,
             )
         })?;
+        let slot = select_admission_replica(replicas);
         let (permit, start_epoch) = slot.admit(priority).await?;
         let current = self.snapshot.load_full();
         if current
             .slots
             .get(deployment)
-            .is_none_or(|current_slot| !Arc::ptr_eq(current_slot, &slot))
+            .is_none_or(|replicas| !replicas.iter().any(|current_slot| Arc::ptr_eq(current_slot, &slot)))
         {
             drop(permit);
             return Err(crate::AdmissionRejection::new(
@@ -1831,70 +1977,82 @@ impl ModelRuntimeManager {
         self.drain(deployment).await.map(|_| ())
     }
 
-    /// Reject new work, cancel queued work, wait boundedly, and stop one generation.
+    /// Reject new work, cancel queued work, wait boundedly, and stop every
+    /// replica of one deployment, aggregating their drain reports.
     pub async fn drain(&self, deployment: &str) -> Result<crate::DrainReport, RuntimeManagerError> {
-        let (slot, owner_epoch, grace) = {
-            let _placement = self.placement_lock.lock().await;
+        let (replicas, grace) = {
             let snapshot = self.snapshot.load_full();
-            let slot =
-                snapshot.slots.get(deployment).cloned().ok_or_else(|| {
-                    RuntimeManagerError::UnknownDeployment(deployment.to_string())
-                })?;
-            let owner_epoch = slot.begin_draining().await?;
+            let replicas = snapshot.slots.get(deployment).cloned().ok_or_else(|| {
+                RuntimeManagerError::UnknownDeployment(deployment.to_string())
+            })?;
             let grace = Duration::from_millis(snapshot.desired.control.shutdown_deadline_ms);
-            (slot, owner_epoch, grace)
+            (replicas, grace)
         };
-        let report = slot.drain_runtime_owned(grace, owner_epoch).await?;
-        let _placement = self.placement_lock.lock().await;
-        if !slot.accepts_drain_owner(owner_epoch).await {
-            return Err(RuntimeManagerError::Draining(deployment.to_string()));
+        let mut aggregate: Option<crate::DrainReport> = None;
+        for slot in replicas.iter() {
+            let owner_epoch = {
+                let _placement = self.placement_lock.lock().await;
+                slot.begin_draining().await?
+            };
+            let report = slot.drain_runtime_owned(grace, owner_epoch).await?;
+            let _placement = self.placement_lock.lock().await;
+            if !slot.accepts_drain_owner(owner_epoch).await {
+                return Err(RuntimeManagerError::Draining(deployment.to_string()));
+            }
+            let mut residency = self.residency.lock().await;
+            for reservation in residency.reservations().into_iter().filter(|reservation| {
+                reservation.deployment == deployment && reservation.generation == slot.generation
+            }) {
+                residency.release(
+                    reservation.memory.primary_device(),
+                    deployment,
+                    slot.generation,
+                );
+            }
+            drop(residency);
+            slot.finalize_stop_owned(owner_epoch).await?;
+            let _cleanup = self.retirement_lock.lock().await;
+            let key = (deployment.to_string(), slot.generation);
+            let mut retired = self.retired_slots.lock().await;
+            if retired
+                .get(&key)
+                .is_some_and(|registered| Arc::ptr_eq(&registered.slot, slot))
+            {
+                retired.remove(&key);
+            }
+            aggregate = Some(merge_drain_reports(aggregate, report));
         }
-        let mut residency = self.residency.lock().await;
-        for reservation in residency.reservations().into_iter().filter(|reservation| {
-            reservation.deployment == deployment && reservation.generation == slot.generation
-        }) {
-            residency.release(
-                reservation.memory.primary_device(),
-                deployment,
-                slot.generation,
-            );
-        }
-        drop(residency);
-        slot.finalize_stop_owned(owner_epoch).await?;
-        let _cleanup = self.retirement_lock.lock().await;
-        let key = (deployment.to_string(), slot.generation);
-        let mut retired = self.retired_slots.lock().await;
-        if retired
-            .get(&key)
-            .is_some_and(|registered| Arc::ptr_eq(&registered.slot, &slot))
-        {
-            retired.remove(&key);
-        }
-        Ok(report)
+        Ok(aggregate.unwrap_or_default())
     }
 
-    /// Clear one current deployment's retained failure state.
+    /// Clear the retained failure state of every replica of one deployment.
     pub async fn reset(
         &self,
         deployment: &str,
     ) -> Result<Option<OperationJob>, RuntimeManagerError> {
         let snapshot = self.snapshot.load_full();
-        let slot = snapshot
+        let replicas = snapshot
             .slots
             .get(deployment)
             .cloned()
             .ok_or_else(|| RuntimeManagerError::UnknownDeployment(deployment.to_string()))?;
-        slot.reset().await
+        let mut job = None;
+        for slot in replicas.iter() {
+            let reset = slot.reset().await?;
+            job = job.or(reset);
+        }
+        Ok(job)
     }
 
-    /// Snapshot every current deployment status in deterministic ID order.
+    /// Snapshot every current replica status in deterministic deployment and
+    /// replica-index order.
     pub async fn statuses(&self) -> Vec<DeploymentRuntimeStatus> {
         let slots = self
             .snapshot
             .load_full()
             .slots
             .values()
-            .cloned()
+            .flat_map(|replicas| replicas.iter().cloned())
             .collect::<Vec<_>>();
         let mut statuses = Vec::with_capacity(slots.len());
         for slot in slots {
@@ -1908,9 +2066,14 @@ impl ModelRuntimeManager {
         self.residency.lock().await.reservations()
     }
 
-    /// Snapshot one current deployment status.
+    /// Snapshot one current deployment's primary-replica status.
     pub async fn status(&self, deployment: &str) -> Option<DeploymentRuntimeStatus> {
-        let slot = self.snapshot.load_full().slots.get(deployment).cloned()?;
+        let slot = self
+            .snapshot
+            .load_full()
+            .slots
+            .get(deployment)
+            .map(|replicas| replicas.primary().clone())?;
         Some(slot.status().await)
     }
 
@@ -2001,9 +2164,11 @@ impl ModelRuntimeManager {
         let _placement = self.placement_lock.lock().await;
         let snapshot = self.snapshot.load_full();
         let mut stopped = Vec::new();
-        for (id, slot) in &snapshot.slots {
-            if let Err(error) = slot.refresh_ready_health().await {
-                tracing::warn!(deployment = %id, reason = error.reason_code(), %error, "managed engine health check failed");
+        for (id, replicas) in &snapshot.slots {
+            for slot in replicas.iter() {
+                if let Err(error) = slot.refresh_ready_health().await {
+                    tracing::warn!(deployment = %id, replica = slot.replica_idx, reason = error.reason_code(), %error, "managed engine health check failed");
+                }
             }
         }
         let grace = Duration::from_millis(snapshot.desired.control.shutdown_deadline_ms);
@@ -2034,11 +2199,13 @@ impl ModelRuntimeManager {
             .collect::<BTreeSet<_>>();
         let reservations = self.residency.lock().await.reservations();
         for reservation in reservations {
-            let keep = match snapshot.slots.get(&reservation.deployment) {
-                Some(slot) if slot.generation == reservation.generation => {
-                    slot.owns_reservation().await
-                }
-                _ => false,
+            let keep = match snapshot
+                .slots
+                .get(&reservation.deployment)
+                .and_then(|replicas| replicas.by_generation(reservation.generation))
+            {
+                Some(slot) => slot.owns_reservation().await,
+                None => false,
             } || retained
                 .contains(&(reservation.deployment.clone(), reservation.generation));
             if !keep {
@@ -2049,33 +2216,35 @@ impl ModelRuntimeManager {
                 );
             }
         }
-        for (id, slot) in &snapshot.slots {
-            let Some(keep_alive_secs) = slot.desired.desired.keep_alive_secs else {
-                continue;
-            };
-            let Some((device, _, generation, _)) = slot.reservation_facts().await else {
-                continue;
-            };
-            if slot
-                .desired
-                .legacy_entry
-                .as_ref()
-                .is_some_and(|entry| entry.pinned)
-                || !slot
-                    .admission
-                    .begin_idle_drain_if_expired_at(now, Duration::from_secs(keep_alive_secs))
-            {
-                continue;
-            }
-            if slot
-                .drain(Duration::from_millis(
-                    snapshot.desired.control.shutdown_deadline_ms,
-                ))
-                .await
-                .is_ok()
-            {
-                self.residency.lock().await.release(device, id, generation);
-                stopped.push(id.clone());
+        for (id, replicas) in &snapshot.slots {
+            for slot in replicas.iter() {
+                let Some(keep_alive_secs) = slot.desired.desired.keep_alive_secs else {
+                    continue;
+                };
+                let Some((device, _, generation, _)) = slot.reservation_facts().await else {
+                    continue;
+                };
+                if slot
+                    .desired
+                    .legacy_entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.pinned)
+                    || !slot
+                        .admission
+                        .begin_idle_drain_if_expired_at(now, Duration::from_secs(keep_alive_secs))
+                {
+                    continue;
+                }
+                if slot
+                    .drain(Duration::from_millis(
+                        snapshot.desired.control.shutdown_deadline_ms,
+                    ))
+                    .await
+                    .is_ok()
+                {
+                    self.residency.lock().await.release(device, id, generation);
+                    stopped.push(id.clone());
+                }
             }
         }
         stopped
@@ -2093,7 +2262,11 @@ impl ModelRuntimeManager {
                 current: current.revision,
             };
             teardown_slots(
-                prepared.staged_slots.into_values().collect(),
+                prepared
+                    .staged_slots
+                    .into_values()
+                    .flat_map(DeploymentReplicas::into_slots)
+                    .collect(),
                 Duration::from_millis(prepared.desired.control.shutdown_deadline_ms),
             )
             .await;
@@ -2111,7 +2284,7 @@ impl ModelRuntimeManager {
             .collect::<BTreeSet<_>>();
         let mut slots = BTreeMap::new();
         for id in prepared.desired.deployments.keys() {
-            let slot = if preserved.contains(id.as_str()) {
+            let replicas = if preserved.contains(id.as_str()) {
                 current.slots.get(id).cloned()
             } else {
                 prepared.staged_slots.remove(id)
@@ -2121,7 +2294,7 @@ impl ModelRuntimeManager {
                     "prepared revision has no runtime slot for {id:?}"
                 ))
             })?;
-            slots.insert(id.clone(), slot);
+            slots.insert(id.clone(), replicas);
         }
 
         let candidate_ids = prepared
@@ -2161,24 +2334,19 @@ impl ModelRuntimeManager {
 
         let mut recreate_begins = Vec::new();
         for id in &recreate_ids {
-            let Some(old) = current.slots.get(id).cloned() else {
+            let Some(old) = current.slots.get(id) else {
                 continue;
             };
-            match old.begin_recreate().await {
-                Ok(begin) => recreate_begins.push((old, begin)),
-                Err(error) => {
-                    for (begun, begin) in recreate_begins {
-                        begun.abort_recreate_begin(begin).await;
+            for replica in old.iter() {
+                match replica.begin_recreate().await {
+                    Ok(begin) => recreate_begins.push((replica.clone(), begin)),
+                    Err(error) => {
+                        for (begun, begin) in recreate_begins {
+                            begun.abort_recreate_begin(begin).await;
+                        }
+                        teardown_slots(candidate_replica_slots(&candidate_ids, &slots), grace).await;
+                        return Err(error);
                     }
-                    teardown_slots(
-                        candidate_ids
-                            .iter()
-                            .filter_map(|candidate| slots.get(candidate).cloned())
-                            .collect(),
-                        grace,
-                    )
-                    .await;
-                    return Err(error);
                 }
             }
         }
@@ -2193,14 +2361,7 @@ impl ModelRuntimeManager {
                     for (pending, begin) in pending_recreates {
                         pending.abort_recreate_begin(begin).await;
                     }
-                    teardown_slots(
-                        candidate_ids
-                            .iter()
-                            .filter_map(|candidate| slots.get(candidate).cloned())
-                            .collect(),
-                        grace,
-                    )
-                    .await;
+                    teardown_slots(candidate_replica_slots(&candidate_ids, &slots), grace).await;
                     if let Some(rollback) =
                         rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
                     {
@@ -2220,14 +2381,7 @@ impl ModelRuntimeManager {
                 based_on: prepared.base_revision,
                 current: latest.revision,
             };
-            teardown_slots(
-                candidate_ids
-                    .iter()
-                    .filter_map(|candidate| slots.get(candidate).cloned())
-                    .collect(),
-                grace,
-            )
-            .await;
+            teardown_slots(candidate_replica_slots(&candidate_ids, &slots), grace).await;
             if let Some(rollback) =
                 rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
             {
@@ -2246,10 +2400,12 @@ impl ModelRuntimeManager {
             let Some(old) = current.slots.get(id) else {
                 continue;
             };
-            for reservation in planned.reservations().into_iter().filter(|reservation| {
-                reservation.deployment == *id && reservation.generation == old.generation
-            }) {
-                planned.release(reservation.memory.primary_device(), id, old.generation);
+            for replica in old.iter() {
+                for reservation in planned.reservations().into_iter().filter(|reservation| {
+                    reservation.deployment == *id && reservation.generation == replica.generation
+                }) {
+                    planned.release(reservation.memory.primary_device(), id, replica.generation);
+                }
             }
         }
 
@@ -2258,40 +2414,42 @@ impl ModelRuntimeManager {
         capacity_probe.protect_all_for_rollout();
         let mut warm_specs = Vec::new();
         let mut capacity_error = None;
-        for id in &warm_candidate_ids {
-            let Some(slot) = slots.get(id).cloned() else {
+        'warm: for id in &warm_candidate_ids {
+            let Some(replicas) = slots.get(id).cloned() else {
                 capacity_error = Some(RuntimeManagerError::Prepare(format!(
                     "prepared warm revision has no runtime slot for {id:?}"
                 )));
                 break;
             };
-            let Some(memory) = prepared.staged_memory.get(id).cloned() else {
-                capacity_error = Some(RuntimeManagerError::Prepare(format!(
-                    "prepared warm revision has no memory estimate for {id:?}"
-                )));
-                break;
-            };
-            let tick = self.residency_tick.fetch_add(1, Ordering::SeqCst);
-            match capacity_probe.reserve_with_policy(
-                id,
-                slot.generation,
-                memory.clone(),
-                slot.protection(true, false),
-                tick,
-                residency_policy,
-            ) {
-                Ok(reservation) if reservation.evicted.is_empty() => {
-                    warm_specs.push((id.clone(), slot, memory, tick));
-                }
-                Ok(_) => {
+            for slot in replicas.iter() {
+                let Some(memory) = prepared.staged_memory.get(&slot.generation).cloned() else {
                     capacity_error = Some(RuntimeManagerError::Prepare(format!(
-                        "warm rollout capacity probe unexpectedly evicted a protected generation for {id:?}"
+                        "prepared warm revision has no memory estimate for {id:?}"
                     )));
-                    break;
-                }
-                Err(error) => {
-                    capacity_error = Some(RuntimeManagerError::Admission(error));
-                    break;
+                    break 'warm;
+                };
+                let tick = self.residency_tick.fetch_add(1, Ordering::SeqCst);
+                match capacity_probe.reserve_with_policy(
+                    id,
+                    slot.generation,
+                    memory.clone(),
+                    slot.protection(true, false),
+                    tick,
+                    residency_policy,
+                ) {
+                    Ok(reservation) if reservation.evicted.is_empty() => {
+                        warm_specs.push((id.clone(), slot.clone(), memory, tick));
+                    }
+                    Ok(_) => {
+                        capacity_error = Some(RuntimeManagerError::Prepare(format!(
+                            "warm rollout capacity probe unexpectedly evicted a protected generation for {id:?}"
+                        )));
+                        break 'warm;
+                    }
+                    Err(error) => {
+                        capacity_error = Some(RuntimeManagerError::Admission(error));
+                        break 'warm;
+                    }
                 }
             }
         }
@@ -2329,11 +2487,14 @@ impl ModelRuntimeManager {
         }
         if capacity_error.is_none() {
             for mut reservation in current_reservations.into_iter().filter(|reservation| {
-                capacity_evictions.contains(&reservation.deployment)
+                capacity_evictions
+                    .contains(&(reservation.deployment.clone(), reservation.generation))
                     && current
                         .slots
                         .get(&reservation.deployment)
-                        .is_some_and(|slot| slot.generation == reservation.generation)
+                        .is_some_and(|replicas| {
+                            replicas.by_generation(reservation.generation).is_some()
+                        })
             }) {
                 reservation.protection.draining = true;
                 if let Err(error) = planned.retain_existing(reservation) {
@@ -2343,14 +2504,7 @@ impl ModelRuntimeManager {
             }
         }
         if let Some(error) = capacity_error {
-            teardown_slots(
-                candidate_ids
-                    .iter()
-                    .filter_map(|id| slots.get(id).cloned())
-                    .collect(),
-                grace,
-            )
-            .await;
+            teardown_slots(candidate_replica_slots(&candidate_ids, &slots), grace).await;
             if let Some(rollback) =
                 rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
             {
@@ -2390,14 +2544,7 @@ impl ModelRuntimeManager {
             }
         }
         if let Some(error) = launch_error {
-            teardown_slots(
-                candidate_ids
-                    .iter()
-                    .filter_map(|id| slots.get(id).cloned())
-                    .collect(),
-                grace,
-            )
-            .await;
+            teardown_slots(candidate_replica_slots(&candidate_ids, &slots), grace).await;
             if let Some(rollback) =
                 rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
             {
@@ -2409,8 +2556,13 @@ impl ModelRuntimeManager {
         }
         let mut eviction_claims = BTreeMap::new();
         let mut claim_error = None;
-        for id in &capacity_evictions {
-            let Some(slot) = current.slots.get(id).cloned() else {
+        for (id, generation) in &capacity_evictions {
+            let Some(slot) = current
+                .slots
+                .get(id)
+                .and_then(|replicas| replicas.by_generation(*generation))
+                .cloned()
+            else {
                 claim_error = Some(RuntimeManagerError::Prepare(format!(
                     "policy eviction selected unknown deployment {id:?}"
                 )));
@@ -2418,7 +2570,7 @@ impl ModelRuntimeManager {
             };
             match slot.begin_idle_eviction().await {
                 Ok(Some(owner_epoch)) => {
-                    eviction_claims.insert((id.clone(), slot.generation), owner_epoch);
+                    eviction_claims.insert((id.clone(), *generation), owner_epoch);
                 }
                 Ok(None) => {
                     claim_error = Some(RuntimeManagerError::Admission(
@@ -2442,19 +2594,12 @@ impl ModelRuntimeManager {
                 if let Some(slot) = current
                     .slots
                     .get(id)
-                    .filter(|slot| slot.generation == *generation)
+                    .and_then(|replicas| replicas.by_generation(*generation))
                 {
                     slot.abort_idle_eviction(*owner_epoch).await;
                 }
             }
-            teardown_slots(
-                candidate_ids
-                    .iter()
-                    .filter_map(|id| slots.get(id).cloned())
-                    .collect(),
-                grace,
-            )
-            .await;
+            teardown_slots(candidate_replica_slots(&candidate_ids, &slots), grace).await;
             if let Some(rollback) =
                 rollback_recreate_slots(recreate_checkpoints, current.limiter.clone()).await
             {
@@ -2466,19 +2611,26 @@ impl ModelRuntimeManager {
         }
         *self.residency.lock().await = planned;
 
-        let retired = current
-            .slots
-            .iter()
-            .filter_map(|(id, old)| {
-                (capacity_evictions.contains(id)
-                    || slots.get(id).is_none_or(|new| !Arc::ptr_eq(old, new)))
-                .then_some((
-                    id.clone(),
-                    old.clone(),
-                    eviction_claims.get(&(id.clone(), old.generation)).copied(),
-                ))
-            })
-            .collect::<Vec<_>>();
+        // Retire every old replica slot the swap displaced: one evicted by
+        // policy, or one absent from the new snapshot (its deployment changed
+        // or was removed). Preserved deployments reuse the same slot Arcs, so
+        // none of their replicas retire.
+        let mut retired = Vec::new();
+        for (id, old) in &current.slots {
+            let new = slots.get(id);
+            for replica in old.iter() {
+                let evicted = capacity_evictions.contains(&(id.clone(), replica.generation));
+                let superseded =
+                    new.is_none_or(|new| !new.iter().any(|slot| Arc::ptr_eq(slot, replica)));
+                if evicted || superseded {
+                    retired.push((
+                        id.clone(),
+                        replica.clone(),
+                        eviction_claims.get(&(id.clone(), replica.generation)).copied(),
+                    ));
+                }
+            }
+        }
         self.register_retired_slots(&retired).await;
         self.snapshot.store(Arc::new(RuntimeSnapshot {
             revision: next_revision,
@@ -2488,8 +2640,10 @@ impl ModelRuntimeManager {
         }));
         drop(placement);
         let published = self.snapshot.load_full();
-        for slot in published.slots.values() {
-            slot.activate_observation().await;
+        for replicas in published.slots.values() {
+            for slot in replicas.iter() {
+                slot.activate_observation().await;
+            }
         }
 
         let grace = Duration::from_millis(prepared.desired.control.shutdown_deadline_ms);
@@ -2530,9 +2684,11 @@ impl ModelRuntimeManager {
 
     async fn refresh_residency_protections(&self, snapshot: &RuntimeSnapshot) {
         let mut facts = Vec::new();
-        for slot in snapshot.slots.values() {
-            if let Some(fact) = slot.reservation_facts().await {
-                facts.push(fact);
+        for replicas in snapshot.slots.values() {
+            for slot in replicas.iter() {
+                if let Some(fact) = slot.reservation_facts().await {
+                    facts.push(fact);
+                }
             }
         }
         let mut residency = self.residency.lock().await;
@@ -2694,12 +2850,6 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
         &self,
         request: DeploymentPrepareRequest,
     ) -> Result<Arc<dyn PreparedDeploymentRuntime>, RuntimeManagerError> {
-        if request.desired.desired.replicas != 1 {
-            return Err(RuntimeManagerError::Prepare(format!(
-                "single-node runtime requires deployment {:?} to use replicas: 1",
-                request.deployment_id
-            )));
-        }
         let worker = WorkerProfile::from_descriptors(&self.probe.probe())
             .map_err(RuntimeManagerError::Prepare)?;
         let resolved = self
@@ -2779,6 +2929,7 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             id: request.deployment_id,
             generation: request.generation,
             desired: request.desired,
+            pinned_fit: request.pinned_fit,
             resolved,
             worker,
             provisioning,
@@ -2797,6 +2948,89 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             _artifact_lease: artifact_lease,
         }))
     }
+
+    async fn plan_replica_devices(
+        &self,
+        request: &DeploymentPrepareRequest,
+    ) -> Result<Vec<crate::FitPlan>, RuntimeManagerError> {
+        let replicas = request.desired.desired.replicas.max(1);
+        let tensor_parallel = request
+            .desired
+            .desired
+            .tensor_parallel
+            .map(|degree| degree as usize);
+        // Packing needs the model's shape and quant, which come from the
+        // resolved artifact. Fetch it once here; each replica's own preparation
+        // then reads it back from the cache.
+        let worker = WorkerProfile::from_descriptors(&self.probe.probe())
+            .map_err(RuntimeManagerError::Prepare)?;
+        let resolved = self
+            .catalog
+            .resolve_artifact(
+                &ResolveArtifactRequest {
+                    model: request.desired.desired.model.clone(),
+                    variant: request.desired.desired.variant.clone(),
+                    engine: request.desired.desired.engine,
+                    replicas,
+                    heterogeneous_variants: request.desired.desired.heterogeneous_variants,
+                },
+                &worker,
+            )
+            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+        let params_fallback = self
+            .catalog
+            .get(&resolved.logical_model)
+            .map(|entry| crate::parse_params(&entry.params))
+            .unwrap_or(0);
+        let pull_policy = request.desired.desired.pull;
+        let ready = self
+            .artifacts
+            .ensure(
+                &resolved,
+                AcquisitionContext {
+                    intent: PullIntent::Startup,
+                    network: self.network_policy,
+                    pull_policy,
+                    credential: None,
+                },
+            )
+            .await
+            .map_err(RuntimeManagerError::from)?;
+        let metadata = ready_metadata(self.metadata.as_ref(), &resolved, &ready, params_fallback)
+            .await
+            .ok_or_else(|| {
+                RuntimeManagerError::Prepare(format!(
+                    "verified artifact {} has no usable model shape metadata",
+                    resolved.artifact_digest
+                ))
+            })?;
+        let seq_len = request
+            .desired
+            .legacy_entry
+            .as_ref()
+            .and_then(|entry| entry.max_context)
+            .unwrap_or(resolved.context_length.max(1));
+        let kv_quant = request
+            .desired
+            .legacy_entry
+            .as_ref()
+            .map(|entry| entry.kv_quant)
+            .unwrap_or(KvCacheQuant::Auto);
+        let concurrency = request.desired.desired.max_concurrency.unwrap_or(1);
+        crate::fit::plan_replica_fits(
+            &self.probe.probe(),
+            &metadata,
+            std::slice::from_ref(&resolved.quant),
+            seq_len,
+            crate::fit::DEFAULT_OVERHEAD,
+            request.control.safety_margin,
+            kv_quant.bytes_per_element(),
+            concurrency,
+            replicas,
+            tensor_parallel,
+        )
+        .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))
+    }
 }
 
 fn validate_legacy_managed_entry(
@@ -2811,6 +3045,9 @@ struct ProductionPreparedDeployment {
     id: String,
     generation: u64,
     desired: CompiledDeployment,
+    /// Node-level device set pinned for this replica; when present,
+    /// activation uses it instead of choosing devices itself.
+    pinned_fit: Option<crate::FitPlan>,
     resolved: crate::ResolvedArtifact,
     worker: WorkerProfile,
     provisioning: EngineProvisioning,
@@ -2892,47 +3129,54 @@ impl ProductionPreparedDeployment {
             return Ok(prepared.clone());
         }
         let ready = self.ensure_artifact(intent).await?;
-        let metadata = ready_metadata(
-            self.metadata.as_ref(),
-            &self.resolved,
-            &ready,
-            self.params_fallback,
-        )
-        .await
-        .ok_or_else(|| {
-            RuntimeManagerError::Prepare(format!(
-                "verified artifact {} has no usable model shape metadata",
-                self.resolved.artifact_digest
-            ))
-        })?;
-        let seq_len = self
-            .desired
-            .legacy_entry
-            .as_ref()
-            .and_then(|entry| entry.max_context)
-            .unwrap_or(self.resolved.context_length.max(1));
         let kv_quant = self
             .desired
             .legacy_entry
             .as_ref()
             .map(|entry| entry.kv_quant)
             .unwrap_or(KvCacheQuant::Auto);
-        let concurrency = self.desired.desired.max_concurrency.unwrap_or(1);
-        let fit = crate::fit::plan_fit_auto_kv_with_margin_and_concurrency(
-            self.probe.as_ref(),
-            &metadata,
-            std::slice::from_ref(&self.resolved.quant),
-            seq_len,
-            crate::fit::DEFAULT_OVERHEAD,
-            self.safety_margin,
-            kv_quant.bytes_per_element(),
-            concurrency,
-            self.desired
-                .desired
-                .tensor_parallel
-                .map(|degree| degree as usize),
-        )
-        .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+        // A replica with a node-level device set uses it directly; the rest
+        // choose a device by planning a fit here.
+        let fit = match self.pinned_fit.clone() {
+            Some(pinned) => pinned,
+            None => {
+                let metadata = ready_metadata(
+                    self.metadata.as_ref(),
+                    &self.resolved,
+                    &ready,
+                    self.params_fallback,
+                )
+                .await
+                .ok_or_else(|| {
+                    RuntimeManagerError::Prepare(format!(
+                        "verified artifact {} has no usable model shape metadata",
+                        self.resolved.artifact_digest
+                    ))
+                })?;
+                let seq_len = self
+                    .desired
+                    .legacy_entry
+                    .as_ref()
+                    .and_then(|entry| entry.max_context)
+                    .unwrap_or(self.resolved.context_length.max(1));
+                let concurrency = self.desired.desired.max_concurrency.unwrap_or(1);
+                crate::fit::plan_fit_auto_kv_with_margin_and_concurrency(
+                    self.probe.as_ref(),
+                    &metadata,
+                    std::slice::from_ref(&self.resolved.quant),
+                    seq_len,
+                    crate::fit::DEFAULT_OVERHEAD,
+                    self.safety_margin,
+                    kv_quant.bytes_per_element(),
+                    concurrency,
+                    self.desired
+                        .desired
+                        .tensor_parallel
+                        .map(|degree| degree as usize),
+                )
+                .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?
+            }
+        };
         let selected_devices = if self.worker.accelerator == AcceleratorKind::Cpu {
             Vec::new()
         } else {
@@ -3273,8 +3517,8 @@ fn plan_reconciliation(current: &RuntimeSnapshot, desired: &RuntimeDesiredState)
     for (id, candidate) in &desired.deployments {
         match current.slots.get(id) {
             None => plan.added.push(id.clone()),
-            Some(slot)
-                if slot.preparation_identity
+            Some(replicas)
+                if *replicas.preparation_identity()
                     == PreparationIdentity::from_desired(candidate, desired) =>
             {
                 plan.preserved.push(id.clone());
@@ -3482,6 +3726,53 @@ async fn teardown_slots(slots: Vec<Arc<DeploymentSlot>>, grace: Duration) {
     for slot in slots {
         let _ = slot.stop(grace).await;
     }
+}
+
+/// Sum the counts of two drain reports and take the worse timeout, so a
+/// deployment-wide drain reports across all its replicas as one result.
+fn merge_drain_reports(
+    accumulated: Option<crate::DrainReport>,
+    report: crate::DrainReport,
+) -> crate::DrainReport {
+    match accumulated {
+        None => report,
+        Some(base) => crate::DrainReport {
+            active_at_start: base.active_at_start.saturating_add(report.active_at_start),
+            cancelled_queued: base.cancelled_queued.saturating_add(report.cancelled_queued),
+            remaining_active: base.remaining_active.saturating_add(report.remaining_active),
+            timed_out: base.timed_out || report.timed_out,
+        },
+    }
+}
+
+/// Pick the replica with the fewest in-flight requests (ties by replica
+/// index), so local admission spreads across a deployment's replicas. This is
+/// the deployment-local default balance; the request router applies the named
+/// strategies across the wider replica set.
+fn select_admission_replica(replicas: &DeploymentReplicas) -> Arc<DeploymentSlot> {
+    let mut best: Option<(usize, u32)> = None;
+    let mut chosen = replicas.primary();
+    for slot in replicas.iter() {
+        let counts = slot.admission.counts();
+        let load = counts.active.saturating_add(counts.queued);
+        let key = (load, slot.replica_idx);
+        if best.is_none_or(|current| key < current) {
+            best = Some(key);
+            chosen = slot;
+        }
+    }
+    chosen.clone()
+}
+
+/// Every replica slot backing the named deployment IDs, for teardown.
+fn candidate_replica_slots(
+    ids: &[String],
+    slots: &BTreeMap<String, DeploymentReplicas>,
+) -> Vec<Arc<DeploymentSlot>> {
+    ids.iter()
+        .filter_map(|id| slots.get(id))
+        .flat_map(|replicas| replicas.iter().cloned())
+        .collect()
 }
 
 async fn rollback_recreate_slots(

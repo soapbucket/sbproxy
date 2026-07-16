@@ -75,7 +75,7 @@ pub struct ModelDeployment {
     /// smallest degree that fits. When set, N replicas need N disjoint
     /// device sets of this size, so `replicas * tensor_parallel` must not
     /// exceed the node's device count.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tensor_parallel: Option<u32>,
     /// Node labels required by placement.
     #[serde(default)]

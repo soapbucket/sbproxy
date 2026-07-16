@@ -1618,6 +1618,7 @@ models:
     ) -> sbproxy_model_host::DeploymentRuntimeStatus {
         sbproxy_model_host::DeploymentRuntimeStatus {
             deployment: "local".to_string(),
+            replica: 0,
             generation: 1,
             state,
             active_requests: 0,
