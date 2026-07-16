@@ -97,6 +97,9 @@ impl ModelMetadataProvider for FixtureMetadata {
             kv_heads: 4,
             head_dim: 64,
             max_context: 4096,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         })
     }
 }

@@ -224,6 +224,8 @@ fn fit() -> FitPlan {
         gpu_indexes: vec![0],
         seq_len: 4096,
         memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1024),
+        moe: None,
+        throughput: None,
     }
 }
 

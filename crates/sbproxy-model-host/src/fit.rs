@@ -231,8 +231,24 @@ pub struct ModelMetadata {
     pub kv_heads: u64,
     /// Per-head dimension.
     pub head_dim: u64,
+    /// Hidden (embedding) size. Used to size MoE expert FFN tensors; `0`
+    /// when the metadata did not declare it.
+    #[serde(default)]
+    pub hidden_size: u64,
     /// Max context length the weights declare.
     pub max_context: u64,
+    /// Number of routed experts per MoE layer, or `0` for a dense model
+    /// (WOR-1866). A non-zero count means the bulk of the weights live in
+    /// per-layer expert FFN tensors that the fit planner can place on the
+    /// GPU or spill to CPU RAM.
+    #[serde(default)]
+    pub expert_count: u64,
+    /// Per-expert feed-forward (intermediate) dimension, used to size the
+    /// routed-expert tensors for MoE placement (WOR-1866). `0` for a dense
+    /// model, or when the header does not declare it (placement then falls
+    /// back to the parameter-count split).
+    #[serde(default)]
+    pub expert_ffn_length: u64,
 }
 
 impl ModelMetadata {
@@ -256,12 +272,28 @@ impl ModelMetadata {
             .get("max_position_embeddings")
             .and_then(|x| x.as_u64())
             .unwrap_or(8192);
+        // MoE shape (WOR-1866): `num_local_experts` / `num_experts` and the
+        // per-expert intermediate size. Absent on a dense model, which
+        // leaves `expert_count` at 0 and the planner in whole-model mode.
+        let expert_count = v
+            .get("num_local_experts")
+            .or_else(|| v.get("num_experts"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let expert_ffn_length = v
+            .get("moe_intermediate_size")
+            .or_else(|| v.get("intermediate_size"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
         Some(Self {
             params,
             layers,
             kv_heads,
             head_dim,
+            hidden_size: hidden.unwrap_or_else(|| head_dim.saturating_mul(attn_heads)),
             max_context,
+            expert_count,
+            expert_ffn_length,
         })
     }
 
@@ -295,6 +327,8 @@ impl ModelMetadata {
         let mut context_length = None;
         let mut key_length = None;
         let mut param_count = None;
+        let mut expert_count = None;
+        let mut expert_ffn_length = None;
 
         for _ in 0..kv_count {
             let key = r.gguf_string()?;
@@ -311,6 +345,14 @@ impl ModelMetadata {
                 _ if key.ends_with(".embedding_length") => embedding_length = scalar,
                 _ if key.ends_with(".context_length") => context_length = scalar,
                 _ if key.ends_with(".attention.key_length") => key_length = scalar,
+                // MoE shape (WOR-1866). `.expert_feed_forward_length` is the
+                // per-expert FFN dim; fall back to the dense
+                // `.feed_forward_length` when only that is present.
+                _ if key.ends_with(".expert_count") => expert_count = scalar,
+                _ if key.ends_with(".expert_feed_forward_length") => expert_ffn_length = scalar,
+                _ if key.ends_with(".feed_forward_length") => {
+                    expert_ffn_length = expert_ffn_length.or(scalar)
+                }
                 _ if key == "general.parameter_count" => param_count = scalar,
                 _ => {}
             }
@@ -325,7 +367,10 @@ impl ModelMetadata {
             layers,
             kv_heads,
             head_dim,
+            hidden_size: embedding_length.unwrap_or_else(|| head_dim.saturating_mul(heads)),
             max_context: context_length.unwrap_or(8192),
+            expert_count: expert_count.unwrap_or(0),
+            expert_ffn_length: expert_ffn_length.unwrap_or(0),
         })
     }
 
@@ -378,6 +423,35 @@ impl ModelMetadata {
             None => self.vram_estimate_bytes(quant, seq_len, overhead),
             Some(bpe) => (self.weight_bytes(quant) + self.kv_bytes_with(bpe, seq_len)) * overhead,
         }
+    }
+
+    /// Whether this is a mixture-of-experts model whose routed experts the
+    /// fit planner can place across GPU VRAM and CPU RAM (WOR-1866). A
+    /// dense model, or one missing the expert dimensions, is `false` and
+    /// keeps whole-model placement.
+    pub fn is_moe(&self) -> bool {
+        self.expert_count > 0 && self.expert_ffn_length > 0 && self.hidden_size > 0
+    }
+
+    /// Estimated weight bytes held in routed-expert FFN tensors at `quant`
+    /// (WOR-1866): the portion a MoE model can spill to CPU RAM. Each
+    /// expert holds three FFN matrices (gate, up, down) of
+    /// `hidden x expert_ffn`, so the routed-expert parameter count is
+    /// `layers x experts x 3 x hidden x expert_ffn`. Charging that share
+    /// of the params-derived weight total keeps the estimate consistent
+    /// with [`Self::weight_bytes`], clamped just below the total so the
+    /// non-expert remainder stays positive. `0` for a dense model.
+    pub fn expert_weight_bytes(&self, quant: Quant) -> f64 {
+        if !self.is_moe() || self.params == 0 {
+            return 0.0;
+        }
+        let expert_params = (self.layers as u128)
+            .saturating_mul(self.expert_count as u128)
+            .saturating_mul(3)
+            .saturating_mul(self.hidden_size as u128)
+            .saturating_mul(self.expert_ffn_length as u128);
+        let fraction = (expert_params as f64 / self.params as f64).clamp(0.0, 0.95);
+        self.weight_bytes(quant) * fraction
     }
 }
 
@@ -485,6 +559,24 @@ impl<'a> GgufReader<'a> {
     }
 }
 
+/// A mixture-of-experts placement plan (WOR-1866): how a MoE model's
+/// routed-expert tensors are split between GPU VRAM and CPU RAM so a model
+/// too large to fit whole still serves. Emitted to llama.cpp as
+/// `--n-cpu-moe`, which keeps attention, shared, and dense tensors on the
+/// GPU while the routed experts of the first `cpu_moe_layers` layers live
+/// in RAM. Prefill is mostly unaffected; decode is bounded by RAM
+/// bandwidth for the spilled experts, so tokens/sec drops accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MoePlacement {
+    /// Layers whose routed-expert FFN tensors are held in CPU RAM
+    /// (llama.cpp `--n-cpu-moe`). `0` means every expert stays on the GPU.
+    pub cpu_moe_layers: u64,
+    /// Routed-expert weight bytes kept resident on the GPU.
+    pub gpu_expert_bytes: u64,
+    /// Routed-expert weight bytes spilled to CPU RAM.
+    pub ram_spilled_bytes: u64,
+}
+
 /// A chosen plan: the quant that fits and runs, with the estimate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FitPlan {
@@ -501,6 +593,13 @@ pub struct FitPlan {
     pub seq_len: u64,
     /// Exact components used by admission and status.
     pub memory: MemoryEstimate,
+    /// MoE expert placement, when routed experts were spilled to CPU RAM to
+    /// fit (WOR-1866). `None` for a dense model or a MoE model that fit whole.
+    pub moe: Option<MoePlacement>,
+    /// Predicted single-stream decode throughput and safe batch ceiling for
+    /// this plan (WOR-1670), when the GPU reports memory bandwidth. Advisory:
+    /// it catches "this fits but will be slow" before an engine starts.
+    pub throughput: Option<ThroughputEstimate>,
 }
 
 impl FitPlan {
@@ -833,6 +932,8 @@ fn plan_fit_sharded(
                 gpu_indexes: devices.to_vec(),
                 seq_len,
                 memory,
+                moe: None,
+                throughput: estimate_throughput(gpu, meta, quant, seq_len),
             });
         }
     }
@@ -936,6 +1037,95 @@ pub fn plan_fit_auto_kv_with_margin_and_concurrency(
         concurrency,
         forced_tp,
     )
+}
+
+/// Try to fit a MoE model on one GPU by spilling routed-expert FFN tensors
+/// to CPU RAM (WOR-1866).
+///
+/// For each candidate quant (capability-gated, in preference order) it
+/// keeps the non-expert weights, KV cache, and framework overhead on the
+/// GPU and spills the fewest whole expert layers needed to fit free VRAM,
+/// emitting the resulting `--n-cpu-moe` layer count. Returns the first
+/// candidate that fits, or `None` when even spilling every expert leaves
+/// the resident set too large (the caller then reports the model genuinely
+/// too big). Single-GPU only: llama.cpp's `--n-cpu-moe` is a per-process
+/// offload, so this is a last resort after tensor parallelism is exhausted.
+#[allow(clippy::too_many_arguments)]
+fn plan_moe_spill(
+    gpu: &GpuDescriptor,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+) -> Option<FitPlan> {
+    if !meta.is_moe() || meta.layers == 0 {
+        return None;
+    }
+    let seq_len = seq_len.min(meta.max_context).max(1);
+    let free = gpu.free_vram_bytes as f64;
+    let overhead = overhead.max(1.0);
+    for name in candidates {
+        let quant = Quant::classify(name);
+        if quant == Quant::Fp8 && !gpu.supports_fp8 {
+            continue; // same capability gate as the dense path
+        }
+        let expert_bytes = meta.expert_weight_bytes(quant);
+        let non_expert_bytes = (meta.weight_bytes(quant) - expert_bytes).max(0.0);
+        let per_layer_expert = expert_bytes / meta.layers as f64;
+        let kv_bytes = match kv_bytes_per_element {
+            Some(b) => meta.kv_bytes_with(b, seq_len),
+            None => meta.kv_bytes(quant, seq_len),
+        } * f64::from(concurrency.max(1));
+        // Resident GPU total when `spilled` expert layers live in CPU RAM.
+        let resident = |spilled: u64| -> f64 {
+            let gpu_expert = (expert_bytes - per_layer_expert * spilled as f64).max(0.0);
+            let base = non_expert_bytes + gpu_expert + kv_bytes;
+            base * overhead * (1.0 + safety_margin)
+        };
+        // Even fully spilled must fit, or this quant is genuinely too big.
+        if resident(meta.layers) > free {
+            continue;
+        }
+        // Fewest expert layers to spill so the resident set fits.
+        let mut spill = 0u64;
+        while spill < meta.layers && resident(spill) > free {
+            spill += 1;
+        }
+        let gpu_expert_bytes = (expert_bytes - per_layer_expert * spill as f64).max(0.0);
+        let ram_spilled_bytes = (per_layer_expert * spill as f64).min(expert_bytes);
+        let gpu_weight = non_expert_bytes + gpu_expert_bytes;
+        let base = gpu_weight + kv_bytes;
+        let runtime_overhead = base * (overhead - 1.0);
+        let subtotal = base + runtime_overhead;
+        let margin = subtotal * safety_margin;
+        let total = subtotal + margin;
+        let memory = MemoryEstimate {
+            device_indexes: vec![gpu.index],
+            weight_bytes: gpu_weight as u64,
+            kv_bytes: kv_bytes as u64,
+            runtime_overhead_bytes: runtime_overhead as u64,
+            safety_margin_bytes: margin as u64,
+            total_bytes: total as u64,
+        };
+        return Some(FitPlan {
+            quant_name: name.clone(),
+            quant,
+            estimated_vram_bytes: memory.total_bytes,
+            gpu_indexes: vec![gpu.index],
+            seq_len,
+            memory,
+            moe: Some(MoePlacement {
+                cpu_moe_layers: spill,
+                gpu_expert_bytes: gpu_expert_bytes as u64,
+                ram_spilled_bytes: ram_spilled_bytes as u64,
+            }),
+            throughput: estimate_throughput(gpu, meta, quant, seq_len),
+        });
+    }
+    None
 }
 
 /// Plan a fit across a set of GPUs, searching tensor-parallel degrees.
@@ -1066,6 +1256,28 @@ pub fn plan_fit_over_set(
             }
         }
     }
+    // WOR-1866: no whole-model placement fit. A MoE model may still serve
+    // by spilling routed experts to CPU RAM. This runs only after every
+    // tensor-parallel degree failed (and never for a forced degree), so a
+    // second GPU is always preferred over slow CPU-resident experts.
+    if forced_tp.is_none() && meta.is_moe() {
+        let mut singles: Vec<&GpuDescriptor> = gpus.iter().collect();
+        singles.sort_by_key(|gpu| std::cmp::Reverse(gpu.free_vram_bytes));
+        for gpu in singles {
+            if let Some(plan) = plan_moe_spill(
+                gpu,
+                meta,
+                candidates,
+                seq_len,
+                overhead,
+                safety_margin,
+                kv_bytes_per_element,
+                concurrency,
+            ) {
+                return Ok(plan);
+            }
+        }
+    }
     Err(first_err.unwrap_or_else(|| match forced_tp {
         Some(tp) => FitError::Unsatisfiable(format!(
             "no homogeneous group of {tp} identical devices has enough free VRAM"
@@ -1137,6 +1349,9 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 40960,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         }
     }
 
@@ -1149,7 +1364,109 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 32768,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         }
+    }
+
+    // A ~30B-A3B-class MoE (Qwen3-30B-A3B-ish): most of the weight lives in
+    // the routed experts, so it can spill to CPU RAM to fit a small card.
+    fn meta_moe() -> ModelMetadata {
+        ModelMetadata {
+            params: 30_000_000_000,
+            layers: 48,
+            kv_heads: 4,
+            head_dim: 128,
+            hidden_size: 2048,
+            max_context: 40960,
+            expert_count: 128,
+            expert_ffn_length: 768,
+        }
+    }
+
+    #[test]
+    fn moe_model_admits_by_spilling_experts_to_ram() {
+        // WOR-1866: a 30B MoE that does not fit whole on a 12 GiB card admits
+        // with a placement plan that spills routed experts to CPU RAM, rather
+        // than being rejected as too large.
+        let mut card = GpuDescriptor::l4();
+        card.index = 0;
+        card.free_vram_bytes = 12 * GIB;
+        card.total_vram_bytes = 12 * GIB;
+        let probe = StaticGpuProbe::new(vec![card]);
+        let plan = plan_fit_auto(
+            &probe,
+            &meta_moe(),
+            &["Q4_K_M".into()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .expect("a MoE model admits by spilling experts");
+        let moe = plan.moe.expect("a placement plan was emitted");
+        assert!(moe.cpu_moe_layers > 0, "some experts must spill to RAM");
+        assert!(
+            moe.cpu_moe_layers < meta_moe().layers,
+            "not every expert layer needs to spill on a 12 GiB card"
+        );
+        assert!(moe.ram_spilled_bytes > 0 && moe.gpu_expert_bytes > 0);
+        assert!(
+            plan.estimated_vram_bytes <= 12 * GIB,
+            "the resident set must fit the card, got {} bytes",
+            plan.estimated_vram_bytes
+        );
+    }
+
+    #[test]
+    fn dense_model_keeps_whole_model_placement() {
+        // A dense model that fits is untouched: no expert placement.
+        let plan = plan_fit(
+            &GpuDescriptor::l4(),
+            &meta_14b(),
+            &["Q4_K_M".into()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .expect("dense model fits");
+        assert!(plan.moe.is_none(), "a dense plan carries no MoE placement");
+    }
+
+    #[test]
+    fn moe_too_large_even_fully_spilled_is_rejected() {
+        // When the non-expert remainder alone exceeds VRAM, spilling every
+        // expert still cannot fit, so the planner reports too large.
+        let mut tiny = GpuDescriptor::l4();
+        tiny.index = 0;
+        tiny.free_vram_bytes = GIB / 2;
+        tiny.total_vram_bytes = GIB / 2;
+        let probe = StaticGpuProbe::new(vec![tiny]);
+        let err = plan_fit_auto(
+            &probe,
+            &meta_moe(),
+            &["Q4_K_M".into()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .unwrap_err();
+        assert!(matches!(err, FitError::TooLarge { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn fit_plan_carries_a_throughput_estimate() {
+        // WOR-1670: a plan on a bandwidth-reporting card predicts decode
+        // throughput so admission can surface tok/s before an engine starts.
+        let plan = plan_fit(
+            &GpuDescriptor::l4(),
+            &meta_14b(),
+            &["Q4_K_M".into()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .expect("fits");
+        let tp = plan
+            .throughput
+            .expect("the L4 reports bandwidth, so the plan predicts throughput");
+        assert!(tp.decode_tokens_per_sec > 0.0);
     }
 
     #[test]
@@ -1383,6 +1700,9 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 131072,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         };
         let long = 131072;
         let candidates = ["FP8".to_string()];
@@ -1452,6 +1772,9 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 8192,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         };
         let err = plan_fit(
             &GpuDescriptor::t4(),
@@ -1574,6 +1897,9 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 131072,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         };
         // Long context so KV dominates.
         let seq = 131072;
@@ -1677,6 +2003,75 @@ mod tests {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
+    }
+
+    /// A MoE GGUF header: the dense shape plus `.expert_count` and
+    /// `.expert_feed_forward_length`, so the placement planner can size the
+    /// routed experts from a golden header (WOR-1866).
+    #[allow(clippy::too_many_arguments)]
+    fn synth_moe_gguf(
+        arch: &str,
+        layers: u32,
+        heads: u32,
+        kv_heads: u32,
+        hidden: u32,
+        ctx: u32,
+        experts: u32,
+        expert_ffn: u32,
+    ) -> Vec<u8> {
+        fn push_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn push_u32_kv(out: &mut Vec<u8>, key: &str, v: u32) {
+            push_str(out, key);
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+                                                    // arch string + 7 shape ints.
+        out.extend_from_slice(&8u64.to_le_bytes());
+        push_str(&mut out, "general.architecture");
+        out.extend_from_slice(&8u32.to_le_bytes());
+        push_str(&mut out, arch);
+        push_u32_kv(&mut out, &format!("{arch}.block_count"), layers);
+        push_u32_kv(&mut out, &format!("{arch}.attention.head_count"), heads);
+        push_u32_kv(
+            &mut out,
+            &format!("{arch}.attention.head_count_kv"),
+            kv_heads,
+        );
+        push_u32_kv(&mut out, &format!("{arch}.embedding_length"), hidden);
+        push_u32_kv(&mut out, &format!("{arch}.context_length"), ctx);
+        push_u32_kv(&mut out, &format!("{arch}.expert_count"), experts);
+        push_u32_kv(
+            &mut out,
+            &format!("{arch}.expert_feed_forward_length"),
+            expert_ffn,
+        );
+        out
+    }
+
+    #[test]
+    fn moe_gguf_parses_expert_shape() {
+        // A MoE GGUF header yields the expert count and expert FFN dim, and
+        // is recognized as MoE; a dense header is not.
+        let bytes = synth_moe_gguf("qwen3moe", 48, 32, 4, 2048, 40960, 128, 768);
+        let m = ModelMetadata::from_gguf(&bytes, 30_000_000_000).expect("parse moe gguf");
+        assert_eq!(m.expert_count, 128);
+        assert_eq!(m.expert_ffn_length, 768);
+        assert_eq!(m.hidden_size, 2048);
+        assert!(m.is_moe());
+        assert!(m.expert_weight_bytes(Quant::Int4) > 0.0);
+        // A dense header leaves the expert fields at zero.
+        let dense =
+            ModelMetadata::from_gguf(&synth_gguf("qwen3", 40, 40, 8, 5120, 40960), 14_000_000_000)
+                .expect("parse dense gguf");
+        assert_eq!(dense.expert_count, 0);
+        assert!(!dense.is_moe());
     }
 
     #[test]

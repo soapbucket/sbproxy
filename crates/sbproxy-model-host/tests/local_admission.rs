@@ -57,6 +57,9 @@ fn fit_reports_a_complete_memory_breakdown_for_the_selected_device() {
         kv_heads: 8,
         head_dim: 128,
         max_context: 8192,
+        hidden_size: 0,
+        expert_count: 0,
+        expert_ffn_length: 0,
     };
     let plan = plan_fit_kv_with_margin(
         &gpu(3, 24),
@@ -92,6 +95,9 @@ fn fit_applies_overhead_and_margin_after_scaling_concurrent_kv() {
         kv_heads: 8,
         head_dim: 128,
         max_context: 8192,
+        hidden_size: 0,
+        expert_count: 0,
+        expert_ffn_length: 0,
     };
     let single = plan_fit_kv_with_margin(
         &gpu(0, 24),

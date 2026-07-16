@@ -87,6 +87,15 @@ pub fn build_launch_spec(
             // any host.
             args.push("--n-gpu-layers".to_string());
             args.push("999".to_string());
+            // WOR-1866: MoE placement keeps attention/shared/dense tensors on
+            // the GPU and spills the routed experts of `cpu_moe_layers` layers
+            // to CPU RAM, so a MoE model too large to fit whole still serves.
+            if let Some(moe) = &plan.moe {
+                if moe.cpu_moe_layers > 0 {
+                    args.push("--n-cpu-moe".to_string());
+                    args.push(moe.cpu_moe_layers.to_string());
+                }
+            }
             if let Some(t) = llama_cache_type(kv_quant) {
                 // Quantize both K and V caches.
                 args.push("--cache-type-k".to_string());
@@ -596,6 +605,8 @@ mod tests {
             gpu_indexes: vec![0],
             seq_len: 8192,
             memory: crate::MemoryEstimate::from_total(0, 12 * crate::fit::GIB),
+            moe: None,
+            throughput: None,
         }
     }
 
@@ -714,6 +725,42 @@ mod tests {
             .position(|a| a == "--n-gpu-layers")
             .unwrap();
         assert_eq!(spec.args[gi + 1], "999");
+    }
+
+    #[test]
+    fn llama_cpp_moe_placement_emits_n_cpu_moe() {
+        // WOR-1866: a plan with a MoE placement adds --n-cpu-moe N so
+        // llama.cpp spills the routed experts of N layers to CPU RAM.
+        let mut p = plan("Q4_K_M");
+        p.moe = Some(crate::fit::MoePlacement {
+            cpu_moe_layers: 17,
+            gpu_expert_bytes: 8 * crate::fit::GIB,
+            ram_spilled_bytes: 6 * crate::fit::GIB,
+        });
+        let spec = build_launch_spec(
+            EngineKind::LlamaCpp,
+            &model(),
+            &p,
+            8030,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        let i = spec
+            .args
+            .iter()
+            .position(|a| a == "--n-cpu-moe")
+            .expect("--n-cpu-moe present");
+        assert_eq!(spec.args[i + 1], "17");
+        // A dense plan (no placement) emits no such flag.
+        let dense = build_launch_spec(
+            EngineKind::LlamaCpp,
+            &model(),
+            &plan("Q4_K_M"),
+            8031,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        assert!(!dense.args.iter().any(|a| a == "--n-cpu-moe"));
     }
 
     #[test]
