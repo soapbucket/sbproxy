@@ -107,6 +107,7 @@ impl EngineDriver for FixtureDriver {
             selected_devices: request.selected_devices.clone(),
             started_at_ms: 1,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            engine_version: provisioned.version.clone(),
             memory: request.fit.memory.clone(),
             process: Arc::new(FixtureProcess {
                 stopped: AtomicBool::new(false),

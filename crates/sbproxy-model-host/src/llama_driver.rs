@@ -492,6 +492,7 @@ impl EngineDriver for LlamaCppDriver {
             accelerator: request.accelerator,
             started_at_ms: unix_time_ms()?,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            engine_version: provisioned.version.clone(),
             memory: request.fit.memory.clone(),
             process,
         })

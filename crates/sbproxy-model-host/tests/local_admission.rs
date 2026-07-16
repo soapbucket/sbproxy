@@ -449,6 +449,7 @@ fn status_contract_covers_every_managed_deployment_phase() {
             active_requests: 2,
             queued_requests: 3,
             engine: Some(EngineKind::Vllm),
+            engine_version: None,
             driver_availability: Some(EngineAvailability::Available),
             artifact_digest: Some("a".repeat(64)),
             selected_devices: vec![0],

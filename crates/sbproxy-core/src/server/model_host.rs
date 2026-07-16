@@ -2906,6 +2906,7 @@ cluster:
                 accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
                 started_at_ms: 1,
                 artifact_digest: "a".repeat(64),
+                engine_version: None,
                 memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1),
                 process: Arc::new(ClusterFixtureProcess),
             })

@@ -184,6 +184,7 @@ fn runtime_converters_keep_exact_state_but_drop_paths_and_raw_errors() {
         active_requests: 4,
         queued_requests: 5,
         engine: Some(EngineKind::Vllm),
+        engine_version: Some("0.11.0".to_string()),
         driver_availability: Some(EngineAvailability::Available),
         artifact_digest: Some("c".repeat(64)),
         selected_devices: vec![0],

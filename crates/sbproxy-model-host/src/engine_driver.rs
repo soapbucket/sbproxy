@@ -159,6 +159,9 @@ pub struct RunningEngine {
     pub started_at_ms: u64,
     /// Canonical digest of the verified artifact snapshot.
     pub artifact_digest: String,
+    /// Resolved engine version this process runs, when the provisioner
+    /// discovered or pinned one. Answers "what served this request".
+    pub engine_version: Option<String>,
     /// Device-specific memory reserved for this generation.
     pub memory: crate::MemoryEstimate,
     /// Opaque process handle owned by the low-level process boundary.
