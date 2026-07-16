@@ -69,7 +69,7 @@ fn fit_reports_a_complete_memory_breakdown_for_the_selected_device() {
     )
     .unwrap();
 
-    assert_eq!(plan.memory.device_index, 3);
+    assert_eq!(plan.memory.device_indexes, vec![3]);
     assert!(plan.memory.weight_bytes > 0);
     assert!(plan.memory.kv_bytes > 0);
     assert!(plan.memory.runtime_overhead_bytes > 0);
@@ -138,7 +138,7 @@ fn fit_applies_overhead_and_margin_after_scaling_concurrent_kv() {
 fn residency_is_per_device_and_never_evicts_protected_generations() {
     let mut residency = DeviceResidencySet::new(BTreeMap::from([(0, 8 * GIB), (1, 24 * GIB)]));
     let estimate = |device_index, total_bytes| MemoryEstimate {
-        device_index,
+        device_indexes: vec![device_index],
         weight_bytes: total_bytes,
         kv_bytes: 0,
         runtime_overhead_bytes: 0,
@@ -224,7 +224,7 @@ fn residency_is_per_device_and_never_evicts_protected_generations() {
 fn max_resident_models_is_global_across_devices() {
     let mut residency = DeviceResidencySet::new(BTreeMap::from([(0, 8 * GIB), (1, 8 * GIB)]));
     let estimate = |device_index| MemoryEstimate {
-        device_index,
+        device_indexes: vec![device_index],
         weight_bytes: GIB,
         kv_bytes: 0,
         runtime_overhead_bytes: 0,
@@ -275,7 +275,7 @@ fn max_resident_models_is_global_across_devices() {
 fn never_eviction_rejects_resident_limit_displacement() {
     let mut residency = DeviceResidencySet::new(BTreeMap::from([(0, 8 * GIB), (1, 8 * GIB)]));
     let estimate = |device_index| MemoryEstimate {
-        device_index,
+        device_indexes: vec![device_index],
         weight_bytes: GIB,
         kv_bytes: 0,
         runtime_overhead_bytes: 0,

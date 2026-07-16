@@ -1119,7 +1119,7 @@ impl DeploymentSlot {
         let lifecycle = self.lifecycle.lock().await;
         let running = lifecycle.running.as_ref()?;
         Some((
-            running.memory.device_index,
+            running.memory.primary_device(),
             self.id.clone(),
             self.generation,
             self.protection(
@@ -1741,7 +1741,7 @@ impl ModelRuntimeManager {
         {
             Ok(running) => {
                 self.residency.lock().await.update_protection(
-                    memory.device_index,
+                    memory.primary_device(),
                     deployment,
                     slot.generation,
                     slot.protection(false, false),
@@ -1751,7 +1751,7 @@ impl ModelRuntimeManager {
             Err(error) => {
                 if !slot.owns_reservation().await {
                     self.residency.lock().await.release(
-                        memory.device_index,
+                        memory.primary_device(),
                         deployment,
                         slot.generation,
                     );
@@ -1853,7 +1853,11 @@ impl ModelRuntimeManager {
         for reservation in residency.reservations().into_iter().filter(|reservation| {
             reservation.deployment == deployment && reservation.generation == slot.generation
         }) {
-            residency.release(reservation.memory.device_index, deployment, slot.generation);
+            residency.release(
+                reservation.memory.primary_device(),
+                deployment,
+                slot.generation,
+            );
         }
         drop(residency);
         slot.finalize_stop_owned(owner_epoch).await?;
@@ -1931,7 +1935,7 @@ impl ModelRuntimeManager {
                 let mut protection = reservation.protection;
                 protection.draining = true;
                 residency.update_protection(
-                    reservation.memory.device_index,
+                    reservation.memory.primary_device(),
                     deployment,
                     slot.generation,
                     protection,
@@ -1975,7 +1979,11 @@ impl ModelRuntimeManager {
         for reservation in residency.reservations().into_iter().filter(|reservation| {
             reservation.deployment == deployment && reservation.generation == slot.generation
         }) {
-            residency.release(reservation.memory.device_index, deployment, slot.generation);
+            residency.release(
+                reservation.memory.primary_device(),
+                deployment,
+                slot.generation,
+            );
         }
         drop(residency);
         let mut retained = self.retired_slots.lock().await;
@@ -2035,7 +2043,7 @@ impl ModelRuntimeManager {
                 .contains(&(reservation.deployment.clone(), reservation.generation));
             if !keep {
                 self.residency.lock().await.release(
-                    reservation.memory.device_index,
+                    reservation.memory.primary_device(),
                     &reservation.deployment,
                     reservation.generation,
                 );
@@ -2241,7 +2249,7 @@ impl ModelRuntimeManager {
             for reservation in planned.reservations().into_iter().filter(|reservation| {
                 reservation.deployment == *id && reservation.generation == old.generation
             }) {
-                planned.release(reservation.memory.device_index, id, old.generation);
+                planned.release(reservation.memory.primary_device(), id, old.generation);
             }
         }
 
@@ -2362,7 +2370,7 @@ impl ModelRuntimeManager {
             {
                 Ok(running) if &running.memory == memory => {
                     planned.update_protection(
-                        memory.device_index,
+                        memory.primary_device(),
                         id,
                         slot.generation,
                         slot.protection(false, false),
@@ -2923,7 +2931,7 @@ impl ProductionPreparedDeployment {
         let selected_devices = if self.worker.accelerator == AcceleratorKind::Cpu {
             Vec::new()
         } else {
-            vec![fit.gpu_index]
+            fit.gpu_indexes.clone()
         };
         let extra_args = self
             .desired

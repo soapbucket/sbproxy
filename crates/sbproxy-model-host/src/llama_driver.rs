@@ -442,6 +442,11 @@ impl EngineDriver for LlamaCppDriver {
                 "999".to_string()
             },
         ];
+        append_llama_split_arguments(
+            &mut arguments,
+            request.accelerator,
+            &request.selected_devices,
+        );
         if let Some(cache_type) = llama_cache_type(request.kv_quant) {
             arguments.extend([
                 "--cache-type-k".to_string(),
@@ -537,6 +542,23 @@ fn ensure_executable(source: &dyn LlamaBinarySource, path: &Path) -> Result<(), 
     }
 }
 
+/// Runtime-owned multi-GPU split for llama.cpp. Row split shards each tensor
+/// across the group; an even `--tensor-split` gives every device an equal
+/// share, matching the fit planner's symmetric per-device estimate. Neither
+/// flag is on the operator allowlist, so the runtime is the only writer. A
+/// single device emits nothing (llama.cpp uses one GPU by default).
+fn append_llama_split_arguments(
+    arguments: &mut Vec<String>,
+    accelerator: AcceleratorKind,
+    selected_devices: &[u32],
+) {
+    if accelerator == AcceleratorKind::Cuda && selected_devices.len() > 1 {
+        arguments.extend(["--split-mode".to_string(), "row".to_string()]);
+        let even = vec!["1"; selected_devices.len()].join(",");
+        arguments.extend(["--tensor-split".to_string(), even]);
+    }
+}
+
 fn verified_gguf_path(request: &LaunchRequest) -> Result<&Path, EngineDriverError> {
     let paths = request
         .artifact
@@ -585,4 +607,33 @@ fn unix_time_ms() -> Result<u64, EngineDriverError> {
             false,
         )
     })
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::append_llama_split_arguments;
+    use crate::AcceleratorKind;
+
+    #[test]
+    fn tensor_split_is_emitted_only_for_a_multi_gpu_cuda_group() {
+        let mut single = Vec::new();
+        append_llama_split_arguments(&mut single, AcceleratorKind::Cuda, &[0]);
+        assert!(single.is_empty(), "one GPU uses llama.cpp's default");
+
+        let mut cpu = Vec::new();
+        append_llama_split_arguments(&mut cpu, AcceleratorKind::Cpu, &[0, 1]);
+        assert!(cpu.is_empty(), "CPU never emits a GPU split");
+
+        let mut pair = Vec::new();
+        append_llama_split_arguments(&mut pair, AcceleratorKind::Cuda, &[0, 1]);
+        assert_eq!(
+            pair,
+            vec![
+                "--split-mode".to_string(),
+                "row".to_string(),
+                "--tensor-split".to_string(),
+                "1,1".to_string(),
+            ]
+        );
+    }
 }

@@ -219,7 +219,7 @@ fn fit() -> FitPlan {
         quant_name: "fixture".to_string(),
         quant: Quant::classify("fixture"),
         estimated_vram_bytes: 1024,
-        gpu_index: 0,
+        gpu_indexes: vec![0],
         seq_len: 4096,
         memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1024),
     }
@@ -1480,7 +1480,7 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
         ready_timeout: Duration::from_secs(1),
     };
     launch.fit.memory = sbproxy_model_host::MemoryEstimate {
-        device_index: 0,
+        device_indexes: vec![0],
         weight_bytes: 512,
         kv_bytes: 256,
         runtime_overhead_bytes: 128,
