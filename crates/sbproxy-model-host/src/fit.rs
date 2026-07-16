@@ -492,44 +492,71 @@ pub struct FitPlan {
     pub quant_name: String,
     /// Its capability class.
     pub quant: Quant,
-    /// Estimated VRAM in bytes at the planned context length.
+    /// Estimated VRAM in bytes on each device at the planned context length.
     pub estimated_vram_bytes: u64,
-    /// The GPU it was fit to.
-    pub gpu_index: u32,
+    /// The GPU(s) it was fit to: one for single-GPU, the tensor-parallel group
+    /// for multi-GPU. Mirrors `memory.device_indexes`.
+    pub gpu_indexes: Vec<u32>,
     /// Context length the estimate assumed.
     pub seq_len: u64,
     /// Exact components used by admission and status.
     pub memory: MemoryEstimate,
 }
 
+impl FitPlan {
+    /// Tensor-parallel degree: the number of GPUs the plan spans.
+    pub fn tp_degree(&self) -> usize {
+        self.gpu_indexes.len().max(1)
+    }
+
+    /// The first GPU in the plan.
+    pub fn primary_gpu(&self) -> u32 {
+        self.gpu_indexes.first().copied().unwrap_or(0)
+    }
+}
+
 /// Device-specific memory requirement for one deployment generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MemoryEstimate {
-    /// Selected worker-local device index.
-    pub device_index: u32,
-    /// Quantized model weight bytes.
+    /// Worker-local device indexes this generation occupies: one for a
+    /// single-GPU deployment, the tensor-parallel group for multi-GPU. Every
+    /// device in the set carries the same per-device requirement below, because
+    /// tensor parallelism shards weights and KV evenly across identical cards.
+    pub device_indexes: Vec<u32>,
+    /// Quantized model weight bytes, per device (full weights / tp degree).
     pub weight_bytes: u64,
-    /// KV-cache bytes at the selected context and dtype.
+    /// KV-cache bytes at the selected context and dtype, per device.
     pub kv_bytes: u64,
-    /// Framework, activation, and device-context overhead.
+    /// Framework, activation, and device-context overhead, per device.
     pub runtime_overhead_bytes: u64,
-    /// Configured headroom added after runtime overhead.
+    /// Configured headroom added after runtime overhead, per device.
     pub safety_margin_bytes: u64,
-    /// Sum of every component above.
+    /// Sum of every component above: the bytes reserved on each device in the set.
     pub total_bytes: u64,
 }
 
 impl MemoryEstimate {
-    /// Construct a compatibility estimate when only a total is known.
+    /// Construct a single-device compatibility estimate when only a total is known.
     pub fn from_total(device_index: u32, total_bytes: u64) -> Self {
         Self {
-            device_index,
+            device_indexes: vec![device_index],
             weight_bytes: total_bytes,
             kv_bytes: 0,
             runtime_overhead_bytes: 0,
             safety_margin_bytes: 0,
             total_bytes,
         }
+    }
+
+    /// The first device in the set. Reservation bookkeeping that predates
+    /// multi-device selection keys on this.
+    pub fn primary_device(&self) -> u32 {
+        self.device_indexes.first().copied().unwrap_or(0)
+    }
+
+    /// Tensor-parallel degree: the number of devices this generation spans.
+    pub fn tp_degree(&self) -> usize {
+        self.device_indexes.len().max(1)
     }
 }
 
@@ -696,8 +723,40 @@ pub fn plan_fit_kv_with_margin_and_concurrency(
     kv_bytes_per_element: Option<f64>,
     concurrency: u32,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_sharded(
+        gpu,
+        std::slice::from_ref(&gpu.index),
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        safety_margin,
+        kv_bytes_per_element,
+        concurrency,
+    )
+}
+
+/// The fit core: place a model on a homogeneous set of `devices` at
+/// tensor-parallel degree `devices.len()`. Weights and the KV cache both shard
+/// evenly across the group, so the per-device requirement is the full estimate
+/// divided by the degree, checked against `gpu` (which the caller sets to the
+/// tightest device in the group: the one with the least free VRAM). A
+/// single-element `devices` is the ordinary single-GPU plan.
+#[allow(clippy::too_many_arguments)]
+fn plan_fit_sharded(
+    gpu: &GpuDescriptor,
+    devices: &[u32],
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+) -> Result<FitPlan, FitError> {
     let seq_len = seq_len.min(meta.max_context).max(1);
     let free = gpu.free_vram_bytes as f64;
+    let tp = devices.len().max(1) as f64;
 
     if concurrency == 0 {
         return Err(FitError::Incompatible {
@@ -730,12 +789,12 @@ pub fn plan_fit_kv_with_margin_and_concurrency(
             });
             continue;
         }
-        let weight_bytes = meta.weight_bytes(quant);
+        let weight_bytes = meta.weight_bytes(quant) / tp;
         let kv_bytes_per_sequence = match kv_bytes_per_element {
             Some(bytes) => meta.kv_bytes_with(bytes, seq_len),
             None => meta.kv_bytes(quant, seq_len),
         };
-        let kv_bytes = kv_bytes_per_sequence * f64::from(concurrency);
+        let kv_bytes = kv_bytes_per_sequence * f64::from(concurrency) / tp;
         let base = weight_bytes + kv_bytes;
         let runtime_overhead = base * (overhead.max(1.0) - 1.0);
         let subtotal = base + runtime_overhead;
@@ -755,7 +814,7 @@ pub fn plan_fit_kv_with_margin_and_concurrency(
                 .saturating_add(runtime_overhead_bytes)
                 .saturating_add(safety_margin_bytes);
             let memory = MemoryEstimate {
-                device_index: gpu.index,
+                device_indexes: devices.to_vec(),
                 weight_bytes,
                 kv_bytes,
                 runtime_overhead_bytes,
@@ -766,7 +825,7 @@ pub fn plan_fit_kv_with_margin_and_concurrency(
                 quant_name: name.clone(),
                 quant,
                 estimated_vram_bytes: memory.total_bytes,
-                gpu_index: gpu.index,
+                gpu_indexes: devices.to_vec(),
                 seq_len,
                 memory,
             });
@@ -859,29 +918,113 @@ pub fn plan_fit_auto_kv_with_margin_and_concurrency(
     kv_bytes_per_element: Option<f64>,
     concurrency: u32,
 ) -> Result<FitPlan, FitError> {
-    let mut gpus = probe.probe();
+    plan_fit_over_set(
+        &probe.probe(),
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        safety_margin,
+        kv_bytes_per_element,
+        concurrency,
+    )
+}
+
+/// Plan a fit across a set of GPUs, searching tensor-parallel degrees.
+///
+/// Tries tp = 1, 2, 4, 8 in order and returns the smallest degree at which a
+/// candidate quant fits, since tensor parallelism costs interconnect bandwidth
+/// and a single card is always cheaper. A tp group must be homogeneous
+/// (identical model and total VRAM) and tp must divide the model's KV heads
+/// evenly. Weights and the KV cache both shard across the group, so a model too
+/// large for any one card can fit on several. Cross-node tensor parallelism is
+/// a non-goal; every device here is on one host.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_over_set(
+    gpus: &[GpuDescriptor],
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+) -> Result<FitPlan, FitError> {
     if gpus.is_empty() {
         return Err(FitError::NoGpu);
     }
-    gpus.sort_by_key(|g| std::cmp::Reverse(g.free_vram_bytes));
-    // Try GPUs in free-VRAM order; return the first successful fit,
-    // else the error from the most-free GPU (the most informative).
-    let mut first_err = None;
-    for gpu in &gpus {
-        match plan_fit_kv_with_margin_and_concurrency(
-            gpu,
-            meta,
-            candidates,
-            seq_len,
-            overhead,
-            safety_margin,
-            kv_bytes_per_element,
-            concurrency,
-        ) {
-            Ok(plan) => return Ok(plan),
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e);
+    let mut first_err: Option<FitError> = None;
+
+    for tp in [1usize, 2, 4, 8] {
+        if tp == 1 {
+            // Single GPU: try cards in free-VRAM order, the cheapest placement.
+            let mut singles: Vec<&GpuDescriptor> = gpus.iter().collect();
+            singles.sort_by_key(|g| std::cmp::Reverse(g.free_vram_bytes));
+            for gpu in singles {
+                match plan_fit_sharded(
+                    gpu,
+                    std::slice::from_ref(&gpu.index),
+                    meta,
+                    candidates,
+                    seq_len,
+                    overhead,
+                    safety_margin,
+                    kv_bytes_per_element,
+                    concurrency,
+                ) {
+                    Ok(plan) => return Ok(plan),
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // Tensor parallelism requires the KV heads to divide evenly across ranks.
+        if !meta.kv_heads.is_multiple_of(tp as u64) {
+            continue;
+        }
+        // Homogeneous classes keyed by (name, total VRAM): TP needs identical cards.
+        let mut classes: std::collections::BTreeMap<(&str, u64), Vec<&GpuDescriptor>> =
+            std::collections::BTreeMap::new();
+        for gpu in gpus {
+            classes
+                .entry((gpu.name.as_str(), gpu.total_vram_bytes))
+                .or_default()
+                .push(gpu);
+        }
+        for members in classes.values() {
+            if members.len() < tp {
+                continue;
+            }
+            // The tp emptiest identical cards; the fit is gated on the tightest.
+            let mut group: Vec<&GpuDescriptor> = members.clone();
+            group.sort_by_key(|g| std::cmp::Reverse(g.free_vram_bytes));
+            let group = &group[..tp];
+            let min_free = group.iter().map(|g| g.free_vram_bytes).min().unwrap_or(0);
+            let representative = GpuDescriptor {
+                free_vram_bytes: min_free,
+                ..group[0].clone()
+            };
+            let devices: Vec<u32> = group.iter().map(|g| g.index).collect();
+            match plan_fit_sharded(
+                &representative,
+                &devices,
+                meta,
+                candidates,
+                seq_len,
+                overhead,
+                safety_margin,
+                kv_bytes_per_element,
+                concurrency,
+            ) {
+                Ok(plan) => return Ok(plan),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
                 }
             }
         }
@@ -973,6 +1116,126 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, FitError::NoGpu);
+    }
+
+    #[test]
+    fn a_model_too_big_for_one_gpu_fits_across_a_homogeneous_pair() {
+        // 14B at f16 needs ~26 GiB of weights, over one 24 GiB L4, but shards
+        // across two L4s at tp=2.
+        let mut a = GpuDescriptor::l4();
+        a.index = 0;
+        let mut b = GpuDescriptor::l4();
+        b.index = 1;
+        let candidates = ["F16".to_string()];
+
+        let single = plan_fit_over_set(
+            std::slice::from_ref(&a),
+            &meta_14b(),
+            &candidates,
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+        );
+        assert!(
+            matches!(single, Err(FitError::TooLarge { .. })),
+            "14B f16 must not fit one L4: {single:?}"
+        );
+
+        let pair = plan_fit_over_set(
+            &[a.clone(), b.clone()],
+            &meta_14b(),
+            &candidates,
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+        )
+        .expect("14B f16 fits two L4 at tp=2");
+        assert_eq!(pair.tp_degree(), 2);
+        assert_eq!(pair.gpu_indexes, vec![0, 1]);
+        assert_eq!(pair.memory.device_indexes, vec![0, 1]);
+        // Weights shard, so each device holds roughly half.
+        assert!(pair.memory.weight_bytes < 20 * GIB);
+    }
+
+    #[test]
+    fn a_model_that_fits_one_gpu_stays_at_tp_1() {
+        // The planner prefers the smallest degree: a model that fits one card is
+        // never sharded, even with several available.
+        let mut a = GpuDescriptor::l4();
+        a.index = 0;
+        let mut b = GpuDescriptor::l4();
+        b.index = 1;
+        let plan = plan_fit_over_set(
+            &[a, b],
+            &meta_small(),
+            &["Q4_K_M".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+        )
+        .expect("0.6B fits one L4");
+        assert_eq!(plan.tp_degree(), 1);
+    }
+
+    #[test]
+    fn a_heterogeneous_pair_cannot_form_a_tp_group() {
+        // Tensor parallelism needs identical cards, so a T4 + L4 pair cannot
+        // shard the 14B model and it is rejected rather than run on a mix.
+        let mut t4 = GpuDescriptor::t4();
+        t4.index = 0;
+        let mut l4 = GpuDescriptor::l4();
+        l4.index = 1;
+        let err = plan_fit_over_set(
+            &[t4, l4],
+            &meta_14b(),
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FitError::TooLarge { .. } | FitError::Incompatible { .. }
+            ),
+            "a heterogeneous pair cannot host a tp group: {err:?}"
+        );
+    }
+
+    #[test]
+    fn tensor_parallel_degree_must_divide_the_kv_heads() {
+        // KV heads that do not divide evenly forbid every power-of-two degree,
+        // so even two identical big cards cannot admit the model.
+        let mut meta = meta_14b();
+        meta.kv_heads = 3;
+        let mut a = GpuDescriptor::l4();
+        a.index = 0;
+        let mut b = GpuDescriptor::l4();
+        b.index = 1;
+        let err = plan_fit_over_set(
+            &[a, b],
+            &meta,
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, FitError::TooLarge { .. }),
+            "kv_heads=3 forbids every power-of-two tp, so 14B stays unservable: {err:?}"
+        );
     }
 
     #[test]
@@ -1142,7 +1405,8 @@ mod tests {
             DEFAULT_OVERHEAD,
         )
         .expect("fits on the L4");
-        assert_eq!(plan.gpu_index, 1);
+        assert_eq!(plan.gpu_indexes, vec![1]);
+        assert_eq!(plan.tp_degree(), 1);
     }
 
     #[test]

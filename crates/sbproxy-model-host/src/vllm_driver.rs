@@ -746,6 +746,7 @@ pub fn build_vllm_container_plan(
         "--kv-cache-memory-bytes".to_string(),
         request.fit.memory.kv_bytes.to_string(),
     ]);
+    append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(
         EngineKind::Vllm,
@@ -775,12 +776,27 @@ fn direct_vllm_arguments(request: &LaunchRequest) -> Result<Vec<String>, EngineD
         "--kv-cache-memory-bytes".to_string(),
         request.fit.memory.kv_bytes.to_string(),
     ];
+    append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(
         EngineKind::Vllm,
         &request.extra_args,
     )?);
     Ok(arguments)
+}
+
+/// Emit the runtime-owned tensor-parallel degree: one rank per selected CUDA
+/// device. The operator cannot set `--tensor-parallel-size` (it is on the
+/// rejected-argument denylist), so the runtime derives it from the placement
+/// and config can never contradict the device assignment. Single-device
+/// deployments emit nothing, since vLLM defaults to a degree of one.
+fn append_tensor_parallel_arguments(arguments: &mut Vec<String>, selected_devices: &[u32]) {
+    if selected_devices.len() > 1 {
+        arguments.extend([
+            "--tensor-parallel-size".to_string(),
+            selected_devices.len().to_string(),
+        ]);
+    }
 }
 
 fn append_vllm_precision_arguments(arguments: &mut Vec<String>, request: &LaunchRequest) {
@@ -1015,4 +1031,26 @@ fn unix_time_ms() -> Result<u64, EngineDriverError> {
             false,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_tensor_parallel_arguments;
+
+    #[test]
+    fn tensor_parallel_size_is_emitted_only_for_a_multi_gpu_group() {
+        let mut single = Vec::new();
+        append_tensor_parallel_arguments(&mut single, &[0]);
+        assert!(
+            single.is_empty(),
+            "a single GPU keeps vLLM's default of one"
+        );
+
+        let mut pair = Vec::new();
+        append_tensor_parallel_arguments(&mut pair, &[0, 1]);
+        assert_eq!(
+            pair,
+            vec!["--tensor-parallel-size".to_string(), "2".to_string()]
+        );
+    }
 }

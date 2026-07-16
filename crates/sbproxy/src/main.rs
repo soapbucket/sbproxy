@@ -2702,6 +2702,27 @@ fn models_command_envelope(command: &'static str, value: serde_json::Value) -> s
     serde_json::Value::Object(object)
 }
 
+/// Render the worker-local device set for `models ps`: a single index for a
+/// single-GPU deployment, or the tensor-parallel group with its degree for a
+/// multi-GPU one ("0,1 tp2"). Empty (CPU or unplaced) renders "-".
+fn format_device_set(value: Option<&serde_json::Value>) -> String {
+    let indexes: Vec<String> = value
+        .and_then(serde_json::Value::as_array)
+        .map(|devices| {
+            devices
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|index| index.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    match indexes.len() {
+        0 => "-".to_string(),
+        1 => indexes[0].clone(),
+        degree => format!("{} tp{degree}", indexes.join(",")),
+    }
+}
+
 fn handle_models_ps(args: &ModelsPsArgs) -> anyhow::Result<i32> {
     let status = admin_request_json(
         &args.admin,
@@ -2722,12 +2743,12 @@ fn handle_models_ps(args: &ModelsPsArgs) -> anyhow::Result<i32> {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             println!(
-                "{:<24} {:<12} {:<8} {:<8} {:<8} REASON",
-                "DEPLOYMENT", "STATE", "PORT", "ACTIVE", "QUEUED"
+                "{:<24} {:<12} {:<8} {:<8} {:<8} {:<14} REASON",
+                "DEPLOYMENT", "STATE", "PORT", "ACTIVE", "QUEUED", "DEVICES"
             );
             for deployment in deployments {
                 println!(
-                    "{:<24} {:<12} {:<8} {:<8} {:<8} {}",
+                    "{:<24} {:<12} {:<8} {:<8} {:<8} {:<14} {}",
                     deployment
                         .get("deployment")
                         .and_then(serde_json::Value::as_str)
@@ -2749,6 +2770,7 @@ fn handle_models_ps(args: &ModelsPsArgs) -> anyhow::Result<i32> {
                         .get("queued_requests")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0),
+                    format_device_set(deployment.get("selected_devices")),
                     deployment
                         .get("reason_code")
                         .and_then(serde_json::Value::as_str)
