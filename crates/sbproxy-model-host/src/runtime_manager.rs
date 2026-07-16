@@ -3196,12 +3196,14 @@ impl ProductionPreparedDeployment {
         } else {
             fit.gpu_indexes.clone()
         };
+        // Serving tuning comes from the legacy `serve:` entry when present, and
+        // otherwise from the canonical deployment's own fields.
         let extra_args = self
             .desired
             .legacy_entry
             .as_ref()
             .map(|entry| entry.extra_args.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| self.desired.desired.extra_args.clone());
         let engine_tuning = self
             .desired
             .legacy_entry
@@ -3212,7 +3214,12 @@ impl ProductionPreparedDeployment {
                 swap_space_gib: entry.swap_space_gib,
                 cpu_offload_gib: entry.cpu_offload_gib,
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| crate::EngineTuning {
+                chunked_prefill: self.desired.desired.chunked_prefill,
+                tool_call_parser: self.desired.desired.tool_call_parser.clone(),
+                swap_space_gib: self.desired.desired.swap_space_gib,
+                cpu_offload_gib: self.desired.desired.cpu_offload_gib,
+            });
         let prepared = PreparedActivation {
             fit,
             selected_devices,

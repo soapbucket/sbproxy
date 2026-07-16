@@ -212,6 +212,13 @@ impl From<StrictModelDeployment> for sbproxy_model_host::ModelDeployment {
             queue_timeout_ms: deployment.queue_timeout_ms,
             engine: deployment.engine,
             rollout: deployment.rollout,
+            // The admin API does not expose engine tuning; it is set through the
+            // config-file managed deployments or the legacy serve block.
+            extra_args: Vec::new(),
+            chunked_prefill: None,
+            tool_call_parser: None,
+            swap_space_gib: None,
+            cpu_offload_gib: None,
         }
     }
 }
@@ -1064,6 +1071,11 @@ mod tests {
             queue_timeout_ms: 30_000,
             engine: sbproxy_model_host::EngineChoice::Auto,
             rollout: RolloutPolicy::Rolling,
+            extra_args: Vec::new(),
+            chunked_prefill: None,
+            tool_call_parser: None,
+            swap_space_gib: None,
+            cpu_offload_gib: None,
         }
     }
 

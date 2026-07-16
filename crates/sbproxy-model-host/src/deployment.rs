@@ -110,6 +110,25 @@ pub struct ModelDeployment {
     /// Replica replacement policy.
     #[serde(default)]
     pub rollout: RolloutPolicy,
+    /// Extra engine command-line arguments appended after the runtime's own,
+    /// validated against the resolved engine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// Chunked-prefill settings (vLLM). `None` uses the engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunked_prefill: Option<crate::ChunkedPrefill>,
+    /// vLLM tool-call parser enabling auto tool-choice. `None` leaves tool
+    /// calling off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_parser: Option<String>,
+    /// CPU KV-cache tier size in GiB (vLLM `--swap-space`). `None` uses the
+    /// engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_space_gib: Option<u64>,
+    /// GiB of model weights to keep in CPU RAM (vLLM `--cpu-offload-gb`).
+    /// `None` disables offload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_offload_gib: Option<u64>,
 }
 
 const fn one_replica() -> u32 {
