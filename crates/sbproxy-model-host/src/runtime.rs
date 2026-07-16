@@ -1140,11 +1140,27 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             .map(|(artifact, _)| vec![artifact.quant.clone()])
             .unwrap_or_else(|| self.candidate_quants(&model_ref));
         let seq_len = entry.max_context.unwrap_or(meta.max_context);
+        // WOR-1908: the served task decides whether a KV cache exists at
+        // all. A managed artifact carries its modality; a legacy catalog
+        // entry declares it; a raw hf: ref defaults to chat.
+        let modality = managed
+            .as_ref()
+            .map(|(artifact, _)| artifact.modality)
+            .or_else(|| {
+                model_ref
+                    .catalog_id
+                    .as_deref()
+                    .and_then(|id| self.catalog.get(id))
+                    .map(|catalog_entry| catalog_entry.modality)
+            })
+            .unwrap_or_default();
         // WOR-1676: if the entry quantizes the KV cache, the planner
         // spends the smaller KV term on the fit (so a card can hold a
         // context it could not at f16 KV). `bytes_per_element()` is
         // `None` for Auto/F16, which follows the weight quant's default.
-        let kv_bpe = entry.kv_quant.bytes_per_element();
+        // WOR-1908: a non-decode modality overrides this to a zero KV
+        // term, so an embedder is sized by weights + overhead, never KV.
+        let kv_bpe = modality.kv_bytes_per_element_override(entry.kv_quant.bytes_per_element());
         let plan = plan_fit_auto_kv(
             &*self.probe,
             &meta,
@@ -1210,6 +1226,11 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             &entry.extra_args,
         );
         spec.args.extend(serving_flags(engine_kind, &entry));
+        // WOR-1908: a non-chat modality needs the engine's task flag
+        // (vLLM `--task embed` / `--task score`); runtime-owned, appended
+        // after the operator allowlist so config can never set it.
+        spec.args
+            .extend(crate::launch::modality_flags(engine_kind, modality));
         // WOR-1673: dynamic adapter paging needs vLLM's runtime LoRA
         // update endpoints, which are gated behind this env var.
         if entry.dynamic_lora() {

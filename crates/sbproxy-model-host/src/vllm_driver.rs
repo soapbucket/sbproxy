@@ -750,6 +750,7 @@ pub fn build_vllm_container_plan(
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
     append_vllm_passthrough_arguments(&mut arguments, &request.engine_tuning);
+    append_vllm_task_argument(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(
         EngineKind::Vllm,
         &request.extra_args,
@@ -781,11 +782,25 @@ fn direct_vllm_arguments(request: &LaunchRequest) -> Result<Vec<String>, EngineD
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
     append_vllm_passthrough_arguments(&mut arguments, &request.engine_tuning);
+    append_vllm_task_argument(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(
         EngineKind::Vllm,
         &request.extra_args,
     )?);
     Ok(arguments)
+}
+
+/// Emit the runtime-owned vLLM `--task` flag for a non-chat modality
+/// (WOR-1908). vLLM serves a chat model in its default mode, but an
+/// embedder or reranker must be launched with `--task embed` / `--task
+/// score`. The runtime owns this decision (it follows from the served
+/// model's catalog modality), so it is never an operator `extra_args`
+/// flag; a chat modality emits nothing.
+fn append_vllm_task_argument(arguments: &mut Vec<String>, request: &LaunchRequest) {
+    if let Some(task) = request.modality.vllm_task_arg() {
+        arguments.push("--task".to_string());
+        arguments.push(task.to_string());
+    }
 }
 
 /// Emit the runtime-owned tensor-parallel degree: one rank per selected CUDA

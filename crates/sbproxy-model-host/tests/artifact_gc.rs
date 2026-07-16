@@ -52,6 +52,7 @@ fn artifact(digest_byte: char, source: String, bytes: &[u8]) -> ResolvedArtifact
         license: "apache-2.0".to_string(),
         stability: SupportLevel::Preview,
         pickle_allowed: false,
+        modality: Default::default(),
     }
 }
 

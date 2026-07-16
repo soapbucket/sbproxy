@@ -322,6 +322,25 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
     args
 }
 
+/// Runtime-owned launch flags for a served model's modality (WOR-1908).
+///
+/// vLLM will not serve an embedder or reranker in its default causal-LM
+/// mode: it needs `--task embed` / `--task score`. That decision belongs
+/// to the runtime, not the operator, so it is emitted here (appended
+/// after [`build_launch_spec`] and [`serving_flags`]) rather than on the
+/// operator `extra_args` allowlist. A chat modality, an engine with no
+/// task concept (llama.cpp, embedded), or a modality with no vLLM task
+/// mapping yet returns an empty vec.
+pub fn modality_flags(engine: EngineKind, modality: crate::catalog::Modality) -> Vec<String> {
+    if engine != EngineKind::Vllm {
+        return Vec::new();
+    }
+    match modality.vllm_task_arg() {
+        Some(task) => vec!["--task".to_string(), task.to_string()],
+        None => Vec::new(),
+    }
+}
+
 /// Whether speculation should be active right now, given the current
 /// batch occupancy (running sequences / max batch). Speculation helps
 /// when the batch is memory-bound (occupancy below the threshold) and
@@ -800,6 +819,24 @@ mod tests {
         assert!(l.args.iter().any(|a| a == "--cache-type-k"));
         assert!(l.args.iter().any(|a| a == "--cache-type-v"));
         assert!(l.args.iter().any(|a| a == "q4_0"));
+    }
+
+    #[test]
+    fn modality_flags_emit_vllm_task_only_for_non_chat() {
+        use crate::catalog::Modality;
+        // Chat: no task flag (default causal-LM mode).
+        assert!(modality_flags(EngineKind::Vllm, Modality::Chat).is_empty());
+        // Embedding / rerank map to the vLLM task the engine needs.
+        assert_eq!(
+            modality_flags(EngineKind::Vllm, Modality::Embedding),
+            vec!["--task".to_string(), "embed".to_string()]
+        );
+        assert_eq!(
+            modality_flags(EngineKind::Vllm, Modality::Rerank),
+            vec!["--task".to_string(), "score".to_string()]
+        );
+        // llama.cpp has no task concept, so nothing is emitted.
+        assert!(modality_flags(EngineKind::LlamaCpp, Modality::Embedding).is_empty());
     }
 
     #[test]

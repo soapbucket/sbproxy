@@ -2988,6 +2988,7 @@ struct ModelRow {
     params: String,
     license: String,
     family: String,
+    modality: String,
     quants: Vec<String>,
     selected_variant: Option<String>,
     format: Option<String>,
@@ -3049,6 +3050,7 @@ fn build_model_rows(
                 params: entry.params.clone(),
                 license: entry.license.clone(),
                 family: entry.family.clone(),
+                modality: entry.modality.label().to_string(),
                 quants: entry.quants.clone(),
                 selected_variant: resolved
                     .as_ref()
@@ -3149,6 +3151,7 @@ struct ModelDetail {
     params: String,
     license: String,
     family: String,
+    modality: String,
     context_length: u64,
     allow_pickle: bool,
     variants: Vec<sbproxy_model_host::ArtifactVariant>,
@@ -3196,6 +3199,7 @@ fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
         params: entry.params.clone(),
         license: entry.license.clone(),
         family: entry.family.clone(),
+        modality: entry.modality.label().to_string(),
         context_length: entry.context_length,
         allow_pickle: entry.allow_pickle,
         variants: entry.variants.clone(),
@@ -3219,6 +3223,7 @@ fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
             println!("  params:       {}", detail.params);
             println!("  license:      {}", detail.license);
             println!("  family:       {}", detail.family);
+            println!("  modality:     {}", detail.modality);
             println!("  context:      {}", detail.context_length);
             println!("  quants:       {}", detail.quants.join(", "));
             println!("  engine:       {}", detail.engine);

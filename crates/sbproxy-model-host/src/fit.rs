@@ -1473,6 +1473,41 @@ mod tests {
     }
 
     #[test]
+    fn non_decode_modality_charges_no_kv() {
+        // WOR-1908: an embedder holds no KV cache, so its fit must size on
+        // weights + overhead only. A chat model at the same shape/context
+        // reserves a positive KV term; the non-decode override zeroes it.
+        use crate::catalog::Modality;
+        let candidates = ["Q4_K_M".to_string()];
+        let chat = plan_fit_kv(
+            &GpuDescriptor::l4(),
+            &meta_14b(),
+            &candidates,
+            40960,
+            DEFAULT_OVERHEAD,
+            Modality::Chat.kv_bytes_per_element_override(None),
+        )
+        .expect("chat fits");
+        let embed = plan_fit_kv(
+            &GpuDescriptor::l4(),
+            &meta_14b(),
+            &candidates,
+            40960,
+            DEFAULT_OVERHEAD,
+            Modality::Embedding.kv_bytes_per_element_override(None),
+        )
+        .expect("embedder fits");
+        assert!(chat.memory.kv_bytes > 0, "a chat model reserves KV");
+        assert_eq!(embed.memory.kv_bytes, 0, "an embedder reserves no KV");
+        assert!(
+            embed.estimated_vram_bytes < chat.estimated_vram_bytes,
+            "dropping KV shrinks the embedder estimate ({} vs {})",
+            embed.estimated_vram_bytes,
+            chat.estimated_vram_bytes
+        );
+    }
+
+    #[test]
     fn seq_len_is_clamped_to_max_context() {
         // Asking for more than the model supports clamps to max_context.
         let plan = plan_fit(
