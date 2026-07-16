@@ -175,9 +175,12 @@ enum Cmd {
     Run(RunArgs),
     /// Discover, cache, remove, and operate managed local models.
     Models(ModelsCmd),
-    /// Freshness: is any of it out of date. `sbproxy update` checks the
-    /// engine release feed and the cached models; `--self` also checks
-    /// the sbproxy binary. Reports only (a dry run); nothing is mutated.
+    /// Update the engines and cached models (add `--self` for the
+    /// binary). `sbproxy update` checks the engine release feed and the
+    /// cached models, then fetches, verifies, and swaps what is out of
+    /// date, with confirmation. `--check` reports only. A pinned or
+    /// `path`/`brew`/`apt`-managed artifact is reported, never replaced,
+    /// unless a run explicitly targets it.
     Update(UpdateArgs),
     /// Diagnose what this binary can do on the current host: compiled
     /// capability features, visible GPUs, inference engines on PATH,
@@ -713,19 +716,27 @@ struct ModelsStopArgs {
 
 #[derive(clap::Args, Debug)]
 struct UpdateArgs {
-    /// Check the sbproxy binary against the release channel.
+    /// Include the sbproxy binary. It is only replaced when `--self` is
+    /// given, since replacing the running binary is an explicit choice.
     #[arg(long = "self")]
     self_: bool,
-    /// Check the inference engines (default when no target flag is set).
+    /// Include the inference engines (default when no target flag is set).
+    /// Passing `--engines` explicitly targets them, so a pinned engine may
+    /// be moved.
     #[arg(long = "engines")]
     engines: bool,
-    /// Check the cached models (default when no target flag is set).
+    /// Include the cached models (default when no target flag is set).
+    /// Passing `--models` explicitly targets them.
     #[arg(long = "models")]
     models: bool,
+    /// Assume yes to every confirmation prompt (for non-interactive runs).
+    #[arg(long = "yes", short = 'y')]
+    yes: bool,
     /// Weight cache directory to check for pulled models.
     #[arg(long = "cache-dir")]
     cache_dir: Option<PathBuf>,
-    /// Output format. `text` (default) or `json`.
+    /// Output format. `text` (default) or `json`. `json` is always the
+    /// freshness report (the acting path prints progress on the text path).
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -889,6 +900,8 @@ fn main() {
     }
 
     let global_config_path = cli.globals.config.clone();
+    // The global `--check` flag doubles as the update dry-run selector.
+    let global_check = cli.check;
     match cli.cmd {
         Some(Cmd::Validate(args)) => {
             run_subcommand("validate", 2, handle_validate_subcommand(&args));
@@ -925,7 +938,11 @@ fn main() {
             );
         }
         Some(Cmd::Update(args)) => {
-            run_subcommand("update", 2, handle_update_subcommand(&args));
+            run_subcommand(
+                "update",
+                2,
+                handle_update_subcommand(&args, global_config_path.as_deref(), global_check),
+            );
         }
         Some(Cmd::Doctor(args)) => {
             run_subcommand("doctor", 2, handle_doctor_subcommand(&args));
@@ -3310,9 +3327,15 @@ struct UpdateReport {
     note: String,
 }
 
-fn handle_update_subcommand(args: &UpdateArgs) -> anyhow::Result<i32> {
-    // `update` = engines + models. `--self` adds the binary check; only
-    // `--engines` / `--models` narrow (so `update --self` still reports
+fn handle_update_subcommand(
+    args: &UpdateArgs,
+    config_path: Option<&std::path::Path>,
+    check: bool,
+) -> anyhow::Result<i32> {
+    let update_cfg = load_update_config(config_path)?;
+
+    // `update` = engines + models. `--self` adds the binary; only
+    // `--engines` / `--models` narrow (so `update --self` still includes
     // engines + models).
     let narrowed = args.engines || args.models;
     let self_ = args.self_.then(check_self_freshness);
@@ -3323,21 +3346,641 @@ fn handle_update_subcommand(args: &UpdateArgs) -> anyhow::Result<i32> {
         None
     };
 
+    // The acting path runs only on a `text`, non-`--check`, non-`auto`
+    // run. `--check` and a background `update.auto` run report only, and
+    // JSON is always the machine-readable freshness report (the acting
+    // path prints progress on the human path).
+    let is_json = matches!(args.format, OutputFormat::Json);
+    let will_act = !check && !update_cfg.auto && !is_json;
+    let note = if update_cfg.auto {
+        "report only: update.auto is on, so this run reports and never \
+         swaps. Run `sbproxy update` with auto off (or override the config) \
+         to apply, and target an artifact to move a pinned one."
+            .to_string()
+    } else if check {
+        "dry run (--check): reports only. Drop --check to apply, with \
+         confirmation. A pinned or externally-managed artifact is never \
+         replaced without an explicit targeted run."
+            .to_string()
+    } else if is_json {
+        "freshness report only (json). Run `sbproxy update` on a terminal \
+         to fetch, verify, and swap what is out of date, with confirmation."
+            .to_string()
+    } else {
+        format!(
+            "channel {}: applying with confirmation. A pinned or \
+             externally-managed artifact is reported, never replaced, unless \
+             you target it (e.g. `sbproxy update --engines`).",
+            channel_label(update_cfg.channel)
+        )
+    };
+
     let report = UpdateReport {
         self_,
         engines,
         models,
-        note: "dry run: `sbproxy update` reports only. Applying an update \
-               (engine swap, self-update, model re-pull) is not wired yet; \
-               a pinned artifact is never mutated without an explicit run."
-            .to_string(),
+        note,
     };
 
-    match args.format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-        OutputFormat::Text => print_update_report(&report),
+    if is_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(0);
     }
-    Ok(0)
+
+    print_update_report(&report);
+    if !will_act {
+        return Ok(0);
+    }
+
+    let applier = RealUpdateApplier;
+    apply_updates(
+        &report,
+        &UpdatePlanContext {
+            channel: update_cfg.channel,
+            targeted_self: args.self_,
+            targeted_engines: args.engines,
+            targeted_models: args.models,
+            assume_yes: args.yes,
+            cache_dir: args.cache_dir.clone(),
+        },
+        &applier,
+    )
+}
+
+/// Load the `update:` block from a config file, or the defaults when no
+/// `-f/--config` was given (or the file omits an `update:` block).
+fn load_update_config(
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<sbproxy_config::UpdateConfig> {
+    match config_path {
+        Some(path) => {
+            let yaml = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read config '{}': {e}", path.display()))?;
+            let cfg: sbproxy_config::ConfigFile = serde_yaml::from_str(&yaml)
+                .map_err(|e| anyhow::anyhow!("parse config '{}': {e}", path.display()))?;
+            Ok(cfg.update)
+        }
+        None => Ok(sbproxy_config::UpdateConfig::default()),
+    }
+}
+
+/// Short label for an update channel, for the report note.
+fn channel_label(channel: sbproxy_config::UpdateChannel) -> &'static str {
+    match channel {
+        sbproxy_config::UpdateChannel::Stable => "stable",
+        sbproxy_config::UpdateChannel::Latest => "latest",
+        sbproxy_config::UpdateChannel::Pinned => "pinned",
+    }
+}
+
+// --- `update` acting half: pinning gate + swap planners + apply seam ---
+
+/// How an updatable artifact is currently obtained, which decides whether
+/// `sbproxy update` is allowed to replace it (WOR-1804).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinState {
+    /// Installed and owned by an external tool: a binary already on
+    /// `PATH`, or a `brew` / `apt` package. Reported, never overwritten.
+    ExternallyManaged,
+    /// Pinned to an explicit version or digest. A blanket run holds it;
+    /// only a run that explicitly targets this artifact may move it.
+    Pinned,
+    /// Tracks a moving reference on the configured channel. Swap-eligible.
+    Tracking,
+}
+
+/// The outcome of the pinning gate: whether a swap may proceed, and why
+/// not when it may not. Pure; drives both the report and the acting path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapDecision {
+    /// A newer artifact exists and may be fetched and swapped in.
+    Eligible,
+    /// Already current; nothing to do.
+    UpToDate,
+    /// Owned by an external package manager; report only, never touch.
+    ManagedElsewhere,
+    /// Pinned and this run did not explicitly target it; hold.
+    PinnedHold,
+    /// A background / `update.auto` run only reports; it never swaps.
+    AutoReportOnly,
+}
+
+/// Decide whether `sbproxy update` may replace one artifact. Pure:
+/// pinning and external management always win over an available update,
+/// an `auto` (background) run never swaps, and the `pinned` channel
+/// freezes everything a targeted run did not name.
+fn decide_swap(
+    pin: PinState,
+    update_available: bool,
+    channel: sbproxy_config::UpdateChannel,
+    targeted: bool,
+    auto: bool,
+) -> SwapDecision {
+    if auto {
+        return SwapDecision::AutoReportOnly;
+    }
+    if pin == PinState::ExternallyManaged {
+        return SwapDecision::ManagedElsewhere;
+    }
+    let frozen = pin == PinState::Pinned || channel == sbproxy_config::UpdateChannel::Pinned;
+    if frozen && !targeted {
+        return SwapDecision::PinnedHold;
+    }
+    if !update_available {
+        return SwapDecision::UpToDate;
+    }
+    SwapDecision::Eligible
+}
+
+/// Classify how the running `sbproxy` binary was installed, from its
+/// path. Homebrew and distro package prefixes are externally managed (the
+/// package manager owns the file); anything else (a `curl | sh` install
+/// into `~/.local/bin`, `/usr/local/bin`, a container, or a dev build) is
+/// treated as channel-tracking and swap-eligible.
+fn classify_self_install(exe: &std::path::Path) -> PinState {
+    let text = exe.to_string_lossy();
+    // Homebrew (Intel + Apple Silicon) and Linuxbrew formula prefixes.
+    let brew =
+        text.contains("/Cellar/") || text.contains("/homebrew/") || text.contains("/linuxbrew/");
+    // apt / dpkg install the binary into the distro-owned /usr (or /bin)
+    // tree. /usr/local is operator-owned by the FHS, so it stays
+    // swap-eligible.
+    let distro = (text.starts_with("/usr/bin/") || text.starts_with("/bin/"))
+        && !text.starts_with("/usr/local/");
+    if brew || distro {
+        PinState::ExternallyManaged
+    } else {
+        PinState::Tracking
+    }
+}
+
+/// Classify how an engine binary is obtained on this host. A binary on
+/// `PATH` is operator-installed (brew / apt / manual) and never
+/// overwritten; otherwise the managed runtime falls back to the pinned
+/// prebuilt release it fetches into the cache.
+fn engine_pin_state(program: &str) -> PinState {
+    if sbproxy_model_host::resolve_on_path(program).is_some() {
+        PinState::ExternallyManaged
+    } else {
+        PinState::Pinned
+    }
+}
+
+/// The PATH program name for an engine key.
+fn engine_program(engine: &str) -> &'static str {
+    match engine {
+        "vllm" => "vllm",
+        _ => "llama-server",
+    }
+}
+
+/// Classify a cached model from its freshness `tracking` label: a pinned
+/// revision is held, a moving ref is swap-eligible (a re-pull chases the
+/// upstream head).
+fn model_pin_state(tracking: &str) -> PinState {
+    if tracking == "moving-ref" {
+        PinState::Tracking
+    } else {
+        PinState::Pinned
+    }
+}
+
+/// A planned engine prebuilt swap: which engine, the target release tag,
+/// the expected sha256 when a digest is known for the tag, and the cache
+/// root the binary is published under. The applier seam fetches, verifies,
+/// and atomically publishes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineSwapPlan {
+    engine: String,
+    program: String,
+    tag: String,
+    expected_sha256: Option<String>,
+    cache_dir: PathBuf,
+}
+
+/// Plan an engine swap from a freshness row and a pinning decision, or
+/// `None` when nothing should move. Only `llama_cpp` publishes a
+/// single-binary prebuilt release the runtime manages; vLLM does not.
+fn plan_engine_swap(
+    freshness: &EngineFreshness,
+    cache_dir: &std::path::Path,
+    decision: SwapDecision,
+) -> Option<EngineSwapPlan> {
+    if decision != SwapDecision::Eligible || freshness.engine != "llama_cpp" {
+        return None;
+    }
+    let tag = freshness.latest_release.clone()?;
+    Some(EngineSwapPlan {
+        engine: freshness.engine.to_string(),
+        program: engine_program(freshness.engine).to_string(),
+        // A vendored digest exists only for the default pinned tag; a
+        // newer tag has no built-in digest, so it is fetched unverified
+        // unless the operator supplies `engines.llama_cpp.acquire.sha256`.
+        expected_sha256: None,
+        tag,
+        cache_dir: cache_dir.to_path_buf(),
+    })
+}
+
+/// A planned binary self-update: the target version and the path of the
+/// binary to replace. The release asset URL + digest are resolved by the
+/// applier seam at apply time (they come from the GitHub release feed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelfUpdatePlan {
+    target_version: String,
+    dest: PathBuf,
+}
+
+/// Plan a self-update from the binary's freshness row and a pinning
+/// decision, or `None` when the binary should not move.
+fn plan_self_update(
+    freshness: &SelfFreshness,
+    dest: &std::path::Path,
+    decision: SwapDecision,
+) -> Option<SelfUpdatePlan> {
+    if decision != SwapDecision::Eligible {
+        return None;
+    }
+    let target_version = freshness.latest.clone()?;
+    Some(SelfUpdatePlan {
+        target_version,
+        dest: dest.to_path_buf(),
+    })
+}
+
+/// A planned model re-pull: the catalog id, HF repo, and revision to
+/// re-fetch through the existing weight manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelRepullPlan {
+    id: String,
+    hf_repo: String,
+    revision: String,
+}
+
+/// Plan a model re-pull from its freshness row and a pinning decision.
+fn plan_model_repull(
+    freshness: &ModelFreshness,
+    decision: SwapDecision,
+) -> Option<ModelRepullPlan> {
+    if decision != SwapDecision::Eligible {
+        return None;
+    }
+    Some(ModelRepullPlan {
+        id: freshness.id.clone(),
+        hf_repo: freshness.hf_repo.clone(),
+        revision: freshness.revision.clone(),
+    })
+}
+
+/// The release-archive base name for a host, matching the naming
+/// `scripts/install.sh` uses: `sbproxy_<os>_<arch>.tar.gz` with `os` in
+/// {linux, darwin} and `arch` in {amd64, arm64}. `Err` when the host is
+/// one no prebuilt binary is published for (Intel macOS).
+fn self_update_asset_name(os: &str, arch: &str) -> anyhow::Result<String> {
+    let os_tag = match os {
+        "linux" => "linux",
+        "macos" => "darwin",
+        other => anyhow::bail!("no prebuilt sbproxy binary for os '{other}'"),
+    };
+    let arch_tag = match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => anyhow::bail!("no prebuilt sbproxy binary for arch '{other}'"),
+    };
+    if os_tag == "darwin" && arch_tag == "amd64" {
+        anyhow::bail!(
+            "no prebuilt sbproxy binary for darwin/amd64 (Intel Mac); build from source or run under Docker"
+        );
+    }
+    Ok(format!("sbproxy_{os_tag}_{arch_tag}.tar.gz"))
+}
+
+/// The side-effecting half of `sbproxy update`: fetch, verify, and swap.
+/// Split from the pure planners so the decision logic is unit-tested with
+/// no network, and the real network + filesystem work is exercised only
+/// on a live run (mirroring how the freshness report shipped ahead of the
+/// acting half).
+trait UpdateApplier {
+    /// Fetch, verify, and publish an engine prebuilt swap. Returns the
+    /// path to the newly published binary.
+    fn apply_engine_swap(&self, plan: &EngineSwapPlan) -> anyhow::Result<PathBuf>;
+    /// Fetch, verify, and atomically replace the running binary.
+    fn apply_self_update(&self, plan: &SelfUpdatePlan) -> anyhow::Result<()>;
+    /// Re-pull a model's weights through the existing weight manager.
+    fn apply_model_repull(&self, plan: &ModelRepullPlan) -> anyhow::Result<()>;
+}
+
+/// The production applier: real network fetches, sha256 verification, and
+/// atomic filesystem swaps.
+struct RealUpdateApplier;
+
+impl UpdateApplier for RealUpdateApplier {
+    fn apply_engine_swap(&self, plan: &EngineSwapPlan) -> anyhow::Result<PathBuf> {
+        #[cfg(feature = "model-weights")]
+        {
+            let path = sbproxy_model_host::ensure_llama_server_blocking(
+                &plan.cache_dir,
+                &plan.tag,
+                sbproxy_model_host::EngineAccel::Auto,
+                plan.expected_sha256.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("acquire {} {}: {e}", plan.engine, plan.tag))?;
+            Ok(path)
+        }
+        #[cfg(not(feature = "model-weights"))]
+        {
+            let _ = plan;
+            anyhow::bail!(
+                "this build has no model-weights feature; rebuild with it to fetch engine prebuilts"
+            )
+        }
+    }
+
+    fn apply_self_update(&self, plan: &SelfUpdatePlan) -> anyhow::Result<()> {
+        let asset = self_update_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
+        let base = format!(
+            "https://github.com/{SBPROXY_RELEASE_REPO}/releases/download/{}",
+            plan.target_version
+        );
+        let archive_url = format!("{base}/{asset}");
+        let sha_url = format!("{archive_url}.sha256");
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()?;
+        // Stage under the destination directory so the final rename is a
+        // same-filesystem atomic move.
+        let dir = plan
+            .dest
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("binary path has no parent directory"))?;
+        let staging = dir.join(format!(".sbproxy-update-{}", std::process::id()));
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", staging.display()))?;
+        let result = self_update_into(&client, &archive_url, &sha_url, &staging, &plan.dest);
+        let _ = std::fs::remove_dir_all(&staging);
+        result
+    }
+
+    fn apply_model_repull(&self, plan: &ModelRepullPlan) -> anyhow::Result<()> {
+        // Re-pull the exact catalog artifact for this model id through the
+        // existing weight manager (the same path as `sbproxy models pull
+        // <id>`), which re-resolves, fetches, and verifies it.
+        let pull = ModelsPullArgs {
+            models: vec![plan.id.clone()],
+            all: false,
+            variant: None,
+            engine: ModelEngineArg::Auto,
+            catalog_file: None,
+            cache_dir: None,
+            offline: false,
+            format: OutputFormat::Text,
+        };
+        let code = handle_models_pull(&pull, None)?;
+        if code != 0 {
+            anyhow::bail!("re-pull of {} exited {code}", plan.id);
+        }
+        Ok(())
+    }
+}
+
+/// Download the release archive + its published sha256, verify, extract
+/// the `sbproxy` binary, and atomically replace `dest`.
+fn self_update_into(
+    client: &reqwest::blocking::Client,
+    archive_url: &str,
+    sha_url: &str,
+    staging: &std::path::Path,
+    dest: &std::path::Path,
+) -> anyhow::Result<()> {
+    let bytes = client
+        .get(archive_url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| anyhow::anyhow!("download {archive_url}: {e}"))?
+        .bytes()
+        .map_err(|e| anyhow::anyhow!("read {archive_url}: {e}"))?;
+    let archive_path = staging.join("sbproxy.tar.gz");
+    std::fs::write(&archive_path, &bytes)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", archive_path.display()))?;
+
+    // Fetch + verify the published checksum. Every release publishes it;
+    // its absence is a hard failure (the same posture as install.sh).
+    let sha_text = client
+        .get(sha_url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| anyhow::anyhow!("fetch checksum {sha_url}: {e}"))?
+        .text()
+        .map_err(|e| anyhow::anyhow!("read checksum {sha_url}: {e}"))?;
+    let expected = sha_text
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("published checksum is malformed: '{sha_text}'"))?;
+    sbproxy_model_host::weights::verify_sha256(&archive_path, &expected)
+        .map_err(|e| anyhow::anyhow!("checksum verify failed: {e}"))?;
+
+    // Extract (shell out to `tar`, as the engine release path does).
+    let status = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(staging)
+        .status()
+        .map_err(|e| anyhow::anyhow!("tar: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("tar extract of {} failed", archive_path.display());
+    }
+    let staged_binary = staging.join("sbproxy");
+    if !staged_binary.is_file() {
+        anyhow::bail!("sbproxy binary not found in the extracted release");
+    }
+    atomic_replace_binary(&staged_binary, dest)
+}
+
+/// Atomically replace `dest` with `src`: copy `src` to a temp file in the
+/// destination directory, mark it executable, then rename over `dest`. On
+/// unix a running binary can be replaced while it executes; on Windows a
+/// rename over the running image fails, so a Windows self-update needs the
+/// rename-self-aside dance this build does not implement.
+fn atomic_replace_binary(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("binary path has no parent directory"))?;
+    let tmp = dir.join(format!(".sbproxy-new-{}", std::process::id()));
+    std::fs::copy(src, &tmp).map_err(|e| anyhow::anyhow!("stage new binary: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| anyhow::anyhow!("chmod staged binary: {e}"))?;
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("replace {}: {e}", dest.display())
+    })?;
+    Ok(())
+}
+
+/// Inputs to the acting half that the freshness report does not carry.
+struct UpdatePlanContext {
+    channel: sbproxy_config::UpdateChannel,
+    targeted_self: bool,
+    targeted_engines: bool,
+    targeted_models: bool,
+    assume_yes: bool,
+    cache_dir: Option<PathBuf>,
+}
+
+/// Drive the acting half: for each artifact in the report run the pinning
+/// gate, and when eligible confirm + apply through the seam. Never mutates
+/// a pinned or externally-managed artifact without an explicit targeted
+/// run. Returns exit code 1 when any apply failed.
+fn apply_updates(
+    report: &UpdateReport,
+    ctx: &UpdatePlanContext,
+    applier: &dyn UpdateApplier,
+) -> anyhow::Result<i32> {
+    println!("\napplying updates");
+    let mut applied = 0u32;
+    let mut failures = 0u32;
+
+    if let Some(freshness) = &report.self_ {
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let decision = decide_swap(
+                    classify_self_install(&exe),
+                    freshness.update_available,
+                    ctx.channel,
+                    ctx.targeted_self,
+                    false,
+                );
+                report_decision("sbproxy", decision);
+                if let Some(plan) = plan_self_update(freshness, &exe, decision) {
+                    if confirm_swap(
+                        &format!("replace this binary with sbproxy {}", plan.target_version),
+                        ctx.assume_yes,
+                    ) {
+                        match applier.apply_self_update(&plan) {
+                            Ok(()) => {
+                                applied += 1;
+                                println!("  sbproxy -> {}", plan.target_version);
+                            }
+                            Err(e) => {
+                                failures += 1;
+                                eprintln!("  sbproxy self-update failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("  sbproxy: cannot locate the running binary: {e}; skipping"),
+        }
+    }
+
+    if let Some(engines) = &report.engines {
+        let cache = model_cache_root(ctx.cache_dir.as_deref());
+        for engine in engines {
+            let decision = decide_swap(
+                engine_pin_state(engine_program(engine.engine)),
+                engine.update_available,
+                ctx.channel,
+                ctx.targeted_engines,
+                false,
+            );
+            report_decision(engine.engine, decision);
+            if let Some(plan) = plan_engine_swap(engine, &cache, decision) {
+                if confirm_swap(
+                    &format!("fetch and swap {} to {}", plan.engine, plan.tag),
+                    ctx.assume_yes,
+                ) {
+                    match applier.apply_engine_swap(&plan) {
+                        Ok(path) => {
+                            applied += 1;
+                            println!("  {} -> {} ({})", plan.engine, plan.tag, path.display());
+                        }
+                        Err(err) => {
+                            failures += 1;
+                            eprintln!("  {} swap failed: {err}", plan.engine);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(models) = &report.models {
+        for model in models {
+            let pin = model_pin_state(model.tracking);
+            // A moving-ref model is treated as potentially behind upstream
+            // (the freshness classifies moving vs pinned; the upstream-head
+            // comparison is a seam), so it is offered for re-pull.
+            let update_available = pin == PinState::Tracking;
+            let decision = decide_swap(
+                pin,
+                update_available,
+                ctx.channel,
+                ctx.targeted_models,
+                false,
+            );
+            report_decision(&model.id, decision);
+            if let Some(plan) = plan_model_repull(model, decision) {
+                if confirm_swap(
+                    &format!("re-pull {} ({}@{})", plan.id, plan.hf_repo, plan.revision),
+                    ctx.assume_yes,
+                ) {
+                    match applier.apply_model_repull(&plan) {
+                        Ok(()) => {
+                            applied += 1;
+                            println!("  re-pulled {}", plan.id);
+                        }
+                        Err(err) => {
+                            failures += 1;
+                            eprintln!("  {} re-pull failed: {err}", plan.id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("\n{applied} applied, {failures} failed");
+    Ok(if failures > 0 { 1 } else { 0 })
+}
+
+/// Print a one-line reason for the pinning gate's non-eligible verdicts,
+/// so a report-and-hold outcome is visible in the acting output.
+fn report_decision(name: &str, decision: SwapDecision) {
+    match decision {
+        SwapDecision::Eligible => {}
+        SwapDecision::UpToDate => println!("  {name}: up to date"),
+        SwapDecision::ManagedElsewhere => {
+            println!("  {name}: managed elsewhere (PATH / brew / apt); skipping")
+        }
+        SwapDecision::PinnedHold => {
+            println!("  {name}: pinned; target it explicitly to move it, or set update.channel")
+        }
+        SwapDecision::AutoReportOnly => println!("  {name}: report only (update.auto)"),
+    }
+}
+
+/// Interactive yes/no confirmation. Returns true immediately when
+/// `assume_yes` (`--yes`) is set; otherwise prompts on stderr and reads a
+/// line from stdin. A non-tty / EOF answer is treated as "no".
+fn confirm_swap(action: &str, assume_yes: bool) -> bool {
+    use std::io::Write;
+    if assume_yes {
+        return true;
+    }
+    eprint!("  {action}? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
 fn check_self_freshness() -> SelfFreshness {
@@ -4739,6 +5382,241 @@ mod tests {
     }
 
     #[test]
+    fn update_pinned_never_swaps_moving_ref_is_eligible() {
+        use sbproxy_config::UpdateChannel::Stable;
+        // A moving-ref artifact on the stable channel with an available
+        // update is swap-eligible.
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Stable, false, false),
+            SwapDecision::Eligible
+        );
+        // The same artifact with nothing newer is up to date.
+        assert_eq!(
+            decide_swap(PinState::Tracking, false, Stable, false, false),
+            SwapDecision::UpToDate
+        );
+        // A pinned artifact holds on a blanket run, even with an update
+        // available, and is never swapped.
+        assert_eq!(
+            decide_swap(PinState::Pinned, true, Stable, false, false),
+            SwapDecision::PinnedHold
+        );
+        // An explicit targeted run may move the pin.
+        assert_eq!(
+            decide_swap(PinState::Pinned, true, Stable, true, false),
+            SwapDecision::Eligible
+        );
+        // Externally managed (PATH / brew / apt) is never touched, even
+        // when targeted.
+        assert_eq!(
+            decide_swap(PinState::ExternallyManaged, true, Stable, true, false),
+            SwapDecision::ManagedElsewhere
+        );
+    }
+
+    #[test]
+    fn update_pinned_channel_freezes_untargeted_tracking() {
+        use sbproxy_config::UpdateChannel::{Pinned, Stable};
+        // The `pinned` channel holds even a moving-ref artifact on a
+        // blanket run...
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Pinned, false, false),
+            SwapDecision::PinnedHold
+        );
+        // ...but a targeted run may still move it.
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Pinned, true, false),
+            SwapDecision::Eligible
+        );
+        // On the stable channel the same untargeted moving-ref is eligible.
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Stable, false, false),
+            SwapDecision::Eligible
+        );
+    }
+
+    #[test]
+    fn update_auto_run_only_reports() {
+        use sbproxy_config::UpdateChannel::Stable;
+        // A background / auto run never swaps anything, even an eligible
+        // tracking artifact on a targeted run.
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Stable, true, true),
+            SwapDecision::AutoReportOnly
+        );
+    }
+
+    #[test]
+    fn update_classify_self_install() {
+        use std::path::Path;
+        // Homebrew and Linuxbrew formula prefixes are externally managed.
+        assert_eq!(
+            classify_self_install(Path::new("/opt/homebrew/Cellar/sbproxy/1.4.0/bin/sbproxy")),
+            PinState::ExternallyManaged
+        );
+        assert_eq!(
+            classify_self_install(Path::new("/home/linuxbrew/.linuxbrew/bin/sbproxy")),
+            PinState::ExternallyManaged
+        );
+        // A distro (apt) path under /usr/bin is externally managed.
+        assert_eq!(
+            classify_self_install(Path::new("/usr/bin/sbproxy")),
+            PinState::ExternallyManaged
+        );
+        // A curl-installed / operator-owned path is channel-tracking.
+        assert_eq!(
+            classify_self_install(Path::new("/home/rick/.local/bin/sbproxy")),
+            PinState::Tracking
+        );
+        assert_eq!(
+            classify_self_install(Path::new("/usr/local/bin/sbproxy")),
+            PinState::Tracking
+        );
+    }
+
+    #[test]
+    fn update_engine_swap_plan_only_for_llama_and_eligible() {
+        let llama = EngineFreshness {
+            engine: "llama_cpp",
+            installed: None,
+            pinned_release: Some("b9905".to_string()),
+            latest_release: Some("b9999".to_string()),
+            update_available: true,
+        };
+        let dir = std::path::Path::new("/cache");
+        // Eligible llama_cpp yields a plan targeting the latest tag.
+        let plan = plan_engine_swap(&llama, dir, SwapDecision::Eligible).unwrap();
+        assert_eq!(plan.engine, "llama_cpp");
+        assert_eq!(plan.program, "llama-server");
+        assert_eq!(plan.tag, "b9999");
+        // A newer tag carries no vendored digest.
+        assert_eq!(plan.expected_sha256, None);
+        // A non-eligible decision produces no plan.
+        assert!(plan_engine_swap(&llama, dir, SwapDecision::PinnedHold).is_none());
+        // vLLM has no single-binary prebuilt swap.
+        let vllm = EngineFreshness {
+            engine: "vllm",
+            installed: None,
+            pinned_release: None,
+            latest_release: None,
+            update_available: false,
+        };
+        assert!(plan_engine_swap(&vllm, dir, SwapDecision::Eligible).is_none());
+    }
+
+    #[test]
+    fn update_self_update_asset_name_matches_installer() {
+        assert_eq!(
+            self_update_asset_name("linux", "x86_64").unwrap(),
+            "sbproxy_linux_amd64.tar.gz"
+        );
+        assert_eq!(
+            self_update_asset_name("linux", "aarch64").unwrap(),
+            "sbproxy_linux_arm64.tar.gz"
+        );
+        assert_eq!(
+            self_update_asset_name("macos", "aarch64").unwrap(),
+            "sbproxy_darwin_arm64.tar.gz"
+        );
+        // Intel macOS and unknown hosts have no published binary.
+        assert!(self_update_asset_name("macos", "x86_64").is_err());
+        assert!(self_update_asset_name("freebsd", "x86_64").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_atomic_replace_binary_swaps_contents_and_is_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "sbproxy-update-replace-{}-{}",
+            std::process::id(),
+            random_local_password(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("sbproxy");
+        std::fs::write(&dest, b"old-binary").unwrap();
+        let src = dir.join("staged");
+        std::fs::write(&src, b"new-binary").unwrap();
+
+        atomic_replace_binary(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-binary");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "replacement is executable");
+        // The temp file is renamed away, not left behind.
+        assert!(!dir
+            .join(format!(".sbproxy-new-{}", std::process::id()))
+            .exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn update_acting_swaps_eligible_and_holds_pinned_via_seam() {
+        use sbproxy_config::UpdateChannel::Stable;
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        struct FakeApplier {
+            engine_swaps: RefCell<Vec<String>>,
+            self_updates: RefCell<Vec<String>>,
+            model_repulls: RefCell<Vec<String>>,
+        }
+        impl UpdateApplier for FakeApplier {
+            fn apply_engine_swap(&self, plan: &EngineSwapPlan) -> anyhow::Result<PathBuf> {
+                self.engine_swaps.borrow_mut().push(plan.engine.clone());
+                Ok(PathBuf::from("/fake/llama-server"))
+            }
+            fn apply_self_update(&self, plan: &SelfUpdatePlan) -> anyhow::Result<()> {
+                self.self_updates
+                    .borrow_mut()
+                    .push(plan.target_version.clone());
+                Ok(())
+            }
+            fn apply_model_repull(&self, plan: &ModelRepullPlan) -> anyhow::Result<()> {
+                self.model_repulls.borrow_mut().push(plan.id.clone());
+                Ok(())
+            }
+        }
+
+        // A report with one moving-ref model and one pinned model. Only
+        // the moving-ref one, on a targeted run, reaches the seam. This
+        // path touches neither PATH nor the running-binary path (self and
+        // engines are absent), so it is host-independent.
+        let report = UpdateReport {
+            self_: None,
+            engines: None,
+            models: Some(vec![
+                ModelFreshness {
+                    id: "moving".to_string(),
+                    hf_repo: "Org/Moving".to_string(),
+                    revision: "main".to_string(),
+                    tracking: "moving-ref",
+                },
+                ModelFreshness {
+                    id: "pinned".to_string(),
+                    hf_repo: "Org/Pinned".to_string(),
+                    revision: "v1.0".to_string(),
+                    tracking: "pinned",
+                },
+            ]),
+            note: String::new(),
+        };
+        let ctx = UpdatePlanContext {
+            channel: Stable,
+            targeted_self: false,
+            targeted_engines: false,
+            targeted_models: true,
+            assume_yes: true,
+            cache_dir: None,
+        };
+        let fake = FakeApplier::default();
+        let code = apply_updates(&report, &ctx, &fake).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(*fake.model_repulls.borrow(), vec!["moving".to_string()]);
+        assert!(fake.self_updates.borrow().is_empty());
+        assert!(fake.engine_swaps.borrow().is_empty());
+    }
+
+    #[test]
     fn config_print_masks_inline_secrets_but_shows_references() {
         let mut v = serde_json::json!({
             "providers": [
@@ -5295,6 +6173,22 @@ mod tests {
             cli.globals.config,
             Some(std::path::PathBuf::from("cfg.yml"))
         );
+    }
+
+    #[test]
+    fn update_accepts_global_check_and_local_yes() {
+        // `--check` is the global flag; it is accepted after the `update`
+        // subcommand and selects the dry-run report. `--yes` / `-y` is
+        // local to `update`.
+        let cli = parse(&["sbproxy", "update", "--check", "-y", "--engines"]);
+        assert!(cli.check, "global --check is accepted after `update`");
+        match cli.cmd {
+            Some(Cmd::Update(args)) => {
+                assert!(args.yes);
+                assert!(args.engines);
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
     }
 
     #[test]
