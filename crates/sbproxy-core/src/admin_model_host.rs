@@ -35,6 +35,10 @@ trait ModelManagementRuntime {
 
     fn management_snapshot(&self) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError>;
 
+    /// Serving devices on this node, the ceiling on a deployment's
+    /// `replicas * tensor_parallel`.
+    fn serving_device_count(&self) -> usize;
+
     fn apply_admin_deployment_revision(
         &self,
         expected_revision: Option<u64>,
@@ -45,6 +49,10 @@ trait ModelManagementRuntime {
 impl ModelManagementRuntime for ProductionModelRuntime {
     fn active_catalog(&self) -> Arc<sbproxy_model_host::Catalog> {
         ProductionModelRuntime::active_catalog(self)
+    }
+
+    fn serving_device_count(&self) -> usize {
+        self.active_manager().serving_device_count()
     }
 
     fn management_snapshot(&self) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError> {
@@ -424,7 +432,8 @@ fn deployments_put_response(runtime: &impl ModelManagementRuntime, body: Option<
     if let Err(error) = draft.validate() {
         return error_response(400, "invalid_desired", error.to_string());
     }
-    if let Err(error) = validate_local_admin_deployments(&draft.deployments) {
+    let serving_device_count = runtime.serving_device_count();
+    if let Err(error) = validate_local_admin_deployments(&draft.deployments, serving_device_count) {
         return error_response(400, "invalid_desired", error);
     }
     for (deployment_id, deployment) in &draft.deployments {
@@ -505,14 +514,23 @@ fn deployments_put_response(runtime: &impl ModelManagementRuntime, body: Option<
 
 fn validate_local_admin_deployments(
     deployments: &BTreeMap<String, sbproxy_model_host::ModelDeployment>,
+    serving_device_count: usize,
 ) -> Result<(), String> {
     if deployments.len() > 1_024 {
         return Err("admin deployment state may contain at most 1024 deployments".to_string());
     }
     for (id, deployment) in deployments {
-        if deployment.replicas != 1 {
+        if deployment.replicas == 0 {
+            return Err(format!("deployment {id:?} must use at least one replica"));
+        }
+        // Each replica claims its own device set, so replicas times the
+        // tensor-parallel degree cannot exceed the node's serving devices.
+        let degree = deployment.tensor_parallel.unwrap_or(1).max(1) as usize;
+        let needed = deployment.replicas as usize * degree;
+        if serving_device_count > 0 && needed > serving_device_count {
             return Err(format!(
-                "deployment {id:?} must use exactly one replica in local admin mode"
+                "deployment {id:?} requests {} replicas at tensor_parallel {degree}, needing {needed} devices, but the node serves {serving_device_count}",
+                deployment.replicas
             ));
         }
         if deployment.heterogeneous_variants
@@ -978,6 +996,7 @@ mod tests {
     struct FakeManagementRuntime {
         catalog: Arc<Catalog>,
         snapshot: ModelManagementSnapshot,
+        serving_device_count: usize,
         apply_result:
             Mutex<Option<Result<AdminDeploymentRevisionResult, AdminDeploymentRevisionError>>>,
         applied: Mutex<Vec<AppliedRevision>>,
@@ -992,6 +1011,10 @@ mod tests {
             &self,
         ) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError> {
             Ok(self.snapshot.clone())
+        }
+
+        fn serving_device_count(&self) -> usize {
+            self.serving_device_count
         }
 
         fn apply_admin_deployment_revision(
@@ -1051,6 +1074,7 @@ mod tests {
         FakeManagementRuntime {
             catalog: Arc::new(Catalog::builtin()),
             snapshot: management_snapshot(authority),
+            serving_device_count: 1,
             apply_result: Mutex::new(Some(apply_result)),
             applied: Mutex::new(Vec::new()),
         }
@@ -1363,7 +1387,7 @@ models:
     }
 
     #[test]
-    fn deployment_put_rejects_invalid_multi_replica_variant_policy() {
+    fn deployment_put_rejects_multi_replica_without_a_pinned_variant() {
         let runtime = fake_runtime(
             sbproxy_config::ModelHostAuthority::AdminManaged,
             Err(AdminDeploymentRevisionError::Store("unused".to_string())),
@@ -1395,9 +1419,85 @@ models:
     }
 
     #[test]
+    fn deployment_put_rejects_more_replicas_than_serving_devices() {
+        // The node serves one device (fake default), so two replicas cannot fit
+        // even with a pinned variant.
+        let runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+        );
+        let body = r#"{
+            "expected_revision": null,
+            "deployments": {
+                "local-qwen": {
+                    "model": "qwen2.5-0.5b-instruct",
+                    "variant": "q4_k_m",
+                    "cold_start": "wait",
+                    "replicas": 2
+                }
+            }
+        }"#;
+
+        let (status, _, response_body) =
+            dispatch_with_runtime(&runtime, "PUT", "/admin/model-host/deployments", Some(body))
+                .expect("deployments route");
+        let response: serde_json::Value =
+            serde_json::from_str(&response_body).expect("error response");
+
+        assert_eq!(status, 400, "{response_body}");
+        assert_eq!(response["code"], "invalid_desired");
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("device")),
+            "the rejection names the device shortfall: {response_body}"
+        );
+        assert!(runtime
+            .applied
+            .lock()
+            .expect("applied revisions lock")
+            .is_empty());
+    }
+
+    #[test]
+    fn deployment_put_accepts_replicas_within_serving_devices() {
+        // A four-GPU node accepts two replicas at tensor_parallel 2.
+        let mut runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Ok(AdminDeploymentRevisionResult {
+                revision: 8,
+                content_digest: "e".repeat(64),
+                plan: ReconcilePlan::default(),
+            }),
+        );
+        runtime.serving_device_count = 4;
+        let body = r#"{
+            "expected_revision": null,
+            "deployments": {
+                "local-qwen": {
+                    "model": "qwen2.5-0.5b-instruct",
+                    "variant": "q4_k_m",
+                    "cold_start": "wait",
+                    "replicas": 2,
+                    "tensor_parallel": 2
+                }
+            }
+        }"#;
+
+        let (status, _, response_body) =
+            dispatch_with_runtime(&runtime, "PUT", "/admin/model-host/deployments", Some(body))
+                .expect("deployments route");
+
+        assert_eq!(status, 200, "{response_body}");
+        let applied = runtime.applied.lock().expect("applied revisions lock");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].1["local-qwen"].replicas, 2);
+        assert_eq!(applied[0].1["local-qwen"].tensor_parallel, Some(2));
+    }
+
+    #[test]
     fn deployment_put_rejects_cluster_only_and_unbounded_local_intent() {
         let cases = [
-            ("replicas", serde_json::json!(2)),
             ("heterogeneous_variants", serde_json::json!(true)),
             ("required_labels", serde_json::json!({"pool": "gpu"})),
             ("spread_by", serde_json::json!(["zone"])),

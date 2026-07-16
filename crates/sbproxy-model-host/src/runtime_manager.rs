@@ -1367,6 +1367,7 @@ pub struct ModelRuntimeManager {
     expected_catalog_revision: String,
     preparer: Arc<dyn DeploymentPreparer>,
     snapshot: ArcSwap<RuntimeSnapshot>,
+    serving_device_count: usize,
     residency: Mutex<crate::DeviceResidencySet>,
     retired_slots: Mutex<BTreeMap<(String, u64), RetiredSlot>>,
     retirement_lock: Mutex<()>,
@@ -1447,10 +1448,12 @@ impl ModelRuntimeManager {
             slots: BTreeMap::new(),
             limiter: Arc::new(Semaphore::new(2)),
         };
+        let serving_device_count = device_capacities.len();
         Ok(Self {
             expected_catalog_revision: catalog_revision,
             preparer,
             snapshot: ArcSwap::from_pointee(snapshot),
+            serving_device_count,
             residency: Mutex::new(crate::DeviceResidencySet::new(device_capacities)),
             retired_slots: Mutex::new(BTreeMap::new()),
             retirement_lock: Mutex::new(()),
@@ -1471,6 +1474,12 @@ impl ModelRuntimeManager {
     /// Current process-local committed revision number.
     pub fn current_revision(&self) -> u64 {
         self.snapshot.load().revision
+    }
+
+    /// Number of model-serving devices this node has, the ceiling on
+    /// `replicas * tensor_parallel` for any one deployment.
+    pub fn serving_device_count(&self) -> usize {
+        self.serving_device_count
     }
 
     /// Current atomic desired-state snapshot.
