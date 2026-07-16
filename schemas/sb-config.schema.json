@@ -1914,6 +1914,30 @@
           ],
           "format": "uint64",
           "minimum": 0.0
+        },
+        "engine_version": {
+          "description": "Per-deployment engine version pin, overriding the node-wide `engines:` policy so one model can run a different backend version than another. Never `latest`. Omit to inherit the node policy or the built-in default.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine_image": {
+          "description": "Per-deployment engine container image, overriding the node policy. Must be tag- or digest-pinned. Omit to inherit the node policy.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine_sha256": {
+          "description": "Expected SHA-256 for the pinned engine binary or image digest. Omit to inherit the node policy.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

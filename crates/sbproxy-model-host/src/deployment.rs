@@ -129,6 +129,19 @@ pub struct ModelDeployment {
     /// `None` disables offload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_offload_gib: Option<u64>,
+    /// Per-deployment engine version pin, overriding the node-wide engine
+    /// policy so one model can run a different backend version than another.
+    /// Never `latest`. `None` inherits the node policy or the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    /// Per-deployment engine container image, overriding the node policy.
+    /// Must be tag- or digest-pinned. `None` inherits the node policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_image: Option<String>,
+    /// Expected SHA-256 for the pinned engine binary or image digest.
+    /// `None` inherits the node policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_sha256: Option<String>,
 }
 
 const fn one_replica() -> u32 {

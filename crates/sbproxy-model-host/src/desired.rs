@@ -202,6 +202,7 @@ pub fn compile_desired_state(
     for (id, deployment) in &control.deployments {
         validate_catalog_deployment(id, deployment, catalog)?;
         validate_canonical_engine_tuning(id, deployment)?;
+        validate_canonical_engine_pin(id, deployment)?;
         let desired = lower_canonical_deployment(deployment);
         revision_deployments.insert(id.clone(), desired.clone());
         compiled_deployments.insert(
@@ -547,6 +548,32 @@ fn validate_canonical_engine_tuning(
     Ok(())
 }
 
+/// Hold a per-deployment engine pin to the same strictness as the node-wide
+/// engine policy: a version is never `latest`, and an image is tag- or
+/// digest-pinned.
+fn validate_canonical_engine_pin(
+    id: &str,
+    config: &ManagedDeploymentConfig,
+) -> Result<(), DesiredStateError> {
+    if config.engine_version.as_deref() == Some("latest") {
+        return Err(DesiredStateError::Invalid(format!(
+            "managed deployment {id:?} engine_version must be a pinned version, not `latest`"
+        )));
+    }
+    if let Some(image) = &config.engine_image {
+        let provisioning = crate::EngineProvisioning {
+            image: Some(image.clone()),
+            ..Default::default()
+        };
+        if !provisioning.image_is_pinned() {
+            return Err(DesiredStateError::Invalid(format!(
+                "managed deployment {id:?} engine_image {image:?} must be tag- or digest-pinned, not `latest` or untagged"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployment {
     ModelDeployment {
         model: config.model.clone(),
@@ -588,6 +615,9 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
         tool_call_parser: config.tool_call_parser.clone(),
         swap_space_gib: config.swap_space_gib,
         cpu_offload_gib: config.cpu_offload_gib,
+        engine_version: config.engine_version.clone(),
+        engine_image: config.engine_image.clone(),
+        engine_sha256: config.engine_sha256.clone(),
     }
 }
 
@@ -635,6 +665,9 @@ fn lower_legacy_deployment(
         tool_call_parser: None,
         swap_space_gib: None,
         cpu_offload_gib: None,
+        engine_version: None,
+        engine_image: None,
+        engine_sha256: None,
     })
 }
 
@@ -775,5 +808,38 @@ mod tests {
                 .and_then(|prefill| prefill.max_batched_tokens),
             Some(2048)
         );
+    }
+
+    #[test]
+    fn engine_pin_lowers_and_accepts_a_pinned_version_and_image() {
+        let config = canonical(
+            "model: qwen3-8b\nengine: vllm\nengine_version: 0.11.0\nengine_image: vllm/vllm-openai:v0.11.0\nengine_sha256: abc123\n",
+        );
+        super::validate_canonical_engine_pin("local", &config).expect("a pinned version and image");
+        let lowered = super::lower_canonical_deployment(&config);
+        assert_eq!(lowered.engine_version.as_deref(), Some("0.11.0"));
+        assert_eq!(
+            lowered.engine_image.as_deref(),
+            Some("vllm/vllm-openai:v0.11.0")
+        );
+        assert_eq!(lowered.engine_sha256.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn engine_pin_rejects_latest_version() {
+        let config = canonical("model: qwen3-8b\nengine_version: latest\n");
+        let error = super::validate_canonical_engine_pin("local", &config)
+            .expect_err("latest is not a pinned version");
+        assert!(error.to_string().contains("latest"), "{error:?}");
+    }
+
+    #[test]
+    fn engine_pin_rejects_an_unpinned_image() {
+        for image in ["vllm/vllm-openai", "vllm/vllm-openai:latest"] {
+            let config = canonical(&format!("model: qwen3-8b\nengine_image: {image}\n"));
+            let error = super::validate_canonical_engine_pin("local", &config)
+                .expect_err(&format!("image {image} must be pinned"));
+            assert!(error.to_string().contains("pinned"), "{error:?}");
+        }
     }
 }
