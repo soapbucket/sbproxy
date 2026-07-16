@@ -161,6 +161,7 @@ fn resolved(kind: EngineKind, format: ArtifactFormat) -> ResolvedArtifact {
         license: "apache-2.0".to_string(),
         stability: SupportLevel::Preview,
         pickle_allowed: false,
+        modality: Default::default(),
     }
 }
 
@@ -263,6 +264,7 @@ async fn driver_contract_is_complete_and_object_safe() {
                     extra_args: Vec::new(),
                     engine_tuning: Default::default(),
                     max_concurrency: 1,
+                    modality: Default::default(),
                     ready_timeout: Duration::from_secs(1),
                 },
             )
@@ -424,6 +426,7 @@ async fn crash_loop_observes_backoff_retains_failure_and_requires_durable_reset(
         extra_args: Vec::new(),
         engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     let task_request = request.clone();
@@ -603,6 +606,7 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         extra_args: vec!["--flash-attn".to_string()],
         engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     request
@@ -631,6 +635,7 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         extra_args: Vec::new(),
         engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     request.artifact.metadata.trust = "legacy-unverified".to_string();
@@ -654,6 +659,7 @@ fn launch_request_requires_devices_that_match_the_accelerator() {
         extra_args: Vec::new(),
         engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     assert_eq!(
@@ -1109,6 +1115,7 @@ async fn llama_launch_uses_one_verified_gguf_and_runtime_owned_network_and_devic
         extra_args: vec!["--flash-attn".to_string()],
         engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
 
@@ -1171,6 +1178,7 @@ async fn llama_metal_launch_offloads_without_exporting_a_cuda_device() {
                 extra_args: Vec::new(),
                 engine_tuning: Default::default(),
                 max_concurrency: 1,
+                modality: Default::default(),
                 ready_timeout: Duration::from_secs(1),
             },
         )
@@ -1486,6 +1494,7 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
         extra_args: vec!["--enable-prefix-caching".to_string()],
         engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     launch.fit.memory = sbproxy_model_host::MemoryEstimate {
@@ -1564,6 +1573,7 @@ acquire:
                 extra_args: Vec::new(),
                 engine_tuning: Default::default(),
                 max_concurrency: 1,
+                modality: Default::default(),
                 ready_timeout: Duration::from_secs(1),
             },
         )
@@ -1592,6 +1602,7 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
         extra_args: vec!["--enable-prefix-caching".to_string()],
         engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     let image = format!("ghcr.io/vllm-project/vllm-openai@sha256:{}", "a".repeat(64));
@@ -1654,4 +1665,58 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn vllm_container_plan_adds_task_flag_for_an_embedding_modality() {
+    // WOR-1908: an embedder is launched with the runtime-owned `--task
+    // embed`; a chat model gets no task flag. The flag lands before the
+    // operator allowlist, and the operator cannot set it.
+    let mut request = LaunchRequest {
+        deployment: "embedder".to_string(),
+        generation: 1,
+        artifact: ready(EngineKind::Vllm, ArtifactFormat::Safetensors),
+        fit: fit(),
+        port: 18124,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
+        selected_devices: vec![0],
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: vec![],
+        engine_tuning: Default::default(),
+        max_concurrency: 1,
+        modality: sbproxy_model_host::Modality::Embedding,
+        ready_timeout: Duration::from_secs(1),
+    };
+    let image = format!("ghcr.io/vllm-project/vllm-openai@sha256:{}", "a".repeat(64));
+    let embed = build_vllm_container_plan(
+        ContainerRuntime::Docker,
+        PathBuf::from("/usr/bin/docker"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("embedding container plan");
+    assert!(
+        embed
+            .arguments
+            .windows(2)
+            .any(|window| window == ["--task", "embed"]),
+        "embedding launch must carry --task embed: {:?}",
+        embed.arguments
+    );
+
+    request.modality = sbproxy_model_host::Modality::Chat;
+    let chat = build_vllm_container_plan(
+        ContainerRuntime::Docker,
+        PathBuf::from("/usr/bin/docker"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("chat container plan");
+    assert!(
+        !chat.arguments.iter().any(|value| value == "--task"),
+        "a chat model gets no --task flag: {:?}",
+        chat.arguments
+    );
 }

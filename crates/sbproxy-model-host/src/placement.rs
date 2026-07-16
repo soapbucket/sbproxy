@@ -349,6 +349,7 @@ fn evaluate_variant(
         entry.context_length,
         &entry.license,
         entry.allow_pickle,
+        entry.modality,
     )
     .map_err(|_| PlacementRejectionReason::VariantIncompatible)?;
     let artifact_cached = node.artifacts.iter().any(|artifact| {

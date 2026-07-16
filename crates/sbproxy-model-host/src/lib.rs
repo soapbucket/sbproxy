@@ -103,7 +103,7 @@ pub use capabilities::{
 };
 pub use catalog::{
     ArtifactResolveError, Catalog, CatalogDiagnostic, CatalogEntry, CatalogError, CatalogLoad,
-    ModelRef, PullPolicy, ResolveError,
+    Modality, ModelRef, PullPolicy, ResolveError,
 };
 pub use cluster_authority::{
     DeploymentAuthorityError, DeploymentBundleCursor, DeploymentSigningKey, DeploymentVerifyingKey,

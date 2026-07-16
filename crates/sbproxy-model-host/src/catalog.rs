@@ -37,6 +37,95 @@ const MAX_CATALOG_ENGINES_PER_VARIANT: usize = 16;
 /// the capability gate.
 pub type QuantName = String;
 
+/// The task a served model performs (WOR-1908).
+///
+/// A catalog is chat-only today, but the model host must be able to
+/// express an embedder, a reranker, and the other non-chat surfaces so
+/// the fit planner, engine launch, and capability negotiation branch on
+/// the actual task rather than assuming autoregressive chat. Only
+/// [`Modality::Chat`] decodes token by token and holds a KV cache; every
+/// other modality is a single forward pass. Defaults to `Chat`, so a
+/// pre-modality catalog entry parses and behaves exactly as before.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Modality {
+    /// Autoregressive chat / text generation (the default). Decodes one
+    /// token at a time and accumulates a KV cache.
+    #[default]
+    Chat,
+    /// Text embeddings: one forward pass to a vector, no KV cache.
+    Embedding,
+    /// Reranking / scoring: one forward pass to a relevance score.
+    Rerank,
+    /// Speech to text (transcription).
+    SpeechToText,
+    /// Text to speech (synthesis).
+    TextToSpeech,
+    /// Image generation.
+    Image,
+}
+
+impl Modality {
+    /// Whether this modality serves by autoregressive decode and thus
+    /// accumulates a KV cache. Only [`Modality::Chat`] does; an embedder
+    /// or reranker runs a single forward pass and holds no KV cache, so
+    /// the fit planner must not charge it KV-cache VRAM (WOR-1908).
+    pub fn uses_kv_cache(self) -> bool {
+        matches!(self, Modality::Chat)
+    }
+
+    /// The bytes-per-KV-element the fit planner should charge for this
+    /// modality, given the caller's KV-quant default. A non-decode
+    /// modality has no KV cache, so it charges `Some(0.0)` (a zero KV
+    /// term) regardless of any KV-quant lever; a chat model keeps the
+    /// caller's `default`. This is how "the planner does not apply
+    /// KV-cache math to a non-decode model" is realized without a second
+    /// estimator.
+    pub fn kv_bytes_per_element_override(self, default: Option<f64>) -> Option<f64> {
+        if self.uses_kv_cache() {
+            default
+        } else {
+            Some(0.0)
+        }
+    }
+
+    /// The vLLM `--task` value for this modality, or `None` when vLLM
+    /// serves it in the default (chat/generate) mode. vLLM will not serve
+    /// an embedder or reranker unless launched with the matching task, so
+    /// this is a runtime-owned launch argument, never an operator knob.
+    pub fn vllm_task_arg(self) -> Option<&'static str> {
+        match self {
+            Modality::Chat => None,
+            Modality::Embedding => Some("embed"),
+            Modality::Rerank => Some("score"),
+            // Speech and image serving are follow-on work (WOR-1675 and
+            // beyond); no vLLM task mapping is claimed here yet.
+            Modality::SpeechToText | Modality::TextToSpeech | Modality::Image => None,
+        }
+    }
+
+    /// A stable lowercase label for status JSON, `models list`, and doctor.
+    pub fn label(self) -> &'static str {
+        match self {
+            Modality::Chat => "chat",
+            Modality::Embedding => "embedding",
+            Modality::Rerank => "rerank",
+            Modality::SpeechToText => "speech_to_text",
+            Modality::TextToSpeech => "text_to_speech",
+            Modality::Image => "image",
+        }
+    }
+
+    /// True for the default (`Chat`) modality. Used by
+    /// `skip_serializing_if` so an unset modality stays absent from the
+    /// serialized catalog, keeping existing YAML and schema output stable.
+    pub fn is_default(&self) -> bool {
+        matches!(self, Modality::Chat)
+    }
+}
+
 /// One catalog entry: everything the resolver knows about a model id
 /// before any GPU is consulted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -71,6 +160,12 @@ pub struct CatalogEntry {
     /// default because pickle can execute code while loading.
     #[serde(default)]
     pub allow_pickle: bool,
+    /// The task this model serves (WOR-1908). Defaults to
+    /// [`Modality::Chat`], so existing chat entries are unchanged; an
+    /// embedder or reranker declares it here so the fit planner, engine
+    /// launch, and capability negotiation branch on the real task.
+    #[serde(default, skip_serializing_if = "Modality::is_default")]
+    pub modality: Modality,
 
     // --- Manifest fields (WOR-1681). All optional so the built-in
     // certified catalog and any pre-manifest file still parse. When
@@ -403,6 +498,7 @@ impl Catalog {
                 entry.context_length,
                 &entry.license,
                 entry.allow_pickle,
+                entry.modality,
             )
             .map_err(|reason| ArtifactResolveError::Digest {
                 model: request.model.clone(),
@@ -671,6 +767,61 @@ models:
 ",
         )
         .expect("parse")
+    }
+
+    #[test]
+    fn modality_defaults_to_chat_and_is_absent_from_serialized_entries() {
+        // WOR-1908: an entry with no modality parses as Chat and round-trips
+        // without emitting a modality key, so existing catalogs are byte-stable.
+        let cat = sample();
+        let entry = cat.get("qwen3-32b").expect("entry");
+        assert_eq!(entry.modality, Modality::Chat);
+        let yaml = serde_yaml::to_string(entry).expect("serialize");
+        assert!(
+            !yaml.contains("modality"),
+            "a default (chat) modality must not appear in serialized output: {yaml}"
+        );
+    }
+
+    #[test]
+    fn modality_kv_and_task_semantics() {
+        // Only chat decodes and holds a KV cache.
+        assert!(Modality::Chat.uses_kv_cache());
+        assert!(!Modality::Embedding.uses_kv_cache());
+        // A non-decode modality zeroes the KV term regardless of the lever;
+        // chat passes the caller's default through untouched.
+        assert_eq!(
+            Modality::Chat.kv_bytes_per_element_override(Some(0.5)),
+            Some(0.5)
+        );
+        assert_eq!(Modality::Chat.kv_bytes_per_element_override(None), None);
+        assert_eq!(
+            Modality::Embedding.kv_bytes_per_element_override(Some(0.5)),
+            Some(0.0)
+        );
+        // vLLM task mapping: embed/score for the two supported non-chat tasks.
+        assert_eq!(Modality::Chat.vllm_task_arg(), None);
+        assert_eq!(Modality::Embedding.vllm_task_arg(), Some("embed"));
+        assert_eq!(Modality::Rerank.vllm_task_arg(), Some("score"));
+    }
+
+    #[test]
+    fn modality_parses_from_catalog_yaml() {
+        let cat = Catalog::from_yaml(
+            "\
+models:
+  bge-small:
+    hf_repo: BAAI/bge-small-en-v1.5
+    quants: [bf16]
+    params: 33M
+    license: mit
+    family: bge
+    min_vram_hint_gib: 1.0
+    modality: embedding
+",
+        )
+        .expect("parse");
+        assert_eq!(cat.get("bge-small").unwrap().modality, Modality::Embedding);
     }
 
     #[test]

@@ -783,8 +783,54 @@ fn any_allowed_provider_supports_surface(
 ) -> bool {
     providers.iter().any(|provider| {
         provider_allowed_for_request(provider, allowed, blocked)
-            && sbproxy_ai::api_routes::provider_supports_surface(&provider.name, surface)
+            && sbproxy_ai::api_routes::provider_supports_surface_for_modality(
+                &provider.name,
+                surface,
+                served_provider_modality(provider, surface),
+            )
     })
+}
+
+/// The modality of a locally served (`serve:`) provider that could handle
+/// `surface`, or `None` for a non-served provider (WOR-1908). A served
+/// provider is not in the provider catalog, so without this it would
+/// blanket-501 a non-chat surface even while serving an embedder. The
+/// served model's task comes from the built-in catalog (the certified
+/// catalog an embedding model is added to); an operator's custom-catalog
+/// modality is not resolved on this pre-dispatch path and keeps the
+/// chat-only default.
+fn served_provider_modality(
+    provider: &sbproxy_ai::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+) -> Option<sbproxy_model_host::Modality> {
+    // Only the non-universal surfaces need a modality answer; chat/models
+    // are already universal, so skip the catalog work for them.
+    if matches!(
+        surface,
+        sbproxy_ai::handler::AiSurface::ChatCompletions
+            | sbproxy_ai::handler::AiSurface::Models
+            | sbproxy_ai::handler::AiSurface::Messages
+            | sbproxy_ai::handler::AiSurface::Responses
+    ) {
+        return None;
+    }
+    let serve = provider.serve.as_ref()?;
+    let catalog = builtin_catalog();
+    // A served provider hosts one or more models; report the first served
+    // model whose modality is non-chat, so its surface becomes legal.
+    serve
+        .models
+        .iter()
+        .filter_map(|entry| catalog.get(&entry.model).map(|model| model.modality))
+        .find(|modality| !modality.uses_kv_cache())
+}
+
+/// The certified built-in catalog, parsed once. Used by the surface gate
+/// to resolve a served model's modality without re-parsing the embedded
+/// YAML per request.
+fn builtin_catalog() -> &'static sbproxy_model_host::Catalog {
+    static BUILTIN: std::sync::OnceLock<sbproxy_model_host::Catalog> = std::sync::OnceLock::new();
+    BUILTIN.get_or_init(sbproxy_model_host::Catalog::builtin)
 }
 
 fn has_allowed_openai_passthrough(

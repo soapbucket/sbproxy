@@ -136,6 +136,9 @@ pub struct LaunchRequest {
     pub engine_tuning: EngineTuning,
     /// Maximum concurrent sequences accounted for by admission and KV memory.
     pub max_concurrency: u32,
+    /// The task the served model performs (WOR-1908). Drives the engine's
+    /// runtime-owned `--task` flag; defaults to chat.
+    pub modality: crate::catalog::Modality,
     /// Maximum wait for the engine's readiness endpoint.
     pub ready_timeout: Duration,
 }

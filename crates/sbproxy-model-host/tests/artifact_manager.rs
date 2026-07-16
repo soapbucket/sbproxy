@@ -91,6 +91,7 @@ fn artifact(digest_byte: char, files: &BTreeMap<String, Vec<u8>>) -> ResolvedArt
         license: "apache-2.0".to_string(),
         stability: SupportLevel::Preview,
         pickle_allowed: false,
+        modality: Default::default(),
     }
 }
 

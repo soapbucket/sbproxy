@@ -247,6 +247,39 @@ pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSur
     }
 }
 
+/// Whether a provider handles `surface`, consulting a served model's
+/// modality (WOR-1908).
+///
+/// A locally served (`serve:`) provider is not in the provider catalog,
+/// so [`provider_supports_surface`] falls to the unknown-provider default
+/// (chat + models only) and would blanket-501 `/v1/embeddings` even when
+/// the box is serving an embedder. This variant lifts that: when
+/// `served_modality` is `Some`, the surfaces its task implies are also
+/// handled (an embedder answers embeddings, a reranker answers
+/// reranking, and so on). `None` (not a served provider, or an unknown
+/// task) keeps the name-based default unchanged.
+pub fn provider_supports_surface_for_modality(
+    provider: &str,
+    surface: &crate::handler::AiSurface,
+    served_modality: Option<sbproxy_model_host::Modality>,
+) -> bool {
+    use crate::handler::AiSurface;
+    use sbproxy_model_host::Modality;
+    // The name-based matrix already covers the universal surfaces and any
+    // real provider format; only widen it for a served non-chat task.
+    if provider_supports_surface(provider, surface) {
+        return true;
+    }
+    match served_modality {
+        Some(Modality::Embedding) => matches!(surface, AiSurface::Embeddings),
+        Some(Modality::Rerank) => matches!(surface, AiSurface::Reranking),
+        Some(Modality::SpeechToText) => matches!(surface, AiSurface::AudioTranscription),
+        Some(Modality::TextToSpeech) => matches!(surface, AiSurface::AudioSpeech),
+        Some(Modality::Image) => matches!(surface, AiSurface::ImageGeneration),
+        Some(Modality::Chat) | None => false,
+    }
+}
+
 /// WOR-824 item 3: per-wire-format capability matrix.
 ///
 /// Surface support keyed on [`crate::providers::ProviderFormat`]
@@ -319,6 +352,48 @@ pub fn provider_format_supports_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn served_modality_makes_a_non_chat_surface_legal() {
+        use crate::handler::AiSurface;
+        use sbproxy_model_host::Modality;
+        // A served provider (unknown to the provider catalog) 501s
+        // embeddings by name alone.
+        assert!(!provider_supports_surface_for_modality(
+            "local-embedder",
+            &AiSurface::Embeddings,
+            None
+        ));
+        // Declaring the served modality lifts exactly its own surface.
+        assert!(provider_supports_surface_for_modality(
+            "local-embedder",
+            &AiSurface::Embeddings,
+            Some(Modality::Embedding)
+        ));
+        assert!(provider_supports_surface_for_modality(
+            "local-reranker",
+            &AiSurface::Reranking,
+            Some(Modality::Rerank)
+        ));
+        // It does not over-widen: an embedder does not gain reranking.
+        assert!(!provider_supports_surface_for_modality(
+            "local-embedder",
+            &AiSurface::Reranking,
+            Some(Modality::Embedding)
+        ));
+        // A served chat model keeps the name-based default (no embeddings).
+        assert!(!provider_supports_surface_for_modality(
+            "local-chat",
+            &AiSurface::Embeddings,
+            Some(Modality::Chat)
+        ));
+        // Universal surfaces stay universal regardless of modality.
+        assert!(provider_supports_surface_for_modality(
+            "local-embedder",
+            &AiSurface::ChatCompletions,
+            Some(Modality::Embedding)
+        ));
+    }
 
     // --- WOR-752: full surface x provider contract matrix ---
     //

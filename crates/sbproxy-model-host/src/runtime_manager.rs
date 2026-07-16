@@ -3185,7 +3185,11 @@ impl ProductionPreparedDeployment {
                     seq_len,
                     crate::fit::DEFAULT_OVERHEAD,
                     self.safety_margin,
-                    kv_quant.bytes_per_element(),
+                    // WOR-1908: a non-decode modality holds no KV cache, so
+                    // its KV term is zeroed regardless of the KV-quant lever.
+                    self.resolved
+                        .modality
+                        .kv_bytes_per_element_override(kv_quant.bytes_per_element()),
                     concurrency,
                     self.desired
                         .desired
@@ -3280,6 +3284,7 @@ impl PreparedDeploymentRuntime for ProductionPreparedDeployment {
                     extra_args: prepared.extra_args,
                     engine_tuning: prepared.engine_tuning,
                     max_concurrency: self.desired.desired.max_concurrency.unwrap_or(1),
+                    modality: self.resolved.modality,
                     ready_timeout: Duration::from_secs(300),
                 },
             )

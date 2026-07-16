@@ -186,6 +186,12 @@ pub struct ResolvedArtifact {
     pub stability: SupportLevel,
     /// Logical-model policy explicitly permits pickle execution risk.
     pub pickle_allowed: bool,
+    /// The task this model serves (WOR-1908). Carried from the catalog
+    /// entry so the fit planner and engine launch branch on it. It is a
+    /// property of the logical model, not the immutable bytes, so it is
+    /// deliberately excluded from the hashed digest material and does not
+    /// change `artifact_digest`.
+    pub modality: crate::catalog::Modality,
 }
 
 #[derive(Serialize)]
@@ -210,6 +216,7 @@ impl ResolvedArtifact {
         context_length: u64,
         license: &str,
         pickle_allowed: bool,
+        modality: crate::catalog::Modality,
     ) -> Result<Self, String> {
         let material = ArtifactDigestMaterial {
             catalog_revision,
@@ -239,6 +246,7 @@ impl ResolvedArtifact {
             license: license.to_string(),
             stability: variant.stability,
             pickle_allowed,
+            modality,
         })
     }
 }
