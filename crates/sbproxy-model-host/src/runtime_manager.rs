@@ -2835,6 +2835,7 @@ struct PreparedActivation {
     selected_devices: Vec<u32>,
     kv_quant: KvCacheQuant,
     extra_args: Vec<String>,
+    engine_tuning: crate::EngineTuning,
 }
 
 impl std::fmt::Debug for ProductionPreparedDeployment {
@@ -2939,11 +2940,23 @@ impl ProductionPreparedDeployment {
             .as_ref()
             .map(|entry| entry.extra_args.clone())
             .unwrap_or_default();
+        let engine_tuning = self
+            .desired
+            .legacy_entry
+            .as_ref()
+            .map(|entry| crate::EngineTuning {
+                chunked_prefill: entry.chunked_prefill,
+                tool_call_parser: entry.tool_call_parser.clone(),
+                swap_space_gib: entry.swap_space_gib,
+                cpu_offload_gib: entry.cpu_offload_gib,
+            })
+            .unwrap_or_default();
         let prepared = PreparedActivation {
             fit,
             selected_devices,
             kv_quant,
             extra_args,
+            engine_tuning,
         };
         *activation = Some(prepared.clone());
         Ok(prepared)
@@ -2992,6 +3005,7 @@ impl PreparedDeploymentRuntime for ProductionPreparedDeployment {
                     selected_devices: prepared.selected_devices,
                     kv_quant: prepared.kv_quant,
                     extra_args: prepared.extra_args,
+                    engine_tuning: prepared.engine_tuning,
                     max_concurrency: self.desired.desired.max_concurrency.unwrap_or(1),
                     ready_timeout: Duration::from_secs(300),
                 },

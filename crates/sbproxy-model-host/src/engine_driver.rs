@@ -13,8 +13,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceleratorKind, ArtifactFormat, EngineKind, EngineProcess, EngineProvisioning, FileJobStore,
-    FitPlan, ReadyArtifact, ResolvedArtifact, WorkerProfile,
+    AcceleratorKind, ArtifactFormat, ChunkedPrefill, EngineKind, EngineProcess, EngineProvisioning,
+    FileJobStore, FitPlan, ReadyArtifact, ResolvedArtifact, WorkerProfile,
 };
 
 /// Whether an engine can run on the detected worker.
@@ -89,6 +89,26 @@ pub struct ProvisionedEngine {
     pub provisioning: EngineProvisioning,
 }
 
+/// Runtime-owned engine tuning knobs sourced from the served-model config
+/// and emitted by the driver after the operator allowlist, so operators
+/// cannot set them directly (the flags are not on the `extra_args`
+/// allowlist). These are vLLM passthroughs today; a non-vLLM driver
+/// ignores them and the desired-state validator rejects a non-vLLM model
+/// that sets them. `Default` leaves every knob unset.
+#[derive(Debug, Clone, Default)]
+pub struct EngineTuning {
+    /// Chunked prefill: `--enable-chunked-prefill` and, when a chunk size
+    /// is set, `--max-num-batched-tokens`.
+    pub chunked_prefill: Option<ChunkedPrefill>,
+    /// vLLM auto tool-choice parser: `--enable-auto-tool-choice
+    /// --tool-call-parser <name>`.
+    pub tool_call_parser: Option<String>,
+    /// CPU KV-cache tier in GiB: `--swap-space`.
+    pub swap_space_gib: Option<u64>,
+    /// Weights kept in CPU RAM in GiB: `--cpu-offload-gb`.
+    pub cpu_offload_gib: Option<u64>,
+}
+
 /// Typed launch input that can only be constructed from verified local bytes.
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -110,6 +130,10 @@ pub struct LaunchRequest {
     pub kv_quant: crate::KvCacheQuant,
     /// Additional allowlisted engine arguments.
     pub extra_args: Vec<String>,
+    /// Runtime-owned engine tuning knobs (chunked prefill, tool-call
+    /// parser, CPU KV swap, weight offload) emitted after the operator
+    /// allowlist.
+    pub engine_tuning: EngineTuning,
     /// Maximum concurrent sequences accounted for by admission and KV memory.
     pub max_concurrency: u32,
     /// Maximum wait for the engine's readiness endpoint.

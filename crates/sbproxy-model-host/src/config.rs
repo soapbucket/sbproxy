@@ -439,16 +439,21 @@ pub struct ServeEntry {
     /// default KV dtype).
     #[serde(default)]
     pub kv_quant: KvCacheQuant,
-    /// Support: preview.
-    /// Speculative decoding. `None` disables it.
+    /// Support: unsupported.
+    /// Speculative decoding. Rejected today: no runtime consumer emits the
+    /// engine's speculation flags yet, so a model that sets this fails to
+    /// deploy rather than silently ignoring it. `None` disables it.
     #[serde(default)]
     pub speculative: Option<SpeculativeConfig>,
     /// Support: preview.
     /// Chunked-prefill settings. `None` uses the engine default.
     #[serde(default)]
     pub chunked_prefill: Option<ChunkedPrefill>,
-    /// Support: preview.
-    /// LoRA adapters served over this base model.
+    /// Support: unsupported.
+    /// LoRA adapters served over this base model. Rejected today: serving
+    /// adapters needs adapter artifact acquisition (pulling each adapter to
+    /// a local path), which is not wired yet, so a model that sets this
+    /// fails to deploy rather than silently ignoring it.
     #[serde(default)]
     pub lora_adapters: Vec<LoraAdapter>,
     /// Support: preview.
@@ -480,8 +485,10 @@ pub struct ServeEntry {
     /// that does not fit can still load. `None` disables offload.
     #[serde(default)]
     pub cpu_offload_gib: Option<u64>,
-    /// Support: preview.
+    /// Support: unsupported.
     /// Max LoRA adapters resident on the engine at once (WOR-1673).
+    /// Rejected today with `lora_adapters`, since adapter serving is not
+    /// wired yet.
     /// When set below the number of configured `lora_adapters`, the
     /// engine loads adapters on demand and evicts the least-recently
     /// used past this cap (dynamic paging), rather than preloading all
