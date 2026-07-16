@@ -293,6 +293,9 @@ pub struct DeploymentRuntimeStatus {
     pub queued_requests: usize,
     /// Resolved managed engine.
     pub engine: Option<EngineKind>,
+    /// Resolved engine version serving this generation, when a running engine
+    /// reported one.
+    pub engine_version: Option<String>,
     /// Driver availability retained from worker preparation.
     pub driver_availability: Option<EngineAvailability>,
     /// Canonical artifact digest, without a source or local path.
@@ -1066,6 +1069,7 @@ impl DeploymentSlot {
             active_requests: counts.active,
             queued_requests: counts.queued,
             engine: running.map(|running| running.kind).or(telemetry.engine),
+            engine_version: running.and_then(|running| running.engine_version.clone()),
             driver_availability: telemetry.driver_availability,
             artifact_digest: running
                 .map(|running| running.artifact_digest.clone())

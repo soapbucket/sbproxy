@@ -79,6 +79,7 @@ impl PreparedDeploymentRuntime for FixtureRuntime {
             accelerator: AcceleratorKind::Cpu,
             started_at_ms: 1,
             artifact_digest: "a".repeat(64),
+            engine_version: None,
             memory: MemoryEstimate::from_total(0, 1),
             process: Arc::new(FixtureProcess),
         })

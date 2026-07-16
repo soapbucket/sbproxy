@@ -646,6 +646,7 @@ fn assert_stable_status_shape() -> Result<(), String> {
         active_requests: 1,
         queued_requests: 2,
         engine: Some(crate::EngineKind::LlamaCpp),
+        engine_version: Some("0.11.0".to_string()),
         driver_availability: Some(crate::EngineAvailability::Available),
         artifact_digest: Some("a".repeat(64)),
         selected_devices: vec![0],
@@ -656,7 +657,11 @@ fn assert_stable_status_shape() -> Result<(), String> {
         last_error: None,
     };
     let json = serde_json::to_value(status).map_err(|error| error.to_string())?;
-    if json["deployment"] != "coder" || json["state"] != "ready" || json["port"] != 41000 {
+    if json["deployment"] != "coder"
+        || json["state"] != "ready"
+        || json["port"] != 41000
+        || json["engine_version"] != "0.11.0"
+    {
         return Err(format!("unexpected lifecycle status shape: {json}"));
     }
     let reasons = [

@@ -460,6 +460,7 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
             selected_devices: Vec::new(),
             started_at_ms: 1,
             artifact_digest: "a".repeat(64),
+            engine_version: None,
             memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1),
             process,
         })
@@ -1858,6 +1859,7 @@ impl EngineDriver for ProductionFixtureDriver {
             selected_devices: request.selected_devices.clone(),
             started_at_ms: 1,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            engine_version: provisioned.version.clone(),
             memory: request.fit.memory.clone(),
             process: Arc::new(ManagerFixtureProcess {
                 stopped: AtomicBool::new(false),

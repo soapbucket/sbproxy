@@ -98,6 +98,7 @@ impl PreparedDeploymentRuntime for ReplicaRuntime {
             selected_devices: self.devices.clone(),
             started_at_ms: 1,
             artifact_digest: "a".repeat(64),
+            engine_version: None,
             memory: zero_memory(self.devices.clone()),
             process: Arc::new(FakeProcess::default()),
         })

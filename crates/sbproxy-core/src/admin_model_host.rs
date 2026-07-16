@@ -1742,6 +1742,7 @@ models:
             active_requests: 0,
             queued_requests: 0,
             engine: Some(sbproxy_model_host::EngineKind::LlamaCpp),
+            engine_version: Some("0.11.0".to_string()),
             driver_availability: Some(sbproxy_model_host::EngineAvailability::Available),
             artifact_digest: Some("a".repeat(64)),
             selected_devices: vec![0],
