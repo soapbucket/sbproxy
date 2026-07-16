@@ -201,6 +201,7 @@ pub fn compile_desired_state(
     let mut compiled_deployments = BTreeMap::new();
     for (id, deployment) in &control.deployments {
         validate_catalog_deployment(id, deployment, catalog)?;
+        validate_canonical_engine_tuning(id, deployment)?;
         let desired = lower_canonical_deployment(deployment);
         revision_deployments.insert(id.clone(), desired.clone());
         compiled_deployments.insert(
@@ -498,6 +499,54 @@ pub(crate) fn validate_legacy_managed_compatibility(
         .map_err(|error| error.to_string())
 }
 
+/// Reject serving tuning a canonical deployment's engine cannot honor, and
+/// validate its extra engine arguments, mirroring the legacy `serve:` gate.
+fn validate_canonical_engine_tuning(
+    id: &str,
+    config: &ManagedDeploymentConfig,
+) -> Result<(), DesiredStateError> {
+    // The four vLLM tuning passthroughs are emitted only by the vLLM driver, so
+    // an explicitly non-vLLM engine that sets them is rejected. engine: auto
+    // defers to the resolved engine, which ignores them when it is not vLLM.
+    if config.engine == ManagedEngineChoice::LlamaCpp {
+        let mut unsupported = Vec::new();
+        if config.chunked_prefill.is_some() {
+            unsupported.push("chunked_prefill");
+        }
+        if config.tool_call_parser.is_some() {
+            unsupported.push("tool_call_parser");
+        }
+        if config.swap_space_gib.is_some() {
+            unsupported.push("swap_space_gib");
+        }
+        if config.cpu_offload_gib.is_some() {
+            unsupported.push("cpu_offload_gib");
+        }
+        if !unsupported.is_empty() {
+            return Err(DesiredStateError::Invalid(format!(
+                "managed deployment {id:?} sets vLLM-only serving fields on engine: llama_cpp: {}. pin engine: vllm or remove them.",
+                unsupported.join(", ")
+            )));
+        }
+    }
+    if config.extra_args.is_empty() {
+        return Ok(());
+    }
+    let engines: &[EngineKind] = match config.engine {
+        ManagedEngineChoice::Vllm => &[EngineKind::Vllm],
+        ManagedEngineChoice::LlamaCpp => &[EngineKind::LlamaCpp],
+        ManagedEngineChoice::Auto => &[EngineKind::LlamaCpp, EngineKind::Vllm],
+    };
+    for engine in engines {
+        crate::validate_engine_args(*engine, &config.extra_args).map_err(|error| {
+            DesiredStateError::Invalid(format!(
+                "managed deployment {id:?} sets extra_args not valid for engine {engine:?}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployment {
     ModelDeployment {
         model: config.model.clone(),
@@ -531,6 +580,14 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
             ManagedRolloutPolicy::Rolling => RolloutPolicy::Rolling,
             ManagedRolloutPolicy::Recreate => RolloutPolicy::Recreate,
         },
+        extra_args: config.extra_args.clone(),
+        chunked_prefill: config.chunked_prefill.map(|prefill| crate::ChunkedPrefill {
+            max_batched_tokens: prefill.max_batched_tokens,
+            target_ttft_ms: prefill.target_ttft_ms,
+        }),
+        tool_call_parser: config.tool_call_parser.clone(),
+        swap_space_gib: config.swap_space_gib,
+        cpu_offload_gib: config.cpu_offload_gib,
     }
 }
 
@@ -571,6 +628,13 @@ fn lower_legacy_deployment(
         queue_timeout_ms: host.queue_timeout_ms.unwrap_or(30_000),
         engine: entry.engine,
         rollout: RolloutPolicy::Rolling,
+        // Legacy serving tuning stays on `legacy_entry`; the canonical
+        // ModelDeployment tuning fields are unused on this path.
+        extra_args: Vec::new(),
+        chunked_prefill: None,
+        tool_call_parser: None,
+        swap_space_gib: None,
+        cpu_offload_gib: None,
     })
 }
 
@@ -671,5 +735,45 @@ mod tests {
             .expect_err("speculative decoding and LoRA have no runtime consumer yet");
         assert!(error.contains("speculative"), "{error}");
         assert!(error.contains("lora_adapters"), "{error}");
+    }
+
+    fn canonical(yaml: &str) -> sbproxy_config::ManagedDeploymentConfig {
+        serde_yaml::from_str(yaml).expect("managed deployment parses")
+    }
+
+    #[test]
+    fn canonical_vllm_tuning_is_rejected_on_llama_cpp() {
+        let config = canonical("model: qwen3-8b\nengine: llama_cpp\nswap_space_gib: 16\n");
+        let error = super::validate_canonical_engine_tuning("local", &config)
+            .expect_err("llama.cpp does not emit the vLLM tuning flags");
+        assert!(error.to_string().contains("swap_space_gib"), "{error:?}");
+    }
+
+    #[test]
+    fn canonical_vllm_tuning_is_accepted_on_vllm_and_auto() {
+        for engine in ["vllm", "auto"] {
+            let config = canonical(&format!(
+                "model: qwen3-8b\nengine: {engine}\ntool_call_parser: hermes\nswap_space_gib: 16\n"
+            ));
+            super::validate_canonical_engine_tuning("local", &config)
+                .unwrap_or_else(|error| panic!("engine {engine} accepts the tuning: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn canonical_tuning_lowers_onto_the_deployment() {
+        let config = canonical(
+            "model: qwen3-8b\nengine: vllm\ntool_call_parser: hermes\nswap_space_gib: 16\ncpu_offload_gib: 8\nchunked_prefill:\n  max_batched_tokens: 2048\n",
+        );
+        let lowered = super::lower_canonical_deployment(&config);
+        assert_eq!(lowered.tool_call_parser.as_deref(), Some("hermes"));
+        assert_eq!(lowered.swap_space_gib, Some(16));
+        assert_eq!(lowered.cpu_offload_gib, Some(8));
+        assert_eq!(
+            lowered
+                .chunked_prefill
+                .and_then(|prefill| prefill.max_batched_tokens),
+            Some(2048)
+        );
     }
 }

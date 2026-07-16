@@ -122,6 +122,12 @@ impl From<RestrictedModelDeployment> for ModelDeployment {
             queue_timeout_ms: deployment.queue_timeout_ms,
             engine: deployment.engine,
             rollout: deployment.rollout,
+            // Signed cluster bundles do not carry engine tuning yet.
+            extra_args: Vec::new(),
+            chunked_prefill: None,
+            tool_call_parser: None,
+            swap_space_gib: None,
+            cpu_offload_gib: None,
         }
     }
 }

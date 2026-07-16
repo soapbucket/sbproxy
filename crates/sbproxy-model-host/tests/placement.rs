@@ -85,6 +85,11 @@ fn deployment(replicas: u32) -> ModelDeployment {
         queue_timeout_ms: 30_000,
         engine: EngineChoice::Auto,
         rollout: RolloutPolicy::Rolling,
+        extra_args: Vec::new(),
+        chunked_prefill: None,
+        tool_call_parser: None,
+        swap_space_gib: None,
+        cpu_offload_gib: None,
     }
 }
 

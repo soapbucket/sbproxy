@@ -71,6 +71,19 @@ pub enum ManagedColdStartPolicy {
     Fallback,
 }
 
+/// Chunked-prefill tuning for a managed deployment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ManagedChunkedPrefill {
+    /// Explicit prefill chunk size (the engine's `max-num-batched-tokens`).
+    /// Omit to leave it to the engine default.
+    #[serde(default)]
+    pub max_batched_tokens: Option<u64>,
+    /// A time-to-first-token target in milliseconds; when set with no explicit
+    /// chunk size, the planner chooses a chunk size to hold it.
+    #[serde(default)]
+    pub target_ttft_ms: Option<u64>,
+}
+
 /// One desired local model deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ManagedDeploymentConfig {
@@ -124,6 +137,25 @@ pub struct ManagedDeploymentConfig {
     /// Replica replacement behavior.
     #[serde(default)]
     pub rollout: ManagedRolloutPolicy,
+    /// Extra engine command-line arguments appended after the runtime's own.
+    /// Validated against the resolved engine.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// Chunked-prefill settings (vLLM). Omit to use the engine default.
+    #[serde(default)]
+    pub chunked_prefill: Option<ManagedChunkedPrefill>,
+    /// vLLM tool-call parser enabling auto tool-choice, e.g. `hermes`,
+    /// `llama3_json`, `mistral`. Omit to leave tool calling off.
+    #[serde(default)]
+    pub tool_call_parser: Option<String>,
+    /// CPU KV-cache tier size in GiB (vLLM `--swap-space`). Omit to use the
+    /// engine default.
+    #[serde(default)]
+    pub swap_space_gib: Option<u64>,
+    /// GiB of model weights to keep in CPU RAM (vLLM `--cpu-offload-gb`).
+    /// Omit to disable offload.
+    #[serde(default)]
+    pub cpu_offload_gib: Option<u64>,
 }
 
 const fn one_replica() -> u32 {

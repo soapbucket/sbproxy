@@ -1651,6 +1651,16 @@ fn managed_deployment_from_model(
                 sbproxy_config::ManagedRolloutPolicy::Recreate
             }
         },
+        extra_args: deployment.extra_args,
+        chunked_prefill: deployment.chunked_prefill.map(|prefill| {
+            sbproxy_config::ManagedChunkedPrefill {
+                max_batched_tokens: prefill.max_batched_tokens,
+                target_ttft_ms: prefill.target_ttft_ms,
+            }
+        }),
+        tool_call_parser: deployment.tool_call_parser,
+        swap_space_gib: deployment.swap_space_gib,
+        cpu_offload_gib: deployment.cpu_offload_gib,
     })
 }
 
@@ -1664,18 +1674,10 @@ pub fn validate_model_runtime(
         candidate.desired.control.authority,
         pipeline.config.server.cluster.is_some(),
     )?;
-    if pipeline.config.server.cluster.is_none() {
-        if let Some((deployment, _)) = candidate
-            .desired
-            .deployments
-            .iter()
-            .find(|(_, deployment)| deployment.desired.replicas != 1)
-        {
-            anyhow::bail!(
-                "single-node runtime requires deployment {deployment:?} to use replicas: 1"
-            );
-        }
-    }
+    // A single node may run several replicas of a deployment. The device
+    // budget (replicas times the tensor-parallel degree against the node's
+    // devices) needs the live probe, so it is enforced at reconcile with a
+    // legible over-subscription error rather than statically here.
     Ok(())
 }
 

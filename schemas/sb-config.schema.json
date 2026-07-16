@@ -1866,6 +1866,54 @@
               "$ref": "#/definitions/ManagedRolloutPolicy"
             }
           ]
+        },
+        "extra_args": {
+          "description": "Extra engine command-line arguments appended after the runtime's own. Validated against the resolved engine.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "chunked_prefill": {
+          "description": "Chunked-prefill settings (vLLM). Omit to use the engine default.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ManagedChunkedPrefill"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_call_parser": {
+          "description": "vLLM tool-call parser enabling auto tool-choice, e.g. `hermes`, `llama3_json`, `mistral`. Omit to leave tool calling off.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "swap_space_gib": {
+          "description": "CPU KV-cache tier size in GiB (vLLM `--swap-space`). Omit to use the engine default.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cpu_offload_gib": {
+          "description": "GiB of model weights to keep in CPU RAM (vLLM `--cpu-offload-gb`). Omit to disable offload.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
         }
       }
     },
@@ -1965,6 +2013,32 @@
           ]
         }
       ]
+    },
+    "ManagedChunkedPrefill": {
+      "description": "Chunked-prefill tuning for a managed deployment.",
+      "type": "object",
+      "properties": {
+        "max_batched_tokens": {
+          "description": "Explicit prefill chunk size (the engine's `max-num-batched-tokens`). Omit to leave it to the engine default.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "target_ttft_ms": {
+          "description": "A time-to-first-token target in milliseconds; when set with no explicit chunk size, the planner chooses a chunk size to hold it.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
     },
     "ClusterConfig": {
       "description": "Stable `proxy.cluster` configuration.",
