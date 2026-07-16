@@ -308,7 +308,7 @@
           ]
         },
         "speculative": {
-          "description": "Support: preview. Speculative decoding. `None` disables it.",
+          "description": "Support: unsupported. Speculative decoding. Rejected today: no runtime consumer emits the engine's speculation flags yet, so a model that sets this fails to deploy rather than silently ignoring it. `None` disables it.",
           "default": null,
           "anyOf": [
             {
@@ -332,7 +332,7 @@
           ]
         },
         "lora_adapters": {
-          "description": "Support: preview. LoRA adapters served over this base model.",
+          "description": "Support: unsupported. LoRA adapters served over this base model. Rejected today: serving adapters needs adapter artifact acquisition (pulling each adapter to a local path), which is not wired yet, so a model that sets this fails to deploy rather than silently ignoring it.",
           "default": [],
           "type": "array",
           "items": {
@@ -373,7 +373,7 @@
           "minimum": 0.0
         },
         "max_loras": {
-          "description": "Support: preview. Max LoRA adapters resident on the engine at once (WOR-1673). When set below the number of configured `lora_adapters`, the engine loads adapters on demand and evicts the least-recently used past this cap (dynamic paging), rather than preloading all of them. `None` preloads every configured adapter (static), which suits a small, fixed adapter set.",
+          "description": "Support: unsupported. Max LoRA adapters resident on the engine at once (WOR-1673). Rejected today with `lora_adapters`, since adapter serving is not wired yet. When set below the number of configured `lora_adapters`, the engine loads adapters on demand and evicts the least-recently used past this cap (dynamic paging), rather than preloading all of them. `None` preloads every configured adapter (static), which suits a small, fixed adapter set.",
           "default": null,
           "type": [
             "integer",
