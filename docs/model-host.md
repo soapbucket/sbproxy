@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-15*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -475,10 +475,15 @@ integer returned by GET. Admin JSON integers are capped at
 `9,007,199,254,740,991`, JavaScript's largest exactly representable integer;
 larger cursors are rejected instead of being rounded by the browser.
 
-Local admin-managed state is deliberately single-node: every deployment must
-use exactly one replica, with no heterogeneous variants, required labels, or
-spread keys. Multi-replica and placement intent belongs in a signed cluster
-bundle published by the configured authority node.
+Local admin-managed state is single-node: a deployment runs any number of
+replicas on this node's devices, but carries no cross-node placement intent
+(heterogeneous variants, required labels, or spread keys). A deployment may set
+`replicas` and a fixed `tensor_parallel` degree; each replica claims its own
+disjoint device set, so `replicas` times `tensor_parallel` cannot exceed the
+node's serving devices, and a request for more is rejected with the shortfall
+named. A deployment with more than one replica must pin a variant. Cross-node
+placement belongs in a signed cluster bundle published by the configured
+authority node.
 
 ```bash
 curl -u "admin:${SB_ADMIN_PASSWORD}" \
@@ -601,9 +606,12 @@ spread keys, pull policy, warm behavior, engine, rollout policy, keep-alive,
 maximum concurrency, queue depth, and queue timeout. Add, edit, rename, and
 remove operations always build one complete replacement map.
 
-In local admin mode the form fixes replicas at one and hides heterogeneous,
-required-label, and spread controls. Those fields appear only for an authority
-node publishing signed cluster placement intent.
+The local admin API accepts a deployment's `replicas` and `tensor_parallel`
+directly, so multi-replica local deployments are configured through the
+deployments endpoint or the config file. The local admin form currently fixes
+replicas at one and hides heterogeneous, required-label, and spread controls;
+those cross-node placement fields appear only for an authority node publishing
+signed cluster placement intent.
 
 Removal requires a fresh lifecycle response. A deployment in `ready`,
 `preparing`, or `draining` state must be stopped first. If a write returns

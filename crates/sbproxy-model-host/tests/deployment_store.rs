@@ -17,6 +17,7 @@ fn deployment(model: &str) -> ModelDeployment {
         variant: Some("q4_k_m".to_string()),
         heterogeneous_variants: false,
         replicas: 1,
+        tensor_parallel: None,
         required_labels: BTreeMap::new(),
         spread_by: Vec::new(),
         pull: PullPolicy::OnDemand,

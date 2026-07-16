@@ -85,6 +85,12 @@ pub struct ManagedDeploymentConfig {
     /// Desired local replica count.
     #[serde(default = "one_replica")]
     pub replicas: u32,
+    /// Fixed tensor-parallel degree per replica: the exact number of
+    /// devices each replica spans. Omit to let the fit planner pick the
+    /// smallest degree that fits. When set, `replicas * tensor_parallel`
+    /// devices are needed, since each replica claims a distinct device set.
+    #[serde(default)]
+    pub tensor_parallel: Option<u32>,
     /// Worker labels required by this deployment.
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,

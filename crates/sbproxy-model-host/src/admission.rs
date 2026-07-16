@@ -93,7 +93,7 @@ pub struct AdmissionCounts {
 }
 
 /// Result of one bounded drain wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DrainReport {
     /// Active requests when drain began.
     pub active_at_start: usize,

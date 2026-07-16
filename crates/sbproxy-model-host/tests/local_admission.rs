@@ -200,7 +200,7 @@ fn residency_is_per_device_and_never_evicts_protected_generations() {
             3,
         )
         .unwrap();
-    assert_eq!(admitted.evicted, vec!["small-device".to_string()]);
+    assert_eq!(admitted.evicted, vec![("small-device".to_string(), 1)]);
     assert!(residency.contains(1, "large", 1));
 
     let duplicate_generation = residency
@@ -264,7 +264,7 @@ fn max_resident_models_is_global_across_devices() {
         )
         .unwrap();
 
-    assert_eq!(admitted.evicted, vec!["oldest".to_string()]);
+    assert_eq!(admitted.evicted, vec![("oldest".to_string(), 1)]);
     assert!(!residency.contains(0, "oldest", 1));
     assert!(residency.contains(1, "newer", 1));
     assert!(residency.contains(1, "newest", 1));
@@ -443,6 +443,7 @@ fn status_contract_covers_every_managed_deployment_phase() {
     ] {
         let status = DeploymentRuntimeStatus {
             deployment: "coder".to_string(),
+            replica: 0,
             generation: 7,
             state,
             active_requests: 2,

@@ -58,8 +58,11 @@ pub struct DeviceReservation {
 /// Successful reservation and deterministic evictions applied before it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DeviceReservationResult {
-    /// Deployment IDs evicted to make room, in LRU order.
-    pub evicted: Vec<String>,
+    /// Generations evicted to make room, in LRU order, each as its
+    /// `(deployment, generation)` pair. A deployment running several replicas
+    /// has one reservation per replica generation, so eviction names the exact
+    /// replica rather than the whole deployment.
+    pub evicted: Vec<(String, u64)>,
 }
 
 /// Host-wide limits applied while placing one generation on a device.
@@ -279,10 +282,7 @@ impl DeviceResidencySet {
                 reservation.deployment == *deployment_id && reservation.generation == *generation_id
             })
         });
-        let evicted = chosen
-            .iter()
-            .map(|(deployment_id, _)| deployment_id.clone())
-            .collect::<Vec<_>>();
+        let evicted = chosen;
         self.reservations.push(DeviceReservation {
             deployment: deployment.to_string(),
             generation,
@@ -347,12 +347,7 @@ impl DeviceResidencySet {
                 reservation.deployment == *deployment && reservation.generation == *generation
             })
         });
-        Ok(DeviceReservationResult {
-            evicted: chosen
-                .into_iter()
-                .map(|(deployment, _)| deployment)
-                .collect::<Vec<_>>(),
-        })
+        Ok(DeviceReservationResult { evicted: chosen })
     }
 
     /// Protect every current generation while probing overlap capacity for a
@@ -542,7 +537,7 @@ mod tests {
                 DeviceResidencyPolicy::new(None, EvictionPolicy::Lru),
             )
             .expect("the new tenant reserves after evicting the idle one");
-        assert_eq!(result.evicted, vec!["old".to_string()]);
+        assert_eq!(result.evicted, vec![("old".to_string(), 1)]);
         assert!(!set.contains(0, "old", 1));
         assert!(!set.contains(1, "old", 1));
         assert!(set.contains(0, "new", 1) && set.contains(1, "new", 1));

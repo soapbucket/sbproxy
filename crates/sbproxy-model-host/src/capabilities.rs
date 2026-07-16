@@ -640,6 +640,7 @@ fn assert_exact_removal_protection() -> Result<(), String> {
 fn assert_stable_status_shape() -> Result<(), String> {
     let status = crate::DeploymentRuntimeStatus {
         deployment: "coder".to_string(),
+        replica: 0,
         generation: 7,
         state: crate::DeploymentRuntimeState::Ready,
         active_requests: 1,

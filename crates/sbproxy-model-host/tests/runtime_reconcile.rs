@@ -1758,8 +1758,10 @@ async fn production_preparer_classifies_artifact_ensure_io_as_infrastructure() {
     let prepared = preparer
         .prepare(DeploymentPrepareRequest {
             deployment_id: "fixture".to_string(),
+            replica_idx: 0,
             generation: 1,
             desired: desired.deployments["fixture"].clone(),
+            pinned_fit: None,
             control: desired.control.clone(),
             legacy_host_policy: desired.legacy_host_policy.clone(),
         })

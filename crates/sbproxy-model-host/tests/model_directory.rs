@@ -178,6 +178,7 @@ fn runtime_converters_keep_exact_state_but_drop_paths_and_raw_errors() {
 
     let runtime = DeploymentRuntimeStatus {
         deployment: "coder".to_string(),
+        replica: 0,
         generation: 7,
         state: DeploymentRuntimeState::Failed,
         active_requests: 4,
