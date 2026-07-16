@@ -435,28 +435,46 @@ pub(crate) fn validate_legacy_managed_compatibility(
     entry: &ServeEntry,
     resolved_engine: Option<EngineKind>,
 ) -> Result<(), String> {
+    // The four vLLM tuning passthroughs (chunked prefill, tool-call parser,
+    // CPU KV swap, weight offload) are emitted by the vLLM driver, so they
+    // are honored only when the resolved engine is vLLM. speculative
+    // decoding and LoRA adapters have no runtime consumer yet and are
+    // rejected regardless of engine. At config-load the engine may still be
+    // `auto`; the reject is deferred to prepare (which re-runs this with the
+    // resolved engine) rather than guessing, so only a pinned non-vLLM
+    // engine trips the passthrough gate early.
+    let vllm_passthrough_supported = match resolved_engine {
+        Some(kind) => kind == EngineKind::Vllm,
+        None => !matches!(
+            entry.engine,
+            EngineChoice::LlamaCpp | EngineChoice::Embedded
+        ),
+    };
+
     let mut unsupported = Vec::new();
     if entry.speculative.is_some() {
         unsupported.push("speculative");
     }
-    if entry.chunked_prefill.is_some() {
-        unsupported.push("chunked_prefill");
-    }
     if !entry.lora_adapters.is_empty() || entry.max_loras.is_some() {
         unsupported.push("lora_adapters/max_loras");
     }
-    if entry.tool_call_parser.is_some() {
-        unsupported.push("tool_call_parser");
-    }
-    if entry.swap_space_gib.is_some() {
-        unsupported.push("swap_space_gib");
-    }
-    if entry.cpu_offload_gib.is_some() {
-        unsupported.push("cpu_offload_gib");
+    if !vllm_passthrough_supported {
+        if entry.chunked_prefill.is_some() {
+            unsupported.push("chunked_prefill");
+        }
+        if entry.tool_call_parser.is_some() {
+            unsupported.push("tool_call_parser");
+        }
+        if entry.swap_space_gib.is_some() {
+            unsupported.push("swap_space_gib");
+        }
+        if entry.cpu_offload_gib.is_some() {
+            unsupported.push("cpu_offload_gib");
+        }
     }
     if !unsupported.is_empty() {
         return Err(format!(
-            "legacy serve model {:?} uses fields not yet available through the verified managed driver: {}; remove them during migration instead of allowing the runtime to ignore them",
+            "legacy serve model {:?} sets serving fields the managed runtime cannot honor here: {}. speculative decoding and lora_adapters are not yet supported; chunked_prefill, tool_call_parser, swap_space_gib, and cpu_offload_gib require the vLLM engine, so pin engine: vllm or remove them.",
             entry.model,
             unsupported.join(", "),
         ));
@@ -608,5 +626,48 @@ fn identifier_fragment(value: &str) -> String {
         "unnamed".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_legacy_managed_compatibility;
+    use crate::{EngineKind, ModelHostConfig, ServeEntry};
+
+    fn first_entry(yaml: &str) -> ServeEntry {
+        serde_yaml::from_str::<ModelHostConfig>(yaml)
+            .expect("fixture parses")
+            .models
+            .into_iter()
+            .next()
+            .expect("fixture declares a model")
+    }
+
+    #[test]
+    fn vllm_passthroughs_are_accepted_for_vllm() {
+        let entry = first_entry(
+            "models:\n  - model: qwen3-8b\n    engine: vllm\n    chunked_prefill: {}\n    tool_call_parser: hermes\n    swap_space_gib: 16\n    cpu_offload_gib: 8\n",
+        );
+        validate_legacy_managed_compatibility(&entry, Some(EngineKind::Vllm))
+            .expect("the vLLM driver emits every tuning passthrough");
+    }
+
+    #[test]
+    fn vllm_passthroughs_are_rejected_for_a_non_vllm_engine() {
+        let entry = first_entry("models:\n  - model: qwen3-8b\n    swap_space_gib: 16\n");
+        let error = validate_legacy_managed_compatibility(&entry, Some(EngineKind::LlamaCpp))
+            .expect_err("llama.cpp does not emit the vLLM tuning flags");
+        assert!(error.contains("swap_space_gib"), "{error}");
+    }
+
+    #[test]
+    fn speculative_and_lora_are_rejected_even_on_vllm() {
+        let entry = first_entry(
+            "models:\n  - model: qwen3-8b\n    engine: vllm\n    speculative: {}\n    lora_adapters:\n      - name: a\n        source: hf:o/a\n",
+        );
+        let error = validate_legacy_managed_compatibility(&entry, Some(EngineKind::Vllm))
+            .expect_err("speculative decoding and LoRA have no runtime consumer yet");
+        assert!(error.contains("speculative"), "{error}");
+        assert!(error.contains("lora_adapters"), "{error}");
     }
 }

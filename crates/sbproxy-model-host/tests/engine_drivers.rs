@@ -260,6 +260,7 @@ async fn driver_contract_is_complete_and_object_safe() {
                     selected_devices: Vec::new(),
                     kv_quant: KvCacheQuant::Auto,
                     extra_args: Vec::new(),
+                    engine_tuning: Default::default(),
                     max_concurrency: 1,
                     ready_timeout: Duration::from_secs(1),
                 },
@@ -420,6 +421,7 @@ async fn crash_loop_observes_backoff_retains_failure_and_requires_durable_reset(
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
+        engine_tuning: Default::default(),
         max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
@@ -598,6 +600,7 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: vec!["--flash-attn".to_string()],
+        engine_tuning: Default::default(),
         max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
@@ -625,6 +628,7 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
+        engine_tuning: Default::default(),
         max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
@@ -647,6 +651,7 @@ fn launch_request_requires_devices_that_match_the_accelerator() {
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
+        engine_tuning: Default::default(),
         max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
@@ -1101,6 +1106,7 @@ async fn llama_launch_uses_one_verified_gguf_and_runtime_owned_network_and_devic
         selected_devices: vec![2],
         kv_quant: KvCacheQuant::Int4,
         extra_args: vec!["--flash-attn".to_string()],
+        engine_tuning: Default::default(),
         max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
@@ -1162,6 +1168,7 @@ async fn llama_metal_launch_offloads_without_exporting_a_cuda_device() {
                 selected_devices: vec![0],
                 kv_quant: KvCacheQuant::Auto,
                 extra_args: Vec::new(),
+                engine_tuning: Default::default(),
                 max_concurrency: 1,
                 ready_timeout: Duration::from_secs(1),
             },
@@ -1476,6 +1483,7 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
         selected_devices: vec![3],
         kv_quant: KvCacheQuant::Fp8,
         extra_args: vec!["--enable-prefix-caching".to_string()],
+        engine_tuning: Default::default(),
         max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };
@@ -1553,6 +1561,7 @@ acquire:
                 selected_devices: vec![0],
                 kv_quant: KvCacheQuant::Auto,
                 extra_args: Vec::new(),
+                engine_tuning: Default::default(),
                 max_concurrency: 1,
                 ready_timeout: Duration::from_secs(1),
             },
@@ -1580,6 +1589,7 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
         selected_devices: vec![1],
         kv_quant: KvCacheQuant::Auto,
         extra_args: vec!["--enable-prefix-caching".to_string()],
+        engine_tuning: Default::default(),
         max_concurrency: 1,
         ready_timeout: Duration::from_secs(1),
     };

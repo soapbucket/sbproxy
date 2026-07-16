@@ -748,6 +748,7 @@ pub fn build_vllm_container_plan(
     ]);
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
+    append_vllm_passthrough_arguments(&mut arguments, &request.engine_tuning);
     arguments.extend(crate::validate_engine_args(
         EngineKind::Vllm,
         &request.extra_args,
@@ -778,6 +779,7 @@ fn direct_vllm_arguments(request: &LaunchRequest) -> Result<Vec<String>, EngineD
     ];
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
+    append_vllm_passthrough_arguments(&mut arguments, &request.engine_tuning);
     arguments.extend(crate::validate_engine_args(
         EngineKind::Vllm,
         &request.extra_args,
@@ -796,6 +798,42 @@ fn append_tensor_parallel_arguments(arguments: &mut Vec<String>, selected_device
             "--tensor-parallel-size".to_string(),
             selected_devices.len().to_string(),
         ]);
+    }
+}
+
+/// Emit the runtime-owned vLLM tuning passthroughs from the served-model
+/// config: chunked prefill, tool-call parsing, and CPU KV/weight offload.
+/// These flags are not on the operator `extra_args` allowlist, so the
+/// runtime owns them here (the same pattern as tensor parallelism); the
+/// desired-state validator rejects a non-vLLM model that sets them, so
+/// only vLLM launches ever reach this path with them populated.
+fn append_vllm_passthrough_arguments(arguments: &mut Vec<String>, tuning: &crate::EngineTuning) {
+    // Tool calling: vLLM rejects `tool_choice: auto` unless launched with a
+    // model-specific parser, so the operator declares it and we enable it.
+    if let Some(parser) = &tuning.tool_call_parser {
+        arguments.push("--enable-auto-tool-choice".to_string());
+        arguments.push("--tool-call-parser".to_string());
+        arguments.push(parser.clone());
+    }
+    // CPU KV tier: `--swap-space` sizes the CPU pool vLLM spills GPU KV
+    // blocks into; `--cpu-offload-gb` keeps that many GiB of weights in RAM.
+    if let Some(gib) = tuning.swap_space_gib {
+        arguments.push("--swap-space".to_string());
+        arguments.push(gib.to_string());
+    }
+    if let Some(gib) = tuning.cpu_offload_gib {
+        arguments.push("--cpu-offload-gb".to_string());
+        arguments.push(gib.to_string());
+    }
+    // Chunked prefill: enable it and, when the config pins a chunk size,
+    // pass it through. Auto-tuning the chunk size to a TTFT target waits on
+    // the throughput predictor and is not derived here.
+    if let Some(chunked_prefill) = &tuning.chunked_prefill {
+        arguments.push("--enable-chunked-prefill".to_string());
+        if let Some(max_batched_tokens) = chunked_prefill.max_batched_tokens {
+            arguments.push("--max-num-batched-tokens".to_string());
+            arguments.push(max_batched_tokens.to_string());
+        }
     }
 }
 
@@ -1035,7 +1073,16 @@ fn unix_time_ms() -> Result<u64, EngineDriverError> {
 
 #[cfg(test)]
 mod tests {
-    use super::append_tensor_parallel_arguments;
+    use super::{append_tensor_parallel_arguments, append_vllm_passthrough_arguments};
+    use crate::{ChunkedPrefill, EngineTuning};
+
+    fn value_after(arguments: &[String], flag: &str) -> String {
+        let index = arguments
+            .iter()
+            .position(|argument| argument == flag)
+            .unwrap_or_else(|| panic!("{flag} not emitted"));
+        arguments[index + 1].clone()
+    }
 
     #[test]
     fn tensor_parallel_size_is_emitted_only_for_a_multi_gpu_group() {
@@ -1051,6 +1098,54 @@ mod tests {
         assert_eq!(
             pair,
             vec!["--tensor-parallel-size".to_string(), "2".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_tuning_emits_no_passthrough_flags() {
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &EngineTuning::default());
+        assert!(arguments.is_empty());
+    }
+
+    #[test]
+    fn every_tuning_knob_maps_to_its_vllm_flag() {
+        let tuning = EngineTuning {
+            chunked_prefill: Some(ChunkedPrefill {
+                max_batched_tokens: Some(2048),
+                target_ttft_ms: None,
+            }),
+            tool_call_parser: Some("hermes".to_string()),
+            swap_space_gib: Some(16),
+            cpu_offload_gib: Some(8),
+        };
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &tuning);
+
+        assert!(arguments.iter().any(|a| a == "--enable-auto-tool-choice"));
+        assert_eq!(value_after(&arguments, "--tool-call-parser"), "hermes");
+        assert_eq!(value_after(&arguments, "--swap-space"), "16");
+        assert_eq!(value_after(&arguments, "--cpu-offload-gb"), "8");
+        assert!(arguments.iter().any(|a| a == "--enable-chunked-prefill"));
+        assert_eq!(value_after(&arguments, "--max-num-batched-tokens"), "2048");
+    }
+
+    #[test]
+    fn chunked_prefill_without_a_chunk_size_only_enables_it() {
+        let tuning = EngineTuning {
+            chunked_prefill: Some(ChunkedPrefill {
+                max_batched_tokens: None,
+                target_ttft_ms: Some(250),
+            }),
+            ..EngineTuning::default()
+        };
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &tuning);
+
+        assert!(arguments.iter().any(|a| a == "--enable-chunked-prefill"));
+        assert!(
+            !arguments.iter().any(|a| a == "--max-num-batched-tokens"),
+            "the target_ttft_ms auto-tune is not derived here yet"
         );
     }
 }
