@@ -3,63 +3,16 @@
 
 //! Hybrid local/cloud polish (WOR-1657 slice).
 //!
-//! Two pure pieces that make the local lane feel like one array with
-//! the paid providers. [`AliasTable`] lets a cloud-shaped model name
-//! (`claude-sonnet-4-5`, `gpt-4o-mini`) resolve to a local catalog id,
-//! so pointing an existing client at your own GPU is a one-line config
-//! change. [`savings_micros`] computes the dollars a local completion
-//! saved versus the cloud price it displaced, which is the number that
-//! justifies the GPU and feeds the value-delivered report.
+//! Pure pieces that make the local lane feel like one array with the
+//! paid providers. [`savings_micros`] computes the dollars a local
+//! completion saved versus the cloud price it displaced, and
+//! [`LaneSplit`] tallies those savings per model. That is the number
+//! that justifies the GPU and feeds the value-delivered report.
 //!
-//! Both are deterministic and unit-tested here; wiring them into the
-//! router and the usage ledger is runtime work that reuses these.
-
-use std::collections::BTreeMap;
+//! Deterministic and unit-tested here; the value recorder in
+//! `sbproxy-ai` persists these tallies and the admin API serves them.
 
 use serde::{Deserialize, Serialize};
-
-/// Maps advertised model names to local catalog ids. An operator sets
-/// this so `model: claude-sonnet-4-5` served locally hits, say,
-/// `glm-4-flash` on their GPU.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct AliasTable {
-    /// advertised name -> local catalog id.
-    #[serde(default)]
-    pub aliases: BTreeMap<String, String>,
-}
-
-impl AliasTable {
-    /// Build from pairs, for tests and programmatic setup.
-    pub fn from_pairs<I, A, B>(pairs: I) -> Self
-    where
-        I: IntoIterator<Item = (A, B)>,
-        A: Into<String>,
-        B: Into<String>,
-    {
-        Self {
-            aliases: pairs
-                .into_iter()
-                .map(|(a, b)| (a.into(), b.into()))
-                .collect(),
-        }
-    }
-
-    /// Resolve an advertised name to its local catalog id, or return
-    /// the name unchanged when there is no alias (so a real catalog id
-    /// passes straight through).
-    pub fn resolve<'a>(&'a self, advertised: &'a str) -> &'a str {
-        self.aliases
-            .get(advertised)
-            .map(String::as_str)
-            .unwrap_or(advertised)
-    }
-
-    /// True when `advertised` is a configured alias (not just a
-    /// passthrough).
-    pub fn is_alias(&self, advertised: &str) -> bool {
-        self.aliases.contains_key(advertised)
-    }
-}
 
 /// Cloud reference price for a model, in micro-USD per million tokens
 /// (micros avoid float drift and match the ledger's cost unit).
@@ -149,29 +102,6 @@ impl LaneSplit {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn alias_resolves_and_passes_through() {
-        let t = AliasTable::from_pairs([
-            ("claude-sonnet-4-5", "glm-4-flash"),
-            ("gpt-4o-mini", "qwen3-30b-a3b"),
-        ]);
-        assert_eq!(t.resolve("claude-sonnet-4-5"), "glm-4-flash");
-        assert_eq!(t.resolve("gpt-4o-mini"), "qwen3-30b-a3b");
-        // Unknown name passes through unchanged.
-        assert_eq!(t.resolve("qwen3-14b"), "qwen3-14b");
-        assert!(t.is_alias("claude-sonnet-4-5"));
-        assert!(!t.is_alias("qwen3-14b"));
-    }
-
-    #[test]
-    fn alias_table_parses_from_yaml() {
-        let t: AliasTable = serde_yaml::from_str(
-            "aliases:\n  claude-sonnet-4-5: glm-4-flash\n  gpt-4o-mini: qwen3-30b-a3b\n",
-        )
-        .expect("parse");
-        assert_eq!(t.resolve("gpt-4o-mini"), "qwen3-30b-a3b");
-    }
 
     #[test]
     fn savings_matches_cloud_price() {

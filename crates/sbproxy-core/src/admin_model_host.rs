@@ -9,10 +9,12 @@
 //! budget and per-device VRAM. Read-only; it sits behind the admin
 //! server's shared auth gate like every other `/admin/*` route.
 //!
-//! This is the "what is running now" half of WOR-1665. The
-//! "value-delivered / dollars-saved" half needs a per-completion lane +
-//! savings recorder on the request path (none exists yet), so it is a
-//! separate slice.
+//! `GET /admin/model-host/value` reports the value-delivered / dollars
+//! saved half (WOR-1913): per-model local and cloud completion counts and
+//! the micro-USD each local completion saved versus its configured cloud
+//! reference price. It reads the request-path value recorder's ledger
+//! (`sbproxy_ai::value_ledger`); with no reference configured the report
+//! is empty, which is the honest answer. Read-only, same auth gate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -721,6 +723,19 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
             }
             Some(status_response())
         }
+        // WOR-1913: value-delivered / dollars-saved report for locally
+        // served completions priced against their configured cloud
+        // reference.
+        "/admin/model-host/value" => {
+            if !method.eq_ignore_ascii_case("GET") {
+                return Some((
+                    405,
+                    JSON,
+                    r#"{"error":"method not allowed; use GET"}"#.to_string(),
+                ));
+            }
+            Some(value_response())
+        }
         // WOR-1765: load (spawn/ready) and evict (unload to free VRAM) a
         // model on demand. keep_alive stays config-driven.
         "/admin/model-host/load" => {
@@ -964,6 +979,24 @@ fn status_response() -> Resp {
     })) {
         Ok(body) => (200, JSON, body),
         Err(e) => (500, JSON, format!(r#"{{"error":"serialize status: {e}"}}"#)),
+    }
+}
+
+fn value_response() -> Resp {
+    // The ledger is populated by the request-path value recorder in
+    // sbproxy-ai. When no serve block configured a reference price the
+    // ledger is unset and the report is empty: no reference, no savings
+    // claim.
+    let report = sbproxy_ai::value_ledger::value_ledger()
+        .map(|ledger| ledger.report())
+        .unwrap_or_default();
+    match serde_json::to_string(&report) {
+        Ok(body) => (200, JSON, body),
+        Err(e) => (
+            500,
+            JSON,
+            format!(r#"{{"error":"serialize value report: {e}"}}"#),
+        ),
     }
 }
 
@@ -1832,6 +1865,27 @@ models:
         assert!(body.contains("\"serving\""));
         assert!(body.contains("\"deployments\""));
         assert!(body.contains("\"runtime_revision\""));
+    }
+
+    #[test]
+    fn value_route_returns_a_report_shape_without_a_ledger() {
+        // With no value recorder wired the ledger is unset, so the route
+        // answers 200 with an empty-but-well-formed report rather than
+        // erroring.
+        let (code, ct, body) =
+            dispatch("GET", "/admin/model-host/value", None).expect("value route");
+        assert_eq!(code, 200);
+        assert_eq!(ct, JSON);
+        let report: serde_json::Value = serde_json::from_str(&body).expect("value report json");
+        assert_eq!(report["total_saved_micros"], 0);
+        assert_eq!(report["total_local_completions"], 0);
+        assert!(report["models"].is_array());
+    }
+
+    #[test]
+    fn value_route_rejects_non_get() {
+        let (code, _, _) = dispatch("POST", "/admin/model-host/value", None).unwrap();
+        assert_eq!(code, 405);
     }
 
     #[tokio::test]

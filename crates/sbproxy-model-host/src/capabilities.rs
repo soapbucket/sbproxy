@@ -116,6 +116,9 @@ pub enum ConsumerContract {
     StatusReportsStableLifecycle,
     /// Managed replicas converge on one deterministic placement plan.
     ClusterPlacementConverges,
+    /// A configured cloud reference price values local completions as
+    /// dollars saved in the value report.
+    ReferencePriceRecordsSavings,
 }
 
 impl ConsumerContract {
@@ -148,6 +151,7 @@ impl ConsumerContract {
             Self::ExactRemovalProtectsReferences => "contract.exact_removal_protects_references",
             Self::StatusReportsStableLifecycle => "contract.status_reports_stable_lifecycle",
             Self::ClusterPlacementConverges => "contract.cluster_placement_converges",
+            Self::ReferencePriceRecordsSavings => "contract.reference_price_records_savings",
         }
     }
 
@@ -314,8 +318,39 @@ impl ConsumerContract {
             Self::ExactRemovalProtectsReferences => assert_exact_removal_protection(),
             Self::StatusReportsStableLifecycle => assert_stable_status_shape(),
             Self::ClusterPlacementConverges => assert_cluster_placement_converges(),
+            Self::ReferencePriceRecordsSavings => assert_reference_price_records_savings(),
         }
     }
+}
+
+fn assert_reference_price_records_savings() -> Result<(), String> {
+    // A serve entry with an explicit reference prices each local
+    // completion at the cloud rate it displaced and folds it into the
+    // per-model value report. This is the deterministic core the
+    // request-path value recorder and the admin value route consume.
+    let config: ModelHostConfig = serde_yaml::from_str(
+        "models:\n  - model: qwen3-32b\n    name: qwen\n    reference:\n      model: gpt-4o\n      prompt_micros_per_mtok: 3000000\n      completion_micros_per_mtok: 15000000\n",
+    )
+    .map_err(|error| error.to_string())?;
+    let entry = config.models.first().ok_or("missing serve entry")?;
+    let reference = entry
+        .reference
+        .as_ref()
+        .ok_or("reference block did not parse")?;
+    let price = reference.cloud_price();
+    let mut lane = crate::LaneSplit::default();
+    lane.record_local(1000, 500, price);
+    lane.record_local(1000, 500, price);
+    let lanes = std::collections::BTreeMap::from([(entry.effective_name()?, lane)]);
+    let report = crate::ValueReport::from_lanes(&lanes);
+    if report.total_saved_micros != 21_000
+        || report.total_local_completions != 2
+        || report.models.len() != 1
+        || report.models[0].model != "qwen"
+    {
+        return Err(format!("reference savings report was {report:?}"));
+    }
+    Ok(())
 }
 
 fn assert_cluster_placement_converges() -> Result<(), String> {
@@ -1294,6 +1329,17 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         ],
         consumer: Some(ConsumerContract::ExactRemovalProtectsReferences),
     },
+    CapabilityEntry {
+        id: "admin.value_report",
+        domain: CapabilityDomain::Admin,
+        status: SupportLevel::Stable,
+        summary: "A configured cloud reference prices each local completion as dollars saved, recorded per model and served on the admin value route.",
+        evidence: &[
+            "contract.reference_price_records_savings",
+            "test.value_ledger",
+        ],
+        consumer: Some(ConsumerContract::ReferencePriceRecordsSavings),
+    },
 ];
 
 const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
@@ -1446,6 +1492,12 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         status: SupportLevel::Preview,
         capability_id: "artifact.legacy_download",
         consumer: None,
+    },
+    ConfigFieldCapability {
+        path: "serve.models[].reference",
+        status: SupportLevel::Stable,
+        capability_id: "admin.value_report",
+        consumer: Some(ConsumerContract::ReferencePriceRecordsSavings),
     },
 ];
 

@@ -40,6 +40,11 @@ regex.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 arc-swap.workspace = true
+# WOR-1913: durable per-model local-vs-cloud savings tallies. redb is the
+# workspace embedded KV store (also used by the platform keystore, cache,
+# and observe rollups); the value ledger persists a LaneSplit per served
+# model so the dollars-saved report survives a restart.
+redb.workspace = true
 lru = "0.16"
 reqwest.workspace = true
 tracing.workspace = true

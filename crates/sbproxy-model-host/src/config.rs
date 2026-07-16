@@ -396,6 +396,35 @@ pub struct LoraAdapter {
     pub source: String,
 }
 
+/// The explicitly-configured cloud model a local model displaces
+/// (WOR-1913). Its per-million-token prices value every local completion
+/// at what the equivalent hosted API would have charged, which is the
+/// dollars-saved number that justifies the GPU. There is no default and
+/// no guessing: without a `reference:` a served model makes no savings
+/// claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct ReferenceModel {
+    /// The hosted model whose price this local model displaces, for
+    /// display in the value report (e.g. `gpt-4o`). Not resolved against
+    /// the catalog; it names the cloud API the saving is measured against.
+    pub model: String,
+    /// Micro-USD per 1e6 prompt tokens the reference model charges.
+    pub prompt_micros_per_mtok: u64,
+    /// Micro-USD per 1e6 completion tokens the reference model charges.
+    pub completion_micros_per_mtok: u64,
+}
+
+impl ReferenceModel {
+    /// The cloud reference price used to value a displaced completion.
+    pub fn cloud_price(&self) -> crate::hybrid::CloudPrice {
+        crate::hybrid::CloudPrice {
+            prompt_micros_per_mtok: self.prompt_micros_per_mtok,
+            completion_micros_per_mtok: self.completion_micros_per_mtok,
+        }
+    }
+}
+
 /// One model an operator wants the gateway to serve locally.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServeEntry {
@@ -507,6 +536,13 @@ pub struct ServeEntry {
     /// default (fine only for a single-file repo).
     #[serde(default)]
     pub gguf_file: Option<String>,
+    /// The hosted model this local model displaces (WOR-1913). When set,
+    /// every completion served locally is priced at what this reference
+    /// would have charged and counted toward the dollars-saved value
+    /// report (`GET /admin/model-host/value`). Omit it to make no savings
+    /// claim: sbproxy never guesses a cloud reference price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<ReferenceModel>,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -1054,6 +1090,7 @@ models:
             cpu_offload_gib: None,
             max_loras: None,
             gguf_file: None,
+            reference: None,
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");

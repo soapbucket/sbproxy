@@ -153,7 +153,7 @@ pub use fit::{
     StaticGpuProbe, ThroughputEstimate,
 };
 pub use generation_store::{DeploymentGenerationStoreError, FileDeploymentGenerationStore};
-pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
+pub use hybrid::{savings_micros, CloudPrice, LaneSplit};
 pub use jobs::{
     FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
 };

@@ -389,6 +389,17 @@
             "string",
             "null"
           ]
+        },
+        "reference": {
+          "description": "The hosted model this local model displaces (WOR-1913). When set, every completion served locally is priced at what this reference would have charged and counted toward the dollars-saved value report (`GET /admin/model-host/value`). Omit it to make no savings claim: sbproxy never guesses a cloud reference price.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReferenceModel"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -555,6 +566,33 @@
         "source": {
           "description": "Adapter source: an `hf:Org/Repo` reference or a local path.",
           "type": "string"
+        }
+      }
+    },
+    "ReferenceModel": {
+      "description": "The explicitly-configured cloud model a local model displaces (WOR-1913). Its per-million-token prices value every local completion at what the equivalent hosted API would have charged, which is the dollars-saved number that justifies the GPU. There is no default and no guessing: without a `reference:` a served model makes no savings claim.",
+      "type": "object",
+      "required": [
+        "completion_micros_per_mtok",
+        "model",
+        "prompt_micros_per_mtok"
+      ],
+      "properties": {
+        "model": {
+          "description": "The hosted model whose price this local model displaces, for display in the value report (e.g. `gpt-4o`). Not resolved against the catalog; it names the cloud API the saving is measured against.",
+          "type": "string"
+        },
+        "prompt_micros_per_mtok": {
+          "description": "Micro-USD per 1e6 prompt tokens the reference model charges.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "completion_micros_per_mtok": {
+          "description": "Micro-USD per 1e6 completion tokens the reference model charges.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
         }
       }
     },

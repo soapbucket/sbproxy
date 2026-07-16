@@ -240,7 +240,60 @@ impl AiHandlerConfig {
     /// request.
     pub fn usage_sinks(&self) -> &[std::sync::Arc<dyn crate::usage_sink::UsageSink>] {
         self.usage_sinks_built
-            .get_or_init(|| crate::usage_sink::build_sinks(&self.usage_sinks))
+            .get_or_init(|| {
+                let mut sinks = crate::usage_sink::build_sinks(&self.usage_sinks);
+                // WOR-1913: a served model that declares a `reference:` cloud
+                // price gets a value recorder that prices each local completion
+                // it serves at that reference, so the admin value route and the
+                // dollars-saved doc claim are backed by a real per-completion
+                // tally. No reference configured means no recorder, never a
+                // guessed saving.
+                let mut references = std::collections::BTreeMap::new();
+                let mut ledger_dir: Option<String> = None;
+                for provider in &self.providers {
+                    if let Some(serve) = &provider.serve {
+                        references.extend(
+                            crate::value_ledger::ValueSink::references_from_serve(serve),
+                        );
+                        if ledger_dir.is_none() {
+                            ledger_dir.clone_from(&serve.cache_dir);
+                        }
+                    }
+                }
+                if !references.is_empty() {
+                    // Persist under the serve cache dir when one is configured
+                    // so the tally survives a restart; an unset cache dir keeps
+                    // an in-memory tally for the life of the process.
+                    let path = ledger_dir
+                        .map(|dir| std::path::Path::new(&dir).join("value-ledger.redb"))
+                        .unwrap_or_default();
+                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    // One shared ledger across handlers: reuse the process
+                    // global when already set, else open and register it.
+                    let ledger = match crate::value_ledger::value_ledger() {
+                        Some(existing) => Some(existing),
+                        None => match crate::value_ledger::ValueLedger::open(&path) {
+                            Ok(ledger) => {
+                                let ledger = std::sync::Arc::new(ledger);
+                                let _ = crate::value_ledger::set_value_ledger(ledger.clone());
+                                Some(ledger)
+                            }
+                            Err(error) => {
+                                tracing::error!(error = %error, "value ledger: disabled (failed to open); local savings will not be recorded");
+                                None
+                            }
+                        },
+                    };
+                    if let Some(ledger) = ledger {
+                        sinks.push(std::sync::Arc::new(
+                            crate::value_ledger::ValueSink::new(ledger, references),
+                        ));
+                    }
+                }
+                sinks
+            })
             .as_slice()
     }
 
