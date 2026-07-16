@@ -3367,9 +3367,29 @@ fn provisioning_for(request: &DeploymentPrepareRequest, kind: EngineKind) -> Eng
         EngineKind::LlamaCpp => sbproxy_config::ManagedEngineKind::LlamaCpp,
         EngineKind::Embedded => return EngineProvisioning::default(),
     };
-    let Some(config) = request.control.engines.get(&managed_kind) else {
-        return EngineProvisioning::default();
-    };
+    let config = request
+        .control
+        .engines
+        .get(&managed_kind)
+        .cloned()
+        .unwrap_or_default();
+    // A per-deployment engine pin overrides the node-wide policy field by
+    // field, so one model can run a different backend version than another.
+    // The launch method and acceleration stay from the node policy; the pin
+    // only replaces the version, image, and expected digest.
+    let deployment = &request.desired.desired;
+    let version = deployment
+        .engine_version
+        .clone()
+        .or_else(|| config.version.clone());
+    let image = deployment
+        .engine_image
+        .clone()
+        .or_else(|| config.image.clone());
+    let sha256 = deployment
+        .engine_sha256
+        .clone()
+        .or_else(|| config.sha256.clone());
     let launch = match config.launch {
         sbproxy_config::ManagedEngineLaunch::Binary => EngineLaunchMethod::Binary,
         sbproxy_config::ManagedEngineLaunch::Container => EngineLaunchMethod::Container,
@@ -3385,15 +3405,15 @@ fn provisioning_for(request: &DeploymentPrepareRequest, kind: EngineKind) -> Eng
     let acquire = match config.launch {
         sbproxy_config::ManagedEngineLaunch::Uv => Some(crate::EngineAcquire {
             source: AcquireSource::Uvx,
-            version: config.version.clone(),
+            version: version.clone(),
             accel,
             path: None,
-            sha256: config.sha256.clone(),
+            sha256: sha256.clone(),
         }),
         sbproxy_config::ManagedEngineLaunch::Binary
             if config.path.is_some()
-                || config.version.is_some()
-                || config.sha256.is_some()
+                || version.is_some()
+                || sha256.is_some()
                 || config.acceleration != sbproxy_config::ManagedEngineAcceleration::Auto =>
         {
             Some(crate::EngineAcquire {
@@ -3402,17 +3422,17 @@ fn provisioning_for(request: &DeploymentPrepareRequest, kind: EngineKind) -> Eng
                 } else {
                     AcquireSource::Release
                 },
-                version: config.version.clone(),
+                version: version.clone(),
                 accel,
                 path: config.path.clone(),
-                sha256: config.sha256.clone(),
+                sha256: sha256.clone(),
             })
         }
         _ => None,
     };
     EngineProvisioning {
         launch,
-        image: config.image.clone(),
+        image,
         acquire,
         shm_size_gib: config.shm_size_gib,
     }
@@ -3814,4 +3834,61 @@ async fn rollback_recreate_slots(
         }
     }
     (!failures.is_empty()).then(|| failures.join("; "))
+}
+
+#[cfg(test)]
+mod provisioning_tests {
+    use super::*;
+
+    fn request(deployment_yaml: &str, control_yaml: &str) -> DeploymentPrepareRequest {
+        let desired: CompiledDeployment = CompiledDeployment {
+            desired: serde_yaml::from_str(deployment_yaml).expect("deployment parses"),
+            origin: crate::DesiredDeploymentOrigin::Canonical,
+            legacy_entry: None,
+        };
+        DeploymentPrepareRequest {
+            deployment_id: "m".to_string(),
+            replica_idx: 0,
+            generation: 1,
+            desired,
+            pinned_fit: None,
+            control: serde_yaml::from_str(control_yaml).expect("control parses"),
+            legacy_host_policy: None,
+        }
+    }
+
+    #[test]
+    fn a_deployment_engine_version_overrides_the_node_policy() {
+        let control = "engines:\n  vllm:\n    launch: uv\n    version: 0.10.0\n";
+        // With no per-deployment pin, the node policy's version resolves.
+        let node = request("model: qwen3-8b\nengine: vllm\n", control);
+        let resolved = provisioning_for(&node, EngineKind::Vllm);
+        assert_eq!(
+            resolved.acquire.as_ref().and_then(|a| a.version.as_deref()),
+            Some("0.10.0")
+        );
+        // A per-deployment pin overrides it, so two models on one node can run
+        // different backend versions.
+        let pinned = request(
+            "model: qwen3-8b\nengine: vllm\nengine_version: 0.11.0\n",
+            control,
+        );
+        let resolved = provisioning_for(&pinned, EngineKind::Vllm);
+        assert_eq!(
+            resolved.acquire.as_ref().and_then(|a| a.version.as_deref()),
+            Some("0.11.0")
+        );
+    }
+
+    #[test]
+    fn a_deployment_engine_image_overrides_the_node_policy() {
+        let control =
+            "engines:\n  vllm:\n    launch: container\n    image: vllm/vllm-openai:v0.10.0\n";
+        let pinned = request(
+            "model: qwen3-8b\nengine: vllm\nengine_image: vllm/vllm-openai:v0.11.0\n",
+            control,
+        );
+        let resolved = provisioning_for(&pinned, EngineKind::Vllm);
+        assert_eq!(resolved.image.as_deref(), Some("vllm/vllm-openai:v0.11.0"));
+    }
 }

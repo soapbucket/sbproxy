@@ -156,6 +156,19 @@ pub struct ManagedDeploymentConfig {
     /// Omit to disable offload.
     #[serde(default)]
     pub cpu_offload_gib: Option<u64>,
+    /// Per-deployment engine version pin, overriding the node-wide `engines:`
+    /// policy so one model can run a different backend version than another.
+    /// Never `latest`. Omit to inherit the node policy or the built-in default.
+    #[serde(default)]
+    pub engine_version: Option<String>,
+    /// Per-deployment engine container image, overriding the node policy.
+    /// Must be tag- or digest-pinned. Omit to inherit the node policy.
+    #[serde(default)]
+    pub engine_image: Option<String>,
+    /// Expected SHA-256 for the pinned engine binary or image digest. Omit to
+    /// inherit the node policy.
+    #[serde(default)]
+    pub engine_sha256: Option<String>,
 }
 
 const fn one_replica() -> u32 {

@@ -35,6 +35,9 @@ fn deployment(model: &str) -> ModelDeployment {
         tool_call_parser: None,
         swap_space_gib: None,
         cpu_offload_gib: None,
+        engine_version: None,
+        engine_image: None,
+        engine_sha256: None,
     }
 }
 

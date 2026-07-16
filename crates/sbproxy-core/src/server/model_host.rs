@@ -1661,6 +1661,9 @@ fn managed_deployment_from_model(
         tool_call_parser: deployment.tool_call_parser,
         swap_space_gib: deployment.swap_space_gib,
         cpu_offload_gib: deployment.cpu_offload_gib,
+        engine_version: deployment.engine_version,
+        engine_image: deployment.engine_image,
+        engine_sha256: deployment.engine_sha256,
     })
 }
 
