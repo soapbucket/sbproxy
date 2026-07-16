@@ -1648,7 +1648,8 @@ impl ModelRuntimeManager {
         // Group prepared replicas under their deployment ID, ordered by replica
         // index. Warm memory estimates are keyed by generation, unique per
         // replica, so a multi-replica warm launch reserves each replica's need.
-        let mut staged_replicas: BTreeMap<String, Vec<(u32, Arc<DeploymentSlot>)>> = BTreeMap::new();
+        let mut staged_replicas: BTreeMap<String, Vec<(u32, Arc<DeploymentSlot>)>> =
+            BTreeMap::new();
         let mut staged_memory = BTreeMap::new();
         let mut first_error = None;
         while let Some(result) = preparations.next().await {
@@ -1804,11 +1805,11 @@ impl ModelRuntimeManager {
             .await?;
         let placement = self.placement_lock.lock().await;
         let current = self.snapshot.load_full();
-        if current
-            .slots
-            .get(deployment)
-            .is_none_or(|replicas| !replicas.iter().any(|current_slot| Arc::ptr_eq(current_slot, &slot)))
-        {
+        if current.slots.get(deployment).is_none_or(|replicas| {
+            !replicas
+                .iter()
+                .any(|current_slot| Arc::ptr_eq(current_slot, &slot))
+        }) {
             slot.cancel_preparation().await;
             return Err(RuntimeManagerError::Draining(deployment.to_string()));
         }
@@ -1957,11 +1958,11 @@ impl ModelRuntimeManager {
         let slot = select_admission_replica(replicas);
         let (permit, start_epoch) = slot.admit(priority).await?;
         let current = self.snapshot.load_full();
-        if current
-            .slots
-            .get(deployment)
-            .is_none_or(|replicas| !replicas.iter().any(|current_slot| Arc::ptr_eq(current_slot, &slot)))
-        {
+        if current.slots.get(deployment).is_none_or(|replicas| {
+            !replicas
+                .iter()
+                .any(|current_slot| Arc::ptr_eq(current_slot, &slot))
+        }) {
             drop(permit);
             return Err(crate::AdmissionRejection::new(
                 crate::AdmissionReason::Draining,
@@ -1991,9 +1992,10 @@ impl ModelRuntimeManager {
     pub async fn drain(&self, deployment: &str) -> Result<crate::DrainReport, RuntimeManagerError> {
         let (replicas, grace) = {
             let snapshot = self.snapshot.load_full();
-            let replicas = snapshot.slots.get(deployment).cloned().ok_or_else(|| {
-                RuntimeManagerError::UnknownDeployment(deployment.to_string())
-            })?;
+            let replicas =
+                snapshot.slots.get(deployment).cloned().ok_or_else(|| {
+                    RuntimeManagerError::UnknownDeployment(deployment.to_string())
+                })?;
             let grace = Duration::from_millis(snapshot.desired.control.shutdown_deadline_ms);
             (replicas, grace)
         };
@@ -2353,7 +2355,8 @@ impl ModelRuntimeManager {
                         for (begun, begin) in recreate_begins {
                             begun.abort_recreate_begin(begin).await;
                         }
-                        teardown_slots(candidate_replica_slots(&candidate_ids, &slots), grace).await;
+                        teardown_slots(candidate_replica_slots(&candidate_ids, &slots), grace)
+                            .await;
                         return Err(error);
                     }
                 }
@@ -2635,7 +2638,9 @@ impl ModelRuntimeManager {
                     retired.push((
                         id.clone(),
                         replica.clone(),
-                        eviction_claims.get(&(id.clone(), replica.generation)).copied(),
+                        eviction_claims
+                            .get(&(id.clone(), replica.generation))
+                            .copied(),
                     ));
                 }
             }
@@ -3747,8 +3752,12 @@ fn merge_drain_reports(
         None => report,
         Some(base) => crate::DrainReport {
             active_at_start: base.active_at_start.saturating_add(report.active_at_start),
-            cancelled_queued: base.cancelled_queued.saturating_add(report.cancelled_queued),
-            remaining_active: base.remaining_active.saturating_add(report.remaining_active),
+            cancelled_queued: base
+                .cancelled_queued
+                .saturating_add(report.cancelled_queued),
+            remaining_active: base
+                .remaining_active
+                .saturating_add(report.remaining_active),
             timed_out: base.timed_out || report.timed_out,
         },
     }

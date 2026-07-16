@@ -340,7 +340,11 @@ async fn draining_a_multi_replica_deployment_stops_every_replica() {
         .filter(|event| event.starts_with("stop:coder:"))
         .cloned()
         .collect::<BTreeSet<_>>();
-    assert_eq!(stops.len(), 3, "every replica generation stops exactly once");
+    assert_eq!(
+        stops.len(),
+        3,
+        "every replica generation stops exactly once"
+    );
 }
 
 #[tokio::test]

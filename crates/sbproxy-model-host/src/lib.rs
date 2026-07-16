@@ -149,8 +149,8 @@ pub use fit::{
     estimate_throughput, fp8_supported, memory_occupancy, plan_fit_auto_kv_with_margin,
     plan_fit_auto_kv_with_margin_and_concurrency, plan_fit_kv_with_margin,
     plan_fit_kv_with_margin_and_concurrency, plan_fit_over_set, plan_replica_fits, FitError,
-    FitPlan, GpuDescriptor,
-    GpuProbe, GpuVendor, MemoryEstimate, ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
+    FitPlan, GpuDescriptor, GpuProbe, GpuVendor, MemoryEstimate, ModelMetadata, Quant,
+    StaticGpuProbe, ThroughputEstimate,
 };
 pub use generation_store::{DeploymentGenerationStoreError, FileDeploymentGenerationStore};
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
