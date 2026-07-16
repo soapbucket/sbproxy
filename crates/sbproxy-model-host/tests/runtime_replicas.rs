@@ -344,6 +344,35 @@ async fn draining_a_multi_replica_deployment_stops_every_replica() {
 }
 
 #[tokio::test]
+async fn admission_spreads_across_local_replicas() {
+    // Each held permit raises a replica's in-flight count, so the next
+    // admission lands on a less-loaded replica: three concurrent admissions
+    // reach three distinct replicas.
+    let preparer = ReplicaPreparer::new(3);
+    let manager = manager(preparer.clone(), 3);
+    manager
+        .reconcile(replica_desired("bal", "coder", 3, Some(1)))
+        .await
+        .expect("three replicas fit");
+
+    let mut generations = BTreeSet::new();
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        let permit = manager
+            .admit("coder", sbproxy_model_host::PriorityClass::Standard)
+            .await
+            .expect("admission succeeds");
+        generations.insert(permit.generation());
+        held.push(permit);
+    }
+    assert_eq!(
+        generations.len(),
+        3,
+        "three concurrent admissions spread across the three replicas"
+    );
+}
+
+#[tokio::test]
 async fn a_single_replica_deployment_needs_no_device_plan() {
     // replicas = 1 keeps the lazy path: plan_replica_devices is never called,
     // so a preparer that would reject it still serves one replica.

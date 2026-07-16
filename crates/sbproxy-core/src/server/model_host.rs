@@ -2288,6 +2288,7 @@ pub async fn current_managed_model_availability(
     };
 
     let local_deployments = runtime.current_desired();
+    let local_statuses = runtime.statuses().await;
     for deployment_id in local_deployments.deployments.keys() {
         let Some(deployment_availability) = availability.get_mut(deployment_id) else {
             continue;
@@ -2295,23 +2296,27 @@ pub async fn current_managed_model_availability(
         if deployment_availability.ready_replicas > 0 || deployment_availability.cold_replicas > 0 {
             continue;
         }
-        let Some(status) = runtime.status(deployment_id).await else {
-            continue;
-        };
-        match status.state {
-            sbproxy_model_host::DeploymentRuntimeState::Ready => {
-                deployment_availability.ready_replicas = 1;
+        // Count every replica of this deployment, not just the primary, so a
+        // multi-replica deployment reports how many engines are actually ready.
+        let mut ready_replicas = 0u32;
+        let mut cold_replicas = 0u32;
+        for status in local_statuses
+            .iter()
+            .filter(|status| &status.deployment == deployment_id)
+        {
+            match status.state {
+                sbproxy_model_host::DeploymentRuntimeState::Ready => ready_replicas += 1,
+                sbproxy_model_host::DeploymentRuntimeState::Assigned
+                | sbproxy_model_host::DeploymentRuntimeState::Cached
+                | sbproxy_model_host::DeploymentRuntimeState::Preparing => cold_replicas += 1,
+                sbproxy_model_host::DeploymentRuntimeState::Configured
+                | sbproxy_model_host::DeploymentRuntimeState::Draining
+                | sbproxy_model_host::DeploymentRuntimeState::Stopped
+                | sbproxy_model_host::DeploymentRuntimeState::Failed => {}
             }
-            sbproxy_model_host::DeploymentRuntimeState::Assigned
-            | sbproxy_model_host::DeploymentRuntimeState::Cached
-            | sbproxy_model_host::DeploymentRuntimeState::Preparing => {
-                deployment_availability.cold_replicas = 1;
-            }
-            sbproxy_model_host::DeploymentRuntimeState::Configured
-            | sbproxy_model_host::DeploymentRuntimeState::Draining
-            | sbproxy_model_host::DeploymentRuntimeState::Stopped
-            | sbproxy_model_host::DeploymentRuntimeState::Failed => {}
         }
+        deployment_availability.ready_replicas = ready_replicas;
+        deployment_availability.cold_replicas = cold_replicas;
     }
     availability
 }
