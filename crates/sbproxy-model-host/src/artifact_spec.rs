@@ -135,7 +135,12 @@ impl WorkerProfile {
             accelerator,
             compute_capability,
             memory_bytes: descriptor.free_vram_bytes,
-            engines: BTreeSet::from([EngineKind::Vllm, EngineKind::LlamaCpp, EngineKind::Embedded]),
+            engines: BTreeSet::from([
+                EngineKind::Vllm,
+                EngineKind::SGLang,
+                EngineKind::LlamaCpp,
+                EngineKind::Embedded,
+            ]),
         })
     }
 }
@@ -255,6 +260,7 @@ pub(crate) fn forced_engine(choice: EngineChoice) -> Option<EngineKind> {
     match choice {
         EngineChoice::Auto => None,
         EngineChoice::Vllm => Some(EngineKind::Vllm),
+        EngineChoice::SGLang => Some(EngineKind::SGLang),
         EngineChoice::LlamaCpp => Some(EngineKind::LlamaCpp),
         EngineChoice::Embedded => Some(EngineKind::Embedded),
     }

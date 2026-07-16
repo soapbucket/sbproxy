@@ -68,6 +68,25 @@ pub fn build_launch_spec(
             // Enable the dev endpoints the sleep/wake phase drives.
             env.push(("VLLM_SERVER_DEV_MODE".to_string(), "1".to_string()));
         }
+        EngineKind::SGLang => {
+            // SGLang mirrors vLLM here: an OpenAI-compatible server. The
+            // real launch is `python -m sglang.launch_server`; the managed
+            // SGLangDriver owns that prefix (and the uvx wrap), so this
+            // legacy template emits the server flags keyed off
+            // `--model-path`, the SGLang equivalent of `vllm serve <repo>`.
+            args.push("--model-path".to_string());
+            args.push(model.hf_repo.clone());
+            args.push("--host".to_string());
+            args.push("127.0.0.1".to_string());
+            args.push("--port".to_string());
+            args.push(port.to_string());
+            if let Some(q) = vllm_quantization(&plan.quant_name) {
+                args.push("--quantization".to_string());
+                args.push(q.to_string());
+            }
+            args.push("--context-length".to_string());
+            args.push(plan.seq_len.to_string());
+        }
         EngineKind::LlamaCpp => {
             // `llama-server --hf-repo <repo> --host 127.0.0.1
             //   --port <p> --ctx-size <ctx> --n-gpu-layers 999` (GGUF
@@ -131,23 +150,49 @@ pub fn build_launch_spec(
     }
 }
 
-/// Wrap a vLLM launch spec to run through `uvx` (`uv tool run`), so vLLM
-/// is provisioned by `uv` at `uv_path` rather than needing `vllm` on PATH
-/// (WOR-1812). The original argv (`serve <repo> ...`) is preserved after
-/// the `vllm` command name: `uv tool run --from vllm[==<v>] vllm <argv>`.
+/// Wrap a Python-package launch spec to run through `uvx` (`uv tool run`),
+/// so the engine is provisioned by `uv` at `uv_path` rather than needing it
+/// on PATH (WOR-1812, WOR-1905). `package_version` pins the engine package.
+/// The original argv is preserved after the package's run command:
+/// - vLLM: `uv tool run --from vllm[==<v>] vllm <argv>` (argv starts `serve
+///   <repo> ...`).
+/// - SGLang: `uv tool run --from sglang[all][==<v>] python -m
+///   sglang.launch_server <argv>` (argv starts `--model-path <repo> ...`).
+///
 /// The engine, env, and VRAM estimate carry over unchanged.
-pub fn wrap_uvx(spec: &LaunchSpec, uv_path: &str, vllm_version: Option<&str>) -> LaunchSpec {
-    let from = match vllm_version {
-        Some(v) => format!("vllm=={v}"),
-        None => "vllm".to_string(),
+pub fn wrap_uvx(spec: &LaunchSpec, uv_path: &str, package_version: Option<&str>) -> LaunchSpec {
+    let (from, command): (String, Vec<String>) = match spec.engine {
+        EngineKind::SGLang => {
+            let from = match package_version {
+                Some(v) => format!("sglang[all]=={v}"),
+                None => "sglang[all]".to_string(),
+            };
+            (
+                from,
+                vec![
+                    "python".to_string(),
+                    "-m".to_string(),
+                    "sglang.launch_server".to_string(),
+                ],
+            )
+        }
+        // vLLM is the default uvx package; llama.cpp and embedded never
+        // reach this wrapper (they are not Python-package engines).
+        _ => {
+            let from = match package_version {
+                Some(v) => format!("vllm=={v}"),
+                None => "vllm".to_string(),
+            };
+            (from, vec!["vllm".to_string()])
+        }
     };
     let mut args = vec![
         "tool".to_string(),
         "run".to_string(),
         "--from".to_string(),
         from,
-        "vllm".to_string(),
     ];
+    args.extend(command);
     args.extend(spec.args.iter().cloned());
     LaunchSpec {
         engine: spec.engine,
@@ -179,6 +224,17 @@ pub fn llama_use_local_model(args: &mut [String], model_path: &std::path::Path) 
 pub fn vllm_use_local_snapshot(args: &mut [String], snapshot: &std::path::Path) {
     if args.first().map(String::as_str) == Some("serve") {
         if let Some(model) = args.get_mut(1) {
+            *model = snapshot.display().to_string();
+        }
+    }
+}
+
+/// Retarget an SGLang `--model-path <source>` argv to one verified local
+/// snapshot (WOR-1905), mirroring [`vllm_use_local_snapshot`]. The rest of
+/// the generated argv is unchanged. A no-op when `--model-path` is absent.
+pub fn sglang_use_local_snapshot(args: &mut [String], snapshot: &std::path::Path) {
+    if let Some(index) = args.iter().position(|argument| argument == "--model-path") {
+        if let Some(model) = args.get_mut(index + 1) {
             *model = snapshot.display().to_string();
         }
     }

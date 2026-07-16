@@ -177,6 +177,7 @@ pub fn filter_desired_state_for_assignments(
 const fn engine_choice(engine: EngineKind) -> EngineChoice {
     match engine {
         EngineKind::Vllm => EngineChoice::Vllm,
+        EngineKind::SGLang => EngineChoice::SGLang,
         EngineKind::LlamaCpp => EngineChoice::LlamaCpp,
         EngineKind::Embedded => EngineChoice::Embedded,
     }

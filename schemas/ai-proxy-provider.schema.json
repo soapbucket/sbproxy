@@ -421,6 +421,13 @@
           ]
         },
         {
+          "description": "Force SGLang (WOR-1905). `Auto` never resolves to this: SGLang is an explicit opt-in that stays behind vLLM as the safetensors default until it is certified on real hardware.",
+          "type": "string",
+          "enum": [
+            "sglang"
+          ]
+        },
+        {
           "description": "Force llama.cpp.",
           "type": "string",
           "enum": [

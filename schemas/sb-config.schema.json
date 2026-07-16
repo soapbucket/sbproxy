@@ -2024,6 +2024,13 @@
           ]
         },
         {
+          "description": "Use SGLang (WOR-1905). An explicit opt-in that `Auto` never selects; it serves the same safetensors weights as vLLM on a CUDA worker.",
+          "type": "string",
+          "enum": [
+            "sglang"
+          ]
+        },
+        {
           "description": "Use llama.cpp.",
           "type": "string",
           "enum": [

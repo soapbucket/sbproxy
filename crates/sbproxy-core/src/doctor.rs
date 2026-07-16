@@ -557,6 +557,7 @@ impl DoctorReport {
     fn engine_for_kind(&self, kind: sbproxy_model_host::EngineKind) -> Option<&EngineBinary> {
         let engine = match kind {
             sbproxy_model_host::EngineKind::Vllm => "vllm",
+            sbproxy_model_host::EngineKind::SGLang => "sglang",
             sbproxy_model_host::EngineKind::LlamaCpp => "llama_cpp",
             sbproxy_model_host::EngineKind::Embedded => "embedded",
         };

@@ -44,6 +44,10 @@ pub enum ManagedEngineChoice {
     Auto,
     /// Use vLLM.
     Vllm,
+    /// Use SGLang (WOR-1905). An explicit opt-in that `Auto` never selects;
+    /// it serves the same safetensors weights as vLLM on a CUDA worker.
+    #[serde(rename = "sglang")]
+    SGLang,
     /// Use llama.cpp.
     LlamaCpp,
 }
@@ -191,6 +195,10 @@ const fn default_max_queue_depth() -> usize {
 pub enum ManagedEngineKind {
     /// vLLM's OpenAI-compatible server.
     Vllm,
+    /// SGLang's OpenAI-compatible server (WOR-1905). Provisioned from a
+    /// pinned uv environment or a digest-pinned container, like vLLM.
+    #[serde(rename = "sglang")]
+    SGLang,
     /// llama.cpp's `llama-server`.
     LlamaCpp,
 }
@@ -430,9 +438,11 @@ fn validate_engine(
             "engine {kind:?} image is only valid for container launch"
         )));
     }
-    if engine.launch == ManagedEngineLaunch::Uv && kind != ManagedEngineKind::Vllm {
+    if engine.launch == ManagedEngineLaunch::Uv
+        && !matches!(kind, ManagedEngineKind::Vllm | ManagedEngineKind::SGLang)
+    {
         return Err(ModelHostConfigError::new(
-            "uv launch is supported only for vllm",
+            "uv launch is supported only for vllm and sglang",
         ));
     }
     if engine.version.as_deref() == Some("latest") {

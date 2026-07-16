@@ -365,6 +365,7 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     ) {
         let engine = match engine {
             Some(sbproxy_model_host::EngineKind::Vllm) => "vllm",
+            Some(sbproxy_model_host::EngineKind::SGLang) => "sglang",
             Some(sbproxy_model_host::EngineKind::LlamaCpp) => "llama_cpp",
             Some(sbproxy_model_host::EngineKind::Embedded) => "embedded",
             None => "unknown",
@@ -1608,6 +1609,7 @@ fn managed_deployment_from_model(
     let engine = match deployment.engine {
         sbproxy_model_host::EngineChoice::Auto => sbproxy_config::ManagedEngineChoice::Auto,
         sbproxy_model_host::EngineChoice::Vllm => sbproxy_config::ManagedEngineChoice::Vllm,
+        sbproxy_model_host::EngineChoice::SGLang => sbproxy_config::ManagedEngineChoice::SGLang,
         sbproxy_model_host::EngineChoice::LlamaCpp => sbproxy_config::ManagedEngineChoice::LlamaCpp,
         sbproxy_model_host::EngineChoice::Embedded => {
             anyhow::bail!("signed cluster deployments do not support the embedded engine")

@@ -189,6 +189,20 @@ pub fn plan_binary_acquire_with_cuda(
                     .to_string(),
             ),
         },
+        // SGLang mirrors vLLM here: a Python-package engine, not a single
+        // binary. The `vllm_version` field of `ProvisionUvx` carries the
+        // pinned SGLang package version; `wrap_uvx` runs `python -m
+        // sglang.launch_server` for it.
+        EngineKind::SGLang => match acquire.map(|a| a.source) {
+            Some(AcquireSource::Uvx) => BinaryAcquirePlan::ProvisionUvx {
+                vllm_version: acquire.and_then(|a| a.version.clone()),
+            },
+            _ => BinaryAcquirePlan::Blocked(
+                "SGLang is not a single-binary release; set engines.sglang.acquire.source: uvx to \
+                 run it via `uv tool run`, or use a container"
+                    .to_string(),
+            ),
+        },
         EngineKind::Embedded => BinaryAcquirePlan::Blocked(
             "the embedded engine runs in-process; there is no binary to acquire".to_string(),
         ),

@@ -38,6 +38,14 @@ pub enum EngineKind {
     /// subprocess over its OpenAI-compatible HTTP surface.
     #[default]
     Vllm,
+    /// SGLang (WOR-1905), driven as a supervised subprocess over its
+    /// OpenAI-compatible HTTP surface, exactly like vLLM. The real launch
+    /// is `python -m sglang.launch_server`; the sentinel binary name is
+    /// never resolved on `PATH`. It loads the same safetensors weights as
+    /// vLLM on a CUDA worker and leads on RadixAttention prefix caching and
+    /// high-concurrency throughput, so it is an explicit opt-in alternative.
+    #[serde(rename = "sglang")]
+    SGLang,
     /// llama.cpp `llama-server`, the low-VRAM / GGUF / edge path.
     LlamaCpp,
     /// In-process engine (WOR-1658): no subprocess, no external binary.
@@ -57,6 +65,10 @@ impl EngineKind {
     pub fn binary_name(self) -> &'static str {
         match self {
             EngineKind::Vllm => "vllm",
+            // A sentinel: SGLang is launched as `python -m
+            // sglang.launch_server`, so this name is never resolved on
+            // `PATH`. The managed driver owns the real invocation.
+            EngineKind::SGLang => "sglang",
             EngineKind::LlamaCpp => "llama-server",
             EngineKind::Embedded => "embedded",
         }
@@ -84,6 +96,11 @@ pub enum EngineChoice {
     Auto,
     /// Force vLLM.
     Vllm,
+    /// Force SGLang (WOR-1905). `Auto` never resolves to this: SGLang is
+    /// an explicit opt-in that stays behind vLLM as the safetensors
+    /// default until it is certified on real hardware.
+    #[serde(rename = "sglang")]
+    SGLang,
     /// Force llama.cpp.
     LlamaCpp,
     /// Force the in-process embedded engine (WOR-1658). `Auto` never
@@ -107,6 +124,7 @@ impl EngineChoice {
     pub fn resolve(self, is_gguf: bool, _container_runtime: bool) -> EngineKind {
         match self {
             EngineChoice::Vllm => EngineKind::Vllm,
+            EngineChoice::SGLang => EngineKind::SGLang,
             EngineChoice::LlamaCpp => EngineKind::LlamaCpp,
             EngineChoice::Embedded => EngineKind::Embedded,
             EngineChoice::Auto if is_gguf => EngineKind::LlamaCpp,
@@ -119,6 +137,7 @@ impl EngineChoice {
     pub fn resolve_reason(self, is_gguf: bool, _container_runtime: bool) -> &'static str {
         match self {
             EngineChoice::Vllm => "engine: vllm (forced)",
+            EngineChoice::SGLang => "engine: sglang (forced, opt-in)",
             EngineChoice::LlamaCpp => "engine: llama_cpp (forced)",
             EngineChoice::Embedded => "engine: embedded (forced, in-process)",
             EngineChoice::Auto if is_gguf => "auto -> llama_cpp (GGUF weights)",
@@ -771,12 +790,15 @@ impl ModelHostConfig {
                     }
                 }
                 // `uvx` provisions a Python package via `uv tool run`, which
-                // is the vLLM path; a binary engine (llama.cpp) uses a
-                // release or an explicit path instead.
-                if acq.source == AcquireSource::Uvx && *kind != EngineKind::Vllm {
+                // is the vLLM and SGLang path (both are Python packages); a
+                // binary engine (llama.cpp) uses a release or an explicit
+                // path instead.
+                if acq.source == AcquireSource::Uvx
+                    && !matches!(*kind, EngineKind::Vllm | EngineKind::SGLang)
+                {
                     return Err(format!(
-                        "engine {kind:?} acquire.source: uvx is only for vllm (a Python package); \
-                         use release or path for a binary engine"
+                        "engine {kind:?} acquire.source: uvx is only for vllm or sglang (Python \
+                         packages); use release or path for a binary engine"
                     ));
                 }
                 if acq.source == AcquireSource::SourceBuild
@@ -876,6 +898,20 @@ impl EngineDoctor {
                     }),
                 )
             }
+            EngineKind::SGLang => {
+                // SGLang mirrors vLLM here: a Python-package engine with no
+                // single binary on PATH. It runs from a container or the
+                // uvx path on a Linux host (the same acquisition surface as
+                // vLLM, so the `vllm_uvx` Linux signal applies to it too).
+                let ok = env.container_runtime || env.vllm_uvx;
+                (
+                    ok,
+                    (!ok).then(|| {
+                        "SGLang needs a container runtime or a Linux host for the uvx path"
+                            .to_string()
+                    }),
+                )
+            }
             EngineKind::Embedded => {
                 // The in-process engine needs no binary; it needs the
                 // `embedded` feature compiled into this build (WOR-1658).
@@ -949,18 +985,40 @@ models:
     #[test]
     fn engine_binary_names() {
         assert_eq!(EngineKind::Vllm.binary_name(), "vllm");
+        assert_eq!(EngineKind::SGLang.binary_name(), "sglang");
         assert_eq!(EngineKind::LlamaCpp.binary_name(), "llama-server");
         assert_eq!(EngineKind::Embedded.binary_name(), "embedded");
     }
 
     #[test]
     fn unknown_engine_is_rejected() {
+        // `sglang` is now a valid allowlisted engine (WOR-1905), so the
+        // rejection test uses a genuinely-unknown engine name.
         let r: Result<ModelHostConfig, _> =
-            serde_yaml::from_str("models:\n  - model: x\n    engine: sglang\n");
+            serde_yaml::from_str("models:\n  - model: x\n    engine: tensorrt\n");
         assert!(
             r.is_err(),
-            "engine is an allowlisted enum; sglang must reject"
+            "engine is an allowlisted enum; an unknown engine must reject"
         );
+    }
+
+    #[test]
+    fn sglang_engine_parses() {
+        // WOR-1905: `engine: sglang` parses to the forced SGLang choice.
+        // The variant is `SGLang` but renamed to `sglang` for config, since
+        // snake_case would otherwise produce `s_g_lang`.
+        let cfg: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: qwen3-8b\n    engine: sglang\n")
+                .expect("sglang parses");
+        assert_eq!(cfg.models[0].engine, EngineChoice::SGLang);
+        // SGLang is a forced choice: Auto never resolves to it.
+        assert_eq!(
+            EngineChoice::SGLang.resolve(false, true),
+            EngineKind::SGLang
+        );
+        assert_eq!(EngineChoice::Auto.resolve(false, true), EngineKind::Vllm);
+        // SGLang is a subprocess engine, not in-process.
+        assert!(!EngineKind::SGLang.is_in_process());
     }
 
     #[test]
@@ -1130,6 +1188,7 @@ models:
         // among a fixed set and can never inject an executable path.
         for (kind, expect) in [
             (EngineKind::Vllm, "vllm"),
+            (EngineKind::SGLang, "sglang"),
             (EngineKind::LlamaCpp, "llama-server"),
             (EngineKind::Embedded, "embedded"),
         ] {

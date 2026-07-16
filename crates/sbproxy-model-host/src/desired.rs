@@ -445,11 +445,14 @@ pub(crate) fn validate_legacy_managed_compatibility(
     // `auto`; the reject is deferred to prepare (which re-runs this with the
     // resolved engine) rather than guessing, so only a pinned non-vLLM
     // engine trips the passthrough gate early.
+    // The four tuning passthroughs are vLLM flags emitted only by the vLLM
+    // driver. SGLang, like llama.cpp, does not consume them, so an
+    // explicitly non-vLLM engine that sets them is rejected.
     let vllm_passthrough_supported = match resolved_engine {
         Some(kind) => kind == EngineKind::Vllm,
         None => !matches!(
             entry.engine,
-            EngineChoice::LlamaCpp | EngineChoice::Embedded
+            EngineChoice::LlamaCpp | EngineChoice::Embedded | EngineChoice::SGLang
         ),
     };
 
@@ -509,7 +512,10 @@ fn validate_canonical_engine_tuning(
     // The four vLLM tuning passthroughs are emitted only by the vLLM driver, so
     // an explicitly non-vLLM engine that sets them is rejected. engine: auto
     // defers to the resolved engine, which ignores them when it is not vLLM.
-    if config.engine == ManagedEngineChoice::LlamaCpp {
+    if matches!(
+        config.engine,
+        ManagedEngineChoice::LlamaCpp | ManagedEngineChoice::SGLang
+    ) {
         let mut unsupported = Vec::new();
         if config.chunked_prefill.is_some() {
             unsupported.push("chunked_prefill");
@@ -525,7 +531,7 @@ fn validate_canonical_engine_tuning(
         }
         if !unsupported.is_empty() {
             return Err(DesiredStateError::Invalid(format!(
-                "managed deployment {id:?} sets vLLM-only serving fields on engine: llama_cpp: {}. pin engine: vllm or remove them.",
+                "managed deployment {id:?} sets vLLM-only serving fields on a non-vLLM engine: {}. pin engine: vllm or remove them.",
                 unsupported.join(", ")
             )));
         }
@@ -535,6 +541,7 @@ fn validate_canonical_engine_tuning(
     }
     let engines: &[EngineKind] = match config.engine {
         ManagedEngineChoice::Vllm => &[EngineKind::Vllm],
+        ManagedEngineChoice::SGLang => &[EngineKind::SGLang],
         ManagedEngineChoice::LlamaCpp => &[EngineKind::LlamaCpp],
         ManagedEngineChoice::Auto => &[EngineKind::LlamaCpp, EngineKind::Vllm],
     };
@@ -601,6 +608,7 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
         engine: match config.engine {
             ManagedEngineChoice::Auto => EngineChoice::Auto,
             ManagedEngineChoice::Vllm => EngineChoice::Vllm,
+            ManagedEngineChoice::SGLang => EngineChoice::SGLang,
             ManagedEngineChoice::LlamaCpp => EngineChoice::LlamaCpp,
         },
         rollout: match config.rollout {

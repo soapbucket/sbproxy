@@ -58,6 +58,7 @@ impl EngineDriver for FixtureDriver {
             artifact_formats: match self.kind {
                 EngineKind::LlamaCpp => vec![ArtifactFormat::Gguf],
                 EngineKind::Vllm => vec![ArtifactFormat::Safetensors],
+                EngineKind::SGLang => vec![ArtifactFormat::Safetensors],
                 EngineKind::Embedded => Vec::new(),
             },
             accelerators: vec![sbproxy_model_host::AcceleratorKind::Cpu],
@@ -563,6 +564,17 @@ fn unsafe_arguments_cannot_override_runtime_owned_launch_fields() {
         (EngineKind::LlamaCpp, vec!["--api-key", "secret"]),
         (EngineKind::LlamaCpp, vec!["--device", "CUDA7"]),
         (EngineKind::LlamaCpp, vec!["--mount", "/:/host"]),
+        // WOR-1905: SGLang keeps model-path, host, port, and tp-size
+        // runtime-owned, the same way vLLM keeps --tensor-parallel-size off.
+        (EngineKind::SGLang, vec!["--model-path", "/tmp/other"]),
+        (EngineKind::SGLang, vec!["--host", "0.0.0.0"]),
+        (EngineKind::SGLang, vec!["--port=9000"]),
+        (EngineKind::SGLang, vec!["--tp-size", "8"]),
+        (EngineKind::SGLang, vec!["--mem-fraction-static", "1.5"]),
+        (
+            EngineKind::SGLang,
+            vec!["--schedule-conservativeness", "-1"],
+        ),
     ] {
         let arguments = arguments
             .into_iter()
@@ -591,6 +603,28 @@ fn unsafe_arguments_cannot_override_runtime_owned_launch_fields() {
         )
         .expect("allowlisted llama.cpp arguments"),
         vec!["--flash-attn", "--threads=8"]
+    );
+    // WOR-1905: SGLang's stable allowlist accepts its safe tuning knobs,
+    // including a bounded float fraction and a non-negative float.
+    assert_eq!(
+        validate_engine_args(
+            EngineKind::SGLang,
+            &[
+                "--enable-torch-compile".to_string(),
+                "--disable-radix-cache".to_string(),
+                "--mem-fraction-static=0.85".to_string(),
+                "--schedule-conservativeness".to_string(),
+                "1.3".to_string(),
+            ]
+        )
+        .expect("allowlisted sglang arguments"),
+        vec![
+            "--enable-torch-compile",
+            "--disable-radix-cache",
+            "--mem-fraction-static=0.85",
+            "--schedule-conservativeness",
+            "1.3",
+        ]
     );
 }
 

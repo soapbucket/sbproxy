@@ -3331,7 +3331,11 @@ pub fn set_model_host_deployment_state(deployment: &str, engine: &str, state: &s
         .expect("model host deployment-state gauge registers")
     });
     let deployment = sanitize_label("deployment", deployment);
-    let engine = closed_label(engine, &["vllm", "llama_cpp", "embedded"], "unknown");
+    let engine = closed_label(
+        engine,
+        &["vllm", "sglang", "llama_cpp", "embedded"],
+        "unknown",
+    );
     let state = closed_label(state, STATES, "unknown");
     let previous = PREVIOUS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut previous = previous
