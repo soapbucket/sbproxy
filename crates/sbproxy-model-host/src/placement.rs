@@ -459,6 +459,7 @@ fn select_engine(
     let explicit = match choice {
         EngineChoice::Auto => None,
         EngineChoice::Vllm => Some(EngineKind::Vllm),
+        EngineChoice::SGLang => Some(EngineKind::SGLang),
         EngineChoice::LlamaCpp => Some(EngineKind::LlamaCpp),
         EngineChoice::Embedded => Some(EngineKind::Embedded),
     };

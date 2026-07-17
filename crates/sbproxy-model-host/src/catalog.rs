@@ -699,6 +699,7 @@ fn fill_legacy_projection(model: &str, entry: &mut CatalogEntry) {
     if entry.engine == crate::config::EngineChoice::Auto {
         entry.engine = match variant.engines.first() {
             Some(crate::config::EngineKind::Vllm) => crate::config::EngineChoice::Vllm,
+            Some(crate::config::EngineKind::SGLang) => crate::config::EngineChoice::SGLang,
             Some(crate::config::EngineKind::LlamaCpp) => crate::config::EngineChoice::LlamaCpp,
             Some(crate::config::EngineKind::Embedded) => crate::config::EngineChoice::Embedded,
             None => crate::config::EngineChoice::Auto,

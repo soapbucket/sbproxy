@@ -903,6 +903,38 @@ Tagged images, `latest`, writable artifact mounts, arbitrary container argv, and
 unscoped devices are rejected. Live container certification is also deferred to
 the final GCP PR.
 
+### SGLang
+
+SGLang runs the same OpenAI-compatible server model as vLLM and loads the same
+safetensors weights on a CUDA worker. The real launch is `python -m
+sglang.launch_server`, so there is no single binary to install: the runtime
+provisions it from a pinned uv environment or a digest-pinned container, the
+same two paths vLLM uses. The readiness probe and dispatch path are identical.
+
+```yaml
+engines:
+  sglang:
+    launch: uv
+    version: 0.4.6.post1
+    acceleration: cuda
+models:
+  - model: qwen3-32b
+    engine: sglang
+```
+
+Choose SGLang when you want RadixAttention prefix caching, higher structured-output
+throughput, or better behavior under high-concurrency agent traffic. It shares
+tensor parallelism, quantization, and context sizing with vLLM, and the runtime
+owns `--model-path`, `--host`, `--port`, and `--tp-size` so config cannot
+contradict the device placement. Its stable extra-argument allowlist is
+`--enable-torch-compile`, `--disable-radix-cache`, `--schedule-conservativeness`,
+and `--mem-fraction-static`.
+
+vLLM stays the default. SGLang is an explicit opt-in: `engine: auto` never
+resolves to it, and you name `engine: sglang` on a model or an `sglang` block
+under `engines:` to select it. It ships at preview support until it is certified
+on real NVIDIA hardware, and it targets CUDA only for now.
+
 ## Admission and residency
 
 Each deployment has its own active cap and bounded queue. Priority is read from

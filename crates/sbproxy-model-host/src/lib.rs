@@ -71,6 +71,7 @@ pub mod rollout;
 pub mod runtime;
 pub mod runtime_manager;
 pub mod scheduling;
+pub mod sglang_driver;
 pub mod sleep_wake;
 pub mod supervisor;
 pub mod supply_chain;
@@ -207,6 +208,9 @@ pub use runtime_manager::{
     ProductionDeploymentPreparer, ReconcilePlan, ReconcileReport, RuntimeManagerError,
 };
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
+pub use sglang_driver::{
+    build_sglang_container_plan, SGLangContainerPlan, SGLangDriver, DEFAULT_SGLANG_VERSION,
+};
 pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};
 pub use supervisor::{
     BackoffPolicy, CrashLoopState, EngineLauncher, EngineState, EngineSupervisor, LaunchSpec,

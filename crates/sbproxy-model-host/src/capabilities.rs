@@ -432,8 +432,10 @@ fn assert_cluster_placement_converges() -> Result<(), String> {
 fn assert_managed_driver_capabilities() -> Result<(), String> {
     let llama = crate::LlamaCppDriver::default();
     let vllm = crate::VllmDriver::default();
+    let sglang = crate::SGLangDriver::default();
     let llama_capabilities = crate::EngineDriver::capabilities(&llama);
     let vllm_capabilities = crate::EngineDriver::capabilities(&vllm);
+    let sglang_capabilities = crate::EngineDriver::capabilities(&sglang);
     if llama_capabilities.artifact_formats != [crate::ArtifactFormat::Gguf]
         || llama_capabilities.supports_container
         || llama_capabilities.supports_uv
@@ -450,6 +452,18 @@ fn assert_managed_driver_capabilities() -> Result<(), String> {
     {
         return Err(format!(
             "unexpected vLLM capabilities: {vllm_capabilities:?}"
+        ));
+    }
+    // SGLang mirrors vLLM: safetensors + CUDA, container and uv, no GGUF.
+    if sglang_capabilities.artifact_formats != [crate::ArtifactFormat::Safetensors]
+        || !sglang_capabilities
+            .accelerators
+            .contains(&crate::AcceleratorKind::Cuda)
+        || !sglang_capabilities.supports_container
+        || !sglang_capabilities.supports_uv
+    {
+        return Err(format!(
+            "unexpected SGLang capabilities: {sglang_capabilities:?}"
         ));
     }
     Ok(())
@@ -1191,6 +1205,14 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         domain: CapabilityDomain::Engine,
         status: SupportLevel::Preview,
         summary: "Digest-pinned private container plans use read-only artifacts and selected devices; live NVIDIA certification remains deferred.",
+        evidence: &["test.engine_drivers"],
+        consumer: None,
+    },
+    CapabilityEntry {
+        id: "engine.sglang",
+        domain: CapabilityDomain::Engine,
+        status: SupportLevel::Preview,
+        summary: "Managed SGLang serves safetensors weights on a CUDA worker from a pinned uv environment or a digest-pinned container, mirroring vLLM and adding RadixAttention prefix caching; live NVIDIA certification remains deferred.",
         evidence: &["test.engine_drivers"],
         consumer: None,
     },

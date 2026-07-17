@@ -1247,6 +1247,11 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                 crate::config::EngineKind::Vllm => {
                     crate::launch::vllm_use_local_snapshot(&mut spec.args, &ready.snapshot_path);
                 }
+                crate::config::EngineKind::SGLang => {
+                    // SGLang mirrors vLLM here: retarget `--model-path` to
+                    // the verified immutable snapshot.
+                    crate::launch::sglang_use_local_snapshot(&mut spec.args, &ready.snapshot_path);
+                }
                 crate::config::EngineKind::LlamaCpp => {
                     let local = managed_gguf.as_ref().ok_or_else(|| {
                         RuntimeError::Artifact(
@@ -1319,11 +1324,12 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                     spec.program = path.to_string_lossy().into_owned();
                 }
                 crate::acquire::BinaryAcquirePlan::ProvisionUvx { vllm_version } => {
-                    // Fetch uv, then run vLLM through `uv tool run`. uv sets
-                    // up (and caches) the environment, and its default wheel
-                    // is CUDA-enabled, so this offloads to an NVIDIA GPU on a
-                    // box that only carries the driver. Best-effort: on
-                    // failure, fall back to spawning `vllm` from PATH.
+                    // Fetch uv, then run the Python-package engine (vLLM or
+                    // SGLang) through `uv tool run`. uv sets up (and caches)
+                    // the environment, and the default wheel is CUDA-enabled,
+                    // so this offloads to an NVIDIA GPU on a box that only
+                    // carries the driver. `wrap_uvx` dispatches on the engine.
+                    // Best-effort: on failure, fall back to spawning from PATH.
                     match self.acquire_uv().await {
                         Ok(uv) => {
                             spec = crate::launch::wrap_uvx(
@@ -1332,14 +1338,14 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                                 vllm_version.as_deref(),
                             );
                             tracing::info!(
-                                engine = "vllm",
-                                "running vLLM via uvx; the first launch provisions the environment \
-                                 (this can take several minutes and a few GB)"
+                                engine = engine_kind.binary_name(),
+                                "running the engine via uvx; the first launch provisions the \
+                                 environment (this can take several minutes and a few GB)"
                             );
                         }
                         Err(e) => tracing::warn!(
-                            engine = "vllm",
-                            "uv acquisition for the vLLM uvx path failed: {e}; falling back to PATH"
+                            engine = engine_kind.binary_name(),
+                            "uv acquisition for the uvx path failed: {e}; falling back to PATH"
                         ),
                     }
                 }

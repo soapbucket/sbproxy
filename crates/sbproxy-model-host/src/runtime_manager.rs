@@ -24,7 +24,7 @@ use crate::{
     EngineProvisioning, FileDeploymentRevisionStore, GpuProbe, KvCacheQuant, LaunchRequest,
     LegacyHostPolicy, LlamaCppDriver, ModelMetadata, ModelMetadataProvider, NetworkPolicy,
     OperationJob, ProvisionRequest, PullIntent, ResolveArtifactRequest, RunningEngine,
-    RuntimeDesiredState, VllmDriver, WorkerProfile,
+    RuntimeDesiredState, SGLangDriver, VllmDriver, WorkerProfile,
 };
 
 /// Reconciliation, preparation, or lifecycle failure.
@@ -2747,6 +2747,10 @@ impl ProductionDeploymentPreparer {
                 EngineKind::Vllm,
                 Arc::new(VllmDriver::default()) as Arc<dyn EngineDriver>,
             ),
+            (
+                EngineKind::SGLang,
+                Arc::new(SGLangDriver::default()) as Arc<dyn EngineDriver>,
+            ),
         ]);
         Self {
             catalog,
@@ -3373,6 +3377,7 @@ fn provisioning_for(request: &DeploymentPrepareRequest, kind: EngineKind) -> Eng
     }
     let managed_kind = match kind {
         EngineKind::Vllm => sbproxy_config::ManagedEngineKind::Vllm,
+        EngineKind::SGLang => sbproxy_config::ManagedEngineKind::SGLang,
         EngineKind::LlamaCpp => sbproxy_config::ManagedEngineKind::LlamaCpp,
         EngineKind::Embedded => return EngineProvisioning::default(),
     };

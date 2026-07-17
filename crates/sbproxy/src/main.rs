@@ -572,6 +572,8 @@ enum ModelEngineArg {
     #[default]
     Auto,
     Vllm,
+    #[value(name = "sglang")]
+    SGLang,
     LlamaCpp,
     Embedded,
 }
@@ -581,6 +583,7 @@ impl From<ModelEngineArg> for sbproxy_model_host::EngineChoice {
         match value {
             ModelEngineArg::Auto => Self::Auto,
             ModelEngineArg::Vllm => Self::Vllm,
+            ModelEngineArg::SGLang => Self::SGLang,
             ModelEngineArg::LlamaCpp => Self::LlamaCpp,
             ModelEngineArg::Embedded => Self::Embedded,
         }
@@ -2006,11 +2009,16 @@ fn parse_run_engine(value: &str) -> anyhow::Result<sbproxy_model_host::EngineCho
     match value {
         "auto" => Ok(sbproxy_model_host::EngineChoice::Auto),
         "vllm" => Ok(sbproxy_model_host::EngineChoice::Vllm),
+        "sglang" => Ok(sbproxy_model_host::EngineChoice::SGLang),
         "llama_cpp" => Ok(sbproxy_model_host::EngineChoice::LlamaCpp),
         "embedded" => {
-            anyhow::bail!("embedded is not a managed process engine; use auto, vllm, or llama_cpp")
+            anyhow::bail!(
+                "embedded is not a managed process engine; use auto, vllm, sglang, or llama_cpp"
+            )
         }
-        other => anyhow::bail!("unknown engine '{other}'; use auto, vllm, or llama_cpp"),
+        other => {
+            anyhow::bail!("unknown engine '{other}'; use auto, vllm, sglang, or llama_cpp")
+        }
     }
 }
 
@@ -2089,6 +2097,11 @@ fn prepare_run(args: &RunArgs) -> anyhow::Result<PreparedRun> {
         sbproxy_model_host::EngineKind::Vllm => serde_json::json!({
             "launch": "uv",
             "version": sbproxy_model_host::DEFAULT_VLLM_VERSION,
+            "acceleration": acceleration,
+        }),
+        sbproxy_model_host::EngineKind::SGLang => serde_json::json!({
+            "launch": "uv",
+            "version": sbproxy_model_host::DEFAULT_SGLANG_VERSION,
             "acceleration": acceleration,
         }),
         sbproxy_model_host::EngineKind::LlamaCpp => serde_json::json!({
@@ -2306,6 +2319,7 @@ struct ModelsPullOutput {
 fn engine_kind_name(engine: sbproxy_model_host::EngineKind) -> &'static str {
     match engine {
         sbproxy_model_host::EngineKind::Vllm => "vllm",
+        sbproxy_model_host::EngineKind::SGLang => "sglang",
         sbproxy_model_host::EngineKind::LlamaCpp => "llama_cpp",
         sbproxy_model_host::EngineKind::Embedded => "embedded",
     }
@@ -2350,6 +2364,7 @@ fn managed_engine_choice(
     match engine {
         sbproxy_config::ManagedEngineChoice::Auto => sbproxy_model_host::EngineChoice::Auto,
         sbproxy_config::ManagedEngineChoice::Vllm => sbproxy_model_host::EngineChoice::Vllm,
+        sbproxy_config::ManagedEngineChoice::SGLang => sbproxy_model_host::EngineChoice::SGLang,
         sbproxy_config::ManagedEngineChoice::LlamaCpp => sbproxy_model_host::EngineChoice::LlamaCpp,
     }
 }
@@ -2833,6 +2848,9 @@ fn configured_artifact_protection(
             let engine = match deployment.engine {
                 sbproxy_config::ManagedEngineChoice::Auto => sbproxy_model_host::EngineChoice::Auto,
                 sbproxy_config::ManagedEngineChoice::Vllm => sbproxy_model_host::EngineChoice::Vllm,
+                sbproxy_config::ManagedEngineChoice::SGLang => {
+                    sbproxy_model_host::EngineChoice::SGLang
+                }
                 sbproxy_config::ManagedEngineChoice::LlamaCpp => {
                     sbproxy_model_host::EngineChoice::LlamaCpp
                 }
@@ -3180,6 +3198,7 @@ fn engine_choice_name(engine: sbproxy_model_host::EngineChoice) -> &'static str 
     match engine {
         sbproxy_model_host::EngineChoice::Auto => "auto",
         sbproxy_model_host::EngineChoice::Vllm => "vllm",
+        sbproxy_model_host::EngineChoice::SGLang => "sglang",
         sbproxy_model_host::EngineChoice::LlamaCpp => "llama_cpp",
         sbproxy_model_host::EngineChoice::Embedded => "embedded",
     }
