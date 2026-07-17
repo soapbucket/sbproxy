@@ -93,13 +93,21 @@ to the first request, or `manual` to require a prior `sbproxy models pull`.
 `sbproxy doctor` answers "can this host serve models" with no config
 at all: build capabilities, visible devices, engines on PATH, container
 runtime, the model cache, and a local-runtime verdict with every
-blocker listed. For each engine it names the acquisition options viable
-here (a pinned llama.cpp release, or vLLM via uvx), and the runtime then
-acquires the engine on first use. What doctor still cannot supply is a
-host prerequisite it can only report: a GPU driver, or the
-`build-essential` and `python3-dev` that vLLM's Triton compile needs. A
-missing prerequisite is a doctor-time message, not a spawn failure at
-2am on the first request.
+blocker listed. When a container runtime is present, that is the path
+SBproxy prefers for a GPU engine: it pulls a digest-pinned image and
+runs the engine in a container, so the host needs only an NVIDIA driver
+and no Python or CUDA build toolchain. For each engine doctor names the
+acquisition options viable here (a pinned llama.cpp release, a
+digest-pinned vLLM image, or vLLM via uvx), and the runtime then
+acquires the engine on first use.
+
+The uv path is the no-docker fallback, and it is the one with host
+prerequisites doctor can only report, not supply: a GPU driver, plus the
+Python development headers (`python3-dev`), `ninja`, and CUDA development
+toolchain (`nvcc` and the CUDA headers) that vLLM's Triton compile
+needs. A missing prerequisite is a doctor-time message, not a spawn
+failure at 2am on the first request. Prefer the container path unless
+the host cannot run one.
 
 `sbproxy validate <path>` parses and validates the config offline,
 and `sbproxy plan -f sb.yml [--against baseline.yml]` diffs it: it

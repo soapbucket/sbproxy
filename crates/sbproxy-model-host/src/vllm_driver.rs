@@ -22,6 +22,18 @@ use crate::{
 /// Default vLLM package pin used by managed uv provisioning.
 pub const DEFAULT_VLLM_VERSION: &str = "0.10.0";
 
+/// Curated digest-pinned default vLLM container image (WOR-1917).
+///
+/// This exact digest is validated: it served real tokens on an NVIDIA L4.
+/// It matches [`DEFAULT_VLLM_VERSION`] (vLLM 0.10.0). The container-first
+/// default selects it when the operator has not configured vLLM
+/// provisioning and the worker has a container runtime, because the image
+/// packages the whole CUDA and Python toolchain and serves cleanly with no
+/// host build cascade. It is pinned by an immutable sha256 digest, never a
+/// floating tag.
+pub const DEFAULT_VLLM_IMAGE: &str =
+    "vllm/vllm-openai@sha256:05a31dc4185b042e91f4d2183689ac8a87bd845713d5c3f987563c5899878271";
+
 const DEFAULT_SHM_SIZE_GIB: u64 = 4;
 const CONTAINER_PORT: u16 = 8000;
 const PRIVATE_NETWORK: &str = "sbproxy-model-host";
@@ -1089,8 +1101,19 @@ fn unix_time_ms() -> Result<u64, EngineDriverError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_tensor_parallel_arguments, append_vllm_passthrough_arguments};
+    use super::{
+        append_tensor_parallel_arguments, append_vllm_passthrough_arguments, digest_pinned_image,
+        DEFAULT_VLLM_IMAGE,
+    };
     use crate::{ChunkedPrefill, EngineTuning};
+
+    #[test]
+    fn default_vllm_image_is_digest_pinned() {
+        // The curated container-first default must be an immutable digest so
+        // the container driver accepts it without an operator override.
+        assert!(digest_pinned_image(DEFAULT_VLLM_IMAGE));
+        assert!(DEFAULT_VLLM_IMAGE.starts_with("vllm/vllm-openai@sha256:"));
+    }
 
     fn value_after(arguments: &[String], flag: &str) -> String {
         let index = arguments

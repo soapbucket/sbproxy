@@ -2896,7 +2896,12 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
         if let Some(entry) = request.desired.legacy_entry.as_ref() {
             validate_legacy_managed_entry(entry, resolved.engine)?;
         }
-        let provisioning = provisioning_for(&request, resolved.engine);
+        // WOR-1917: a container runtime makes container the default engine
+        // launch, so probe docker/podman once here and thread it into the
+        // default-provisioning decision (the same signal `EngineEnv` uses).
+        let container_runtime = crate::llama_release::resolve_on_path("docker").is_some()
+            || crate::llama_release::resolve_on_path("podman").is_some();
+        let provisioning = provisioning_for(&request, resolved.engine, container_runtime);
         let detection = driver.detect(&worker, &provisioning);
         let driver_availability = detection.availability;
         match detection.availability {
@@ -3366,7 +3371,49 @@ impl PreparedDeploymentRuntime for ProductionPreparedDeployment {
     }
 }
 
-fn provisioning_for(request: &DeploymentPrepareRequest, kind: EngineKind) -> EngineProvisioning {
+/// The curated digest-pinned default container image for a
+/// container-capable Python engine (WOR-1917), or `None` for an engine that
+/// has no container-first default here (llama.cpp, the embedded engine).
+fn default_container_image(kind: EngineKind) -> Option<&'static str> {
+    match kind {
+        EngineKind::Vllm => Some(crate::vllm_driver::DEFAULT_VLLM_IMAGE),
+        EngineKind::SGLang => Some(crate::sglang_driver::DEFAULT_SGLANG_IMAGE),
+        EngineKind::LlamaCpp | EngineKind::Embedded => None,
+    }
+}
+
+/// The container-first default provisioning (WOR-1917) for an engine the
+/// operator did not configure under `engines:`.
+///
+/// Returns `Some` container provisioning when the worker has a container
+/// runtime and the engine is a container-capable Python engine (vLLM or
+/// SGLang); it packages the whole CUDA and Python toolchain, so it serves
+/// cleanly with no host build cascade, unlike the fragile host uv path.
+/// Returns `None` when the caller should keep the prior binary/uv default:
+/// no container runtime, or a non-container engine (llama.cpp, embedded). A
+/// per-deployment `engine_image` pin overrides the curated default image.
+fn container_first_default(
+    kind: EngineKind,
+    container_runtime: bool,
+    pinned_image: Option<&str>,
+) -> Option<EngineProvisioning> {
+    if !container_runtime {
+        return None;
+    }
+    let default_image = default_container_image(kind)?;
+    Some(EngineProvisioning {
+        launch: EngineLaunchMethod::Container,
+        image: Some(pinned_image.unwrap_or(default_image).to_string()),
+        acquire: None,
+        shm_size_gib: None,
+    })
+}
+
+fn provisioning_for(
+    request: &DeploymentPrepareRequest,
+    kind: EngineKind,
+    container_runtime: bool,
+) -> EngineProvisioning {
     if request.desired.origin == crate::DesiredDeploymentOrigin::LegacyServe {
         return request
             .legacy_host_policy
@@ -3381,6 +3428,20 @@ fn provisioning_for(request: &DeploymentPrepareRequest, kind: EngineKind) -> Eng
         EngineKind::LlamaCpp => sbproxy_config::ManagedEngineKind::LlamaCpp,
         EngineKind::Embedded => return EngineProvisioning::default(),
     };
+    // WOR-1917: when the operator has not configured this engine under
+    // `engines:`, a container-capable Python engine defaults to a
+    // digest-pinned container launch wherever a container runtime is
+    // present. An explicit `engines:` block still wins (this branch is
+    // skipped when one is present), so only the default changes.
+    if !request.control.engines.contains_key(&managed_kind) {
+        if let Some(provisioning) = container_first_default(
+            kind,
+            container_runtime,
+            request.desired.desired.engine_image.as_deref(),
+        ) {
+            return provisioning;
+        }
+    }
     let config = request
         .control
         .engines
@@ -3876,7 +3937,9 @@ mod provisioning_tests {
         let control = "engines:\n  vllm:\n    launch: uv\n    version: 0.10.0\n";
         // With no per-deployment pin, the node policy's version resolves.
         let node = request("model: qwen3-8b\nengine: vllm\n", control);
-        let resolved = provisioning_for(&node, EngineKind::Vllm);
+        // The operator configured `engines.vllm`, so the container-first
+        // default is skipped regardless of the container-runtime signal.
+        let resolved = provisioning_for(&node, EngineKind::Vllm, false);
         assert_eq!(
             resolved.acquire.as_ref().and_then(|a| a.version.as_deref()),
             Some("0.10.0")
@@ -3887,7 +3950,7 @@ mod provisioning_tests {
             "model: qwen3-8b\nengine: vllm\nengine_version: 0.11.0\n",
             control,
         );
-        let resolved = provisioning_for(&pinned, EngineKind::Vllm);
+        let resolved = provisioning_for(&pinned, EngineKind::Vllm, false);
         assert_eq!(
             resolved.acquire.as_ref().and_then(|a| a.version.as_deref()),
             Some("0.11.0")
@@ -3902,7 +3965,86 @@ mod provisioning_tests {
             "model: qwen3-8b\nengine: vllm\nengine_image: vllm/vllm-openai:v0.11.0\n",
             control,
         );
-        let resolved = provisioning_for(&pinned, EngineKind::Vllm);
+        let resolved = provisioning_for(&pinned, EngineKind::Vllm, false);
         assert_eq!(resolved.image.as_deref(), Some("vllm/vllm-openai:v0.11.0"));
+    }
+
+    // --- WOR-1917: container-first default provisioning ---
+
+    #[test]
+    fn container_first_default_prefers_container_for_python_engines() {
+        // A container runtime present and a container-capable engine: the
+        // default is a container launch with the curated digest-pinned image.
+        let vllm = container_first_default(EngineKind::Vllm, true, None).expect("vllm default");
+        assert_eq!(vllm.launch, EngineLaunchMethod::Container);
+        assert_eq!(
+            vllm.image.as_deref(),
+            Some(crate::vllm_driver::DEFAULT_VLLM_IMAGE)
+        );
+        assert!(vllm.acquire.is_none());
+
+        let sglang =
+            container_first_default(EngineKind::SGLang, true, None).expect("sglang default");
+        assert_eq!(sglang.launch, EngineLaunchMethod::Container);
+        assert_eq!(
+            sglang.image.as_deref(),
+            Some(crate::sglang_driver::DEFAULT_SGLANG_IMAGE)
+        );
+    }
+
+    #[test]
+    fn container_first_default_keeps_binary_without_a_runtime() {
+        // No container runtime: fall through to the prior binary/uv default.
+        assert!(container_first_default(EngineKind::Vllm, false, None).is_none());
+        assert!(container_first_default(EngineKind::SGLang, false, None).is_none());
+    }
+
+    #[test]
+    fn container_first_default_skips_non_container_engines() {
+        // llama.cpp and the embedded engine have no container-first default
+        // even when a container runtime is present.
+        assert!(container_first_default(EngineKind::LlamaCpp, true, None).is_none());
+        assert!(container_first_default(EngineKind::Embedded, true, None).is_none());
+    }
+
+    #[test]
+    fn container_first_default_honours_a_per_deployment_image_pin() {
+        // A per-deployment `engine_image` pin overrides the curated default.
+        let pinned = "vllm/vllm-openai@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let resolved =
+            container_first_default(EngineKind::Vllm, true, Some(pinned)).expect("vllm default");
+        assert_eq!(resolved.image.as_deref(), Some(pinned));
+    }
+
+    #[test]
+    fn unconfigured_vllm_defaults_to_container_when_a_runtime_is_present() {
+        // No `engines:` block at all: with a container runtime the default
+        // vLLM provisioning is the curated digest-pinned container image.
+        let node = request(
+            "model: qwen3-8b\nengine: vllm\n",
+            "authority: file_managed\n",
+        );
+        let resolved = provisioning_for(&node, EngineKind::Vllm, true);
+        assert_eq!(resolved.launch, EngineLaunchMethod::Container);
+        assert_eq!(
+            resolved.image.as_deref(),
+            Some(crate::vllm_driver::DEFAULT_VLLM_IMAGE)
+        );
+
+        // Without a container runtime the default keeps the prior binary path.
+        let resolved = provisioning_for(&node, EngineKind::Vllm, false);
+        assert_eq!(resolved.launch, EngineLaunchMethod::Binary);
+        assert!(resolved.image.is_none());
+    }
+
+    #[test]
+    fn an_operator_uv_engine_block_still_wins_over_container_default() {
+        // An explicit `engines.vllm.launch: uv` wins even where a container
+        // runtime is present: only the DEFAULT changes.
+        let control = "engines:\n  vllm:\n    launch: uv\n    version: 0.10.0\n";
+        let node = request("model: qwen3-8b\nengine: vllm\n", control);
+        let resolved = provisioning_for(&node, EngineKind::Vllm, true);
+        assert_eq!(resolved.launch, EngineLaunchMethod::Venv);
+        assert!(resolved.image.is_none());
     }
 }

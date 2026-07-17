@@ -7,6 +7,8 @@
 #   SBPROXY_INSTALL   - install directory (default: $HOME/.local/bin)
 #   SBPROXY_SKIP_COSIGN - set to 1 to skip cosign verification even when cosign
 #                         is installed (the sha256 check is never skippable)
+#   SBPROXY_SKIP_GPU_SETUP - set to 1 to skip the optional NVIDIA container
+#                         runtime setup on a GPU host (see below)
 #
 # This is the front door of a gateway that will hold every provider API key in
 # your environment. It downloads a binary over the network, so it verifies that
@@ -27,6 +29,8 @@ main() {
     download_and_verify
     install_binary
     verify_install
+    # Best-effort GPU serving prerequisites; never aborts the install.
+    provision_gpu_container_runtime || true
 }
 
 detect_platform() {
@@ -273,6 +277,103 @@ verify_install() {
             echo "Add it with: export PATH=\"${INSTALL_DIR}:\$PATH\""
         fi
     fi
+}
+
+# Optionally provision a container runtime for GPU model serving.
+#
+# SBproxy's model host serves GPU models most reliably from a digest-pinned
+# engine container: the image packages the whole CUDA and Python toolchain, so
+# there is no host build cascade (a bare host uv path can fail on a missing
+# Python.h, ninja, or CUDA dev toolchain). This step makes that container path
+# available on a fresh GPU box.
+#
+# It is deliberately conservative. It runs only when an NVIDIA GPU is present
+# (nvidia-smi) and the host is apt-based (Debian/Ubuntu), installs Docker and
+# the NVIDIA Container Toolkit when they are missing, wires the NVIDIA runtime
+# into Docker, and is a no-op when Docker is already there. It never fails the
+# install: any error here is a warning, and an operator can serve through the
+# host uv path instead. Set SBPROXY_SKIP_GPU_SETUP=1 to skip it entirely.
+provision_gpu_container_runtime() {
+    if [ "${SBPROXY_SKIP_GPU_SETUP:-0}" = "1" ]; then
+        return 0
+    fi
+    # Only relevant on a box with an NVIDIA GPU.
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        return 0
+    fi
+    # Only the apt path is automated; other distros are left to the operator.
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo ""
+        echo "Note: NVIDIA GPU detected, but this is not an apt-based host."
+        echo "To serve engines from a container, install Docker and the NVIDIA"
+        echo "Container Toolkit manually, or serve through the host uv path."
+        return 0
+    fi
+
+    SUDO=""
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+        else
+            echo ""
+            echo "Note: NVIDIA GPU detected, but Docker and NVIDIA Container"
+            echo "Toolkit setup needs root and sudo is unavailable. Skipping;"
+            echo "install them manually to use the container engine path."
+            return 0
+        fi
+    fi
+
+    echo ""
+    echo "NVIDIA GPU detected. Preparing the container engine path so SBproxy"
+    echo "can serve from a digest-pinned image with no host CUDA/Python setup."
+
+    # Docker: install only when it is missing (a no-op when already present).
+    if command -v docker >/dev/null 2>&1; then
+        echo "Docker already present; leaving it as-is."
+    else
+        echo "Installing Docker (get.docker.com)..."
+        if ! curl -fsSL https://get.docker.com | $SUDO sh; then
+            echo "Warning: Docker install failed. Skipping GPU container setup;" >&2
+            echo "you can still serve through the host uv path." >&2
+            return 0
+        fi
+    fi
+
+    # NVIDIA Container Toolkit: add the apt repo and install when missing.
+    if command -v nvidia-ctk >/dev/null 2>&1; then
+        echo "NVIDIA Container Toolkit already present."
+    else
+        echo "Installing the NVIDIA Container Toolkit..."
+        _keyring="/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+        _list="/etc/apt/sources.list.d/nvidia-container-toolkit.list"
+        if ! curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+                | $SUDO gpg --dearmor -o "$_keyring" 2>/dev/null; then
+            echo "Warning: could not fetch the NVIDIA Container Toolkit key." >&2
+            echo "Skipping GPU container setup; use the host uv path instead." >&2
+            return 0
+        fi
+        if ! curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+                | sed "s#deb https://#deb [signed-by=${_keyring}] https://#g" \
+                | $SUDO tee "$_list" >/dev/null; then
+            echo "Warning: could not write the NVIDIA Container Toolkit repo." >&2
+            return 0
+        fi
+        if ! { $SUDO apt-get update && $SUDO apt-get install -y nvidia-container-toolkit; }; then
+            echo "Warning: NVIDIA Container Toolkit install failed. Skipping GPU" >&2
+            echo "container setup; serve through the host uv path instead." >&2
+            return 0
+        fi
+    fi
+
+    # Wire the NVIDIA runtime into Docker and restart it so containers can
+    # request GPUs. Both steps are best-effort.
+    $SUDO nvidia-ctk runtime configure --runtime=docker >/dev/null 2>&1 \
+        || echo "Warning: could not configure the Docker NVIDIA runtime." >&2
+    $SUDO systemctl restart docker >/dev/null 2>&1 \
+        || $SUDO service docker restart >/dev/null 2>&1 \
+        || echo "Note: restart Docker to activate the NVIDIA runtime." >&2
+
+    echo "GPU container runtime ready."
 }
 
 main
