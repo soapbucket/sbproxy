@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-15*
+*Last modified: 2026-07-16*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -864,30 +864,22 @@ engines:
 Live CUDA validation is part of the final GCP PR, so this path remains preview
 despite deterministic source-build coverage in CI.
 
-### vLLM with uv
+### vLLM in a container (default)
 
-vLLM consumes a read-only verified snapshot and requires a CUDA worker. Managed
-uv mode creates a version-pinned environment in the engine cache:
-
-```yaml
-engines:
-  vllm:
-    launch: uv
-    version: 0.10.0
-    acceleration: cuda
-```
-
-Compatibility checks report Python, torch, CUDA, and vLLM mismatches with a
-bounded remediation. A failed check does not fall back to an unrelated Python
-environment. Launch bounds `max-num-seqs` to deployment concurrency and derives
-the engine KV-cache byte limit from the admitted memory estimate.
-
-### vLLM in a container
+The most reliable way to serve a GPU model is a digest-pinned engine container.
+The image ships the whole CUDA and Python toolchain, so the host needs nothing
+beyond a container runtime and an NVIDIA driver, and there is no host build
+cascade to hit. This is the default: when the worker has a container runtime
+(Docker or Podman) and you have not configured vLLM provisioning yourself,
+SBproxy runs vLLM from a curated digest-pinned image. The smallest useful
+config names no image at all and still serves in a container.
 
 Container mode accepts only an immutable `repository@sha256:<digest>` image.
 The runtime creates a private internal network, mounts the verified artifact
 read-only, publishes the engine only on loopback, scopes the selected NVIDIA
 devices, and passes shared memory as a validated typed setting.
+
+To pin your own image instead of the curated default, set it explicitly:
 
 ```yaml
 engines:
@@ -900,16 +892,48 @@ engines:
 ```
 
 Tagged images, `latest`, writable artifact mounts, arbitrary container argv, and
-unscoped devices are rejected. Live container certification is also deferred to
-the final GCP PR.
+unscoped devices are rejected. Live container certification is deferred to the
+final GCP PR.
+
+### vLLM with uv (no-docker fallback)
+
+Where a host cannot run containers, vLLM can run from a managed, version-pinned
+uv environment in the engine cache instead. This is the advanced path: it
+builds vLLM against the host, so the host itself must supply the toolchain the
+container would otherwise carry.
+
+```yaml
+engines:
+  vllm:
+    launch: uv
+    version: 0.10.0
+    acceleration: cuda
+```
+
+Before choosing this path, make sure the host provides what the vLLM wheel and
+its Triton JIT need, on top of the NVIDIA driver:
+
+- Python development headers matching the engine's Python (`Python.h`, from
+  `python3-dev` / `python3-devel`).
+- `ninja`, the build tool the compile step invokes.
+- A CUDA development toolchain, meaning `nvcc` and the CUDA headers, not just
+  the runtime driver.
+
+A box missing any of these fails the compatibility check with a bounded
+remediation rather than falling back to an unrelated Python environment. That
+missing-toolchain cascade is exactly what the container path avoids, so prefer
+the container unless you genuinely cannot run one. Launch bounds `max-num-seqs`
+to deployment concurrency and derives the engine KV-cache byte limit from the
+admitted memory estimate.
 
 ### SGLang
 
 SGLang runs the same OpenAI-compatible server model as vLLM and loads the same
 safetensors weights on a CUDA worker. The real launch is `python -m
 sglang.launch_server`, so there is no single binary to install: the runtime
-provisions it from a pinned uv environment or a digest-pinned container, the
-same two paths vLLM uses. The readiness probe and dispatch path are identical.
+provisions it from a digest-pinned container or a pinned uv environment, the
+same two paths vLLM uses and with the same container-first preference. The
+readiness probe and dispatch path are identical.
 
 ```yaml
 engines:

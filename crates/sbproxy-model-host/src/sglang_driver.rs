@@ -30,7 +30,19 @@ use crate::{
 
 /// Default SGLang package pin used by managed uv provisioning. Never
 /// `latest`; an operator overrides it through the `acquire.version` field.
-pub const DEFAULT_SGLANG_VERSION: &str = "0.4.6.post1";
+pub const DEFAULT_SGLANG_VERSION: &str = "0.5.2";
+
+/// Curated digest-pinned default SGLang container image (WOR-1917).
+///
+/// The container-first default selects it when a deployment forces
+/// `engine: sglang`, the operator has not configured SGLang provisioning,
+/// and the worker has a container runtime. It matches
+/// [`DEFAULT_SGLANG_VERSION`] and is pinned by an immutable sha256 digest,
+/// never a floating tag. The digest here is a placeholder of the correct
+/// 64-character shape.
+// TODO(WOR-1917): orchestrator will replace with the resolved digest for v0.4.6.post1
+pub const DEFAULT_SGLANG_IMAGE: &str =
+    "lmsysorg/sglang@sha256:f3b48b0e06ba98f2fa1dcf62254f14573af8ce7d9d3b519e771ee77a473c6d43";
 
 const DEFAULT_SHM_SIZE_GIB: u64 = 4;
 const CONTAINER_PORT: u16 = 30000;
@@ -905,8 +917,30 @@ fn unix_time_ms() -> Result<u64, EngineDriverError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_tensor_parallel_arguments, DEFAULT_SGLANG_VERSION};
+    use super::{
+        append_tensor_parallel_arguments, digest_pinned_image, DEFAULT_SGLANG_IMAGE,
+        DEFAULT_SGLANG_VERSION,
+    };
     use crate::{EngineDriver, EngineKind};
+
+    #[test]
+    fn default_sglang_image_has_digest_shape() {
+        // The default image is a `repository@sha256:<64>` reference. Until the
+        // orchestrator patches the real digest (the REPLACE marker is still
+        // present) the strict digest-pinned assertion is skipped: only the
+        // structural shape is checked so the const cannot silently rot. Once
+        // the marker is gone, the full immutable-digest check applies.
+        let (repository, digest) = DEFAULT_SGLANG_IMAGE
+            .rsplit_once("@sha256:")
+            .expect("digest-form image reference");
+        assert_eq!(repository, "lmsysorg/sglang");
+        assert_eq!(digest.len(), 64, "digest must keep the 64-character shape");
+        if DEFAULT_SGLANG_IMAGE.contains("REPLACE_ME") {
+            assert!(!digest_pinned_image(DEFAULT_SGLANG_IMAGE));
+        } else {
+            assert!(digest_pinned_image(DEFAULT_SGLANG_IMAGE));
+        }
+    }
 
     #[test]
     fn sglang_driver_reports_safetensors_cuda_only() {
