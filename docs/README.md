@@ -55,6 +55,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [model-host-capabilities.md](model-host-capabilities.md) - generated stable, preview, config-only, and unsupported contracts for model-host features and configuration fields.
 - [gpu-fit-planning.md](gpu-fit-planning.md) - how the fit planner picks a quant for your GPU: capability tiers, the weights + KV math, throughput, and why it refuses an impossible config.
 - [model-host-certification.md](model-host-certification.md) - the hardware evidence ledger and the GCP NVIDIA procedure reserved for the final integration PR.
+- [serving-engine-benchmark.md](serving-engine-benchmark.md) - vLLM vs SGLang head-to-head on one L4: throughput, prefix-cache behavior, and how the gateway picks an engine.
 - [security-model-host.md](security-model-host.md) - trusted config, verified artifacts, typed process launch, engine acquisition, containers, credentials, and remaining isolation work.
 - [ai-usage-ledger.md](ai-usage-ledger.md) - the verifiable usage ledger: hash-chained, Ed25519-signed spend receipts you can re-derive and verify.
 - [key-management.md](key-management.md) - dynamic virtual keys: mint, revoke, and rotate at runtime through the admin API, hashed at rest, with a fail-closed policy cache.
