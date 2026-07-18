@@ -80,6 +80,12 @@ const routes = [
     meta: { title: "Model host" },
   },
   {
+    path: "/storage",
+    name: "storage",
+    component: () => import("./views/StorageView.vue"),
+    meta: { title: "Storage" },
+  },
+  {
     path: "/audit",
     name: "audit",
     component: () => import("./views/AuditView.vue"),

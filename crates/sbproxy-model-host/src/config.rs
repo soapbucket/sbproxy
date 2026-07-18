@@ -590,9 +590,11 @@ pub struct ModelHostConfig {
     /// the platform default (`$HF_HOME` / `~/.cache/sbproxy/models`).
     #[serde(default)]
     pub cache_dir: Option<String>,
-    /// Support: config_only.
+    /// Support: preview.
     /// Disk budget in GiB for the weight cache before GC. `None`
-    /// means unbounded (operator manages the disk).
+    /// means unbounded (operator manages the disk). Collection runs
+    /// after `models pull` and on demand through the authenticated
+    /// `POST /admin/model-host/gc` route.
     #[serde(default)]
     pub cache_budget_gib: Option<f64>,
     /// What to do under VRAM pressure. Defaults to LRU eviction.

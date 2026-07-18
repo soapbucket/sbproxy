@@ -70,6 +70,17 @@ struct Cli {
     #[arg(long = "check", action = ArgAction::SetTrue, global = true)]
     check: bool,
 
+    /// Refuse to serve unless the model stack matches
+    /// `sbproxy-models.lock` (WOR-1864). Before any listener starts,
+    /// the lockfile next to the config is diffed against the verified
+    /// weight cache and every configured serve/deployment entry must
+    /// resolve to a locked artifact digest. Drift (or a missing
+    /// lockfile) prints the per-model drift lines and exits 2 without
+    /// serving. Honored by `serve` and the bare run form; other
+    /// subcommands ignore it.
+    #[arg(long = "locked", action = ArgAction::SetTrue, global = true)]
+    locked: bool,
+
     #[command(flatten)]
     globals: GlobalArgs,
 
@@ -985,6 +996,12 @@ fn main() {
         Some(Cmd::Version) => unreachable!("handled by short-circuit above"),
         Some(Cmd::Serve(_)) | None => {
             let path = pick_run_path(&cli);
+            // WOR-1864: `--locked` gates boot on the model lockfile.
+            // The check runs before `run_proxy` (and therefore before
+            // any listener binds); drift or a missing lockfile exits 2.
+            if cli.locked {
+                enforce_locked_serve_or_exit(path.as_deref());
+            }
             run_proxy(path.as_deref(), grace);
         }
     }
@@ -2341,9 +2358,9 @@ fn handle_models_subcommand(
 ) -> anyhow::Result<i32> {
     match &cmd.sub {
         // `sbproxy models` with no subcommand lists.
-        None => handle_models_list(&ModelsListArgs::default()),
-        Some(ModelsSub::List(a)) => handle_models_list(a),
-        Some(ModelsSub::Show(a)) => handle_models_show(a),
+        None => handle_models_list(&ModelsListArgs::default(), config_path),
+        Some(ModelsSub::List(a)) => handle_models_list(a, config_path),
+        Some(ModelsSub::Show(a)) => handle_models_show(a, config_path),
         Some(ModelsSub::Pull(a)) => handle_models_pull(a, config_path),
         Some(ModelsSub::Remove(a)) => handle_models_remove(a, config_path),
         Some(ModelsSub::Ps(a)) => handle_models_ps(a),
@@ -3028,6 +3045,55 @@ fn locked_engine_pin(
     (None, None)
 }
 
+/// Resolve `selections` on this host's worker profile into the exact
+/// locked identities `models lock` writes and the `--locked` boot
+/// check pins against. Two selections resolving to the same artifact
+/// collapse into one entry.
+fn resolve_locked_models(
+    selections: Vec<PullSelection>,
+    catalog: &sbproxy_model_host::Catalog,
+    serve: Option<&sbproxy_model_host::ModelHostConfig>,
+    canonical: Option<&sbproxy_config::ModelHostControlConfig>,
+) -> anyhow::Result<Vec<sbproxy_model_host::LockedModel>> {
+    let report = sbproxy_core::doctor::DoctorReport::collect();
+    let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&report.gpus)
+        .map_err(|error| anyhow::anyhow!("resolve lock worker: {error}"))?;
+    let mut models: Vec<sbproxy_model_host::LockedModel> = Vec::with_capacity(selections.len());
+    for selection in selections {
+        let model = &selection.model;
+        let entry = catalog
+            .get(model)
+            .ok_or_else(|| anyhow::anyhow!("model '{model}' is not in the catalog"))?;
+        if entry.variants.is_empty() {
+            anyhow::bail!(
+                "model '{model}' has no exact catalog v2 variant; migrate its files, sizes, digests, and revision before locking"
+            );
+        }
+        let artifact = catalog.resolve_artifact(
+            &sbproxy_model_host::ResolveArtifactRequest {
+                model: selection.model.clone(),
+                variant: selection.variant.clone(),
+                engine: selection.engine,
+                replicas: selection.replicas,
+                heterogeneous_variants: selection.heterogeneous_variants,
+            },
+            &worker,
+        )?;
+        // Two selections resolving to the same artifact lock one entry.
+        if models
+            .iter()
+            .any(|locked| locked.artifact_digest == artifact.artifact_digest)
+        {
+            continue;
+        }
+        let (version, image) = locked_engine_pin(&artifact, serve, canonical);
+        let locked =
+            sbproxy_model_host::LockedModel::from(&artifact).with_engine_pin(version, image);
+        models.push(locked);
+    }
+    Ok(models)
+}
+
 #[derive(serde::Serialize)]
 struct ModelsLockRow {
     name: String,
@@ -3080,42 +3146,7 @@ fn handle_models_lock(
         );
     }
 
-    let report = sbproxy_core::doctor::DoctorReport::collect();
-    let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&report.gpus)
-        .map_err(|error| anyhow::anyhow!("resolve lock worker: {error}"))?;
-    let mut models: Vec<sbproxy_model_host::LockedModel> = Vec::with_capacity(selections.len());
-    for selection in selections {
-        let model = &selection.model;
-        let entry = catalog
-            .get(model)
-            .ok_or_else(|| anyhow::anyhow!("model '{model}' is not in the catalog"))?;
-        if entry.variants.is_empty() {
-            anyhow::bail!(
-                "model '{model}' has no exact catalog v2 variant; migrate its files, sizes, digests, and revision before locking"
-            );
-        }
-        let artifact = catalog.resolve_artifact(
-            &sbproxy_model_host::ResolveArtifactRequest {
-                model: selection.model.clone(),
-                variant: selection.variant.clone(),
-                engine: selection.engine,
-                replicas: selection.replicas,
-                heterogeneous_variants: selection.heterogeneous_variants,
-            },
-            &worker,
-        )?;
-        // Two selections resolving to the same artifact lock one entry.
-        if models
-            .iter()
-            .any(|locked| locked.artifact_digest == artifact.artifact_digest)
-        {
-            continue;
-        }
-        let (version, image) = locked_engine_pin(&artifact, serve.as_ref(), canonical.as_ref());
-        let locked =
-            sbproxy_model_host::LockedModel::from(&artifact).with_engine_pin(version, image);
-        models.push(locked);
-    }
+    let models = resolve_locked_models(selections, &catalog, serve.as_ref(), canonical.as_ref())?;
     let generated_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3216,6 +3247,9 @@ fn handle_models_verify_lock(
                         sbproxy_model_host::LockDrift::DigestMismatch { .. } => {
                             "digest_mismatch".to_string()
                         }
+                        // Only the serve-time check produces this
+                        // variant; verify-lock diffs the cache alone.
+                        sbproxy_model_host::LockDrift::Unlocked { .. } => "unlocked".to_string(),
                     },
                     Some(drift.to_string()),
                 ),
@@ -3268,6 +3302,98 @@ fn handle_models_verify_lock(
         }
     }
     Ok(if drifts.is_empty() { 0 } else { 2 })
+}
+
+// --- `--locked` serve-time lockfile enforcement (WOR-1864) ---
+
+/// Read the lockfile for the `--locked` boot check. A missing file is
+/// the distinct operator error `no lockfile at <path>; run sbproxy
+/// models lock` (exit 2 at the call site), never a silent pass. An
+/// unreadable or invalid file surfaces the underlying read error.
+fn read_serve_lockfile(path: &std::path::Path) -> anyhow::Result<sbproxy_model_host::Lockfile> {
+    if !path.exists() {
+        anyhow::bail!("no lockfile at {}; run sbproxy models lock", path.display());
+    }
+    sbproxy_model_host::read_lockfile(path)
+        .map_err(|error| anyhow::anyhow!("read lockfile '{}': {error}", path.display()))
+}
+
+/// Resolve every configured serve/deployment entry in `config_path`
+/// for the `--locked` boot check, plus the cache directory the serve
+/// path would use (canonical `model_host.cache.directory` first, then
+/// the legacy serve `cache_dir`, mirroring the boot-time resolution).
+/// A config with no `proxy.model_host` and no `serve:` block yields
+/// an empty model set: the check then only diffs the lockfile against
+/// the cache.
+fn locked_models_for_config(
+    config_path: &std::path::Path,
+) -> anyhow::Result<(Vec<sbproxy_model_host::LockedModel>, Option<String>)> {
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|error| anyhow::anyhow!("read config '{}': {error}", config_path.display()))?;
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let compiled = sbproxy_config::compile_config(&yaml)?;
+    let canonical = compiled.server.model_host.clone();
+    let legacy = extract_serve_and_catalog(&yaml, config_dir)?;
+    let (serve, catalog) = match legacy {
+        Some((serve, catalog)) => (Some(serve), catalog),
+        None => (None, sbproxy_model_host::Catalog::builtin()),
+    };
+    let cache_dir = canonical
+        .as_ref()
+        .and_then(|control| control.cache.directory.clone())
+        .or_else(|| serve.as_ref().and_then(|serve| serve.cache_dir.clone()));
+    let selections = configured_pull_selections(serve.as_ref(), canonical.as_ref());
+    if selections.is_empty() {
+        return Ok((Vec::new(), cache_dir));
+    }
+    let models = resolve_locked_models(selections, &catalog, serve.as_ref(), canonical.as_ref())?;
+    Ok((models, cache_dir))
+}
+
+/// The `--locked` pre-boot check (WOR-1864): read `sbproxy-models.lock`
+/// next to the config, diff it against the verified weight cache, and
+/// pin every configured serve/deployment entry's resolved artifact
+/// digest to the lock. Any drift prints the same per-model drift lines
+/// `models verify-lock` prints and returns the refusal as an `Err`;
+/// the caller exits 2 before any listener starts. A clean lock logs
+/// one info line and returns `Ok`.
+fn enforce_locked_serve(config_path: &std::path::Path) -> anyhow::Result<()> {
+    let lockfile_path = default_lockfile_path(Some(config_path));
+    let lockfile = read_serve_lockfile(&lockfile_path)?;
+    let (configured, cache_dir) = locked_models_for_config(config_path)?;
+    let root = sbproxy_model_host::resolve_cache_dir_default(cache_dir.as_deref());
+    let manager = sbproxy_model_host::ArtifactManager::new(root, models_pull_transport()?)?;
+    let cached = manager.cached_artifacts()?;
+    let drifts = sbproxy_model_host::lockfile::verify_for_serve(&lockfile, &cached, &configured);
+    if drifts.is_empty() {
+        tracing::info!(
+            lockfile = %lockfile_path.display(),
+            models = lockfile.models.len(),
+            "lockfile clean; serving the locked model stack"
+        );
+        return Ok(());
+    }
+    for drift in &drifts {
+        println!("{}:{} drift: {drift}", drift.name(), drift.variant_id());
+    }
+    anyhow::bail!("refusing to serve: lockfile drift")
+}
+
+/// Apply `--locked` before boot: run [`enforce_locked_serve`] and exit
+/// 2 on any failure (drift, missing lockfile, or an unresolvable
+/// config), so listeners never start against a drifted stack. Returns
+/// only when the lock is clean.
+fn enforce_locked_serve_or_exit(config_path: Option<&std::path::Path>) {
+    let Some(config_path) = config_path else {
+        eprintln!("--locked requires a config path (positional or -f/--config)");
+        std::process::exit(2);
+    };
+    if let Err(error) = enforce_locked_serve(config_path) {
+        eprintln!("{error:#}");
+        std::process::exit(2);
+    }
 }
 
 fn configured_artifact_protection(
@@ -3429,6 +3555,32 @@ fn model_cache_root(cache_dir: Option<&std::path::Path>) -> PathBuf {
 }
 
 /// Whether any weights for `entry` are present in the cache dir.
+/// Cache directory configured in `config_path`, mirroring the pull path's
+/// resolution order: the canonical `proxy.model_host.cache.directory`
+/// first, then the legacy provider `serve.cache_dir`. `None` without a
+/// config or when neither is set, which lets the platform default apply.
+/// Read-only status commands (`models list`, `models show`) use this so
+/// they inspect the same cache the pull and serve paths write; without it
+/// a `-f` invocation silently reads the platform default cache instead.
+fn configured_model_cache_dir(config_path: Option<&std::path::Path>) -> Option<PathBuf> {
+    let config_path = config_path?;
+    let yaml = std::fs::read_to_string(config_path).ok()?;
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let canonical = sbproxy_config::compile_config(&yaml)
+        .ok()
+        .and_then(|compiled| compiled.server.model_host)
+        .and_then(|control| control.cache.directory.map(PathBuf::from));
+    if canonical.is_some() {
+        return canonical;
+    }
+    extract_serve_and_catalog(&yaml, config_dir)
+        .ok()
+        .flatten()
+        .and_then(|(serve, _)| serve.cache_dir.map(PathBuf::from))
+}
+
 fn model_is_cached(
     root: &std::path::Path,
     model: &str,
@@ -3473,17 +3625,23 @@ struct ModelRow {
     fit: String,
     estimated_vram_gib: Option<f64>,
     /// cached (weights present in the cache dir) or not-pulled. Resident
-    /// / serving state needs a running gateway and is not shown here.
+    /// / serving state needs a running gateway and is not shown here. A
+    /// not-pulled model whose declared files all have a size-matching
+    /// candidate in one foreign cache (Ollama, LM Studio, the HF hub)
+    /// carries an appended `importable from <source>` marker; the size
+    /// match is a cheap list-time heuristic, and the real digest
+    /// verification happens at import (WOR-1863).
     status: String,
 }
 
-/// Build the model rows from a catalog, the host report, and the cache
-/// dir. Pure over its inputs (the report/probe is passed in), so it is
-/// unit-testable.
+/// Build the model rows from a catalog, the host report, the cache
+/// dir, and one foreign-cache scan. Pure over its inputs (the
+/// report/probe and the scan are passed in), so it is unit-testable.
 fn build_model_rows(
     catalog: &sbproxy_model_host::Catalog,
     report: &sbproxy_core::doctor::DoctorReport,
     cache_root: &std::path::Path,
+    foreign: &[sbproxy_model_host::ForeignModelFile],
 ) -> Vec<ModelRow> {
     // One serve entry per catalog id, so the doctor resolves engine +
     // fit per model against the detected GPU.
@@ -3551,6 +3709,8 @@ fn build_model_rows(
                     "preview-incomplete".to_string()
                 } else if model_is_cached(cache_root, id, entry) {
                     "cached".to_string()
+                } else if let Some(source) = foreign_import_source(resolved.as_ref(), foreign) {
+                    format!("not-pulled, importable from {}", source.label())
                 } else {
                     "not-pulled".to_string()
                 },
@@ -3559,11 +3719,56 @@ fn build_model_rows(
         .collect()
 }
 
-fn handle_models_list(args: &ModelsListArgs) -> anyhow::Result<i32> {
+/// The single foreign cache whose files could seed every declared file
+/// of the resolved artifact, judged by exact byte-size match only
+/// (WOR-1863). List time never hashes: the size match is a cheap
+/// heuristic that only decides whether to show the marker, and the
+/// real verification happens at import, where each candidate is
+/// stream-hashed with SHA-256 and the staged bytes are re-verified by
+/// the cache's promote path. Sources are tried in the scan's stable
+/// order, and a model whose files are only covered by a mix of sources
+/// shows no marker.
+fn foreign_import_source(
+    resolved: Option<&sbproxy_model_host::ResolvedArtifact>,
+    foreign: &[sbproxy_model_host::ForeignModelFile],
+) -> Option<sbproxy_model_host::ForeignCacheSource> {
+    let artifact = resolved?;
+    if artifact.files.is_empty() || foreign.is_empty() {
+        return None;
+    }
+    let mut sources: Vec<_> = foreign.iter().map(|file| file.source).collect();
+    sources.sort();
+    sources.dedup();
+    sources.into_iter().find(|source| {
+        artifact.files.iter().all(|file| {
+            foreign
+                .iter()
+                .any(|c| c.source == *source && c.size_bytes == file.size_bytes)
+        })
+    })
+}
+
+/// Raw foreign-cache scan for `models list` (WOR-1863): the weight
+/// files Ollama, LM Studio, or the Hugging Face hub already hold under
+/// the current home directory. Read-only; no resolvable home directory
+/// yields an empty list.
+fn foreign_model_files() -> Vec<sbproxy_model_host::ForeignModelFile> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| sbproxy_model_host::discover_foreign_models(&PathBuf::from(home)))
+        .unwrap_or_default()
+}
+
+fn handle_models_list(
+    args: &ModelsListArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
     let catalog = load_models_catalog(args.catalog_file.as_deref())?;
-    let root = model_cache_root(args.cache_dir.as_deref());
+    let configured = configured_model_cache_dir(config_path);
+    let root = model_cache_root(args.cache_dir.as_deref().or(configured.as_deref()));
     let report = sbproxy_core::doctor::DoctorReport::collect();
-    let rows = build_model_rows(&catalog, &report, &root);
+    let foreign = foreign_model_files();
+    let rows = build_model_rows(&catalog, &report, &root, &foreign);
 
     match args.format {
         OutputFormat::Json => println!(
@@ -3650,9 +3855,13 @@ fn pull_policy_name(policy: sbproxy_model_host::PullPolicy) -> &'static str {
     }
 }
 
-fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
+fn handle_models_show(
+    args: &ModelsShowArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
     let catalog = load_models_catalog(args.catalog_file.as_deref())?;
-    let root = model_cache_root(args.cache_dir.as_deref());
+    let configured = configured_model_cache_dir(config_path);
+    let root = model_cache_root(args.cache_dir.as_deref().or(configured.as_deref()));
     let Some(entry) = catalog.get(&args.id) else {
         eprintln!("sbproxy models show: '{}' is not in the catalog", args.id);
         return Ok(2);
@@ -6115,7 +6324,8 @@ mod tests {
         let report = sbproxy_core::doctor::DoctorReport::collect();
         // A cache root that does not exist -> everything reads not-pulled.
         let root = std::env::temp_dir().join("sbproxy-models-test-nonexistent");
-        let rows = build_model_rows(&catalog, &report, &root);
+        // An empty foreign scan -> no importable markers appear.
+        let rows = build_model_rows(&catalog, &report, &root, &[]);
         assert_eq!(rows.len(), catalog.len());
         for r in &rows {
             // Catalog ids resolve, so the fit is a real verdict, never empty.
@@ -6128,6 +6338,64 @@ mod tests {
                 r.status
             );
         }
+    }
+
+    #[test]
+    fn models_list_importable_marker_requires_full_size_coverage_from_one_source() {
+        use sbproxy_model_host::{ForeignCacheSource, ForeignModelFile};
+        let artifact = sbproxy_model_host::ResolvedArtifact {
+            catalog_revision: "list-fixture".to_string(),
+            logical_model: "fixture".to_string(),
+            variant_id: "exact".to_string(),
+            artifact_digest: "a".repeat(64),
+            format: sbproxy_model_host::ArtifactFormat::Gguf,
+            quant: "q4".to_string(),
+            engine: sbproxy_model_host::EngineKind::LlamaCpp,
+            source: "hf:Fixture/List".to_string(),
+            revision: "main".to_string(),
+            files: vec![
+                sbproxy_model_host::ArtifactFile {
+                    path: "a.gguf".to_string(),
+                    sha256: "b".repeat(64),
+                    size_bytes: 10,
+                },
+                sbproxy_model_host::ArtifactFile {
+                    path: "b.gguf".to_string(),
+                    sha256: "c".repeat(64),
+                    size_bytes: 20,
+                },
+            ],
+            context_length: 4096,
+            license: "apache-2.0".to_string(),
+            stability: sbproxy_model_host::SupportLevel::Preview,
+            pickle_allowed: false,
+            modality: Default::default(),
+        };
+        let candidate = |source, size_bytes: u64| ForeignModelFile {
+            source,
+            path: std::path::PathBuf::from("/scan/fixture"),
+            repo_or_name: "fixture".to_string(),
+            size_bytes,
+            format_hint: None,
+        };
+        // Every declared file size-covered by one source -> that source.
+        let full = vec![
+            candidate(ForeignCacheSource::Ollama, 10),
+            candidate(ForeignCacheSource::Ollama, 20),
+        ];
+        assert_eq!(
+            foreign_import_source(Some(&artifact), &full),
+            Some(ForeignCacheSource::Ollama)
+        );
+        // Partial coverage, coverage split across sources, or no
+        // resolved artifact -> no marker.
+        assert_eq!(foreign_import_source(Some(&artifact), &full[..1]), None);
+        let split = vec![
+            candidate(ForeignCacheSource::Ollama, 10),
+            candidate(ForeignCacheSource::LmStudio, 20),
+        ];
+        assert_eq!(foreign_import_source(Some(&artifact), &split), None);
+        assert_eq!(foreign_import_source(None, &full), None);
     }
 
     #[test]
@@ -6840,6 +7108,67 @@ mod tests {
         ));
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn serve_locked_flag_parses_on_serve_and_bare_run_forms() {
+        let serve = Cli::try_parse_from(["sbproxy", "serve", "sb.yml", "--locked"]).unwrap();
+        assert!(serve.locked);
+        assert!(matches!(serve.cmd, Some(Cmd::Serve(_))));
+
+        let bare = Cli::try_parse_from(["sbproxy", "--locked", "sb.yml"]).unwrap();
+        assert!(bare.locked);
+        assert!(bare.cmd.is_none());
+        assert_eq!(bare.config_path, Some(PathBuf::from("sb.yml")));
+
+        // Without the flag, the run form parses exactly as before.
+        let unlocked = Cli::try_parse_from(["sbproxy", "serve", "sb.yml"]).unwrap();
+        assert!(!unlocked.locked);
+    }
+
+    #[test]
+    fn read_serve_lockfile_missing_file_is_a_distinct_error() {
+        let path = std::env::temp_dir().join(format!(
+            "sbproxy-locked-test-{}-missing/sbproxy-models.lock",
+            std::process::id()
+        ));
+        let error = read_serve_lockfile(&path).expect_err("a missing lockfile must not pass");
+        let message = error.to_string();
+        assert!(message.contains("no lockfile at"), "got: {message}");
+        assert!(
+            message.contains("run sbproxy models lock"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn read_serve_lockfile_reads_back_a_written_lockfile() {
+        let marker = temp_config("");
+        let path = marker.with_extension("lock");
+        let lockfile = sbproxy_model_host::Lockfile::new(1, "cli-fixture".to_string(), Vec::new());
+        sbproxy_model_host::write_lockfile(&path, &lockfile).unwrap();
+        let read = read_serve_lockfile(&path).expect("written lockfile must read back");
+        assert_eq!(read, lockfile);
+        let _ = std::fs::remove_file(marker);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn enforce_locked_serve_refuses_when_no_lockfile_exists() {
+        // A config directory without sbproxy-models.lock refuses before
+        // touching the config, the cache, or any listener. The config
+        // lives in its own directory so a stray lockfile in the shared
+        // temp dir cannot turn the refusal into a pass.
+        let dir = std::env::temp_dir().join(format!("sbproxy-locked-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("sb.yml");
+        std::fs::write(&config, MINIMAL_VALID).unwrap();
+        let error = enforce_locked_serve(&config).expect_err("no lockfile must refuse to serve");
+        assert!(
+            error.to_string().contains("no lockfile at"),
+            "got: {error:#}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     const MINIMAL_VALID: &str = "proxy:\n  http_bind_port: 8080\norigins:\n  \"x.local\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n";

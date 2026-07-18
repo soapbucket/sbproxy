@@ -9,8 +9,9 @@
 //! [`crate::Catalog::resolve_artifact`]. `sbproxy models verify-lock`
 //! reads that lock back and diffs it against the verified local cache
 //! inventory ([`crate::ArtifactManager::cached_artifacts`]), reporting
-//! per-model drift. Enforcement at serve time is a later slice; nothing
-//! here is consulted by the serve path.
+//! per-model drift. `sbproxy serve --locked` enforces the lock before
+//! boot via [`verify_for_serve`]: the verify-lock diff plus resolution
+//! pinning, refusing to start listeners on any drift.
 //!
 //! The lockfile is JSON with models sorted by name (then variant), so
 //! writing the same resolved stack twice produces byte-identical files
@@ -168,22 +169,36 @@ pub enum LockDrift {
         /// The digest actually present in the cache.
         cached_digest: String,
     },
+    /// A configured serve/deployment entry resolved to an artifact
+    /// digest the lockfile does not pin. Only the serve-time check
+    /// ([`verify_for_serve`]) reports this: resolution moving off the
+    /// lock is drift even when the cache agrees with the lockfile.
+    Unlocked {
+        /// Logical model ID of the configured entry.
+        name: String,
+        /// Resolved variant ID of the configured entry.
+        variant_id: String,
+        /// The resolved digest the lockfile is missing.
+        artifact_digest: String,
+    },
 }
 
 impl LockDrift {
     /// Logical model ID the drift is about.
     pub fn name(&self) -> &str {
         match self {
-            Self::Missing { name, .. } | Self::DigestMismatch { name, .. } => name,
+            Self::Missing { name, .. }
+            | Self::DigestMismatch { name, .. }
+            | Self::Unlocked { name, .. } => name,
         }
     }
 
     /// Locked variant ID the drift is about.
     pub fn variant_id(&self) -> &str {
         match self {
-            Self::Missing { variant_id, .. } | Self::DigestMismatch { variant_id, .. } => {
-                variant_id
-            }
+            Self::Missing { variant_id, .. }
+            | Self::DigestMismatch { variant_id, .. }
+            | Self::Unlocked { variant_id, .. } => variant_id,
         }
     }
 }
@@ -204,6 +219,12 @@ impl std::fmt::Display for LockDrift {
             } => write!(
                 formatter,
                 "digest mismatch: locked sha256:{locked_digest}, cached sha256:{cached_digest}"
+            ),
+            Self::Unlocked {
+                artifact_digest, ..
+            } => write!(
+                formatter,
+                "not pinned by the lockfile (resolved sha256:{artifact_digest})"
             ),
         }
     }
@@ -300,6 +321,50 @@ pub fn diff_against_cache(lockfile: &Lockfile, cached: &[ArtifactCacheMetadata])
                 artifact_digest: model.artifact_digest.clone(),
             }),
         }
+    }
+    drifts
+}
+
+/// Serve-time lockfile enforcement (WOR-1864): the union of
+/// [`diff_against_cache`] and resolution pinning. On top of the
+/// lockfile-versus-cache diff, every entry of `configured` (the
+/// serve/deployment entries resolved on this host, carried as the
+/// same [`LockedModel`] identity `models lock` writes) must resolve
+/// to an artifact digest the lockfile pins; one that does not is
+/// [`LockDrift::Unlocked`]. Lockfile-side drift comes first in
+/// lockfile model order, then configured-side drift in `configured`
+/// order, with duplicate configured digests reported once. An empty
+/// result means serving is faithful to the lock.
+pub fn verify_for_serve(
+    lockfile: &Lockfile,
+    cached: &[ArtifactCacheMetadata],
+    configured: &[LockedModel],
+) -> Vec<LockDrift> {
+    let mut drifts = diff_against_cache(lockfile, cached);
+    for model in configured {
+        if lockfile
+            .models
+            .iter()
+            .any(|locked| locked.artifact_digest == model.artifact_digest)
+        {
+            continue;
+        }
+        let already_reported = drifts.iter().any(|drift| {
+            matches!(
+                drift,
+                LockDrift::Unlocked {
+                    artifact_digest, ..
+                } if *artifact_digest == model.artifact_digest
+            )
+        });
+        if already_reported {
+            continue;
+        }
+        drifts.push(LockDrift::Unlocked {
+            name: model.name.clone(),
+            variant_id: model.variant_id.clone(),
+            artifact_digest: model.artifact_digest.clone(),
+        });
     }
     drifts
 }
@@ -445,6 +510,84 @@ mod tests {
         // Accessors name the model for CLI grouping.
         assert_eq!(drifts[0].name(), "mira-9b");
         assert_eq!(drifts[0].variant_id(), "cuda-fp16");
+    }
+
+    #[test]
+    fn verify_for_serve_flags_configured_model_the_lockfile_does_not_pin() {
+        // Lock and cache agree on aria-2b, but the config also resolves
+        // mira-9b, which the lockfile never pinned: resolution drift.
+        let lockfile = Lockfile::new(
+            1,
+            "2026-07".to_string(),
+            vec![locked("aria-2b", "cuda-fp16", &"aa".repeat(32))],
+        );
+        let cache = vec![cached("aria-2b", "cuda-fp16", &"aa".repeat(32))];
+        let configured = vec![
+            locked("aria-2b", "cuda-fp16", &"aa".repeat(32)),
+            locked("mira-9b", "cuda-fp16", &"bb".repeat(32)),
+            // The same unlocked digest twice reports once.
+            locked("mira-9b", "cuda-fp16", &"bb".repeat(32)),
+        ];
+        let drifts = verify_for_serve(&lockfile, &cache, &configured);
+        assert_eq!(
+            drifts,
+            vec![LockDrift::Unlocked {
+                name: "mira-9b".to_string(),
+                variant_id: "cuda-fp16".to_string(),
+                artifact_digest: "bb".repeat(32),
+            }]
+        );
+        // Accessors and the display line feed the serve refusal output.
+        assert_eq!(drifts[0].name(), "mira-9b");
+        assert_eq!(drifts[0].variant_id(), "cuda-fp16");
+        assert_eq!(
+            drifts[0].to_string(),
+            format!(
+                "not pinned by the lockfile (resolved sha256:{})",
+                "bb".repeat(32)
+            )
+        );
+    }
+
+    #[test]
+    fn verify_for_serve_clean_when_configured_locked_and_cached() {
+        let lockfile = Lockfile::new(
+            1,
+            "2026-07".to_string(),
+            vec![locked("aria-2b", "cuda-fp16", &"aa".repeat(32))],
+        );
+        let cache = vec![cached("aria-2b", "cuda-fp16", &"aa".repeat(32))];
+        let configured = vec![locked("aria-2b", "cuda-fp16", &"aa".repeat(32))];
+        assert!(verify_for_serve(&lockfile, &cache, &configured).is_empty());
+    }
+
+    #[test]
+    fn verify_for_serve_unions_cache_drift_with_resolution_drift() {
+        // zephyr-7b is locked but not cached (cache drift) and the
+        // configured extra-1b is not locked (resolution drift): both
+        // surface, lockfile-side first.
+        let lockfile = Lockfile::new(
+            1,
+            "2026-07".to_string(),
+            vec![locked("zephyr-7b", "cuda-fp16", &"cc".repeat(32))],
+        );
+        let configured = vec![locked("extra-1b", "cuda-fp16", &"ee".repeat(32))];
+        let drifts = verify_for_serve(&lockfile, &[], &configured);
+        assert_eq!(
+            drifts,
+            vec![
+                LockDrift::Missing {
+                    name: "zephyr-7b".to_string(),
+                    variant_id: "cuda-fp16".to_string(),
+                    artifact_digest: "cc".repeat(32),
+                },
+                LockDrift::Unlocked {
+                    name: "extra-1b".to_string(),
+                    variant_id: "cuda-fp16".to_string(),
+                    artifact_digest: "ee".repeat(32),
+                },
+            ]
+        );
     }
 
     #[test]

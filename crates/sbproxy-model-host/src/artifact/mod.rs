@@ -6,6 +6,7 @@
 mod cache;
 mod gc;
 mod http;
+mod import;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -119,10 +120,14 @@ pub enum ArtifactError {
         digest: String,
     },
     /// Network-denied acquisition encountered an HTTP cache miss.
-    #[error("offline artifact '{digest}' is not in the verified cache")]
+    #[error("offline artifact '{digest}' is not in the verified cache{detail}")]
     OfflineArtifactMissing {
         /// Artifact digest.
         digest: String,
+        /// Bounded message suffix naming the files no foreign cache
+        /// could satisfy after a partial import (WOR-1863); empty when
+        /// nothing was importable locally.
+        detail: String,
     },
     /// Startup warming was requested for a non-on-boot artifact.
     #[error("startup warming skipped artifact '{digest}' with pull policy {pull_policy:?}")]
@@ -510,42 +515,81 @@ impl ArtifactManager {
         }
 
         let local_source = artifact.source.strip_prefix("file:");
-        enforce_cache_miss_policy(
-            &artifact.artifact_digest,
-            context.intent,
-            context.network,
-            context.pull_policy,
-            local_source.is_some(),
-        )?;
-
         if let Some(local_source) = local_source {
+            enforce_cache_miss_policy(
+                &artifact.artifact_digest,
+                context.intent,
+                context.network,
+                context.pull_policy,
+                true,
+            )?;
             self.stage_local_files(artifact, local_source, total_bytes, job)
                 .await?;
         } else {
-            *job = self.transition_job(
-                job,
-                OperationState::Downloading,
-                OperationProgress {
-                    completed_bytes: 0,
-                    total_bytes,
-                    current_file: artifact.files.first().map(|file| file.path.clone()),
-                },
+            // Intent and pull-policy gates cover every acquisition,
+            // including a foreign-cache import, so they run before any
+            // bytes move. The network gate is deferred until after the
+            // import attempt: a file another local tool already holds
+            // never needs the network, so in denied mode a full import
+            // turns the refusal into a success (WOR-1863).
+            enforce_cache_miss_policy(
+                &artifact.artifact_digest,
+                context.intent,
+                NetworkPolicy::Allowed,
+                context.pull_policy,
+                false,
             )?;
-            let mut completed_bytes = 0u64;
-            for file in &artifact.files {
-                let file_bytes = self
-                    .download_http_file(
-                        artifact,
-                        file,
-                        completed_bytes,
+            let imported = self.import_foreign_sources(artifact).await?;
+            let missing: Vec<ArtifactFile> = artifact
+                .files
+                .iter()
+                .filter(|file| !imported.contains(file.path.as_str()))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                if context.network == NetworkPolicy::Denied {
+                    return Err(ArtifactError::OfflineArtifactMissing {
+                        digest: artifact.artifact_digest.clone(),
+                        detail: offline_missing_detail(&imported, &missing),
+                    });
+                }
+                let imported_bytes = artifact
+                    .files
+                    .iter()
+                    .filter(|file| imported.contains(file.path.as_str()))
+                    .try_fold(0u64, |total, file| total.checked_add(file.size_bytes))
+                    .ok_or_else(|| {
+                        ArtifactError::InvalidArtifact(
+                            "artifact progress overflows u64".to_string(),
+                        )
+                    })?;
+                *job = self.transition_job(
+                    job,
+                    OperationState::Downloading,
+                    OperationProgress {
+                        completed_bytes: imported_bytes,
                         total_bytes,
-                        context.credential.clone(),
-                        job,
-                    )
-                    .await?;
-                completed_bytes = completed_bytes.checked_add(file_bytes).ok_or_else(|| {
-                    ArtifactError::InvalidArtifact("artifact progress overflows u64".to_string())
-                })?;
+                        current_file: missing.first().map(|file| file.path.clone()),
+                    },
+                )?;
+                let mut completed_bytes = imported_bytes;
+                for file in &missing {
+                    let file_bytes = self
+                        .download_http_file(
+                            artifact,
+                            file,
+                            completed_bytes,
+                            total_bytes,
+                            context.credential.clone(),
+                            job,
+                        )
+                        .await?;
+                    completed_bytes = completed_bytes.checked_add(file_bytes).ok_or_else(|| {
+                        ArtifactError::InvalidArtifact(
+                            "artifact progress overflows u64".to_string(),
+                        )
+                    })?;
+                }
             }
             *job = self.transition_job(
                 job,
@@ -703,6 +747,30 @@ impl ArtifactManager {
             },
         )?;
         Ok(())
+    }
+
+    /// Try to satisfy this ensure call's declared files from weights
+    /// other local tools already cached (WOR-1863). Runs one read-only
+    /// [`crate::foreign_cache::discover`] scan per call, confirms each
+    /// size-matched candidate by streaming SHA-256, and stages matches
+    /// into the normal partial location so the unchanged verify and
+    /// promote path re-checks every invariant. Returns the relative
+    /// paths staged; the remainder is left for the network.
+    async fn import_foreign_sources(
+        &self,
+        artifact: &ResolvedArtifact,
+    ) -> Result<std::collections::BTreeSet<String>, ArtifactError> {
+        let Some(home) = import::foreign_scan_home() else {
+            return Ok(std::collections::BTreeSet::new());
+        };
+        let cache = self.cache.clone();
+        let requested = artifact.clone();
+        tokio::task::spawn_blocking(move || {
+            let candidates = crate::foreign_cache::discover(&home);
+            import::import_foreign_candidates(&cache, &requested, &candidates)
+        })
+        .await
+        .map_err(|error| ArtifactError::Join(error.to_string()))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1166,9 +1234,28 @@ pub(crate) fn enforce_cache_miss_policy(
     if network == NetworkPolicy::Denied && !local_source {
         return Err(ArtifactError::OfflineArtifactMissing {
             digest: digest.to_string(),
+            detail: String::new(),
         });
     }
     Ok(())
+}
+
+/// Message suffix for a network-denied miss: names the files no
+/// foreign cache satisfied when an import staged part of the artifact
+/// (WOR-1863), and stays empty on a plain miss so the established
+/// message is unchanged.
+fn offline_missing_detail(
+    imported: &std::collections::BTreeSet<String>,
+    missing: &[ArtifactFile],
+) -> String {
+    if imported.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = missing.iter().map(|file| file.path.as_str()).collect();
+    format!(
+        "; foreign caches satisfied only part of it, still missing: {}",
+        names.join(", ")
+    )
 }
 
 fn source_url(artifact: &ResolvedArtifact, relative_path: &str) -> Result<String, ArtifactError> {
