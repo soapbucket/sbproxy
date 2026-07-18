@@ -30,8 +30,8 @@ use bytes::Bytes;
 use sbproxy_ai::local_host::pick_local_model_name;
 use sbproxy_ai::AiHandlerConfig;
 use sbproxy_model_host::{
-    ArtifactManager, ArtifactTransport, Catalog, ConfigDirMetadataProvider, GpuProbe,
-    ModelHostConfig,
+    ArtifactCacheMetadata, ArtifactError, ArtifactManager, ArtifactTransport, Catalog,
+    ConfigDirMetadataProvider, GpuProbe, ModelHostConfig,
 };
 
 /// Permanent process-wide managed-model runtime adapter.
@@ -839,6 +839,30 @@ impl ProductionModelRuntime {
     /// Snapshot every configured deployment in deterministic ID order.
     pub async fn statuses(&self) -> Vec<sbproxy_model_host::DeploymentRuntimeStatus> {
         self.active_manager().statuses().await
+    }
+
+    /// Root directory of the verified artifact cache, when a model runtime
+    /// foundation has been committed. `None` until a model host is
+    /// configured, because no artifact cache is open before that.
+    pub fn artifact_cache_root(&self) -> Option<PathBuf> {
+        self.foundation
+            .read()
+            .expect("model runtime foundation lock")
+            .as_ref()
+            .map(|foundation| foundation.cache_root.clone())
+    }
+
+    /// List durable ready artifact metadata from the verified cache in
+    /// deterministic digest order, when a production preparer is active.
+    /// Read-only inventory for the admin files surface (WOR-1910); it
+    /// never touches artifact bytes.
+    pub fn cached_artifacts(&self) -> Option<Result<Vec<ArtifactCacheMetadata>, ArtifactError>> {
+        let preparer = self
+            .snapshot_preparer
+            .read()
+            .expect("model runtime snapshot-preparer lock")
+            .clone();
+        preparer.map(|preparer| preparer.cached_artifacts())
     }
 
     /// Build one bounded, path-free cluster snapshot from current runtime truth.

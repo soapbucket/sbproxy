@@ -2775,6 +2775,16 @@ impl ProductionDeploymentPreparer {
         self
     }
 
+    /// List durable ready artifact metadata from the verified cache in
+    /// deterministic digest order. Read-only inventory passthrough to
+    /// [`ArtifactManager::cached_artifacts`] for admin surfaces; it never
+    /// touches artifact bytes.
+    pub fn cached_artifacts(
+        &self,
+    ) -> Result<Vec<crate::ArtifactCacheMetadata>, crate::ArtifactError> {
+        self.artifacts.cached_artifacts()
+    }
+
     /// Snapshot path-free worker hardware, engine, and verified-cache truth.
     pub fn node_snapshot_inventory(
         &self,

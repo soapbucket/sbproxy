@@ -1052,6 +1052,7 @@ GET  /admin/model-host/catalog
 GET  /admin/model-host/deployments
 PUT  /admin/model-host/deployments
 GET  /admin/model-host/status
+GET  /admin/model-host/files
 POST /admin/model-host/load
 POST /admin/model-host/stop
 POST /admin/model-host/drain

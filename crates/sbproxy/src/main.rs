@@ -565,6 +565,10 @@ enum ModelsSub {
     Ps(ModelsPsArgs),
     /// Drain and stop one deployment on a running local gateway.
     Stop(ModelsStopArgs),
+    /// Write a lockfile pinning the exactly resolved serving stack.
+    Lock(ModelsLockArgs),
+    /// Check the verified local cache against the lockfile.
+    VerifyLock(ModelsVerifyLockArgs),
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -712,6 +716,31 @@ struct ModelsStopArgs {
     /// Admin endpoint and credentials.
     #[command(flatten)]
     admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ModelsLockArgs {
+    /// Lockfile path to write. Defaults to `sbproxy-models.lock` next
+    /// to the config given with -f/--config.
+    #[arg(long = "out")]
+    out: Option<PathBuf>,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ModelsVerifyLockArgs {
+    /// Lockfile path to check. Defaults to `sbproxy-models.lock` next
+    /// to the config (or in the current directory without -f/--config).
+    #[arg(long = "lockfile")]
+    lockfile: Option<PathBuf>,
+    /// Content-addressed artifact cache directory.
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
     /// Output format.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -1714,11 +1743,125 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
             }
         }
     }
+    // WOR-1863: weights other local tools already cached (Ollama, LM
+    // Studio, the HF hub), discovered read-only and summarized per
+    // source alongside sbproxy's own model cache.
+    let foreign = foreign_cache_summaries();
     match args.format {
-        OutputFormat::Text => print!("{}", report.render_text()),
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Text => {
+            let mut text = report.render_text();
+            insert_after_model_cache_block(&mut text, &render_foreign_caches_text(&foreign));
+            print!("{text}");
+        }
+        OutputFormat::Json => {
+            // `DoctorReport` lives in sbproxy-core; attach the foreign
+            // summary as an extra top-level field rather than widening
+            // that struct.
+            let mut value = serde_json::to_value(&report)?;
+            if let serde_json::Value::Object(object) = &mut value {
+                object.insert(
+                    "foreign_model_caches".to_string(),
+                    serde_json::to_value(&foreign)?,
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
     }
     Ok(exit)
+}
+
+/// Per-source rollup of the read-only foreign model-cache scan
+/// (WOR-1863): weights Ollama, LM Studio, or the Hugging Face hub
+/// already have on disk under the current user's home directory.
+#[derive(Debug, serde::Serialize)]
+struct ForeignCacheSummary {
+    /// Which foreign cache the files came from.
+    source: sbproxy_model_host::ForeignCacheSource,
+    /// Number of weight files found for this source.
+    files: usize,
+    /// Combined on-disk size of those files in bytes.
+    total_bytes: u64,
+}
+
+/// Scan the foreign model caches under the current home directory and
+/// roll the findings up per source, in a stable order. Read-only and
+/// silent about absent directories; no resolvable home directory
+/// yields an empty list.
+fn foreign_cache_summaries() -> Vec<ForeignCacheSummary> {
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    let mut summaries: Vec<ForeignCacheSummary> = Vec::new();
+    for file in sbproxy_model_host::discover_foreign_models(&home) {
+        match summaries.iter_mut().find(|s| s.source == file.source) {
+            Some(summary) => {
+                summary.files += 1;
+                summary.total_bytes += file.size_bytes;
+            }
+            None => summaries.push(ForeignCacheSummary {
+                source: file.source,
+                files: 1,
+                total_bytes: file.size_bytes,
+            }),
+        }
+    }
+    summaries
+}
+
+/// Render the `foreign model caches` doctor block, mirroring the
+/// report's section formatting: one line per source found, or a
+/// single `none found` line.
+fn render_foreign_caches_text(summaries: &[ForeignCacheSummary]) -> String {
+    let mut out = String::from("\nforeign model caches\n");
+    if summaries.is_empty() {
+        out.push_str("  none found\n");
+        return out;
+    }
+    for summary in summaries {
+        let plural = if summary.files == 1 { "" } else { "s" };
+        out.push_str(&format!(
+            "  {:<14}{} file{plural}, {}\n",
+            summary.source.label(),
+            summary.files,
+            format_cache_size(summary.total_bytes)
+        ));
+    }
+    out
+}
+
+/// Human-readable byte size for the foreign-caches block: GiB for
+/// anything large, MiB below one GiB, raw bytes below one MiB.
+fn format_cache_size(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.0} MiB", b / MIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Insert `block` into the rendered doctor text directly after the
+/// `model cache` section, falling back to appending at the end if
+/// that section marker ever moves.
+fn insert_after_model_cache_block(text: &mut String, block: &str) {
+    const MARKER: &str = "\nmodel cache\n";
+    let insert_at = text.find(MARKER).and_then(|start| {
+        let body = start + MARKER.len();
+        // The section body ends where the blank line before the next
+        // section header begins.
+        text[body..].find("\n\n").map(|i| body + i + 1)
+    });
+    match insert_at {
+        Some(at) => text.insert_str(at, block),
+        None => text.push_str(block),
+    }
 }
 
 /// Extract the merged `serve:` block (across every `ai_proxy` provider)
@@ -2205,6 +2348,8 @@ fn handle_models_subcommand(
         Some(ModelsSub::Remove(a)) => handle_models_remove(a, config_path),
         Some(ModelsSub::Ps(a)) => handle_models_ps(a),
         Some(ModelsSub::Stop(a)) => handle_models_stop(a),
+        Some(ModelsSub::Lock(a)) => handle_models_lock(a, config_path),
+        Some(ModelsSub::VerifyLock(a)) => handle_models_verify_lock(a, config_path),
     }
 }
 
@@ -2830,6 +2975,299 @@ fn handle_models_stop(args: &ModelsStopArgs) -> anyhow::Result<i32> {
         OutputFormat::Text => println!("{} stopped", args.deployment),
     }
     Ok(0)
+}
+
+// --- `models lock` / `models verify-lock` handlers (WOR-1864) ---
+
+/// Default lockfile location: next to the active config, or the
+/// current directory when no config was given.
+fn default_lockfile_path(config_path: Option<&std::path::Path>) -> PathBuf {
+    match config_path.and_then(std::path::Path::parent) {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(sbproxy_model_host::LOCKFILE_NAME),
+        _ => PathBuf::from(sbproxy_model_host::LOCKFILE_NAME),
+    }
+}
+
+/// The engine version/image pin for a resolved artifact, when the
+/// config pins one: a per-deployment pin (WOR-1906) on a matching
+/// canonical deployment wins over the legacy node-wide `engines:`
+/// provisioning for the selected engine. Unpinned engines lock the
+/// kind alone.
+fn locked_engine_pin(
+    artifact: &sbproxy_model_host::ResolvedArtifact,
+    serve: Option<&sbproxy_model_host::ModelHostConfig>,
+    canonical: Option<&sbproxy_config::ModelHostControlConfig>,
+) -> (Option<String>, Option<String>) {
+    if let Some(deployment) = canonical.and_then(|canonical| {
+        canonical
+            .deployments
+            .values()
+            .filter(|deployment| {
+                deployment.model == artifact.logical_model
+                    && (deployment.engine_version.is_some() || deployment.engine_image.is_some())
+            })
+            // Prefer the deployment pinning the exact selected variant.
+            .max_by_key(|deployment| {
+                deployment.variant.as_deref() == Some(artifact.variant_id.as_str())
+            })
+    }) {
+        return (
+            deployment.engine_version.clone(),
+            deployment.engine_image.clone(),
+        );
+    }
+    if let Some(provisioning) = serve.and_then(|serve| serve.engines.get(&artifact.engine)) {
+        let version = provisioning
+            .acquire
+            .as_ref()
+            .and_then(|acquire| acquire.version.clone());
+        if version.is_some() || provisioning.image.is_some() {
+            return (version, provisioning.image.clone());
+        }
+    }
+    (None, None)
+}
+
+#[derive(serde::Serialize)]
+struct ModelsLockRow {
+    name: String,
+    variant: String,
+    engine: String,
+    artifact_digest: String,
+}
+
+#[derive(serde::Serialize)]
+struct ModelsLockOutput {
+    schema_version: u32,
+    command: &'static str,
+    path: PathBuf,
+    catalog_revision: String,
+    models: Vec<ModelsLockRow>,
+}
+
+fn handle_models_lock(
+    args: &ModelsLockArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let Some(config_path) = config_path else {
+        anyhow::bail!(
+            "models lock requires -f/--config: the lockfile pins that config's serve entries"
+        );
+    };
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|error| anyhow::anyhow!("read config '{}': {error}", config_path.display()))?;
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let compiled = sbproxy_config::compile_config(&yaml)?;
+    let canonical = compiled.server.model_host.clone();
+    let legacy = extract_serve_and_catalog(&yaml, config_dir)?;
+    if canonical.is_none() && legacy.is_none() {
+        anyhow::bail!(
+            "config '{}' has no proxy.model_host or local serve block",
+            config_path.display()
+        );
+    }
+    let (serve, catalog) = match legacy {
+        Some((serve, catalog)) => (Some(serve), catalog),
+        None => (None, sbproxy_model_host::Catalog::builtin()),
+    };
+    let selections = configured_pull_selections(serve.as_ref(), canonical.as_ref());
+    if selections.is_empty() {
+        anyhow::bail!(
+            "config '{}' has no serve entries to lock",
+            config_path.display()
+        );
+    }
+
+    let report = sbproxy_core::doctor::DoctorReport::collect();
+    let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&report.gpus)
+        .map_err(|error| anyhow::anyhow!("resolve lock worker: {error}"))?;
+    let mut models: Vec<sbproxy_model_host::LockedModel> = Vec::with_capacity(selections.len());
+    for selection in selections {
+        let model = &selection.model;
+        let entry = catalog
+            .get(model)
+            .ok_or_else(|| anyhow::anyhow!("model '{model}' is not in the catalog"))?;
+        if entry.variants.is_empty() {
+            anyhow::bail!(
+                "model '{model}' has no exact catalog v2 variant; migrate its files, sizes, digests, and revision before locking"
+            );
+        }
+        let artifact = catalog.resolve_artifact(
+            &sbproxy_model_host::ResolveArtifactRequest {
+                model: selection.model.clone(),
+                variant: selection.variant.clone(),
+                engine: selection.engine,
+                replicas: selection.replicas,
+                heterogeneous_variants: selection.heterogeneous_variants,
+            },
+            &worker,
+        )?;
+        // Two selections resolving to the same artifact lock one entry.
+        if models
+            .iter()
+            .any(|locked| locked.artifact_digest == artifact.artifact_digest)
+        {
+            continue;
+        }
+        let (version, image) = locked_engine_pin(&artifact, serve.as_ref(), canonical.as_ref());
+        let locked =
+            sbproxy_model_host::LockedModel::from(&artifact).with_engine_pin(version, image);
+        models.push(locked);
+    }
+    let generated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let lockfile = sbproxy_model_host::Lockfile::new(
+        generated_at_ms,
+        catalog.catalog_revision.clone(),
+        models,
+    );
+    let path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| default_lockfile_path(Some(config_path)));
+    sbproxy_model_host::write_lockfile(&path, &lockfile)
+        .map_err(|error| anyhow::anyhow!("write lockfile '{}': {error}", path.display()))?;
+
+    let output = ModelsLockOutput {
+        schema_version: 1,
+        command: "models.lock",
+        path: path.clone(),
+        catalog_revision: lockfile.catalog_revision.clone(),
+        models: lockfile
+            .models
+            .iter()
+            .map(|locked| ModelsLockRow {
+                name: locked.name.clone(),
+                variant: locked.variant_id.clone(),
+                engine: engine_kind_name(locked.engine.kind).to_string(),
+                artifact_digest: locked.artifact_digest.clone(),
+            })
+            .collect(),
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output)?),
+        OutputFormat::Text => {
+            for row in &output.models {
+                println!(
+                    "{}:{} locked (sha256:{}, engine {})",
+                    row.name, row.variant, row.artifact_digest, row.engine
+                );
+            }
+            println!(
+                "wrote {} ({} models, catalog {})",
+                path.display(),
+                output.models.len(),
+                output.catalog_revision
+            );
+        }
+    }
+    Ok(0)
+}
+
+#[derive(serde::Serialize)]
+struct ModelsVerifyLockRow {
+    name: String,
+    variant: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ModelsVerifyLockOutput {
+    schema_version: u32,
+    command: &'static str,
+    lockfile: PathBuf,
+    drift: usize,
+    models: Vec<ModelsVerifyLockRow>,
+}
+
+fn handle_models_verify_lock(
+    args: &ModelsVerifyLockArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let path = args
+        .lockfile
+        .clone()
+        .unwrap_or_else(|| default_lockfile_path(config_path));
+    let lockfile = sbproxy_model_host::read_lockfile(&path)
+        .map_err(|error| anyhow::anyhow!("read lockfile '{}': {error}", path.display()))?;
+    let root = model_cache_root(args.cache_dir.as_deref());
+    let manager = sbproxy_model_host::ArtifactManager::new(root, models_pull_transport()?)?;
+    let cached = manager.cached_artifacts()?;
+    let drifts = sbproxy_model_host::diff_against_cache(&lockfile, &cached);
+
+    let rows: Vec<ModelsVerifyLockRow> = lockfile
+        .models
+        .iter()
+        .map(|locked| {
+            let drift = drifts.iter().find(|drift| {
+                drift.name() == locked.name && drift.variant_id() == locked.variant_id
+            });
+            let (status, detail) = match drift {
+                None => ("ok".to_string(), None),
+                Some(drift) => (
+                    match drift {
+                        sbproxy_model_host::LockDrift::Missing { .. } => "missing".to_string(),
+                        sbproxy_model_host::LockDrift::DigestMismatch { .. } => {
+                            "digest_mismatch".to_string()
+                        }
+                    },
+                    Some(drift.to_string()),
+                ),
+            };
+            ModelsVerifyLockRow {
+                name: locked.name.clone(),
+                variant: locked.variant_id.clone(),
+                status,
+                detail,
+            }
+        })
+        .collect();
+    let output = ModelsVerifyLockOutput {
+        schema_version: 1,
+        command: "models.verify-lock",
+        lockfile: path.clone(),
+        drift: drifts.len(),
+        models: rows,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output)?),
+        OutputFormat::Text => {
+            for locked in &lockfile.models {
+                match drifts.iter().find(|drift| {
+                    drift.name() == locked.name && drift.variant_id() == locked.variant_id
+                }) {
+                    None => println!(
+                        "{}:{} ok (sha256:{})",
+                        locked.name, locked.variant_id, locked.artifact_digest
+                    ),
+                    Some(drift) => {
+                        println!("{}:{} drift: {drift}", locked.name, locked.variant_id)
+                    }
+                }
+            }
+            if drifts.is_empty() {
+                println!(
+                    "{}: {} models match the verified cache",
+                    path.display(),
+                    lockfile.models.len()
+                );
+            } else {
+                println!(
+                    "{}: {} of {} models drifted",
+                    path.display(),
+                    drifts.len(),
+                    lockfile.models.len()
+                );
+            }
+        }
+    }
+    Ok(if drifts.is_empty() { 0 } else { 2 })
 }
 
 fn configured_artifact_protection(

@@ -4863,8 +4863,8 @@ pub(super) async fn relay_ai_response_with_cache(
     // in the response's `model` field. Rewrite it to the serve-entry
     // name the client asked for, before the rewrap and the cache
     // writes, so local lanes echo a model id exactly like hosted
-    // lanes. Streaming responses keep the engine's string for now
-    // (the SSE relay does not materialize chunks).
+    // lanes. Streaming responses get the same rewrite per SSE frame
+    // in `relay_ai_stream` (WOR-1811, `rewrite_stream_chunk_model`).
     let resp_body: bytes::Bytes = match ctx
         .as_ref()
         .and_then(|c| c.ai_serve_model.as_deref())
@@ -6042,6 +6042,19 @@ pub(super) async fn relay_ai_stream(
     let status = resp.status().as_u16();
     record_ai_provider_response_failure(&ai_span, router_sink.provider_name, status, None);
 
+    // WOR-1811: a served (local) engine stamps its internal model id
+    // (historically the weights file path or the internal deployment
+    // id) on every SSE chunk. Capture the public serve-entry name so
+    // the chunk loop rewrites each frame's `model` field to match
+    // what the buffered path reports. `ai_serve_model` is only set on
+    // managed local attempts, so hosted passthrough lanes skip the
+    // rewrite entirely.
+    let serve_model: Option<String> = if (200..300).contains(&status) {
+        ctx.as_deref().and_then(|c| c.ai_serve_model.clone())
+    } else {
+        None
+    };
+
     // --- Start safety session (fail-closed on None) ---
     //
     // Gating on `hooks.stream_safety.is_some()` ties this feature to
@@ -6444,6 +6457,16 @@ pub(super) async fn relay_ai_stream(
                 } else {
                     chunk_bytes
                 };
+                // WOR-1811: served-local lanes rewrite each frame's
+                // `model` field to the public serve-entry name so
+                // streamed chunks echo the same id the buffered path
+                // reports. Runs before the restorer so any bytes it
+                // holds back are already rewritten. No-op (zero-copy)
+                // for hosted lanes and frames without a model field.
+                let outbound_bytes = match serve_model.as_deref() {
+                    Some(name) => rewrite_stream_chunk_model(outbound_bytes, name),
+                    None => outbound_bytes,
+                };
                 // WOR-1044 PR2: run the outbound bytes through the
                 // reversible PII restorer before writing to the
                 // client. The restorer is a no-op (clone-only) when
@@ -6561,6 +6584,12 @@ pub(super) async fn relay_ai_stream(
                     }
                     if !translated.is_empty() {
                         let bytes = Bytes::from(translated);
+                        // WOR-1811: tail frames get the same serve-entry
+                        // model rewrite as the chunk loop.
+                        let bytes = match serve_model.as_deref() {
+                            Some(name) => rewrite_stream_chunk_model(bytes, name),
+                            None => bytes,
+                        };
                         let bytes = if reversible_restore.is_noop() {
                             bytes
                         } else {
@@ -6884,6 +6913,80 @@ fn rewrite_response_model(body: bytes::Bytes, model: &str) -> bytes::Bytes {
             }
         }
         _ => body,
+    }
+}
+
+/// WOR-1811: streaming counterpart of [`rewrite_response_model`].
+/// Rewrite the top-level `model` field of every complete `data:` frame
+/// in an SSE chunk to `model`. A served (local) engine stamps its
+/// internal id (historically the weights file path or the internal
+/// deployment id) on every streamed chunk; the serve-entry name is
+/// what the client asked for and what the buffered path reports.
+///
+/// The relay's pass-through path forwards network reads as-is, so a
+/// chunk may end mid-frame. Any `data:` line whose payload does not
+/// parse as JSON (a partial frame, a keepalive comment, `[DONE]`)
+/// passes through byte-identical; the rewrite is best-effort per
+/// complete frame, exactly matching the relay's no-buffering contract.
+/// Chunks with no `model` key anywhere, and frames already carrying
+/// the target name, return the input `Bytes` untouched so the hot
+/// path stays allocation-free.
+fn rewrite_stream_chunk_model(chunk: bytes::Bytes, model: &str) -> bytes::Bytes {
+    // Cheap pre-scan: a chunk with no `"model"` key needs no parse.
+    if !chunk.windows(b"\"model\"".len()).any(|w| w == b"\"model\"") {
+        return chunk;
+    }
+    let Ok(text) = std::str::from_utf8(&chunk) else {
+        return chunk;
+    };
+    // Lazily materialized output: stays `None` (zero-copy return)
+    // until the first frame actually needs a rewrite. `mirrored`
+    // counts the prefix bytes already scanned so the first rewrite
+    // can copy everything before it verbatim.
+    let mut out: Option<String> = None;
+    let mut mirrored = 0usize;
+    // `split_inclusive` keeps each line's terminator, so lines we do
+    // not rewrite are re-emitted byte-identical (including a trailing
+    // partial line with no terminator).
+    for line in text.split_inclusive('\n') {
+        let rewritten = line
+            .strip_prefix("data:")
+            .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+            .and_then(|payload| {
+                let json = payload.trim_end_matches(['\r', '\n']);
+                let mut v = serde_json::from_str::<serde_json::Value>(json).ok()?;
+                match v.get("model").and_then(|m| m.as_str()) {
+                    Some(existing) if existing != model => {
+                        v["model"] = serde_json::Value::String(model.to_string());
+                        // Reattach the line's original terminator bytes.
+                        let terminator = &payload[json.len()..];
+                        serde_json::to_string(&v)
+                            .ok()
+                            .map(|body| format!("data: {body}{terminator}"))
+                    }
+                    _ => None,
+                }
+            });
+        match rewritten {
+            Some(frame) => {
+                let buf = out.get_or_insert_with(|| {
+                    let mut s = String::with_capacity(text.len() + 32);
+                    s.push_str(&text[..mirrored]);
+                    s
+                });
+                buf.push_str(&frame);
+            }
+            None => {
+                if let Some(buf) = out.as_mut() {
+                    buf.push_str(line);
+                }
+            }
+        }
+        mirrored += line.len();
+    }
+    match out {
+        Some(s) => bytes::Bytes::from(s),
+        None => chunk,
     }
 }
 
@@ -8525,7 +8628,9 @@ mod governance_reserve_decision_tests {
 
 #[cfg(test)]
 mod served_model_rewrite_tests {
-    use super::{rewrite_managed_request_model, rewrite_response_model};
+    use super::{
+        rewrite_managed_request_model, rewrite_response_model, rewrite_stream_chunk_model,
+    };
 
     #[test]
     fn rewrites_public_model_to_the_engine_served_deployment() {
@@ -8558,5 +8663,62 @@ mod served_model_rewrite_tests {
         assert_eq!(rewrite_response_model(sse.clone(), "m"), sse);
         let err = bytes::Bytes::from(r#"{"error":{"message":"boom"}}"#);
         assert_eq!(rewrite_response_model(err.clone(), "m"), err);
+    }
+
+    #[test]
+    fn stream_chunk_rewrites_engine_model_to_serve_name() {
+        let chunk = bytes::Bytes::from(
+            "data: {\"model\":\"/var/lib/sbproxy/models/Qwen/Qwen3-14B-GGUF/main/Qwen3-14B-Q4_K_M.gguf\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        );
+        let out = rewrite_stream_chunk_model(chunk, "qwen3-14b");
+        let text = std::str::from_utf8(&out).expect("utf8");
+        let payload = text
+            .strip_prefix("data: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .expect("data frame shape");
+        let v: serde_json::Value = serde_json::from_str(payload).expect("json");
+        assert_eq!(v["model"], "qwen3-14b");
+        assert_eq!(v["choices"][0]["delta"]["content"], "hi");
+    }
+
+    #[test]
+    fn stream_chunk_rewrites_only_frames_carrying_a_model() {
+        // A multi-frame chunk: one frame carries the engine id, the
+        // trailing [DONE] sentinel must survive byte-identical.
+        let chunk = bytes::Bytes::from(
+            "data: {\"model\":\"internal-0\",\"choices\":[]}\n\ndata: [DONE]\n\n",
+        );
+        let out = rewrite_stream_chunk_model(chunk, "qwen3-14b");
+        let text = std::str::from_utf8(&out).expect("utf8");
+        assert!(text.contains("\"model\":\"qwen3-14b\""));
+        assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn stream_chunk_passes_done_sentinel_through_untouched() {
+        let done = bytes::Bytes::from("data: [DONE]\n\n");
+        assert_eq!(rewrite_stream_chunk_model(done.clone(), "m"), done);
+    }
+
+    #[test]
+    fn stream_chunk_passes_non_json_through_untouched() {
+        // A keepalive comment and a partial frame cut mid-JSON: both
+        // must pass through byte-identical (the relay does not buffer
+        // partial frames, so neither can be parsed here).
+        let keepalive = bytes::Bytes::from(": ping\n\n");
+        assert_eq!(
+            rewrite_stream_chunk_model(keepalive.clone(), "m"),
+            keepalive
+        );
+        let partial = bytes::Bytes::from("data: {\"model\":\"internal-0\",\"choi");
+        assert_eq!(rewrite_stream_chunk_model(partial.clone(), "m"), partial);
+    }
+
+    #[test]
+    fn stream_chunk_leaves_matching_model_untouched() {
+        let chunk = bytes::Bytes::from("data: {\"model\":\"qwen3-14b\",\"choices\":[]}\n\n");
+        let out = rewrite_stream_chunk_model(chunk.clone(), "qwen3-14b");
+        // Zero-copy pass-through: same bytes, not a re-serialization.
+        assert_eq!(out, chunk);
     }
 }
