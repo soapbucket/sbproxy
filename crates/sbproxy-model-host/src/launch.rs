@@ -663,6 +663,7 @@ mod tests {
             memory: crate::MemoryEstimate::from_total(0, 12 * crate::fit::GIB),
             moe: None,
             throughput: None,
+            gpu_memory_fraction: None,
         }
     }
 
@@ -985,6 +986,7 @@ mod tests {
             max_loras: None,
             gguf_file: None,
             reference: None,
+            modality: None,
         }
     }
 

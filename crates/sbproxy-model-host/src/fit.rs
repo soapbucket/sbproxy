@@ -285,12 +285,32 @@ impl ModelMetadata {
             .or_else(|| v.get("intermediate_size"))
             .and_then(|x| x.as_u64())
             .unwrap_or(0);
+        let hidden_size = hidden.unwrap_or_else(|| head_dim.saturating_mul(attn_heads));
+        // A raw `hf:` reference's config.json rarely carries `num_parameters`,
+        // so `params` arrives as 0. Left at 0 the fit planner sees a
+        // weightless model, keeps it on one GPU, and reports absurd
+        // throughput; estimate the count from the architecture instead so
+        // tensor-parallel and fit decisions are based on the real size.
+        let params = if params > 0 {
+            params
+        } else {
+            estimate_transformer_params(
+                v,
+                layers,
+                hidden_size,
+                attn_heads,
+                kv_heads,
+                head_dim,
+                expert_count,
+                expert_ffn_length,
+            )
+        };
         Some(Self {
             params,
             layers,
             kv_heads,
             head_dim,
-            hidden_size: hidden.unwrap_or_else(|| head_dim.saturating_mul(attn_heads)),
+            hidden_size,
             max_context,
             expert_count,
             expert_ffn_length,
@@ -600,6 +620,13 @@ pub struct FitPlan {
     /// this plan (WOR-1670), when the GPU reports memory bandwidth. Advisory:
     /// it catches "this fits but will be slow" before an engine starts.
     pub throughput: Option<ThroughputEstimate>,
+    /// Fraction of each device's total VRAM the engine should reserve,
+    /// emitted as vLLM/SGLang `--gpu-memory-utilization`. Derived from the
+    /// per-device byte budget and the device capacity so a fit-bounded
+    /// engine honors the same envelope the planner reserved. `None` when
+    /// the device capacity is unknown; the launcher then uses a safe
+    /// default utilization.
+    pub gpu_memory_fraction: Option<f32>,
 }
 
 impl FitPlan {
@@ -713,9 +740,97 @@ pub struct ThroughputEstimate {
     pub safe_max_batch: u64,
 }
 
+impl ThroughputEstimate {
+    /// Scale a single-device decode estimate for a tensor-parallel group of
+    /// `degree` GPUs. Each GPU holds 1/degree of the weights and streams its
+    /// shard in parallel over NVLink, so single-stream decode (a memory-bound
+    /// weight read) scales roughly linearly with the degree; `bytes_per_token`
+    /// becomes the per-device figure. A degree of 1 is a no-op. Note the
+    /// estimate is a weights-only roofline and stays deliberately conservative
+    /// (it ignores KV reads and assumes 70% bandwidth); treat it as a floor.
+    fn scaled_for_tp(mut self, degree: usize) -> Self {
+        let degree = degree.max(1);
+        self.decode_tokens_per_sec *= degree as f64;
+        self.bytes_per_token /= degree as u64;
+        self
+    }
+}
+
 /// Fraction of peak memory bandwidth a real engine sustains during
 /// decode. Empirically 60-80%; use a conservative midpoint.
 pub const DECODE_BANDWIDTH_EFFICIENCY: f64 = 0.7;
+
+/// Fixed per-device VRAM a CUDA inference engine consumes before any KV
+/// cache: the CUDA context, framework allocator, and compiled-graph buffers.
+/// The planner's `runtime_overhead_bytes` models this as a small multiplier
+/// of the working set, which under-counts it badly for small models, so the
+/// `--gpu-memory-utilization` mapping adds this fixed floor on top of the
+/// planned budget. Without it vLLM reserves the planned bytes, spends this
+/// much on its own runtime, and then has too little left for the KV cache it
+/// needs for the model's max sequence length.
+pub const ENGINE_FIXED_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Map a per-device byte budget to a vLLM/SGLang `--gpu-memory-utilization`
+/// fraction of the device's total VRAM. Adds [`ENGINE_FIXED_OVERHEAD_BYTES`]
+/// so the engine has room for its own runtime on top of weights and KV, then
+/// clamps to a safe serving range so a small model still reserves enough for
+/// its KV cache and a large one never over-commits the card.
+pub fn device_memory_fraction(need_bytes: u64, total_vram_bytes: u64) -> Option<f32> {
+    if total_vram_bytes == 0 {
+        return None;
+    }
+    let fraction =
+        need_bytes.saturating_add(ENGINE_FIXED_OVERHEAD_BYTES) as f64 / total_vram_bytes as f64;
+    Some(fraction.clamp(0.2, 0.95) as f32)
+}
+
+/// Estimate a transformer's parameter count from its config.json shape when
+/// the file omits `num_parameters` (common for a raw `hf:` reference). Sums
+/// the (tied) embedding table, per-layer attention (q/k/v/o with GQA), and
+/// the per-layer MLP: one dense gated FFN, or `expert_count` gated experts
+/// for a MoE. Approximate (ignores norms, biases, and the router) but well
+/// within the accuracy the fit planner needs to choose a device count.
+// The shape is already parsed by the caller; threading it in avoids a second
+// parse and keeps the estimate beside the fields it derives from.
+#[allow(clippy::too_many_arguments)]
+fn estimate_transformer_params(
+    v: &serde_json::Value,
+    layers: u64,
+    hidden: u64,
+    _attn_heads: u64,
+    kv_heads: u64,
+    head_dim: u64,
+    expert_count: u64,
+    expert_ffn_length: u64,
+) -> u64 {
+    let vocab = v.get("vocab_size").and_then(|x| x.as_u64()).unwrap_or(0);
+    let intermediate = v
+        .get("intermediate_size")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let kv_dim = kv_heads.saturating_mul(head_dim);
+    // Attention: q_proj + o_proj (hidden x hidden each) + k_proj + v_proj
+    // (hidden x kv_dim each, smaller under grouped-query attention).
+    let attn = hidden
+        .saturating_mul(hidden)
+        .saturating_mul(2)
+        .saturating_add(hidden.saturating_mul(kv_dim).saturating_mul(2));
+    // A gated FFN is 3 matrices (gate, up, down) of hidden x ffn. A MoE layer
+    // has `expert_count` of them over the expert intermediate size; a dense
+    // layer has one over the model intermediate size.
+    let mlp = if expert_count > 0 && expert_ffn_length > 0 {
+        expert_count
+            .saturating_mul(3)
+            .saturating_mul(hidden)
+            .saturating_mul(expert_ffn_length)
+    } else {
+        3u64.saturating_mul(hidden).saturating_mul(intermediate)
+    };
+    let per_layer = attn.saturating_add(mlp);
+    vocab
+        .saturating_mul(hidden)
+        .saturating_add(layers.saturating_mul(per_layer))
+}
 
 /// Estimate decode throughput and a safe batch ceiling for a model +
 /// quant on a GPU. Returns `None` when the GPU does not report memory
@@ -931,9 +1046,14 @@ fn plan_fit_sharded(
                 estimated_vram_bytes: memory.total_bytes,
                 gpu_indexes: devices.to_vec(),
                 seq_len,
+                gpu_memory_fraction: device_memory_fraction(
+                    memory.total_bytes,
+                    gpu.total_vram_bytes,
+                ),
                 memory,
                 moe: None,
-                throughput: estimate_throughput(gpu, meta, quant, seq_len),
+                throughput: estimate_throughput(gpu, meta, quant, seq_len)
+                    .map(|estimate| estimate.scaled_for_tp(devices.len())),
             });
         }
     }
@@ -1116,6 +1236,7 @@ fn plan_moe_spill(
             estimated_vram_bytes: memory.total_bytes,
             gpu_indexes: vec![gpu.index],
             seq_len,
+            gpu_memory_fraction: device_memory_fraction(memory.total_bytes, gpu.total_vram_bytes),
             memory,
             moe: Some(MoePlacement {
                 cpu_moe_layers: spill,

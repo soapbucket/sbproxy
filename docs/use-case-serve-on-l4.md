@@ -8,11 +8,11 @@
 
 You have GCP credits and a model you want to run on your own terms. The open-weight releases from Qwen, GLM, and Gemma are good enough for real work now, but most serving guides stop at a bare `vllm serve` with nothing in front of it and no plan for the day you need a hosted fallback. SBproxy is built for exactly this gap: "Call any model. Serve your own. Govern both." One Apache-2.0 binary routes to 66 providers or serves the weights on your own GPUs, and this page walks the serving half, from `gcloud compute instances create` to a first completion on a single NVIDIA L4.
 
-A status note before you spend money. This is the planned L4 procedure, not evidence that the current PR passed on an L4. NVIDIA vLLM, container, CUDA llama.cpp, multi-GPU, and multi-node GCP validation is reserved for the final integration PR. The deterministic driver and capacity suites run in CI. Use [model-host-certification.md](model-host-certification.md) for the evidence ledger and tear the VM down when the final gate finishes.
+A status note before you spend money. This is the planned L4 procedure, not evidence that the current PR passed on an L4. NVIDIA vLLM and SGLang container, multi-GPU, and multi-node GCP validation is reserved for the final integration PR. The deterministic driver and capacity suites run in CI. Use [model-host-certification.md](model-host-certification.md) for the evidence ledger and tear the VM down when the final gate finishes.
 
 ## What you will build
 
-A `g2-standard-8` VM with one 24 GB L4, running an OpenAI-compatible gateway on port 8080. The final gate will use canonical managed deployments and exact catalog v2 artifacts, then record vLLM and CUDA llama.cpp readiness, completion, status, stop, and cache reuse. The same routing, guardrail, budget, and ledger planes that govern hosted providers apply to a local deployment.
+A `g2-standard-8` VM with one 24 GB L4, running an OpenAI-compatible gateway on port 8080. The final gate will use canonical managed deployments and exact catalog v2 artifacts, then record vLLM and SGLang readiness, completion, status, stop, and cache reuse. The same routing, guardrail, budget, and ledger planes that govern hosted providers apply to a local deployment.
 
 ## Prerequisites
 
@@ -48,11 +48,9 @@ gcloud compute ssh sbproxy-l4 --zone=us-central1-a
 
 The repo wraps these commands in `scripts/provision-l4.sh` (`up`, `ssh`, `down`) if you would rather not retype them, and [`deploy/terraform/l4-demo`](../deploy/terraform/l4-demo) is the Terraform version with a public IP, Let's Encrypt TLS, and a bearer token in front, for when this stops being an experiment.
 
-The final gate exercises both managed NVIDIA paths. vLLM uses a pinned uv
-environment or digest-pinned container. llama.cpp uses the fixed CUDA source
-build when Linux x86-64, the NVIDIA driver, `nvcc`, CMake, a compiler, and `tar`
-are present. The build verifies the official source archive before CMake runs
-and publishes the executable atomically. See
+The NVIDIA GPU engines are vLLM and SGLang, both launched as digest-pinned
+containers (vLLM can also use a pinned uv environment). llama.cpp serves GGUF
+models on CPU and Apple Metal, not on NVIDIA GPUs. See
 [model-host.md](model-host.md#managed-engines) for the exact policies.
 
 Then install SBproxy itself:

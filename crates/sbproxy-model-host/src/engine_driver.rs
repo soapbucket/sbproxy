@@ -467,7 +467,12 @@ impl LaunchRequest {
                 false,
             ));
         }
-        if self.artifact.metadata.trust != "verified" {
+        // A repo-mode (unpinned raw `hf:`) artifact has no verified local
+        // bytes: the engine self-downloads the weights at launch, so the
+        // trust and file-verification invariants below apply only to
+        // pinned, content-addressed snapshots.
+        let repo_mode = self.artifact.repo.is_some();
+        if !repo_mode && self.artifact.metadata.trust != "verified" {
             return Err(EngineDriverError::artifact_not_ready(format!(
                 "artifact {} has trust state {:?}",
                 self.artifact.artifact_digest, self.artifact.metadata.trust
@@ -489,7 +494,7 @@ impl LaunchRequest {
                 "verified snapshot path must be absolute",
             ));
         }
-        if self.artifact.files.len() != self.artifact.metadata.files.len() {
+        if !repo_mode && self.artifact.files.len() != self.artifact.metadata.files.len() {
             return Err(EngineDriverError::artifact_not_ready(
                 "verified file map does not match artifact metadata",
             ));

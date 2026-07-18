@@ -400,6 +400,17 @@
               "type": "null"
             }
           ]
+        },
+        "modality": {
+          "description": "The task this served model performs (WOR-1908 / WOR-1675). A catalog entry carries its own modality, but a raw `hf:Org/Repo` reference has none, so declare it here to serve an embedding or rerank model: it drives the engine's runtime-owned `--task` flag (vLLM `embed` / `score`) and zeroes the KV-cache term in the fit. Defaults to chat (autoregressive generation) when omitted.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Modality"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -602,6 +613,53 @@
           "minimum": 0.0
         }
       }
+    },
+    "Modality": {
+      "description": "The task a served model performs (WOR-1908).\n\nA catalog is chat-only today, but the model host must be able to express an embedder, a reranker, and the other non-chat surfaces so the fit planner, engine launch, and capability negotiation branch on the actual task rather than assuming autoregressive chat. Only [`Modality::Chat`] decodes token by token and holds a KV cache; every other modality is a single forward pass. Defaults to `Chat`, so a pre-modality catalog entry parses and behaves exactly as before.",
+      "oneOf": [
+        {
+          "description": "Autoregressive chat / text generation (the default). Decodes one token at a time and accumulates a KV cache.",
+          "type": "string",
+          "enum": [
+            "chat"
+          ]
+        },
+        {
+          "description": "Text embeddings: one forward pass to a vector, no KV cache.",
+          "type": "string",
+          "enum": [
+            "embedding"
+          ]
+        },
+        {
+          "description": "Reranking / scoring: one forward pass to a relevance score.",
+          "type": "string",
+          "enum": [
+            "rerank"
+          ]
+        },
+        {
+          "description": "Speech to text (transcription).",
+          "type": "string",
+          "enum": [
+            "speech_to_text"
+          ]
+        },
+        {
+          "description": "Text to speech (synthesis).",
+          "type": "string",
+          "enum": [
+            "text_to_speech"
+          ]
+        },
+        {
+          "description": "Image generation.",
+          "type": "string",
+          "enum": [
+            "image"
+          ]
+        }
+      ]
     },
     "EvictionPolicy": {
       "description": "What to do when VRAM is needed and an idle model is resident.",

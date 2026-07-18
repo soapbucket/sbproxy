@@ -82,10 +82,10 @@ sbproxy models show qwen2.5-0.5b-instruct --format json
 
 ## Hardware status
 
-The bootstrap GGUF supports CPU, Apple Metal, and CUDA catalog workers. This PR
-runs a real Apple Silicon request before publication. NVIDIA discovery, managed
-vLLM, and the CUDA llama.cpp build have deterministic coverage, while the live
-GCP NVIDIA and multi-node gate remains in the final integration PR.
+The bootstrap GGUF runs on CPU and Apple Metal catalog workers. This PR
+runs a real Apple Silicon request before publication. NVIDIA discovery and the
+managed vLLM and SGLang container engines have deterministic coverage, while the
+live GCP NVIDIA and multi-node gate remains in the final integration PR.
 
 If the selected artifact does not fit, the command exits before claiming the
 endpoint is ready. Use a smaller variant, free device memory, or configure a

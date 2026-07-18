@@ -214,6 +214,7 @@ fn ready(kind: EngineKind, format: ArtifactFormat) -> ReadyArtifact {
             terminal_at_ms: Some(1),
             error: None,
         },
+        repo: None,
     }
 }
 
@@ -227,6 +228,7 @@ fn fit() -> FitPlan {
         memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1024),
         moe: None,
         throughput: None,
+        gpu_memory_fraction: None,
     }
 }
 

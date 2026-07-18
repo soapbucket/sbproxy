@@ -402,10 +402,12 @@ the last good runtime.
 
 The managed runtime resolves an engine in this order:
 
-- An explicit trusted `engines.<kind>.path` wins.
+- An explicit trusted binary path wins: set `engines.<kind>.acquire.path` with
+  `engines.<kind>.acquire.source: path`.
 - A compatible binary on `PATH` is next for ordinary binary launch.
-- llama.cpp can fetch a pinned release. Built-in prebuilt assets and the Linux
-  CUDA source archive have checked-in digests and identity-scoped caches.
+- llama.cpp can fetch a pinned release. Built-in prebuilt assets have checked-in
+  digests and identity-scoped caches. It serves GGUF models on CPU and Apple
+  Metal; NVIDIA GPU serving uses the vLLM and SGLang container engines.
 - vLLM can use a version-pinned managed uv environment or a digest-pinned
   private container.
 

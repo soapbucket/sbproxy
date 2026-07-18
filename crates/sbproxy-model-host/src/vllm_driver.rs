@@ -37,6 +37,9 @@ pub const DEFAULT_VLLM_IMAGE: &str =
 const DEFAULT_SHM_SIZE_GIB: u64 = 4;
 const CONTAINER_PORT: u16 = 8000;
 const PRIVATE_NETWORK: &str = "sbproxy-model-host";
+/// Fallback vLLM `--gpu-memory-utilization` when the fit did not derive a
+/// device-capacity-aware fraction (e.g. the probe reported no total VRAM).
+const DEFAULT_GPU_MEMORY_UTILIZATION: f32 = 0.90;
 const HEALTH_PATH: &str = "/health";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
@@ -712,13 +715,22 @@ pub fn build_vllm_container_plan(
             "verified snapshot path contains a comma unsupported by OCI mount syntax",
         ));
     }
+    // The private network is `--internal` (no egress) for pinned launches
+    // that serve locally mounted weights. A repo-mode (unpinned raw `hf:`)
+    // launch must self-download from Hugging Face, so it runs on the default
+    // bridge, which has external DNS and egress via the host resolver.
+    let network = if request.artifact.repo.is_some() {
+        "bridge"
+    } else {
+        PRIVATE_NETWORK
+    };
     let mut arguments = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--name".to_string(),
         format!("sbproxy-{}-g{}", request.deployment, request.generation),
         "--network".to_string(),
-        PRIVATE_NETWORK.to_string(),
+        network.to_string(),
     ];
     match runtime {
         ContainerRuntime::Docker => {
@@ -728,7 +740,11 @@ pub fn build_vllm_container_plan(
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            arguments.extend(["--gpus".to_string(), format!("device={devices}")]);
+            // The device set must be double-quoted: `--gpus device=0,1`
+            // makes Docker read the `,1` as a GPU count and reject the
+            // request ("cannot set both Count and DeviceIDs"). The quoted
+            // form is a single device-id spec and works for one or many.
+            arguments.extend(["--gpus".to_string(), format!("\"device={devices}\"")]);
         }
         ContainerRuntime::Podman => {
             for device in &request.selected_devices {
@@ -736,16 +752,40 @@ pub fn build_vllm_container_plan(
             }
         }
     }
+    // Repo mode (unpinned raw `hf:` ref): mount a writable, shared Hugging
+    // Face cache and let vLLM download `--model <repo>` itself. Pinned
+    // mode: mount the verified immutable snapshot read-only and serve it.
+    let (mount_arg, model_arg) = match request.artifact.repo.as_deref() {
+        Some(repo) => (
+            format!("type=bind,src={snapshot},dst=/root/.cache/huggingface"),
+            repo.to_string(),
+        ),
+        None => (
+            format!("type=bind,src={snapshot},dst=/models/model,readonly"),
+            "/models/model".to_string(),
+        ),
+    };
+    if request.artifact.repo.is_some() {
+        arguments.extend([
+            "--env".to_string(),
+            "HF_HOME=/root/.cache/huggingface".to_string(),
+        ]);
+        if std::env::var_os("HF_TOKEN").is_some() {
+            // Pass the token through from the launching process's
+            // environment without placing its value on the argv.
+            arguments.extend(["--env".to_string(), "HF_TOKEN".to_string()]);
+        }
+    }
     arguments.extend([
         "--shm-size".to_string(),
         format!("{shm_size_gib}g"),
         "--mount".to_string(),
-        format!("type=bind,src={snapshot},dst=/models/model,readonly"),
+        mount_arg,
         "-p".to_string(),
         format!("127.0.0.1:{}:{CONTAINER_PORT}", request.port),
         image.to_string(),
         "--model".to_string(),
-        "/models/model".to_string(),
+        model_arg,
         "--host".to_string(),
         "0.0.0.0".to_string(),
         "--port".to_string(),
@@ -756,8 +796,14 @@ pub fn build_vllm_container_plan(
         request.fit.seq_len.to_string(),
         "--max-num-seqs".to_string(),
         request.max_concurrency.to_string(),
-        "--kv-cache-memory-bytes".to_string(),
-        request.fit.memory.kv_bytes.to_string(),
+        "--gpu-memory-utilization".to_string(),
+        format!(
+            "{:.4}",
+            request
+                .fit
+                .gpu_memory_fraction
+                .unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION)
+        ),
     ]);
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
@@ -788,8 +834,14 @@ fn direct_vllm_arguments(request: &LaunchRequest) -> Result<Vec<String>, EngineD
         request.fit.seq_len.to_string(),
         "--max-num-seqs".to_string(),
         request.max_concurrency.to_string(),
-        "--kv-cache-memory-bytes".to_string(),
-        request.fit.memory.kv_bytes.to_string(),
+        "--gpu-memory-utilization".to_string(),
+        format!(
+            "{:.4}",
+            request
+                .fit
+                .gpu_memory_fraction
+                .unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION)
+        ),
     ];
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
@@ -950,8 +1002,10 @@ fn compatibility_command(mode: &VllmLaunchMode) -> (PathBuf, Vec<String>) {
                 "--rm".to_string(),
                 "--network".to_string(),
                 "none".to_string(),
+                // The digest-pinned vLLM images ship `python3`, not a bare
+                // `python`; the base entrypoint is `python3 -m vllm...`.
                 "--entrypoint".to_string(),
-                "python".to_string(),
+                "python3".to_string(),
                 image.clone(),
                 "-c".to_string(),
                 COMPATIBILITY_SCRIPT.to_string(),
