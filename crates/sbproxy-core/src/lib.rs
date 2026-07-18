@@ -17,6 +17,9 @@ pub mod admin;
 pub mod admin_cache;
 /// Fleet metrics admin API (`/admin/cluster/metrics`), WOR-1721.
 pub mod admin_cluster;
+/// Administrative metadata, inspection, and lifecycle controls for external
+/// AI compression session state.
+pub mod admin_compression;
 /// WOR-1553/1554: key + credential lifecycle REST API mounted on the
 /// admin server (`/admin/keys`, `/admin/credentials`).
 pub mod admin_keys;

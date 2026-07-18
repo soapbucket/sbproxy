@@ -217,10 +217,19 @@ impl RedisCompressionStore {
                 let Some(record) = self.load_record_key(&key).await? else {
                     continue;
                 };
-                if record.tenant_id != request.tenant_id
+                if request
+                    .tenant_id
+                    .as_ref()
+                    .is_some_and(|tenant_id| record.tenant_id != *tenant_id)
                     || wanted_origin
                         .as_ref()
                         .is_some_and(|origin| record.origin != *origin)
+                    || request.expired.is_some_and(|expired| {
+                        (record.expires_at_unix_ms <= request.expiration_cutoff_unix_ms) != expired
+                    })
+                    || request
+                        .conflict
+                        .is_some_and(|conflict| record.conflict_detected != conflict)
                 {
                     continue;
                 }
@@ -453,6 +462,9 @@ impl CompressionSessionStore for RedisCompressionStore {
             .list_page(&ListRequest {
                 tenant_id: request.tenant_id.clone(),
                 origin: request.origin.clone(),
+                expired: request.expired_before_unix_ms.map(|_| true),
+                expiration_cutoff_unix_ms: request.expired_before_unix_ms.unwrap_or(0),
+                conflict: request.conflict,
                 cursor: request.cursor.clone(),
                 limit: request.limit,
             })
@@ -522,7 +534,17 @@ fn validate_config(config: &RedisCompressionStoreConfig) -> Result<(), StoreErro
 }
 
 fn validate_list_request(request: &ListRequest) -> Result<(), StoreError> {
-    if request.tenant_id.trim().is_empty() || !(1..=MAX_ADMIN_PAGE_SIZE).contains(&request.limit) {
+    if request
+        .tenant_id
+        .as_ref()
+        .is_some_and(|tenant_id| tenant_id.trim().is_empty())
+        || request
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.trim().is_empty())
+        || (request.expired.is_some() && request.expiration_cutoff_unix_ms == 0)
+        || !(1..=MAX_ADMIN_PAGE_SIZE).contains(&request.limit)
+    {
         return Err(StoreError::InvalidRequest);
     }
     Ok(())
@@ -875,8 +897,11 @@ mod tests {
             }));
         let store = store(redis.clone());
         let request = ListRequest {
-            tenant_id: "tenant-a".to_string(),
+            tenant_id: Some("tenant-a".to_string()),
             origin: Some("API.Example.COM.".to_string()),
+            expired: None,
+            expiration_cutoff_unix_ms: 0,
+            conflict: None,
             cursor: None,
             limit: 1,
         };
@@ -898,13 +923,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_listing_supports_unscoped_expiry_and_conflict_filters() {
+        let redis = Arc::new(RecordingRedis::default());
+        let expired_id = id(40);
+        let active_id = id(41);
+        let expired_key = redis_keys(&config(), expired_id).record;
+        let active_key = redis_keys(&config(), active_id).record;
+        let mut expired = record(1, "tenant-a", "api.example.com");
+        expired.conflict_detected = true;
+        expired.expires_at_unix_ms = 50_000;
+        let mut active = record(1, "tenant-b", "other.example.com");
+        active.conflict_detected = true;
+        active.expires_at_unix_ms = 70_000;
+        redis.values.lock().unwrap().extend([
+            (expired_key.clone(), serde_json::to_vec(&expired).unwrap()),
+            (active_key.clone(), serde_json::to_vec(&active).unwrap()),
+        ]);
+        redis
+            .scan_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(RedisScanPage {
+                next_cursor: 0,
+                keys: vec![expired_key, active_key],
+            }));
+
+        let page = store(redis)
+            .list(&ListRequest {
+                tenant_id: None,
+                origin: None,
+                expired: Some(true),
+                expiration_cutoff_unix_ms: 60_000,
+                conflict: Some(true),
+                cursor: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].id, expired_id);
+    }
+
+    #[tokio::test]
     async fn invalid_cursor_and_backend_failures_are_not_empty_pages() {
         let redis = Arc::new(RecordingRedis::default());
         let store = store(redis.clone());
         let invalid = store
             .list(&ListRequest {
-                tenant_id: "tenant-a".to_string(),
+                tenant_id: Some("tenant-a".to_string()),
                 origin: None,
+                expired: None,
+                expiration_cutoff_unix_ms: 0,
+                conflict: None,
                 cursor: Some("not-a-cursor".to_string()),
                 limit: 10,
             })
@@ -918,8 +989,11 @@ mod tests {
             .push_back(Err(anyhow::anyhow!("redis://user:secret@host")));
         let unavailable = store
             .list(&ListRequest {
-                tenant_id: "tenant-a".to_string(),
+                tenant_id: Some("tenant-a".to_string()),
                 origin: None,
+                expired: None,
+                expiration_cutoff_unix_ms: 0,
+                conflict: None,
                 cursor: None,
                 limit: 10,
             })
@@ -1127,8 +1201,11 @@ mod tests {
         }
         let first_page = store
             .list(&ListRequest {
-                tenant_id: "tenant-a".to_string(),
+                tenant_id: Some("tenant-a".to_string()),
                 origin: Some("api.example.com".to_string()),
+                expired: None,
+                expiration_cutoff_unix_ms: 0,
+                conflict: None,
                 cursor: None,
                 limit: 1,
             })
@@ -1137,8 +1214,11 @@ mod tests {
         assert_eq!(first_page.records.len(), 1);
         let second_page = store
             .list(&ListRequest {
-                tenant_id: "tenant-a".to_string(),
+                tenant_id: Some("tenant-a".to_string()),
                 origin: Some("api.example.com".to_string()),
+                expired: None,
+                expiration_cutoff_unix_ms: 0,
+                conflict: None,
                 cursor: first_page.next_cursor,
                 limit: 1,
             })

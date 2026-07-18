@@ -285,6 +285,16 @@ impl CompressionRuntime {
             .any(|lever| matches!(lever, CompressionLeverConfig::SummaryBuffer(_)))
     }
 
+    /// External state adapter shared by request and admin operations.
+    pub(crate) fn admin_store(&self) -> Option<&Arc<dyn CompressionSessionStore>> {
+        self.store.as_ref()
+    }
+
+    /// Whether the current handler explicitly permits audited content inspection.
+    pub(crate) fn allows_admin_content_inspection(&self) -> bool {
+        self.policy.allow_admin_content_inspection
+    }
+
     /// Whether semantic-cache reads and writes must be bypassed for this request.
     pub fn bypasses_semantic_cache(&self, has_captured_session: bool) -> bool {
         has_captured_session && self.has_stateful_summary()

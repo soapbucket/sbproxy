@@ -378,10 +378,19 @@ impl MeshCompressionStore {
             let Some(record) = self.load_record(id).await? else {
                 continue;
             };
-            if record.tenant_id != request.tenant_id
+            if request
+                .tenant_id
+                .as_ref()
+                .is_some_and(|tenant_id| record.tenant_id != *tenant_id)
                 || wanted_origin
                     .as_ref()
                     .is_some_and(|origin| record.origin != *origin)
+                || request.expired.is_some_and(|expired| {
+                    (record.expires_at_unix_ms <= request.expiration_cutoff_unix_ms) != expired
+                })
+                || request
+                    .conflict
+                    .is_some_and(|conflict| record.conflict_detected != conflict)
             {
                 continue;
             }
@@ -577,6 +586,9 @@ impl CompressionSessionStore for MeshCompressionStore {
             .list_page(&ListRequest {
                 tenant_id: request.tenant_id.clone(),
                 origin: request.origin.clone(),
+                expired: request.expired_before_unix_ms.map(|_| true),
+                expiration_cutoff_unix_ms: request.expired_before_unix_ms.unwrap_or(0),
+                conflict: request.conflict,
                 cursor: request.cursor.clone(),
                 limit: request.limit,
             })
@@ -612,7 +624,17 @@ fn validate_config(config: &MeshCompressionStoreConfig) -> Result<(), StoreError
 }
 
 fn validate_list_request(request: &ListRequest) -> Result<(), StoreError> {
-    if request.tenant_id.trim().is_empty() || !(1..=MAX_ADMIN_PAGE_SIZE).contains(&request.limit) {
+    if request
+        .tenant_id
+        .as_ref()
+        .is_some_and(|tenant_id| tenant_id.trim().is_empty())
+        || request
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.trim().is_empty())
+        || (request.expired.is_some() && request.expiration_cutoff_unix_ms == 0)
+        || !(1..=MAX_ADMIN_PAGE_SIZE).contains(&request.limit)
+    {
         return Err(StoreError::InvalidRequest);
     }
     Ok(())
@@ -943,8 +965,11 @@ mod tests {
 
         let first = store
             .list(&ListRequest {
-                tenant_id: "tenant-a".to_string(),
+                tenant_id: Some("tenant-a".to_string()),
                 origin: None,
+                expired: None,
+                expiration_cutoff_unix_ms: 0,
+                conflict: None,
                 cursor: None,
                 limit: 2,
             })
@@ -957,8 +982,11 @@ mod tests {
             .contains("secret-"));
         let second = store
             .list(&ListRequest {
-                tenant_id: "tenant-a".to_string(),
+                tenant_id: Some("tenant-a".to_string()),
                 origin: None,
+                expired: None,
+                expiration_cutoff_unix_ms: 0,
+                conflict: None,
                 cursor: first.next_cursor,
                 limit: 2,
             })
@@ -966,6 +994,44 @@ mod tests {
             .unwrap();
         assert_eq!(second.records.len(), 1);
         assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_snapshot_supports_unscoped_expiry_and_conflict_filters() {
+        let store = MeshCompressionStore::new(handle(), config(4)).unwrap();
+        let expired_id = id(40);
+        let active_id = id(41);
+        for (record_id, expires_at_unix_ms) in [(expired_id, 50_000), (active_id, 70_000)] {
+            let permit = store
+                .acquire_update(&record_id, Duration::from_secs(5))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut candidate = record(1, "sensitive");
+            candidate.conflict_detected = true;
+            candidate.expires_at_unix_ms = expires_at_unix_ms;
+            store
+                .commit(&permit, None, &candidate, Duration::from_secs(30))
+                .await
+                .unwrap();
+            store.release(permit).await.unwrap();
+        }
+
+        let page = store
+            .list(&ListRequest {
+                tenant_id: None,
+                origin: None,
+                expired: Some(true),
+                expiration_cutoff_unix_ms: 60_000,
+                conflict: Some(true),
+                cursor: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].id, expired_id);
     }
 
     #[test]

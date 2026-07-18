@@ -403,6 +403,8 @@ pub struct AdminState {
     /// tail at `GET /api/requests/stream`. A subscriber that falls behind
     /// the buffer is lagged (skipped), never blocking `log_request`.
     pub log_events: tokio::sync::broadcast::Sender<String>,
+    /// Fallible audit sink guarding compression summary-content inspection.
+    compression_audit: Arc<dyn crate::admin_compression::CompressionAuditSink>,
 }
 
 impl AdminState {
@@ -424,6 +426,7 @@ impl AdminState {
             session_signer: crate::admin_session::SessionSigner::random(),
             revoked_sessions: Mutex::new(std::collections::HashSet::new()),
             log_events: tokio::sync::broadcast::channel(256).0,
+            compression_audit: Arc::new(crate::admin_compression::TracingCompressionAuditSink),
         }
     }
 
@@ -531,6 +534,15 @@ impl AdminState {
     /// via [`PromptPersistence::from_store`].
     pub fn with_prompt_persistence(mut self, persistence: Arc<PromptPersistence>) -> Self {
         self.prompt_persistence = Some(persistence);
+        self
+    }
+
+    /// Replace the fallible sink used before returning compression content.
+    pub fn with_compression_audit_sink(
+        mut self,
+        audit: Arc<dyn crate::admin_compression::CompressionAuditSink>,
+    ) -> Self {
+        self.compression_audit = audit;
         self
     }
 
@@ -2650,6 +2662,37 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         return;
     }
 
+    // Compression session state is external and asynchronous. Dispatch it
+    // here, after principal/CSRF resolution and before the generic GET path,
+    // so content inspection can enforce Admin-only, opt-in, audit-first
+    // behavior and attach non-cacheable response headers.
+    let compression_path = path.split('?').next().unwrap_or(path);
+    if compression_path == "/admin/compression/sessions"
+        || compression_path.starts_with("/admin/compression/sessions/")
+    {
+        if let Some(response) = crate::admin_compression::dispatch(
+            method,
+            path,
+            body_owned.as_deref(),
+            principal.as_ref(),
+            csrf_header.as_deref(),
+            state.compression_audit.as_ref(),
+        )
+        .await
+        {
+            cors.extend(response.headers);
+            let _ = write_admin_response_headed(
+                sock,
+                response.status,
+                response.content_type,
+                response.body.as_bytes(),
+                &cors,
+            )
+            .await;
+            return;
+        }
+    }
+
     // WOR-1753: chat playground. Handled here (not in
     // `handle_admin_request`) because the chat call awaits the AI client.
     // Both routes require authentication; the chat POST is a mutation, so
@@ -3161,6 +3204,53 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
         assert!(!response.contains("request_body_too_large"));
+    }
+
+    #[tokio::test]
+    async fn compression_content_route_audits_before_the_generic_auth_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct Audit {
+            events: Mutex<Vec<crate::admin_compression::CompressionAuditEvent>>,
+        }
+        impl crate::admin_compression::CompressionAuditSink for Audit {
+            fn record(
+                &self,
+                event: &crate::admin_compression::CompressionAuditEvent,
+            ) -> Result<(), crate::admin_compression::CompressionAuditError> {
+                self.events.lock().unwrap().push(event.clone());
+                Ok(())
+            }
+        }
+
+        let audit = Arc::new(Audit::default());
+        let state = make_state().with_compression_audit_sink(audit.clone());
+        let record_id = sbproxy_ai::compression::CompressionRecordId::derive(
+            "tenant-a",
+            "api.example.com",
+            [7; 16],
+        );
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let handler = tokio::spawn(handle_admin_connection(server, Arc::new(state)));
+        client
+            .write_all(
+                format!("GET /admin/compression/sessions/{record_id}/content HTTP/1.1\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, "unauthenticated");
+        assert!(events[0].operator.is_none());
     }
 
     fn basic_auth(user: &str, pass: &str) -> String {

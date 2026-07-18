@@ -85,6 +85,8 @@ pub struct CompressionRecordMetadata {
     pub backend: CompressionBackend,
     /// Adapter concurrency model.
     pub consistency: CompressionConsistency,
+    /// External record serialization schema.
+    pub schema_version: u16,
     /// Tenant boundary used for authorization and filtering.
     pub tenant_id: String,
     /// Normalized AI handler hostname.
@@ -129,6 +131,7 @@ impl CompressionRecordMetadata {
             id,
             backend,
             consistency,
+            schema_version: record.schema_version,
             tenant_id: record.tenant_id.clone(),
             origin: record.origin.clone(),
             logical_version: record.logical_version,
@@ -148,13 +151,19 @@ impl CompressionRecordMetadata {
     }
 }
 
-/// Bounded metadata scan request. Tenant scope is always required.
+/// Bounded metadata scan request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRequest {
-    /// Required tenant boundary.
-    pub tenant_id: String,
+    /// Optional tenant boundary.
+    pub tenant_id: Option<String>,
     /// Optional normalized-origin filter.
     pub origin: Option<String>,
+    /// Optional expired (`true`) or active (`false`) filter.
+    pub expired: Option<bool>,
+    /// Timestamp used by [`Self::expired`], in Unix milliseconds.
+    pub expiration_cutoff_unix_ms: u64,
+    /// Optional eventual-convergence conflict filter.
+    pub conflict: Option<bool>,
     /// Adapter-issued opaque cursor.
     pub cursor: Option<String>,
     /// Maximum records returned in one page.
@@ -170,13 +179,17 @@ pub struct ListPage {
     pub next_cursor: Option<String>,
 }
 
-/// Bounded tenant-scoped purge request.
+/// Bounded explicitly scoped purge request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgeRequest {
-    /// Required tenant boundary.
-    pub tenant_id: String,
+    /// Optional tenant boundary.
+    pub tenant_id: Option<String>,
     /// Optional normalized-origin filter.
     pub origin: Option<String>,
+    /// Optional exclusive upper expiration timestamp in Unix milliseconds.
+    pub expired_before_unix_ms: Option<u64>,
+    /// Optional eventual-convergence conflict filter.
+    pub conflict: Option<bool>,
     /// Adapter-issued opaque cursor.
     pub cursor: Option<String>,
     /// Maximum records deleted in one call.
@@ -338,6 +351,7 @@ mod tests {
         assert!(!encoded.contains("summary\""));
         assert!(!encoded.contains("session_id"));
         assert_eq!(metadata.id, id);
+        assert_eq!(metadata.schema_version, RECORD_SCHEMA_VERSION);
         assert_eq!(metadata.logical_version, 4);
         assert_eq!(metadata.covered_history_count, 6);
     }
