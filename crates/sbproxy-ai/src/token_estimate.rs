@@ -100,6 +100,58 @@ pub fn estimate_tokens_heuristic(messages: &[Message]) -> u64 {
     n + REPLY_PRIMING
 }
 
+/// Estimate target-model tokens from complete raw JSON message values.
+///
+/// Role and content use the same model-aware estimator as [`estimate_tokens`].
+/// Provider-specific message fields are additionally counted from their JSON
+/// representation, while the original values remain available to compression
+/// safety checks and byte-for-byte message retention.
+pub fn estimate_json_message_tokens(model: &str, messages: &[serde_json::Value]) -> u64 {
+    let projected = messages
+        .iter()
+        .map(|message| Message {
+            role: message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            content: match message.as_object() {
+                Some(object) => object
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                None => message.clone(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut tokens = estimate_tokens(model, &projected);
+
+    if let Ok(bpe) = tiktoken_rs::bpe_for_model(model) {
+        for extra in messages.iter().filter_map(extra_message_fields_json) {
+            tokens += bpe.encode_with_special_tokens(&extra).len() as u64;
+        }
+    } else {
+        for extra in messages.iter().filter_map(extra_message_fields_json) {
+            tokens += (extra.len() as u64 / 4).max(1);
+        }
+    }
+    tokens
+}
+
+fn extra_message_fields_json(message: &serde_json::Value) -> Option<String> {
+    let object = message.as_object()?;
+    let extra = object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "role" && key.as_str() != "content")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if extra.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(extra).to_string())
+    }
+}
+
 fn role_tokens_heuristic(role: &str) -> u64 {
     // Roles are short single words ("system", "user", ...). chars/4 gives
     // 1 for everything reasonable; clamp to 1 for the empty role.
@@ -264,5 +316,53 @@ mod tests {
         }];
         let est = estimate_tokens("some-self-hosted-model", &messages);
         assert!(est > 0);
+    }
+
+    #[test]
+    fn raw_json_estimate_matches_typed_estimate_for_plain_messages() {
+        let raw = vec![json!({"role": "user", "content": "Hello, world!"})];
+        let typed = vec![msg("user", "Hello, world!")];
+
+        assert_eq!(
+            estimate_json_message_tokens("gpt-4", &raw),
+            estimate_tokens("gpt-4", &typed)
+        );
+    }
+
+    #[test]
+    fn raw_json_estimate_accounts_for_provider_specific_message_fields() {
+        let plain = vec![json!({"role": "assistant", "content": "calling"})];
+        let structured = vec![json!({
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"id\":42}"}
+            }]
+        })];
+
+        assert!(
+            estimate_json_message_tokens("gpt-4", &structured)
+                > estimate_json_message_tokens("gpt-4", &plain)
+        );
+    }
+
+    #[test]
+    fn missing_content_counts_structured_fields_once_like_explicit_null() {
+        let missing = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{"id": "call_1", "type": "function"}]
+        })];
+        let explicit_null = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function"}]
+        })];
+
+        assert_eq!(
+            estimate_json_message_tokens("gpt-4", &missing),
+            estimate_json_message_tokens("gpt-4", &explicit_null)
+        );
     }
 }

@@ -111,7 +111,9 @@ pub use semantic_cache::{
 pub use session::{ConversationSession, SessionStore};
 pub use streaming::*;
 pub use streaming_analytics::{StreamRegistry, StreamTracker};
-pub use token_estimate::{estimate_tokens, estimate_tokens_heuristic};
+pub use token_estimate::{
+    estimate_json_message_tokens, estimate_tokens, estimate_tokens_heuristic,
+};
 pub use types::*;
 pub use usage_parser::{select_parser, SseUsageParser, UsageParserHints, UsageTokens};
 pub use value_ledger::{ValueLedger, ValueSink};
