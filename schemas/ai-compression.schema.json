@@ -1,0 +1,196 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CompressionPolicy",
+  "description": "Ordered context-compression policy for one AI handler.",
+  "type": "object",
+  "properties": {
+    "state": {
+      "description": "Shared-state backend used by stateful levers.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CompressionStateConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "allow_admin_content_inspection": {
+      "description": "Permit audited Admin-only summary-content inspection.",
+      "default": false,
+      "type": "boolean"
+    },
+    "levers": {
+      "description": "Compression levers executed in declaration order.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CompressionLeverConfig"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CompressionStateConfig": {
+      "description": "External state selected for stateful compression levers.",
+      "type": "object",
+      "required": [
+        "backend",
+        "ttl"
+      ],
+      "properties": {
+        "backend": {
+          "description": "Existing process-wide state subsystem to reuse.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CompressionBackend"
+            }
+          ]
+        },
+        "ttl": {
+          "description": "Record lifetime, in seconds after deserialization.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DurationSchema"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompressionBackend": {
+      "description": "Supported external state backends.",
+      "oneOf": [
+        {
+          "description": "Strict Redis lease, fence, and compare-and-set storage.",
+          "type": "string",
+          "enum": [
+            "redis"
+          ]
+        },
+        {
+          "description": "Eventual last-writer-wins mesh storage.",
+          "type": "string",
+          "enum": [
+            "mesh"
+          ]
+        }
+      ]
+    },
+    "DurationSchema": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "CompressionLeverConfig": {
+      "description": "One configured compression lever.",
+      "oneOf": [
+        {
+          "description": "Stateful running-summary compaction.",
+          "type": "object",
+          "required": [
+            "min_tokens",
+            "retain_recent_messages",
+            "summarizer",
+            "target_summary_tokens",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "summary_buffer"
+              ]
+            },
+            "min_tokens": {
+              "description": "Minimum request input tokens before summary buffering is eligible.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "retain_recent_messages": {
+              "description": "Number of most recent messages retained byte-for-byte.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "target_summary_tokens": {
+              "description": "Maximum tokens requested from the dedicated summarizer.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "summarizer": {
+              "description": "Dedicated provider and model used for internal summaries.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SummarizerConfig"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Deterministic compatibility trimming to the target model window.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "window_fit"
+              ]
+            },
+            "completion_reserve_tokens": {
+              "description": "Completion capacity excluded from the input-message budget.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SummarizerConfig": {
+      "description": "Dedicated internal summarizer selection and timeout.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider",
+        "timeout"
+      ],
+      "properties": {
+        "provider": {
+          "description": "Provider name from the same AI handler.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model sent to the selected provider.",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Hard request timeout, in seconds after deserialization.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DurationSchema"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

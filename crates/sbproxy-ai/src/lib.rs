@@ -13,6 +13,7 @@ pub mod audio;
 pub mod batch;
 pub mod budget;
 pub mod client;
+pub mod compression;
 pub mod concurrency;
 pub mod context_compress;
 pub mod context_overflow;
