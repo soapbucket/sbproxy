@@ -4,10 +4,11 @@
 //! Model-host status admin API (WOR-1665).
 //!
 //! `GET /admin/model-host/status` reports what the local model host is
-//! running right now: resident models with their engine state, bound
-//! port, VRAM estimate, and configured `keep_alive`, plus the residency
-//! budget and per-device VRAM. Read-only; it sits behind the admin
-//! server's shared auth gate like every other `/admin/*` route.
+//! running right now: resident models with their engine state, served
+//! engine version (WOR-1906), bound port, VRAM estimate, and configured
+//! `keep_alive`, plus the residency budget and per-device VRAM.
+//! Read-only; it sits behind the admin server's shared auth gate like
+//! every other `/admin/*` route.
 //!
 //! `GET /admin/model-host/value` reports the value-delivered / dollars
 //! saved half (WOR-1913): per-model local and cloud completion counts and
@@ -15,6 +16,11 @@
 //! reference price. It reads the request-path value recorder's ledger
 //! (`sbproxy_ai::value_ledger`); with no reference configured the report
 //! is empty, which is the honest answer. Read-only, same auth gate.
+//!
+//! `GET /admin/model-host/files` reports the verified artifact cache
+//! (WOR-1910): the cache root, exact total bytes, and per-artifact
+//! durable ready metadata including whether the artifact currently backs
+//! a ready deployment replica. Read-only, same auth gate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -736,6 +742,17 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
             }
             Some(value_response())
         }
+        // WOR-1910: verified artifact cache inventory and disk usage.
+        "/admin/model-host/files" => {
+            if !method.eq_ignore_ascii_case("GET") {
+                return Some((
+                    405,
+                    JSON,
+                    r#"{"error":"method not allowed; use GET"}"#.to_string(),
+                ));
+            }
+            Some(files_response())
+        }
         // WOR-1765: load (spawn/ready) and evict (unload to free VRAM) a
         // model on demand. keep_alive stays config-driven.
         "/admin/model-host/load" => {
@@ -998,6 +1015,112 @@ fn value_response() -> Resp {
             format!(r#"{{"error":"serialize value report: {e}"}}"#),
         ),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct FilesResponse {
+    schema_version: u32,
+    // Absent when no model host is configured: no artifact cache is open
+    // then, and reporting a made-up root would invent data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_root: Option<String>,
+    total_bytes: u64,
+    artifacts: Vec<FilesArtifactEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct FilesArtifactEntry {
+    logical_model: String,
+    variant_id: String,
+    artifact_digest: String,
+    total_size_bytes: u64,
+    last_accessed_ms: u64,
+    resident: bool,
+}
+
+/// Build `GET /admin/model-host/files` (WOR-1910): the verified artifact
+/// cache root, exact total bytes, and per-artifact durable ready metadata.
+/// Reads the same lightweight inventory the CLI lists through
+/// `ArtifactManager::cached_artifacts`, plus the current runtime statuses
+/// to mark artifacts backing a ready replica as `resident`; it never
+/// touches artifact bytes. Read-only; the admin server's shared auth gate
+/// authenticates the caller before dispatch, like every other `/admin/*`
+/// route.
+fn files_response() -> Resp {
+    let runtime = crate::server::model_host::model_runtime_manager();
+    let (Some(cache_root), Some(artifacts)) =
+        (runtime.artifact_cache_root(), runtime.cached_artifacts())
+    else {
+        // No model host is configured, so no artifact cache is open. The
+        // honest answer is an empty inventory, mirroring how the status
+        // route reports an empty deployment list.
+        return json_response(
+            200,
+            &FilesResponse {
+                schema_version: MANAGEMENT_SCHEMA_VERSION,
+                cache_root: None,
+                total_bytes: 0,
+                artifacts: Vec::new(),
+            },
+        );
+    };
+    let artifacts = match artifacts {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            tracing::error!(%error, "list model artifact cache inventory");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact inventory unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    // The admin dispatcher runs under `spawn_blocking`, so we are on a
+    // blocking-pool thread and may block on the async status snapshot.
+    let statuses = tokio::runtime::Handle::current().block_on(async { runtime.statuses().await });
+    let resident_digests = statuses
+        .iter()
+        .filter(|status| status.state == sbproxy_model_host::DeploymentRuntimeState::Ready)
+        .filter_map(|status| status.artifact_digest.as_deref())
+        .collect::<BTreeSet<_>>();
+    // Same exact-JSON-integer bound the catalog route enforces: never
+    // emit a number JavaScript would silently round.
+    let bound = sbproxy_model_host::MAX_SAFE_JSON_INTEGER;
+    let mut total_bytes: u64 = 0;
+    let mut entries = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let accessed_in_bounds = artifact.last_accessed_ms <= bound;
+        let next_total = total_bytes
+            .checked_add(artifact.total_size_bytes)
+            .filter(|total| accessed_in_bounds && *total <= bound);
+        let Some(next_total) = next_total else {
+            tracing::error!("model artifact cache metadata exceeds exact admin JSON bounds");
+            return (
+                500,
+                JSON,
+                r#"{"error":"artifact inventory metadata unavailable"}"#.to_string(),
+            );
+        };
+        total_bytes = next_total;
+        let resident = resident_digests.contains(artifact.artifact_digest.as_str());
+        entries.push(FilesArtifactEntry {
+            logical_model: artifact.logical_model,
+            variant_id: artifact.variant_id,
+            artifact_digest: artifact.artifact_digest,
+            total_size_bytes: artifact.total_size_bytes,
+            last_accessed_ms: artifact.last_accessed_ms,
+            resident,
+        });
+    }
+    json_response(
+        200,
+        &FilesResponse {
+            schema_version: MANAGEMENT_SCHEMA_VERSION,
+            cache_root: Some(cache_root.display().to_string()),
+            total_bytes,
+            artifacts: entries,
+        },
+    )
 }
 
 fn runtime_error_response(operation: &str, error: sbproxy_model_host::RuntimeManagerError) -> Resp {
@@ -1886,6 +2009,28 @@ models:
     fn value_route_rejects_non_get() {
         let (code, _, _) = dispatch("POST", "/admin/model-host/value", None).unwrap();
         assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn files_route_rejects_non_get() {
+        let (code, _, _) = dispatch("POST", "/admin/model-host/files", None).unwrap();
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn files_route_reports_an_empty_inventory_without_a_model_host() {
+        // With no model host configured there is no open artifact cache,
+        // so the route answers 200 with an empty inventory and omits
+        // cache_root rather than erroring or inventing a path.
+        let (code, ct, body) =
+            dispatch("GET", "/admin/model-host/files", None).expect("files route");
+        assert_eq!(code, 200);
+        assert_eq!(ct, JSON);
+        let report: serde_json::Value = serde_json::from_str(&body).expect("files json");
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["total_bytes"], 0);
+        assert_eq!(report["artifacts"], serde_json::json!([]));
+        assert!(report.get("cache_root").is_none());
     }
 
     #[tokio::test]

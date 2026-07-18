@@ -97,8 +97,10 @@ pub struct ProvisionedEngine {
 /// that sets them. `Default` leaves every knob unset.
 #[derive(Debug, Clone, Default)]
 pub struct EngineTuning {
-    /// Chunked prefill: `--enable-chunked-prefill` and, when a chunk size
-    /// is set, `--max-num-batched-tokens`.
+    /// Chunked prefill: `--enable-chunked-prefill` plus
+    /// `--max-num-batched-tokens` from the explicit chunk size or, when
+    /// only `target_ttft_ms` is set, from the driver's conservative TTFT
+    /// auto-tune (WOR-1678). Neither set leaves the engine default.
     pub chunked_prefill: Option<ChunkedPrefill>,
     /// vLLM auto tool-choice parser: `--enable-auto-tool-choice
     /// --tool-call-parser <name>`.

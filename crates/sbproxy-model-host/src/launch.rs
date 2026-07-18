@@ -418,19 +418,6 @@ pub fn should_speculate(batch_occupancy: f64, threshold: f64) -> bool {
 /// Default batch-occupancy threshold below which speculation is on.
 pub const SPECULATE_OCCUPANCY_THRESHOLD: f64 = 0.5;
 
-/// Choose a chunked-prefill chunk size (`max-num-batched-tokens`) to
-/// hold a target TTFT, given the engine's estimated prefill throughput
-/// in tokens/sec (WOR-1678). Larger chunks raise throughput but push
-/// TTFT out; the chunk that fits the SLO is `throughput * ttft`,
-/// clamped to a sane floor so a tiny SLO does not starve prefill.
-pub fn chunk_size_for_ttft(target_ttft_ms: u64, prefill_tokens_per_sec: f64) -> u64 {
-    let budget = prefill_tokens_per_sec * (target_ttft_ms as f64 / 1000.0);
-    (budget as u64).max(MIN_PREFILL_CHUNK)
-}
-
-/// Floor on an auto-tuned prefill chunk size.
-pub const MIN_PREFILL_CHUNK: u64 = 512;
-
 /// The production launcher: spawns the engine binary as a child
 /// process, waits for its readiness endpoint, and kills it on evict.
 #[derive(Debug, Clone)]
@@ -1136,14 +1123,6 @@ mod tests {
         // batch (compute-bound) turns it off.
         assert!(should_speculate(0.2, SPECULATE_OCCUPANCY_THRESHOLD));
         assert!(!should_speculate(0.9, SPECULATE_OCCUPANCY_THRESHOLD));
-    }
-
-    #[test]
-    fn chunk_size_tracks_ttft_and_throughput() {
-        // 10k tok/s prefill, 250ms SLO -> ~2500 token chunk.
-        assert_eq!(chunk_size_for_ttft(250, 10_000.0), 2500);
-        // A tiny SLO clamps to the floor.
-        assert_eq!(chunk_size_for_ttft(1, 10_000.0), MIN_PREFILL_CHUNK);
     }
 
     // --- ProcessEngineLauncher against a fake process ---
