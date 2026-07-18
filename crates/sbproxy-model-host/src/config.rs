@@ -568,6 +568,7 @@ pub struct ServeEntry {
     /// it drives the engine's runtime-owned `--task` flag (vLLM `embed` /
     /// `score`) and zeroes the KV-cache term in the fit. Defaults to chat
     /// (autoregressive generation) when omitted.
+    /// Support: preview.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modality: Option<crate::catalog::Modality>,
 }

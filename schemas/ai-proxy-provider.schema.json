@@ -402,7 +402,7 @@
           ]
         },
         "modality": {
-          "description": "The task this served model performs (WOR-1908 / WOR-1675). A catalog entry carries its own modality, but a raw `hf:Org/Repo` reference has none, so declare it here to serve an embedding or rerank model: it drives the engine's runtime-owned `--task` flag (vLLM `embed` / `score`) and zeroes the KV-cache term in the fit. Defaults to chat (autoregressive generation) when omitted.",
+          "description": "The task this served model performs (WOR-1908 / WOR-1675). A catalog entry carries its own modality, but a raw `hf:Org/Repo` reference has none, so declare it here to serve an embedding or rerank model: it drives the engine's runtime-owned `--task` flag (vLLM `embed` / `score`) and zeroes the KV-cache term in the fit. Defaults to chat (autoregressive generation) when omitted. Support: preview.",
           "anyOf": [
             {
               "$ref": "#/definitions/Modality"

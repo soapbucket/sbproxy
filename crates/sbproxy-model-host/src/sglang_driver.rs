@@ -48,9 +48,6 @@ const DEFAULT_SHM_SIZE_GIB: u64 = 4;
 const CONTAINER_PORT: u16 = 30000;
 const PRIVATE_NETWORK: &str = "sbproxy-model-host";
 const HEALTH_PATH: &str = "/health";
-/// Fallback SGLang `--mem-fraction-static` when the fit did not derive a
-/// device-capacity-aware fraction (e.g. the probe reported no total VRAM).
-const DEFAULT_SGLANG_MEM_FRACTION: f32 = 0.90;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
 const COMPATIBILITY_SCRIPT: &str = r#"import json,platform
@@ -708,17 +705,6 @@ pub fn build_sglang_container_plan(
         request.fit.seq_len.to_string(),
         "--max-running-requests".to_string(),
         request.max_concurrency.to_string(),
-        // Bound static VRAM (weights + KV pool) to the fit's per-device
-        // envelope, the SGLang analogue of vLLM `--gpu-memory-utilization`.
-        // Falls back to SGLang's own default when the fit lacks a fraction.
-        "--mem-fraction-static".to_string(),
-        format!(
-            "{:.4}",
-            request
-                .fit
-                .gpu_memory_fraction
-                .unwrap_or(DEFAULT_SGLANG_MEM_FRACTION)
-        ),
     ]);
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_sglang_precision_arguments(&mut arguments, request);

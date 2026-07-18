@@ -67,3 +67,4 @@ Registry version: `1`
 | `serve.models[].max_loras` | `unsupported` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].gguf_file` | `preview` | `artifact.legacy_download` | `none` |
 | `serve.models[].reference` | `stable` | `admin.value_report` | `contract.reference_price_records_savings` |
+| `serve.models[].modality` | `preview` | `engine.typed_managed_drivers` | `none` |

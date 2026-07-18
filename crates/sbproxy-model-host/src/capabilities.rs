@@ -1074,6 +1074,7 @@ fn field_is_active(path: &str, config: &ModelHostConfig) -> bool {
             .any(|entry| entry.cpu_offload_gib.is_some()),
         "serve.models[].max_loras" => config.models.iter().any(|entry| entry.max_loras.is_some()),
         "serve.models[].gguf_file" => config.models.iter().any(|entry| entry.gguf_file.is_some()),
+        "serve.models[].modality" => config.models.iter().any(|entry| entry.modality.is_some()),
         _ => false,
     }
 }
@@ -1520,6 +1521,12 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         status: SupportLevel::Stable,
         capability_id: "admin.value_report",
         consumer: Some(ConsumerContract::ReferencePriceRecordsSavings),
+    },
+    ConfigFieldCapability {
+        path: "serve.models[].modality",
+        status: SupportLevel::Preview,
+        capability_id: "engine.typed_managed_drivers",
+        consumer: None,
     },
 ];
 
