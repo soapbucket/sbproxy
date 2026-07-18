@@ -28,6 +28,15 @@ pub struct AsyncRedisConfig {
     pub url: String,
 }
 
+/// One bounded Redis `SCAN` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedisScanPage {
+    /// Cursor to pass to the next scan call. Zero means the iteration ended.
+    pub next_cursor: u64,
+    /// Raw Redis keys returned by this bounded scan step.
+    pub keys: Vec<String>,
+}
+
 impl AsyncRedisConfig {
     /// Construct a new config from a Redis connection URL.
     pub fn new(url: &str) -> Self {
@@ -160,6 +169,28 @@ impl AsyncRedisKVStore {
         }
         command.query_async(&mut connection).await
     }
+
+    /// Execute one bounded `SCAN MATCH COUNT` step.
+    ///
+    /// Redis treats `COUNT` as a work hint rather than a strict result cap.
+    /// Callers must therefore retain any unconsumed keys in their own bounded
+    /// pagination cursor. This method never falls back to `KEYS`.
+    pub async fn scan_page(&self, cursor: u64, pattern: &str, count: u16) -> Result<RedisScanPage> {
+        if !(1..=1_000).contains(&count) {
+            anyhow::bail!("redis scan count must be between 1 and 1000");
+        }
+        let mut connection = self.conn().await?;
+        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(count)
+            .query_async(&mut connection)
+            .await
+            .context("redis SCAN failed")?;
+        Ok(RedisScanPage { next_cursor, keys })
+    }
 }
 
 #[async_trait]
@@ -245,6 +276,19 @@ mod tests {
         let store = AsyncRedisKVStore::new(AsyncRedisConfig::new("redis://127.0.0.1:1"));
         // Invariant: constructor never panics and never opens a socket.
         assert!(Arc::strong_count(&store) >= 1);
+    }
+
+    #[tokio::test]
+    async fn scan_page_rejects_unbounded_count_before_connecting() {
+        let store = AsyncRedisKVStore::new(AsyncRedisConfig::new("redis://127.0.0.1:1"));
+
+        let zero = store.scan_page(0, "sbproxy:test:*", 0).await.unwrap_err();
+        assert!(zero.to_string().contains("between 1 and 1000"));
+        let excessive = store
+            .scan_page(0, "sbproxy:test:*", 1_001)
+            .await
+            .unwrap_err();
+        assert!(excessive.to_string().contains("between 1 and 1000"));
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ mod redis;
 mod sqlite;
 
 pub use async_kv::AsyncKVStore;
-pub use async_redis::{AsyncRedisConfig, AsyncRedisKVStore};
+pub use async_redis::{AsyncRedisConfig, AsyncRedisKVStore, RedisScanPage};
 pub use file::FileKVStore;
 pub use memory::MemoryKVStore;
 pub use redb_store::RedbKVStore;
