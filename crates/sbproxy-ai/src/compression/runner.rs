@@ -6,29 +6,165 @@ use crate::compression::outcome::{
 use crate::compression::CompressionBackend;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Request-shape controls that affect safe compression eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionRequestControls {
+    /// The request uses the supported chat message-array shape.
+    pub supported_chat: bool,
+    /// A top-level tool declaration is present.
+    pub has_tools: bool,
+    /// A legacy top-level function declaration is present.
+    pub has_functions: bool,
+    /// A structured response format is present.
+    pub has_response_format: bool,
+    /// A top-level output schema is present.
+    pub has_schema: bool,
+}
+
+impl CompressionRequestControls {
+    /// Whether any top-level structured-output or tool control is present.
+    pub const fn has_structured_top_level_fields(self) -> bool {
+        self.has_tools || self.has_functions || self.has_response_format || self.has_schema
+    }
+}
+
+impl Default for CompressionRequestControls {
+    fn default() -> Self {
+        Self {
+            supported_chat: true,
+            has_tools: false,
+            has_functions: false,
+            has_response_format: false,
+            has_schema: false,
+        }
+    }
+}
+
 /// Immutable request data shared by every lever in one pipeline run.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct CompressionRequest<'a> {
     model: &'a str,
+    tenant_id: Option<&'a str>,
+    api_key_id: Option<&'a str>,
+    origin: Option<&'a str>,
+    session_id: Option<[u8; 16]>,
+    controls: CompressionRequestControls,
+    now_unix_ms: u64,
+    writer_node: &'a str,
+}
+
+impl fmt::Debug for CompressionRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompressionRequest")
+            .field("model", &self.model)
+            .field("tenant_id", &self.tenant_id)
+            .field("api_key_id", &self.api_key_id)
+            .field("origin", &self.origin)
+            .field("session_id", &self.session_id.map(|_| "<redacted>"))
+            .field("controls", &self.controls)
+            .field("now_unix_ms", &self.now_unix_ms)
+            .field("writer_node", &self.writer_node)
+            .finish()
+    }
 }
 
 impl<'a> CompressionRequest<'a> {
     /// Construct request context for one resolved target model.
     pub const fn new(model: &'a str) -> Self {
-        Self { model }
+        Self {
+            model,
+            tenant_id: None,
+            api_key_id: None,
+            origin: None,
+            session_id: None,
+            controls: CompressionRequestControls {
+                supported_chat: true,
+                has_tools: false,
+                has_functions: false,
+                has_response_format: false,
+                has_schema: false,
+            },
+            now_unix_ms: 0,
+            writer_node: "",
+        }
     }
 
     /// Resolved target model used for all token comparisons.
     pub const fn model(&self) -> &'a str {
         self.model
     }
+
+    /// Add the captured session identity and its isolation boundaries.
+    pub const fn with_session_context(
+        mut self,
+        tenant_id: &'a str,
+        api_key_id: Option<&'a str>,
+        origin: &'a str,
+        session_id: [u8; 16],
+    ) -> Self {
+        self.tenant_id = Some(tenant_id);
+        self.api_key_id = api_key_id;
+        self.origin = Some(origin);
+        self.session_id = Some(session_id);
+        self
+    }
+
+    /// Set request-shape controls captured before body transformation.
+    pub const fn with_controls(mut self, controls: CompressionRequestControls) -> Self {
+        self.controls = controls;
+        self
+    }
+
+    /// Set the deterministic request clock and stable writer identity.
+    pub const fn with_clock_and_writer(mut self, now_unix_ms: u64, writer_node: &'a str) -> Self {
+        self.now_unix_ms = now_unix_ms;
+        self.writer_node = writer_node;
+        self
+    }
+
+    /// Tenant boundary, available only when a session was captured.
+    pub const fn tenant_id(&self) -> Option<&'a str> {
+        self.tenant_id
+    }
+
+    /// Sanitized API-key identifier used for internal admission and metrics.
+    pub const fn api_key_id(&self) -> Option<&'a str> {
+        self.api_key_id
+    }
+
+    /// AI handler origin included in the opaque record identity.
+    pub const fn origin(&self) -> Option<&'a str> {
+        self.origin
+    }
+
+    /// Captured request session bytes. The compression layer never generates one.
+    pub const fn session_id(&self) -> Option<[u8; 16]> {
+        self.session_id
+    }
+
+    /// Request-shape controls used by stateful lever eligibility checks.
+    pub const fn controls(&self) -> CompressionRequestControls {
+        self.controls
+    }
+
+    /// Request-time Unix timestamp in milliseconds.
+    pub const fn now_unix_ms(&self) -> u64 {
+        self.now_unix_ms
+    }
+
+    /// Stable process or mesh node identity, never a credential.
+    pub const fn writer_node(&self) -> &'a str {
+        self.writer_node
+    }
 }
 
 /// Backend-neutral result returned by a lever before runner validation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum CompressionDecision {
     /// Complete candidate replacement to validate and possibly commit.
     Candidate {
@@ -45,6 +181,25 @@ pub enum CompressionDecision {
         /// Closed failure code.
         reason: FailureReason,
     },
+}
+
+impl fmt::Debug for CompressionDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Candidate { messages } => formatter
+                .debug_struct("Candidate")
+                .field("message_count", &messages.len())
+                .finish(),
+            Self::Skipped { reason } => formatter
+                .debug_struct("Skipped")
+                .field("reason", reason)
+                .finish(),
+            Self::Failed { reason } => formatter
+                .debug_struct("Failed")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
 }
 
 /// One asynchronous compression transformation.
@@ -81,7 +236,7 @@ impl TokenCounter for ModelTokenCounter {
 }
 
 /// Completed ordered compression run and exact token accounting.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CompressionRun {
     /// Final committed message list.
     pub messages: Vec<Value>,
@@ -93,6 +248,19 @@ pub struct CompressionRun {
     pub tokens_saved: u64,
     /// Ordered result for every lever that ran.
     pub lever_results: Vec<LeverResult>,
+}
+
+impl fmt::Debug for CompressionRun {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompressionRun")
+            .field("message_count", &self.messages.len())
+            .field("initial_tokens", &self.initial_tokens)
+            .field("final_tokens", &self.final_tokens)
+            .field("tokens_saved", &self.tokens_saved)
+            .field("lever_results", &self.lever_results)
+            .finish()
+    }
 }
 
 impl CompressionRun {
@@ -222,7 +390,8 @@ impl CompressionRunner {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompressionDecision, CompressionLever, CompressionRequest, CompressionRunner, TokenCounter,
+        CompressionDecision, CompressionLever, CompressionRequest, CompressionRequestControls,
+        CompressionRunner, TokenCounter,
     };
     use crate::compression::outcome::{
         FailureReason, LeverKind, LeverOutcome, RequestOutcome, SkipReason,
@@ -301,6 +470,44 @@ mod tests {
         CompressionDecision::Candidate {
             messages: messages(tokens, label),
         }
+    }
+
+    #[test]
+    fn request_context_defaults_are_safe_and_session_context_is_explicit() {
+        let bare = CompressionRequest::new("gpt-target");
+        assert_eq!(bare.model(), "gpt-target");
+        assert_eq!(bare.tenant_id(), None);
+        assert_eq!(bare.api_key_id(), None);
+        assert_eq!(bare.origin(), None);
+        assert_eq!(bare.session_id(), None);
+        assert!(bare.controls().supported_chat);
+        assert!(!bare.controls().has_structured_top_level_fields());
+
+        let controls = CompressionRequestControls {
+            supported_chat: true,
+            has_tools: true,
+            ..CompressionRequestControls::default()
+        };
+        let contextual = CompressionRequest::new("gpt-target")
+            .with_session_context("tenant-a", Some("key-a"), "API.Example.COM.", [7; 16])
+            .with_controls(controls)
+            .with_clock_and_writer(12_345, "node-a");
+
+        assert_eq!(contextual.tenant_id(), Some("tenant-a"));
+        assert_eq!(contextual.api_key_id(), Some("key-a"));
+        assert_eq!(contextual.origin(), Some("API.Example.COM."));
+        assert_eq!(contextual.session_id(), Some([7; 16]));
+        assert!(contextual.controls().has_structured_top_level_fields());
+        assert_eq!(contextual.now_unix_ms(), 12_345);
+        assert_eq!(contextual.writer_node(), "node-a");
+        let request_debug = format!("{contextual:?}");
+        assert!(!request_debug.contains("[7, 7"));
+        assert!(request_debug.contains("<redacted>"));
+
+        let decision = candidate(1, "sensitive prompt text");
+        let decision_debug = format!("{decision:?}");
+        assert!(!decision_debug.contains("sensitive prompt text"));
+        assert!(decision_debug.contains("message_count"));
     }
 
     #[tokio::test]
