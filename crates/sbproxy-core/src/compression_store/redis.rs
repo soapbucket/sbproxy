@@ -1,5 +1,9 @@
 //! Strict lease-serialized Redis compression session store.
 
+use crate::compression_metrics::{
+    record_compression_state_operation, record_redis_compression_coordination,
+    CompressionStateOperation, CompressionStateOutcome, RedisCompressionCoordinationEvent,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use rand::RngCore;
@@ -14,7 +18,7 @@ use sbproxy_platform::storage::{AsyncKVStore, AsyncRedisKVStore, RedisScanPage};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LUA_MAX_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_ADMIN_PAGE_SIZE: u16 = 100;
@@ -304,8 +308,22 @@ impl CompressionSessionStore for RedisCompressionStore {
         &self,
         id: &CompressionRecordId,
     ) -> Result<Option<CompressionSessionRecord>, StoreError> {
-        self.load_record_key(&redis_keys(&self.config, *id).record)
-            .await
+        let started = Instant::now();
+        let result = self
+            .load_record_key(&redis_keys(&self.config, *id).record)
+            .await;
+        let outcome = match &result {
+            Ok(Some(_)) => CompressionStateOutcome::Ok,
+            Ok(None) => CompressionStateOutcome::Missing,
+            Err(_) => CompressionStateOutcome::Error,
+        };
+        record_compression_state_operation(
+            CompressionBackend::Redis,
+            CompressionStateOperation::Get,
+            outcome,
+            started.elapsed(),
+        );
+        result
     }
 
     async fn acquire_update(
@@ -335,7 +353,12 @@ impl CompressionSessionStore for RedisCompressionStore {
             .await
             .map_err(|_| StoreError::Unavailable)?;
         match response.first().map(String::as_str) {
-            Some("contended") => Ok(None),
+            Some("contended") => {
+                record_redis_compression_coordination(
+                    RedisCompressionCoordinationEvent::Contention,
+                );
+                Ok(None)
+            }
             Some("acquired") => {
                 let fence = response
                     .get(1)
@@ -360,48 +383,77 @@ impl CompressionSessionStore for RedisCompressionStore {
         record: &CompressionSessionRecord,
         ttl: Duration,
     ) -> Result<(), CommitError> {
-        if permit.backend() != CompressionBackend::Redis
-            || record.schema_version != RECORD_SCHEMA_VERSION
-            || record.logical_version
-                != expected_logical_version
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or(CommitError::Serialization)?
-            || record.logical_version > LUA_MAX_EXACT_INTEGER
-        {
-            return Err(CommitError::Serialization);
+        let started = Instant::now();
+        let result = async {
+            if permit.backend() != CompressionBackend::Redis
+                || record.schema_version != RECORD_SCHEMA_VERSION
+                || record.logical_version
+                    != expected_logical_version
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or(CommitError::Serialization)?
+                || record.logical_version > LUA_MAX_EXACT_INTEGER
+            {
+                return Err(CommitError::Serialization);
+            }
+            let ttl_ms = duration_millis(ttl).ok_or(CommitError::Serialization)?;
+            let owner = std::str::from_utf8(permit.ownership_token())
+                .map_err(|_| CommitError::Serialization)?;
+            let payload = serde_json::to_string(record).map_err(|_| CommitError::Serialization)?;
+            let keys = redis_keys(&self.config, permit.record_id());
+            let response = self
+                .redis
+                .eval(
+                    COMMIT_LUA,
+                    &[keys.record, keys.lease, keys.fence],
+                    &[
+                        expected_logical_version
+                            .map(|version| version.to_string())
+                            .unwrap_or_default(),
+                        record.logical_version.to_string(),
+                        owner.to_string(),
+                        permit.fence().to_string(),
+                        payload,
+                        ttl_ms.to_string(),
+                    ],
+                )
+                .await
+                .map_err(|_| CommitError::Unavailable)?;
+            match response.first().map(String::as_str) {
+                Some("committed") => Ok(()),
+                Some("lease_lost") => Err(CommitError::LeaseLost),
+                Some("stale_version") => Err(CommitError::StaleVersion),
+                Some("fence_rejected") => Err(CommitError::FenceRejected),
+                Some("serialization") => Err(CommitError::Serialization),
+                _ => Err(CommitError::Unavailable),
+            }
         }
-        let ttl_ms = duration_millis(ttl).ok_or(CommitError::Serialization)?;
-        let owner = std::str::from_utf8(permit.ownership_token())
-            .map_err(|_| CommitError::Serialization)?;
-        let payload = serde_json::to_string(record).map_err(|_| CommitError::Serialization)?;
-        let keys = redis_keys(&self.config, permit.record_id());
-        let response = self
-            .redis
-            .eval(
-                COMMIT_LUA,
-                &[keys.record, keys.lease, keys.fence],
-                &[
-                    expected_logical_version
-                        .map(|version| version.to_string())
-                        .unwrap_or_default(),
-                    record.logical_version.to_string(),
-                    owner.to_string(),
-                    permit.fence().to_string(),
-                    payload,
-                    ttl_ms.to_string(),
-                ],
-            )
-            .await
-            .map_err(|_| CommitError::Unavailable)?;
-        match response.first().map(String::as_str) {
-            Some("committed") => Ok(()),
-            Some("lease_lost") => Err(CommitError::LeaseLost),
-            Some("stale_version") => Err(CommitError::StaleVersion),
-            Some("fence_rejected") => Err(CommitError::FenceRejected),
-            Some("serialization") => Err(CommitError::Serialization),
-            _ => Err(CommitError::Unavailable),
+        .await;
+
+        if let Err(error) = &result {
+            let event = match error {
+                CommitError::LeaseLost => Some(RedisCompressionCoordinationEvent::LeaseExpiry),
+                CommitError::StaleVersion => Some(RedisCompressionCoordinationEvent::StaleVersion),
+                CommitError::FenceRejected => {
+                    Some(RedisCompressionCoordinationEvent::FenceRejection)
+                }
+                CommitError::Unavailable | CommitError::Serialization => None,
+            };
+            if let Some(event) = event {
+                record_redis_compression_coordination(event);
+            }
         }
+        record_compression_state_operation(
+            CompressionBackend::Redis,
+            CompressionStateOperation::Commit,
+            if result.is_ok() {
+                CompressionStateOutcome::Ok
+            } else {
+                CompressionStateOutcome::Error
+            },
+            started.elapsed(),
+        );
+        result
     }
 
     async fn release(&self, permit: UpdatePermit) -> Result<(), StoreError> {
@@ -427,58 +479,101 @@ impl CompressionSessionStore for RedisCompressionStore {
     }
 
     async fn list(&self, request: &ListRequest) -> Result<ListPage, StoreError> {
-        self.list_page(request).await
+        let started = Instant::now();
+        let result = self.list_page(request).await;
+        record_compression_state_operation(
+            CompressionBackend::Redis,
+            CompressionStateOperation::List,
+            if result.is_ok() {
+                CompressionStateOutcome::Ok
+            } else {
+                CompressionStateOutcome::Error
+            },
+            started.elapsed(),
+        );
+        result
     }
 
     async fn delete(&self, id: &CompressionRecordId) -> Result<DeleteResult, StoreError> {
-        let fence_ttl_ms =
-            duration_millis(self.config.deletion_fence_ttl).ok_or(StoreError::InvalidRequest)?;
-        let keys = redis_keys(&self.config, *id);
-        let response = self
-            .redis
-            .eval(
-                DELETE_LUA,
-                &[keys.record, keys.lease, keys.fence],
-                &[fence_ttl_ms.to_string()],
-            )
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        if response.first().map(String::as_str) != Some("deleted") {
-            return Err(StoreError::Unavailable);
+        let started = Instant::now();
+        let result = async {
+            let fence_ttl_ms = duration_millis(self.config.deletion_fence_ttl)
+                .ok_or(StoreError::InvalidRequest)?;
+            let keys = redis_keys(&self.config, *id);
+            let response = self
+                .redis
+                .eval(
+                    DELETE_LUA,
+                    &[keys.record, keys.lease, keys.fence],
+                    &[fence_ttl_ms.to_string()],
+                )
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+            if response.first().map(String::as_str) != Some("deleted") {
+                return Err(StoreError::Unavailable);
+            }
+            let deleted = match response.get(1).map(String::as_str) {
+                Some("0") => false,
+                Some("1") => true,
+                _ => return Err(StoreError::Unavailable),
+            };
+            Ok(DeleteResult {
+                deleted,
+                logical_version: None,
+            })
         }
-        let deleted = match response.get(1).map(String::as_str) {
-            Some("0") => false,
-            Some("1") => true,
-            _ => return Err(StoreError::Unavailable),
+        .await;
+        let outcome = match &result {
+            Ok(result) if result.deleted => CompressionStateOutcome::Ok,
+            Ok(_) => CompressionStateOutcome::Missing,
+            Err(_) => CompressionStateOutcome::Error,
         };
-        Ok(DeleteResult {
-            deleted,
-            logical_version: None,
-        })
+        record_compression_state_operation(
+            CompressionBackend::Redis,
+            CompressionStateOperation::Delete,
+            outcome,
+            started.elapsed(),
+        );
+        result
     }
 
     async fn purge(&self, request: &PurgeRequest) -> Result<PurgePage, StoreError> {
-        let page = self
-            .list_page(&ListRequest {
-                tenant_id: request.tenant_id.clone(),
-                origin: request.origin.clone(),
-                expired: request.expired_before_unix_ms.map(|_| true),
-                expiration_cutoff_unix_ms: request.expired_before_unix_ms.unwrap_or(0),
-                conflict: request.conflict,
-                cursor: request.cursor.clone(),
-                limit: request.limit,
-            })
-            .await?;
-        let mut deleted = 0_u64;
-        for record in page.records {
-            if self.delete(&record.id).await?.deleted {
-                deleted += 1;
+        let started = Instant::now();
+        let result = async {
+            let page = self
+                .list_page(&ListRequest {
+                    tenant_id: request.tenant_id.clone(),
+                    origin: request.origin.clone(),
+                    expired: request.expired_before_unix_ms.map(|_| true),
+                    expiration_cutoff_unix_ms: request.expired_before_unix_ms.unwrap_or(0),
+                    conflict: request.conflict,
+                    cursor: request.cursor.clone(),
+                    limit: request.limit,
+                })
+                .await?;
+            let mut deleted = 0_u64;
+            for record in page.records {
+                if self.delete(&record.id).await?.deleted {
+                    deleted += 1;
+                }
             }
+            Ok(PurgePage {
+                deleted,
+                next_cursor: page.next_cursor,
+            })
         }
-        Ok(PurgePage {
-            deleted,
-            next_cursor: page.next_cursor,
-        })
+        .await;
+        record_compression_state_operation(
+            CompressionBackend::Redis,
+            CompressionStateOperation::Purge,
+            if result.is_ok() {
+                CompressionStateOutcome::Ok
+            } else {
+                CompressionStateOutcome::Error
+            },
+            started.elapsed(),
+        );
+        result
     }
 }
 

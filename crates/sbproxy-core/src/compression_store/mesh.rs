@@ -1,5 +1,9 @@
 //! Eventual LWW compression session state over the shared process mesh.
 
+use crate::compression_metrics::{
+    record_compression_state_operation, record_mesh_compression_event, CompressionStateOperation,
+    CompressionStateOutcome,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use parking_lot::Mutex;
@@ -343,6 +347,7 @@ impl MeshCompressionStore {
             VersionedLwwMergeOutcome::TombstoneRetained => MeshCompressionEvent::TombstoneRetained,
             VersionedLwwMergeOutcome::Unchanged => return,
         };
+        record_mesh_compression_event(event);
         self.events.record(event);
     }
 
@@ -425,7 +430,20 @@ impl CompressionSessionStore for MeshCompressionStore {
         &self,
         id: &CompressionRecordId,
     ) -> Result<Option<CompressionSessionRecord>, StoreError> {
-        self.load_record(*id).await
+        let started = Instant::now();
+        let result = self.load_record(*id).await;
+        let outcome = match &result {
+            Ok(Some(_)) => CompressionStateOutcome::Ok,
+            Ok(None) => CompressionStateOutcome::Missing,
+            Err(_) => CompressionStateOutcome::Error,
+        };
+        record_compression_state_operation(
+            CompressionBackend::Mesh,
+            CompressionStateOperation::Get,
+            outcome,
+            started.elapsed(),
+        );
+        result
     }
 
     async fn acquire_update(
@@ -453,39 +471,54 @@ impl CompressionSessionStore for MeshCompressionStore {
         record: &CompressionSessionRecord,
         ttl: Duration,
     ) -> Result<(), CommitError> {
-        if permit.backend() != CompressionBackend::Mesh
-            || record.schema_version != RECORD_SCHEMA_VERSION
-            || record.kind != RecordKind::Live
-            || record.writer_node != self.cluster.identity().node_id
-            || record.logical_version
-                != expected_logical_version
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or(CommitError::Serialization)?
-            || record.parent_logical_version != expected_logical_version
-            || ttl.is_zero()
-            || ttl > MAX_MESH_STATE_TTL
-        {
-            return Err(CommitError::Serialization);
+        let started = Instant::now();
+        let result = async {
+            if permit.backend() != CompressionBackend::Mesh
+                || record.schema_version != RECORD_SCHEMA_VERSION
+                || record.kind != RecordKind::Live
+                || record.writer_node != self.cluster.identity().node_id
+                || record.logical_version
+                    != expected_logical_version
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or(CommitError::Serialization)?
+                || record.parent_logical_version != expected_logical_version
+                || ttl.is_zero()
+                || ttl > MAX_MESH_STATE_TTL
+            {
+                return Err(CommitError::Serialization);
+            }
+            self.locks
+                .validate(permit.record_id(), permit.ownership_token(), permit.fence())?;
+            let outcome = self
+                .merge_record(permit.record_id(), record, ttl)
+                .await
+                .map_err(|error| match error {
+                    StoreError::Unavailable => CommitError::Unavailable,
+                    _ => CommitError::Serialization,
+                })?;
+            self.observe_merge(outcome);
+            match outcome {
+                VersionedLwwMergeOutcome::Replaced
+                | VersionedLwwMergeOutcome::ConflictReplaced
+                | VersionedLwwMergeOutcome::Unchanged => Ok(()),
+                VersionedLwwMergeOutcome::StaleRejected
+                | VersionedLwwMergeOutcome::ConflictRetained
+                | VersionedLwwMergeOutcome::TombstoneRetained => Err(CommitError::StaleVersion),
+            }
         }
-        self.locks
-            .validate(permit.record_id(), permit.ownership_token(), permit.fence())?;
-        let outcome = self
-            .merge_record(permit.record_id(), record, ttl)
-            .await
-            .map_err(|error| match error {
-                StoreError::Unavailable => CommitError::Unavailable,
-                _ => CommitError::Serialization,
-            })?;
-        self.observe_merge(outcome);
-        match outcome {
-            VersionedLwwMergeOutcome::Replaced
-            | VersionedLwwMergeOutcome::ConflictReplaced
-            | VersionedLwwMergeOutcome::Unchanged => Ok(()),
-            VersionedLwwMergeOutcome::StaleRejected
-            | VersionedLwwMergeOutcome::ConflictRetained
-            | VersionedLwwMergeOutcome::TombstoneRetained => Err(CommitError::StaleVersion),
-        }
+        .await;
+        record_compression_state_operation(
+            CompressionBackend::Mesh,
+            CompressionStateOperation::Commit,
+            if result.is_ok() {
+                CompressionStateOutcome::Ok
+            } else {
+                CompressionStateOutcome::Error
+            },
+            started.elapsed(),
+        );
+        result
     }
 
     async fn release(&self, permit: UpdatePermit) -> Result<(), StoreError> {
@@ -500,109 +533,154 @@ impl CompressionSessionStore for MeshCompressionStore {
     }
 
     async fn list(&self, request: &ListRequest) -> Result<ListPage, StoreError> {
-        self.list_page(request).await
+        let started = Instant::now();
+        let result = self.list_page(request).await;
+        record_compression_state_operation(
+            CompressionBackend::Mesh,
+            CompressionStateOperation::List,
+            if result.is_ok() {
+                CompressionStateOutcome::Ok
+            } else {
+                CompressionStateOutcome::Error
+            },
+            started.elapsed(),
+        );
+        result
     }
 
     async fn delete(&self, id: &CompressionRecordId) -> Result<DeleteResult, StoreError> {
-        self.locks.invalidate(*id);
-        for _ in 0..3 {
-            let current = self.load_record(*id).await?;
-            if let Some(current) = current.as_ref() {
-                if current.kind == RecordKind::Tombstone {
-                    return Ok(DeleteResult {
-                        deleted: false,
-                        logical_version: Some(current.logical_version),
-                    });
+        let started = Instant::now();
+        let result = async {
+            self.locks.invalidate(*id);
+            for _ in 0..3 {
+                let current = self.load_record(*id).await?;
+                if let Some(current) = current.as_ref() {
+                    if current.kind == RecordKind::Tombstone {
+                        return Ok(DeleteResult {
+                            deleted: false,
+                            logical_version: Some(current.logical_version),
+                        });
+                    }
+                }
+                let now = unix_time_ms().ok_or(StoreError::Unavailable)?;
+                let ttl_ms = u64::try_from(self.config.tombstone_ttl.as_millis())
+                    .map_err(|_| StoreError::InvalidRequest)?;
+                let logical_version = current
+                    .as_ref()
+                    .map_or(0, |record| record.logical_version)
+                    .checked_add(1)
+                    .ok_or(StoreError::CorruptRecord)?;
+                let deleted = current.is_some();
+                let mut tombstone = current.unwrap_or_else(|| CompressionSessionRecord {
+                    schema_version: RECORD_SCHEMA_VERSION,
+                    logical_version,
+                    tenant_id: String::new(),
+                    origin: String::new(),
+                    summary: String::new(),
+                    protected_prefix_count: 0,
+                    protected_prefix_digest: MessageDigest::for_messages(&[]),
+                    covered_history_count: 0,
+                    covered_history_digest: MessageDigest::for_messages(&[]),
+                    covered_input_tokens: 0,
+                    summary_tokens: 0,
+                    summarizer_provider: String::new(),
+                    summarizer_model: String::new(),
+                    writer_node: self.cluster.identity().node_id.clone(),
+                    parent_logical_version: None,
+                    conflict_detected: false,
+                    created_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                    expires_at_unix_ms: now.saturating_add(ttl_ms),
+                    kind: RecordKind::Tombstone,
+                });
+                tombstone.logical_version = logical_version;
+                tombstone.summary.clear();
+                tombstone.writer_node = self.cluster.identity().node_id.clone();
+                tombstone.parent_logical_version =
+                    (logical_version > 1).then_some(logical_version - 1);
+                tombstone.conflict_detected = false;
+                tombstone.updated_at_unix_ms = now;
+                tombstone.expires_at_unix_ms = now.saturating_add(ttl_ms);
+                tombstone.kind = RecordKind::Tombstone;
+                let outcome = self
+                    .merge_record(*id, &tombstone, self.config.tombstone_ttl)
+                    .await?;
+                self.observe_merge(outcome);
+                match outcome {
+                    VersionedLwwMergeOutcome::Replaced
+                    | VersionedLwwMergeOutcome::ConflictReplaced
+                    | VersionedLwwMergeOutcome::Unchanged => {
+                        record_mesh_compression_event(MeshCompressionEvent::TombstoneWritten);
+                        self.events.record(MeshCompressionEvent::TombstoneWritten);
+                        return Ok(DeleteResult {
+                            deleted,
+                            logical_version: Some(logical_version),
+                        });
+                    }
+                    VersionedLwwMergeOutcome::TombstoneRetained => {
+                        return Ok(DeleteResult {
+                            deleted: false,
+                            logical_version: Some(logical_version),
+                        });
+                    }
+                    VersionedLwwMergeOutcome::StaleRejected
+                    | VersionedLwwMergeOutcome::ConflictRetained => continue,
                 }
             }
-            let now = unix_time_ms().ok_or(StoreError::Unavailable)?;
-            let ttl_ms = u64::try_from(self.config.tombstone_ttl.as_millis())
-                .map_err(|_| StoreError::InvalidRequest)?;
-            let logical_version = current
-                .as_ref()
-                .map_or(0, |record| record.logical_version)
-                .checked_add(1)
-                .ok_or(StoreError::CorruptRecord)?;
-            let deleted = current.is_some();
-            let mut tombstone = current.unwrap_or_else(|| CompressionSessionRecord {
-                schema_version: RECORD_SCHEMA_VERSION,
-                logical_version,
-                tenant_id: String::new(),
-                origin: String::new(),
-                summary: String::new(),
-                protected_prefix_count: 0,
-                protected_prefix_digest: MessageDigest::for_messages(&[]),
-                covered_history_count: 0,
-                covered_history_digest: MessageDigest::for_messages(&[]),
-                covered_input_tokens: 0,
-                summary_tokens: 0,
-                summarizer_provider: String::new(),
-                summarizer_model: String::new(),
-                writer_node: self.cluster.identity().node_id.clone(),
-                parent_logical_version: None,
-                conflict_detected: false,
-                created_at_unix_ms: now,
-                updated_at_unix_ms: now,
-                expires_at_unix_ms: now.saturating_add(ttl_ms),
-                kind: RecordKind::Tombstone,
-            });
-            tombstone.logical_version = logical_version;
-            tombstone.summary.clear();
-            tombstone.writer_node = self.cluster.identity().node_id.clone();
-            tombstone.parent_logical_version = (logical_version > 1).then_some(logical_version - 1);
-            tombstone.conflict_detected = false;
-            tombstone.updated_at_unix_ms = now;
-            tombstone.expires_at_unix_ms = now.saturating_add(ttl_ms);
-            tombstone.kind = RecordKind::Tombstone;
-            let outcome = self
-                .merge_record(*id, &tombstone, self.config.tombstone_ttl)
-                .await?;
-            self.observe_merge(outcome);
-            match outcome {
-                VersionedLwwMergeOutcome::Replaced
-                | VersionedLwwMergeOutcome::ConflictReplaced
-                | VersionedLwwMergeOutcome::Unchanged => {
-                    self.events.record(MeshCompressionEvent::TombstoneWritten);
-                    return Ok(DeleteResult {
-                        deleted,
-                        logical_version: Some(logical_version),
-                    });
-                }
-                VersionedLwwMergeOutcome::TombstoneRetained => {
-                    return Ok(DeleteResult {
-                        deleted: false,
-                        logical_version: Some(logical_version),
-                    });
-                }
-                VersionedLwwMergeOutcome::StaleRejected
-                | VersionedLwwMergeOutcome::ConflictRetained => continue,
-            }
+            Err(StoreError::Unavailable)
         }
-        Err(StoreError::Unavailable)
+        .await;
+        let outcome = match &result {
+            Ok(result) if result.deleted => CompressionStateOutcome::Ok,
+            Ok(_) => CompressionStateOutcome::Missing,
+            Err(_) => CompressionStateOutcome::Error,
+        };
+        record_compression_state_operation(
+            CompressionBackend::Mesh,
+            CompressionStateOperation::Delete,
+            outcome,
+            started.elapsed(),
+        );
+        result
     }
 
     async fn purge(&self, request: &PurgeRequest) -> Result<PurgePage, StoreError> {
-        let page = self
-            .list_page(&ListRequest {
-                tenant_id: request.tenant_id.clone(),
-                origin: request.origin.clone(),
-                expired: request.expired_before_unix_ms.map(|_| true),
-                expiration_cutoff_unix_ms: request.expired_before_unix_ms.unwrap_or(0),
-                conflict: request.conflict,
-                cursor: request.cursor.clone(),
-                limit: request.limit,
-            })
-            .await?;
-        let mut deleted = 0_u64;
-        for record in page.records {
-            if self.delete(&record.id).await?.deleted {
-                deleted += 1;
+        let started = Instant::now();
+        let result = async {
+            let page = self
+                .list_page(&ListRequest {
+                    tenant_id: request.tenant_id.clone(),
+                    origin: request.origin.clone(),
+                    expired: request.expired_before_unix_ms.map(|_| true),
+                    expiration_cutoff_unix_ms: request.expired_before_unix_ms.unwrap_or(0),
+                    conflict: request.conflict,
+                    cursor: request.cursor.clone(),
+                    limit: request.limit,
+                })
+                .await?;
+            let mut deleted = 0_u64;
+            for record in page.records {
+                if self.delete(&record.id).await?.deleted {
+                    deleted += 1;
+                }
             }
+            Ok(PurgePage {
+                deleted,
+                next_cursor: page.next_cursor,
+            })
         }
-        Ok(PurgePage {
-            deleted,
-            next_cursor: page.next_cursor,
-        })
+        .await;
+        record_compression_state_operation(
+            CompressionBackend::Mesh,
+            CompressionStateOperation::Purge,
+            if result.is_ok() {
+                CompressionStateOutcome::Ok
+            } else {
+                CompressionStateOutcome::Error
+            },
+            started.elapsed(),
+        );
+        result
     }
 }
 

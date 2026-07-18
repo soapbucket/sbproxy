@@ -150,3 +150,28 @@ groups:
         annotations:
           summary: "AI spend velocity above $10/hour"
           description: "Derived AI spend has been running above $10 per hour for 15 minutes. Tune the threshold to your budget; the unit conversion is micro-USD/s to USD/h."
+
+      - alert: SBProxyAICompressionFailures
+        expr: sbproxy:ai_compression_failure_ratio_5m > 0.10 and sum(rate(sbproxy_ai_compression_requests_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI context compression failure ratio above 10%"
+          description: "More than 10% of non-empty compression pipelines have failed open for 10 minutes. Requests still dispatch with the last committed message list. Check the lever failure reason and state backend health."
+
+      - alert: SBProxyAICompressionStateRejections
+        expr: |
+          (
+            sum(rate(sbproxy_ai_compression_state_operations_total{outcome="error"}[5m]))
+              +
+            sum(rate(sbproxy_ai_compression_redis_coordination_total{event=~"lease_expiry|stale_version|fence_rejection"}[5m]))
+              +
+            sum(rate(sbproxy_ai_compression_mesh_events_total{event=~"conflict_loser|stale_write_rejected|tombstone_retained"}[5m]))
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI compression state updates are being rejected"
+          description: "External compression state errors or rejected concurrent updates have exceeded 0.1 events/second for 10 minutes. Inspect Redis lease/fence health or mesh convergence before changing compression policy."

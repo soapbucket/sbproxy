@@ -1,5 +1,5 @@
 # SBproxy Dashboards and Alerts
-*Last modified: 2026-06-23*
+*Last modified: 2026-07-18*
 
 Grafana dashboards and Prometheus alert/recording rules for monitoring SBproxy.
 
@@ -22,7 +22,7 @@ scrape_configs:
 | Dashboard | File | UID | Description |
 |-----------|------|-----|-------------|
 | SBProxy Overview | `grafana/sbproxy-overview.json` | `sbproxy-overview` | Request rate, latency percentiles, error rate, active connections, cache hit ratio, bandwidth |
-| AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks |
+| AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks, and context-compression savings, latency, failures, and state coordination |
 | AI Value | `grafana/sbproxy-ai-value.json` | `sbproxy-ai-value` | Per-credential, multi-tenant, multi-model value tracking: spend by tenant / model / credential, token volume, p95 model latency, and value-vs-waste by outcome. Tenant and credential template variables. Built on the `sbproxy_ai_*_attributed_total` metrics |
 | Judge Backend | `grafana/sbproxy-judge-backend.json` | `sbproxy-judge-backend` | LLM-as-judge call rate by verdict, cache hit ratio, latency, cost per decision, budget exhaustion |
 | Policy Verdicts | `grafana/sbproxy-policy-verdicts.json` | `sbproxy-policy-verdicts` | Verdict rate by tag, audit bus drops per tenant, plugin vs built-in surface ratio, decision latency percentiles, top policies |
@@ -74,6 +74,8 @@ rule_files:
 | SBProxyAIProviderDown | critical | AI provider returning only errors for 2 minutes |
 | SBProxyGuardrailSpike | warning | Guardrail block rate > 10/min for 1 minute |
 | SBProxyHighTokenUsage | info | Over 1M output tokens in the last hour |
+| SBProxyAICompressionFailures | warning | Compression failure ratio > 10% for 10 minutes |
+| SBProxyAICompressionStateRejections | warning | Compression state or coordination rejections > 0.1/sec for 10 minutes |
 
 ## Recording Rules
 
@@ -94,6 +96,10 @@ rule_files:
 | `sbproxy:error_rate_5m` | 5xx error ratio (5m window) |
 | `sbproxy:ai_token_rate_5m` | AI output token rate (5m window) |
 | `sbproxy:ai_latency_p95_5m` | AI request P95 latency (5m window) |
+| `sbproxy:ai_compression_application_rate_5m` | Fraction of compression lever invocations that applied (5m window) |
+| `sbproxy:ai_compression_failure_ratio_5m` | Fraction of non-empty compression requests with any failed lever (5m window) |
+| `sbproxy:ai_compression_latency_p95_5m` | Compression lever P95 latency (5m window) |
+| `sbproxy:ai_compression_tokens_saved_rate_5m` | Exact tokens removed by applied compression levers per second (5m window) |
 
 ## Metric names reference
 

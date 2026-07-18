@@ -3352,6 +3352,12 @@ pub(super) async fn handle_ai_proxy(
                     &messages,
                 )
                 .await;
+            runtime.record_telemetry(
+                ctx.tenant_id.as_str(),
+                budget_api_key_id.as_deref(),
+                compression_cache_bypass,
+                &run,
+            );
             body["messages"] = serde_json::Value::Array(run.messages);
         }
     }

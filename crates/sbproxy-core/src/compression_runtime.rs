@@ -300,6 +300,23 @@ impl CompressionRuntime {
         has_captured_session && self.has_stateful_summary()
     }
 
+    /// Record bounded metrics and one content-free event for a completed run.
+    pub(crate) fn record_telemetry(
+        &self,
+        tenant_id: &str,
+        api_key_id: Option<&str>,
+        cache_bypass: bool,
+        run: &CompressionRun,
+    ) {
+        crate::compression_metrics::record_compression_run(
+            &self.policy,
+            tenant_id,
+            api_key_id,
+            cache_bypass,
+            run,
+        );
+    }
+
     /// Execute the configured lever sequence against one immutable message list.
     pub async fn run(
         &self,
