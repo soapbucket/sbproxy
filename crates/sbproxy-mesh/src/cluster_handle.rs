@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::gossip_loop::{PeerEntry, PeerState};
 use crate::isolation::IsolationObserver;
 use crate::state::distributed_cache::DistributedCache;
+use crate::state::register::{VersionedLwwMergeOutcome, VersionedLwwRegister};
 use crate::MeshNode;
 
 const STATE_KEY_PREFIX: &str = "sbproxy:cluster-state:v1";
@@ -267,6 +268,84 @@ pub enum ClusterStateRead<T> {
         /// Bounded decode or validation reason.
         reason: String,
     },
+}
+
+/// Live state or a deletion marker in a versioned mesh register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterVersionedStateKind {
+    /// Application payload may be consumed normally.
+    Live,
+    /// Application payload represents a retained deletion marker.
+    Tombstone,
+}
+
+/// Validated value and convergence metadata from a versioned mesh register.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterVersionedStateRecord<T> {
+    /// Publisher node ID authenticated by the inner state envelope.
+    pub publisher_node_id: String,
+    /// Payload schema version.
+    pub schema_version: u32,
+    /// Monotonic application version.
+    pub logical_version: u64,
+    /// Logical version extended by this update.
+    pub parent_logical_version: Option<u64>,
+    /// Unix publication time in milliseconds.
+    pub published_at_unix_ms: u64,
+    /// Unix expiry time in milliseconds.
+    pub expires_at_unix_ms: u64,
+    /// Authority-signed enrolled publisher claims when canonical mTLS is active.
+    pub authenticated_identity: Option<Box<crate::peer_identity::AuthenticatedPeerIdentity>>,
+    /// Live state or a retained deletion marker.
+    pub kind: ClusterVersionedStateKind,
+    /// Whether deterministic merge observed competing equal-version updates.
+    pub conflict_detected: bool,
+    /// Decoded application payload.
+    pub payload: T,
+}
+
+/// Result of reading one versioned typed cluster-state key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusterVersionedStateRead<T> {
+    /// A current compatible value was decoded.
+    Present(ClusterVersionedStateRecord<T>),
+    /// The state key has no value.
+    Missing,
+    /// The stored value passed its absolute expiry.
+    Expired {
+        /// Expired logical version.
+        logical_version: u64,
+        /// Absolute expiry time in Unix milliseconds.
+        expires_at_unix_ms: u64,
+    },
+    /// The stored payload uses a schema this consumer cannot normalize.
+    IncompatibleSchema {
+        /// Schema requested by the consumer.
+        expected: u32,
+        /// Schema carried by the stored envelope.
+        actual: u32,
+        /// Stored logical version.
+        logical_version: u64,
+    },
+    /// Membership named an owner but its transport was unavailable.
+    Unreachable {
+        /// State owner selected by the distributed hash ring.
+        owner: String,
+    },
+    /// Register, envelope metadata, or typed payload was malformed.
+    Malformed {
+        /// Bounded decode or validation reason.
+        reason: String,
+    },
+}
+
+/// Bounded deterministic list of keys currently owned by this mesh node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterStateKeySnapshot {
+    /// Namespace-relative keys in lexicographic order.
+    pub keys: Vec<String>,
+    /// Whether additional local keys were excluded by the requested bound.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,6 +644,302 @@ impl ClusterHandle {
                 .saturating_add(u64::from(ttl.subsec_nanos() > 0)),
         )
         .await
+    }
+
+    /// Atomically merge one typed value through the version-aware LWW owner.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_versioned_state<T: Serialize>(
+        &self,
+        namespace: &str,
+        key: &str,
+        schema_version: u32,
+        logical_version: u64,
+        parent_logical_version: Option<u64>,
+        kind: ClusterVersionedStateKind,
+        ttl: Duration,
+        payload: &T,
+    ) -> Result<VersionedLwwMergeOutcome, ClusterStateError> {
+        validate_state_component("namespace", namespace)?;
+        validate_state_component("key", key)?;
+        if ttl.is_zero() || ttl > MAX_STATE_TTL {
+            return Err(ClusterStateError::InvalidTtl(format!(
+                "TTL must be in the range 1ms through {}s",
+                MAX_STATE_TTL.as_secs()
+            )));
+        }
+        let payload = serde_json::to_value(payload)
+            .map_err(|error| ClusterStateError::Serialize(error.to_string()))?;
+        let now = unix_time_ms()?;
+        let ttl_ms = u64::try_from(ttl.as_millis()).map_err(|_| {
+            ClusterStateError::InvalidTtl("TTL millisecond value overflowed".to_string())
+        })?;
+        let expires_at_unix_ms = now.checked_add(ttl_ms.max(1)).ok_or_else(|| {
+            ClusterStateError::InvalidTtl("absolute expiry overflowed".to_string())
+        })?;
+        let mut envelope = ClusterStateEnvelope {
+            namespace: namespace.to_string(),
+            key: key.to_string(),
+            publisher_node_id: self.inner.identity.node_id.clone(),
+            schema_version,
+            generation: logical_version,
+            published_at_unix_ms: now,
+            expires_at_unix_ms,
+            payload,
+            identity_proof: None,
+        };
+        if let Some(authenticator) = self.identity_authenticator() {
+            let signing_bytes = cluster_state_signing_bytes(&envelope)
+                .map_err(|error| ClusterStateError::Serialize(error.to_string()))?;
+            envelope.identity_proof = Some(
+                authenticator
+                    .sign(CLUSTER_STATE_PROOF_CONTEXT, &signing_bytes)
+                    .map_err(|error| ClusterStateError::Serialize(error.to_string()))?,
+            );
+        }
+        let envelope = serde_json::to_string(&envelope)
+            .map_err(|error| ClusterStateError::Serialize(error.to_string()))?;
+        let register = match kind {
+            ClusterVersionedStateKind::Live => VersionedLwwRegister::live(
+                envelope,
+                &self.inner.identity.node_id,
+                now,
+                logical_version,
+                parent_logical_version,
+            ),
+            ClusterVersionedStateKind::Tombstone => VersionedLwwRegister::tombstone(
+                envelope,
+                &self.inner.identity.node_id,
+                now,
+                logical_version,
+                parent_logical_version,
+            ),
+        };
+        let bytes = serde_json::to_vec(&register)
+            .map_err(|error| ClusterStateError::Serialize(error.to_string()))?;
+        if bytes.len() > MAX_STATE_BYTES {
+            return Err(ClusterStateError::PayloadTooLarge {
+                size: bytes.len(),
+                maximum: MAX_STATE_BYTES,
+            });
+        }
+        let storage_key = storage_key(namespace, key);
+        let ttl_secs = ttl
+            .as_secs()
+            .saturating_add(u64::from(ttl.subsec_nanos() > 0));
+        match &self.inner.backend {
+            ClusterBackend::Local { state } => state
+                .merge_versioned_local_with_ttl(&storage_key, Bytes::from(bytes), ttl_secs)
+                .map_err(|error| ClusterStateError::Transport(error.to_string())),
+            ClusterBackend::Distributed { mesh } => mesh
+                .distributed_cache()
+                .merge_versioned_routed_with_ttl(
+                    &storage_key,
+                    Bytes::from(bytes),
+                    ttl_secs,
+                    &mesh.transport_pool(),
+                    mesh.peer_addr_lookup(),
+                )
+                .await
+                .map_err(|error| ClusterStateError::Transport(error.to_string())),
+        }
+    }
+
+    /// Read and decode one versioned typed value.
+    pub async fn read_versioned_state<T: DeserializeOwned>(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected_schema: u32,
+    ) -> ClusterVersionedStateRead<T> {
+        match self.read_versioned_state_value(namespace, key).await {
+            ClusterVersionedStateRead::Present(record)
+                if record.schema_version != expected_schema =>
+            {
+                ClusterVersionedStateRead::IncompatibleSchema {
+                    expected: expected_schema,
+                    actual: record.schema_version,
+                    logical_version: record.logical_version,
+                }
+            }
+            ClusterVersionedStateRead::Present(record) => {
+                let payload = match serde_json::from_value(record.payload) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return ClusterVersionedStateRead::Malformed {
+                            reason: "decode typed payload failed".to_string(),
+                        };
+                    }
+                };
+                ClusterVersionedStateRead::Present(ClusterVersionedStateRecord {
+                    publisher_node_id: record.publisher_node_id,
+                    schema_version: record.schema_version,
+                    logical_version: record.logical_version,
+                    parent_logical_version: record.parent_logical_version,
+                    published_at_unix_ms: record.published_at_unix_ms,
+                    expires_at_unix_ms: record.expires_at_unix_ms,
+                    authenticated_identity: record.authenticated_identity,
+                    kind: record.kind,
+                    conflict_detected: record.conflict_detected,
+                    payload,
+                })
+            }
+            ClusterVersionedStateRead::Missing => ClusterVersionedStateRead::Missing,
+            ClusterVersionedStateRead::Expired {
+                logical_version,
+                expires_at_unix_ms,
+            } => ClusterVersionedStateRead::Expired {
+                logical_version,
+                expires_at_unix_ms,
+            },
+            ClusterVersionedStateRead::IncompatibleSchema { .. } => unreachable!(
+                "schema-agnostic versioned state reads never return an incompatibility"
+            ),
+            ClusterVersionedStateRead::Unreachable { owner } => {
+                ClusterVersionedStateRead::Unreachable { owner }
+            }
+            ClusterVersionedStateRead::Malformed { reason } => {
+                ClusterVersionedStateRead::Malformed { reason }
+            }
+        }
+    }
+
+    /// Read one versioned state register without imposing a payload schema.
+    pub async fn read_versioned_state_value(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> ClusterVersionedStateRead<serde_json::Value> {
+        if let Err(error) = validate_state_component("namespace", namespace)
+            .and_then(|_| validate_state_component("key", key))
+        {
+            return ClusterVersionedStateRead::Malformed {
+                reason: error.to_string(),
+            };
+        }
+        let storage_key = storage_key(namespace, key);
+        let bytes = match self.read_raw(&storage_key).await {
+            RawStateRead::Present(bytes) => bytes,
+            RawStateRead::Missing => return ClusterVersionedStateRead::Missing,
+            RawStateRead::Unreachable(owner) => {
+                return ClusterVersionedStateRead::Unreachable { owner };
+            }
+        };
+        if bytes.len() > MAX_STATE_BYTES {
+            return ClusterVersionedStateRead::Malformed {
+                reason: format!(
+                    "versioned register is {} bytes; maximum is {MAX_STATE_BYTES}",
+                    bytes.len()
+                ),
+            };
+        }
+        let register = match serde_json::from_slice::<VersionedLwwRegister>(&bytes) {
+            Ok(register) => register,
+            Err(_) => {
+                return ClusterVersionedStateRead::Malformed {
+                    reason: "decode versioned register failed".to_string(),
+                };
+            }
+        };
+        let envelope = match register
+            .value()
+            .and_then(|value| serde_json::from_str::<ClusterStateEnvelope>(value).ok())
+        {
+            Some(envelope) => envelope,
+            None => {
+                return ClusterVersionedStateRead::Malformed {
+                    reason: "decode versioned state envelope failed".to_string(),
+                };
+            }
+        };
+        if envelope.namespace != namespace
+            || envelope.key != key
+            || envelope.publisher_node_id != register.node_id()
+            || envelope.generation != register.logical_version()
+            || envelope.published_at_unix_ms != register.timestamp_ms()
+        {
+            return ClusterVersionedStateRead::Malformed {
+                reason: "versioned register metadata does not match its signed envelope"
+                    .to_string(),
+            };
+        }
+        if envelope.publisher_node_id.is_empty()
+            || envelope.publisher_node_id.len() > MAX_IDENTITY_LEN
+        {
+            return ClusterVersionedStateRead::Malformed {
+                reason: "publisher node ID is empty or oversized".to_string(),
+            };
+        }
+        let authenticated_identity = match self.verify_envelope_identity(&envelope) {
+            Ok(identity) => identity.map(Box::new),
+            Err(reason) => return ClusterVersionedStateRead::Malformed { reason },
+        };
+        let now = match unix_time_ms() {
+            Ok(now) => now,
+            Err(error) => {
+                return ClusterVersionedStateRead::Malformed {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        if envelope.expires_at_unix_ms <= now {
+            return ClusterVersionedStateRead::Expired {
+                logical_version: register.logical_version(),
+                expires_at_unix_ms: envelope.expires_at_unix_ms,
+            };
+        }
+        if envelope.published_at_unix_ms > envelope.expires_at_unix_ms {
+            return ClusterVersionedStateRead::Malformed {
+                reason: "publication time is after expiry".to_string(),
+            };
+        }
+        ClusterVersionedStateRead::Present(ClusterVersionedStateRecord {
+            publisher_node_id: envelope.publisher_node_id,
+            schema_version: envelope.schema_version,
+            logical_version: register.logical_version(),
+            parent_logical_version: register.parent_logical_version(),
+            published_at_unix_ms: envelope.published_at_unix_ms,
+            expires_at_unix_ms: envelope.expires_at_unix_ms,
+            authenticated_identity,
+            kind: if register.is_tombstone() {
+                ClusterVersionedStateKind::Tombstone
+            } else {
+                ClusterVersionedStateKind::Live
+            },
+            conflict_detected: register.conflict_detected(),
+            payload: envelope.payload,
+        })
+    }
+
+    /// Snapshot a bounded, sorted set of keys currently owned by this node.
+    pub fn local_state_key_snapshot(
+        &self,
+        namespace: &str,
+        maximum: usize,
+    ) -> Result<ClusterStateKeySnapshot, ClusterStateError> {
+        validate_state_component("namespace", namespace)?;
+        let prefix = format!("{STATE_KEY_PREFIX}:{namespace}:");
+        let snapshot = self
+            .state_cache()
+            .snapshot_prefix_local(&prefix, maximum)
+            .map_err(|_| {
+                ClusterStateError::InvalidKey(
+                    "local state snapshot limit must be in the range 1 through 4096".to_string(),
+                )
+            })?;
+        let keys = snapshot
+            .entries
+            .into_iter()
+            .map(|(storage_key, _)| {
+                storage_key
+                    .strip_prefix(&prefix)
+                    .expect("snapshot prefix already matched")
+                    .to_string()
+            })
+            .collect();
+        Ok(ClusterStateKeySnapshot {
+            keys,
+            truncated: snapshot.truncated,
+        })
     }
 
     /// Read and decode one namespaced typed value.

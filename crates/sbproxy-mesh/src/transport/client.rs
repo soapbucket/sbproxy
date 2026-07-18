@@ -24,6 +24,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::crypto::Cipher;
+use crate::state::register::VersionedLwwMergeOutcome;
 
 use super::frame::{read_frame, write_frame, CacheOp, CacheResult, Request, Response};
 
@@ -215,6 +216,27 @@ impl PeerClient {
             CacheResult::Acked => Ok(()),
             CacheResult::Error(e) => Err(anyhow::anyhow!("remote error: {}", e)),
             other => Err(anyhow::anyhow!("unexpected cache result: {:?}", other)),
+        }
+    }
+
+    /// Atomically merge one versioned LWW candidate on the remote owner.
+    pub async fn merge_versioned(
+        &self,
+        key: String,
+        value: Bytes,
+        ttl_secs: u64,
+    ) -> anyhow::Result<VersionedLwwMergeOutcome> {
+        match self
+            .send_request(CacheOp::MergeVersioned {
+                key,
+                value,
+                ttl_secs,
+            })
+            .await?
+        {
+            CacheResult::VersionedMerged(outcome) => Ok(outcome),
+            CacheResult::Error(error) => Err(anyhow::anyhow!("remote error: {error}")),
+            other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
         }
     }
 
@@ -483,6 +505,7 @@ impl TransportClientPool {
 mod tests {
     use super::*;
     use crate::state::distributed_cache::DistributedCache;
+    use crate::state::register::{VersionedLwwMergeOutcome, VersionedLwwRegister};
     use crate::transport::server::TransportServer;
 
     async fn spawn_server() -> (TransportServer, Arc<DistributedCache<Bytes>>, u16) {
@@ -574,6 +597,44 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(cache.get_local("x"), None);
         assert_eq!(cache.get_local("y"), None);
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn client_versioned_merge_runs_atomically_on_remote_owner() {
+        let (server, cache, port) = spawn_server().await;
+        let client = PeerClient::new(format!("127.0.0.1:{port}"));
+        let candidate = |value: &str, version: u64| {
+            Bytes::from(
+                serde_json::to_vec(&VersionedLwwRegister::live(
+                    value.to_string(),
+                    "node-a",
+                    version * 100,
+                    version,
+                    version.checked_sub(1),
+                ))
+                .unwrap(),
+            )
+        };
+
+        assert_eq!(
+            client
+                .merge_versioned("state:one".to_string(), candidate("new", 2), 60)
+                .await
+                .unwrap(),
+            VersionedLwwMergeOutcome::Replaced
+        );
+        assert_eq!(
+            client
+                .merge_versioned("state:one".to_string(), candidate("stale", 1), 60)
+                .await
+                .unwrap(),
+            VersionedLwwMergeOutcome::StaleRejected
+        );
+        let stored: VersionedLwwRegister =
+            serde_json::from_slice(&cache.get_local("state:one").unwrap()).unwrap();
+        assert_eq!(stored.value(), Some("new"));
 
         server.shutdown();
     }

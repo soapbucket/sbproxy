@@ -14,6 +14,8 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::state::register::VersionedLwwMergeOutcome;
+
 /// Maximum permitted frame payload size, in bytes. Frames larger than this
 /// are rejected on the read path to bound memory usage from a hostile peer.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -83,6 +85,15 @@ pub enum CacheOp {
         /// Key prefix to match; an empty prefix purges every entry.
         prefix: String,
     },
+    /// Atomically merge a versioned LWW candidate on the owning node.
+    MergeVersioned {
+        /// Key whose current version participates in the merge.
+        key: String,
+        /// JSON-encoded versioned register candidate.
+        value: Bytes,
+        /// Lifetime in seconds applied only when the candidate wins.
+        ttl_secs: u64,
+    },
 }
 
 /// Server reply to a [`Request`]. Carries the original `request_id` so the
@@ -112,6 +123,8 @@ pub enum CacheResult {
     /// Reply to `PurgePrefix`: count of entries removed on the server's
     /// local shard. Added in K2 as part of the cluster-wide purge fan-out.
     Purged(u64),
+    /// Closed result of an atomic version-aware LWW merge.
+    VersionedMerged(VersionedLwwMergeOutcome),
 }
 
 // --- Framing helpers ---
@@ -323,6 +336,37 @@ mod tests {
             CacheResult::Acked => {}
             other => panic!("expected Acked, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn versioned_merge_wire_round_trip_preserves_closed_outcome() {
+        use crate::state::register::VersionedLwwMergeOutcome;
+
+        let request = Request {
+            request_id: 77,
+            op: CacheOp::MergeVersioned {
+                key: "state:opaque".to_string(),
+                value: Bytes::from_static(b"candidate"),
+                ttl_secs: 60,
+            },
+        };
+        let encoded = crate::transport::wire::encode(&request).unwrap();
+        let decoded: Request = crate::transport::wire::decode(&encoded).unwrap();
+        assert!(matches!(
+            decoded.op,
+            CacheOp::MergeVersioned { ttl_secs: 60, .. }
+        ));
+
+        let response = Response {
+            request_id: 77,
+            result: CacheResult::VersionedMerged(VersionedLwwMergeOutcome::ConflictRetained),
+        };
+        let encoded = crate::transport::wire::encode(&response).unwrap();
+        let decoded: Response = crate::transport::wire::decode(&encoded).unwrap();
+        assert!(matches!(
+            decoded.result,
+            CacheResult::VersionedMerged(VersionedLwwMergeOutcome::ConflictRetained)
+        ));
     }
 
     #[tokio::test]
