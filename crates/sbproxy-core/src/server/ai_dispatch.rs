@@ -817,11 +817,18 @@ fn served_provider_modality(
     let serve = provider.serve.as_ref()?;
     let catalog = builtin_catalog();
     // A served provider hosts one or more models; report the first served
-    // model whose modality is non-chat, so its surface becomes legal.
+    // model whose modality is non-chat, so its surface becomes legal. An
+    // explicit `modality:` on the serve entry wins (the only way to declare
+    // it for a raw `hf:` reference, which has no catalog entry); otherwise
+    // fall back to the certified catalog entry's modality.
     serve
         .models
         .iter()
-        .filter_map(|entry| catalog.get(&entry.model).map(|model| model.modality))
+        .filter_map(|entry| {
+            entry
+                .modality
+                .or_else(|| catalog.get(&entry.model).map(|model| model.modality))
+        })
         .find(|modality| !modality.uses_kv_cache())
 }
 

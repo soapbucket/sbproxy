@@ -19,7 +19,7 @@ Registry version: `1`
 | `artifact.cache_budget` | `artifact` | `stable` | contract.cache_budget_protects_active_artifacts<br>test.artifact_gc | Cache collection enforces LRU budgets without deleting protected artifacts. |
 | `artifact.exact_removal` | `artifact` | `stable` | contract.exact_removal_protects_references<br>test.artifact_manager<br>test.models_lifecycle_cli | Exact cache removal is idempotent and rejects configured, resident, pinned, locked, leased, or active artifacts. |
 | `engine.typed_managed_drivers` | `engine` | `stable` | contract.managed_drivers_expose_typed_capabilities<br>test.engine_drivers | Managed engines share typed detect, provision, launch, health, and shutdown contracts over verified local artifacts. |
-| `engine.llama_cpp_managed` | `engine` | `preview` | test.engine_drivers<br>test.cuda_build<br>cert.apple_metal.2026-07-11 | Managed llama.cpp supports digest-verified binary acquisition and Linux CUDA source builds; Apple Metal is certified while live CUDA remains deferred. |
+| `engine.llama_cpp_managed` | `engine` | `preview` | test.engine_drivers<br>test.cuda_build<br>cert.apple_metal.2026-07-11 | Managed llama.cpp acquires a digest-verified prebuilt binary to serve GGUF models on CPU and Apple Metal. NVIDIA GPU serving is handled by vLLM and SGLang, not llama.cpp. |
 | `engine.vllm_uv` | `engine` | `preview` | test.engine_drivers | Managed vLLM can use a pinned uv environment; live NVIDIA certification remains deferred. |
 | `engine.vllm_container` | `engine` | `preview` | test.engine_drivers | Digest-pinned private container plans use read-only artifacts and selected devices; live NVIDIA certification remains deferred. |
 | `engine.sglang` | `engine` | `preview` | test.engine_drivers | Managed SGLang serves safetensors weights on a CUDA worker from a pinned uv environment or a digest-pinned container, mirroring vLLM and adding RadixAttention prefix caching; live NVIDIA certification remains deferred. |
@@ -32,7 +32,7 @@ Registry version: `1`
 | `admin.model_status` | `admin` | `stable` | contract.status_reports_stable_lifecycle<br>test.models_lifecycle_cli<br>test.admin_model_host | Authenticated admin status, load, stop, drain, and reset adapt the shared runtime lifecycle. |
 | `admin.model_management` | `admin` | `preview` | contract.canonical_desired_state_reconciles_atomically<br>test.admin_model_management<br>test.ui_model_management | Backend E2E covers authenticated full-map revision conflicts and restart persistence; UI unit and component contracts cover mode-aware catalog evidence, lifecycle state, conflict recovery, removal guards, and cluster authority proof. |
 | `platform.apple_metal` | `platform` | `stable` | contract.catalog_v2_selects_exact_artifact<br>test.engine_drivers<br>cert.apple_metal.2026-07-11 | Apple Metal completed a real managed gateway completion, status, stop, cache-reuse, and Ctrl-C shutdown gate on Apple M4 Max. |
-| `platform.nvidia_cuda` | `platform` | `preview` | test.cuda_build<br>test.local_admission | NVIDIA discovery, vLLM, and CUDA llama.cpp have deterministic coverage; live GCP certification is reserved for the final PR group. |
+| `platform.nvidia_cuda` | `platform` | `preview` | test.cuda_build<br>test.local_admission | NVIDIA discovery and the vLLM and SGLang container engines have deterministic coverage; live GPU serving is recorded in the certification ledger. |
 | `lifecycle.priority_admission` | `lifecycle` | `stable` | contract.priority_gate_changes_dispatch | Configured local concurrency changes request admission. |
 | `lifecycle.model_cli` | `lifecycle` | `stable` | contract.exact_removal_protects_references<br>test.models_lifecycle_cli | Pull, list, show, remove, process status, and stop commands use versioned JSON and shared artifact or runtime contracts. |
 | `admin.value_report` | `admin` | `stable` | contract.reference_price_records_savings<br>test.value_ledger | A configured cloud reference prices each local completion as dollars saved, recorded per model and served on the admin value route. |
@@ -67,3 +67,4 @@ Registry version: `1`
 | `serve.models[].max_loras` | `unsupported` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].gguf_file` | `preview` | `artifact.legacy_download` | `none` |
 | `serve.models[].reference` | `stable` | `admin.value_report` | `contract.reference_price_records_savings` |
+| `serve.models[].modality` | `preview` | `engine.typed_managed_drivers` | `none` |

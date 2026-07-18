@@ -214,6 +214,7 @@ fn ready(kind: EngineKind, format: ArtifactFormat) -> ReadyArtifact {
             terminal_at_ms: Some(1),
             error: None,
         },
+        repo: None,
     }
 }
 
@@ -227,6 +228,7 @@ fn fit() -> FitPlan {
         memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1024),
         moe: None,
         throughput: None,
+        gpu_memory_fraction: None,
     }
 }
 
@@ -1563,8 +1565,8 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
     );
     assert_eq!(flag_value(&captured[0].arguments, "--max-num-seqs"), "1");
     assert_eq!(
-        flag_value(&captured[0].arguments, "--kv-cache-memory-bytes"),
-        "256"
+        flag_value(&captured[0].arguments, "--gpu-memory-utilization"),
+        "0.9000"
     );
     assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "3");
 }
@@ -1654,7 +1656,7 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
     assert!(plan
         .arguments
         .windows(2)
-        .any(|window| window == ["--gpus", "device=1"]));
+        .any(|window| window == ["--gpus", "\"device=1\""]));
     assert!(plan
         .arguments
         .iter()

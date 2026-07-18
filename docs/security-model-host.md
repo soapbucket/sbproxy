@@ -116,11 +116,11 @@ removing from the cache used by a running file-managed gateway.
 
 ## Engine supply chain
 
-### llama.cpp binary and source build
+### llama.cpp binary
 
 The driver can use a trusted explicit path, a compatible `PATH` executable, or a
-pinned release. Built-in b9905 prebuilt assets and the Linux CUDA source archive
-have checked-in SHA-256 digests. A custom release may carry an expected digest.
+pinned release. Built-in b9905 prebuilt assets have checked-in per-platform
+SHA-256 digests. A custom release may carry an expected digest.
 Acquirers share an identity-scoped lock, stage away from the ready path, verify
 the archive, and publish only a complete executable directory.
 
@@ -305,9 +305,8 @@ contract:
 - complete server-derived key introspection for every managed route decision.
 
 Live NVIDIA and multi-node validation runs on GCP in the final PR group. Until
-that evidence is recorded, NVIDIA uv, container, and CUDA source-build paths
-remain preview even though their deterministic process and isolation contracts
-run in CI.
+that evidence is recorded, the NVIDIA uv and container paths remain preview even
+though their deterministic process and isolation contracts run in CI.
 
 ## Related
 

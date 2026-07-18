@@ -13,7 +13,7 @@ certification.
 |---|---|---|
 | CPU contracts | covered in CI | Artifact, driver, fit, admission, reconcile, reload, and CLI suites. |
 | Apple Silicon Metal | passed 2026-07-11 | Real managed GGUF completion, status and stop truth, cache reuse, maintenance health, and ready-engine Ctrl-C shutdown on Apple M4 Max. |
-| NVIDIA CUDA single node | pending final GCP PR | Deterministic T4/L4 descriptors, vLLM plans, container isolation, and CUDA llama.cpp source-build tests exist. No live claim is made in this PR. |
+| NVIDIA CUDA single node | pending final GCP PR | Deterministic T4/L4 descriptors, vLLM plans, and container isolation tests exist. No live claim is made in this PR. |
 | NVIDIA multi-GPU | pending final GCP PR | Placement and device-scoping tests only. |
 | Local multi-process cluster control | passed 2026-07-11 | Four real processes, enrolled identities, signed gossip and state, node-specific mTLS, controller restart fencing, rolling and recreate transitions, worker loss, post-GC tombstone, partition callout, digest mismatch and recovery, and child cleanup. |
 | Local three-process data plane | passed 2026-07-13 | A gateway and two workers prove authenticated HTTP/2 dispatch, logical discovery, unary and SSE responses, coordinated cold start, pre-output failover, no mid-stream replay, cancellation, permit release, and absence of the bearer sentinel from worker logs. |
@@ -255,14 +255,6 @@ The gate must prove all of the following with retained logs and status output:
 Repeat with a digest-pinned container. Inspect the exact Docker or Podman argv,
 private network, loopback port, read-only snapshot mount, selected devices, and
 shared-memory bound.
-
-### CUDA llama.cpp
-
-On Linux x86-64 with the NVIDIA toolkit installed, configure llama.cpp binary
-launch with `acceleration: cuda`. The gate must show the official source archive
-digest, shared build lock, successful CMake CUDA build, atomic executable
-publication, GGUF load, and a completion through the gateway. Repeat once from
-the ready build cache to prove no rebuild occurs.
 
 ### T4 capability refusal
 

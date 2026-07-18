@@ -320,6 +320,85 @@ impl ArtifactManager {
         }
     }
 
+    /// Prepare an unpinned raw `hf:Org/Repo` reference for a
+    /// self-downloading container launch. There are no pinned bytes to
+    /// stage or verify, so this skips the content-addressed download. It
+    /// prefetches `config.json` (the fit planner needs the model shape
+    /// before the engine starts) and returns a repo-mode [`ReadyArtifact`]
+    /// whose `snapshot_path` is a writable, shared Hugging Face cache the
+    /// container mounts and downloads the weights into.
+    pub async fn ensure_unpinned(
+        &self,
+        artifact: &ResolvedArtifact,
+    ) -> Result<ReadyArtifact, ArtifactError> {
+        let repo = artifact
+            .source
+            .strip_prefix("hf:")
+            .unwrap_or(artifact.source.as_str())
+            .to_string();
+        if repo.trim().is_empty() || !repo.contains('/') {
+            return Err(ArtifactError::InvalidArtifact(format!(
+                "unpinned artifact source {:?} is not an hf:Org/Repo reference",
+                artifact.source
+            )));
+        }
+        let mut job = self.jobs.create(
+            OperationKind::Pull,
+            format!("unpinned:sha256:{}", artifact.artifact_digest),
+        )?;
+        self.observer.on_job(&job);
+
+        // A safetensors model carries its shape in config.json; prefetch it
+        // so the fit planner can size KV and pick devices before launch. A
+        // GGUF ref carries its shape in the file header (read at launch),
+        // so nothing is prefetched here for it.
+        let mut files = std::collections::BTreeMap::new();
+        if artifact.format != ArtifactFormat::Gguf {
+            match self
+                .ensure_legacy_file(&repo, &artifact.revision, "config.json", None, None)
+                .await
+            {
+                Ok(path) => {
+                    files.insert("config.json".to_string(), path);
+                }
+                Err(error) => {
+                    let failed = self.jobs.transition(
+                        &job.id,
+                        OperationState::Failed,
+                        job.progress.clone(),
+                        Some(&error.to_string()),
+                    )?;
+                    self.observer.on_job(&failed);
+                    return Err(error);
+                }
+            }
+        }
+
+        let hf_home = self.cache.root().join("hf-home");
+        std::fs::create_dir_all(&hf_home).map_err(|error| {
+            ArtifactError::InvalidArtifact(format!(
+                "create hugging face cache {}: {error}",
+                hf_home.display()
+            ))
+        })?;
+
+        job = self.transition_job(
+            &job,
+            OperationState::Ready,
+            OperationProgress {
+                completed_bytes: 0,
+                total_bytes: 0,
+                current_file: None,
+            },
+        )?;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        ReadyArtifact::unpinned(artifact, repo, hf_home, files, job, now_ms)
+    }
+
     /// Safely acquire one legacy Hugging Face file for the documented
     /// preview compatibility path. Managed v2 launches never consume
     /// this path because it lacks a catalog-declared exact byte size.

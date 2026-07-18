@@ -618,13 +618,22 @@ pub fn build_sglang_container_plan(
             "verified snapshot path contains a comma unsupported by OCI mount syntax",
         ));
     }
+    // The private network is `--internal` (no egress) for pinned launches
+    // that serve locally mounted weights. A repo-mode (unpinned raw `hf:`)
+    // launch must self-download from Hugging Face, so it runs on the default
+    // bridge, which has external DNS and egress via the host resolver.
+    let network = if request.artifact.repo.is_some() {
+        "bridge"
+    } else {
+        PRIVATE_NETWORK
+    };
     let mut arguments = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--name".to_string(),
         format!("sbproxy-{}-g{}", request.deployment, request.generation),
         "--network".to_string(),
-        PRIVATE_NETWORK.to_string(),
+        network.to_string(),
     ];
     match runtime {
         ContainerRuntime::Docker => {
@@ -634,7 +643,11 @@ pub fn build_sglang_container_plan(
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            arguments.extend(["--gpus".to_string(), format!("device={devices}")]);
+            // The device set must be double-quoted: `--gpus device=0,1`
+            // makes Docker read the `,1` as a GPU count and reject the
+            // request ("cannot set both Count and DeviceIDs"). The quoted
+            // form is a single device-id spec and works for one or many.
+            arguments.extend(["--gpus".to_string(), format!("\"device={devices}\"")]);
         }
         ContainerRuntime::Podman => {
             for device in &request.selected_devices {
@@ -642,16 +655,46 @@ pub fn build_sglang_container_plan(
             }
         }
     }
+    // Repo mode (unpinned raw `hf:` ref): mount a writable, shared Hugging
+    // Face cache and let SGLang download `--model-path <repo>` itself.
+    // Pinned mode: mount the verified immutable snapshot read-only.
+    let (mount_arg, model_arg) = match request.artifact.repo.as_deref() {
+        Some(repo) => (
+            format!("type=bind,src={snapshot},dst=/root/.cache/huggingface"),
+            repo.to_string(),
+        ),
+        None => (
+            format!("type=bind,src={snapshot},dst=/models/model,readonly"),
+            "/models/model".to_string(),
+        ),
+    };
+    if request.artifact.repo.is_some() {
+        arguments.extend([
+            "--env".to_string(),
+            "HF_HOME=/root/.cache/huggingface".to_string(),
+        ]);
+        if std::env::var_os("HF_TOKEN").is_some() {
+            arguments.extend(["--env".to_string(), "HF_TOKEN".to_string()]);
+        }
+    }
     arguments.extend([
         "--shm-size".to_string(),
         format!("{shm_size_gib}g"),
         "--mount".to_string(),
-        format!("type=bind,src={snapshot},dst=/models/model,readonly"),
+        mount_arg,
         "-p".to_string(),
         format!("127.0.0.1:{}:{CONTAINER_PORT}", request.port),
+        // The SGLang image entrypoint is a generic NVIDIA wrapper
+        // (`/opt/nvidia/nvidia_entrypoint.sh`) that execs its arguments, so
+        // unlike the vLLM image it does not itself launch the server. Run
+        // the launch module explicitly under python3.
+        "--entrypoint".to_string(),
+        "python3".to_string(),
         image.to_string(),
+        "-m".to_string(),
+        "sglang.launch_server".to_string(),
         "--model-path".to_string(),
-        "/models/model".to_string(),
+        model_arg,
         "--host".to_string(),
         "0.0.0.0".to_string(),
         "--port".to_string(),

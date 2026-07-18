@@ -778,6 +778,41 @@ assigned only to workers that already report the exact verified artifact.
 placement. Each worker projection is exact-variant pinned, warm, single-replica,
 and fenced to the cluster deployment generation.
 
+## Serve model settings
+
+An inline `serve:` provider hosts one or more models under `serve.models[]`.
+Each entry accepts these settings.
+
+| Setting | Purpose |
+|---|---|
+| `model` | Catalog id (`qwen3-32b`) or a raw `hf:Org/Repo[:QUANT]` reference. Required. |
+| `name` | Client-facing model id that routing, budgets, and the ledger see. Defaults to the catalog id, and is required for a raw `hf:` reference. |
+| `variant` | Exact catalog v2 artifact variant to run. Omitting it lets the worker select a compatible variant. |
+| `engine` | Engine to serve with: `auto` (default), `vllm`, `sglang`, `llama_cpp`, or `embedded`. |
+| `modality` | Task the model performs: `chat` (default), `embedding`, `rerank`, `speech_to_text`, `text_to_speech`, or `image`. It drives the engine's task flag (`embedding` serves `--task embed`, `rerank` serves `--task score`) and zeroes the KV-cache term in the fit. Set it to serve an embedding or rerank model from a raw `hf:` reference, which has no catalog entry to carry the modality. |
+| `max_context` | Context length to plan VRAM for and pass to the engine. |
+| `keep_alive` | Idle time before the engine unloads, as a duration like `30m` or `1h`. Omitting it keeps the engine resident until eviction. |
+| `kv_quant` | KV-cache quantization: `auto` (default), `f16`, `fp8`, `int8`, or `int4`. |
+| `pinned` | Keep the model resident and never evict it to make room. |
+| `gguf_file` | Exact GGUF filename to serve from a multi-file llama.cpp repo. |
+| `extra_args` | Extra engine flags appended after the runtime's own arguments, one argv element each, filtered against an allowlist. |
+| `tool_call_parser` | vLLM tool-call parser (`hermes`, `llama3_json`, `mistral`) that enables auto tool choice. |
+| `swap_space_gib` | CPU KV-cache tier in GiB (vLLM `--swap-space`). |
+| `cpu_offload_gib` | GiB of weights kept in CPU RAM (vLLM `--cpu-offload-gb`). |
+| `reference` | Hosted model this local model displaces, used to price the dollars-saved value report. |
+
+Host-wide settings sit on the `serve:` block itself.
+
+| Setting | Purpose |
+|---|---|
+| `catalog_file` | Operator catalog file that replaces the built-in certified catalog. |
+| `cache_dir` | Directory for the content-addressed weight cache. |
+| `cache_budget_gib` | Disk budget in GiB for the weight cache before garbage collection. |
+| `eviction` | VRAM-pressure policy: `lru` (default) or `never`. |
+| `engines` | Per-engine provisioning map (`launch`, `image`, `acquire`, `shm_size_gib`). |
+| `max_concurrent_requests` | Cap on concurrently dispatched served-lane requests. |
+| `queue_timeout_ms` | How long a queued request waits for a slot before failover. Default 30000, read only when `max_concurrent_requests` is set. |
+
 ## Artifacts and cache safety
 
 The cache root contains `blobs/sha256`, `snapshots`, `metadata`, `partials`,
@@ -847,18 +882,16 @@ asset-identity directory only after verification, so later starts reuse the
 same archive and executable. Apple Silicon uses Metal, and a CPU worker uses
 system RAM.
 
-Linux CUDA can build the pinned llama.cpp source archive on the node. The build
-requires Linux x86-64, an NVIDIA driver, `nvcc`, CMake, a C or C++ compiler, and
-`tar`. The source URL and SHA-256 are fixed, concurrent builders share one lock,
-and only an executable final binary is published. A custom source tag needs an
-explicit archive digest.
+llama.cpp is the engine for GGUF models on CPU and Apple Metal. NVIDIA GPU
+serving is handled by the vLLM and SGLang container engines, not llama.cpp, so
+point a GPU deployment at one of those.
 
 ```yaml
 engines:
   llama_cpp:
     launch: binary
     version: b9905
-    acceleration: cuda
+    acceleration: auto   # Metal on Apple Silicon, otherwise CPU
 ```
 
 Live CUDA validation is part of the final GCP PR, so this path remains preview

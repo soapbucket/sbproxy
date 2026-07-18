@@ -223,12 +223,22 @@ pub struct ReadyArtifact {
     pub metadata: ArtifactCacheMetadata,
     /// Durable operation job for this ensure call, including cache hits.
     pub job: OperationJob,
+    /// For an unpinned raw `hf:` reference, the source repo the engine
+    /// self-downloads from at launch (repo mode). `None` for a pinned,
+    /// content-addressed snapshot the engine loads from the local disk.
+    pub repo: Option<String>,
 }
 
 impl ReadyArtifact {
     /// Resolve one declared relative file in this verified snapshot.
     pub fn file(&self, relative_path: &str) -> Option<&Path> {
         self.files.get(relative_path).map(PathBuf::as_path)
+    }
+
+    /// Whether this artifact is an unpinned raw `hf:` reference the engine
+    /// self-downloads (repo mode), rather than a verified local snapshot.
+    pub fn is_repo_mode(&self) -> bool {
+        self.repo.is_some()
     }
 
     pub(crate) fn new(root: &Path, metadata: ArtifactCacheMetadata, job: OperationJob) -> Self {
@@ -244,7 +254,34 @@ impl ReadyArtifact {
             files,
             metadata,
             job,
+            repo: None,
         }
+    }
+
+    /// Build a repo-mode ready artifact for an unpinned `hf:Org/Repo`
+    /// reference. There are no verified bytes: the container engine
+    /// self-downloads the weights from `repo` into `hf_home` (a writable,
+    /// shared Hugging Face cache) at launch. `files` carries only
+    /// prefetched shape aids (`config.json`) so the fit planner can read
+    /// the model shape before the engine starts.
+    pub(crate) fn unpinned(
+        artifact: &ResolvedArtifact,
+        repo: String,
+        hf_home: PathBuf,
+        files: BTreeMap<String, PathBuf>,
+        job: OperationJob,
+        now_ms: u64,
+    ) -> Result<Self, ArtifactError> {
+        let mut metadata = ArtifactCacheMetadata::from_artifact(artifact, now_ms)?;
+        metadata.trust = "unpinned".to_string();
+        Ok(Self {
+            artifact_digest: artifact.artifact_digest.clone(),
+            snapshot_path: hf_home,
+            files,
+            metadata,
+            job,
+            repo: Some(repo),
+        })
     }
 }
 

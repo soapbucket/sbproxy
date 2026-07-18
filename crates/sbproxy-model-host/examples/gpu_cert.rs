@@ -694,6 +694,7 @@ fn serve(repo: &str, port: u16) {
         memory: sbproxy_model_host::MemoryEstimate::from_total(0, 4 * 1024 * 1024 * 1024),
         moe: None,
         throughput: None,
+        gpu_memory_fraction: None,
     };
     let spec = build_launch_spec(
         EngineKind::Vllm,
