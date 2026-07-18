@@ -884,6 +884,79 @@ fn validate_caller_tools(
     Ok(())
 }
 
+fn compression_request_controls(
+    path: &str,
+    body: &serde_json::Value,
+) -> sbproxy_ai::compression::CompressionRequestControls {
+    sbproxy_ai::compression::CompressionRequestControls {
+        supported_chat: path == "/v1/chat/completions"
+            && body
+                .get("messages")
+                .is_some_and(serde_json::Value::is_array),
+        has_tools: body.get("tools").is_some(),
+        has_functions: body.get("functions").is_some(),
+        has_response_format: body.get("response_format").is_some(),
+        has_schema: ["schema", "json_schema", "output_schema"]
+            .iter()
+            .any(|field| body.get(*field).is_some()),
+    }
+}
+
+fn current_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod compression_request_control_tests {
+    use super::compression_request_controls;
+    use serde_json::json;
+
+    #[test]
+    fn chat_shape_is_supported_and_structured_controls_are_closed() {
+        let ordinary = compression_request_controls(
+            "/v1/chat/completions",
+            &json!({"messages": [{"role": "user", "content": "hello"}]}),
+        );
+        assert!(ordinary.supported_chat);
+        assert!(!ordinary.has_structured_top_level_fields());
+
+        for field in [
+            "tools",
+            "functions",
+            "response_format",
+            "schema",
+            "json_schema",
+            "output_schema",
+        ] {
+            let mut body = json!({"messages": []});
+            body[field] = json!({});
+            assert!(
+                compression_request_controls("/v1/chat/completions", &body)
+                    .has_structured_top_level_fields(),
+                "field {field} must disable stateful summarization"
+            );
+        }
+    }
+
+    #[test]
+    fn non_chat_paths_and_non_array_messages_are_unsupported() {
+        assert!(
+            !compression_request_controls("/v1/embeddings", &json!({"messages": []}))
+                .supported_chat
+        );
+        assert!(
+            !compression_request_controls(
+                "/v1/chat/completions",
+                &json!({"messages": "not-an-array"})
+            )
+            .supported_chat
+        );
+    }
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -2918,6 +2991,17 @@ pub(super) async fn handle_ai_proxy(
 
     ctx.ai_logical_model = (!model.is_empty()).then(|| model.clone());
 
+    // Resolve the compression runtime from the request-pinned pipeline before
+    // any semantic-cache implementation can read or create write-on-miss
+    // state. A captured-session summary policy is conservatively non-cacheable
+    // even if the lever later skips or fails open.
+    let compression_runtime = origin_idx
+        .and_then(|index| pipeline.compression_runtimes.get(index))
+        .cloned();
+    let compression_cache_bypass = compression_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.bypasses_semantic_cache(ctx.session_id.is_some()));
+
     // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
     //
     // When the enterprise semantic cache is wired, ask the hook whether
@@ -2939,77 +3023,79 @@ pub(super) async fn handle_ai_proxy(
     // When populated, the relay path below dispatches a `hook.store`
     // after the upstream call completes (subject to status + size gates).
     let mut semcache_miss: Option<PendingSemcacheMiss> = None;
-    if let Some(hook) = pipeline.hooks.semantic_lookup.as_ref().cloned() {
-        if !extracted_prompt.is_empty() {
-            let model_id = if model.is_empty() {
-                None
-            } else {
-                Some(model.clone())
-            };
-            let lookup_req = crate::hooks::LookupRequest {
-                origin: hostname.to_string(),
-                model_id: model_id.clone(),
-                prompt: extracted_prompt.clone(),
-                request_headers: snapshot_request_headers(session),
-                request_body: body_bytes.clone(),
-                method: method.as_str().to_string(),
-                path: path.clone(),
-            };
-            let outcome = hook.lookup(&lookup_req).await;
-            if let Some(cached) = outcome.hit {
-                debug!(
-                    origin = %hostname,
-                    status = cached.status,
-                    body_len = cached.body.len(),
-                    "AI proxy: semantic cache HIT; replaying cached response"
-                );
+    if !compression_cache_bypass {
+        if let Some(hook) = pipeline.hooks.semantic_lookup.as_ref().cloned() {
+            if !extracted_prompt.is_empty() {
+                let model_id = if model.is_empty() {
+                    None
+                } else {
+                    Some(model.clone())
+                };
+                let lookup_req = crate::hooks::LookupRequest {
+                    origin: hostname.to_string(),
+                    model_id: model_id.clone(),
+                    prompt: extracted_prompt.clone(),
+                    request_headers: snapshot_request_headers(session),
+                    request_body: body_bytes.clone(),
+                    method: method.as_str().to_string(),
+                    path: path.clone(),
+                };
+                let outcome = hook.lookup(&lookup_req).await;
+                if let Some(cached) = outcome.hit {
+                    debug!(
+                        origin = %hostname,
+                        status = cached.status,
+                        body_len = cached.body.len(),
+                        "AI proxy: semantic cache HIT; replaying cached response"
+                    );
 
-                // Build a Pingora ResponseHeader from the cached entry.
-                // Size hint: cached headers + x-semcache marker.
-                let mut header = pingora_http::ResponseHeader::build(
-                    cached.status,
-                    Some(cached.headers.len() + 1),
-                )
-                .map_err(|e| {
-                    Error::because(
-                        ErrorType::InternalError,
-                        "semantic cache: failed to build response header",
-                        e,
+                    // Build a Pingora ResponseHeader from the cached entry.
+                    // Size hint: cached headers + x-semcache marker.
+                    let mut header = pingora_http::ResponseHeader::build(
+                        cached.status,
+                        Some(cached.headers.len() + 1),
                     )
-                })?;
-                for (name, value) in &cached.headers {
-                    // Skip hop-by-hop / framing headers that Pingora will
-                    // recompute for us. We intentionally preserve content-type
-                    // and any origin-provided response metadata.
-                    let lname = name.to_ascii_lowercase();
-                    if lname == "transfer-encoding" || lname == "connection" {
-                        continue;
+                    .map_err(|e| {
+                        Error::because(
+                            ErrorType::InternalError,
+                            "semantic cache: failed to build response header",
+                            e,
+                        )
+                    })?;
+                    for (name, value) in &cached.headers {
+                        // Skip hop-by-hop / framing headers that Pingora will
+                        // recompute for us. We intentionally preserve content-type
+                        // and any origin-provided response metadata.
+                        let lname = name.to_ascii_lowercase();
+                        if lname == "transfer-encoding" || lname == "connection" {
+                            continue;
+                        }
+                        let _ = header.insert_header(name.clone(), value.clone());
                     }
-                    let _ = header.insert_header(name.clone(), value.clone());
-                }
-                // Always emit the debug marker so operators and integration
-                // tests can distinguish a replayed hit from an upstream
-                // response. Matches OSS `x-sbproxy-cache: HIT` convention.
-                let _ = header.insert_header("x-semcache", "HIT");
+                    // Always emit the debug marker so operators and integration
+                    // tests can distinguish a replayed hit from an upstream
+                    // response. Matches OSS `x-sbproxy-cache: HIT` convention.
+                    let _ = header.insert_header("x-semcache", "HIT");
 
-                session
-                    .write_response_header(Box::new(header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(cached.body.clone()), true)
-                    .await?;
-                return Ok(());
-            }
-            // MISS with a usable key: remember enough state to populate the
-            // cache once we get the upstream response back.
-            if let Some(key) = outcome.miss_key {
-                semcache_miss = Some((
-                    hook,
-                    key,
-                    outcome.cacheable_status,
-                    outcome.max_response_size,
-                    model_id,
-                ));
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(cached.body.clone()), true)
+                        .await?;
+                    return Ok(());
+                }
+                // MISS with a usable key: remember enough state to populate the
+                // cache once we get the upstream response back.
+                if let Some(key) = outcome.miss_key {
+                    semcache_miss = Some((
+                        hook,
+                        key,
+                        outcome.cacheable_status,
+                        outcome.max_response_size,
+                        model_id,
+                    ));
+                }
             }
         }
     }
@@ -3023,7 +3109,7 @@ pub(super) async fn handle_ai_proxy(
     // the relay can store the upstream response. Embedding failures
     // fail open (proceed to the upstream uncached).
     let mut embed_miss: Option<PendingEmbedMiss> = None;
-    if pipeline.hooks.semantic_lookup.is_none() {
+    if !compression_cache_bypass && pipeline.hooks.semantic_lookup.is_none() {
         if let Some(cache) = config.embedding_cache() {
             // WOR-1142: scope cache entries to the caller so one
             // tenant/credential never receives another's cached response.
@@ -3236,34 +3322,37 @@ pub(super) async fn handle_ai_proxy(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // WOR-1545: LLM-aware context-window compression. When enabled, fit an
-    // over-long prompt to the resolved model's context window before
-    // dispatch, dropping the oldest non-system turns, so the request
-    // succeeds on the same model instead of being rejected with a
-    // context-length error. No-op for unknown models, non-chat surfaces, or
-    // prompts that already fit.
-    if let Some(llm) = config
-        .resilience
-        .as_ref()
-        .and_then(|r| r.llm_aware.as_ref())
-    {
-        if llm.context_compress && !model.is_empty() {
-            if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
-                let reserve = llm.completion_reserve_tokens.unwrap_or(1024);
-                if let Some(trimmed) =
-                    sbproxy_ai::context_compress::fit_messages_to_model(messages, &model, reserve)
-                {
-                    let removed = messages.len().saturating_sub(trimmed.len());
-                    if removed > 0 {
-                        warn!(
-                            model = %model,
-                            removed,
-                            "AI proxy: context-window compress, trimmed oldest messages to fit"
-                        );
-                        body["messages"] = serde_json::Value::Array(trimmed);
-                    }
-                }
-            }
+    // Apply the request-pinned ordered pipeline at the legacy mutable-body
+    // seam. The runner owns a local working list and this assignment is the
+    // only mutation visible to routing/failover. Runtime failures preserve the
+    // last committed list and later levers continue.
+    if !model.is_empty() {
+        if let (Some(runtime), Some(messages)) = (
+            compression_runtime.as_ref(),
+            body.get("messages").and_then(serde_json::Value::as_array),
+        ) {
+            let messages = messages.clone();
+            let session_id = ctx.session_id.map(|session| session.to_bytes());
+            let run = runtime
+                .run(
+                    crate::compression_runtime::CompressionExecution {
+                        model: &model,
+                        tenant_id: ctx.tenant_id.as_str(),
+                        api_key_id: budget_api_key_id.as_deref(),
+                        origin: hostname,
+                        session_id,
+                        controls: compression_request_controls(&path, &body),
+                        now_unix_ms: current_unix_millis(),
+                        allowed_providers,
+                        blocked_providers,
+                        allowed_models,
+                        blocked_models,
+                        budget: effective_budget.as_deref(),
+                    },
+                    &messages,
+                )
+                .await;
+            body["messages"] = serde_json::Value::Array(run.messages);
         }
     }
 
@@ -4387,6 +4476,7 @@ pub(super) async fn handle_ai_proxy(
                     origin_id,
                     semantic_key: semcache_key,
                     policy: stream_policy,
+                    cache_bypass: compression_cache_bypass,
                 },
                 stream_recorder,
                 stream_router_sink,
@@ -5772,6 +5862,7 @@ pub(super) struct StreamCacheRecorderArgs {
     origin_id: String,
     semantic_key: Option<String>,
     policy: serde_json::Value,
+    cache_bypass: bool,
 }
 
 /// Inputs the streaming relay needs to construct the right
@@ -6087,7 +6178,7 @@ pub(super) async fn relay_ai_stream(
     // event lands exactly once: either via `finish()` on a clean
     // end-of-stream or via the guard's `Drop` impl on any other exit
     // path (client cancel, upstream error, mid-stream abort).
-    let recorder_guard: Option<crate::hooks::StreamCacheGuard> =
+    let recorder_guard: Option<crate::hooks::StreamCacheGuard> = if !recorder_args.cache_bypass {
         if let Some(hook) = pipeline.hooks.stream_cache_recorder.as_ref().cloned() {
             let ctx = crate::hooks::StreamCacheCtx {
                 hostname: hostname.to_string(),
@@ -6102,7 +6193,10 @@ pub(super) async fn relay_ai_stream(
                 .map(crate::hooks::StreamCacheGuard::new)
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
     // Write SSE response headers.
     let route_headers = ctx.as_deref().map(public_route_headers).unwrap_or_default();

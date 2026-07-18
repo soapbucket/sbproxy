@@ -826,7 +826,7 @@ mod ai_trace_content_tests {
 /// Outcome of a pre-dispatch budget check. Tells the caller whether
 /// the request should proceed, fail with a 402, or have its model
 /// rewritten before forwarding upstream.
-pub(super) enum BudgetGate {
+pub(crate) enum BudgetGate {
     /// No limit was exceeded. Continue with the original model.
     Allow,
     /// At least one limit fired and the configured action is `block`.
@@ -840,7 +840,7 @@ pub(super) enum BudgetGate {
 /// Build the list of scope keys to check / record against for a given
 /// AI request. We compute one key per limit so a workspace cap can
 /// coexist with a per-api-key cap on the same origin.
-pub(super) fn budget_scope_keys(
+pub(crate) fn budget_scope_keys(
     cfg: &sbproxy_ai::BudgetConfig,
     workspace_id: &str,
     api_key: Option<&str>,
@@ -938,7 +938,7 @@ pub(super) fn limit_utilization(
 /// across the configured providers' `models` lists is selected from
 /// the embedded price catalog; if no candidates are available the
 /// request blocks instead of silently passing through.
-pub(super) fn budget_preflight(
+pub(crate) fn budget_preflight(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
     providers: &[sbproxy_ai::ProviderConfig],
@@ -1945,7 +1945,7 @@ pub(super) fn inprocess_embed(
     }
 }
 
-pub(super) fn record_budget_usage(
+pub(crate) fn record_budget_usage(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
     model: &str,

@@ -3252,7 +3252,7 @@ mod callbacks;
 use callbacks::*;
 
 // --- AI proxy helpers ---
-mod ai_support;
+pub(crate) mod ai_support;
 use ai_support::*;
 
 mod ai_dispatch;

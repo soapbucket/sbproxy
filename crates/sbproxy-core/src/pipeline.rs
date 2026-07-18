@@ -816,6 +816,8 @@ pub struct CompiledPipeline {
     pub router: HostRouter,
     /// Compiled action for each origin (parallel to config.origins).
     pub actions: Vec<Action>,
+    /// Immutable per-origin AI compression dependencies and policies.
+    pub compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry,
     /// Compiled auth for each origin (None if no auth configured).
     pub auths: Vec<Option<Auth>>,
     /// Compiled policies for each origin (may be empty).
@@ -957,6 +959,7 @@ impl Default for CompiledPipeline {
             config,
             router,
             actions: Vec::new(),
+            compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
             auths: Vec::new(),
             policies: Vec::new(),
             enforcers: Vec::new(),
@@ -1288,10 +1291,17 @@ impl CompiledPipeline {
                 None => (None, None),
             };
 
+        let compression_runtimes =
+            crate::compression_runtime::CompressionRuntimeRegistry::from_process(
+                &config.server,
+                &actions,
+            )?;
+
         let pipeline = Self {
             config,
             router,
             actions,
+            compression_runtimes,
             auths,
             policies,
             enforcers,

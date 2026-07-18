@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::ai_metrics;
+use crate::compression::{SummarizationOutput, SummarizerError};
 use crate::handler::AiHandlerConfig;
 use crate::provider::ProviderConfig;
 use crate::providers::{get_provider_info, ProviderFormat};
@@ -169,6 +170,61 @@ impl AiClient {
     /// Borrow the shadow supervisor (test + diagnostic accessor).
     pub fn shadow_supervisor(&self) -> &Arc<ShadowSupervisor> {
         &self.shadow_supervisor
+    }
+
+    /// Execute one bounded chat-completion call against exactly one provider.
+    ///
+    /// This is the below-pipeline boundary for internal context summaries. It
+    /// deliberately has no router, handler configuration, semantic cache,
+    /// shadow configuration, or compression callback, so an internal request
+    /// cannot recursively enter ordinary AI dispatch. Credential governance
+    /// and budget admission remain the responsibility of the request-scoped
+    /// runtime adapter before this method is called.
+    pub async fn summarize_internal(
+        &self,
+        provider: &ProviderConfig,
+        model: &str,
+        messages: &[serde_json::Value],
+        target_summary_tokens: u64,
+        timeout: Duration,
+    ) -> Result<SummarizationOutput, SummarizerError> {
+        let mapped_model = provider.map_model(model);
+        let body = serde_json::json!({
+            "model": mapped_model,
+            "messages": messages,
+            "max_tokens": target_summary_tokens,
+            "stream": false,
+        });
+        let response_limit = target_summary_tokens
+            .saturating_mul(32)
+            .clamp(64 * 1024, 1024 * 1024) as usize;
+        let operation = async {
+            let mut response = self
+                .forward_request(provider, "/v1/chat/completions", &body)
+                .await
+                .map_err(|_| SummarizerError::Provider)?;
+            if !response.status().is_success() {
+                return Err(SummarizerError::Provider);
+            }
+
+            let mut raw = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| SummarizerError::Provider)?
+            {
+                if raw.len().saturating_add(chunk.len()) > response_limit {
+                    return Err(SummarizerError::InvalidOutput);
+                }
+                raw.extend_from_slice(&chunk);
+            }
+            let translated = translators::translate_response_bytes(provider_format(provider), &raw);
+            parse_internal_summary(model, messages, &translated)
+        };
+
+        tokio::time::timeout(timeout, operation)
+            .await
+            .map_err(|_| SummarizerError::Timeout)?
     }
 
     /// Forward a chat completions request to the selected provider.
@@ -482,6 +538,48 @@ impl AiClient {
         let resp = req.send().await?;
         Ok(resp)
     }
+}
+
+fn parse_internal_summary(
+    model: &str,
+    input_messages: &[serde_json::Value],
+    body: &[u8],
+) -> Result<SummarizationOutput, SummarizerError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| SummarizerError::InvalidOutput)?;
+    let summary = value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|summary| !summary.trim().is_empty())
+        .ok_or(SummarizerError::InvalidOutput)?
+        .to_string();
+
+    let usage = value.get("usage");
+    let input_tokens = usage
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| {
+            crate::token_estimate::estimate_json_message_tokens(model, input_messages)
+        });
+    let output_tokens = usage
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| {
+            crate::token_estimate::estimate_json_message_tokens(
+                model,
+                &[serde_json::json!({"role": "assistant", "content": summary})],
+            )
+        });
+
+    Ok(SummarizationOutput {
+        summary,
+        input_tokens,
+        output_tokens,
+    })
 }
 
 impl AiClient {
@@ -1320,6 +1418,104 @@ pub(crate) fn build_url(base_url: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn serve_one_json_response(
+        response_body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let address = listener.local_addr().expect("test provider address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            let mut request = Vec::new();
+            let expected_len = loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.expect("read test request");
+                assert!(read > 0, "request ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(headers_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .unwrap_or(0);
+                break headers_end + 4 + content_length;
+            };
+            while request.len() < expected_len {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.expect("read request body");
+                assert!(read > 0, "request body ended early");
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test response");
+            request
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    #[tokio::test]
+    async fn internal_summarizer_targets_one_provider_and_mapped_model() {
+        let (base_url, captured) = serve_one_json_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"bounded facts"}}],"usage":{"prompt_tokens":31,"completion_tokens":4}}"#,
+        )
+        .await;
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "dedicated-summary-provider",
+            "api_key": "test-secret",
+            "base_url": base_url,
+            "allow_private_base_url": true,
+            "models": ["summary-model"],
+            "model_map": {"summary-model": "upstream-summary-model"}
+        }))
+        .expect("provider fixture");
+        let messages = vec![serde_json::json!({"role": "user", "content": "history"})];
+
+        let output = AiClient::new()
+            .summarize_internal(
+                &provider,
+                "summary-model",
+                &messages,
+                64,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("internal summary succeeds");
+
+        assert_eq!(output.summary, "bounded facts");
+        assert_eq!(output.input_tokens, 31);
+        assert_eq!(output.output_tokens, 4);
+
+        let request = captured.await.expect("test provider task");
+        let request_text = String::from_utf8(request).expect("HTTP request is UTF-8");
+        assert!(request_text.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(!request_text
+            .to_ascii_lowercase()
+            .contains("x-sbproxy-shadow"));
+        let body = request_text.split_once("\r\n\r\n").expect("HTTP body").1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON request body");
+        assert_eq!(body["model"], "upstream-summary-model");
+        assert_eq!(body["messages"], serde_json::Value::Array(messages));
+        assert_eq!(body["max_tokens"], 64);
+        assert_eq!(body["stream"], false);
+    }
 
     #[test]
     fn build_url_with_v1_overlap() {

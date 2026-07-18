@@ -56,6 +56,8 @@ pub mod cluster;
 pub mod cluster_metrics;
 #[doc(hidden)]
 pub mod cluster_models;
+/// Per-pipeline AI compression dependencies and request execution.
+pub mod compression_runtime;
 /// External Redis and mesh adapters for AI compression session state.
 pub mod compression_store;
 pub mod context;
