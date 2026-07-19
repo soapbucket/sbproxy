@@ -98,7 +98,7 @@ struct is `McpActionConfig` in
 | `sessions` | object | unset | Streamable HTTP session management: `{enabled, ttl}` (see [`examples/mcp-sessions`](../examples/mcp-sessions)). |
 | `egress` | object | unset | Default OpenAPI REST egress policy. See [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md). |
 | `token_compaction` | object | unset | Opt-in compaction for large MCP text result blocks. |
-| `dual_llm_quarantine` | object | unset | Opt-in quarantine gate for suspicious MCP text result blocks. |
+| `dual_llm_quarantine` | object | unset | Opt-in dual-LLM judge quarantine for untrusted MCP text result blocks (`enabled`, `endpoint`, optional `model` / `timeout`). Fail closed; reason-code only. |
 | `refresh_interval` | duration | `60s` | How often the background task re-fetches upstream catalogues. Inbound requests always serve the cached snapshot; this is the only steady-state fan-out. |
 | `upstream_connect_timeout` | duration | `5s` | TCP connect deadline per upstream exchange. |
 | `upstream_timeout` | duration | `30s` | Whole-request deadline per upstream exchange (refreshes, calls, reads). Per-server `timeout:` can only shorten it for `tools/call`. |
@@ -120,7 +120,8 @@ struct is `McpActionConfig` in
 | `transport` | string | `streamable_http` | `streamable_http`, `sse`, or supervised local `stdio`. |
 | `command` / `args` | string / list | unset | Required command and optional arguments for `transport: stdio`. |
 | `egress` | object | inherited | Per-server OpenAPI REST egress policy. |
-| `run_as_user_auth` | bool | `false` | Attach bounded caller identity to outbound tool arguments. |
+| `run_as_user_auth` | bool | `false` | Mint per-caller upstream `Authorization` via `upstream_auth` (never tool args). |
+| `upstream_auth` | object | unset | Required when `run_as_user_auth` is true. See [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md). |
 
 A `rbac` value that does not match a key in `rbac_policies` is a hard
 config error (see `McpAction::from_parsed` in
