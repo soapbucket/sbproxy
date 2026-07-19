@@ -166,6 +166,12 @@ pub struct AiHandlerConfig {
     /// runtime. `None` uses only `model_prices` + the built-in catalog.
     #[serde(default)]
     pub rate_card: Option<String>,
+    /// WOR-1880: optional fair-share quota pool across providers.
+    /// When set, each provider attempt reserves against the pool before
+    /// dispatch; a deny advances to the next candidate when alternatives
+    /// exist. Process-local only unless a future atomic backend lands.
+    #[serde(default)]
+    pub quota_pool: Option<crate::quota_pool::QuotaPoolConfig>,
     /// Lazy-built compiled redactor cached on the per-origin
     /// config. Built on first use so config-load does not pay the
     /// regex-compile cost for origins that never serve a request.
@@ -202,6 +208,11 @@ pub struct AiHandlerConfig {
     #[serde(skip)]
     pub(crate) ai_policy_compiled:
         OnceLock<Option<std::sync::Arc<crate::ai_policy::CompiledAiPolicy>>>,
+    /// Lazy-built fair-share pool store (WOR-1880). `None` inside the
+    /// OnceLock means no pool is configured or validation failed at build.
+    #[serde(skip)]
+    pub(crate) quota_pool_store:
+        OnceLock<Option<std::sync::Arc<crate::quota_pool::LocalQuotaPool>>>,
 }
 
 fn default_usage_parser() -> String {
@@ -349,6 +360,28 @@ impl AiHandlerConfig {
                 ))
             })
             .clone()
+    }
+
+    /// Return the shared fair-share quota pool for this handler (WOR-1880).
+    /// `None` when unset or when config validation rejected the pool.
+    pub fn quota_pool_store(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::quota_pool::LocalQuotaPool>> {
+        self.quota_pool_store
+            .get_or_init(|| {
+                let config = self.quota_pool.as_ref()?;
+                match crate::quota_pool::LocalQuotaPool::new(vec![config.clone()]) {
+                    Ok(store) => Some(std::sync::Arc::new(store)),
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "ai quota_pool: disabled (failed to build local store)"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
     }
 
     /// Apply PII redaction to a parsed request body. Returns whether
@@ -753,6 +786,11 @@ impl AiHandlerConfig {
                     ));
                 }
             }
+        }
+        // WOR-1880: reject strong consistency / invalid pool shapes at load.
+        if let Some(pool) = &config.quota_pool {
+            crate::quota_pool::validate_quota_pool_config(pool)
+                .map_err(|error| anyhow::anyhow!("ai quota_pool: {error}"))?;
         }
         // WOR-1683: on a served provider the serve-entry name IS the
         // model id every plane sees, so an empty `models:` list derives
@@ -1180,7 +1218,9 @@ mod tests {
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            quota_pool: None,
             ai_policy_compiled: OnceLock::new(),
+            quota_pool_store: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("anything"));
@@ -1217,7 +1257,9 @@ mod tests {
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            quota_pool: None,
             ai_policy_compiled: OnceLock::new(),
+            quota_pool_store: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -1254,7 +1296,9 @@ mod tests {
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            quota_pool: None,
             ai_policy_compiled: OnceLock::new(),
+            quota_pool_store: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -1292,7 +1336,9 @@ mod tests {
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            quota_pool: None,
             ai_policy_compiled: OnceLock::new(),
+            quota_pool_store: OnceLock::new(),
         };
         // Block list wins
         assert!(!config.is_model_allowed("gpt-4"));
@@ -1365,6 +1411,28 @@ mod tests {
         assert!(config.blocked_models.is_empty());
         assert!(config.max_body_size.is_none());
         assert!(!config.require_governed_key);
+        assert!(config.quota_pool.is_none());
+    }
+
+    #[test]
+    fn from_config_rejects_strong_quota_pool_without_atomic_backend() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "quota_pool": {
+                "name": "shared",
+                "total_limit": 100,
+                "weights": {"openai": 1},
+                "policy": "hard",
+                "consistency": "strong"
+            }
+        });
+        let err = AiHandlerConfig::from_config(json)
+            .expect_err("strong consistency must fail closed")
+            .to_string();
+        assert!(
+            err.contains("atomic backend") || err.contains("strong"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

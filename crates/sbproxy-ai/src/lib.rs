@@ -47,6 +47,7 @@ pub mod prompts;
 pub mod provider;
 pub mod provider_ratelimit;
 pub mod providers;
+pub mod quota_pool;
 pub mod ratelimit;
 pub mod realtime;
 pub mod response_dedup;
@@ -94,6 +95,12 @@ pub use provider::ProviderConfig;
 pub use provider_ratelimit::{
     ProviderQuotaSnapshot, ProviderRateLimitTracker, ProviderRateState, QuotaSignalQuality,
     QuotaSignalSource,
+};
+pub use quota_pool::{
+    rank_by_fair_share, reserve_next_candidate, validate_quota_pool_config, LocalQuotaPool,
+    OverShareRecord, PoolDeny, PoolUsage, QuotaPoolConfig, QuotaPoolConfigError,
+    QuotaPoolConsistency, QuotaPoolDimension, QuotaPoolPolicy, QuotaPoolStore, QuotaReservation,
+    QuotaReservationGuard,
 };
 pub use providers::{
     get_provider_info, init_provider_registry, list_providers, reload_provider_registry,

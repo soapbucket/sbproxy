@@ -1438,6 +1438,11 @@ pub(super) async fn handle_ai_proxy(
     // survives across requests. A per-request router would reset that
     // state every call and make the latency/usage-aware strategies inert.
     let router = config.router();
+    let quota_pool_store = config.quota_pool_store().cloned();
+    let quota_pool_name = config
+        .quota_pool
+        .as_ref()
+        .map(|pool| pool.name.clone());
     // Serve model discovery locally; other GET surfaces use ordinary dispatch.
     if method == http::Method::GET {
         if matches!(
@@ -3789,7 +3794,9 @@ pub(super) async fn handle_ai_proxy(
 
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
-    let max_attempts = if is_failover || content_policy_fallback {
+    // WOR-1880: a configured quota pool must be allowed to advance past a
+    // denied member to the next candidate even outside failover_chain.
+    let max_attempts = if is_failover || content_policy_fallback || config.quota_pool.is_some() {
         config.providers.len()
     } else {
         1
@@ -4307,6 +4314,32 @@ pub(super) async fn handle_ai_proxy(
         }
         let provider = &resolved_provider;
 
+        // WOR-1880: fair-share pool reservation. A deny advances to the
+        // next candidate rather than failing the whole request when
+        // alternatives remain.
+        let mut quota_reservation = None;
+        if let (Some(store), Some(pool_name)) = (quota_pool_store.as_ref(), quota_pool_name.as_deref())
+        {
+            match sbproxy_ai::QuotaReservationGuard::reserve(
+                std::sync::Arc::clone(store),
+                pool_name,
+                provider.name.as_str(),
+                1,
+            ) {
+                Ok(guard) => quota_reservation = Some(guard),
+                Err(deny) => {
+                    debug!(
+                        provider = %provider.name,
+                        pool = %pool_name,
+                        deny = ?deny,
+                        attempt = %attempt,
+                        "AI proxy: quota pool denied provider; trying next candidate"
+                    );
+                    continue;
+                }
+            }
+        }
+
         // Map model name for this provider.
         let mut attempt_body = body.clone();
         let resolved_model = if !model.is_empty() {
@@ -4696,6 +4729,9 @@ pub(super) async fn handle_ai_proxy(
                     upstream_secs,
                 );
                 last_provider_name = provider.name.to_string();
+                if let Some(guard) = quota_reservation.take() {
+                    guard.settle(sbproxy_ai::PoolUsage { units: 1 });
+                }
                 last_resp = Some(resp);
                 break;
             }
