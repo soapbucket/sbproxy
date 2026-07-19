@@ -6,15 +6,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sbproxy_model_host::{
-    build_vllm_container_plan, validate_engine_args, ArtifactCacheMetadata, ArtifactFile,
-    ArtifactFormat, BackoffPolicy, CommandExecutor, CommandOutput, ContainerRuntime,
-    CudaBuildPrerequisites, EngineAccel, EngineAvailability, EngineCapabilities, EngineCommand,
-    EngineDetection, EngineDriver, EngineDriverError, EngineFailureReason, EngineHealth,
-    EngineKind, EngineProcess, EngineProcessRunner, EngineProvisioning, EngineReadinessProbe,
-    EngineSupervisor, FileJobStore, FitPlan, KvCacheQuant, LaunchRequest, LlamaBinarySource,
-    LlamaCppDriver, OperationJob, OperationKind, OperationProgress, OperationState,
-    ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact, ResolvedArtifact, RunningEngine,
-    SupervisorClock, SupportLevel, VllmDriver, VllmHost, VllmLaunchMode, WorkerProfile,
+    build_sglang_container_plan, build_vllm_container_plan, validate_engine_args,
+    ArtifactCacheMetadata, ArtifactFile, ArtifactFormat, BackoffPolicy, CommandExecutor,
+    CommandOutput, ContainerRuntime, CudaBuildPrerequisites, EngineAccel, EngineAvailability,
+    EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
+    EngineFailureReason, EngineHealth, EngineKind, EngineProcess, EngineProcessRunner,
+    EngineProvisioning, EngineReadinessProbe, EngineSupervisor, FileJobStore, FitPlan,
+    KvCacheQuant, LaunchRequest, LlamaBinarySource, LlamaCppDriver, OperationJob, OperationKind,
+    OperationProgress, OperationState, ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact,
+    ResolvedArtifact, RunningEngine, SupervisorClock, SupportLevel, VllmDriver, VllmHost,
+    VllmLaunchMode, WorkerProfile,
 };
 use tempfile::tempdir;
 
@@ -566,13 +567,14 @@ fn unsafe_arguments_cannot_override_runtime_owned_launch_fields() {
         (EngineKind::LlamaCpp, vec!["--api-key", "secret"]),
         (EngineKind::LlamaCpp, vec!["--device", "CUDA7"]),
         (EngineKind::LlamaCpp, vec!["--mount", "/:/host"]),
-        // WOR-1905: SGLang keeps model-path, host, port, and tp-size
-        // runtime-owned, the same way vLLM keeps --tensor-parallel-size off.
+        // WOR-1905: SGLang keeps model-path, host, port, tp-size, and
+        // mem-fraction-static runtime-owned, the same way vLLM keeps
+        // --tensor-parallel-size and --gpu-memory-utilization off.
         (EngineKind::SGLang, vec!["--model-path", "/tmp/other"]),
         (EngineKind::SGLang, vec!["--host", "0.0.0.0"]),
         (EngineKind::SGLang, vec!["--port=9000"]),
         (EngineKind::SGLang, vec!["--tp-size", "8"]),
-        (EngineKind::SGLang, vec!["--mem-fraction-static", "1.5"]),
+        (EngineKind::SGLang, vec!["--mem-fraction-static", "0.5"]),
         (
             EngineKind::SGLang,
             vec!["--schedule-conservativeness", "-1"],
@@ -606,15 +608,16 @@ fn unsafe_arguments_cannot_override_runtime_owned_launch_fields() {
         .expect("allowlisted llama.cpp arguments"),
         vec!["--flash-attn", "--threads=8"]
     );
-    // WOR-1905: SGLang's stable allowlist accepts its safe tuning knobs,
-    // including a bounded float fraction and a non-negative float.
+    // WOR-1905: SGLang's stable allowlist accepts its safe tuning knobs, a
+    // non-negative float among them. `--mem-fraction-static` is not here:
+    // it is runtime-owned, derived from the fit plan (see the rejected set
+    // above), mirroring how the runtime owns vLLM's `--gpu-memory-utilization`.
     assert_eq!(
         validate_engine_args(
             EngineKind::SGLang,
             &[
                 "--enable-torch-compile".to_string(),
                 "--disable-radix-cache".to_string(),
-                "--mem-fraction-static=0.85".to_string(),
                 "--schedule-conservativeness".to_string(),
                 "1.3".to_string(),
             ]
@@ -623,7 +626,6 @@ fn unsafe_arguments_cannot_override_runtime_owned_launch_fields() {
         vec![
             "--enable-torch-compile",
             "--disable-radix-cache",
-            "--mem-fraction-static=0.85",
             "--schedule-conservativeness",
             "1.3",
         ]
@@ -1703,6 +1705,63 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn sglang_container_plan_emits_runtime_owned_memory_fraction() {
+    // WOR-1905 regression: SGLang must launch with a runtime-owned
+    // `--mem-fraction-static` derived from the fit plan. Without it SGLang
+    // uses its ~0.88 default and OOMs on first-token decode graph capture on
+    // any card where 0.88 leaves too little headroom (reproduced live on an
+    // L4). The value is the fit fraction, mirroring vLLM's utilization flag.
+    let mut request = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 1,
+        artifact: ready(EngineKind::SGLang, ArtifactFormat::Safetensors),
+        fit: fit(),
+        port: 18123,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
+        selected_devices: vec![1],
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: vec![],
+        engine_tuning: Default::default(),
+        max_concurrency: 1,
+        modality: Default::default(),
+        ready_timeout: Duration::from_secs(1),
+    };
+    request.fit.gpu_memory_fraction = Some(0.30);
+    let image = format!("lmsysorg/sglang@sha256:{}", "a".repeat(64));
+    let plan = build_sglang_container_plan(
+        ContainerRuntime::Docker,
+        PathBuf::from("/usr/bin/docker"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("isolated SGLang container plan");
+    assert!(
+        plan.arguments
+            .windows(2)
+            .any(|window| window == ["--mem-fraction-static", "0.3000"]),
+        "SGLang plan must carry the fit-derived --mem-fraction-static, got {:?}",
+        plan.arguments
+    );
+
+    // No fit fraction falls back to the conservative default, never SGLang's
+    // higher built-in default.
+    request.fit.gpu_memory_fraction = None;
+    let fallback = build_sglang_container_plan(
+        ContainerRuntime::Docker,
+        PathBuf::from("/usr/bin/docker"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("isolated SGLang container plan");
+    assert!(fallback
+        .arguments
+        .windows(2)
+        .any(|window| window == ["--mem-fraction-static", "0.8500"]));
 }
 
 #[test]
