@@ -7652,13 +7652,14 @@ dependencies = [
 
 [[package]]
 name = "redis"
-version = "0.28.2"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e37ec3fd44bea2ec947ba6cc7634d7999a6590aca7c35827c250bc0de502bda6"
+checksum = "0bc1ea653e0b2e097db3ebb5b7f678be339620b8041f66b30a308c1d45d36a7f"
 dependencies = [
  "arc-swap",
  "backon",
  "bytes",
+ "cfg-if",
  "combine",
  "futures-channel",
  "futures-util",
@@ -7667,10 +7668,9 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "rustls",
- "rustls-native-certs 0.7.3",
- "rustls-pemfile",
- "rustls-pki-types",
+ "rustls-native-certs 0.8.3",
  "ryu",
+ "socket2 0.5.10",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -8508,6 +8508,7 @@ dependencies = [
  "bytes",
  "compact_str 0.8.1",
  "http 1.4.0",
+ "rcgen",
  "sbproxy-capability",
  "sbproxy-observe",
  "sbproxy-platform",
@@ -8557,6 +8558,7 @@ dependencies = [
  "pingora-proxy",
  "prometheus 0.14.0",
  "rand 0.8.6",
+ "rcgen",
  "regex",
  "reqwest 0.12.28",
  "rustls",
@@ -8984,9 +8986,13 @@ dependencies = [
  "dashmap",
  "hex",
  "parking_lot",
+ "prometheus 0.14.0",
+ "rcgen",
  "redb",
  "redis",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "sbproxy-plugin",
  "serde",
  "serde_json",
@@ -8994,6 +9000,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
+ "url",
 ]
 
 [[package]]

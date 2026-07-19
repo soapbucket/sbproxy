@@ -14,12 +14,13 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     future::Future,
     sync::{atomic::AtomicU64, atomic::Ordering, Arc},
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use redis::{
@@ -28,7 +29,10 @@ use redis::{
 };
 use tokio::sync::Mutex;
 
-use super::async_kv::AsyncKVStore;
+use super::{
+    async_kv::AsyncKVStore,
+    redis_connection::{RedisTlsConfig, ValidatedRedisConnection},
+};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -36,6 +40,108 @@ const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_EXPONENT_BASE: u64 = 2;
 const RECONNECT_DELAY_FACTOR_MS: u64 = 25;
 const RECONNECT_RETRIES: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+enum RedisErrorAction {
+    Connect,
+    ScriptLoad,
+    EvalSha,
+    EvalShaAfterReload,
+    Scan,
+    Get,
+    Set,
+    SetWithExpiry,
+    Incr,
+    Expire,
+    IncrBy,
+    Delete,
+}
+
+impl RedisErrorAction {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Connect => "connecting to Redis failed",
+            Self::ScriptLoad => "redis SCRIPT LOAD failed",
+            Self::EvalSha => "redis EVALSHA failed",
+            Self::EvalShaAfterReload => "redis EVALSHA failed after NOSCRIPT reload",
+            Self::Scan => "redis SCAN failed",
+            Self::Get => "redis GET failed",
+            Self::Set => "redis SET failed",
+            Self::SetWithExpiry => "redis SET EX failed",
+            Self::Incr => "redis INCR failed",
+            Self::Expire => "redis EXPIRE failed",
+            Self::IncrBy => "redis INCRBY failed",
+            Self::Delete => "redis DEL failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RedisErrorReason {
+    Timeout,
+    Transport,
+    Authentication,
+    Configuration,
+    ScriptUnavailable,
+    Command,
+}
+
+impl RedisErrorReason {
+    fn from_error(error: &redis::RedisError) -> Self {
+        if error.is_timeout() {
+            return Self::Timeout;
+        }
+        match error.kind() {
+            ErrorKind::IoError
+            | ErrorKind::Moved
+            | ErrorKind::Ask
+            | ErrorKind::TryAgain
+            | ErrorKind::ClusterDown
+            | ErrorKind::MasterDown
+            | ErrorKind::MasterNameNotFoundBySentinel
+            | ErrorKind::NoValidReplicasFoundBySentinel
+            | ErrorKind::EmptySentinelList
+            | ErrorKind::ClusterConnectionNotFound => Self::Transport,
+            ErrorKind::AuthenticationFailed => Self::Authentication,
+            ErrorKind::InvalidClientConfig => Self::Configuration,
+            ErrorKind::NoScriptError => Self::ScriptUnavailable,
+            _ => Self::Command,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Timeout => "Redis transport timed out",
+            Self::Transport => "Redis transport failed",
+            Self::Authentication => "Redis authentication failed",
+            Self::Configuration => "Redis client configuration failed",
+            Self::ScriptUnavailable => "Redis script unavailable",
+            Self::Command => "Redis command failed",
+        }
+    }
+}
+
+fn sanitize_redis_error(action: RedisErrorAction, error: &redis::RedisError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: {}",
+        action.message(),
+        RedisErrorReason::from_error(error).message()
+    )
+}
+
+enum RedisQueryError {
+    Connection(anyhow::Error),
+    Command(redis::RedisError),
+}
+
+impl RedisQueryError {
+    fn into_public_error(self, action: RedisErrorAction) -> anyhow::Error {
+        match self {
+            Self::Connection(error) => error,
+            Self::Command(error) => sanitize_redis_error(action, &error),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RedisTimeouts {
@@ -55,10 +161,28 @@ impl Default for RedisTimeouts {
 }
 
 /// Configuration for [`AsyncRedisKVStore`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AsyncRedisConfig {
-    /// Connection URL (`redis://host:6379/0` or `rediss://host:6380/0`).
-    pub url: String,
+    source: AsyncRedisClientSource,
+}
+
+#[derive(Clone)]
+enum AsyncRedisClientSource {
+    Dsn(String),
+    Validated(ValidatedRedisConnection),
+}
+
+impl fmt::Debug for AsyncRedisConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let source = match &self.source {
+            AsyncRedisClientSource::Dsn(_) => "dsn",
+            AsyncRedisClientSource::Validated(_) => "validated",
+        };
+        formatter
+            .debug_struct("AsyncRedisConfig")
+            .field("source", &source)
+            .finish()
+    }
 }
 
 /// One bounded Redis `SCAN` response.
@@ -71,21 +195,33 @@ pub struct RedisScanPage {
 }
 
 impl AsyncRedisConfig {
-    /// Construct a new config from a Redis connection URL.
+    /// Construct a new config from a Redis connection string.
     pub fn new(url: &str) -> Self {
         Self {
-            url: url.to_string(),
+            source: AsyncRedisClientSource::Dsn(url.to_string()),
         }
     }
 
-    /// Validate Redis-specific URL semantics without opening a connection.
+    /// Construct a config from an already validated Redis connection.
+    pub fn from_connection(connection: ValidatedRedisConnection) -> Self {
+        Self {
+            source: AsyncRedisClientSource::Validated(connection),
+        }
+    }
+
+    /// Validate Redis connection semantics without opening a connection.
     pub fn validate(&self) -> Result<()> {
-        let client = Client::open(self.url.as_str()).context("invalid Redis connection URL")?;
-        anyhow::ensure!(
-            client.get_connection_info().redis.db >= 0,
-            "invalid Redis database selection"
-        );
-        Ok(())
+        self.client().map(|_| ())
+    }
+
+    fn client(&self) -> Result<Client> {
+        match &self.source {
+            AsyncRedisClientSource::Dsn(dsn) => {
+                ValidatedRedisConnection::new(dsn, RedisTlsConfig::default())
+                    .map(|connection| connection.client())
+            }
+            AsyncRedisClientSource::Validated(connection) => Ok(connection.client()),
+        }
     }
 }
 
@@ -155,8 +291,7 @@ impl AsyncRedisKVStore {
             }
         }
         // Slow path: establish the connection without holding the lock.
-        let client =
-            Client::open(self.config.url.as_str()).context("invalid Redis connection URL")?;
+        let client = self.config.client()?;
         let manager_config = ConnectionManagerConfig::new()
             .set_exponent_base(RECONNECT_EXPONENT_BASE)
             .set_factor(RECONNECT_DELAY_FACTOR_MS)
@@ -174,7 +309,7 @@ impl AsyncRedisKVStore {
                 self.timeouts.connect.as_millis()
             )
         })?
-        .context("connecting to Redis")?;
+        .map_err(|error| sanitize_redis_error(RedisErrorAction::Connect, &error))?;
         let candidate = CachedConnection {
             generation: self
                 .next_connection_generation
@@ -202,17 +337,14 @@ impl AsyncRedisKVStore {
         }
     }
 
-    async fn query_redis<T>(&self, command: &mut redis::Cmd) -> redis::RedisResult<T>
+    async fn query_redis<T>(
+        &self,
+        command: &mut redis::Cmd,
+    ) -> std::result::Result<T, RedisQueryError>
     where
         T: FromRedisValue,
     {
-        let mut cached = self.conn().await.map_err(|error| {
-            redis::RedisError::from((
-                ErrorKind::IoError,
-                "opening managed Redis connection",
-                error.to_string(),
-            ))
-        })?;
+        let mut cached = self.conn().await.map_err(RedisQueryError::Connection)?;
         let result = command.query_async(&mut cached.manager).await;
         if result
             .as_ref()
@@ -220,14 +352,16 @@ impl AsyncRedisKVStore {
         {
             self.invalidate_connection(cached.generation).await;
         }
-        result
+        result.map_err(RedisQueryError::Command)
     }
 
-    async fn query<T>(&self, command: &mut redis::Cmd, context: &'static str) -> Result<T>
+    async fn query<T>(&self, command: &mut redis::Cmd, action: RedisErrorAction) -> Result<T>
     where
         T: FromRedisValue,
     {
-        self.query_redis(command).await.context(context)
+        self.query_redis(command)
+            .await
+            .map_err(|error| error.into_public_error(action))
     }
 
     /// Execute a Lua script through `EVALSHA`, loading or reloading it as needed.
@@ -267,13 +401,13 @@ impl AsyncRedisKVStore {
 
         match self.evalsha(&script_hash, keys, args).await {
             Ok(value) => Ok(value),
-            Err(error) if error.kind() == ErrorKind::NoScriptError => {
+            Err(RedisQueryError::Command(error)) if error.kind() == ErrorKind::NoScriptError => {
                 let reloaded_hash = self.load_script(script_source).await?;
                 self.evalsha(&reloaded_hash, keys, args)
                     .await
-                    .context("redis EVALSHA failed after NOSCRIPT reload")
+                    .map_err(|error| error.into_public_error(RedisErrorAction::EvalShaAfterReload))
             }
-            Err(error) => Err(error).context("redis EVALSHA failed"),
+            Err(error) => Err(error.into_public_error(RedisErrorAction::EvalSha)),
         }
     }
 
@@ -281,7 +415,7 @@ impl AsyncRedisKVStore {
         let script_hash: String = self
             .query(
                 redis::cmd("SCRIPT").arg("LOAD").arg(script_source),
-                "redis SCRIPT LOAD failed",
+                RedisErrorAction::ScriptLoad,
             )
             .await?;
         self.script_hashes
@@ -296,7 +430,7 @@ impl AsyncRedisKVStore {
         script_hash: &str,
         keys: &[String],
         args: &[String],
-    ) -> redis::RedisResult<Vec<String>> {
+    ) -> std::result::Result<Vec<String>, RedisQueryError> {
         let mut command = redis::cmd("EVALSHA");
         command.arg(script_hash).arg(keys.len());
         for key in keys {
@@ -326,7 +460,7 @@ impl AsyncRedisKVStore {
                         .arg(pattern)
                         .arg("COUNT")
                         .arg(count),
-                    "redis SCAN failed",
+                    RedisErrorAction::Scan,
                 )
                 .await?;
             Ok(RedisScanPage { next_cursor, keys })
@@ -340,7 +474,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.with_operation_deadline("GET", async {
             let value: Option<Vec<u8>> = self
-                .query(redis::cmd("GET").arg(key), "redis GET failed")
+                .query(redis::cmd("GET").arg(key), RedisErrorAction::Get)
                 .await?;
             Ok(value.map(Bytes::from))
         })
@@ -349,7 +483,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
 
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.with_operation_deadline("SET", async {
-            self.query::<()>(redis::cmd("SET").arg(key).arg(value), "redis SET failed")
+            self.query::<()>(redis::cmd("SET").arg(key).arg(value), RedisErrorAction::Set)
                 .await?;
             Ok(())
         })
@@ -359,7 +493,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
     async fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl_secs: u64) -> Result<()> {
         self.with_operation_deadline("SET with TTL", async {
             if ttl_secs == 0 {
-                self.query::<()>(redis::cmd("SET").arg(key).arg(value), "redis SET failed")
+                self.query::<()>(redis::cmd("SET").arg(key).arg(value), RedisErrorAction::Set)
                     .await?;
             } else {
                 self.query::<()>(
@@ -368,7 +502,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
                         .arg(value)
                         .arg("EX")
                         .arg(ttl_secs),
-                    "redis SET EX failed",
+                    RedisErrorAction::SetWithExpiry,
                 )
                 .await?;
             }
@@ -386,12 +520,12 @@ impl AsyncKVStore for AsyncRedisKVStore {
             // TTL. If stricter atomicity is needed later, switch to a Lua
             // script via EVAL.
             let value: i64 = self
-                .query(redis::cmd("INCR").arg(key), "redis INCR failed")
+                .query(redis::cmd("INCR").arg(key), RedisErrorAction::Incr)
                 .await?;
             if ttl_secs > 0 {
                 self.query::<bool>(
                     redis::cmd("EXPIRE").arg(key).arg(ttl_secs),
-                    "redis EXPIRE failed",
+                    RedisErrorAction::Expire,
                 )
                 .await?;
             }
@@ -408,13 +542,13 @@ impl AsyncKVStore for AsyncRedisKVStore {
             let value: i64 = self
                 .query(
                     redis::cmd("INCRBY").arg(key).arg(amount),
-                    "redis INCRBY failed",
+                    RedisErrorAction::IncrBy,
                 )
                 .await?;
             if ttl_secs > 0 {
                 self.query::<bool>(
                     redis::cmd("EXPIRE").arg(key).arg(ttl_secs),
-                    "redis EXPIRE failed",
+                    RedisErrorAction::Expire,
                 )
                 .await?;
             }
@@ -425,7 +559,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
 
     async fn delete(&self, key: &[u8]) -> Result<()> {
         self.with_operation_deadline("DEL", async {
-            self.query::<i64>(redis::cmd("DEL").arg(key), "redis DEL failed")
+            self.query::<i64>(redis::cmd("DEL").arg(key), RedisErrorAction::Delete)
                 .await?;
             Ok(())
         })
@@ -436,6 +570,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{RedisTlsConfig, ValidatedRedisConnection};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -458,7 +593,6 @@ mod tests {
     #[test]
     fn config_constructs() {
         let cfg = AsyncRedisConfig::new("redis://127.0.0.1:6379/0");
-        assert_eq!(cfg.url, "redis://127.0.0.1:6379/0");
         cfg.validate().unwrap();
         assert!(AsyncRedisConfig::new("redis://127.0.0.1/not-a-database")
             .validate()
@@ -473,6 +607,73 @@ mod tests {
         AsyncRedisConfig::new("rediss://127.0.0.1:6380/0")
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn validated_connection_config_debug_redacts_dsn_and_private_ca() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params =
+            rcgen::CertificateParams::new(vec!["sentinel-private-ca.invalid".to_string()]).unwrap();
+        let certificate = params.self_signed(&key).unwrap().pem();
+        let dsn = "rediss://sentinel-user:sentinel-password@sentinel-host.invalid:6380/7";
+        let connection = ValidatedRedisConnection::new(
+            dsn,
+            RedisTlsConfig {
+                root_cert: Some(certificate.as_bytes().to_vec()),
+                ..RedisTlsConfig::default()
+            },
+        )
+        .unwrap();
+
+        let config = AsyncRedisConfig::from_connection(connection);
+        let rendered = format!("{config:?}");
+        for forbidden in [
+            dsn,
+            "sentinel-user",
+            "sentinel-password",
+            "sentinel-host",
+            certificate.as_str(),
+        ] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn legacy_constructor_still_validates_database_selection() {
+        AsyncRedisConfig::new("redis://localhost:6379/7")
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn redis_error_sanitization_drops_endpoint_bearing_source_chains() {
+        let source = redis::RedisError::from((
+            ErrorKind::IoError,
+            "TLS connection failed",
+            "rediss://sentinel-user:sentinel-password@sentinel-host.invalid:6380/7: \
+             certificate is not valid for 203.0.113.77; key sentinel-key; value sentinel-value"
+                .to_string(),
+        ));
+        assert!(source.to_string().contains("sentinel-host.invalid"));
+
+        let error = sanitize_redis_error(RedisErrorAction::Get, &source);
+        let rendered = format!("{error:#}");
+
+        assert_eq!(rendered, "redis GET failed: Redis transport failed");
+        assert_eq!(error.chain().count(), 1);
+        for forbidden in [
+            "sentinel-user",
+            "sentinel-password",
+            "sentinel-host",
+            "203.0.113.77",
+            "6380",
+            "/7",
+            "certificate",
+            "sentinel-key",
+            "sentinel-value",
+        ] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
     }
 
     #[test]

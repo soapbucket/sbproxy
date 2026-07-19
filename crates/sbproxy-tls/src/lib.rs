@@ -120,15 +120,19 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVSto
             }
         }
         "redis" => {
-            // storage_path holds the redis address (host:port) for the
-            // shared cert store; connections open lazily. The distributed
-            // issuance lock (SET NX PX) makes a fleet issue a cert once
-            // instead of stampeding the CA (WOR-1774).
-            let cfg = sbproxy_platform::storage::RedisConfig {
-                addr: acme.storage_path.clone(),
-                ..Default::default()
+            // Connections open lazily. The distributed issuance lock
+            // (SET NX PX) makes a fleet issue a cert once instead of
+            // stampeding the CA (WOR-1774).
+            let cfg = match sbproxy_platform::storage::RedisConfig::from_dsn(&acme.storage_path) {
+                Ok(cfg) => cfg,
+                Err(_) => {
+                    warn!(
+                        "cert store: invalid Redis connection configuration; certs will NOT persist (in-memory fallback)"
+                    );
+                    return Arc::new(MemoryKVStore::new(0));
+                }
             };
-            info!(addr = %acme.storage_path, "cert store backend: redis (shared, cluster-safe)");
+            info!("cert store backend: redis (shared, cluster-safe)");
             Arc::new(sbproxy_platform::storage::RedisKVStore::new(cfg))
         }
         "file" => {
@@ -648,6 +652,37 @@ fn cert_needs_renewal(meta: &CertMeta, renew_before_days: u32) -> bool {
 mod tests {
     use super::*;
     use cert_store::CertMeta;
+
+    fn acme_with_storage(backend: &str, path: &str) -> sbproxy_config::AcmeConfig {
+        sbproxy_config::AcmeConfig {
+            enabled: true,
+            email: "operator@example.com".to_string(),
+            directory_url: "https://acme.invalid/directory".to_string(),
+            challenge_types: vec!["http-01".to_string()],
+            storage_backend: backend.to_string(),
+            storage_path: path.to_string(),
+            renew_before_days: 30,
+        }
+    }
+
+    #[test]
+    fn redis_cert_backend_rejects_invalid_full_dsn_without_network_io() {
+        let sentinel = "rediss://default:sentinel-acme-password@sentinel-acme-host.invalid:6380/-1";
+        let acme = acme_with_storage("redis", sentinel);
+
+        let backend = open_cert_backend(Some(&acme));
+
+        backend
+            .put(b"certificate-key", b"certificate-value")
+            .expect("invalid Redis config must retain the in-memory fallback posture");
+        assert_eq!(
+            backend
+                .get(b"certificate-key")
+                .expect("read fallback certificate state")
+                .as_deref(),
+            Some(b"certificate-value".as_slice())
+        );
+    }
 
     // Regression: the OCSP refresh task and the maintenance handle are started
     // from the synchronous proxy-setup path, before Pingora installs a runtime.

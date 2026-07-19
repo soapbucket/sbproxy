@@ -27,14 +27,20 @@ ureq = { version = "2", features = ["json"] }
 # Async runtime bridge. `rt` supports spawn_blocking for sync backends;
 # `macros`+`net` are required by the async Redis client (AsyncRedisKVStore).
 tokio = { workspace = true, features = ["rt", "macros", "sync", "net"] }
-# Async Redis client for AsyncRedisKVStore, including rustls for `rediss://`.
-redis = { version = "0.28.1", default-features = false, features = ["connection-manager", "tokio-rustls-comp"] }
+# Redis client for validated connection config and AsyncRedisKVStore, including
+# rustls for `rediss://`.
+redis = { workspace = true, features = ["connection-manager", "tokio-rustls-comp"] }
 async-trait = { workspace = true }
+prometheus = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 
 # Optional storage backends
 redb = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tempfile = "3"

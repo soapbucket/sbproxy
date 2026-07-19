@@ -3474,27 +3474,55 @@ fn get_or_init_revocation_store(
         }
         sbproxy_config::OlpRevocationStoreConfig::Redis { url } => {
             // WOR-808 PR11: open the operator-declared Redis store.
-            // RedisConfig wants a `host:port` address, not a
-            // `redis://` URL; tolerate either by stripping the
-            // scheme prefix. Bad URL / unreachable Redis returns
-            // None so the handler 503s (introspect MUST NOT
-            // silently allow when the revocation store is down).
-            let addr = url
-                .strip_prefix("redis://")
-                .or_else(|| url.strip_prefix("rediss://"))
-                .unwrap_or(url.as_str())
-                .trim_end_matches('/')
-                .to_string();
-            let redis_cfg = sbproxy_platform::storage::RedisConfig {
-                addr,
-                pool_size: 8,
-                acquire_timeout: std::time::Duration::from_secs(5),
-            };
+            // Invalid connection configuration returns None so the handler
+            // 503s. Introspection must not silently allow when the revocation
+            // store is unavailable.
+            let redis_cfg = sbproxy_platform::storage::RedisConfig::from_dsn(url).ok()?;
             std::sync::Arc::new(sbproxy_platform::storage::RedisKVStore::new(redis_cfg))
         }
     };
     reg.insert(key, new_store.clone());
     Some(new_store)
+}
+
+#[cfg(test)]
+mod redis_revocation_store_tests {
+    use super::get_or_init_revocation_store;
+    use sbproxy_config::OlpRevocationStoreConfig;
+
+    #[test]
+    fn redis_revocation_store_accepts_full_secure_dsn_without_network_io() {
+        let config = OlpRevocationStoreConfig::Redis {
+            url: "rediss://default:p%40ss@[::1]:6380/7".to_string(),
+        };
+
+        assert!(get_or_init_revocation_store("secure-dsn.example", &config).is_some());
+    }
+
+    #[test]
+    fn redis_revocation_store_rejects_invalid_dsn_before_network_io() {
+        let config = OlpRevocationStoreConfig::Redis {
+            url: "rediss://default:sentinel-olp-password@sentinel-olp-host.invalid:6380/-1"
+                .to_string(),
+        };
+
+        assert!(get_or_init_revocation_store("invalid-dsn.example", &config).is_none());
+    }
+
+    #[test]
+    fn invalid_revocation_store_log_uses_static_unavailable_message() {
+        let source = include_str!("request_phase.rs");
+        let obsolete = ["revocation store backend not yet", " implemented"].concat();
+
+        assert!(
+            source.contains("warn!(\"olp introspect: revocation store unavailable\");"),
+            "invalid revocation-store construction must report unavailability"
+        );
+        assert!(
+            !source.contains(&obsolete),
+            "shipped Redis support must not be described as unimplemented"
+        );
+    }
 }
 
 /// WOR-808 PR10: per-IP token-bucket rate limiter for the
@@ -3678,7 +3706,7 @@ async fn handle_olp_introspect_or_revoke(
     let store = match get_or_init_revocation_store(aud_hint, &introspect_cfg.revocation_store) {
         Some(s) => s,
         None => {
-            warn!("olp introspect: revocation store backend not yet implemented (PR10/PR11)");
+            warn!("olp introspect: revocation store unavailable");
             let body = br#"{"error":"temporarily_unavailable"}"#;
             send_response(session, 503, "application/json", body).await?;
             return Ok(());

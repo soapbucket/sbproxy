@@ -128,9 +128,10 @@ impl CompressionAdminRegistry {
             .iter()
             .any(|entry| entry.backend == CompressionBackend::Redis)
         {
-            if let Some(store) =
-                crate::compression_runtime::redis_admin_store(&pipeline.config.server)
-            {
+            if let Some(store) = crate::compression_runtime::redis_admin_store(
+                &pipeline.config.server,
+                pipeline.config.l2_store.as_deref(),
+            ) {
                 stores.push(AdminStore {
                     backend: CompressionBackend::Redis,
                     store,
@@ -1080,12 +1081,16 @@ mod tests {
     #[test]
     fn disabled_summary_policy_keeps_the_configured_redis_admin_store() {
         let mut pipeline = crate::pipeline::CompiledPipeline::default();
-        pipeline.config.server.l2_cache = Some(sbproxy_config::L2CacheConfig {
+        let l2_config = sbproxy_config::L2CacheConfig {
             driver: "redis".to_string(),
             params: sbproxy_config::L2CacheParams {
                 dsn: "redis://redis.internal:6379/0".to_string(),
+                ..sbproxy_config::L2CacheParams::default()
             },
-        });
+        };
+        pipeline.config.l2_store =
+            Some(sbproxy_config::build_l2_store(&l2_config).expect("compile general L2 store"));
+        pipeline.config.server.l2_cache = Some(l2_config);
 
         let registry = CompressionAdminRegistry::from_pipeline(&pipeline);
         assert_eq!(

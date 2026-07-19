@@ -182,6 +182,9 @@ Every metric SBproxy emits, what writes it, and what we promise about its name.
 | `sbproxy_rate_limit_decisions_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `policy`, `result` | Rate-limit middleware decisions, by policy and outcome. |
 | `sbproxy_rate_limit_suspend_total` | Counter | `stable` | `beta` | `workspace` | Workspace auto-suspend transitions. |
 | `sbproxy_rate_limit_total` | Counter | `stable` | `beta` | `workspace`, `result` | Workspace rate-limit budget outcomes by workspace and result (soft/throttle). |
+| `sbproxy_redis_kv_connections_total` | Counter | `stable` | `beta` | `result` | Redis KV connection attempts by result. |
+| `sbproxy_redis_kv_operation_duration_seconds` | Histogram | `stable` | `beta` | `operation` | Redis KV operation duration in seconds. |
+| `sbproxy_redis_kv_operation_errors_total` | Counter | `stable` | `beta` | `operation`, `reason` | Redis KV operation failures by operation and reason. |
 | `sbproxy_request_duration_seconds` | Histogram | `stable` | `stable` | `hostname` | Request latency. |
 | `sbproxy_requests_total` | Counter | `stable` | `stable` | `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape` | Total HTTP requests. |
 | `sbproxy_response_body_bytes` | Histogram | `stable` | `beta` | `direction` | Response body size, by compression direction. |

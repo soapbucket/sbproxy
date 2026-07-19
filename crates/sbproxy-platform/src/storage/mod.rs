@@ -6,6 +6,7 @@ mod file;
 mod memory;
 mod redb_store;
 mod redis;
+mod redis_connection;
 mod sqlite;
 
 pub use async_kv::AsyncKVStore;
@@ -14,6 +15,7 @@ pub use file::FileKVStore;
 pub use memory::MemoryKVStore;
 pub use redb_store::RedbKVStore;
 pub use redis::{RedisConfig, RedisKVStore};
+pub use redis_connection::{RedisTlsConfig, ValidatedRedisConnection};
 pub use sqlite::SqliteKVStore;
 
 use anyhow::Result;
@@ -21,6 +23,17 @@ use bytes::Bytes;
 
 /// Low-level key-value storage. All implementations must be thread-safe.
 pub trait KVStore: Send + Sync + 'static {
+    /// Clone the already-validated Redis connection snapshot, when this store
+    /// is Redis-backed.
+    ///
+    /// Runtime consumers use this internal seam to share one compiled DSN and
+    /// TLS identity without reopening configuration files. Other backends
+    /// retain the default `None` implementation.
+    #[doc(hidden)]
+    fn validated_redis_connection(&self) -> Option<ValidatedRedisConnection> {
+        None
+    }
+
     /// Get a value by key. Returns None if the key does not exist.
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
 

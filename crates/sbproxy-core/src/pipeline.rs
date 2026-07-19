@@ -1314,12 +1314,14 @@ impl CompiledPipeline {
             PipelineConstructionMode::Runtime => {
                 crate::compression_runtime::CompressionRuntimeRegistry::from_process(
                     &config.server,
+                    config.l2_store.as_deref(),
                     &actions,
                 )?
             }
             PipelineConstructionMode::Validation => {
                 crate::compression_runtime::CompressionRuntimeRegistry::for_validation(
                     &config.server,
+                    config.l2_store.as_deref(),
                     &actions,
                 )?
             }

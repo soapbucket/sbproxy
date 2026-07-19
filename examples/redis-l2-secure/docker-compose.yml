@@ -1,0 +1,44 @@
+# Development-only TLS Redis for the secure L2 example.
+# Generate examples/redis-l2-secure/certs before starting this service.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6380:6379"
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-development-only-password}"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        mkdir -p /run/redis-tls
+        cp /source-certs/ca.pem /source-certs/server.pem /source-certs/server.key /source-certs/users.acl /run/redis-tls/
+        chown -R redis:redis /run/redis-tls
+        chmod 0444 /run/redis-tls/ca.pem /run/redis-tls/server.pem
+        chmod 0400 /run/redis-tls/server.key /run/redis-tls/users.acl
+        exec su-exec redis redis-server /usr/local/etc/redis/redis.conf
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./certs/ca.pem:/source-certs/ca.pem:ro
+      - ./certs/server.pem:/source-certs/server.pem:ro
+      - ./certs/server.key:/source-certs/server.key:ro
+      - ./certs/client.pem:/source-certs/client.pem:ro
+      - ./certs/client.key:/source-certs/client.key:ro
+      - ./certs/users.acl:/source-certs/users.acl:ro
+    read_only: true
+    tmpfs:
+      - /run/redis-tls
+      - /tmp
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          REDISCLI_AUTH="$$REDIS_PASSWORD"
+          redis-cli --tls --cacert /source-certs/ca.pem
+          --cert /source-certs/client.pem --key /source-certs/client.key
+          -h localhost -p 6379 ping | grep -qx PONG
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s

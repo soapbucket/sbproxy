@@ -6,7 +6,9 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const ADMIN_FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sbproxy")
@@ -74,22 +76,23 @@ fn fixture_admin(
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + ADMIN_FIXTURE_TIMEOUT;
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(accepted) => break accepted,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(
-                        std::time::Instant::now() < deadline,
+                        Instant::now() < deadline,
                         "timed out waiting for admin request"
                     );
-                    thread::sleep(std::time::Duration::from_millis(10));
+                    thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => panic!("accept admin request: {error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(ADMIN_FIXTURE_TIMEOUT))
             .unwrap();
         let mut request = Vec::new();
         let mut buffer = [0u8; 4096];

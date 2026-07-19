@@ -232,7 +232,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # dep so sbproxy-modules can drive XREAD directly for feature feeds (WAF
 # rule subscription) without going through the KVStore facade.
 # `streams` enables the XREAD typed reply parser (StreamReadReply).
-redis = { version = "0.28.1", default-features = false, features = ["tokio-comp", "streams"] }
+redis = { version = "0.31.0", default-features = false, features = ["tokio-comp", "streams"] }
 
 # Bloom filter
 bloomfilter = "1"

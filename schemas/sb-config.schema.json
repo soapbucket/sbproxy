@@ -4067,7 +4067,10 @@
         "params": {
           "description": "Driver-specific parameters.",
           "default": {
-            "dsn": ""
+            "ca_file": null,
+            "cert_file": null,
+            "dsn": "",
+            "key_file": null
           },
           "allOf": [
             {
@@ -4082,9 +4085,33 @@
       "type": "object",
       "properties": {
         "dsn": {
-          "description": "Connection DSN. For `redis` drivers this is a `redis://host:port[/db]` URL. Only the host:port portion is parsed today; the DB index is ignored.",
+          "description": "Redis connection DSN. Supports `redis://`, `rediss://`, credentials, bracketed IPv6 addresses, and a non-negative logical database.",
           "default": "",
           "type": "string"
+        },
+        "ca_file": {
+          "description": "Optional path to PEM-encoded Redis trust anchors for a private CA.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cert_file": {
+          "description": "Optional path to a PEM-encoded Redis client certificate chain. Must be configured together with `key_file` and requires `rediss://`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_file": {
+          "description": "Optional path to the PEM-encoded Redis client private key. Must be configured together with `cert_file` and requires `rediss://`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
