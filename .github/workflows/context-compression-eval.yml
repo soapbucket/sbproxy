@@ -1,0 +1,76 @@
+# Deterministic context-compression value and quality smoke gate (WOR-1922).
+
+name: context-compression-eval
+
+on:
+  pull_request:
+    paths:
+      - 'sbproxy-bench/harness/context_compression_eval/**'
+      - 'crates/sbproxy-ai/src/compression/**'
+      - 'crates/sbproxy-ai/src/context_compress.rs'
+      - 'crates/sbproxy-ai/src/token_estimate.rs'
+      - 'Cargo.toml'
+      - '.github/workflows/context-compression-eval.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'sbproxy-bench/harness/context_compression_eval/**'
+      - 'crates/sbproxy-ai/src/compression/**'
+      - 'crates/sbproxy-ai/src/context_compress.rs'
+      - 'crates/sbproxy-ai/src/token_estimate.rs'
+      - 'Cargo.toml'
+      - '.github/workflows/context-compression-eval.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  MANIFEST: sbproxy-bench/harness/context_compression_eval/Cargo.toml
+  HARNESS: sbproxy-bench/harness/context_compression_eval
+
+jobs:
+  context-compression-eval:
+    name: fmt + test + clippy + report drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: context-compression-eval
+          workspaces: sbproxy-bench/harness/context_compression_eval
+
+      - name: install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      - name: format
+        run: cargo fmt --manifest-path "$MANIFEST" -- --check
+
+      - name: test
+        run: cargo test --manifest-path "$MANIFEST" --all-targets --locked
+
+      - name: clippy
+        run: cargo clippy --manifest-path "$MANIFEST" --all-targets --locked -- -D warnings
+
+      - name: deterministic report drift
+        run: |
+          cargo run --manifest-path "$MANIFEST" --locked -- check \
+            --harness-root "$HARNESS" \
+            --input "$HARNESS/fixtures/ruler-smoke.jsonl" \
+            --input "$HARNESS/fixtures/coding-agent-smoke.jsonl" \
+            --provenance "$HARNESS/fixtures/provenance.json" \
+            --json-report "$HARNESS/reports/window-fit-smoke.json" \
+            --markdown-report "$HARNESS/reports/window-fit-smoke.md"
