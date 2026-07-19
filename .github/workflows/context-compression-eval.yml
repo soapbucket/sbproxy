@@ -12,6 +12,8 @@ on:
       - 'crates/sbproxy-ai/src/token_estimate.rs'
       - 'crates/sbproxy-core/src/compression_runtime.rs'
       - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
+      - 'e2e/tests/ai_native_inbound.rs'
+      - 'e2e/tests/governed_key_policy.rs'
       - 'schemas/ai-compression.schema.json'
       - 'schemas/sb-config.schema.json'
       - 'Cargo.toml'
@@ -27,6 +29,8 @@ on:
       - 'crates/sbproxy-ai/src/token_estimate.rs'
       - 'crates/sbproxy-core/src/compression_runtime.rs'
       - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
+      - 'e2e/tests/ai_native_inbound.rs'
+      - 'e2e/tests/governed_key_policy.rs'
       - 'schemas/ai-compression.schema.json'
       - 'schemas/sb-config.schema.json'
       - 'Cargo.toml'
@@ -85,3 +89,29 @@ jobs:
             --input-budget-tokens 192 \
             --json-report "$HARNESS/reports/window-fit-smoke.json" \
             --markdown-report "$HARNESS/reports/window-fit-smoke.md"
+
+  compression-request-path:
+    name: production request-path smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: context-compression-request-path
+
+      - name: build sbproxy binary
+        run: cargo build -p sbproxy --locked
+
+      - name: governed selector precedence
+        run: >-
+          cargo test -p sbproxy-e2e --locked --test governed_key_policy
+          dynamic_compression_profile_changes_context_and_header_overrides_it
+          -- --exact --test-threads=1
+
+      - name: Anthropic native compression
+        run: >-
+          cargo test -p sbproxy-e2e --locked --test ai_native_inbound
+          anthropic_native_upstream_receives_the_compressed_message_list
+          -- --exact --test-threads=1
