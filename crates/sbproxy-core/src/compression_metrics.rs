@@ -209,6 +209,36 @@ pub(crate) fn record_compression_selection(
         .inc();
 }
 
+/// Record and emit one resolved request policy without exposing selector input.
+pub(crate) fn record_compression_selection_event(
+    tenant_id: &str,
+    source: &'static str,
+    outcome: &'static str,
+    reason: Option<&'static str>,
+) {
+    record_compression_selection(tenant_id, source, outcome);
+    if let Some(reason) = reason {
+        tracing::warn!(
+            target: "ai_compression",
+            event = "ai_compression_selection",
+            tenant_id,
+            source,
+            outcome,
+            reason,
+            "AI compression: request policy resolved"
+        );
+    } else {
+        tracing::info!(
+            target: "ai_compression",
+            event = "ai_compression_selection",
+            tenant_id,
+            source,
+            outcome,
+            "AI compression: request policy resolved"
+        );
+    }
+}
+
 impl CompressionStateOperation {
     const fn as_str(self) -> &'static str {
         match self {
@@ -344,11 +374,16 @@ fn target_log(policy: &CompressionPolicy) -> String {
                 "target_summary_tokens": config.target_summary_tokens,
                 "timeout_ms": config.summarizer.timeout_secs.saturating_mul(1_000),
             }),
-            CompressionLeverConfig::WindowFit(config) => serde_json::json!({
-                "lever": "window_fit",
-                "completion_reserve_tokens": config.completion_reserve_tokens,
-                "input_budget_tokens": config.input_budget_tokens,
-            }),
+            CompressionLeverConfig::WindowFit(config) => {
+                let mut target = serde_json::json!({
+                    "lever": "window_fit",
+                    "completion_reserve_tokens": config.completion_reserve_tokens,
+                });
+                if let Some(input_budget_tokens) = config.input_budget_tokens {
+                    target["input_budget_tokens"] = serde_json::json!(input_budget_tokens);
+                }
+                target
+            }
         })
         .collect::<Vec<_>>();
     serde_json::Value::Array(targets).to_string()
@@ -542,9 +577,9 @@ pub(crate) fn record_compression_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        record_compression_run, record_compression_selection, record_compression_state_operation,
-        record_redis_compression_coordination, CompressionStateOperation, CompressionStateOutcome,
-        RedisCompressionCoordinationEvent,
+        record_compression_run, record_compression_selection, record_compression_selection_event,
+        record_compression_state_operation, record_redis_compression_coordination, target_log,
+        CompressionStateOperation, CompressionStateOutcome, RedisCompressionCoordinationEvent,
     };
     use sbproxy_ai::compression::{
         CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionRun,
@@ -601,6 +636,30 @@ mod tests {
         String::from_utf8(bytes).expect("compression log is UTF-8")
     }
 
+    fn capture_selection(reason: Option<&'static str>) -> String {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            record_compression_selection_event(
+                "compression-selection-log-tenant",
+                "governed_key",
+                if reason.is_some() {
+                    "invalid_operator"
+                } else {
+                    "selected"
+                },
+                reason,
+            );
+        });
+        let bytes = captured.lock().expect("log capture").clone();
+        String::from_utf8(bytes).expect("compression log is UTF-8")
+    }
+
     fn policy() -> CompressionPolicy {
         CompressionPolicy {
             state: Some(CompressionStateConfig {
@@ -626,6 +685,29 @@ mod tests {
             ],
             profiles: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn window_fit_target_omits_an_unconfigured_explicit_budget() {
+        let configured = target_log(&policy());
+        assert!(configured.contains("input_budget_tokens"), "{configured}");
+
+        let mut unconfigured = policy();
+        let window_fit = unconfigured
+            .levers
+            .iter_mut()
+            .find_map(|lever| match lever {
+                CompressionLeverConfig::WindowFit(config) => Some(config),
+                CompressionLeverConfig::SummaryBuffer(_) => None,
+            })
+            .expect("test policy has window_fit");
+        window_fit.input_budget_tokens = None;
+
+        let unconfigured = target_log(&unconfigured);
+        assert!(
+            !unconfigured.contains("input_budget_tokens"),
+            "{unconfigured}"
+        );
     }
 
     fn applied_run() -> CompressionRun {
@@ -774,6 +856,22 @@ mod tests {
 
         let after = metric_sample("sbproxy_ai_compression_selection_total", &labels).0;
         assert_eq!(after - before, 1.0);
+    }
+
+    #[test]
+    fn policy_selection_emits_exactly_one_resolution_event() {
+        let selected = capture_selection(None);
+        assert_eq!(selected.matches("ai_compression_selection").count(), 1);
+        assert!(selected.contains(" INFO "), "{selected}");
+        assert!(!selected.contains("reason="), "{selected}");
+
+        let invalid = capture_selection(Some("invalid_or_undeclared_operator_selector"));
+        assert_eq!(invalid.matches("ai_compression_selection").count(), 1);
+        assert!(invalid.contains(" WARN "), "{invalid}");
+        assert!(
+            invalid.contains("reason=\"invalid_or_undeclared_operator_selector\""),
+            "{invalid}"
+        );
     }
 
     #[test]

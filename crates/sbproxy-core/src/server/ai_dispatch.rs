@@ -3286,17 +3286,6 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     };
-    if bound.invalid_operator_selector {
-        warn!(
-            target: "ai_compression",
-            event = "ai_compression_selection",
-            tenant_id = %ctx.tenant_id,
-            source = bound.source.as_str(),
-            outcome = "invalid_operator",
-            reason = "invalid_or_undeclared_operator_selector",
-            "AI compression: operator selector disabled compression"
-        );
-    }
     let compression_runtime = bound
         .selected
         .as_ref()
@@ -3310,18 +3299,13 @@ pub(super) async fn handle_ai_proxy(
     if explicit_compression_selection
         || runtime_set.is_some_and(|set| set.requires_semantic_cache_bypass())
     {
-        crate::compression_metrics::record_compression_selection(
+        crate::compression_metrics::record_compression_selection_event(
             ctx.tenant_id.as_str(),
             bound.source.as_str(),
             compression_selection_outcome,
-        );
-        info!(
-            target: "ai_compression",
-            event = "ai_compression_selection",
-            tenant_id = %ctx.tenant_id,
-            source = bound.source.as_str(),
-            outcome = compression_selection_outcome,
-            "AI compression: request policy resolved"
+            bound
+                .invalid_operator_selector
+                .then_some("invalid_or_undeclared_operator_selector"),
         );
     }
     let compression_cache_bypass = compression_selection_bypasses_cache(
