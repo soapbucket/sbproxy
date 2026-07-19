@@ -18,9 +18,10 @@ the next version cut.
   and safe invalid-selector behavior. Stateful summaries use Redis as the
   canonical session store while request workers remain stateless; authenticated
   Admin APIs list, inspect metadata for, and purge that state. Per-lever token
-  and gross-cost savings now appear in bounded metrics, structured logs,
-  dashboards, and the model-host value report, with a deterministic synthetic
-  evaluation harness guarding production window-fit behavior.
+  savings now appear in bounded metrics and structured logs; gross-cost value
+  appears in bounded value metrics, dashboards, and the model-host value
+  report. A deterministic synthetic evaluation harness guards production
+  window-fit behavior.
 - **MCP tool rollout plane.** Publish several versions of one tool at once
   and roll out breaking changes without breaking callers: a `rollout:` block
   under the `mcp` action's `tool_versioning` declares versions, where each
