@@ -1,7 +1,7 @@
-//! Sweep every published example sb.yml through the full boot-time
-//! construction path: `compile_config` followed by
-//! `CompiledPipeline::from_config`, the same pair the server, the
-//! reload handler, and (since WOR-1815) the `validate` subcommand run.
+//! Sweep every published example sb.yml through full module construction:
+//! `compile_config` followed by
+//! `CompiledPipeline::from_config_for_validation`, the same declared-
+//! dependency path used by the `validate` subcommand.
 //!
 //! The sibling sweep in `sbproxy-config/tests/validate_examples.rs`
 //! stops at `compile_config`, which cannot see constructor-level
@@ -117,7 +117,9 @@ fn every_oss_example_constructs_its_pipeline() {
                 continue;
             }
         };
-        if let Err(e) = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled) {
+        if let Err(e) =
+            sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+        {
             failures.push(format!(
                 "{}: pipeline construction: {:#}",
                 file.display(),
@@ -128,7 +130,7 @@ fn every_oss_example_constructs_its_pipeline() {
     if !failures.is_empty() {
         let summary = failures.join("\n  ");
         panic!(
-            "{} of {} example(s) failed boot-time construction:\n  {}",
+            "{} of {} example(s) failed module construction:\n  {}",
             failures.len(),
             files.len(),
             summary

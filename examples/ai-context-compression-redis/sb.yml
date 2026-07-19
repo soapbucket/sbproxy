@@ -1,0 +1,78 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Stateful AI context compression with Redis-backed session summaries.
+#
+# The caller sends the complete conversation on every request and supplies a
+# stable ULID in X-Sb-Session-Id. Request workers remain stateless. Redis holds
+# only the versioned running-summary record shared by every worker.
+
+proxy:
+  http_bind_port: ${SB_HTTP_PORT:-8080}
+
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: ${SB_ADMIN_PORT:-9090}
+    username: admin
+    password: ${ADMIN_PASSWORD}
+
+  # compression.state.backend: redis binds to this process-wide Redis store.
+  l2_cache_settings:
+    driver: redis
+    params:
+      dsn: ${SB_REDIS_URL:-redis://127.0.0.1:6379/0}
+
+  tenants:
+    - id: compression-redis-demo
+
+origins:
+  "ai.local":
+    tenant_id: compression-redis-demo
+
+    # Stateful compression never invents its own session identifier. Capture
+    # only a valid caller-provided X-Sb-Session-Id ULID.
+    sessions:
+      capture: true
+      auto_generate: never
+
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai-primary
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o
+          models:
+            - gpt-4o
+
+        # This provider and model are selected directly by summary_buffer.
+        # They do not recursively enter the ordinary AI request pipeline.
+        - name: openai-summarizer
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          models:
+            - gpt-4o-mini
+
+      compression:
+        state:
+          backend: redis
+          ttl: 24h
+
+        # Summary content remains unavailable through the Admin API.
+        allow_admin_content_inspection: false
+
+        # Levers run in declaration order. The stateful summary reduces old
+        # history first, then deterministic window fitting is the final bound.
+        levers:
+          - type: summary_buffer
+            min_tokens: 4096
+            retain_recent_messages: 4
+            target_summary_tokens: 768
+            summarizer:
+              provider: openai-summarizer
+              model: gpt-4o-mini
+              timeout: 8s
+
+          - type: window_fit
+            completion_reserve_tokens: 2048

@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-18*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -578,9 +578,16 @@ proxy:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `dsn` | string | | Connection string. Accepts `redis://[user[:pass]@]host:port[/db]`, `rediss://...`, or a bare `host:port`. The database index in the path is parsed but ignored by the single-connection RESP client. |
+| `dsn` | string | | Connection address. The general L2 client currently supports only an unauthenticated, plaintext Redis endpoint supplied as `redis.internal:6379` or `redis://redis.internal:6379`. |
 
 Pool size and acquire timeout are not exposed via `params` and use built-in defaults (pool size 8, acquire timeout 5 seconds).
+
+The general L2 client does not yet implement TLS, `AUTH`, or `SELECT`. Its
+legacy parser accepts credentials, a database path, and a `rediss://` scheme
+but discards them before opening a plaintext connection, so do not rely on
+those forms for L2 traffic. AI context compression uses a separate async
+client built from the complete DSN and does support credentials, database
+selection, `redis://`, and `rediss://`.
 
 ### messenger_settings
 
@@ -1064,6 +1071,7 @@ origins:
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
 | `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
@@ -1098,6 +1106,125 @@ A `managed_model` provider must set a non-empty `deployment` and must not set
 `api_key`, `base_url`, or the legacy `serve` block. Conversely, `deployment` is
 rejected for every other provider type. Managed traffic resolves through the
 deployment runtime rather than an operator-supplied upstream URL.
+
+#### AI context compression
+
+The `compression` block on an `ai_proxy` action runs an ordered list of
+prompt-compression levers before provider dispatch. It is separate from the
+origin-level [response compression](#compression) middleware.
+
+This example first maintains a session summary, then deterministically fits the
+result to the resolved target model's context window:
+
+```yaml
+proxy:
+  l2_cache_settings:
+    driver: redis
+    params:
+      dsn: redis://redis.internal:6379/0
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o]
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models: [claude-haiku-4-5]
+      compression:
+        state:
+          backend: redis
+          ttl: 24h
+        allow_admin_content_inspection: false
+        levers:
+          - type: summary_buffer
+            min_tokens: 12000
+            retain_recent_messages: 8
+            target_summary_tokens: 2048
+            summarizer:
+              provider: anthropic
+              model: claude-haiku-4-5
+              timeout: 5s
+          - type: window_fit
+            completion_reserve_tokens: 1024
+```
+
+Levers execute in declaration order. Each lever sees the message list accepted
+from the preceding lever, and a candidate replacement is used only when it
+strictly reduces the resolved target model's token estimate.
+
+Policy fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `state` | object | unset | External state used by `summary_buffer`. Required when any `summary_buffer` lever is present. It may be omitted for a policy containing only `window_fit`. |
+| `state.backend` | enum | required | `redis` for lease-serialized, fenced compare-and-set storage. There is no in-process or mesh session-state backend. |
+| `state.ttl` | duration | required | Positive record lifetime. Accepts integer seconds or strings such as `60s`, `5m`, `2h30m`, and `1d`. Newly committed summaries refresh the lifetime; exact-summary reuse does not write or refresh it. |
+| `allow_admin_content_inspection` | bool | `false` | Permit the Admin-only, audit-first content endpoint for records from this handler. Metadata remains available to authenticated readers. This flag alone never grants access. |
+| `levers` | list | `[]` | Compression levers in execution order. An explicitly empty list disables compression for this handler. |
+
+`summary_buffer` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | required | Must be `summary_buffer`. |
+| `min_tokens` | int | required | Positive input-token threshold below which the lever skips the request. |
+| `retain_recent_messages` | int | required | Positive number of the most recent messages to retain byte-for-byte. |
+| `target_summary_tokens` | int | required | Positive maximum output-token request sent to the summarizer. Must be smaller than `min_tokens`. |
+| `summarizer.provider` | string | required | Exact `providers[].name` from the same AI handler. The provider must be enabled. |
+| `summarizer.model` | string | required | Non-empty model sent to the selected provider. It must be declared by that provider, mapped by `model_map`, selected as its `default_model`, or allowed by an empty provider model list, and it must pass the handler's model allow and block lists. |
+| `summarizer.timeout` | duration | required | Positive hard deadline for the internal summarization request. Accepts the same seconds or humanized duration syntax as `state.ttl`. |
+
+`window_fit` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | required | Must be `window_fit`. |
+| `completion_reserve_tokens` | int | `1024` | Non-negative completion capacity excluded from the input-message budget. |
+
+Configuration loading rejects unknown fields within `compression`, `state`,
+each lever, and `summarizer`. It also rejects a zero TTL or timeout, zero
+`summary_buffer` numeric fields, a summary target greater than or equal to its
+minimum threshold, an empty summarizer model, an unknown summarizer provider,
+a disabled summarizer provider, and a summarizer model not available through
+that provider or denied by the handler policy. A stateful backend that is not
+available also fails pipeline construction instead of silently falling back:
+
+- `backend: redis` requires `proxy.l2_cache_settings.driver: redis`. For this
+  feature, `params.dsn` must be a `redis://` or `rediss://` URL with a host.
+- `backend: mesh` is rejected because the current cluster cache does not offer
+  the replication, restart restore, ownership handoff, and delete guarantees
+  required for canonical summary state.
+- `window_fit` is stateless and needs neither dependency.
+
+Request workers retain no conversational state between requests. The
+stateful lever stores its canonical running-summary record in Redis under an
+opaque ID; raw session identifiers and raw turns are not
+stored in that record. There is no OmniRoute import path, migration format, or
+runtime dependency. Enabling this feature starts and maintains native SBproxy
+state only.
+
+For compatibility, the older boolean remains accepted:
+
+```yaml
+resilience:
+  llm_aware:
+    context_compress: true
+    completion_reserve_tokens: 2048
+```
+
+When `compression` is absent, `context_compress: true` maps to one
+`window_fit` lever with the configured reserve, or `1024` when the reserve is
+omitted. Any explicit `compression` block is authoritative, including
+`compression: {levers: []}`, so it disables that legacy mapping. The legacy
+form does not enable session summaries or admin content inspection.
+
+See [AI context compression](ai-context-compression.md) for request
+eligibility, session identity, concurrency, failure behavior, and operational
+guidance.
 
 #### Credentials
 

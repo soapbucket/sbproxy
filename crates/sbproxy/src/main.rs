@@ -1680,13 +1680,14 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
         .and_then(|yaml| {
             let compiled = sbproxy_config::compile_config(&yaml)
                 .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
-            let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "config '{path_str}' compiled, but a module failed to construct \
+            let pipeline =
+                sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "config '{path_str}' compiled, but a module failed to construct \
                          (this would fail at boot):\n{e:#}"
-                    )
-                })?;
+                        )
+                    })?;
             let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
             sbproxy_core::model_runtime::validate_model_runtime(&pipeline, config_dir).map_err(
                 |e| {
@@ -5495,9 +5496,10 @@ fn load_and_validate(
     // can fold it into their findings report: `plan` renders it next
     // to the other semantic findings and exits 3, the same channel
     // the validate-rule findings use.
-    let construction_error = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
-        .err()
-        .map(|e| format!("{e:#}"));
+    let construction_error =
+        sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .err()
+            .map(|e| format!("{e:#}"));
     let config = serde_yaml::from_str::<sbproxy_config::ConfigFile>(&yaml)
         .map_err(|e| anyhow::anyhow!("failed to parse '{path_str}' as ConfigFile: {e}"))?;
     Ok((config, construction_error))
@@ -7237,6 +7239,57 @@ mod tests {
         assert_eq!(
             handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
             0
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_rejects_mesh_compression_until_cluster_state_is_durable_and_replicated() {
+        let path = temp_config(
+            r#"proxy:
+  cluster:
+    cluster_id: compression-test
+    node_id: gateway-a
+    roles: [gateway]
+    seeds: ["127.0.0.1:17946"]
+    gossip_port: 17946
+    transport_port: 18946
+    advertise_addr: "127.0.0.1:17946"
+    transport_advertise_addr: "127.0.0.1:18946"
+    state_dir: ./state/compression-test
+    security:
+      mode: shared_key
+      development: true
+      shared_key: validation-only-secret
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: primary
+          api_key: test-key
+          models: [gpt-4o]
+        - name: summarizer
+          api_key: test-key
+          models: [gpt-4o-mini]
+      compression:
+        state: { backend: mesh, ttl: 1h }
+        levers:
+          - type: summary_buffer
+            min_tokens: 100
+            retain_recent_messages: 2
+            target_summary_tokens: 20
+            summarizer:
+              provider: summarizer
+              model: gpt-4o-mini
+              timeout: 2s
+"#,
+        );
+
+        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
         );
         let _ = std::fs::remove_file(&path);
     }

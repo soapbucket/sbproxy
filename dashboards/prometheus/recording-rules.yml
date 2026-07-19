@@ -45,3 +45,27 @@ groups:
             0.95,
             sum by (le, tenant_id, model) (rate(sbproxy_ai_request_duration_attributed_seconds_bucket[5m]))
           )
+
+      # AI context compression value and health. Request savings use the
+      # initial-to-final histogram, so a multi-lever pipeline is counted once.
+      - record: sbproxy:ai_compression_application_rate_5m
+        expr: |
+          sum(rate(sbproxy_ai_compression_lever_total{outcome="applied"}[5m]))
+            /
+          clamp_min(sum(rate(sbproxy_ai_compression_lever_total[5m])), 0.000001)
+
+      - record: sbproxy:ai_compression_failure_ratio_5m
+        expr: |
+          sum(rate(sbproxy_ai_compression_requests_total{outcome="failed"}[5m]))
+            /
+          clamp_min(sum(rate(sbproxy_ai_compression_requests_total[5m])), 0.000001)
+
+      - record: sbproxy:ai_compression_latency_p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(sbproxy_ai_compression_duration_seconds_bucket[5m]))
+          )
+
+      - record: sbproxy:ai_compression_tokens_saved_rate_5m
+        expr: sum(rate(sbproxy_ai_compression_tokens_saved_total[5m]))

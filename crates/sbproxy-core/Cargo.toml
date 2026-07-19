@@ -152,6 +152,7 @@ notify.workspace = true
 
 # Observability
 tracing.workspace = true
+prometheus.workspace = true
 
 # Error handling
 anyhow.workspace = true
@@ -199,7 +200,3 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber.workspace = true
 tempfile = "3"
 loom = "0.7"
-# WOR-169: hooks tests scrape `sbproxy_hooks_channel_dropped_total` from
-# the global Prometheus registry to assert the bounded-channel drop
-# counter advances. Pulls the same workspace pin used by sbproxy-observe.
-prometheus = { workspace = true }

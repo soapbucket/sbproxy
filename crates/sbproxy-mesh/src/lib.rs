@@ -65,6 +65,9 @@ pub mod transport;
 
 pub use cluster_handle::{
     ClusterHandle, ClusterIdentity, ClusterMember, ClusterMemberState, ClusterMode,
-    ClusterNodeRole, ClusterStateError, ClusterStateRead, ClusterStateRecord,
+    ClusterNodeRole, ClusterStateError, ClusterStateKeySnapshot, ClusterStateRead,
+    ClusterStateRecord, ClusterVersionedStateKind, ClusterVersionedStateRead,
+    ClusterVersionedStateRecord,
 };
 pub use node_handle::MeshNode;
+pub use state::register::VersionedLwwMergeOutcome;

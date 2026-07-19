@@ -1,5 +1,6 @@
 # LLM-aware resilience
-*Last modified: 2026-06-24*
+
+*Last modified: 2026-07-18*
 
 Status-code retries treat every `5xx` the same and ignore the LLM-specific
 failure modes a provider signals in the response: a context-window
@@ -51,12 +52,12 @@ set (`500`/`502`/`503`) or when the classified cause clears the policy. A
 class with an explicit count caps its retries; a class with no entry uses
 its default retryability. The overall `max_attempts` still bounds the total.
 
-## Context-window compression
+## Context-window fitting compatibility
 
 A context-length overflow is not worth retrying as-is; the same prompt only
-fails again. With `llm_aware.context_compress`, the gateway fits an
-over-long prompt to the resolved model's context window before dispatch, so
-it succeeds on the same model instead of being rejected:
+fails again. The legacy `llm_aware.context_compress` switch enables stateless
+window fitting before dispatch, so an over-long prompt can stay on the same
+model instead of being rejected:
 
 ```yaml
 action:
@@ -67,9 +68,19 @@ action:
       completion_reserve_tokens: 1024  # reserve room for the response
 ```
 
-Only the oldest non-system turns are dropped; the system message and the
-most recent turns are preserved. It is a no-op for unknown models (where the
-window is not known), non-chat surfaces, and prompts that already fit.
+When no explicit `compression` block is present, this lowers to one
+`window_fit` lever. The leading system message is preserved and remaining
+messages are considered newest to oldest using the existing content-byte
+heuristic after the completion reserve. A message that does not fit is skipped,
+so a smaller older message may still be retained. It is a no-op for unknown
+models and prompts that already fit that heuristic. This compatibility behavior
+is not an exact tokenizer or hard provider-window guarantee. An explicit
+compression policy is authoritative, including an empty lever list.
+
+For the ordered `summary_buffer` and `window_fit` pipeline, captured-session
+requirements, Redis state, structured-content protection, failure
+semantics, and telemetry, see
+[AI context compression](ai-context-compression.md).
 
 ## Hedged (raced) requests
 

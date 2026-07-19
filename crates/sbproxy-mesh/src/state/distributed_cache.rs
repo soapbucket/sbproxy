@@ -5,14 +5,17 @@
 //! or removed.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
+use crate::state::register::{VersionedLwwMergeOutcome, VersionedLwwRegister};
 use crate::transport::TransportClientPool;
+
+const MAX_LOCAL_SNAPSHOT_ENTRIES: usize = 4_096;
 
 /// Default sweeper period (seconds) used by
 /// [`DistributedCache::start_sweeper`] when the caller does not pin a
@@ -108,6 +111,25 @@ pub struct DistributedCache<V: Clone + Send + Sync + 'static> {
     ring: Mutex<ConsistentHashRing>,
     local_node_id: String,
 }
+
+/// Deterministically ordered, bounded view of one local cache-key prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalCacheSnapshot<V> {
+    /// Lexicographically ordered key/value pairs.
+    pub entries: Vec<(String, V)>,
+    /// Whether additional matching keys were excluded by the bound.
+    pub truncated: bool,
+}
+
+/// A local cache snapshot request violated its fixed output bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid local cache snapshot limit")]
+pub struct LocalCacheSnapshotError;
+
+/// A versioned application value could not be decoded or encoded safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid versioned mesh state")]
+pub struct VersionedCacheMergeError;
 
 impl<V: Clone + Send + Sync + 'static> DistributedCache<V> {
     /// Create a new distributed cache for the given local node.
@@ -297,6 +319,42 @@ impl<V: Clone + Send + Sync + 'static> DistributedCache<V> {
         n
     }
 
+    /// Capture the lexicographically first bounded page for one local prefix.
+    ///
+    /// The method scans the local shard while retaining at most
+    /// `maximum + 1` matching values, so output memory remains bounded even
+    /// when another cache namespace is large. Expired entries are removed
+    /// before the snapshot is assembled.
+    pub fn snapshot_prefix_local(
+        &self,
+        prefix: &str,
+        maximum: usize,
+    ) -> Result<LocalCacheSnapshot<V>, LocalCacheSnapshotError> {
+        if !(1..=MAX_LOCAL_SNAPSHOT_ENTRIES).contains(&maximum) {
+            return Err(LocalCacheSnapshotError);
+        }
+        let now = Instant::now();
+        let mut cache = self.local_cache.lock().unwrap();
+        cache.retain(|_, entry| entry.expires_at.is_none_or(|deadline| deadline > now));
+
+        let retained = maximum.saturating_add(1);
+        let mut selected = BTreeMap::new();
+        for (key, entry) in cache.iter().filter(|(key, _)| key.starts_with(prefix)) {
+            selected.insert(key.clone(), entry.value.clone());
+            if selected.len() > retained {
+                selected.pop_last();
+            }
+        }
+        let truncated = selected.len() > maximum;
+        if truncated {
+            selected.pop_last();
+        }
+        Ok(LocalCacheSnapshot {
+            entries: selected.into_iter().collect(),
+            truncated,
+        })
+    }
+
     /// Number of entries currently in the local shard (including expired
     /// entries that have not yet been swept). Test / diagnostics only.
     #[cfg(test)]
@@ -339,6 +397,55 @@ impl<V: Clone + Send + Sync + 'static> DistributedCache<V> {
 // generic routed API would require.
 
 impl DistributedCache<Bytes> {
+    /// Atomically merge a versioned LWW value into the owning local shard.
+    ///
+    /// Existing expiry is retained when a candidate loses. A winning
+    /// candidate receives the supplied TTL, while conflict metadata is
+    /// persisted without extending the winning value's lifetime.
+    pub fn merge_versioned_local_with_ttl(
+        &self,
+        key: &str,
+        candidate: Bytes,
+        ttl_secs: u64,
+    ) -> Result<VersionedLwwMergeOutcome, VersionedCacheMergeError> {
+        let candidate = serde_json::from_slice::<VersionedLwwRegister>(&candidate)
+            .map_err(|_| VersionedCacheMergeError)?;
+        let now = Instant::now();
+        let candidate_expiry = (ttl_secs > 0).then(|| now + Duration::from_secs(ttl_secs));
+        let mut cache = self.local_cache.lock().unwrap();
+        if cache
+            .get(key)
+            .is_some_and(|entry| entry.expires_at.is_some_and(|deadline| deadline <= now))
+        {
+            cache.remove(key);
+        }
+
+        let Some(current_entry) = cache.get_mut(key) else {
+            let encoded = serde_json::to_vec(&candidate).map_err(|_| VersionedCacheMergeError)?;
+            cache.insert(
+                key.to_string(),
+                Entry {
+                    value: Bytes::from(encoded),
+                    expires_at: candidate_expiry,
+                },
+            );
+            return Ok(VersionedLwwMergeOutcome::Replaced);
+        };
+
+        let mut current = serde_json::from_slice::<VersionedLwwRegister>(&current_entry.value)
+            .map_err(|_| VersionedCacheMergeError)?;
+        let outcome = current.merge(&candidate);
+        let encoded = serde_json::to_vec(&current).map_err(|_| VersionedCacheMergeError)?;
+        current_entry.value = Bytes::from(encoded);
+        if matches!(
+            outcome,
+            VersionedLwwMergeOutcome::Replaced | VersionedLwwMergeOutcome::ConflictReplaced
+        ) {
+            current_entry.expires_at = candidate_expiry;
+        }
+        Ok(outcome)
+    }
+
     /// Fetch `key` via the consistent hash ring.
     ///
     /// If the local node owns the key, serves from the local shard. Otherwise
@@ -446,6 +553,43 @@ impl DistributedCache<Bytes> {
         client.put_with_ttl(key.to_string(), value, ttl_secs).await
     }
 
+    /// Atomically merge a versioned value through the consistent-hash owner.
+    pub async fn merge_versioned_routed_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl_secs: u64,
+        pool: &TransportClientPool,
+        peer_addr_for_node: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<VersionedLwwMergeOutcome> {
+        let owner = match self.responsible_node(key) {
+            Some(owner) => owner,
+            None => {
+                return self
+                    .merge_versioned_local_with_ttl(key, value, ttl_secs)
+                    .map_err(anyhow::Error::from);
+            }
+        };
+        if owner == self.local_node_id {
+            return self
+                .merge_versioned_local_with_ttl(key, value, ttl_secs)
+                .map_err(anyhow::Error::from);
+        }
+        let address = peer_addr_for_node(&owner).ok_or_else(|| {
+            anyhow::anyhow!(
+                "merge_versioned_routed: no transport address configured for owner node '{owner}'"
+            )
+        })?;
+        let client = pool.try_client_for_node(&owner, &address).ok_or_else(|| {
+            anyhow::anyhow!(
+                "merge_versioned_routed: owner node '{owner}' is not an authenticated node ID"
+            )
+        })?;
+        client
+            .merge_versioned(key.to_string(), value, ttl_secs)
+            .await
+    }
+
     /// Delete `key` via the consistent hash ring.
     ///
     /// Routing mirrors [`Self::put_routed`]. Transport failures propagate as
@@ -485,6 +629,26 @@ impl DistributedCache<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::register::{VersionedLwwMergeOutcome, VersionedLwwRegister};
+
+    fn versioned_bytes(
+        value: &str,
+        node_id: &str,
+        timestamp_ms: u64,
+        logical_version: u64,
+        parent_logical_version: Option<u64>,
+    ) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&VersionedLwwRegister::live(
+                value.to_string(),
+                node_id,
+                timestamp_ms,
+                logical_version,
+                parent_logical_version,
+            ))
+            .unwrap(),
+        )
+    }
 
     // --- ConsistentHashRing tests ---
 
@@ -788,6 +952,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn versioned_merge_routes_to_the_consistent_hash_owner() {
+        let cache_b: Arc<DistributedCache<Bytes>> = Arc::new(DistributedCache::new("node-B", 128));
+        let server_b = TransportServer::start(0, cache_b.clone()).await.unwrap();
+        let cache_a: DistributedCache<Bytes> = DistributedCache::new("node-A", 128);
+        cache_a.add_node("node-B");
+        let key = find_key_owned_by(&cache_a, "node-B");
+        let address = format!("127.0.0.1:{}", server_b.local_port());
+        let lookup = |node_id: &str| (node_id == "node-B").then(|| address.clone());
+        let pool = TransportClientPool::new();
+
+        let outcome = cache_a
+            .merge_versioned_routed_with_ttl(
+                &key,
+                versioned_bytes("remote", "node-A", 100, 1, None),
+                60,
+                &pool,
+                lookup,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, VersionedLwwMergeOutcome::Replaced);
+        assert!(cache_a.get_local(&key).is_none());
+        let stored: VersionedLwwRegister =
+            serde_json::from_slice(&cache_b.get_local(&key).unwrap()).unwrap();
+        assert_eq!(stored.value(), Some("remote"));
+        server_b.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_routed_fails_open_when_peer_unreachable() {
         let cache_a: DistributedCache<Bytes> = DistributedCache::new("node-A", 128);
         cache_a.add_node("node-B");
@@ -986,5 +1180,77 @@ mod tests {
             .await
             .expect_err("put_routed should fail without a peer mapping");
         assert!(err.to_string().contains("no transport address"));
+    }
+
+    #[test]
+    fn versioned_local_merge_is_atomic_and_rejects_stale_replacement() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        let inserted = cache
+            .merge_versioned_local_with_ttl(
+                "state:one",
+                versioned_bytes("v2", "node-a", 100, 2, Some(1)),
+                60,
+            )
+            .unwrap();
+        let rejected = cache
+            .merge_versioned_local_with_ttl(
+                "state:one",
+                versioned_bytes("stale", "node-z", 9_000, 1, None),
+                60,
+            )
+            .unwrap();
+
+        assert_eq!(inserted, VersionedLwwMergeOutcome::Replaced);
+        assert_eq!(rejected, VersionedLwwMergeOutcome::StaleRejected);
+        let stored: VersionedLwwRegister =
+            serde_json::from_slice(&cache.get_local("state:one").unwrap()).unwrap();
+        assert_eq!(stored.value(), Some("v2"));
+        assert_eq!(stored.logical_version(), 2);
+    }
+
+    #[test]
+    fn versioned_local_merge_marks_competing_children_on_the_winner() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        cache
+            .merge_versioned_local_with_ttl(
+                "state:one",
+                versioned_bytes("left", "node-a", 700, 8, Some(7)),
+                60,
+            )
+            .unwrap();
+        let outcome = cache
+            .merge_versioned_local_with_ttl(
+                "state:one",
+                versioned_bytes("right", "node-z", 700, 8, Some(7)),
+                60,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, VersionedLwwMergeOutcome::ConflictReplaced);
+        let stored: VersionedLwwRegister =
+            serde_json::from_slice(&cache.get_local("state:one").unwrap()).unwrap();
+        assert_eq!(stored.value(), Some("right"));
+        assert!(stored.conflict_detected());
+    }
+
+    #[test]
+    fn local_prefix_snapshot_is_sorted_bounded_and_namespace_scoped() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        cache.put_local("state:z", Bytes::from_static(b"z"));
+        cache.put_local("state:a", Bytes::from_static(b"a"));
+        cache.put_local("other:a", Bytes::from_static(b"other"));
+        cache.put_local("state:m", Bytes::from_static(b"m"));
+
+        let snapshot = cache.snapshot_prefix_local("state:", 2).unwrap();
+
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                ("state:a".to_string(), Bytes::from_static(b"a")),
+                ("state:m".to_string(), Bytes::from_static(b"m")),
+            ]
+        );
+        assert!(snapshot.truncated);
+        assert!(cache.snapshot_prefix_local("state:", 0).is_err());
     }
 }

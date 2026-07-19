@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-18*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -8,11 +8,11 @@ Three providers behind one wire format ([config](../examples/ai-gateway-quicksta
 
 SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 66 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
-This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, and per-request attribution. Six features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [predictive budgets with soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), and [LLM-aware resilience](ai-llm-aware-resilience.md). For those six, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
+This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, and per-request attribution. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [predictive budgets with soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
 
 ## Provider setup
 
-Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list. A provider entry can also carry a `default_model`, used when a request omits the `model` field:
+Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list. Callers of hosted providers should send an explicit `model`. A `default_model` can select among locally served models and appears in model metadata, but the hosted dynamic-routing path does not inject one into a request that omitted `model`:
 
 ```yaml
 origins:
@@ -23,7 +23,6 @@ origins:
         - name: openai
           api_key: ${OPENAI_API_KEY}
           models: [gpt-4o, gpt-4o-mini, gpt-4-turbo]
-          default_model: gpt-4o-mini
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           models: [claude-sonnet-4-20250514, claude-haiku-4-5]
@@ -31,7 +30,7 @@ origins:
         strategy: round_robin
 ```
 
-API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files. Note that `default_model` is a per-provider field, not an `action`-level one; an action-level `default_model` key is ignored.
+API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files. `default_model` is a per-provider field, not an `action`-level one; an action-level `default_model` key is ignored. Context compression also requires the request's effective `model` to be non-empty, so hosted requests that omit it do not run the compression pipeline.
 
 ### Native providers
 66 native providers ship in-tree alongside native translators for Anthropic, Gemini, and Bedrock. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
@@ -326,7 +325,7 @@ resilience:
     content_policy: 0  # never retry a refusal in place
 ```
 
-The same block hosts `llm_aware.context_compress`, which fits an over-long prompt to the resolved model's window instead of letting it fail, and `content_policy_fallback`, which routes a refusal to the next provider in priority order. The failure-cause table, compression rules, and hedged requests are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
+The same block hosts the legacy `llm_aware.context_compress` shorthand, which maps to stateless `window_fit` when no explicit compression policy is present, and `content_policy_fallback`, which routes a refusal to the next provider in priority order. The failure-cause table and hedged-request behavior are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). The ordered `summary_buffer` and `window_fit` pipeline is documented in [AI context compression](ai-context-compression.md).
 
 ## Shadow eval
 
@@ -837,6 +836,13 @@ Different words, same meaning, no provider call ([config](../examples/semantic-c
 
 Serves cached responses to prompts that mean the same thing without a provider call. Implemented in `semantic_cache.rs` as `EmbeddingCache`: on a miss the dispatcher embeds the prompt once via the configured source, and on later requests a cosine-similarity scan over the stored vectors replays the closest response that meets `threshold`. Vectors are L2-normalised at insert time, eviction is LRU with a `max_entries` cap, entries past `ttl_secs` are dropped lazily on lookup, and every entry is scoped to the calling tenant and credential so one caller's cached response is never replayed to another. Embedding failures fail open to an uncached upstream call.
 
+A captured-session request on a handler whose compression policy contains
+`summary_buffer` bypasses semantic-cache reads and writes. The decision is
+conservative and happens before compression, so the bypass remains in effect
+even if the stateful lever later skips or fails open. A `window_fit`-only
+policy does not bypass the cache. See
+[Semantic cache interaction](ai-context-compression.md#semantic-cache-interaction).
+
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `enabled` | bool | `false` | Opts an origin into semantic-cache lookup and storage. |
@@ -1050,13 +1056,27 @@ Per-surface knobs live under `per_surface_rate_limits` (see [Per-surface rate li
 
 ## Context handling
 
-The shipped answer to a prompt that approaches a model's context window is context compression: an opt-in dispatch step that trims history so the request keeps fitting. Two neighbouring modules, context relay and context overflow, are design-stage library code with no serving-path callers; they are described here so their status is not mistaken for shipped behaviour.
+The shipped answer to a prompt that approaches a model's context window is an
+ordered, per-handler compression pipeline. `summary_buffer` compacts eligible
+older text into externally stored running summary state. `window_fit` is the
+stateless compatibility lever that applies the existing newest-to-oldest
+message-selection heuristic for a known model window. Levers run in declaration
+order, only strict token
+reductions commit, and a skip or runtime failure leaves the last committed
+messages in place while later levers continue.
 
-### Context compress (shipped)
+### Context compression (shipped)
 
-`crates/sbproxy-ai/src/context_compress.rs` does cost-aware history trimming. `estimate_message_tokens` uses a four-characters-per-token approximation. `trim_to_budget` always keeps the leading system message, then walks remaining messages newest-to-oldest, including each one only if it fits in the remaining token budget, then restores chronological order before returning.
+Configure `compression.levers` on the AI action. A stateful summary requires a
+captured session ID and the configured Redis L2 service. Request workers retain
+no canonical session summary in process. `backend: mesh` is rejected until the
+cluster state substrate provides durable replicated session semantics.
+The legacy `resilience.llm_aware.context_compress` switch remains a shorthand
+for one `window_fit` lever only when the explicit block is absent.
 
-The operator-facing switch is `resilience.llm_aware.context_compress` on the AI action; when it is on, the dispatch pipeline calls `fit_messages_to_model` before forwarding. See [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#context-window-compression).
+The complete configuration, session and structured-content safety rules,
+Redis state guarantees, failure table, metrics, logs, and PromQL are
+in [AI context compression](ai-context-compression.md).
 
 ### Context relay (design stage)
 
@@ -1216,6 +1236,11 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_realtime_frames_forwarded_total` | Counter | `provider`, `direction`, `kind` | Cumulative frames forwarded over Realtime sessions (`kind` is `text` or `audio`). Reserved for a future enterprise terminate-and-relay path |
 
 Use these to build spending dashboards, set budget alerts, and track provider reliability without any application-level instrumentation.
+
+Context compression adds lever, request, token-savings, state-operation, and
+Redis-coordination metrics under
+`sbproxy_ai_compression_*`. Their exact labels and accounting rules are in
+[AI context compression metrics](ai-context-compression.md#metrics).
 
 ## Dashboards
 
@@ -1410,3 +1435,4 @@ Deep-dive pages summarized in this guide:
 - [ai-predictive-budget.md](ai-predictive-budget.md) - soft-landing budget degradation.
 - [ai-usage-ledger.md](ai-usage-ledger.md) - hash-chained, signable spend records.
 - [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md) - typed failure causes, per-error retries, hedging.
+- [ai-context-compression.md](ai-context-compression.md) - ordered context compression, external summary state, degradation, and observability.

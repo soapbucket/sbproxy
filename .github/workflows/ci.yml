@@ -103,12 +103,15 @@ jobs:
       - uses: taiki-e/install-action@nextest
         if: steps.filter.outputs.code == 'true'
 
-      - name: install protoc and libclang
+      - name: install protoc, libclang, and Redis
         if: steps.filter.outputs.code == 'true'
         # libclang-dev is needed for rquickjs-sys's bindgen build script.
         # Without it, clang's bundled stdbool.h is missing from the include
         # path and the build fails with `'stdbool.h' file not found`.
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+        # redis-server backs the always-run compression-state Lua and
+        # reconnect integration tests below. Each test owns an isolated
+        # ephemeral-port process rather than sharing mutable CI state.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang redis-server
 
       - name: fmt
         if: steps.filter.outputs.code == 'true'
@@ -146,6 +149,21 @@ jobs:
         run: |
           cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci
           cargo test --workspace --exclude sbproxy-e2e --locked --doc
+
+      # These tests are ignored in the default local lane because they require
+      # a redis-server executable. CI installs Redis above and invokes them
+      # explicitly so the Lua scripts, delete fencing, NOSCRIPT reload, and
+      # connection recovery are verified against a real server on every PR.
+      - name: Redis compression state (Lua fencing + recovery)
+        if: steps.filter.outputs.code == 'true'
+        run: |
+          redis-server --version
+          cargo test -p sbproxy-core --locked --lib \
+            'compression_store::redis::tests::live_redis_' -- \
+            --ignored --test-threads=1
+          cargo test -p sbproxy-platform --locked --lib \
+            'storage::async_redis::tests::redis_connection_recovers_after_server_restart' -- \
+            --ignored --test-threads=1
 
       # Build the sbproxy binary so the e2e harness tests below can
       # spawn it. cargo cannot infer the ordering between

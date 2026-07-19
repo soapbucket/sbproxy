@@ -273,6 +273,14 @@ async fn handle_connection<S>(
                 };
                 CacheResult::Purged(n as u64)
             }
+            CacheOp::MergeVersioned {
+                key,
+                value,
+                ttl_secs,
+            } => match cache.merge_versioned_local_with_ttl(&key, value, ttl_secs) {
+                Ok(outcome) => CacheResult::VersionedMerged(outcome),
+                Err(_) => CacheResult::Error("invalid versioned mesh state".to_string()),
+            },
         };
 
         // --- Write the response ---

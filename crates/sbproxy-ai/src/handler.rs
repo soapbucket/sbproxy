@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::budget::BudgetConfig;
+use crate::compression::CompressionPolicy;
 use crate::guardrails::GuardrailsConfig;
 use crate::identity::VirtualKeyConfig;
 use crate::ids::ModelId;
@@ -65,6 +66,13 @@ pub struct AiHandlerConfig {
     /// upstreams.
     #[serde(default)]
     pub resilience: Option<AiResilienceConfig>,
+    /// Optional ordered context-compression policy.
+    ///
+    /// When present this block is authoritative, including an empty lever
+    /// list. When absent, the legacy `resilience.llm_aware.context_compress`
+    /// setting is adapted by [`Self::effective_compression_policy`].
+    #[serde(default)]
+    pub compression: Option<CompressionPolicy>,
     /// Optional shadow / side-by-side eval. The primary response is
     /// served unchanged; a copy of every request goes to the shadow
     /// provider concurrently and metrics (TTFT, tokens, cost,
@@ -825,6 +833,9 @@ impl AiHandlerConfig {
                 }
             }
         }
+        if let Some(compression) = &config.compression {
+            compression.validate(&config.providers)?;
+        }
         // WOR-1707: install the operator price table (config prices +
         // external rate card) into the process-global consulted by cost
         // estimation. Runs on every config (re)load so prices update
@@ -834,6 +845,24 @@ impl AiHandlerConfig {
             config.rate_card.as_deref(),
         ));
         Ok(config)
+    }
+
+    /// Resolve explicit compression or synthesize the legacy window-fit policy.
+    ///
+    /// An explicit block always wins, including an explicit empty lever list.
+    /// The explicit path is borrowed and does not allocate on request handling.
+    pub fn effective_compression_policy(&self) -> Option<std::borrow::Cow<'_, CompressionPolicy>> {
+        if let Some(policy) = self.compression.as_ref() {
+            return Some(std::borrow::Cow::Borrowed(policy));
+        }
+        let legacy = self
+            .resilience
+            .as_ref()
+            .and_then(|resilience| resilience.llm_aware.as_ref())
+            .filter(|legacy| legacy.context_compress)?;
+        Some(std::borrow::Cow::Owned(
+            CompressionPolicy::legacy_window_fit(legacy.completion_reserve_tokens),
+        ))
     }
 
     /// Number of provider attempts allowed for one client request.
@@ -1075,6 +1104,7 @@ mod tests {
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
+            compression: None,
             shadow: None,
             pii: None,
             trace_content: false,
@@ -1111,6 +1141,7 @@ mod tests {
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
+            compression: None,
             shadow: None,
             pii: None,
             trace_content: false,
@@ -1147,6 +1178,7 @@ mod tests {
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
+            compression: None,
             shadow: None,
             pii: None,
             trace_content: false,
@@ -1184,6 +1216,7 @@ mod tests {
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
+            compression: None,
             shadow: None,
             pii: None,
             trace_content: false,

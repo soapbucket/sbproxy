@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-18*
 
 The embedded admin server publishes a small set of HTTP routes for
 operator tooling: liveness probes, request log, per-target health, managed
@@ -38,17 +38,31 @@ operator console needs remote access.
 
 Routes split into two tiers:
 
-- **Unauthenticated probe routes** are reachable without credentials so
+- **Unauthenticated utility routes** are reachable without credentials so
   load balancers and orchestrators can probe liveness without
   configuring secrets: `/healthz`, `/health`, `/readyz`, `/ready`,
-  `/livez`, `/live`, `/.well-known/sbproxy/quote-keys.json`.
+  `/livez`, `/live`, and `/.well-known/sbproxy/quote-keys.json`. The login,
+  logout, and session-discovery routes also run before the general auth gate;
+  they establish, revoke, or describe a browser session rather than exposing
+  protected control-plane data.
 
-- **Authenticated routes** require HTTP Basic auth using the
-  `username` and `password` from the config block. Every route under
-  `/api/*` and `/admin/*` is in this tier.
+- **Protected routes** accept HTTP Basic auth using the configured top-level
+  identity, or the signed browser session created by `POST /admin/login`.
+  Configured operator credentials are accepted by login and then use the
+  session cookie; they are not accepted directly as HTTP Basic credentials on
+  protected routes. The top-level identity has the `admin` role; configured
+  operators may have `admin` or `read_only`. The one-time-token exchange at
+  `POST /admin/cluster/enroll` is a separate documented exception.
 
 Send credentials with `curl -u admin:secret <url>` or an
 `Authorization: Basic <base64(user:pass)>` header.
+
+Protected state-changing routes require the `admin` role. When authentication
+came from the browser session cookie, the request must also echo the CSRF token
+returned at login in the `X-CSRF-Token` header. HTTP Basic requests are
+CSRF-exempt. Login, logout, session discovery, and enrollment have their own
+route-specific rules. Individual read routes may impose a stricter role, as
+the compression-content route does.
 
 ## Rate limiting
 
@@ -68,9 +82,9 @@ All authenticated routes return JSON errors as:
 ```
 
 Status codes follow conventional HTTP: `401` for missing or invalid
-credentials, `405` for wrong method on a method-gated route, `409`
-when a hot reload is already in flight, `429` when rate-limited,
-`5xx` for server-side failures.
+credentials, `403` for an insufficient role or failed session CSRF check,
+`405` for wrong method on a method-gated route, `409` when a hot reload is
+already in flight, `429` when rate-limited, and `5xx` for server-side failures.
 
 ---
 
@@ -277,6 +291,290 @@ The shape and the per-origin mapping are documented in
 [openapi-emission.md](openapi-emission.md). The `.json` route
 returns `Content-Type: application/json`; the `.yaml` route returns
 `Content-Type: application/yaml`.
+
+---
+
+## AI compression session state
+
+These routes operate on the external running-summary state used by
+`origins[].action.compression` policies on `ai_proxy` handlers. They expose only
+the globally configured Redis compression store for metadata, deletion, and
+purge operations. Summary-content inspection additionally requires an active
+origin policy that opts in. Records use opaque, canonical 64-character
+lowercase hexadecimal IDs. See
+[AI context compression](ai-context-compression.md) for the data-plane policy,
+session identity, and request eligibility rules.
+
+Authorization is deliberately narrower than the general read/write split:
+
+| Route | Required role | Session CSRF requirement |
+|---|---|---|
+| `GET /admin/compression/sessions` | `read_only` or `admin` | None |
+| `GET /admin/compression/sessions/{id}` | `read_only` or `admin` | None |
+| `GET /admin/compression/sessions/{id}/content` | `admin` only, plus handler opt-in | None because this is a GET |
+| `DELETE /admin/compression/sessions/{id}` | `admin` | Required for session auth; Basic auth is exempt |
+| `POST /admin/compression/sessions/purge` | `admin` | Required for session auth; Basic auth is exempt |
+
+A valid route request with missing authentication returns `401`. A `read_only`
+caller on an Admin-only route, or a session mutation with a missing or invalid
+`X-CSRF-Token`, returns `403`.
+
+### Metadata schema
+
+The list response places these fields in each `records[]` entry. The single
+record endpoint places the same object in `record`.
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Opaque canonical record ID, 64 lowercase hexadecimal characters. |
+| `backend` | string | `redis`. |
+| `consistency` | string | `serialized`. |
+| `schema_version` | int | External record serialization schema version. |
+| `tenant_id` | string | Tenant isolation and filtering boundary. |
+| `origin` | string | Normalized AI handler hostname. |
+| `logical_version` | int | Monotonic version within the current retained record lineage. Delete or expiry allows a later lineage to restart at 1. |
+| `protected_prefix_count` | int | Count of leading system or developer messages protected verbatim. |
+| `covered_history_count` | int | Count of original history messages represented by the summary. |
+| `covered_input_tokens` | int | SBproxy model-aware token estimate represented by that covered history. |
+| `summary_tokens` | int | Bounded summarizer output token count, not its content. |
+| `summarizer_provider` | string | Configured internal summarizer provider name. |
+| `summarizer_model` | string | Configured internal summarizer model name. |
+| `writer_node` | string | Configured cluster node ID, or the literal `standalone` outside cluster mode. It is not a credential or guaranteed unique process ID. |
+| `conflict_detected` | bool | Always `false` for the current serialized Redis backend. Retained for metadata compatibility. |
+| `created_at_unix_ms` | int | Creation time in Unix milliseconds. |
+| `updated_at_unix_ms` | int | Last update time in Unix milliseconds. |
+| `expires_at_unix_ms` | int | Backend expiration time in Unix milliseconds. |
+| `kind` | string | `live` for Redis records returned by these endpoints. |
+
+Metadata never contains `summary`, a raw session ID, raw messages, protected or
+covered message digests, or credential material. The opaque ID is derived from
+the tenant, normalized origin, captured session ID, and stable summary-policy
+fingerprint without retaining that raw session ID.
+
+### `GET /admin/compression/sessions`
+
+Returns one bounded metadata page:
+
+```json
+{
+  "records": [
+    {
+      "id": "cee8c51340c1413d8b85a56c6f51928a92b12fa00e1e8cfd761c3cd0fb28ce47",
+      "backend": "redis",
+      "consistency": "serialized",
+      "schema_version": 1,
+      "tenant_id": "tenant-a",
+      "origin": "api.example.com",
+      "logical_version": 4,
+      "protected_prefix_count": 1,
+      "covered_history_count": 6,
+      "covered_input_tokens": 300,
+      "summary_tokens": 40,
+      "summarizer_provider": "anthropic",
+      "summarizer_model": "claude-haiku-4-5",
+      "writer_node": "node-a",
+      "conflict_detected": false,
+      "created_at_unix_ms": 1784300000000,
+      "updated_at_unix_ms": 1784300300000,
+      "expires_at_unix_ms": 1784386700000,
+      "kind": "live"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+Supported query parameters:
+
+| Parameter | Values | Meaning |
+|---|---|---|
+| `tenant` | non-empty string | Exact tenant filter. |
+| `origin` | non-empty hostname | Origin filter. Input is trimmed, lowercased, and has a trailing dot removed. |
+| `backend` | `redis` | Restrict the scan to Redis. Any other value returns `400`. |
+| `conflict` | `true`, `false` | Match `conflict_detected`. |
+| `cursor` | opaque string | Continue from `next_cursor` returned by the preceding list call. |
+| `limit` | positive integer | Page size. Defaults to 100; values above the maximum of 500 are clamped to 500. |
+
+Parameters may appear only once. Unknown or duplicate parameters, invalid
+booleans or backends, a zero or non-integer limit, and an invalid cursor return
+`400`. Redis listing scans the shared Redis namespace through bounded pages and
+an opaque cursor. Redis expires records at their TTL, so expired records are
+not retained as a separate Admin-visible collection and cannot be filtered.
+
+### `GET /admin/compression/sessions/{id}`
+
+Returns `200` with `{"record": <metadata>}`. The endpoint returns `400` for an
+ID that is not canonical lowercase hexadecimal and `404` when no configured
+store has the record. It does not expose summary content, even to an Admin.
+
+### `GET /admin/compression/sessions/{id}/content`
+
+This is the only route that can return a generated running summary. It is
+denied by default and succeeds only when all of the following are true:
+
+1. The caller is authenticated with the `admin` role.
+2. The ID is valid and resolves to a `live`, unexpired record.
+3. The current AI handler for that record's normalized origin and backend sets
+   `allow_admin_content_inspection: true`.
+4. The audit sink accepts the content-free inspection event before the response
+   is returned.
+
+Success returns the usual metadata plus the only content-bearing field:
+
+```json
+{
+  "record": {
+    "id": "cee8c51340c1413d8b85a56c6f51928a92b12fa00e1e8cfd761c3cd0fb28ce47",
+    "backend": "redis",
+    "consistency": "serialized",
+    "schema_version": 1,
+    "tenant_id": "tenant-a",
+    "origin": "api.example.com",
+    "logical_version": 4,
+    "protected_prefix_count": 1,
+    "covered_history_count": 6,
+    "covered_input_tokens": 300,
+    "summary_tokens": 40,
+    "summarizer_provider": "anthropic",
+    "summarizer_model": "claude-haiku-4-5",
+    "writer_node": "node-a",
+    "conflict_detected": false,
+    "created_at_unix_ms": 1784300000000,
+    "updated_at_unix_ms": 1784300300000,
+    "expires_at_unix_ms": 1784386700000,
+    "kind": "live"
+  },
+  "summary": "Bounded generated running summary."
+}
+```
+
+Successful content responses include all three safety headers:
+
+```text
+Cache-Control: no-store
+Pragma: no-cache
+X-Content-Type-Options: nosniff
+```
+
+Every content-inspection attempt that reaches the compression route is emitted
+on the `sbproxy::admin::audit` tracing target before its response is returned,
+including invalid IDs, missing or expired records, disabled inspection,
+backend errors, and success. Authentication and role failures handled by the
+outer Admin gate do not reach this route. The audit event carries only
+`operator`, `role`, `record_id`, `tenant_id`, `origin`,
+`action=inspect_compression_content`, and a closed outcome. It never carries
+the summary, raw messages, bearer material, or CSRF token. The built-in sink
+emits tracing events, so durable retention depends on the configured tracing
+collector. If an installed sink reports failure, the route returns
+`503 {"error":"audit unavailable"}` and withholds the summary. Missing or
+expired records return `404`; a disabled handler returns
+`403 {"error":"content inspection is disabled"}`.
+
+### `DELETE /admin/compression/sessions/{id}`
+
+Deletion runs against the globally configured Redis compression store. Success is always
+`200`, including when no live record existed:
+
+```json
+{
+  "deleted": true,
+  "logical_versions": {}
+}
+```
+
+`deleted` is true when Redis removed live state. Redis does not return a
+logical version, so `logical_versions` is empty. Repeating the delete is safe
+and returns `"deleted": false`.
+
+Redis atomically removes the record and active lease, then increments a
+retained fence so an in-flight writer cannot recreate deleted state. A later
+eligible request with the same captured session can create a new record;
+deletion clears summary state, not the caller's session identity.
+
+### `POST /admin/compression/sessions/purge`
+
+Purge deletes one bounded Redis page. The JSON body is strict and
+accepts only these fields:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `tenant` | string | unset | Exact tenant scope. Must not be empty. |
+| `origin` | string | unset | Normalized origin scope. Must not be empty. |
+| `conflict` | bool | unset | Match the record's `conflict_detected` value. This narrows a tenant or origin scope but is not a destructive boundary by itself. |
+| `backend` | string | unset | `redis`. This narrows execution but is not, by itself, a destructive scope. |
+| `cursor` | string | unset | Opaque `next_cursor` from the preceding purge call. It is not a destructive scope. |
+| `limit` | int | 100 | Positive page size. Values above the maximum of 500 are clamped to 500. It is not a destructive scope. |
+| `all` | bool | `false` | Permit an otherwise unscoped purge. When true, exact confirmation is mandatory. |
+| `confirmation` | string | unset | Must equal `purge-compression-sessions` whenever `all` is true. |
+
+Without `all`, at least one of `tenant` or `origin` must be present. `conflict`,
+backend, cursor, and limit may narrow that scope but do not establish a deletion
+boundary. Requests such as `{"conflict":false}` or `{"backend":"redis"}` are
+rejected. An all-record purge
+must use this exact shape, optionally with `backend`, `cursor`, or `limit`:
+
+```json
+{
+  "all": true,
+  "confirmation": "purge-compression-sessions"
+}
+```
+
+Success returns the number affected in this page and an opaque continuation:
+
+```json
+{"deleted":100,"next_cursor":"<opaque>"}
+```
+
+Continue with the returned purge cursor until `next_cursor` is `null`.
+Repeating a deletion is safe.
+
+### Compression state errors
+
+Invalid requests and cursors return `400`. An unavailable backend returns
+`503 {"error":"compression state unavailable"}`. Corrupt or unsupported
+record bytes return `503` when an operation must decode them, including list,
+detail, purge, and content inspection. Delete removes the addressed Redis bytes
+without decoding them. List and detail never return a partial metadata body on
+those errors. Delete and purge are idempotent; retry with the same ID, scope,
+and cursor after a transient backend failure.
+
+### Curl examples
+
+These examples use the documented HTTP Basic convention, so mutation requests
+do not need a CSRF header. They assume at least one record exists for
+`tenant-a`.
+
+```bash
+export SB_ADMIN_URL=http://127.0.0.1:9090
+export SB_ADMIN_PASSWORD='replace-me'
+
+# List content-free metadata and capture one opaque ID.
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/compression/sessions?tenant=tenant-a&limit=100" \
+  | jq '{records,next_cursor}'
+SB_COMPRESSION_RECORD_ID="$(
+  curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+    "${SB_ADMIN_URL}/admin/compression/sessions?tenant=tenant-a&limit=1" \
+    | jq -er '.records[0].id'
+)"
+
+# With the default handler opt-in set to false, this returns 403 and no summary.
+curl -sS -i -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/compression/sessions/${SB_COMPRESSION_RECORD_ID}/content"
+
+# Delete one record. Repeating the command returns deleted=false.
+curl -fsS -X DELETE -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/compression/sessions/${SB_COMPRESSION_RECORD_ID}" \
+  | jq
+
+# Purge one bounded page for this tenant.
+curl -fsS -X POST -u "admin:${SB_ADMIN_PASSWORD}" \
+  -H 'Content-Type: application/json' \
+  --data '{"tenant":"tenant-a","limit":100}' \
+  "${SB_ADMIN_URL}/admin/compression/sessions/purge" \
+  | jq
+```
 
 ---
 
@@ -573,7 +871,9 @@ curl -s -u admin:secret \
 ## See also
 
 - [manual.md](manual.md) - install, CLI, hot reload workflow.
+- [admin.md](admin.md) - admin listener, authentication, roles, TLS, and operator workflows.
 - [configuration.md](configuration.md) - the `proxy.admin:` block.
+- [ai-context-compression.md](ai-context-compression.md) - compression policy, external state, and degradation behavior.
 - [openapi-emission.md](openapi-emission.md) - the emitted OpenAPI document's shape and per-origin mapping.
 - [access-log.md](access-log.md) - the durable structured request log.
 - [metrics-stability.md](metrics-stability.md) - the Prometheus `/metrics` surface.
