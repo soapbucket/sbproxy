@@ -497,11 +497,13 @@ pub struct ServeEntry {
     /// Chunked-prefill settings. `None` uses the engine default.
     #[serde(default)]
     pub chunked_prefill: Option<ChunkedPrefill>,
-    /// Support: unsupported.
-    /// LoRA adapters served over this base model. Rejected today: serving
-    /// adapters needs adapter artifact acquisition (pulling each adapter to
-    /// a local path), which is not wired yet, so a model that sets this
-    /// fails to deploy rather than silently ignoring it.
+    /// Support: preview.
+    /// LoRA adapters served over this base model on the vLLM engine
+    /// (WOR-1945): each becomes a `--lora-modules <name>=<source>`
+    /// alongside `--enable-lora`, so a client requests the adapter by
+    /// name over one resident base. An `hf:Org/Repo` source is handed to
+    /// vLLM as the repo id (resolved from the Hub or the mounted cache);
+    /// a local path passes through. Requires `engine: vllm`.
     #[serde(default)]
     pub lora_adapters: Vec<LoraAdapter>,
     /// Support: preview.
@@ -533,10 +535,9 @@ pub struct ServeEntry {
     /// that does not fit can still load. `None` disables offload.
     #[serde(default)]
     pub cpu_offload_gib: Option<u64>,
-    /// Support: unsupported.
-    /// Max LoRA adapters resident on the engine at once (WOR-1673).
-    /// Rejected today with `lora_adapters`, since adapter serving is not
-    /// wired yet.
+    /// Support: preview.
+    /// Max LoRA adapters resident on the engine at once (WOR-1945):
+    /// vLLM's `--max-loras`.
     /// When set below the number of configured `lora_adapters`, the
     /// engine loads adapters on demand and evicts the least-recently
     /// used past this cap (dynamic paging), rather than preloading all
