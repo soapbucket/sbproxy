@@ -22,6 +22,26 @@ enum DynamicKeyOutcome {
     Deny(u16, String),
 }
 
+/// WOR-1881: feed provider quota headers into the shared router before
+/// retry/reselect so headroom and reset-aware strategies see live signals.
+/// Does not log header values (may contain operational detail; never secrets).
+fn update_router_quota_from_response(
+    router: &sbproxy_ai::Router,
+    provider_name: &str,
+    resp: &reqwest::Response,
+) {
+    let status = resp.status().as_u16();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            let value = value.to_str().ok()?.to_string();
+            Some((name.as_str().to_string(), value))
+        })
+        .collect();
+    router.update_quota_from_headers(provider_name, &headers, status);
+}
+
 fn effective_policy_to_virtual_key(
     policy: &sbproxy_ai::effective_key_policy::EffectiveKeyPolicy,
 ) -> sbproxy_ai::identity::VirtualKeyConfig {
@@ -2008,6 +2028,8 @@ pub(super) async fn handle_ai_proxy(
             };
             match response_result {
                 Ok(response) => {
+                    // WOR-1881: refresh quota snapshots before failover reselect.
+                    update_router_quota_from_response(&router, &provider.name, &response);
                     let retryable_status = matches!(response.status().as_u16(), 500 | 502 | 503);
                     let has_next = attempt + 1 < provider_order.len();
                     if is_failover
@@ -4099,6 +4121,8 @@ pub(super) async fn handle_ai_proxy(
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     router.record_latency(idx, race_start.elapsed().as_micros() as u64);
+                    // WOR-1881: race losers still contribute quota signals.
+                    update_router_quota_from_response(&router, &config.providers[idx].name, &resp);
                     let outcome = if (200..300).contains(&status) {
                         "success"
                     } else {
@@ -4509,6 +4533,10 @@ pub(super) async fn handle_ai_proxy(
                 // `lowest_latency` reflect live data on the next request.
                 router.record_latency(provider_idx, attempt_start.elapsed().as_micros() as u64);
                 let status = resp.status().as_u16();
+                // WOR-1881: update quota snapshots before retry/reselect so
+                // headroom and reset-aware strategies see this response's
+                // headers (including 429 Retry-After).
+                update_router_quota_from_response(&router, &provider.name, &resp);
                 // WOR-1545 / WOR-1524: retry on the default status-code set,
                 // or on a per-error-class policy decision when configured.
                 // Classification from status alone is enough for the

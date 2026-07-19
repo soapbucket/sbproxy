@@ -205,6 +205,32 @@ routing:
   strategy: token_rate
 ```
 
+### headroom
+
+Routes to the provider with the lowest request-quota pressure from fresh
+provider rate-limit headers (`1 - remaining/limit`). Ties keep enabled-list
+order. Unknown or stale snapshots are advisory only: they sort after known
+fresh observations and never invent a capacity guarantee. Prefer pairing
+with live header updates on the dispatch path; local `token_rate` counters
+remain a separate strategy.
+
+```yaml
+routing:
+  strategy: headroom
+```
+
+### reset_aware
+
+Routes to the provider whose quota window resets soonest among candidates
+waiting for positive capacity. Providers that already report remaining
+capacity sort first. Unknown or stale signals sort last and do not invent
+a reset time. `Retry-After` is accepted as delta-seconds or HTTP-date.
+
+```yaml
+routing:
+  strategy: reset_aware
+```
+
 ### race
 
 ![one request fanned out to every provider, the first 2xx returned and the slow racer cancelled](assets/ai-race-routing.gif)
@@ -928,23 +954,45 @@ cache record above the response cap.
 
 ## Per-provider limits
 
-The proxy reads rate limit headers off provider responses and pre-emptively throttles when remaining capacity falls under a configured fraction. Implemented in `provider_ratelimit.rs` as `ProviderRateLimitTracker`.
+The proxy reads rate limit headers off provider responses into advisory
+`ProviderQuotaSnapshot` values and pre-emptively throttles when remaining
+capacity falls under a configured fraction of a *known* limit. Implemented
+in `provider_ratelimit.rs` as `ProviderRateLimitTracker`, wired from
+`ai_dispatch` before retry/reselect so `headroom` and `reset_aware` see
+live signals.
+
+Signal quality is explicit:
+
+| Quality | Meaning | Routing / throttle behavior |
+|---------|---------|-----------------------------|
+| `KnownFresh` | Header-derived observation inside the freshness window | May score pressure / reset; throttle uses real `remaining/limit` |
+| `Stale` | Observed before, but aged past freshness or cleared after reset | Advisory only; must not invent hard guarantees |
+| `Unknown` | Never observed for that provider | No invented capacity; throttle stays off |
 
 Recognised response headers (case-insensitive):
 
 - `x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`
+- `x-ratelimit-limit-requests`, `x-ratelimit-limit-tokens`
 - `x-ratelimit-reset-requests`, `x-ratelimit-reset-tokens` (formats: `1s`, `500ms`, plain seconds)
-- `retry-after` (plain seconds)
+- `retry-after` (delta-seconds or HTTP-date)
 - `anthropic-ratelimit-requests-remaining`, `anthropic-ratelimit-tokens-remaining`
+- `anthropic-ratelimit-requests-limit`, `anthropic-ratelimit-tokens-limit`
 - `anthropic-ratelimit-requests-reset`
 
-The tracker takes a single `throttle_threshold: f64` between 0.0 and 1.0. The implementation throttles when remaining requests fall to or below `floor(1000 * threshold)`, treating 1000 req/min as a baseline. Default: `0.1`, which throttles at 100 remaining requests or fewer.
+A `429` response marks remaining requests as exhausted when the upstream
+omits an explicit remaining count.
+
+The tracker takes a single `throttle_threshold: f64` between 0.0 and 1.0.
+Throttling uses the real limit from headers: remaining requests at or below
+`floor(limit * threshold)`. Without a known limit, remaining alone does not
+invent a synthetic denominator. Hard blocks still apply when remaining
+requests or tokens are reported as zero. Default threshold: `0.1`.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `throttle_threshold` | f64 | `0.1` | Clamped to `[0.0, 1.0]`. Lower values delay throttling until the provider is closer to its hard limit. |
 
-Per-provider throttling is a runtime construct. There is no top-level YAML field; the tracker is instantiated alongside the provider pool and updated from every upstream response.
+Per-provider throttling is a runtime construct. There is no top-level YAML field; the tracker is instantiated alongside the provider router and updated from every upstream response on the dispatch path.
 
 For per-model rate limits configurable in YAML, use `model_rate_limits` on the `action` block. The struct is `ModelRateConfig` in `ratelimit.rs`:
 

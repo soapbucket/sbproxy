@@ -91,7 +91,10 @@ pub use multimodal::{
 pub use prompt_cache::{check_cache, has_cache_control, prompt_cache_key};
 pub use prompt_fingerprint::prompt_fingerprint;
 pub use provider::ProviderConfig;
-pub use provider_ratelimit::{ProviderRateLimitTracker, ProviderRateState};
+pub use provider_ratelimit::{
+    ProviderQuotaSnapshot, ProviderRateLimitTracker, ProviderRateState, QuotaSignalQuality,
+    QuotaSignalSource,
+};
 pub use providers::{
     get_provider_info, init_provider_registry, list_providers, reload_provider_registry,
     ProviderFormat, ProviderInfo,
@@ -101,7 +104,7 @@ pub use ratelimit::{
     SurfaceRateLimiter, DEFAULT_ESTIMATED_TOKENS, DEFAULT_MAX_KEYS,
 };
 pub use response_dedup::ResponseDedup;
-pub use routing::{Router, RoutingStrategy};
+pub use routing::{FilteredSelectionFallback, Router, RoutingStrategy};
 pub use semantic_cache::{
     CachedAiResponse, CachedHttpResponse, EmbeddingCache, EmbeddingCacheConfig, EmbeddingHit,
     SemanticCache,
