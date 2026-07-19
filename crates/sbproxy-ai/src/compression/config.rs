@@ -104,12 +104,16 @@ pub struct WindowFitConfig {
     /// Completion capacity excluded from the input-message budget.
     #[serde(default = "default_completion_reserve_tokens")]
     pub completion_reserve_tokens: u64,
+    /// Optional hard input-message budget before the target model limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_budget_tokens: Option<u64>,
 }
 
 impl Default for WindowFitConfig {
     fn default() -> Self {
         Self {
             completion_reserve_tokens: DEFAULT_COMPLETION_RESERVE_TOKENS,
+            input_budget_tokens: None,
         }
     }
 }
@@ -123,6 +127,7 @@ impl CompressionPolicy {
             levers: vec![CompressionLeverConfig::WindowFit(WindowFitConfig {
                 completion_reserve_tokens: completion_reserve_tokens
                     .unwrap_or(DEFAULT_COMPLETION_RESERVE_TOKENS),
+                input_budget_tokens: None,
             })],
         }
     }
@@ -134,44 +139,54 @@ impl CompressionPolicy {
         }
 
         for (index, lever) in self.levers.iter().enumerate() {
-            let CompressionLeverConfig::SummaryBuffer(summary) = lever else {
-                continue;
-            };
-            if self.state.is_none() {
-                bail!("compression.state is required for summary_buffer");
-            }
-            if summary.min_tokens == 0 {
-                bail!("compression.levers[{index}].min_tokens must be greater than zero");
-            }
-            if summary.retain_recent_messages == 0 {
-                bail!(
-                    "compression.levers[{index}].retain_recent_messages must be greater than zero"
-                );
-            }
-            if summary.target_summary_tokens == 0 {
-                bail!(
-                    "compression.levers[{index}].target_summary_tokens must be greater than zero"
-                );
-            }
-            if summary.target_summary_tokens >= summary.min_tokens {
-                bail!(
-                    "compression.levers[{index}].target_summary_tokens must be smaller than min_tokens"
-                );
-            }
-            if summary.summarizer.model.trim().is_empty() {
-                bail!("compression.levers[{index}].summarizer.model must not be empty");
-            }
-            if summary.summarizer.timeout_secs == 0 {
-                bail!("compression.levers[{index}].summarizer.timeout must be greater than zero");
-            }
-            if !providers
-                .iter()
-                .any(|provider| provider.name.as_str() == summary.summarizer.provider)
-            {
-                bail!(
-                    "compression.levers[{index}].summarizer.provider {:?} is not configured on this AI handler",
-                    summary.summarizer.provider
-                );
+            match lever {
+                CompressionLeverConfig::SummaryBuffer(summary) => {
+                    if self.state.is_none() {
+                        bail!("compression.state is required for summary_buffer");
+                    }
+                    if summary.min_tokens == 0 {
+                        bail!("compression.levers[{index}].min_tokens must be greater than zero");
+                    }
+                    if summary.retain_recent_messages == 0 {
+                        bail!(
+                            "compression.levers[{index}].retain_recent_messages must be greater than zero"
+                        );
+                    }
+                    if summary.target_summary_tokens == 0 {
+                        bail!(
+                            "compression.levers[{index}].target_summary_tokens must be greater than zero"
+                        );
+                    }
+                    if summary.target_summary_tokens >= summary.min_tokens {
+                        bail!(
+                            "compression.levers[{index}].target_summary_tokens must be smaller than min_tokens"
+                        );
+                    }
+                    if summary.summarizer.model.trim().is_empty() {
+                        bail!("compression.levers[{index}].summarizer.model must not be empty");
+                    }
+                    if summary.summarizer.timeout_secs == 0 {
+                        bail!(
+                            "compression.levers[{index}].summarizer.timeout must be greater than zero"
+                        );
+                    }
+                    if !providers
+                        .iter()
+                        .any(|provider| provider.name.as_str() == summary.summarizer.provider)
+                    {
+                        bail!(
+                            "compression.levers[{index}].summarizer.provider {:?} is not configured on this AI handler",
+                            summary.summarizer.provider
+                        );
+                    }
+                }
+                CompressionLeverConfig::WindowFit(window) => {
+                    if window.input_budget_tokens == Some(0) {
+                        bail!(
+                            "compression.levers[{index}].input_budget_tokens must be greater than zero"
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -390,6 +405,7 @@ mod tests {
         match &effective.levers[0] {
             CompressionLeverConfig::WindowFit(window) => {
                 assert_eq!(window.completion_reserve_tokens, 2_048);
+                assert_eq!(window.input_budget_tokens, None);
             }
             other => panic!("expected legacy window_fit, got {other:?}"),
         }
@@ -415,5 +431,47 @@ mod tests {
             .effective_compression_policy()
             .expect("explicit policy remains present");
         assert!(effective.levers.is_empty());
+    }
+
+    #[test]
+    fn parses_explicit_window_fit_input_budget() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [provider("openai")],
+            "compression": {
+                "levers": [{
+                    "type": "window_fit",
+                    "completion_reserve_tokens": 512,
+                    "input_budget_tokens": 4_096
+                }]
+            }
+        }))
+        .expect("explicit input budget parses");
+
+        let policy = config.compression.expect("explicit policy");
+        let CompressionLeverConfig::WindowFit(window) = &policy.levers[0] else {
+            panic!("expected window_fit");
+        };
+        assert_eq!(window.completion_reserve_tokens, 512);
+        assert_eq!(window.input_budget_tokens, Some(4_096));
+    }
+
+    #[test]
+    fn rejects_zero_window_fit_input_budget() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [provider("openai")],
+            "compression": {
+                "levers": [{
+                    "type": "window_fit",
+                    "input_budget_tokens": 0
+                }]
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("compression.levers[0].input_budget_tokens must be greater than zero"),
+            "unexpected validation error: {error}"
+        );
     }
 }

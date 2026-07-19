@@ -3,6 +3,19 @@
 //! Automatically trims a conversation history to fit within a token budget
 //! while preserving the system message and the most recent exchanges.
 
+use std::ops::Range;
+
+/// Result of fitting with an explicit, target-model-counted input budget.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExplicitBudgetFit {
+    /// The original message list already meets the effective budget.
+    NotNeeded,
+    /// A complete, protocol-safe replacement message list.
+    Candidate(Vec<serde_json::Value>),
+    /// No valid message list can meet the configured budget.
+    CannotMeetBudget,
+}
+
 /// Estimate the number of tokens in a single chat message.
 ///
 /// Uses the common approximation of 4 characters per token, with a minimum
@@ -76,6 +89,106 @@ pub fn fit_messages_to_model(
         return None;
     }
     Some(trim_to_budget(messages, budget))
+}
+
+/// Fit messages to an explicit input budget using the target-model counter.
+///
+/// When the model window is known, the effective budget is capped at the
+/// model window minus `completion_reserve_tokens`. Unknown models can still be
+/// fitted because the operator supplied an explicit capacity. The first system
+/// message is protected, and assistant tool calls remain grouped with their
+/// consecutive tool results.
+pub fn fit_messages_to_input_budget(
+    messages: &[serde_json::Value],
+    model: &str,
+    completion_reserve_tokens: u64,
+    input_budget_tokens: u64,
+) -> ExplicitBudgetFit {
+    let model_capacity = crate::context_overflow::model_context_window(model)
+        .map(|window| window.saturating_sub(completion_reserve_tokens).max(1));
+    let budget = model_capacity.map_or(input_budget_tokens, |capacity| {
+        input_budget_tokens.min(capacity)
+    });
+    let count = |candidate: &[serde_json::Value]| {
+        crate::token_estimate::estimate_json_message_tokens(model, candidate)
+    };
+
+    if count(messages) <= budget {
+        return ExplicitBudgetFit::NotNeeded;
+    }
+
+    let protected_system = messages
+        .first()
+        .filter(|message| message_role(message) == Some("system"));
+    if protected_system.is_some_and(|message| count(std::slice::from_ref(message)) > budget) {
+        return ExplicitBudgetFit::CannotMeetBudget;
+    }
+
+    let start = usize::from(protected_system.is_some());
+    let units = protocol_units(messages, start);
+    let mut selected = Vec::<Range<usize>>::new();
+
+    for unit in units.into_iter().rev() {
+        selected.push(unit);
+        let candidate = collect_candidate(messages, protected_system.is_some(), &selected);
+        if count(&candidate) > budget {
+            selected.pop();
+        }
+    }
+
+    let candidate = collect_candidate(messages, protected_system.is_some(), &selected);
+    if count(&candidate) > budget || (candidate.is_empty() && !messages.is_empty()) {
+        ExplicitBudgetFit::CannotMeetBudget
+    } else {
+        ExplicitBudgetFit::Candidate(candidate)
+    }
+}
+
+fn message_role(message: &serde_json::Value) -> Option<&str> {
+    message.get("role").and_then(serde_json::Value::as_str)
+}
+
+fn protocol_units(messages: &[serde_json::Value], start: usize) -> Vec<Range<usize>> {
+    let mut units = Vec::new();
+    let mut index = start;
+    while index < messages.len() {
+        let unit_start = index;
+        index += 1;
+        let starts_tool_exchange = message_role(&messages[unit_start]) == Some("assistant")
+            && (messages[unit_start]
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|calls| !calls.is_empty())
+                || messages[unit_start].get("function_call").is_some());
+        if starts_tool_exchange {
+            while index < messages.len()
+                && matches!(message_role(&messages[index]), Some("tool" | "function"))
+            {
+                index += 1;
+            }
+        }
+        units.push(unit_start..index);
+    }
+    units
+}
+
+fn collect_candidate(
+    messages: &[serde_json::Value],
+    has_protected_system: bool,
+    selected_newest_first: &[Range<usize>],
+) -> Vec<serde_json::Value> {
+    let selected_len = selected_newest_first
+        .iter()
+        .map(|range| range.len())
+        .sum::<usize>();
+    let mut candidate = Vec::with_capacity(selected_len + usize::from(has_protected_system));
+    if has_protected_system {
+        candidate.push(messages[0].clone());
+    }
+    for range in selected_newest_first.iter().rev() {
+        candidate.extend(messages[range.clone()].iter().cloned());
+    }
+    candidate
 }
 
 #[cfg(test)]

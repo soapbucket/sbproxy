@@ -577,6 +577,7 @@ mod tests {
                 }),
                 CompressionLeverConfig::WindowFit(WindowFitConfig {
                     completion_reserve_tokens: 1_024,
+                    input_budget_tokens: None,
                 }),
             ],
         }
