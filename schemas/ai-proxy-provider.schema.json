@@ -332,7 +332,7 @@
           ]
         },
         "lora_adapters": {
-          "description": "Support: unsupported. LoRA adapters served over this base model. Rejected today: serving adapters needs adapter artifact acquisition (pulling each adapter to a local path), which is not wired yet, so a model that sets this fails to deploy rather than silently ignoring it.",
+          "description": "Support: preview. LoRA adapters served over this base model on the vLLM engine (WOR-1945): each becomes a `--lora-modules <name>=<source>` alongside `--enable-lora`, so a client requests the adapter by name over one resident base. An `hf:Org/Repo` source is handed to vLLM as the repo id (resolved from the Hub or the mounted cache); a local path passes through. Requires `engine: vllm`.",
           "default": [],
           "type": "array",
           "items": {
@@ -373,7 +373,7 @@
           "minimum": 0.0
         },
         "max_loras": {
-          "description": "Support: unsupported. Max LoRA adapters resident on the engine at once (WOR-1673). Rejected today with `lora_adapters`, since adapter serving is not wired yet. When set below the number of configured `lora_adapters`, the engine loads adapters on demand and evicts the least-recently used past this cap (dynamic paging), rather than preloading all of them. `None` preloads every configured adapter (static), which suits a small, fixed adapter set.",
+          "description": "Support: preview. Max LoRA adapters resident on the engine at once (WOR-1945): vLLM's `--max-loras`. When set below the number of configured `lora_adapters`, the engine loads adapters on demand and evicts the least-recently used past this cap (dynamic paging), rather than preloading all of them. `None` preloads every configured adapter (static), which suits a small, fixed adapter set.",
           "default": null,
           "type": [
             "integer",

@@ -109,6 +109,14 @@ pub struct EngineTuning {
     pub swap_space_gib: Option<u64>,
     /// Weights kept in CPU RAM in GiB: `--cpu-offload-gb`.
     pub cpu_offload_gib: Option<u64>,
+    /// LoRA adapters served over the base model (WOR-1945): each becomes a
+    /// vLLM `--lora-modules <name>=<path>` alongside `--enable-lora`, so a
+    /// client can request the adapter by name over one resident base.
+    /// Empty leaves LoRA off.
+    pub lora_adapters: Vec<crate::config::LoraAdapter>,
+    /// vLLM adapter-slot capacity (`--max-loras`): the maximum adapters
+    /// resident at once. Ignored when `lora_adapters` is empty.
+    pub max_loras: usize,
 }
 
 /// Typed launch input that can only be constructed from verified local bytes.

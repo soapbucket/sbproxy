@@ -3405,12 +3405,16 @@ impl ProductionPreparedDeployment {
                 tool_call_parser: entry.tool_call_parser.clone(),
                 swap_space_gib: entry.swap_space_gib,
                 cpu_offload_gib: entry.cpu_offload_gib,
+                lora_adapters: entry.lora_adapters.clone(),
+                max_loras: entry.lora_capacity(),
             })
             .unwrap_or_else(|| crate::EngineTuning {
                 chunked_prefill: self.desired.desired.chunked_prefill,
                 tool_call_parser: self.desired.desired.tool_call_parser.clone(),
                 swap_space_gib: self.desired.desired.swap_space_gib,
                 cpu_offload_gib: self.desired.desired.cpu_offload_gib,
+                lora_adapters: Vec::new(),
+                max_loras: 0,
             });
         let prepared = PreparedActivation {
             fit,

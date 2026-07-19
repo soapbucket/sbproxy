@@ -905,6 +905,25 @@ fn append_vllm_passthrough_arguments(arguments: &mut Vec<String>, tuning: &crate
         arguments.push("--cpu-offload-gb".to_string());
         arguments.push(gib.to_string());
     }
+    // LoRA (WOR-1945): serve one or more adapters over the resident base.
+    // `--enable-lora` turns the feature on, `--max-loras` caps the resident
+    // adapter slots, and each `--lora-modules <name>=<path>` registers an
+    // adapter the client can request by name. An `hf:Org/Repo` source is
+    // handed to vLLM as the bare repo id, which it resolves from the Hub
+    // (or the mounted cache); a local path passes through unchanged.
+    if !tuning.lora_adapters.is_empty() {
+        arguments.push("--enable-lora".to_string());
+        arguments.push("--max-loras".to_string());
+        arguments.push(tuning.max_loras.max(1).to_string());
+        for adapter in &tuning.lora_adapters {
+            let path = adapter
+                .source
+                .strip_prefix("hf:")
+                .unwrap_or(&adapter.source);
+            arguments.push("--lora-modules".to_string());
+            arguments.push(format!("{}={}", adapter.name, path));
+        }
+    }
     // Chunked prefill: enable it and pass a chunk size through. An explicit
     // `max_batched_tokens` always wins; otherwise a `target_ttft_ms` derives
     // one at launch time (WOR-1678); with neither, the engine default holds.
@@ -1256,6 +1275,17 @@ mod tests {
             tool_call_parser: Some("hermes".to_string()),
             swap_space_gib: Some(16),
             cpu_offload_gib: Some(8),
+            lora_adapters: vec![
+                crate::config::LoraAdapter {
+                    name: "support-bot".to_string(),
+                    source: "hf:Org/support-lora".to_string(),
+                },
+                crate::config::LoraAdapter {
+                    name: "local-tune".to_string(),
+                    source: "/models/adapters/local".to_string(),
+                },
+            ],
+            max_loras: 2,
         };
         let mut arguments = Vec::new();
         append_vllm_passthrough_arguments(&mut arguments, &tuning);
@@ -1266,6 +1296,24 @@ mod tests {
         assert_eq!(value_after(&arguments, "--cpu-offload-gb"), "8");
         assert!(arguments.iter().any(|a| a == "--enable-chunked-prefill"));
         assert_eq!(value_after(&arguments, "--max-num-batched-tokens"), "2048");
+        // LoRA: enabled, capacity set, and each adapter registered by
+        // name=source (the hf: prefix stripped so vLLM sees the repo id).
+        assert!(arguments.iter().any(|a| a == "--enable-lora"));
+        assert_eq!(value_after(&arguments, "--max-loras"), "2");
+        let lora_modules: Vec<&String> = arguments
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                arguments.get(i.wrapping_sub(1)).map(String::as_str) == Some("--lora-modules")
+            })
+            .map(|(_, value)| value)
+            .collect();
+        assert!(lora_modules
+            .iter()
+            .any(|m| *m == "support-bot=Org/support-lora"));
+        assert!(lora_modules
+            .iter()
+            .any(|m| *m == "local-tune=/models/adapters/local"));
     }
 
     #[test]

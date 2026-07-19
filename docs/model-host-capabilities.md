@@ -59,12 +59,12 @@ Registry version: `1`
 | `serve.models[].kv_quant` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].speculative` | `unsupported` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].chunked_prefill` | `preview` | `engine.typed_managed_drivers` | `none` |
-| `serve.models[].lora_adapters` | `unsupported` | `engine.typed_managed_drivers` | `none` |
+| `serve.models[].lora_adapters` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].pinned` | `preview` | `lifecycle.single_node_residency` | `none` |
 | `serve.models[].tool_call_parser` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].swap_space_gib` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].cpu_offload_gib` | `preview` | `engine.typed_managed_drivers` | `none` |
-| `serve.models[].max_loras` | `unsupported` | `engine.typed_managed_drivers` | `none` |
+| `serve.models[].max_loras` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].gguf_file` | `preview` | `artifact.legacy_download` | `none` |
 | `serve.models[].reference` | `stable` | `admin.value_report` | `contract.reference_price_records_savings` |
 | `serve.models[].modality` | `preview` | `engine.typed_managed_drivers` | `none` |

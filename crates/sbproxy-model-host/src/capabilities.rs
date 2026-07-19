@@ -1479,7 +1479,7 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
     },
     ConfigFieldCapability {
         path: "serve.models[].lora_adapters",
-        status: SupportLevel::Unsupported,
+        status: SupportLevel::Preview,
         capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
@@ -1509,7 +1509,7 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
     },
     ConfigFieldCapability {
         path: "serve.models[].max_loras",
-        status: SupportLevel::Unsupported,
+        status: SupportLevel::Preview,
         capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },

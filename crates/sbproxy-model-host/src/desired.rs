@@ -460,9 +460,6 @@ pub(crate) fn validate_legacy_managed_compatibility(
     if entry.speculative.is_some() {
         unsupported.push("speculative");
     }
-    if !entry.lora_adapters.is_empty() || entry.max_loras.is_some() {
-        unsupported.push("lora_adapters/max_loras");
-    }
     if !vllm_passthrough_supported {
         if entry.chunked_prefill.is_some() {
             unsupported.push("chunked_prefill");
@@ -476,10 +473,13 @@ pub(crate) fn validate_legacy_managed_compatibility(
         if entry.cpu_offload_gib.is_some() {
             unsupported.push("cpu_offload_gib");
         }
+        if !entry.lora_adapters.is_empty() || entry.max_loras.is_some() {
+            unsupported.push("lora_adapters/max_loras");
+        }
     }
     if !unsupported.is_empty() {
         return Err(format!(
-            "legacy serve model {:?} sets serving fields the managed runtime cannot honor here: {}. speculative decoding and lora_adapters are not yet supported; chunked_prefill, tool_call_parser, swap_space_gib, and cpu_offload_gib require the vLLM engine, so pin engine: vllm or remove them.",
+            "legacy serve model {:?} sets serving fields the managed runtime cannot honor here: {}. speculative decoding is not yet supported; chunked_prefill, tool_call_parser, swap_space_gib, cpu_offload_gib, and lora_adapters require the vLLM engine, so pin engine: vllm or remove them.",
             entry.model,
             unsupported.join(", "),
         ));
@@ -768,13 +768,25 @@ mod tests {
     }
 
     #[test]
-    fn speculative_and_lora_are_rejected_even_on_vllm() {
-        let entry = first_entry(
-            "models:\n  - model: qwen3-8b\n    engine: vllm\n    speculative: {}\n    lora_adapters:\n      - name: a\n        source: hf:o/a\n",
-        );
+    fn speculative_is_rejected_even_on_vllm() {
+        let entry =
+            first_entry("models:\n  - model: qwen3-8b\n    engine: vllm\n    speculative: {}\n");
         let error = validate_legacy_managed_compatibility(&entry, Some(EngineKind::Vllm))
-            .expect_err("speculative decoding and LoRA have no runtime consumer yet");
+            .expect_err("speculative decoding has no runtime consumer yet");
         assert!(error.contains("speculative"), "{error}");
+    }
+
+    #[test]
+    fn lora_adapters_are_accepted_on_vllm_and_rejected_elsewhere() {
+        // WOR-1945: LoRA is a vLLM passthrough. A vLLM model with adapters
+        // compiles; the same on llama.cpp fails closed with a clear reason.
+        let entry = first_entry(
+            "models:\n  - model: qwen3-8b\n    engine: vllm\n    lora_adapters:\n      - name: a\n        source: hf:o/a\n    max_loras: 1\n",
+        );
+        validate_legacy_managed_compatibility(&entry, Some(EngineKind::Vllm))
+            .expect("LoRA adapters serve on the vLLM engine");
+        let error = validate_legacy_managed_compatibility(&entry, Some(EngineKind::LlamaCpp))
+            .expect_err("LoRA needs the vLLM engine");
         assert!(error.contains("lora_adapters"), "{error}");
     }
 
