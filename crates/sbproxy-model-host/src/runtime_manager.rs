@@ -27,6 +27,22 @@ use crate::{
     RuntimeDesiredState, SGLangDriver, VllmDriver, WorkerProfile,
 };
 
+/// Extra readiness re-probes before a ready engine is declared unhealthy.
+///
+/// The health probe is a 2-second raw-socket check, and it runs from two
+/// places: the periodic maintenance tick and the request path
+/// (`ensure_ready`). Those can probe concurrently, and an engine whose
+/// `/health` is momentarily slow under two simultaneous probes (observed
+/// with SGLang during scheduler activity) can miss one. A single dropped
+/// probe must not kill a working engine, so a non-ready result is re-probed
+/// a few times before the deployment is failed. A process that has actually
+/// exited (`EngineHealth::Stopped`) is terminal and skips the retries.
+const HEALTH_RECHECK_ATTEMPTS: u32 = 3;
+
+/// Delay between readiness re-probes. Bounds the added latency before a
+/// genuinely dead engine is failed to `HEALTH_RECHECK_ATTEMPTS` times this.
+const HEALTH_RECHECK_DELAY: Duration = Duration::from_millis(250);
+
 /// Reconciliation, preparation, or lifecycle failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeManagerError {
@@ -633,20 +649,43 @@ impl DeploymentSlot {
                 self.id
             ))
         })?;
-        let health = self.runtime.health(&running).await;
-        let health_error = match health {
-            Ok(EngineHealth::Ready) => return Ok(Some(running)),
-            Ok(observed) => RuntimeManagerError::Engine(EngineDriverError::new(
-                EngineFailureReason::EngineHealthFailed,
-                format!(
-                    "managed deployment {:?} health changed from ready to {observed:?}",
-                    self.id
-                ),
-                "inspect the retained engine diagnostics, then reset the deployment",
-                true,
-            )),
-            Err(error) => error,
-        };
+        // Re-probe a non-ready result before failing the deployment: a
+        // single dropped or timed-out /health probe (probe races between the
+        // maintenance tick and the request path, brief scheduler stalls) must
+        // not kill a working engine. A process that has exited is terminal
+        // and does not benefit from retries.
+        let mut health_error = None;
+        for attempt in 0..=HEALTH_RECHECK_ATTEMPTS {
+            match self.runtime.health(&running).await {
+                Ok(EngineHealth::Ready) => return Ok(Some(running)),
+                Ok(EngineHealth::Stopped) => {
+                    health_error = Some(RuntimeManagerError::Engine(EngineDriverError::new(
+                        EngineFailureReason::EngineHealthFailed,
+                        format!("managed deployment {:?} engine process has exited", self.id),
+                        "inspect the retained engine diagnostics, then reset the deployment",
+                        true,
+                    )));
+                    break;
+                }
+                Ok(observed) => {
+                    health_error = Some(RuntimeManagerError::Engine(EngineDriverError::new(
+                        EngineFailureReason::EngineHealthFailed,
+                        format!(
+                            "managed deployment {:?} health changed from ready to {observed:?}",
+                            self.id
+                        ),
+                        "inspect the retained engine diagnostics, then reset the deployment",
+                        true,
+                    )));
+                }
+                Err(error) => health_error = Some(error),
+            }
+            if attempt < HEALTH_RECHECK_ATTEMPTS {
+                tokio::time::sleep(HEALTH_RECHECK_DELAY).await;
+            }
+        }
+        let health_error =
+            health_error.expect("a non-ready health result records an error before failing");
         let cleanup = self.runtime.stop(Duration::from_secs(1)).await;
         lifecycle.start_epoch = lifecycle
             .start_epoch

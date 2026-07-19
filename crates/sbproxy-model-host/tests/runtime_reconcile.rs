@@ -322,6 +322,9 @@ struct FixtureRuntimeFacts {
     fail_start_once: Mutex<BTreeSet<String>>,
     fail_stop: Mutex<BTreeSet<String>>,
     fail_health: Mutex<BTreeSet<String>>,
+    // id -> number of health probes to fail transiently before recovering.
+    // Each failing probe decrements the count; at zero the engine reads ready.
+    flap_health: Mutex<BTreeMap<String, u32>>,
     events: Mutex<Vec<String>>,
     next_port: AtomicU16,
     block_memory: AtomicBool,
@@ -497,6 +500,12 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
                 "repair the fixture health boundary",
                 true,
             )));
+        }
+        if let Some(remaining) = self.facts.flap_health.lock().unwrap().get_mut(&self.id) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Ok(EngineHealth::Unhealthy);
+            }
         }
         if running.process.has_exited().await? {
             Ok(EngineHealth::Stopped)
@@ -794,6 +803,42 @@ async fn ready_generation_detects_a_process_that_exited_after_readiness() {
     );
     assert!(status.port.is_none());
     assert!(manager.residency_reservations().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_transient_health_probe_miss_does_not_fail_a_ready_engine() {
+    // Regression: the readiness monitor runs from both the maintenance tick
+    // and the request path, so a single dropped or timed-out /health probe
+    // (probe races, brief scheduler stalls, observed live with SGLang) must
+    // not kill a working engine. A flap shorter than the re-probe budget
+    // recovers and the deployment stays ready and routable.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("health-flap", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    let first = manager.ensure_ready("a").await.unwrap();
+
+    // Two consecutive misses, under the re-probe budget, then ready again.
+    preparer
+        .facts
+        .flap_health
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), 2);
+
+    let recovered = manager
+        .ensure_ready("a")
+        .await
+        .expect("a transient health miss must not fail the ready engine");
+    assert_eq!(recovered.port, first.port, "the same engine keeps serving");
+    let status = manager.status("a").await.unwrap();
+    assert_eq!(
+        status.state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+    assert_eq!(manager.residency_reservations().await.len(), 1);
 }
 
 #[tokio::test]
