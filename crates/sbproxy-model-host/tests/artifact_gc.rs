@@ -315,3 +315,51 @@ async fn locked_and_active_artifacts_are_never_collected() {
         Some(&"deleting".to_string())
     );
 }
+
+#[tokio::test]
+async fn prune_reclaims_exactly_the_unreferenced_blobs_and_keeps_referenced_ones() {
+    // WOR-1862: a cold cache is a no-op; an orphan blob (referenced by no
+    // metadata) is reported by dry-run without deletion, then reclaimed
+    // exactly, while a referenced blob survives.
+    let directory = tempdir().unwrap();
+    let manager = ArtifactManager::new(directory.path(), Arc::new(NoNetwork)).unwrap();
+
+    // Cold cache with no blobs: nothing to reclaim.
+    let cold = manager.prune(false).unwrap();
+    assert_eq!(cold.orphan_blobs, 0);
+    assert_eq!(cold.reclaimed_bytes, 0);
+
+    // One referenced artifact, plus an orphan blob planted directly.
+    let referenced = prepare_artifact(directory.path(), &manager, 'a', b"kept weights", 10).await;
+    let orphan_bytes = b"orphaned shard bytes";
+    let orphan_digest = sha256(orphan_bytes);
+    let blobs = directory.path().join("blobs/sha256");
+    fs::write(blobs.join(&orphan_digest), orphan_bytes).unwrap();
+
+    // Dry-run reports the orphan but deletes nothing.
+    let preview = manager.prune(true).unwrap();
+    assert!(preview.dry_run);
+    assert_eq!(preview.orphan_blobs, 1);
+    assert_eq!(preview.reclaimed_bytes, orphan_bytes.len() as u64);
+    assert!(
+        blobs.join(&orphan_digest).exists(),
+        "dry-run must not delete"
+    );
+
+    // Real prune reclaims exactly the orphan bytes; the referenced blob stays.
+    let pruned = manager.prune(false).unwrap();
+    assert!(!pruned.dry_run);
+    assert_eq!(pruned.orphan_blobs, 1);
+    assert_eq!(pruned.reclaimed_bytes, orphan_bytes.len() as u64);
+    assert!(!blobs.join(&orphan_digest).exists(), "orphan reclaimed");
+    let referenced_sha = &referenced.files[0].sha256;
+    assert!(
+        blobs.join(referenced_sha).exists(),
+        "a referenced blob must survive prune"
+    );
+
+    // Second prune is a no-op now that the cache is clean.
+    let again = manager.prune(false).unwrap();
+    assert_eq!(again.orphan_blobs, 0);
+    assert_eq!(again.reclaimed_bytes, 0);
+}

@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 
 pub use cache::{ArtifactCacheMetadata, ArtifactCacheState, ReadyArtifact};
 pub(crate) use gc::explicit_protection_reason;
-pub use gc::{CacheProtection, GcReport, RemoveArtifactReport};
+pub use gc::{CacheProtection, GcReport, PruneReport, RemoveArtifactReport};
 #[cfg(feature = "weights")]
 pub use http::HttpArtifactTransport;
 pub use http::{

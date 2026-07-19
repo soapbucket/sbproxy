@@ -38,6 +38,19 @@ pub struct GcReport {
     pub budget_unsatisfied_bytes: u64,
 }
 
+/// Result of reclaiming unreferenced content-addressed blobs (WOR-1862).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PruneReport {
+    /// Physical content-addressed blob bytes before pruning.
+    pub before_bytes: u64,
+    /// Number of unreferenced blobs found (deleted unless `dry_run`).
+    pub orphan_blobs: u64,
+    /// Bytes reclaimed, or that would be reclaimed under `dry_run`.
+    pub reclaimed_bytes: u64,
+    /// Whether this was a report-only run that deleted nothing.
+    pub dry_run: bool,
+}
+
 /// Result of one exact, protected artifact removal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemoveArtifactReport {
@@ -52,6 +65,33 @@ pub struct RemoveArtifactReport {
 }
 
 impl ArtifactManager {
+    /// Reclaim content-addressed blobs referenced by no cached artifact
+    /// (WOR-1862): orphans left by an interrupted pull or a removed
+    /// artifact whose shared blobs another model no longer keeps alive.
+    /// This is the standalone counterpart to the post-collection sweep
+    /// `enforce_budget` already runs. Under the collection lock so it never
+    /// races a concurrent pull's promote. `dry_run` reports what it would
+    /// reclaim and deletes nothing; a cold cache with no orphans reclaims
+    /// zero either way.
+    pub fn prune(&self, dry_run: bool) -> Result<PruneReport, ArtifactError> {
+        let _mutation = self.cache.lock_exclusive_mutation()?;
+        let before_bytes = self.cache.blob_bytes()?;
+        let (orphan_blobs, reclaimed_bytes) = if dry_run {
+            let (bytes, count) = self.cache.unreferenced_blob_bytes()?;
+            (count, bytes)
+        } else {
+            let (_, count) = self.cache.unreferenced_blob_bytes()?;
+            let reclaimed = self.cache.remove_unreferenced_blobs()?;
+            (count, reclaimed)
+        };
+        Ok(PruneReport {
+            before_bytes,
+            orphan_blobs,
+            reclaimed_bytes,
+            dry_run,
+        })
+    }
+
     /// Enforce a physical blob budget without deleting protected or busy artifacts.
     pub fn enforce_budget(
         &self,

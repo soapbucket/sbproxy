@@ -855,11 +855,23 @@ sbproxy models remove qwen2.5-0.5b-instruct \
   --variant q4_k_m \
   --cache-dir /var/lib/sbproxy/models \
   --format json
+
+# Reclaim content-addressed blobs referenced by no cached artifact,
+# such as orphans left by an interrupted pull. --dry-run reports the
+# reclaimable bytes without deleting anything.
+sbproxy models prune --cache-dir /var/lib/sbproxy/models --dry-run
+sbproxy models prune --cache-dir /var/lib/sbproxy/models
 ```
 
+Because the weight store is content-addressed, two models that share a shard
+store it once, and `prune` reclaims only blobs that no cached artifact still
+references, so a shared blob survives while its last reference remains. Prune
+runs under the same collection lock as the cache-budget sweep, so it never
+races a concurrent pull.
+
 Every JSON command uses `schema_version: 1` and a stable command name such as
-`models.pull` or `models.remove`. Pull and removal results include durable job
-IDs when a mutation occurred.
+`models.pull`, `models.remove`, or `models.prune`. Pull and removal results
+include durable job IDs when a mutation occurred.
 
 ## Managed engines
 

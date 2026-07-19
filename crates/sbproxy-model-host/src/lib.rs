@@ -93,8 +93,8 @@ pub use artifact::HttpArtifactTransport;
 pub use artifact::{
     AcquisitionContext, ArtifactCacheMetadata, ArtifactCacheState, ArtifactError, ArtifactLease,
     ArtifactManager, ArtifactObserver, ArtifactTransport, CacheProtection, GcReport, NetworkPolicy,
-    PullIntent, ReadyArtifact, ResponseDisposition, SourceCredential, TransportRequest,
-    TransportResponse, UnavailableArtifactTransport,
+    PruneReport, PullIntent, ReadyArtifact, ResponseDisposition, SourceCredential,
+    TransportRequest, TransportResponse, UnavailableArtifactTransport,
 };
 pub use artifact_spec::{
     AcceleratorKind, ArtifactFile, ArtifactFormat, ArtifactVariant, ComputeCapability,

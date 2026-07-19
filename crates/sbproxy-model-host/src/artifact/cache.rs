@@ -540,6 +540,51 @@ impl ArtifactCache {
         Ok(reclaimed)
     }
 
+    /// Count the unreferenced blobs and their bytes without deleting them,
+    /// for a `prune --dry-run` report. Mirrors the reference set that
+    /// [`Self::remove_unreferenced_blobs`] would delete.
+    pub(crate) fn unreferenced_blob_bytes(&self) -> Result<(u64, u64), ArtifactError> {
+        let referenced: BTreeSet<_> = self
+            .metadata_entries()?
+            .into_iter()
+            .flat_map(|metadata| {
+                metadata
+                    .files
+                    .into_iter()
+                    .map(|file| file.sha256)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let directory = self.root.join("blobs/sha256");
+        let mut bytes = 0u64;
+        let mut count = 0u64;
+        for entry in fs::read_dir(&directory)
+            .map_err(|source| io_error("list artifact blobs", &directory, source))?
+        {
+            let entry =
+                entry.map_err(|source| io_error("read artifact blob entry", &directory, source))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_digest(name).is_err() || referenced.contains(name) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| io_error("read artifact blob metadata", &path, source))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            bytes = bytes.checked_add(metadata.len()).ok_or_else(|| {
+                ArtifactError::InvalidArtifact(
+                    "unreferenced artifact bytes overflow u64".to_string(),
+                )
+            })?;
+            count += 1;
+        }
+        Ok((bytes, count))
+    }
+
     pub(crate) fn inspect(&self, digest: &str) -> Result<ArtifactCacheState, ArtifactError> {
         Ok(match self.lookup(digest)? {
             CacheLookup::Missing => ArtifactCacheState::Missing,
