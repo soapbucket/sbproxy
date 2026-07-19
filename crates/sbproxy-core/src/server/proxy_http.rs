@@ -79,6 +79,10 @@ fn final_response_status(
         .unwrap_or(0)
 }
 
+fn is_billable_provider_success(status: u16, provider: Option<&str>) -> bool {
+    (200..300).contains(&status) && provider.is_some_and(|value| !value.is_empty())
+}
+
 fn retry_config_for_action(action: &Action) -> Option<&sbproxy_modules::action::RetryConfig> {
     match action {
         Action::Proxy(proxy) => proxy.retry.as_ref(),
@@ -3993,6 +3997,20 @@ impl ProxyHttp for SbProxy {
         let hostname = ctx.hostname.to_string();
         let status_u16 = final_response_status(ctx, session.response_written());
 
+        // WOR-1921: compression savings become realized value only after the
+        // terminal provider response succeeds. Always take the pending value
+        // so this end-of-request hook cannot record it more than once.
+        let pending_compression_value = ctx.pending_compression_value.take();
+        if is_billable_provider_success(status_u16, ctx.ai_provider.as_deref()) {
+            if let Some(pending) = pending_compression_value.as_ref() {
+                crate::compression_value::record_pending_compression_value(
+                    ctx.tenant_id.as_str(),
+                    ctx.hostname.as_str(),
+                    pending,
+                );
+            }
+        }
+
         // WOR-1528 / WOR-1540: hand the completed AI call to the
         // configured usage sinks (the verifiable ledger among them).
         // No-op unless this request dispatched to an AI provider on an
@@ -4367,5 +4385,14 @@ mod tests {
         assert_eq!(final_response_status(&ctx, Some(&header)), 429);
         ctx.response_status = None;
         assert_eq!(final_response_status(&ctx, None), 0);
+    }
+
+    #[test]
+    fn compression_value_requires_a_terminal_provider_success() {
+        assert!(is_billable_provider_success(200, Some("openai")));
+        assert!(is_billable_provider_success(299, Some("local")));
+        assert!(!is_billable_provider_success(302, Some("openai")));
+        assert!(!is_billable_provider_success(429, Some("openai")));
+        assert!(!is_billable_provider_success(200, None));
     }
 }

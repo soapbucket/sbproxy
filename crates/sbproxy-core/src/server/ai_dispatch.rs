@@ -3626,6 +3626,8 @@ pub(super) async fn handle_ai_proxy(
                 compression_cache_bypass,
                 &run,
             );
+            ctx.pending_compression_value =
+                sbproxy_ai::PendingCompressionValue::from_run(model.clone(), &run);
             body["messages"] = serde_json::Value::Array(run.messages);
         }
     }

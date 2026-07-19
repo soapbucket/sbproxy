@@ -661,6 +661,10 @@ pub struct RequestContext {
     /// when the AI handler dispatched the request. `None` for
     /// non-AI traffic.
     pub ai_provider: Option<String>,
+    /// Prompt-free compression savings waiting for a terminal provider
+    /// success. The logging phase consumes this exactly once so retries,
+    /// failures, and cache hits never claim avoided tokens or cost.
+    pub pending_compression_value: Option<sbproxy_ai::PendingCompressionValue>,
     /// WOR-800: name of the stored prompt this request resolved (when it
     /// referenced one via `"prompt": "name@version"`). Recorded on the
     /// run metadata / billing event so a run can be traced to the prompt
@@ -1137,6 +1141,7 @@ impl RequestContext {
             canonical_url: None,
             metrics: RequestMetrics::default(),
             ai_provider: None,
+            pending_compression_value: None,
             ai_prompt_name: None,
             ai_prompt_version: None,
             principal: sbproxy_plugin::Principal::anonymous(),
