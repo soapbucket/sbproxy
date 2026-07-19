@@ -47,7 +47,18 @@ pub const DEFAULT_SGLANG_IMAGE: &str =
 const DEFAULT_SHM_SIZE_GIB: u64 = 4;
 const CONTAINER_PORT: u16 = 30000;
 const PRIVATE_NETWORK: &str = "sbproxy-model-host";
-const HEALTH_PATH: &str = "/health";
+// SGLang's `/health` runs a real model generation (a `HEALTH_CHECK`
+// request through the scheduler with its own 4-second timeout), so it
+// takes ~1s even idle and returns 503 whenever a generation slot is not
+// free. With `--max-running-requests` sized to the deployment concurrency,
+// an in-flight completion starves the health generation and the endpoint
+// fails; measured live on an L4, sbproxy's raw 2-second probe missed
+// `/health` 12 of 40 times under a single concurrent completion, which
+// tripped the readiness monitor and killed a serving engine. `/get_model_info`
+// is a non-generating liveness endpoint (200 once the model is loaded,
+// ~1ms, no slot contention) and missed 0 of 40 under the same load. vLLM's
+// `/health` is already a trivial liveness check, so only SGLang needs this.
+const HEALTH_PATH: &str = "/get_model_info";
 /// Fallback `--mem-fraction-static` when the fit did not derive a
 /// device-capacity-aware fraction (e.g. the probe reported no total VRAM).
 /// SGLang's own default is roughly 0.88, which sizes the static weight and
@@ -993,9 +1004,23 @@ fn unix_time_ms() -> Result<u64, EngineDriverError> {
 mod tests {
     use super::{
         append_tensor_parallel_arguments, digest_pinned_image, DEFAULT_SGLANG_IMAGE,
-        DEFAULT_SGLANG_VERSION,
+        DEFAULT_SGLANG_VERSION, HEALTH_PATH,
     };
     use crate::{EngineDriver, EngineKind};
+
+    #[test]
+    fn health_probe_uses_a_non_generating_endpoint() {
+        // Regression: SGLang's `/health` runs a model generation and returns
+        // 503 when no request slot is free, so probing it starves against
+        // in-flight completions and kills a serving engine (measured live on
+        // an L4: 12/40 raw probes missed under one completion, versus 0/40
+        // for the model-info endpoint). The readiness probe must not generate.
+        assert_ne!(
+            HEALTH_PATH, "/health",
+            "SGLang /health generates; probe a liveness endpoint instead"
+        );
+        assert_eq!(HEALTH_PATH, "/get_model_info");
+    }
 
     #[test]
     fn default_sglang_image_has_digest_shape() {
