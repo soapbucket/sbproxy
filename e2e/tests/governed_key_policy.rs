@@ -1192,13 +1192,17 @@ fn dynamic_record_enforces_prompt_rates_budget_and_safe_attribution() {
         "one record budget must not consume another record's bucket",
     );
 
+    // Keep enough room for the prompt-cost reservation introduced by
+    // governed-key monetary preflight. The mock provider records 1,000 input
+    // and 1,000 output tokens, so its settled charge still exhausts this cap
+    // before the second request.
     let cost_budget_a = mint(
         &world,
-        json!({"name": "cost-budget-a", "max_budget_usd": 0.000001}),
+        json!({"name": "cost-budget-a", "max_budget_usd": 0.0001}),
     );
     let cost_budget_b = mint(
         &world,
-        json!({"name": "cost-budget-b", "max_budget_usd": 0.000001}),
+        json!({"name": "cost-budget-b", "max_budget_usd": 0.0001}),
     );
     assert_status(
         &chat(

@@ -297,6 +297,12 @@ impl CompiledAiPolicy {
             .map_err(|e| anyhow::anyhow!("ai_policy.expression: {e}"))?;
         let on_error = parse_action_list(&cfg.on_error)
             .map_err(|e| anyhow::anyhow!("ai_policy.on_error: {e}"))?;
+        if on_error
+            .iter()
+            .any(|action| matches!(action, AiPolicyAction::InvalidCompressionSelector))
+        {
+            anyhow::bail!("ai_policy.on_error: invalid compression selector");
+        }
         Ok(Self {
             engine,
             expr,
@@ -424,6 +430,19 @@ mod tests {
             on_error: "allow".to_string(),
         });
         assert!(err.is_err(), "syntax error caught at compile time");
+    }
+
+    #[test]
+    fn malformed_compression_selector_in_on_error_fails_to_compile() {
+        let err = CompiledAiPolicy::compile(&AiPolicyConfig {
+            expression: r#""allow""#.to_string(),
+            on_error: "compression:Upper".to_string(),
+        });
+
+        assert!(
+            err.is_err(),
+            "configured on_error selectors must be validated at config load"
+        );
     }
 
     #[test]

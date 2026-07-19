@@ -367,7 +367,7 @@ fn registered_enforcement_test(proof: PolicyEnforcementProof) -> EnforcementTest
             &[
                 "\"max_budget_tokens\": 100",
                 "provider usage must exhaust the dynamic record budget",
-                "\"max_budget_usd\": 0.000001",
+                "\"max_budget_usd\": 0.0001",
                 "recorded provider cost must exhaust the dynamic USD budget",
             ],
             |policy| {
