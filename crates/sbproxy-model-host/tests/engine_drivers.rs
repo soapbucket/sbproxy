@@ -14,8 +14,8 @@ use sbproxy_model_host::{
     EngineProvisioning, EngineReadinessProbe, EngineSupervisor, FileJobStore, FitPlan,
     KvCacheQuant, LaunchRequest, LlamaBinarySource, LlamaCppDriver, OperationJob, OperationKind,
     OperationProgress, OperationState, ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact,
-    ResolvedArtifact, RunningEngine, SupervisorClock, SupportLevel, VllmDriver, VllmHost,
-    VllmLaunchMode, WorkerProfile,
+    ResolvedArtifact, RunningEngine, SGLangDriver, SupervisorClock, SupportLevel, VllmDriver,
+    VllmHost, VllmLaunchMode, WorkerProfile,
 };
 use tempfile::tempdir;
 
@@ -1369,6 +1369,47 @@ fn compatibility_output(compatible: bool) -> CommandOutput {
         ),
         stderr: String::new(),
     }
+}
+
+fn sglang_compatibility_output(version: &str) -> CommandOutput {
+    CommandOutput {
+        success: true,
+        stdout: format!(
+            r#"{{"python":"3.12.4","torch":"2.7.1","cuda":"12.8","sglang":"{version}","compatible":true,"reason":null}}"#
+        ),
+        stderr: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn sglang_provision_records_the_probed_version() {
+    // WOR-1905/WOR-1906: the SGLang provision must thread the version the
+    // compatibility probe already reads into the provisioned engine, the
+    // same way the vLLM driver does, so admin status and the usage ledger
+    // can answer "what served this request". A regression against the bug
+    // where the container branch discarded the probe version and reported
+    // None on a live L4.
+    let driver = SGLangDriver::new(
+        vllm_runner(vec![sglang_compatibility_output("0.5.2")]),
+        vllm_host(&[("python3", "/usr/bin/python3")]),
+    );
+    let mut worker = cuda_worker();
+    worker.engines = BTreeSet::from([EngineKind::SGLang]);
+    let provisioned = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::SGLang, ArtifactFormat::Safetensors),
+            worker,
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect("SGLang provisions from the probed python environment");
+    assert_eq!(
+        provisioned.version.as_deref(),
+        Some("0.5.2"),
+        "the probed SGLang version must reach the provisioned engine"
+    );
 }
 
 #[test]
