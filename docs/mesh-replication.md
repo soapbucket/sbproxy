@@ -130,6 +130,13 @@ its covering tombstone cannot have been collected yet (collection
 requires the full grace period), so anti-entropy delivers the tombstone
 to it, not the other way around.
 
+One boundary rule makes collection terminate: a tombstone already past
+the grace period may still fence out an existing stale record on a
+replica, but it never re-creates an entry on a replica that stores
+nothing for the key. Without this, two replicas that both hold a
+collectable tombstone would re-teach it to each other through
+anti-entropy forever, each collecting it and then pulling it back.
+
 ## Repair
 
 A maintenance loop runs every `anti_entropy_interval_secs` on every

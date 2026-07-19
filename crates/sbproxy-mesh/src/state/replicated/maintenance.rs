@@ -189,6 +189,8 @@ impl ReplicatedStore {
             report.truncated = true;
         }
 
+        let grace_ms = self.settings.tombstone_gc_grace_secs.saturating_mul(1_000);
+        let now = (self.clock)();
         for entry in &peer_digest {
             if !self
                 .replica_set(&entry.key)
@@ -198,6 +200,16 @@ impl ReplicatedStore {
                 continue;
             }
             let local = self.shard.fetch(&entry.key);
+            // A collectable tombstone (past grace) with no local record is
+            // not worth pulling: the shard's apply fence would drop it
+            // anyway (see the shard docs on the ping-pong hazard).
+            if local.is_none()
+                && entry.tombstone
+                && grace_ms > 0
+                && now.saturating_sub(entry.timestamp_ms) > grace_ms
+            {
+                continue;
+            }
             if !peer_side_is_newer(entry, local.as_ref()) {
                 continue;
             }
@@ -238,9 +250,19 @@ impl ReplicatedStore {
                 if !self.replica_set(&key).iter().any(|n| n == peer) {
                     continue;
                 }
-                let peer_has_newer = peer_versions
-                    .get(key.as_str())
-                    .is_some_and(|entry| !local_side_is_newer(&record.register, entry));
+                let peer_entry = peer_versions.get(key.as_str());
+                // Mirror of the pull-phase rule: never push a collectable
+                // tombstone at a peer that no longer stores the key; its
+                // apply fence would reject the record anyway.
+                if peer_entry.is_none()
+                    && record.register.is_tombstone()
+                    && grace_ms > 0
+                    && now.saturating_sub(record.register.timestamp_ms()) > grace_ms
+                {
+                    continue;
+                }
+                let peer_has_newer =
+                    peer_entry.is_some_and(|entry| !local_side_is_newer(&record.register, entry));
                 if peer_has_newer {
                     continue;
                 }

@@ -127,6 +127,9 @@ pub struct ReplicaShard {
     db: Option<Database>,
     clock: MeshClock,
     limits: ShardLimits,
+    /// Tombstone GC grace period in milliseconds; `0` disables both the
+    /// open-time quarantine and the expired-tombstone apply fence.
+    grace_ms: u64,
     /// Records discarded by the long-absence quarantine on open. Zero when
     /// the shard was opened within the grace window.
     quarantine_discarded: AtomicU64,
@@ -180,6 +183,7 @@ impl ReplicaShard {
             db: Some(db),
             clock,
             limits,
+            grace_ms,
             quarantine_discarded: AtomicU64::new(0),
         };
 
@@ -202,12 +206,13 @@ impl ReplicaShard {
 
     /// Construct a memory-only shard (no durability). Used by tests and by
     /// deployments that explicitly opt out of a durable directory.
-    pub fn in_memory(limits: ShardLimits, clock: MeshClock) -> Self {
+    pub fn in_memory(limits: ShardLimits, grace_ms: u64, clock: MeshClock) -> Self {
         Self {
             records: Mutex::new(BTreeMap::new()),
             db: None,
             clock,
             limits,
+            grace_ms,
             quarantine_discarded: AtomicU64::new(0),
         }
     }
@@ -379,6 +384,19 @@ impl ReplicaShard {
             }
             None => None,
         };
+
+        // Expired-tombstone fence: a tombstone past the GC grace period may
+        // still fence out an existing stale record, but it must never
+        // materialize where nothing is stored. Without this, two replicas
+        // that both hold a collectable tombstone ping-pong it forever:
+        // each collects it, then re-learns it from the other's digest.
+        if candidate.is_tombstone()
+            && current.is_none()
+            && self.grace_ms > 0
+            && now.saturating_sub(candidate.timestamp_ms()) > self.grace_ms
+        {
+            return Ok(VersionedLwwMergeOutcome::Unchanged);
+        }
 
         let (merged, outcome, expires_at_ms) = match current {
             None => {
@@ -602,7 +620,7 @@ mod tests {
     #[test]
     fn apply_then_fetch_roundtrip() {
         let clock_cell = Arc::new(TestClockCell::new(1_000));
-        let shard = ReplicaShard::in_memory(ShardLimits::default(), fixed_clock(clock_cell));
+        let shard = ReplicaShard::in_memory(ShardLimits::default(), 0, fixed_clock(clock_cell));
         let record = live("dmFsdWU", "node-a", 1_000, 1);
         let outcome = shard.apply("k", &record, 0).unwrap();
         assert_eq!(outcome, VersionedLwwMergeOutcome::Replaced);
@@ -612,7 +630,7 @@ mod tests {
     #[test]
     fn reapplying_the_same_record_is_idempotent() {
         let clock_cell = Arc::new(TestClockCell::new(1_000));
-        let shard = ReplicaShard::in_memory(ShardLimits::default(), fixed_clock(clock_cell));
+        let shard = ReplicaShard::in_memory(ShardLimits::default(), 0, fixed_clock(clock_cell));
         let record = live("dmFsdWU", "node-a", 1_000, 3);
         shard.apply("k", &record, 0).unwrap();
         let outcome = shard.apply("k", &record, 0).unwrap();
@@ -721,7 +739,7 @@ mod tests {
             max_entries: 1,
             max_value_bytes: 1024,
         };
-        let shard = ReplicaShard::in_memory(limits, fixed_clock(clock_cell));
+        let shard = ReplicaShard::in_memory(limits, 0, fixed_clock(clock_cell));
         shard
             .apply("k1", &live("dg", "node-a", 1_000, 1), 0)
             .unwrap();
@@ -740,17 +758,48 @@ mod tests {
             max_entries: 16,
             max_value_bytes: 8,
         };
-        let shard = ReplicaShard::in_memory(limits, fixed_clock(clock_cell));
+        let shard = ReplicaShard::in_memory(limits, 0, fixed_clock(clock_cell));
         let big = "A".repeat(64);
         let err = shard.apply("k", &live(&big, "node-a", 1_000, 1), 0);
         assert!(matches!(err, Err(ShardError::TooLarge)));
     }
 
     #[test]
+    fn expired_tombstone_fences_existing_state_but_never_materializes() {
+        let clock_cell = Arc::new(TestClockCell::new(1_000));
+        let grace_ms = 60_000;
+        let shard = ReplicaShard::in_memory(
+            ShardLimits::default(),
+            grace_ms,
+            fixed_clock(clock_cell.clone()),
+        );
+        let stone = tombstone("node-a", 1_000, 6);
+
+        // Advance well past grace: the tombstone is collectable.
+        clock_cell.store(1_000 + grace_ms + 1, Ordering::Relaxed);
+
+        // With no stored record, applying the expired tombstone is a
+        // no-op: this is what stops two replicas from ping-ponging a
+        // collected tombstone back and forth via anti-entropy.
+        let outcome = shard.apply("k", &stone, 0).unwrap();
+        assert_eq!(outcome, VersionedLwwMergeOutcome::Unchanged);
+        assert!(shard.fetch("k").is_none());
+
+        // With a stale live record present, the same expired tombstone
+        // must still fence it out: that is resurrection protection.
+        shard
+            .apply("k", &live("c3RhbGU", "node-b", 500, 5), 0)
+            .unwrap();
+        let outcome = shard.apply("k", &stone, 0).unwrap();
+        assert_eq!(outcome, VersionedLwwMergeOutcome::Replaced);
+        assert!(shard.fetch("k").is_some_and(|r| r.is_tombstone()));
+    }
+
+    #[test]
     fn tombstones_ignore_ttl_and_never_expire() {
         let clock_cell = Arc::new(TestClockCell::new(1_000));
         let shard =
-            ReplicaShard::in_memory(ShardLimits::default(), fixed_clock(clock_cell.clone()));
+            ReplicaShard::in_memory(ShardLimits::default(), 0, fixed_clock(clock_cell.clone()));
         shard.apply("k", &tombstone("node-a", 1_000, 2), 1).unwrap();
         clock_cell.store(1_000_000, Ordering::Relaxed);
         assert!(shard.fetch("k").is_some_and(|r| r.is_tombstone()));
@@ -759,7 +808,7 @@ mod tests {
     #[test]
     fn digest_page_paginates_in_key_order() {
         let clock_cell = Arc::new(TestClockCell::new(1_000));
-        let shard = ReplicaShard::in_memory(ShardLimits::default(), fixed_clock(clock_cell));
+        let shard = ReplicaShard::in_memory(ShardLimits::default(), 0, fixed_clock(clock_cell));
         for i in 0..5 {
             shard
                 .apply(&format!("k{i}"), &live("dg", "node-a", 1_000, 1), 0)
@@ -782,7 +831,7 @@ mod tests {
     #[test]
     fn digest_page_honors_prefix() {
         let clock_cell = Arc::new(TestClockCell::new(1_000));
-        let shard = ReplicaShard::in_memory(ShardLimits::default(), fixed_clock(clock_cell));
+        let shard = ReplicaShard::in_memory(ShardLimits::default(), 0, fixed_clock(clock_cell));
         shard
             .apply("a:1", &live("dg", "node-a", 1_000, 1), 0)
             .unwrap();
@@ -800,7 +849,7 @@ mod tests {
     #[test]
     fn remove_exact_only_drops_the_expected_register() {
         let clock_cell = Arc::new(TestClockCell::new(1_000));
-        let shard = ReplicaShard::in_memory(ShardLimits::default(), fixed_clock(clock_cell));
+        let shard = ReplicaShard::in_memory(ShardLimits::default(), 0, fixed_clock(clock_cell));
         let v1 = live("dg", "node-a", 1_000, 1);
         let v2 = live("dg2", "node-a", 1_100, 2);
         shard.apply("k", &v1, 0).unwrap();

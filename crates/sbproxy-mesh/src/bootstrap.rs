@@ -465,9 +465,11 @@ pub async fn bootstrap(
                     clock,
                 )
                 .map_err(|e| anyhow::anyhow!("open replicated state shard: {e}"))?,
-                None => {
-                    crate::state::replicated::ReplicaShard::in_memory(replication.limits, clock)
-                }
+                None => crate::state::replicated::ReplicaShard::in_memory(
+                    replication.limits,
+                    grace_ms,
+                    clock,
+                ),
             };
             let shard = Arc::new(shard);
             if let Some(server) = transport_server.as_ref() {

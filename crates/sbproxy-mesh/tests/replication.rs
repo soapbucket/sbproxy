@@ -553,6 +553,18 @@ async fn tombstone_gc_waits_for_every_replica_to_confirm() {
     assert_eq!(report_b.gc_collected, 1, "B collects after A confirms");
     assert!(b.shard.fetch(&key).is_none());
 
+    // Collection must TERMINATE: further rounds on either side must not
+    // re-learn the collected tombstone from the other's digest (the
+    // ping-pong hazard found during live GCP validation) nor re-push it.
+    for _ in 0..3 {
+        store_a.maintenance_round().await;
+        store_b.maintenance_round().await;
+    }
+    assert!(
+        a.shard.fetch(&key).is_none() && b.shard.fetch(&key).is_none(),
+        "collected tombstone must stay collected on both replicas"
+    );
+
     // Nothing resurrects after collection: reads agree the key is gone.
     assert_eq!(store_b.get(&key).await.expect("read").value, None);
 }
