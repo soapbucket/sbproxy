@@ -319,14 +319,26 @@ A populated compression row has this shape:
 `compression` is sorted by model and lever. `compression_totals` aggregates by
 the closed lever name, and the two `total_compression_*` fields cover the whole
 report. A known target-model tokenizer produces `model_tokenizer`; the
-documented character fallback produces `heuristic`. Both are SBproxy estimates
-rather than provider billing totals. Unknown model pricing records zero gross
-cost while retaining the saved-token count.
+documented UTF-8 byte-length fallback produces `heuristic`. Both are SBproxy
+estimates rather than provider billing totals. Unknown model pricing records
+zero gross cost while retaining the saved-token count.
 
-The process-wide ledger stores no prompt or summary content. With a configured
-model-host value database it persists in redb. Compression-only deployments
-use a bounded in-memory ledger. After 1,000 model lanes, new model names
-aggregate into `__other__` so an unbounded model string cannot grow Admin state.
+Because both value dimensions share per-model lanes, a compression-only report's
+`models` array contains a zeroed local-serving row for each compression target;
+its local and cloud completion totals remain zero. The actual compression value
+stays in `compression` and `compression_totals`.
+
+The process-wide ledger stores no prompt or summary content. The current redb
+path requires an AI handler with at least one
+`providers[].serve.models[].reference` in the provider-level compatibility form
+and a `providers[].serve.cache_dir`; the file is
+`<cache_dir>/value-ledger.redb`. `proxy.model_host.cache.directory` does not
+currently activate value-ledger persistence. Otherwise compression uses a
+bounded in-memory ledger.
+
+The ledger holds at most 1,000 model lanes total, including `__other__`. Once
+999 non-overflow model names have been admitted, additional names aggregate
+into `__other__` so an unbounded model string cannot grow Admin state.
 
 ### Managed model operations
 

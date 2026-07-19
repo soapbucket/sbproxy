@@ -478,14 +478,14 @@ All token measurements use the same target-model SBproxy counter at the runner
 boundary. A lever is applied only when `after_tokens < before_tokens`.
 Skipped and failed levers report zero saved tokens. Known OpenAI model families
 use their registered tokenizer. Other model names use the documented
-character-count fallback. Value reports expose this as
+UTF-8 byte-length fallback. Value reports expose this as
 `token_count_precision: model_tokenizer` or `heuristic`; both values remain
 estimates of the provider's eventual billed usage.
 
 The arithmetic is exact relative to that shared estimate. For model families
 without a dedicated tokenizer, the estimator uses its documented conservative
-character heuristic; these metrics are not reconciled to provider-reported
-usage after dispatch.
+UTF-8 byte-length heuristic, not a Unicode character count. These metrics are
+not reconciled to provider-reported usage after dispatch.
 
 Per-lever savings can be summed safely because every applied lever starts from
 the preceding committed output. At request scope,
@@ -605,11 +605,18 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
   | jq '{compression,compression_totals,total_compression_tokens_saved,total_compression_gross_cost_saved_micros}'
 ```
 
-When model hosting configures its durable value ledger, compression shares
-that redb ledger. A compression-only process uses a bounded in-memory ledger.
-The ledger keeps at most 1,000 model lanes and aggregates additional model
-names into `__other__`; metric labels pass through the normal cardinality
-budget. Neither surface contains prompt or summary content.
+The current durable path is the provider-level `serve:` compatibility form. On
+an AI handler with at least one `providers[].serve.models[].reference`, setting
+`providers[].serve.cache_dir` places the process-wide ledger at
+`<cache_dir>/value-ledger.redb`, and compression on that handler shares it.
+`proxy.model_host.cache.directory` does not currently activate value-ledger
+persistence. If no referenced inline served model initializes the durable path,
+compression uses a bounded in-memory ledger.
+
+The ledger keeps at most 1,000 model lanes total, including the deterministic
+`__other__` overflow lane. Once 999 non-overflow model names have been admitted,
+additional names aggregate into `__other__`; metric labels pass through the
+normal cardinality budget. Neither surface contains prompt or summary content.
 
 ## Safe summary log event
 
@@ -631,7 +638,7 @@ summary.
 The top-level fields are `event`, `tenant_id`, `api_key_id`, `outcome`,
 `initial_tokens`, `final_tokens`, `tokens_saved`, `levers_run`,
 `levers_applied`, `latency_ms`, `backend`, `consistency`, `cache_bypass`,
-`lever_outcomes`, and `targets`.
+`selection_source`, `selection_outcome`, `lever_outcomes`, and `targets`.
 
 `backend` is `redis` or `none`. The corresponding `consistency` value is
 `serialized` or `none`.

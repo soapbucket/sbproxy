@@ -350,14 +350,14 @@ restarts, use `increase(...[$__range])`; Prometheus applies its normal range
 boundary extrapolation. Use the request histogram's `_bucket` series for
 per-request distributions; never sum buckets to recover token counts.
 For model families without a dedicated tokenizer, the counter uses the
-documented character heuristic and is not reconciled to provider-reported
-usage after dispatch.
+documented UTF-8 byte-length heuristic, not a Unicode character count, and is
+not reconciled to provider-reported usage after dispatch.
 
 Applied pipelines emit one content-free `ai_compression_summary` event. With
 the JSON log format used above, a safely redacted example is:
 
 ```json
-{"timestamp":"<redacted>","level":"INFO","fields":{"message":"AI context compression pipeline summary","event":"ai_compression_summary","tenant_id":"<redacted>","api_key_id":"<redacted>","outcome":"applied","initial_tokens":12480,"final_tokens":1320,"tokens_saved":11160,"levers_run":2,"levers_applied":1,"latency_ms":640,"backend":"redis","consistency":"serialized","cache_bypass":true,"lever_outcomes":"<content-free JSON omitted>","targets":"<configured numeric targets omitted>"},"target":"ai_compression"}
+{"timestamp":"<redacted>","level":"INFO","fields":{"message":"AI context compression pipeline summary","event":"ai_compression_summary","tenant_id":"<redacted>","api_key_id":"<redacted>","outcome":"applied","initial_tokens":12480,"final_tokens":1320,"tokens_saved":11160,"levers_run":2,"levers_applied":1,"latency_ms":640,"backend":"redis","consistency":"serialized","cache_bypass":true,"selection_source":"route_default","selection_outcome":"default","lever_outcomes":"<content-free JSON omitted>","targets":"<configured numeric targets omitted>"},"target":"ai_compression"}
 ```
 
 The event never includes request messages, generated summary text, raw session
@@ -386,7 +386,7 @@ curl --fail-with-body -sS \
 Each row includes `model`, `lever`, `tokens_saved`,
 `gross_cost_saved_micros`, and `token_count_precision`. The precision value is
 `model_tokenizer` for a registered target-model tokenizer and `heuristic` for
-the character-count fallback. It describes the SBproxy estimate, not the
+the UTF-8 byte-length fallback. It describes the SBproxy estimate, not the
 provider's billed input count.
 
 ## Run the evaluation gate

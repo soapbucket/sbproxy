@@ -833,7 +833,7 @@ Each `compression` row names the target `model`, closed `lever`,
 total.
 
 The precision value is `model_tokenizer` when the target model resolves to a
-registered tokenizer, or `heuristic` when SBproxy uses its character-count
+registered tokenizer, or `heuristic` when SBproxy uses its UTF-8 byte-length
 fallback. Unknown input pricing yields zero gross cost and keeps the token
 saving. The amount is gross because dedicated summarizer spend remains in the
 normal usage stream instead of being silently netted out.
@@ -845,10 +845,17 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
 ```
 
 The same endpoint is available when no local model is configured. In that
-compression-only case, the local-serving arrays are empty and compression uses
-a bounded in-memory ledger. A configured model-host value database gives both
-dimensions the existing redb persistence. The ledger caps model lanes at
-1,000 and combines additional names under `__other__`.
+compression-only case, `models` contains a zeroed local-serving row for each
+compression target, while all local and cloud completion totals remain zero.
+Compression uses a bounded in-memory ledger unless an AI handler initializes
+the current durable compatibility path: at least one
+`providers[].serve.models[].reference` plus `providers[].serve.cache_dir`, which
+stores the process-wide ledger at `<cache_dir>/value-ledger.redb`.
+`proxy.model_host.cache.directory` does not currently activate that ledger.
+
+The ledger caps the complete lane set at 1,000 entries, including the
+deterministic `__other__` overflow lane. After 999 non-overflow model names,
+additional names combine under `__other__`.
 
 ## Artifacts and cache safety
 
