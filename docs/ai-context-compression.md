@@ -196,8 +196,12 @@ reported output count and a conservative local estimate must both fit
 ## Redis state
 
 `backend: redis` reuses the process-wide Redis L2 configuration and Redis
-service. The compression runtime opens its own lazy multiplexed connection from
-that configured DSN; the compression block does not accept a separate DSN.
+service. It inherits all four connection fields: `dsn`, `ca_file`, `cert_file`,
+and `key_file`. The compression runtime clones the same validated Redis client
+and opens its own lazy multiplexed connection. The compression block does not
+accept a separate DSN, CA, or client identity, so it cannot silently lose the
+L2 trust or mTLS configuration.
+
 Redis serializes updates with a bounded lease, a monotonic fence, and a
 logical-version compare-and-set. The lease is the configured summarizer timeout
 plus a fixed 5-second margin for the bounded state load, validation, and commit;
@@ -208,7 +212,10 @@ proxy:
   l2_cache_settings:
     driver: redis
     params:
-      dsn: redis://redis.internal:6379/0
+      dsn: rediss://cache-user:${REDIS_PASSWORD_URLENCODED}@redis.internal:6380/7
+      ca_file: /etc/sbproxy/redis/ca.pem
+      cert_file: /etc/sbproxy/redis/client.pem
+      key_file: /etc/sbproxy/redis/client-key.pem
 
 origins:
   "ai.example.com":
@@ -239,13 +246,26 @@ origins:
 ```
 
 Selecting Redis without `proxy.l2_cache_settings.driver: redis` is a startup
-configuration error. An invalid Redis DSN is also rejected. Once the runtime is
-active, a Redis command or connection failure makes the stateful lever fail
-open for that request. The current internal bounds are 500 milliseconds for
-connection setup, 1 second for a command response, and 2 seconds for a complete
-state operation. A failed cached connection is replaced so a restarted Redis
-service can recover without restarting SBproxy. There is no worker-local
-summary fallback.
+configuration error. Invalid DSN semantics, invalid TLS field combinations,
+and bad local PEM material are also rejected before serving. Configuration
+validation does not open a network connection. TLS verification,
+authentication, and database selection happen when the lazy compression
+connection is first used.
+
+Once the runtime is active, a Redis connection, TLS, authentication, database,
+or command failure makes the stateful lever fail open for that request. The
+current internal bounds are 500 milliseconds for connection setup, 1 second
+for a command response, and 2 seconds for a complete state operation. A failed
+cached connection is replaced, and a later request can recover without
+restarting SBproxy. There is no worker-local summary fallback.
+
+The general synchronous L2 metrics named `sbproxy_redis_kv_*` cover
+`RedisKVStore` consumers such as shared response cache and rate limiting. The
+compression runtime remains covered by
+`sbproxy_ai_compression_state_operations_total`,
+`sbproxy_ai_compression_state_operation_duration_seconds`, and
+`sbproxy_ai_compression_redis_coordination_total`; it does not double-count its
+async operations in the synchronous families.
 
 ## Why mesh is not a supported state backend
 

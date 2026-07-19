@@ -571,23 +571,52 @@ proxy:
   l2_cache_settings:
     driver: redis
     params:
-      dsn: redis://redis.internal:6379/0
+      dsn: rediss://cache-user:${REDIS_PASSWORD_URLENCODED}@redis.internal:6380/7
+      ca_file: /etc/sbproxy/redis/ca.pem
+      cert_file: /etc/sbproxy/redis/client.pem
+      key_file: /etc/sbproxy/redis/client-key.pem
 ```
 
 `params` keys for the `redis` driver:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `dsn` | string | | Connection address. The general L2 client currently supports only an unauthenticated, plaintext Redis endpoint supplied as `redis.internal:6379` or `redis://redis.internal:6379`. |
+| `dsn` | string | required | Redis connection. Accepts a legacy hostname or `host:port`, a `redis://` URL, or a verified `rediss://` URL. URL paths select a non-negative logical database. |
+| `ca_file` | string | unset | PEM trust anchor for a private Redis CA. Valid only with `rediss://`. When omitted, verified TLS uses system trust roots. |
+| `cert_file` | string | unset | PEM client certificate chain for Redis mTLS. Must appear with `key_file` and requires `rediss://`. |
+| `key_file` | string | unset | PEM private key matching `cert_file`. Must appear with `cert_file` and requires `rediss://`. |
 
-Pool size and acquire timeout are not exposed via `params` and use built-in defaults (pool size 8, acquire timeout 5 seconds).
+Legacy `redis.internal` and `redis.internal:6379` values remain compatible and
+normalize to plaintext `redis://` connections. Bracketed IPv6 addresses are
+accepted. Unbracketed ambiguous IPv6 addresses are rejected.
 
-The general L2 client does not yet implement TLS, `AUTH`, or `SELECT`. Its
-legacy parser accepts credentials, a database path, and a `rediss://` scheme
-but discards them before opening a plaintext connection, so do not rely on
-those forms for L2 traffic. AI context compression uses a separate async
-client built from the complete DSN and does support credentials, database
-selection, `redis://`, and `rediss://`.
+Use `redis://` only for an intentionally plaintext connection. `rediss://`
+performs certificate verification and never retries as plaintext. Redis ACL
+username and password authentication, password-only authentication, and
+database paths are preserved during connection setup. Percent-encode reserved
+characters in credentials, such as `%40` for `@` and `%2F` for `/`; environment
+interpolation does not URL-encode a value for you.
+
+Configuration loading validates the URL, supported scheme, database syntax,
+TLS field combinations, PEM material, and client certificate/key match. It
+does not contact Redis. The first L2 operation opens the connection and performs
+TLS, `AUTH`, and `SELECT`, so an unreachable service or a server-side trust,
+authentication, or database rejection appears at runtime. Query parameters,
+URL fragments such as `#insecure`, negative databases, and a username without
+a password are rejected instead of being weakened.
+
+Pool size, pool acquisition timeout, connection timeout, and command timeout
+are not exposed through `params`. The built-in pool size is 8 and each timeout
+defaults to 5 seconds.
+
+AI context compression with `summary_buffer` reuses this same validated DSN,
+private CA, client certificate, and client key. The compression block does not
+accept a separate Redis connection.
+
+Do not roll a secure deployment back to a release that predates these fields.
+Older releases are safe only for unauthenticated plaintext database-zero
+deployments because they did not preserve TLS, authentication, or database
+selection.
 
 ### messenger_settings
 
@@ -611,7 +640,7 @@ Supported drivers and their `params` keys:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `dsn` | string | `redis://127.0.0.1:6379` | Redis connection string. Same parsing rules as the L2 cache `dsn`. |
+| `dsn` | string | `redis://127.0.0.1:6379` | Redis messenger connection string. The secure L2 fields and connection behavior described above do not apply to `messenger_settings`. |
 
 `sqs` (all required):
 
@@ -3965,7 +3994,11 @@ proxy:
 
 ## Redis integration
 
-Redis has two roles in SBproxy: distributed caching (L2 cache) and real-time messaging (config sync, cache invalidation). Both blocks are nested under `proxy:`.
+Redis has two roles in SBproxy: distributed caching and shared state through the
+general L2 store, plus real-time messaging for config sync and cache
+invalidation. Both blocks are nested under `proxy`, but they use separate
+connection implementations. The verified TLS, authentication, database, and
+client-certificate contract in this section applies to `l2_cache_settings`.
 
 ### L2 cache (distributed rate limiting and caching)
 
@@ -3974,10 +4007,20 @@ proxy:
   l2_cache_settings:
     driver: redis
     params:
-      dsn: redis://redis.internal:6379/0
+      dsn: rediss://cache-user:${REDIS_PASSWORD_URLENCODED}@redis.internal:6380/7
+      ca_file: /etc/sbproxy/redis/ca.pem
+      cert_file: /etc/sbproxy/redis/client.pem
+      key_file: /etc/sbproxy/redis/client-key.pem
 ```
 
-When configured, rate limit counters are shared across all proxy instances. Response cache entries can also be stored in Redis for shared caching. The deserializer also accepts `l2_cache:` as a canonical alias.
+When configured, rate limit counters are shared across all proxy instances.
+Response cache entries can also be stored in Redis for shared caching. The
+deserializer accepts `l2_cache:` as an alias. See
+[`l2_cache_settings`](#l2_cache_settings) for legacy address compatibility,
+verified TLS, credential encoding, database selection, startup validation, and
+lazy connection behavior. The runnable
+[`redis-l2-secure`](../examples/redis-l2-secure/) example exercises private-CA
+verification, client mTLS, password authentication, and database 7.
 
 ### Messenger (real-time config updates)
 
@@ -3993,7 +4036,7 @@ When configured, config changes pushed via the API propagate to all proxy instan
 
 The Redis driver expects `params.dsn`. SQS uses `queue_url`, `region`, `api_key`. GCP Pub/Sub uses `project`, `topic`, `subscription`, `access_token`. The `memory` driver takes no params and is single-replica only.
 
-### Full Redis setup
+### L2 plus messenger setup
 
 ```yaml
 proxy:
@@ -4002,7 +4045,10 @@ proxy:
   l2_cache_settings:
     driver: redis
     params:
-      dsn: redis://redis.internal:6379/0
+      dsn: rediss://cache-user:${REDIS_PASSWORD_URLENCODED}@redis.internal:6380/7
+      ca_file: /etc/sbproxy/redis/ca.pem
+      cert_file: /etc/sbproxy/redis/client.pem
+      key_file: /etc/sbproxy/redis/client-key.pem
   messenger_settings:
     driver: redis
     params:
@@ -4018,8 +4064,12 @@ origins:
         requests_per_minute: 100
     response_cache:
       enabled: true
-      ttl_secs: 300
+      ttl_seconds: 300
 ```
+
+The messenger DSN above is intentionally shown separately. Do not add the L2
+TLS file fields under `messenger_settings` or assume that the messenger inherits
+the L2 connection.
 
 ---
 

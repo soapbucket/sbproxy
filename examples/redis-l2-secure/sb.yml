@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Development-only Redis L2 example with verified TLS, mTLS, password auth,
+# and logical database 7. Generate the ignored certs/ files before validation.
+
+proxy:
+  http_bind_port: 8080
+  l2_cache_settings:
+    driver: redis
+    params:
+      dsn: "rediss://default:${REDIS_PASSWORD}@localhost:6380/7"
+      ca_file: "${REDIS_CA_FILE:-examples/redis-l2-secure/certs/ca.pem}"
+      cert_file: "${REDIS_CLIENT_CERT_FILE:-examples/redis-l2-secure/certs/client.pem}"
+      key_file: "${REDIS_CLIENT_KEY_FILE:-examples/redis-l2-secure/certs/client.key}"
+
+origins:
+  "redis-l2.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    response_cache:
+      enabled: true
+      ttl_seconds: 60
+      cache_control: false

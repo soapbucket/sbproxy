@@ -1,5 +1,5 @@
 # Troubleshooting
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-18*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -21,7 +21,7 @@ Jump by symptom:
 | No traces in the backend | [Traces never arrive at the collector](#traces-never-arrive-at-the-collector) |
 | Admin port dead or 401/403 | [The admin server is unreachable or rejects you](#the-admin-server-is-unreachable-or-rejects-you) |
 | Dashboards empty | [Grafana dashboards show no data](#grafana-dashboards-show-no-data) |
-| Cluster limits or shared cache misbehaving | [Redis went down and cluster behavior changed](#redis-went-down-and-cluster-behavior-changed) |
+| Cluster limits or shared cache misbehaving | [Redis shared state is degraded](#redis-shared-state-is-degraded) |
 | TLS errors | [TLS handshake fails](#tls-handshake-fails) |
 | Cert expiring, renewal not happening | [ACME renewal is failing](#acme-renewal-is-failing) |
 | No HTTP/3 | [HTTP/3 requests fall back to HTTP/2](#http3-requests-fall-back-to-http2) |
@@ -176,15 +176,81 @@ Check:
 - Send some traffic. Counters that have never incremented emit no series, and a fresh proxy with zero requests renders empty panels that look broken but are not.
 - Alert panels need the recording rules: `dashboards/prometheus/alerts.yml` references series computed by `dashboards/prometheus/recording-rules.yml`, so load both files.
 
-## Redis went down and cluster behavior changed
+## Redis shared state is degraded
 
-With `proxy.l2_cache_settings` on Redis, an outage does not stop traffic, but shared state degrades to per-node until it reconnects.
+With `proxy.l2_cache_settings` on Redis, a runtime connection failure does not
+stop general traffic. Shared response cache and rate-limit state degrade to
+per-process behavior until Redis recovers. `summary_buffer` also fails open for
+the primary AI request, but it does not create worker-local summary state.
 
 Check:
-- Expected during the outage: rate-limit counters go node-local (a multi-replica fleet lets slightly more traffic through a global limit), and response-cache entries written meanwhile stay local. This is the designed fallback behavior; see [degradation.md](degradation.md).
-- There is no dedicated Redis metric family; confirm the outage in the logs, where failed Redis operations surface as errors on the rate-limit and cache paths.
-- Reconnection is automatic: the client connects lazily and re-establishes the connection on the next operation once Redis is back. There is nothing to restart; fix Redis and the proxy re-attaches.
-- Alert on this when running clustered, since the visible symptom (limits slightly leaky, cache hit rate down) is easy to miss.
+
+- Run `sbproxy validate --config sb.yml` with the required secret environment
+  already set. Do not print the expanded DSN. Validation catches malformed or
+  unsupported schemes, query strings, fragments, bad database syntax, missing
+  certificate/key partners, unreadable PEM files, and a mismatched client key.
+- Remember that validation does not contact Redis. The first L2 operation
+  performs TLS, `AUTH`, and `SELECT`, so trust, credential, server-side database,
+  and reachability failures appear only when traffic uses shared state.
+- Check that the SBproxy process can read `ca_file`, `cert_file`, and `key_file`.
+  `openssl x509 -in <file> -noout -subject -issuer` safely checks certificate
+  parsing. Let `sbproxy validate` check that the client certificate and key
+  match, rather than dumping either file.
+- Test Redis without putting the password or DSN on the command line. Set
+  `REDISCLI_AUTH` in the command environment and pass the host, port, CA, client
+  certificate, client key, username, and database as separate `redis-cli`
+  options. Run `PING` or `DBSIZE`; do not run `KEYS`, `SCAN`, or `GET` during a
+  privacy-sensitive incident.
+- Expected during an outage: rate-limit counters become node-local, and
+  response-cache entries written during the outage stay local. See
+  [degradation.md](degradation.md).
+- Reconnection is automatic. Broken connections leave the pool, and a later
+  operation opens a new connection. Fix Redis or the trust/authentication
+  configuration, then send a new cache miss or shared-state operation. SBproxy
+  does not need a restart when the configured connection material is unchanged.
+
+The runtime error reason points at the next check without exposing the Redis
+response:
+
+| Reason | Check |
+|---|---|
+| `pool_timeout` | Pool saturation or an operation holding a slot too long |
+| `connect_timeout` | Reachability and time spent in TCP, TLS, `AUTH`, or `SELECT` setup |
+| `command_timeout` | Redis command latency and server load |
+| `tls` | CA trust, server name, client certificate, and client key |
+| `auth` | ACL username and password; percent-encoding of reserved URL characters |
+| `transport` | Listener, network, reset, or dropped connection |
+| `server` | Redis application errors, including a server-side `SELECT` rejection |
+| `protocol` | Invalid or unexpected Redis protocol data |
+
+Health logging is transition-based. The first failure from an unknown or
+healthy state is `WARN`, repeated failures are `DEBUG`, and the first successful
+operation after failure is `INFO`. Safe events look like this:
+
+```text
+WARN operation="get" reason="tls" redis store health failed
+INFO operation="get" redis store health recovered
+```
+
+The three Redis L2 metric families use only closed labels:
+
+```bash
+curl -fsS http://127.0.0.1:8080/metrics |
+  grep -E '^(# (HELP|TYPE) sbproxy_redis_kv_|sbproxy_redis_kv_)'
+```
+
+- `sbproxy_redis_kv_connections_total{result}` uses `success` or `error`.
+- `sbproxy_redis_kv_operation_duration_seconds{operation}` uses `get`, `set`,
+  `set_ttl`, `delete`, `increment`, `lock`, `unlock`, or `scan`.
+- `sbproxy_redis_kv_operation_errors_total{operation,reason}` uses the operation
+  values above and `pool_timeout`, `connect_timeout`, `command_timeout`, `tls`,
+  `auth`, `transport`, `server`, or `protocol`.
+
+No Redis metric or transition log includes the endpoint, tenant, application
+key, username, database, credential, certificate path, or free-form server
+error. Alert on connection errors or operation errors when running more than
+one replica because the application can continue while shared-state guarantees
+are degraded.
 
 ## TLS handshake fails
 

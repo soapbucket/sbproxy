@@ -17,7 +17,7 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 |---|---|---|---|---|
 | Upstream target (`proxy` or `load_balancer`) | Connection error / timeout | Active health checks + outlier detection + circuit breaker eject the target. Retries pick the next healthy peer. With every target ejected, the LB falls back to the unfiltered list rather than 502'ing the client. | Auto on next probe success / breaker recovery window | `sbproxy_requests_total{status}`, `sbproxy_origin_requests_total{origin,method,status}` |
 | AI provider (OpenAI, Anthropic, OpenRouter, ...) | 5xx, timeout, rate-limit | Routing strategy picks the next provider in the chain (`fallback_chain` / `cost_optimized`). All-providers-failed returns 502. | Auto on next successful request | `sbproxy_ai_failovers_total`, `sbproxy_ai_provider_errors_total` |
-| Redis (`proxy.l2_cache_settings`) | Connection / command failure | General response caching and rate limiting fall back to per-process behavior. AI `summary_buffer` state never falls back to worker memory: that lever fails open, preserves the last committed message list, and lets later levers run. | Auto-reconnect; summary updates resume on a later request | `sbproxy_ai_compression_state_operations_total`, `sbproxy_ai_compression_redis_coordination_total` for compression state |
+| Redis (`proxy.l2_cache_settings`) | Connection, TLS, authentication, database selection, protocol, or command failure | General response caching and rate limiting fall back to per-process behavior. AI `summary_buffer` state never falls back to worker memory: that lever fails open, preserves the last committed message list, and lets later levers run. | A later operation opens a fresh connection automatically; summary updates resume on a later request | `sbproxy_redis_kv_connections_total`, `sbproxy_redis_kv_operation_duration_seconds`, `sbproxy_redis_kv_operation_errors_total`, plus the compression state metrics |
 | Dedicated AI compression summarizer | Timeout, provider failure, invalid output, policy denial, or budget denial | `summary_buffer` skips safe admission denials or fails open on runtime errors. The primary AI request continues with the last committed messages, and a later `window_fit` lever still runs. | Next eligible request retries under the configured policy and timeout | `sbproxy_ai_compression_lever_total`, `sbproxy_ai_compression_requests_total`, `sbproxy_ai_compression_duration_seconds` |
 | Governed-key budget backend (`key_management.governance.backend`, strict tier only) | Connection / command failure | Only affects keys governed under `consistency: strict`. The default `approximate` tier does not depend on this backend at all; its per-node counters keep disseminating over the cluster mesh. For a strict key, a reserve call that cannot reach the backend denies the request (`503`) by default (`failure_mode: closed`); `failure_mode: allow_unreserved` admits it instead without a reservation. A settle call on an already-admitted request is unaffected by `failure_mode` and stays best-effort. | Auto-reconnect; enforcement resumes on the next successful call | `sbproxy_governance_fail_open_total{key_id}` on `allow_unreserved`; also logged at WARN (fail-open/fail-closed) or DEBUG (other reserve/settle errors) |
 | ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
@@ -111,20 +111,37 @@ action:
 
 ---
 
-### Redis (l2 cache + cross-replica state)
+### Redis L2 cache and cross-replica state
 
-**When down:** Redis connect or command fails.
+**When down:** a lazy Redis connection can fail during TCP setup, verified TLS,
+authentication, or database selection. An established connection can fail on a
+pool deadline, command deadline, transport error, server error, or protocol
+error. Invalid DSN syntax, unsupported query parameters or fragments, and bad
+local PEM material are configuration errors caught before the runtime starts;
+they do not enter degradation mode.
 
-**Fallback:** for the general L2 consumers, the proxy keeps using the per-origin in-memory cache. Rate-limit counters become node-local; with multiple replicas, slightly more traffic may sneak through the global limit until Redis recovers. Response cache entries written during the outage are local and not shared. Reconnects use exponential backoff with a circuit breaker so a sustained outage does not pile up retry attempts.
+**Fallback:** for the general L2 consumers, the proxy keeps using the per-origin
+in-memory cache. Rate-limit counters become node-local; with multiple replicas,
+slightly more traffic may pass the global limit until Redis recovers. Response
+cache entries written during the outage are local and not shared. A broken
+pooled connection is discarded. A later operation can open a fresh connection,
+so recovery does not require an SBproxy restart.
 
 AI context summary state is intentionally different. When an AI handler selects
 `compression.state.backend: redis`, Redis is the only canonical summary store.
-On a connection or command failure, `summary_buffer` records
+On a connection, TLS, authentication, database, or command failure,
+`summary_buffer` records
 `state_unavailable`, preserves the last committed message list, and continues
 to later levers and upstream dispatch. It never creates a worker-local summary
-fork.
+fork. The compression runtime uses its existing bounded async reconnect policy
+and inherits the same validated L2 DSN and TLS material.
 
-**Log level:** `ERROR` on initial disconnect, `WARN` per reconnect attempt, `INFO` on recovery.
+**Log level:** the general L2 store emits one content-free `WARN` when health
+moves from unknown or healthy to failed. Repeated failures in the failed state
+are `DEBUG`. The first successful operation after failure emits one
+content-free `INFO` recovery event. These events contain only the closed
+`operation` and `reason` values. They do not contain a DSN, endpoint, username,
+database, key, value, or certificate path.
 
 **Alert:** yes when running clustered. Redis unavailability degrades multi-replica consistency.
 
@@ -134,8 +151,24 @@ proxy:
   l2_cache_settings:
     driver: redis
     params:
-      dsn: redis://redis.internal:6379/0
+      dsn: rediss://cache-user:${REDIS_PASSWORD_URLENCODED}@redis.internal:6380/7
+      ca_file: /etc/sbproxy/redis/ca.pem
+      cert_file: /etc/sbproxy/redis/client.pem
+      key_file: /etc/sbproxy/redis/client-key.pem
 ```
+
+The synchronous L2 store exposes three bounded metric families:
+
+| Metric | Labels |
+|---|---|
+| `sbproxy_redis_kv_connections_total` | `result`: `success` or `error` |
+| `sbproxy_redis_kv_operation_duration_seconds` | `operation`: `get`, `set`, `set_ttl`, `delete`, `increment`, `lock`, `unlock`, or `scan` |
+| `sbproxy_redis_kv_operation_errors_total` | `operation` above and `reason`: `pool_timeout`, `connect_timeout`, `command_timeout`, `tls`, `auth`, `transport`, `server`, or `protocol` |
+
+Every general L2 call records one duration observation. A failed call adds one
+error count, and each new connection attempt adds one connection result. None
+of these labels includes an endpoint, tenant, application key, username,
+database, or free-form error text.
 
 For strict Redis leases, fences, coordination events, and the full fail-open
 table, see [AI context compression](ai-context-compression.md).
