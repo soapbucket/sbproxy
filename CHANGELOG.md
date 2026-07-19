@@ -12,6 +12,15 @@ the next version cut.
 
 ### Added
 
+- **Request-selectable AI context compression.** Declare named route-local
+  profiles and explicit input budgets, then select them through
+  `X-Compression`, governed virtual keys, or CEL with deterministic precedence
+  and safe invalid-selector behavior. Stateful summaries use Redis as the
+  canonical session store while request workers remain stateless; authenticated
+  Admin APIs list, inspect metadata for, and purge that state. Per-lever token
+  and gross-cost savings now appear in bounded metrics, structured logs,
+  dashboards, and the model-host value report, with a deterministic synthetic
+  evaluation harness guarding production window-fit behavior.
 - **MCP tool rollout plane.** Publish several versions of one tool at once
   and roll out breaking changes without breaking callers: a `rollout:` block
   under the `mcp` action's `tool_versioning` declares versions, where each
