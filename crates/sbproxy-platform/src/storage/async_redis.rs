@@ -22,7 +22,10 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use redis::{aio::ConnectionManager, Client, ErrorKind, FromRedisValue};
+use redis::{
+    aio::{ConnectionManager, ConnectionManagerConfig},
+    Client, ErrorKind, FromRedisValue,
+};
 use tokio::sync::Mutex;
 
 use super::async_kv::AsyncKVStore;
@@ -154,15 +157,23 @@ impl AsyncRedisKVStore {
         // Slow path: establish the connection without holding the lock.
         let client =
             Client::open(self.config.url.as_str()).context("invalid Redis connection URL")?;
-        let manager = ConnectionManager::new_with_backoff_and_timeouts(
-            client,
-            RECONNECT_EXPONENT_BASE,
-            RECONNECT_DELAY_FACTOR_MS,
-            RECONNECT_RETRIES,
-            self.timeouts.response,
+        let manager_config = ConnectionManagerConfig::new()
+            .set_exponent_base(RECONNECT_EXPONENT_BASE)
+            .set_factor(RECONNECT_DELAY_FACTOR_MS)
+            .set_number_of_retries(RECONNECT_RETRIES)
+            .set_response_timeout(self.timeouts.response)
+            .set_connection_timeout(self.timeouts.connect);
+        let manager = tokio::time::timeout(
             self.timeouts.connect,
+            ConnectionManager::new_with_config(client, manager_config),
         )
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "connecting to Redis exceeded the {} ms connection-setup deadline",
+                self.timeouts.connect.as_millis()
+            )
+        })?
         .context("connecting to Redis")?;
         let candidate = CachedConnection {
             generation: self

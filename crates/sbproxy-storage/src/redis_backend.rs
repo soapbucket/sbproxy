@@ -694,44 +694,44 @@ impl StreamKv for RedisStore {
 fn parse_xread_reply(raw: &redis::Value) -> Vec<StreamEntry> {
     use redis::Value as V;
     let streams = match raw {
-        V::Bulk(s) => s,
+        V::Array(s) => s,
         _ => return Vec::new(),
     };
     let mut out = Vec::new();
     for stream in streams {
         let parts = match stream {
-            V::Bulk(p) if p.len() == 2 => p,
+            V::Array(p) if p.len() == 2 => p,
             _ => continue,
         };
         let entries = match &parts[1] {
-            V::Bulk(e) => e,
+            V::Array(e) => e,
             _ => continue,
         };
         for entry in entries {
             let pair = match entry {
-                V::Bulk(p) if p.len() == 2 => p,
+                V::Array(p) if p.len() == 2 => p,
                 _ => continue,
             };
             let id = match &pair[0] {
-                V::Data(b) => String::from_utf8_lossy(b).into_owned(),
-                V::Status(s) => s.clone(),
+                V::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                V::SimpleString(s) => s.clone(),
                 _ => continue,
             };
             let fields = match &pair[1] {
-                V::Bulk(fv) => fv,
+                V::Array(fv) => fv,
                 _ => continue,
             };
             let mut field_vec = Vec::with_capacity(fields.len() / 2);
             let mut iter = fields.iter();
             while let (Some(fv), Some(vv)) = (iter.next(), iter.next()) {
                 let field = match fv {
-                    V::Data(b) => String::from_utf8_lossy(b).into_owned(),
-                    V::Status(s) => s.clone(),
+                    V::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                    V::SimpleString(s) => s.clone(),
                     _ => continue,
                 };
                 let value = match vv {
-                    V::Data(b) => Bytes::from(b.clone()),
-                    V::Status(s) => Bytes::from(s.clone().into_bytes()),
+                    V::BulkString(b) => Bytes::from(b.clone()),
+                    V::SimpleString(s) => Bytes::from(s.clone().into_bytes()),
                     _ => continue,
                 };
                 field_vec.push((field, value));
@@ -867,16 +867,22 @@ mod tests {
     fn parse_xread_reply_handles_well_formed_reply() {
         use redis::Value as V;
         // [["mystream", [["1-0", ["field1", "v1"]], ["2-0", ["field2", "v2"]]]]]
-        let reply = V::Bulk(vec![V::Bulk(vec![
-            V::Data(b"mystream".to_vec()),
-            V::Bulk(vec![
-                V::Bulk(vec![
-                    V::Data(b"1-0".to_vec()),
-                    V::Bulk(vec![V::Data(b"field1".to_vec()), V::Data(b"v1".to_vec())]),
+        let reply = V::Array(vec![V::Array(vec![
+            V::BulkString(b"mystream".to_vec()),
+            V::Array(vec![
+                V::Array(vec![
+                    V::BulkString(b"1-0".to_vec()),
+                    V::Array(vec![
+                        V::BulkString(b"field1".to_vec()),
+                        V::BulkString(b"v1".to_vec()),
+                    ]),
                 ]),
-                V::Bulk(vec![
-                    V::Data(b"2-0".to_vec()),
-                    V::Bulk(vec![V::Data(b"field2".to_vec()), V::Data(b"v2".to_vec())]),
+                V::Array(vec![
+                    V::BulkString(b"2-0".to_vec()),
+                    V::Array(vec![
+                        V::BulkString(b"field2".to_vec()),
+                        V::BulkString(b"v2".to_vec()),
+                    ]),
                 ]),
             ]),
         ])]);

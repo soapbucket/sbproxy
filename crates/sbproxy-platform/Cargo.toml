@@ -28,7 +28,7 @@ ureq = { version = "2", features = ["json"] }
 # `macros`+`net` are required by the async Redis client (AsyncRedisKVStore).
 tokio = { workspace = true, features = ["rt", "macros", "sync", "net"] }
 # Async Redis client for AsyncRedisKVStore, including rustls for `rediss://`.
-redis = { version = "0.25", default-features = false, features = ["connection-manager", "tokio-rustls-comp"] }
+redis = { version = "0.28.1", default-features = false, features = ["connection-manager", "tokio-rustls-comp"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 

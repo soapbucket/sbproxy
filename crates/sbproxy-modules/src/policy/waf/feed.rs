@@ -863,16 +863,16 @@ enum FetchOutcome {
 // --- Helpers ---
 
 /// Extract a Redis stream entry field as raw bytes. Stream values
-/// arrive as [`redis::Value::Data`] (RESP2 bulk-string) or
-/// [`redis::Value::Status`] (inline string); anything else is
+/// arrive as [`redis::Value::BulkString`] (RESP2 bulk-string) or
+/// [`redis::Value::SimpleString`] (inline string); anything else is
 /// treated as missing.
 fn bytes_field(
     map: &std::collections::HashMap<String, redis::Value>,
     name: &str,
 ) -> Option<Vec<u8>> {
     match map.get(name)? {
-        redis::Value::Data(b) => Some(b.clone()),
-        redis::Value::Status(s) => Some(s.as_bytes().to_vec()),
+        redis::Value::BulkString(b) => Some(b.clone()),
+        redis::Value::SimpleString(s) => Some(s.as_bytes().to_vec()),
         _ => None,
     }
 }
