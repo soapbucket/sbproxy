@@ -7,6 +7,7 @@
 pub mod agent_verify;
 pub mod cookie;
 pub mod crypto;
+pub mod egress;
 #[cfg(feature = "tls-fingerprint")]
 pub mod headless_detect;
 pub mod hostfilter;
@@ -28,6 +29,11 @@ pub use crypto::{
 pub use headless_detect::{
     detect as detect_headless, HeadlessSignal as HeadlessDetectSignal, TlsFingerprintCatalog,
     TlsFingerprintEntry,
+};
+pub use egress::{
+    AuthorizedDestination, EgressAuthorizer, EgressConfig, EgressDenied, EgressPurpose,
+    GovernedHttpClient, GovernedHttpResponse, GovernedRedirectSeam, HostResolver,
+    PurposeAllowlist, RedirectDecision,
 };
 pub use hostfilter::HostFilter;
 pub use ip::{ip_in_cidrs, is_private_ip, parse_cidrs};

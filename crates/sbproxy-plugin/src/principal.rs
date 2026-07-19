@@ -302,6 +302,42 @@ impl Principal {
     }
 }
 
+/// Subject identity for run-as-user / delegated MCP execution.
+///
+/// Carries only identifiers and type tags. Never secrets, tokens, or
+/// raw credentials; G3 wires the actual impersonation path against this
+/// shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationSubject {
+    /// Stable subject identifier being delegated to (user id, service
+    /// account id, …). Never a secret.
+    pub subject_id: String,
+    /// Kind of subject (`user`, `service`, …). Open string so out-of-tree
+    /// plugins can introduce new kinds without a schema bump.
+    pub subject_type: String,
+}
+
+/// Borrowed execution context for an MCP tool invocation.
+///
+/// Threads the inbound [`Principal`], correlation ids, and optional
+/// run-as-user delegation through federation / policy hooks without
+/// copying. G1 quarantine and G3 run-as-user lanes adopt this shape;
+/// this lane only freezes the type.
+#[derive(Debug, Clone, Copy)]
+pub struct McpExecutionContext<'a> {
+    /// Inbound principal that authenticated the request.
+    pub principal: &'a Principal,
+    /// Request / correlation id for audit and tracing.
+    pub request_id: &'a str,
+    /// Optional MCP session id when the call is session-scoped.
+    pub session_id: Option<&'a str>,
+    /// Optional OpenAI Apps SDK / SEP-1865 `params.audit.cause`.
+    pub audit_cause: Option<&'a str>,
+    /// Optional run-as-user / delegation subject. Absent for
+    /// non-delegated calls.
+    pub delegation: Option<&'a DelegationSubject>,
+}
+
 // --- Credential model ---
 
 /// Where a credential's secret material lives. Mirrors today's
@@ -423,6 +459,28 @@ mod tests {
         assert_eq!(p.api_key_id(), "");
         p.attrs.key_id = Some("billing-prod-01".to_string());
         assert_eq!(p.api_key_id(), "billing-prod-01");
+    }
+
+    /// `McpExecutionContext` borrows principal + optional delegation
+    /// without copying; fields stay accessible for the borrow duration.
+    #[test]
+    fn mcp_execution_context_borrows_principal_and_delegation() {
+        let principal = Principal::anonymous();
+        let delegation = DelegationSubject {
+            subject_id: "user-42".to_string(),
+            subject_type: "user".to_string(),
+        };
+        let ctx = McpExecutionContext {
+            principal: &principal,
+            request_id: "req-1",
+            session_id: Some("sess-9"),
+            audit_cause: Some("button.click"),
+            delegation: Some(&delegation),
+        };
+        assert!(ctx.principal.is_anonymous());
+        assert_eq!(ctx.request_id, "req-1");
+        assert_eq!(ctx.session_id, Some("sess-9"));
+        assert_eq!(ctx.delegation.map(|d| d.subject_id.as_str()), Some("user-42"));
     }
 
     /// Adding any attribute makes the principal non-anonymous.
