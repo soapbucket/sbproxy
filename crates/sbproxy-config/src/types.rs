@@ -2152,10 +2152,21 @@ pub struct L2CacheConfig {
 /// (auth, pool size) without churning the parent struct.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 pub struct L2CacheParams {
-    /// Connection DSN. For `redis` drivers this is a `redis://host:port[/db]`
-    /// URL. Only the host:port portion is parsed today; the DB index is ignored.
+    /// Redis connection DSN. Supports `redis://`, `rediss://`, credentials,
+    /// bracketed IPv6 addresses, and a non-negative logical database.
     #[serde(default)]
     pub dsn: String,
+    /// Optional path to PEM-encoded Redis trust anchors for a private CA.
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    /// Optional path to a PEM-encoded Redis client certificate chain.
+    /// Must be configured together with `key_file` and requires `rediss://`.
+    #[serde(default)]
+    pub cert_file: Option<String>,
+    /// Optional path to the PEM-encoded Redis client private key.
+    /// Must be configured together with `cert_file` and requires `rediss://`.
+    #[serde(default)]
+    pub key_file: Option<String>,
 }
 
 // --- Cache Reserve Config ---

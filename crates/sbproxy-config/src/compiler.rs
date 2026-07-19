@@ -4,6 +4,8 @@
 //! performance-optimized `CompiledConfig` / `CompiledOrigin` types that
 //! the proxy runtime works with.
 
+use std::fs::File;
+use std::io::Read;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -14,18 +16,22 @@ use sbproxy_platform::messenger::redis::RedisMessengerConfig;
 use sbproxy_platform::messenger::{
     GcpPubSubMessenger, MemoryMessenger, Messenger, RedisMessenger, SqsMessenger,
 };
-use sbproxy_platform::storage::{KVStore, RedisConfig, RedisKVStore};
+use sbproxy_platform::storage::{
+    KVStore, RedisConfig, RedisKVStore, RedisTlsConfig, ValidatedRedisConnection,
+};
 use smallvec::SmallVec;
 
 use crate::snapshot::{CompiledConfig, CompiledOrigin};
-use crate::types::{ConfigFile, L2CacheConfig, MessengerSettings, RawOriginConfig};
+use crate::types::{ConfigFile, L2CacheConfig, L2CacheParams, MessengerSettings, RawOriginConfig};
+
+const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
 
 /// Extract the Redis host:port pair from a DSN like `redis://host:6379/0`.
 ///
 /// Accepts either a bare `host:port` form (as used by the raw RESP client)
 /// or a `redis://[user[:pass]@]host:port[/db]` URL. The database index is
 /// ignored since the single-connection RESP client does not issue SELECT.
-fn parse_redis_addr(dsn: &str) -> Result<String> {
+fn parse_redis_messenger_addr(dsn: &str) -> Result<String> {
     let s = dsn.trim();
     let without_scheme = s
         .strip_prefix("redis://")
@@ -56,22 +62,62 @@ fn parse_redis_addr(dsn: &str) -> Result<String> {
     }
 }
 
+fn read_redis_tls_file(path: &str, error: &'static str) -> Result<Vec<u8>> {
+    let file = File::open(path).map_err(|_| anyhow::anyhow!(error))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REDIS_TLS_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!(error))?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_REDIS_TLS_FILE_BYTES {
+        return Err(anyhow::anyhow!(error));
+    }
+    Ok(bytes)
+}
+
+fn read_optional_redis_tls_file(
+    path: Option<&str>,
+    error: &'static str,
+) -> Result<Option<Vec<u8>>> {
+    path.map(|path| read_redis_tls_file(path, error))
+        .transpose()
+}
+
+/// Compile the Redis connection shared by the blocking L2 store and async
+/// compression state without opening a network connection.
+///
+/// # Errors
+///
+/// Returns a static, redacted error when the DSN, TLS field combination, file
+/// contents, or client identity is invalid.
+pub fn build_l2_redis_connection(params: &L2CacheParams) -> Result<ValidatedRedisConnection> {
+    let tls = RedisTlsConfig {
+        root_cert: read_optional_redis_tls_file(
+            params.ca_file.as_deref(),
+            "invalid Redis ca_file configuration",
+        )?,
+        client_cert: read_optional_redis_tls_file(
+            params.cert_file.as_deref(),
+            "invalid Redis cert_file configuration",
+        )?,
+        client_key: read_optional_redis_tls_file(
+            params.key_file.as_deref(),
+            "invalid Redis key_file configuration",
+        )?,
+    };
+    ValidatedRedisConnection::new(&params.dsn, tls)
+}
+
 /// Build a concrete `KVStore` for the given L2 cache config.
 ///
 /// # Errors
 ///
-/// Returns an error if the configured `driver` is not recognized, or if
-/// the `redis` driver is selected and its DSN cannot be parsed into a
-/// `host:port` address.
+/// Returns an error if the configured `driver` is not recognized or if the
+/// Redis connection and TLS configuration is invalid.
 pub fn build_l2_store(cfg: &L2CacheConfig) -> Result<Arc<dyn KVStore>> {
     match cfg.driver.as_str() {
         "redis" => {
-            let addr = parse_redis_addr(&cfg.params.dsn)
-                .with_context(|| format!("invalid redis DSN '{}'", cfg.params.dsn))?;
-            Ok(Arc::new(RedisKVStore::new(RedisConfig {
-                addr,
-                ..RedisConfig::default()
-            })))
+            let connection = build_l2_redis_connection(&cfg.params)?;
+            Ok(Arc::new(RedisKVStore::new(RedisConfig::new(connection))))
         }
         other => anyhow::bail!("unsupported l2_cache driver: '{}'", other),
     }
@@ -115,7 +161,7 @@ pub fn build_messenger(settings: &MessengerSettings) -> Result<Arc<dyn Messenger
                 .get("dsn")
                 .cloned()
                 .unwrap_or_else(|| "redis://127.0.0.1:6379".to_string());
-            let addr = parse_redis_addr(&dsn)
+            let addr = parse_redis_messenger_addr(&dsn)
                 .with_context(|| format!("invalid redis messenger DSN '{}'", dsn))?;
             Ok(Arc::new(RedisMessenger::new(RedisMessengerConfig { addr })))
         }

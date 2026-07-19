@@ -76,10 +76,12 @@ fn redis_dependency(
     }
     match server.l2_cache.as_ref() {
         Some(config) if config.driver == "redis" => {
-            validate_redis_dsn(&config.params.dsn)?;
-            Ok(Some(AsyncRedisKVStore::new(AsyncRedisConfig::new(
-                &config.params.dsn,
-            ))))
+            let connection =
+                sbproxy_config::build_l2_redis_connection(&config.params).map_err(|_| {
+                    anyhow::anyhow!("Redis compression state has invalid connection configuration")
+                })?;
+            let async_config = AsyncRedisConfig::from_connection(connection);
+            Ok(Some(AsyncRedisKVStore::new(async_config)))
         }
         _ => Ok(None),
     }
@@ -93,20 +95,6 @@ pub(crate) fn redis_admin_store(
     let redis = redis_dependency(server, true).ok().flatten()?;
     let store = RedisCompressionStore::new(redis, RedisCompressionStoreConfig::default()).ok()?;
     Some(Arc::new(store))
-}
-
-fn validate_redis_dsn(dsn: &str) -> anyhow::Result<()> {
-    let parsed = url::Url::parse(dsn).context("Redis compression state has an invalid DSN")?;
-    if !matches!(parsed.scheme(), "redis" | "rediss")
-        || parsed.host_str().is_none()
-        || parsed.fragment().is_some()
-    {
-        bail!("Redis compression state has an invalid DSN");
-    }
-    AsyncRedisConfig::new(dsn)
-        .validate()
-        .map_err(|_| anyhow::anyhow!("Redis compression state has an invalid DSN"))?;
-    Ok(())
 }
 
 /// Immutable per-origin compression dependencies held by a pipeline snapshot.
@@ -574,7 +562,7 @@ fn destination_allowed(value: &str, allowed: &[String], blocked: &[String]) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_redis_dsn, CompressionExecution, CompressionRuntime, CompressionRuntimeRegistry,
+        redis_dependency, CompressionExecution, CompressionRuntime, CompressionRuntimeRegistry,
         RuntimeDependencies,
     };
     use async_trait::async_trait;
@@ -800,37 +788,76 @@ mod tests {
         .expect("handler fixture")
     }
 
-    #[test]
-    fn compression_redis_dsn_accepts_plaintext_and_tls_transports() {
-        assert!(validate_redis_dsn("redis://redis.internal:6379/0").is_ok());
-        assert!(validate_redis_dsn("rediss://redis.internal:6380/0").is_ok());
+    fn generated_redis_identity() -> (String, String) {
+        let tls_config = sbproxy_config::ProxyServerConfig {
+            https_bind_port: Some(443),
+            ..sbproxy_config::ProxyServerConfig::default()
+        };
+        let tls =
+            sbproxy_tls::TlsState::init(&tls_config, vec!["redis-client.example".to_string()])
+                .expect("initialize test TLS state");
+        tls.generate_self_signed_bootstrap_cert()
+            .expect("generate test Redis client identity")
+    }
+
+    fn server_with_l2(params: sbproxy_config::L2CacheParams) -> sbproxy_config::ProxyServerConfig {
+        sbproxy_config::ProxyServerConfig {
+            l2_cache: Some(sbproxy_config::L2CacheConfig {
+                driver: "redis".to_string(),
+                params,
+            }),
+            ..sbproxy_config::ProxyServerConfig::default()
+        }
     }
 
     #[test]
-    fn compression_redis_dsn_rejects_invalid_database_paths_before_startup() {
-        let error = validate_redis_dsn("redis://redis.internal/not-a-database")
-            .expect_err("Redis database selection must be parsed during validation");
+    fn compression_redis_reuses_private_ca_and_mtls_without_network_io() {
+        let (cert_file, key_file) = generated_redis_identity();
+        let server = server_with_l2(sbproxy_config::L2CacheParams {
+            dsn: "rediss://default:p%40ss@[::1]:6380/7".to_string(),
+            ca_file: Some(cert_file.clone()),
+            cert_file: Some(cert_file),
+            key_file: Some(key_file),
+        });
 
-        assert!(error.to_string().contains("invalid DSN"));
-        assert!(!format!("{error:#}").contains("redis://"));
+        let dependency = redis_dependency(&server, true)
+            .expect("valid Redis TLS configuration must compile without connecting");
+
+        assert!(dependency.is_some());
     }
 
     #[test]
-    fn compression_redis_dsn_rejects_negative_database_before_startup() {
-        let error = validate_redis_dsn("redis://redis.internal/-1")
-            .expect_err("Redis database selection must be non-negative");
+    fn compression_redis_rejects_the_same_tls_mismatch_as_l2_without_disclosure() {
+        let (cert_file, _) = generated_redis_identity();
+        let dsn = "redis://default:sentinel-compression-password@sentinel-compression-host.invalid:6379/7";
+        let server = server_with_l2(sbproxy_config::L2CacheParams {
+            dsn: dsn.to_string(),
+            ca_file: Some(cert_file),
+            ..sbproxy_config::L2CacheParams::default()
+        });
+        let l2_config = server.l2_cache.as_ref().expect("L2 config");
 
-        assert!(error.to_string().contains("invalid DSN"));
-        assert!(!format!("{error:#}").contains("redis://"));
-    }
+        let l2_error = match sbproxy_config::build_l2_store(l2_config) {
+            Ok(_) => panic!("blocking L2 store accepted plaintext TLS material"),
+            Err(error) => error,
+        };
+        let compression_error = match redis_dependency(&server, true) {
+            Ok(_) => panic!("compression state accepted plaintext TLS material"),
+            Err(error) => error,
+        };
 
-    #[test]
-    fn compression_redis_dsn_rejects_insecure_tls_escape_hatch() {
-        let error = validate_redis_dsn("rediss://redis.internal:6380/0#insecure")
-            .expect_err("compression state must never disable TLS certificate verification");
-
-        assert!(error.to_string().contains("invalid DSN"));
-        assert!(!format!("{error:#}").contains("rediss://"));
+        assert_eq!(
+            compression_error.to_string(),
+            "Redis compression state has invalid connection configuration"
+        );
+        for chain in [format!("{l2_error:#}"), format!("{compression_error:#}")] {
+            for forbidden in [dsn, "sentinel-compression", "/7"] {
+                assert!(
+                    !chain.contains(forbidden),
+                    "Redis configuration error exposed forbidden material: {chain}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -840,6 +867,7 @@ mod tests {
                 driver: "redis".to_string(),
                 params: sbproxy_config::L2CacheParams {
                     dsn: "redis.internal:6379".to_string(),
+                    ..sbproxy_config::L2CacheParams::default()
                 },
             }),
             ..sbproxy_config::ProxyServerConfig::default()

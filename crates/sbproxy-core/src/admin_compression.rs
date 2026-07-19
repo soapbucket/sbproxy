@@ -1084,6 +1084,7 @@ mod tests {
             driver: "redis".to_string(),
             params: sbproxy_config::L2CacheParams {
                 dsn: "redis://redis.internal:6379/0".to_string(),
+                ..sbproxy_config::L2CacheParams::default()
             },
         });
 
