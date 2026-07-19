@@ -4,6 +4,41 @@
 //! test catches that on every CI run.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+struct RedisTlsExampleFixtures {
+    _directory: tempfile::TempDir,
+    ca_file: String,
+    cert_file: String,
+    key_file: String,
+}
+
+fn redis_tls_example_fixtures() -> &'static RedisTlsExampleFixtures {
+    static FIXTURES: OnceLock<RedisTlsExampleFixtures> = OnceLock::new();
+    FIXTURES.get_or_init(|| {
+        let directory = tempfile::tempdir().expect("create Redis TLS example fixture directory");
+        let key = rcgen::KeyPair::generate().expect("generate Redis TLS example key");
+        let certificate = rcgen::CertificateParams::new(vec!["redis-client.example".to_string()])
+            .expect("create Redis TLS example certificate parameters")
+            .self_signed(&key)
+            .expect("self-sign Redis TLS example certificate");
+
+        let ca_file = directory.path().join("ca.pem");
+        let cert_file = directory.path().join("client.pem");
+        let key_file = directory.path().join("client.key");
+        std::fs::write(&ca_file, certificate.pem()).expect("write Redis TLS example CA");
+        std::fs::write(&cert_file, certificate.pem())
+            .expect("write Redis TLS example client certificate");
+        std::fs::write(&key_file, key.serialize_pem()).expect("write Redis TLS example client key");
+
+        RedisTlsExampleFixtures {
+            _directory: directory,
+            ca_file: ca_file.to_string_lossy().into_owned(),
+            cert_file: cert_file.to_string_lossy().into_owned(),
+            key_file: key_file.to_string_lossy().into_owned(),
+        }
+    })
+}
 
 fn examples_root() -> PathBuf {
     // sbproxy-config lives at crates/sbproxy-config/ inside the workspace.
@@ -73,10 +108,16 @@ fn export_example_env_dummies() {
         ),
         ("ENV_VAR", "dummy"),
         ("VAR", "dummy"),
+        ("REDIS_PASSWORD", "redis-example-dummy"),
     ];
     for (k, v) in DUMMIES {
         std::env::set_var(k, v);
     }
+
+    let redis = redis_tls_example_fixtures();
+    std::env::set_var("REDIS_CA_FILE", &redis.ca_file);
+    std::env::set_var("REDIS_CLIENT_CERT_FILE", &redis.cert_file);
+    std::env::set_var("REDIS_CLIENT_KEY_FILE", &redis.key_file);
 }
 
 #[test]
