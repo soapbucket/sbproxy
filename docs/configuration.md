@@ -1251,9 +1251,10 @@ available also fails pipeline construction instead of silently falling back:
 
 - `backend: redis` requires `proxy.l2_cache_settings.driver: redis`. For this
   feature, `params.dsn` must be a `redis://` or `rediss://` URL with a host.
-- `backend: mesh` is rejected because the current cluster cache does not offer
-  the replication, restart restore, ownership handoff, and delete guarantees
-  required for canonical summary state.
+- `backend: mesh` is rejected. `proxy.cluster.replication` supplies a durable
+  replicated substrate, but compression's legacy mesh adapter is not integrated
+  with or validated against `ReplicatedStore` for the required session and Admin
+  lifecycle semantics. That integration remains a separate, unshipped change.
 - `window_fit` is stateless and needs neither dependency.
 
 Request workers retain no conversational state between requests. The

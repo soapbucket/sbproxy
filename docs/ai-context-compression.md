@@ -355,12 +355,14 @@ async operations in the synchronous families.
 
 ## Why mesh is not a supported state backend
 
-`compression.state.backend` currently accepts only `redis`. The existing proxy
-mesh routes cache keys to one in-memory owner; it does not yet replicate,
-restore, hand off, or repair that state across topology changes. That is not a
-safe canonical store for sensitive running summaries or Admin deletion. SBproxy
-therefore rejects `backend: mesh` during configuration parsing instead of
-claiming restart safety or eventual convergence it cannot provide.
+`compression.state.backend` currently accepts only `redis`.
+`proxy.cluster.replication` provides a durable replicated mesh substrate with
+quorum consistency, restart recovery, ownership handoff, repair, and tombstone
+garbage collection. Compression's retained experimental mesh adapter still
+targets the legacy single-owner cache, however; it is not integrated with or
+validated against `ReplicatedStore` for session and Admin lifecycle semantics.
+SBproxy therefore rejects `backend: mesh` during configuration parsing.
+Enabling cluster replication does not change compression state behavior.
 
 ## Configuration reference
 

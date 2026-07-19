@@ -229,11 +229,13 @@ failures. An expired summary is never reused while Redis awaits physical TTL
 removal.
 
 Selecting `backend: redis` without the Redis L2 wiring is a startup
-configuration error. `backend: mesh` is rejected because the current mesh
-cache is not a durable replicated session store. Runtime failure-open behavior
-begins only after a valid pipeline has been built. Redis remains the only
-canonical summary store; worker memory and the mesh never become an implicit
-state fork.
+configuration error. `proxy.cluster.replication` supplies a durable replicated
+mesh substrate, but compression's legacy mesh adapter is not integrated with or
+validated against `ReplicatedStore` for session and Admin lifecycle semantics;
+public `backend: mesh` selection remains rejected. Runtime failure-open
+behavior begins only after a valid pipeline has been built. Redis remains the
+only canonical summary store; worker memory and the mesh never become an
+implicit state fork.
 
 **Log level:** the content-free `ai_compression_summary` event is `DEBUG` when
 all levers skip, `INFO` when at least one applies and none fail, and `WARN` when

@@ -1077,9 +1077,11 @@ OpenAI/Anthropic tool-call groupings.
 
 A stateful summary requires a captured session ID and the configured Redis L2
 service. Request workers retain no canonical session summary in process.
-`backend: mesh` is rejected until the cluster state substrate provides durable
-replicated session semantics. There is no OmniRoute dependency, import, or
-migration path.
+`proxy.cluster.replication` provides a durable replicated mesh substrate, but
+compression's legacy mesh adapter is not integrated with or validated against
+its `ReplicatedStore` session and Admin lifecycle semantics. Public
+`backend: mesh` selection therefore remains rejected as a separate, unshipped
+integration. There is no OmniRoute dependency, import, or migration path.
 The legacy `resilience.llm_aware.context_compress` switch remains a shorthand
 for one `window_fit` lever only when the explicit block is absent.
 
