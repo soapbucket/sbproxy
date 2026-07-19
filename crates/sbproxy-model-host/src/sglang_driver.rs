@@ -239,11 +239,17 @@ impl SGLangDriver {
 
     /// Probe fixed Python, torch, CUDA, and SGLang versions with bounded
     /// output, returning the bounded incompatibility reason on failure.
+    /// Run the compatibility probe and, on success, return the detected
+    /// SGLang package version so the caller can record what actually serves.
+    /// Mirrors the vLLM driver, which threads its probe's version into the
+    /// provisioned engine; the version then surfaces per replica in admin
+    /// status and the usage ledger (WOR-1906). Returns the reason string on
+    /// an incompatible environment.
     async fn compatibility_check(
         &self,
         mode: &SGLangLaunchMode,
         worker: &WorkerProfile,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         if let Some(reason) = worker_compatibility_error(worker) {
             return Err(reason);
         }
@@ -273,7 +279,7 @@ impl SGLangDriver {
             && payload.cuda.is_some()
             && payload.sglang.is_some();
         if payload.compatible && versions_present {
-            Ok(())
+            Ok(payload.sglang)
         } else {
             Err(bounded_reason(payload.reason.as_deref().unwrap_or(
                 "Python, torch, CUDA, or SGLang version is unavailable",
@@ -449,18 +455,26 @@ impl EngineDriver for SGLangDriver {
                 python: self.executable("python3").expect("validated python path"),
             }
         };
-        if let Err(reason) = self.compatibility_check(&mode, &request.worker).await {
-            return Err(EngineDriverError::new(
-                EngineFailureReason::EngineIncompatible,
-                reason,
-                "run model-host doctor and repair Python, torch, CUDA, or SGLang compatibility",
-                false,
-            ));
-        }
-        let (executable, version, fingerprint) = match mode {
-            SGLangLaunchMode::Binary { python } => {
-                (python.clone(), None, format!("path:{}", python.display()))
+        let probe_version = match self.compatibility_check(&mode, &request.worker).await {
+            Ok(version) => version,
+            Err(reason) => {
+                return Err(EngineDriverError::new(
+                    EngineFailureReason::EngineIncompatible,
+                    reason,
+                    "run model-host doctor and repair Python, torch, CUDA, or SGLang compatibility",
+                    false,
+                ));
             }
+        };
+        // Binary and container launches learn the exact SGLang version from
+        // the probe; a uv environment already pins it. Mirrors the vLLM
+        // driver so "what served this request" is answerable per replica.
+        let (executable, version, fingerprint) = match mode {
+            SGLangLaunchMode::Binary { python } => (
+                python.clone(),
+                probe_version,
+                format!("path:{}", python.display()),
+            ),
             SGLangLaunchMode::Uv {
                 executable,
                 sglang_version,
@@ -471,7 +485,7 @@ impl EngineDriver for SGLangDriver {
             ),
             SGLangLaunchMode::Container {
                 executable, image, ..
-            } => (executable, None, image),
+            } => (executable, probe_version, image),
         };
         Ok(ProvisionedEngine {
             kind: EngineKind::SGLang,
