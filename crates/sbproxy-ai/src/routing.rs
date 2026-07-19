@@ -859,14 +859,10 @@ impl Router {
             let snap = self.quota.snapshot(&p.name);
             let key = if snap.has_positive_capacity() {
                 (0u8, 0u128, pos)
-            } else if snap.quality
-                == crate::provider_ratelimit::QuotaSignalQuality::KnownFresh
-            {
+            } else if snap.quality == crate::provider_ratelimit::QuotaSignalQuality::KnownFresh {
                 match snap.reset_at {
                     Some(reset) => {
-                        let nanos = reset
-                            .saturating_duration_since(now)
-                            .as_nanos();
+                        let nanos = reset.saturating_duration_since(now).as_nanos();
                         (1u8, nanos, pos)
                     }
                     None => (2u8, u128::MAX, pos),

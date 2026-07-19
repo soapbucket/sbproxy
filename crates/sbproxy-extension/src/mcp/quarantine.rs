@@ -415,8 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn judge_timeout_or_malformed_response_quarantines() {
-        let output =
-            UntrustedToolOutput::from_text_blocks(vec!["benign looking output".into()]);
+        let output = UntrustedToolOutput::from_text_blocks(vec!["benign looking output".into()]);
 
         let timeout_judge = HttpToolOutputJudge::new(
             ScriptedTransport::err(JudgeTransportError::Timeout),

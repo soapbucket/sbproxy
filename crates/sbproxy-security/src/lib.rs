@@ -25,15 +25,15 @@ pub use crypto::{
     aes256gcm_decrypt, aes256gcm_encrypt, hkdf_derive_purpose, random_aes256_key,
     random_aes_gcm_nonce, HkdfPurpose, AES256_KEY_LEN, AES_GCM_NONCE_LEN,
 };
+pub use egress::{
+    AuthorizedDestination, EgressAuthorizer, EgressConfig, EgressDenied, EgressPurpose,
+    GovernedHttpClient, GovernedHttpResponse, GovernedRedirectSeam, HostResolver, PurposeAllowlist,
+    RedirectDecision,
+};
 #[cfg(feature = "tls-fingerprint")]
 pub use headless_detect::{
     detect as detect_headless, HeadlessSignal as HeadlessDetectSignal, TlsFingerprintCatalog,
     TlsFingerprintEntry,
-};
-pub use egress::{
-    AuthorizedDestination, EgressAuthorizer, EgressConfig, EgressDenied, EgressPurpose,
-    GovernedHttpClient, GovernedHttpResponse, GovernedRedirectSeam, HostResolver,
-    PurposeAllowlist, RedirectDecision,
 };
 pub use hostfilter::HostFilter;
 pub use ip::{ip_in_cidrs, is_private_ip, parse_cidrs};

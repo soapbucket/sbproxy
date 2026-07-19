@@ -218,12 +218,7 @@ pub fn validate_quota_pool_config(config: &QuotaPoolConfig) -> Result<(), QuotaP
 /// Atomic reservation store for a fair-share pool.
 pub trait QuotaPoolStore: Send + Sync {
     /// Reserve `units` for `member` in `pool`, or deny.
-    fn reserve(
-        &self,
-        pool: &str,
-        member: &str,
-        units: u64,
-    ) -> Result<QuotaReservation, PoolDeny>;
+    fn reserve(&self, pool: &str, member: &str, units: u64) -> Result<QuotaReservation, PoolDeny>;
 
     /// Settle a reservation to actual usage (refund over-reserve, add debt on under).
     fn reconcile(&self, reservation: QuotaReservation, actual: PoolUsage);
@@ -398,19 +393,18 @@ impl LocalQuotaPool {
             .unwrap_or_default()
     }
 
-    fn admit_locked(
-        state: &mut PoolState,
-        member: &str,
-        units: u64,
-    ) -> Result<(), PoolDeny> {
+    fn admit_locked(state: &mut PoolState, member: &str, units: u64) -> Result<(), PoolDeny> {
         let Some(entitlement) = state.entitlement(member) else {
             return Err(PoolDeny::UnknownMember {
                 member: member.to_string(),
             });
         };
-        let member_state = state.members.get(member).ok_or_else(|| PoolDeny::UnknownMember {
-            member: member.to_string(),
-        })?;
+        let member_state = state
+            .members
+            .get(member)
+            .ok_or_else(|| PoolDeny::UnknownMember {
+                member: member.to_string(),
+            })?;
         let member_load = member_state.load();
         let total_load = state.total_load();
 
@@ -457,12 +451,7 @@ impl LocalQuotaPool {
 }
 
 impl QuotaPoolStore for LocalQuotaPool {
-    fn reserve(
-        &self,
-        pool: &str,
-        member: &str,
-        units: u64,
-    ) -> Result<QuotaReservation, PoolDeny> {
+    fn reserve(&self, pool: &str, member: &str, units: u64) -> Result<QuotaReservation, PoolDeny> {
         let mut guard = self.pools.lock();
         let state = guard.get_mut(pool).ok_or_else(|| PoolDeny::UnknownPool {
             pool: pool.to_string(),
@@ -503,12 +492,7 @@ impl QuotaPoolStore for LocalQuotaPool {
 }
 
 impl QuotaPoolStore for Arc<LocalQuotaPool> {
-    fn reserve(
-        &self,
-        pool: &str,
-        member: &str,
-        units: u64,
-    ) -> Result<QuotaReservation, PoolDeny> {
+    fn reserve(&self, pool: &str, member: &str, units: u64) -> Result<QuotaReservation, PoolDeny> {
         (**self).reserve(pool, member, units)
     }
 
@@ -686,24 +670,16 @@ mod tests {
             pool.release(reservation);
         }
         let loads = pool.member_loads("burst");
-        let ranked = rank_by_fair_share(
-            &loads,
-            &weights,
-            &["alpha".to_string(), "beta".to_string()],
-        );
+        let ranked =
+            rank_by_fair_share(&loads, &weights, &["alpha".to_string(), "beta".to_string()]);
         assert_eq!(
             ranked.first().map(String::as_str),
             Some("alpha"),
             "idle alpha must rank ahead of loaded beta after rebalance"
         );
 
-        let (idx, reservation) = reserve_next_candidate(
-            &pool,
-            "burst",
-            &["alpha", "beta"],
-            1,
-        )
-        .expect("alpha should admit after rebalance");
+        let (idx, reservation) = reserve_next_candidate(&pool, "burst", &["alpha", "beta"], 1)
+            .expect("alpha should admit after rebalance");
         assert_eq!(idx, 0);
         assert_eq!(reservation.member, "alpha");
     }
@@ -729,10 +705,7 @@ mod tests {
         }
 
         let records = pool.over_shares("soft");
-        assert!(
-            !records.is_empty(),
-            "soft policy must record over-share"
-        );
+        assert!(!records.is_empty(), "soft policy must record over-share");
         assert!(
             records.iter().any(|r| r.member == "alpha" && r.excess > 0),
             "alpha over-share missing: {records:?}"
@@ -755,7 +728,10 @@ mod tests {
         assert_eq!(err, QuotaPoolConfigError::StrongConsistencyUnavailable);
 
         let build_err = LocalQuotaPool::new(vec![config]).expect_err("store build must fail");
-        assert_eq!(build_err, QuotaPoolConfigError::StrongConsistencyUnavailable);
+        assert_eq!(
+            build_err,
+            QuotaPoolConfigError::StrongConsistencyUnavailable
+        );
     }
 
     #[test]
@@ -767,13 +743,9 @@ mod tests {
             pool.reconcile(reservation, PoolUsage { units: 1 });
         }
 
-        let (idx, reservation) = reserve_next_candidate(
-            &pool,
-            "shared",
-            &["alpha", "beta", "gamma"],
-            1,
-        )
-        .expect("must advance past denied alpha");
+        let (idx, reservation) =
+            reserve_next_candidate(&pool, "shared", &["alpha", "beta", "gamma"], 1)
+                .expect("must advance past denied alpha");
         assert_eq!(idx, 1, "beta is the first admissible candidate");
         assert_eq!(reservation.member, "beta");
     }

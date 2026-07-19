@@ -12,9 +12,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use sbproxy_security::egress::{
-    EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver,
-};
+use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use serde::{Deserialize, Serialize};
 
 /// A record of one completed LLM call, handed to every configured sink.
@@ -1050,14 +1048,8 @@ mod tests {
     fn object_store_object_key_prefers_request_id_under_prefix() {
         let mut event = sample_event();
         event.request_id = Some("req-42".into());
-        assert_eq!(
-            object_store_object_key("llm/", &event),
-            "llm/req-42.json"
-        );
-        assert_eq!(
-            object_store_object_key("llm", &event),
-            "llm/req-42.json"
-        );
+        assert_eq!(object_store_object_key("llm/", &event), "llm/req-42.json");
+        assert_eq!(object_store_object_key("llm", &event), "llm/req-42.json");
         assert_eq!(object_store_object_key("", &event), "req-42.json");
     }
 
@@ -1083,8 +1075,8 @@ mod tests {
     }
 
     fn enforce_purpose(purpose: EgressPurpose, hosts: &[&str]) -> EgressAuthorizer {
-        use std::collections::HashMap;
         use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+        use std::collections::HashMap;
         let mut allow = PurposeAllowlist::default();
         for h in hosts {
             allow.hosts.insert((*h).to_string());
@@ -1136,8 +1128,10 @@ mod tests {
     #[test]
     fn enforce_webhook_sink_skips_post_when_denied() {
         // record() must not panic and must not attempt I/O when denied.
-        let sink = WebhookSink::new("https://evil.example/ingest")
-            .with_egress(enforce_purpose(EgressPurpose::Webhook, &["collector.example.com"]));
+        let sink = WebhookSink::new("https://evil.example/ingest").with_egress(enforce_purpose(
+            EgressPurpose::Webhook,
+            &["collector.example.com"],
+        ));
         sink.record(&sample_event());
     }
 }

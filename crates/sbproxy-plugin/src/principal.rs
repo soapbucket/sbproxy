@@ -480,7 +480,10 @@ mod tests {
         assert!(ctx.principal.is_anonymous());
         assert_eq!(ctx.request_id, "req-1");
         assert_eq!(ctx.session_id, Some("sess-9"));
-        assert_eq!(ctx.delegation.map(|d| d.subject_id.as_str()), Some("user-42"));
+        assert_eq!(
+            ctx.delegation.map(|d| d.subject_id.as_str()),
+            Some("user-42")
+        );
     }
 
     /// Adding any attribute makes the principal non-anonymous.

@@ -87,7 +87,10 @@ impl std::fmt::Display for UpstreamAuthError {
         match self {
             Self::AnonymousCaller => write!(f, "run-as-user requires an authenticated subject"),
             Self::SharedKeyCaller => {
-                write!(f, "run-as-user rejects shared-key callers without a subject")
+                write!(
+                    f,
+                    "run-as-user rejects shared-key callers without a subject"
+                )
             }
             Self::StdioRunAsUserUnsupported => {
                 write!(f, "stdio transport cannot use run-as-user credentials")

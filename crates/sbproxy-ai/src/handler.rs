@@ -364,9 +364,7 @@ impl AiHandlerConfig {
 
     /// Return the shared fair-share quota pool for this handler (WOR-1880).
     /// `None` when unset or when config validation rejected the pool.
-    pub fn quota_pool_store(
-        &self,
-    ) -> Option<&std::sync::Arc<crate::quota_pool::LocalQuotaPool>> {
+    pub fn quota_pool_store(&self) -> Option<&std::sync::Arc<crate::quota_pool::LocalQuotaPool>> {
         self.quota_pool_store
             .get_or_init(|| {
                 let config = self.quota_pool.as_ref()?;

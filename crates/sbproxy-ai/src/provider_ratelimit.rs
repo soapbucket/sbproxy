@@ -703,11 +703,7 @@ mod tests {
     #[test]
     fn status_429_marks_remaining_requests_exhausted() {
         let tracker = ProviderRateLimitTracker::new(0.1);
-        tracker.update_from_headers_with_status(
-            "openai",
-            &headers(&[("retry-after", "2")]),
-            429,
-        );
+        tracker.update_from_headers_with_status("openai", &headers(&[("retry-after", "2")]), 429);
         let snap = tracker.snapshot("openai");
         assert_eq!(snap.remaining_requests, Some(0));
         assert!(snap.reset_at.is_some());

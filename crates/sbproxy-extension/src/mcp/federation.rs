@@ -15,10 +15,10 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 
 use super::egress::{EgressPolicy, SystemHostResolver};
-use sbproxy_security::egress::EgressPurpose;
 use super::sse_client::send_via_sse;
 use super::streamable::send_request;
 use super::types::{JsonRpcRequest, JsonRpcResponse};
+use sbproxy_security::egress::EgressPurpose;
 
 /// Outcome of [`McpFederation::call_tool_with_policy`].
 ///
@@ -1198,10 +1198,7 @@ impl McpFederation {
             };
             redirects += 1;
             if redirects > 10 {
-                anyhow::bail!(
-                    "openapi REST call to {} exceeded redirect limit",
-                    dest.url
-                );
+                anyhow::bail!("openapi REST call to {} exceeded redirect limit", dest.url);
             }
             // Re-authorize redirect target before any second connect.
             let (next, _strip) = backing

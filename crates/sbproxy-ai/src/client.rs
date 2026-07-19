@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use sbproxy_security::egress::{
-    EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver,
-};
+use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
@@ -1779,8 +1777,8 @@ mod tests {
     }
 
     fn enforce_ai_provider(hosts: &[&str]) -> EgressAuthorizer {
-        use std::collections::HashMap;
         use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+        use std::collections::HashMap;
         let mut allow = PurposeAllowlist::default();
         for h in hosts {
             allow.hosts.insert((*h).to_string());

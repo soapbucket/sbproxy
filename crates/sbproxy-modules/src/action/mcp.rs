@@ -593,8 +593,7 @@ pub struct McpAction {
     pub dual_llm_quarantine: Option<McpDualLlmQuarantineConfig>,
     /// Dual-LLM quarantine judge. Present when
     /// `dual_llm_quarantine.enabled` compiled successfully.
-    pub tool_output_judge:
-        Option<Arc<dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge>>,
+    pub tool_output_judge: Option<Arc<dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge>>,
     /// Per-tool USD price map for cost attribution (WOR-1644).
     pub tool_pricing: HashMap<String, f64>,
     /// Built usage sinks for MCP tool-call attribution (WOR-1644),
@@ -981,10 +980,10 @@ impl McpAction {
                         model: qcfg.model.clone(),
                     },
                 );
-                Some(
-                    Arc::new(judge)
-                        as Arc<dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge>,
-                )
+                Some(Arc::new(judge)
+                    as Arc<
+                        dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge,
+                    >)
             }
             None => None,
         };

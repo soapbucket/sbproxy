@@ -1439,10 +1439,7 @@ pub(super) async fn handle_ai_proxy(
     // state every call and make the latency/usage-aware strategies inert.
     let router = config.router();
     let quota_pool_store = config.quota_pool_store().cloned();
-    let quota_pool_name = config
-        .quota_pool
-        .as_ref()
-        .map(|pool| pool.name.clone());
+    let quota_pool_name = config.quota_pool.as_ref().map(|pool| pool.name.clone());
     // Serve model discovery locally; other GET surfaces use ordinary dispatch.
     if method == http::Method::GET {
         if matches!(
@@ -4318,7 +4315,8 @@ pub(super) async fn handle_ai_proxy(
         // next candidate rather than failing the whole request when
         // alternatives remain.
         let mut quota_reservation = None;
-        if let (Some(store), Some(pool_name)) = (quota_pool_store.as_ref(), quota_pool_name.as_deref())
+        if let (Some(store), Some(pool_name)) =
+            (quota_pool_store.as_ref(), quota_pool_name.as_deref())
         {
             match sbproxy_ai::QuotaReservationGuard::reserve(
                 std::sync::Arc::clone(store),

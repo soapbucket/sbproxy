@@ -320,7 +320,10 @@ pub fn translate_litellm(input: &str) -> Result<LitellmTranslation> {
     let mut usage_sinks: Vec<Value> = Vec::new();
     let mut emitted_sink_types: HashSet<&'static str> = HashSet::new();
     let callback_lists: [(&str, &[String]); 3] = [
-        ("litellm_settings.callbacks", &cfg.litellm_settings.callbacks),
+        (
+            "litellm_settings.callbacks",
+            &cfg.litellm_settings.callbacks,
+        ),
         (
             "litellm_settings.success_callback",
             &cfg.litellm_settings.success_callback,
@@ -494,7 +497,11 @@ pub fn translate_litellm(input: &str) -> Result<LitellmTranslation> {
     })
 }
 
-fn account(accounts: &mut Vec<LitellmKeyAccount>, path: impl Into<String>, disposition: Disposition) {
+fn account(
+    accounts: &mut Vec<LitellmKeyAccount>,
+    path: impl Into<String>,
+    disposition: Disposition,
+) {
     accounts.push(LitellmKeyAccount {
         path: path.into(),
         disposition,
@@ -567,9 +574,9 @@ fn emit_budget_from_candidates(
         return None;
     }
     let (_, first_cost, first_period) = &candidates[0];
-    let uniform = candidates
-        .iter()
-        .all(|(_, cost, period)| (cost - first_cost).abs() < f64::EPSILON && period == first_period);
+    let uniform = candidates.iter().all(|(_, cost, period)| {
+        (cost - first_cost).abs() < f64::EPSILON && period == first_period
+    });
     if !uniform {
         for (model, cost, period) in candidates {
             warnings.push(format!(

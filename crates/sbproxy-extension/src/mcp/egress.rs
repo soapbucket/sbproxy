@@ -9,11 +9,11 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use reqwest::Url;
-use serde::Deserialize;
 use sbproxy_security::egress::{
     AuthorizedDestination, EgressAuthorizer, EgressConfig, EgressPurpose, HostResolver,
     PurposeAllowlist,
 };
+use serde::Deserialize;
 
 /// Closed denial vocabulary from the GF egress foundation.
 pub use sbproxy_security::egress::EgressDenied;
@@ -181,7 +181,6 @@ impl EgressPolicy {
         purposes.insert(purpose, allow);
         Ok(EgressAuthorizer::new(EgressConfig { purposes }))
     }
-
 }
 
 /// System DNS resolver for production OpenAPI / MCP egress checks.
@@ -191,7 +190,10 @@ pub struct SystemHostResolver;
 impl HostResolver for SystemHostResolver {
     fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
         use std::net::ToSocketAddrs;
-        (host, port).to_socket_addrs().map(|i| i.collect()).map_err(|_| ())
+        (host, port)
+            .to_socket_addrs()
+            .map(|i| i.collect())
+            .map_err(|_| ())
     }
 }
 
@@ -283,7 +285,10 @@ mod tests {
             allow_private: false,
             scope: "server:api".to_string(),
         };
-        let resolver = MapResolver::new(vec![("api.example.com", vec![addr([93, 184, 216, 34], 443)])]);
+        let resolver = MapResolver::new(vec![(
+            "api.example.com",
+            vec![addr([93, 184, 216, 34], 443)],
+        )]);
 
         policy
             .authorize(
@@ -344,10 +349,8 @@ mod tests {
             allow_private: false,
             scope: "server:api".to_string(),
         };
-        let resolver = MapResolver::new(vec![(
-            "attacker.test",
-            vec![addr([93, 184, 216, 34], 443)],
-        )]);
+        let resolver =
+            MapResolver::new(vec![("attacker.test", vec![addr([93, 184, 216, 34], 443)])]);
 
         let err = policy
             .authorize(

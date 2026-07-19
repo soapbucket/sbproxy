@@ -369,10 +369,8 @@ mod tests {
     #[test]
     fn deny_by_default_rejects_unlisted_purpose_host() {
         let auth = EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com"]));
-        let resolver = MapResolver::new(vec![(
-            "evil.example",
-            vec![addr([93, 184, 216, 34], 443)],
-        )]);
+        let resolver =
+            MapResolver::new(vec![("evil.example", vec![addr([93, 184, 216, 34], 443)])]);
 
         let err = auth
             .authorize(
@@ -434,13 +432,9 @@ mod tests {
             .expect("initial host allowed");
 
         // Seam must deny before any second connect would occur.
-        let err = GovernedRedirectSeam::evaluate(
-            &auth,
-            &from,
-            "https://evil.example/steal",
-            &resolver,
-        )
-        .expect_err("redirect to unlisted host must be denied");
+        let err =
+            GovernedRedirectSeam::evaluate(&auth, &from, "https://evil.example/steal", &resolver)
+                .expect_err("redirect to unlisted host must be denied");
         assert_eq!(err, EgressDenied::RedirectToUnlistedHost);
     }
 
@@ -492,13 +486,9 @@ mod tests {
             )
             .expect("initial authorize");
 
-        let decision = GovernedRedirectSeam::evaluate(
-            &auth,
-            &from,
-            "https://cdn.openai.com/file",
-            &resolver,
-        )
-        .expect("same-purpose listed host redirect allowed");
+        let decision =
+            GovernedRedirectSeam::evaluate(&auth, &from, "https://cdn.openai.com/file", &resolver)
+                .expect("same-purpose listed host redirect allowed");
         assert!(decision.strip_credentials);
         assert!(decision.destination.url.username().is_empty());
         assert_eq!(decision.destination.url.password(), None);
@@ -507,8 +497,7 @@ mod tests {
     #[test]
     fn private_resolved_address_denied_by_default() {
         let auth = EgressAuthorizer::new(ai_provider_https_443(&["internal.svc"]));
-        let resolver =
-            MapResolver::new(vec![("internal.svc", vec![addr([10, 0, 0, 5], 443)])]);
+        let resolver = MapResolver::new(vec![("internal.svc", vec![addr([10, 0, 0, 5], 443)])]);
 
         let err = auth
             .authorize(

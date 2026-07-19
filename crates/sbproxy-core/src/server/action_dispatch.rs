@@ -1923,9 +1923,10 @@ pub(super) async fn handle_mcp_action(
                                     delegation: None,
                                 };
                                 let outbound_arguments = if run_as_user {
-                                    let Some(auth_cfg) = federated.as_ref().and_then(|t| {
-                                        mcp.upstream_auth_for_server(&t.server_name)
-                                    }) else {
+                                    let Some(auth_cfg) = federated
+                                        .as_ref()
+                                        .and_then(|t| mcp.upstream_auth_for_server(&t.server_name))
+                                    else {
                                         return write_jsonrpc(
                                             session,
                                             &JsonRpcResponse::error(
@@ -2910,8 +2911,8 @@ mod govern_security_tests {
         let value = json!({
             "content": [{"type": "text", "text": "attacker controlled output"}]
         });
-        let verdict = mcp_apply_tool_output_quarantine(Some(&judge as &dyn ToolOutputJudge), &value)
-            .await;
+        let verdict =
+            mcp_apply_tool_output_quarantine(Some(&judge as &dyn ToolOutputJudge), &value).await;
         let mut ledger_served = false;
         match &verdict {
             ToolOutputVerdict::Release => {
@@ -2981,28 +2982,14 @@ mod govern_security_tests {
         let lookup = move |r: &str| map.get(r).cloned().ok_or(());
         let http = reqwest::Client::new();
 
-        let (out_a, auth_a) = mcp_prepare_run_as_user_auth(
-            args.clone(),
-            &cfg,
-            &exec_a,
-            &lookup,
-            &http,
-            None,
-            None,
-        )
-        .await
-        .expect("user-a");
-        let (out_b, auth_b) = mcp_prepare_run_as_user_auth(
-            args.clone(),
-            &cfg,
-            &exec_b,
-            &lookup,
-            &http,
-            None,
-            None,
-        )
-        .await
-        .expect("user-b");
+        let (out_a, auth_a) =
+            mcp_prepare_run_as_user_auth(args.clone(), &cfg, &exec_a, &lookup, &http, None, None)
+                .await
+                .expect("user-a");
+        let (out_b, auth_b) =
+            mcp_prepare_run_as_user_auth(args.clone(), &cfg, &exec_b, &lookup, &http, None, None)
+                .await
+                .expect("user-b");
 
         assert_eq!(out_a, args, "user-a args must be unchanged");
         assert_eq!(out_b, args, "user-b args must be unchanged");

@@ -25,9 +25,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use dashmap::DashMap;
-use sbproxy_security::egress::{
-    EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver,
-};
+use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use serde::Deserialize;
 
 /// RFC 8693 grant type for token exchange.
@@ -670,8 +668,8 @@ mod tests {
     }
 
     fn enforce_token_exchange(hosts: &[&str]) -> EgressAuthorizer {
-        use std::collections::HashMap;
         use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+        use std::collections::HashMap;
         let mut allow = PurposeAllowlist::default();
         for h in hosts {
             allow.hosts.insert((*h).to_string());

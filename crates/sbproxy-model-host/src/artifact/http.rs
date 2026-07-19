@@ -144,13 +144,8 @@ pub fn authorize_artifact_url(
 /// shared closed vocabulary.
 #[cfg(feature = "weights")]
 pub(crate) fn authorize_engine_download(url: &str) -> Result<(), String> {
-    authorize_artifact_url(
-        None,
-        EgressPurpose::EngineArtifact,
-        url,
-        &PublicPinResolver,
-    )
-    .map_err(|e| format!("egress denied: {e:?}"))
+    authorize_artifact_url(None, EgressPurpose::EngineArtifact, url, &PublicPinResolver)
+        .map_err(|e| format!("egress denied: {e:?}"))
 }
 
 /// Resolver that pins a fixed public address so gates never touch the
@@ -283,8 +278,8 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+    use std::collections::HashMap;
 
     #[cfg(feature = "weights")]
     #[test]
