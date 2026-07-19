@@ -48,6 +48,14 @@ const DEFAULT_SHM_SIZE_GIB: u64 = 4;
 const CONTAINER_PORT: u16 = 30000;
 const PRIVATE_NETWORK: &str = "sbproxy-model-host";
 const HEALTH_PATH: &str = "/health";
+/// Fallback `--mem-fraction-static` when the fit did not derive a
+/// device-capacity-aware fraction (e.g. the probe reported no total VRAM).
+/// SGLang's own default is roughly 0.88, which sizes the static weight and
+/// KV pool so aggressively that first-token decode graph capture can exceed
+/// a smaller card and OOM; a slightly lower fallback keeps headroom. The
+/// runtime always prefers the fit's computed fraction, exactly as the vLLM
+/// driver prefers it for `--gpu-memory-utilization`.
+const DEFAULT_MEM_FRACTION_STATIC: f32 = 0.85;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
 const COMPATIBILITY_SCRIPT: &str = r#"import json,platform
@@ -706,6 +714,7 @@ pub fn build_sglang_container_plan(
         "--max-running-requests".to_string(),
         request.max_concurrency.to_string(),
     ]);
+    append_memory_fraction_arguments(&mut arguments, request);
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_sglang_precision_arguments(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(
@@ -747,6 +756,7 @@ fn sglang_server_arguments(request: &LaunchRequest) -> Result<Vec<String>, Engin
         "--max-running-requests".to_string(),
         request.max_concurrency.to_string(),
     ];
+    append_memory_fraction_arguments(&mut arguments, request);
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_sglang_precision_arguments(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(
@@ -754,6 +764,27 @@ fn sglang_server_arguments(request: &LaunchRequest) -> Result<Vec<String>, Engin
         &request.extra_args,
     )?);
     Ok(arguments)
+}
+
+/// Emit the runtime-owned static memory fraction via SGLang's
+/// `--mem-fraction-static`, derived from the fit plan and shared by the
+/// installed, uv, and container launch paths so the two argv builders never
+/// drift. Without it SGLang uses its own ~0.88 default, which sizes the
+/// static weight and KV pool so aggressively that first-token decode graph
+/// capture can exceed a smaller card and OOM (reproduced live on an L4).
+/// This mirrors the vLLM driver's runtime-owned `--gpu-memory-utilization`;
+/// the operator cannot set it, since it is off the allowlist.
+fn append_memory_fraction_arguments(arguments: &mut Vec<String>, request: &LaunchRequest) {
+    arguments.extend([
+        "--mem-fraction-static".to_string(),
+        format!(
+            "{:.4}",
+            request
+                .fit
+                .gpu_memory_fraction
+                .unwrap_or(DEFAULT_MEM_FRACTION_STATIC)
+        ),
+    ]);
 }
 
 /// Emit the runtime-owned tensor-parallel degree: one rank per selected CUDA

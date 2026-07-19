@@ -654,9 +654,6 @@ enum ArgumentRule {
 enum ArgumentValue {
     Unsigned,
     VllmDtype,
-    /// A finite float in the inclusive unit interval [0.0, 1.0], for
-    /// fraction knobs such as SGLang's `--mem-fraction-static`.
-    UnitInterval,
     /// A finite, non-negative float, for tuning knobs such as SGLang's
     /// `--schedule-conservativeness` (default 1.0, values may exceed 1).
     NonNegativeFloat,
@@ -671,16 +668,16 @@ fn argument_rule(kind: EngineKind, flag: &str) -> Option<ArgumentRule> {
         (EngineKind::Vllm, "--seed") => Some(ArgumentRule::Value(ArgumentValue::Unsigned)),
         (EngineKind::Vllm, "--dtype") => Some(ArgumentRule::Value(ArgumentValue::VllmDtype)),
         // SGLang's stable allowlist. `--model-path`, `--host`, `--port`,
-        // and `--tp-size` stay off it: they are runtime-owned, the same
-        // way vLLM keeps `--tensor-parallel-size` off.
+        // `--tp-size`, and `--mem-fraction-static` stay off it: they are
+        // runtime-owned, the same way vLLM keeps `--tensor-parallel-size`
+        // and `--gpu-memory-utilization` off. The runtime derives the
+        // static memory fraction from the fit plan, so an operator flag
+        // would either duplicate or fight it.
         (EngineKind::SGLang, "--enable-torch-compile" | "--disable-radix-cache") => {
             Some(ArgumentRule::Boolean)
         }
         (EngineKind::SGLang, "--schedule-conservativeness") => {
             Some(ArgumentRule::Value(ArgumentValue::NonNegativeFloat))
-        }
-        (EngineKind::SGLang, "--mem-fraction-static") => {
-            Some(ArgumentRule::Value(ArgumentValue::UnitInterval))
         }
         (EngineKind::LlamaCpp, "--flash-attn" | "--no-mmap" | "--mlock") => {
             Some(ArgumentRule::Boolean)
@@ -712,9 +709,6 @@ fn validate_argument_value(
         ArgumentValue::VllmDtype => {
             matches!(value, "auto" | "half" | "float16" | "bfloat16" | "float32")
         }
-        ArgumentValue::UnitInterval => value
-            .parse::<f64>()
-            .is_ok_and(|parsed| parsed.is_finite() && (0.0..=1.0).contains(&parsed)),
         ArgumentValue::NonNegativeFloat => value
             .parse::<f64>()
             .is_ok_and(|parsed| parsed.is_finite() && parsed >= 0.0),
