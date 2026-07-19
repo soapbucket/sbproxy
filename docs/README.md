@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-19*
 
 Call any model. Serve your own. Govern both. SBproxy is the open-source OpenRouter alternative: one Apache-2.0 binary that routes to 66 providers or serves the weights on your GPUs, with the guardrails, keys, budgets, and spend ledger applying to every model the same way, and a real Pingora-based reverse proxy underneath for the rest of your traffic.
 
@@ -117,6 +117,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [performance.md](performance.md) - tuning guide, benchmark methodology, profiling.
 - [degradation.md](degradation.md) - failure modes and graceful degradation behavior.
 - [upgrade.md](upgrade.md) - migration notes between releases.
+- [mesh-replication.md](mesh-replication.md) - the replicated cluster-state substrate: replication factor, read/write consistency, durable restart, handoff, anti-entropy, and the tombstone deletion protocol.
 - [quickstart-operator.md](quickstart-operator.md) - first 24 hours running the Kubernetes operator.
 - [kubernetes.md](kubernetes.md) - the OSS Kubernetes operator and its CRDs.
 - [sidecar-deployment.md](sidecar-deployment.md) - running sbproxy as a per-pod sidecar: traffic capture (iptables / eBPF), service-mesh integration (Istio, Linkerd), and the kustomize overlay under `deploy/k8s/sidecar/`.

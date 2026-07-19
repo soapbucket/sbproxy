@@ -88,6 +88,11 @@ pub struct MeshNode {
     /// design). Drops on `MeshNode::drop` which signals shutdown. `None`
     /// when federation is disabled or mesh config has no federation block.
     federation_task: Option<crate::federation::FederationTaskHandle>,
+
+    /// WOR-1947 replicated durable state substrate. `None` when the
+    /// cluster config does not enable replication. Dropping the handle
+    /// drops the store, which stops its maintenance loop.
+    replicated_store: Option<Arc<crate::state::replicated::ReplicatedStore>>,
 }
 
 impl MeshNode {
@@ -129,6 +134,7 @@ impl MeshNode {
             peer_addr_map: Arc::new(RwLock::new(HashMap::new())),
             persistence_task: None,
             federation_task: None,
+            replicated_store: None,
         }
     }
 
@@ -178,6 +184,20 @@ impl MeshNode {
     ) -> Self {
         self.identity_authenticator = authenticator;
         self
+    }
+
+    /// Attach the WOR-1947 replicated state substrate.
+    pub fn with_replicated_store(
+        mut self,
+        store: Arc<crate::state::replicated::ReplicatedStore>,
+    ) -> Self {
+        self.replicated_store = Some(store);
+        self
+    }
+
+    /// The replicated state substrate, when the cluster enables it.
+    pub fn replicated_store(&self) -> Option<Arc<crate::state::replicated::ReplicatedStore>> {
+        self.replicated_store.clone()
     }
 
     /// Returns a cheap `Arc` clone of the distributed cache suitable for

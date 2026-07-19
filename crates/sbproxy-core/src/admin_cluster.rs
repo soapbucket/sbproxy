@@ -18,6 +18,10 @@ pub const STATUS_PATH: &str = "/admin/cluster/status";
 pub const DEPLOYMENTS_PATH: &str = "/admin/cluster/deployments";
 const METRICS_PATH: &str = "/admin/cluster/metrics";
 const ARTIFACTS_PATH: &str = "/admin/cluster/artifacts";
+/// Authenticated replicated-state listing and replicated delete (WOR-1947).
+const STATE_PATH: &str = "/admin/cluster/state";
+/// Authenticated bounded replicated-state purge (WOR-1947).
+const STATE_PURGE_PATH: &str = "/admin/cluster/state/purge";
 
 #[derive(Debug, Clone, Serialize)]
 struct ClusterStatusResponse {
@@ -128,6 +132,7 @@ pub fn dispatch(
     path: &str,
     body: Option<&str>,
 ) -> Option<(u16, &'static str, String)> {
+    let query = path.split_once('?').map(|(_, query)| query);
     let path = path.split('?').next().unwrap_or(path);
     match path {
         STATUS_PATH => Some(dispatch_status(method)),
@@ -135,8 +140,167 @@ pub fn dispatch(
         METRICS_PATH => Some(dispatch_metrics(method)),
         ARTIFACTS_PATH => Some(dispatch_artifacts(method)),
         ENROLL_PATH => Some(dispatch_enrollment(method, body)),
+        STATE_PATH => Some(dispatch_state(method, query)),
+        STATE_PURGE_PATH => Some(dispatch_state_purge(method, body)),
         _ => None,
     }
+}
+
+// --- WOR-1947 replicated-state admin ---
+
+/// Resolve the replicated store, or the standard "not enabled" error.
+fn replicated_store(
+) -> Result<Arc<sbproxy_mesh::state::replicated::ReplicatedStore>, (u16, &'static str, String)> {
+    crate::cluster::current_cluster_handle()
+        .and_then(|handle| handle.mesh_node())
+        .and_then(|node| node.replicated_store())
+        .ok_or_else(|| {
+            json(
+                404,
+                serde_json::json!({
+                    "error": "replicated state substrate not enabled",
+                    "code": "replication_disabled",
+                }),
+            )
+        })
+}
+
+/// Minimal percent-decoder for admin query parameters. Replicated keys
+/// and opaque page tokens can carry characters that URL syntax reserves.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = bytes.get(i + 1..i + 3).and_then(|pair| {
+                    std::str::from_utf8(pair)
+                        .ok()
+                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                });
+                match hex {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| percent_decode(value))
+}
+
+fn dispatch_state(method: &str, query: Option<&str>) -> (u16, &'static str, String) {
+    let store = match replicated_store() {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    if method.eq_ignore_ascii_case("GET") {
+        let prefix = query_param(query, "prefix").unwrap_or_default();
+        let page_token = query_param(query, "page_token");
+        let limit = query_param(query, "limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200);
+        let page = crate::cluster::block_on_cluster(store.fleet_state_page(
+            &prefix,
+            page_token.as_deref(),
+            limit,
+        ));
+        return json(
+            200,
+            serde_json::json!({
+                "schema_version": 1,
+                "entries": page.entries,
+                "next_page_token": page.next_page_token,
+                "unreachable": page.unreachable,
+            }),
+        );
+    }
+    if method.eq_ignore_ascii_case("DELETE") {
+        let Some(key) = query_param(query, "key").filter(|key| !key.is_empty()) else {
+            return json(
+                400,
+                serde_json::json!({"error": "missing key query parameter", "code": "bad_request"}),
+            );
+        };
+        return match crate::cluster::block_on_cluster(store.delete(&key)) {
+            Ok(receipt) => json(
+                200,
+                serde_json::json!({
+                    "schema_version": 1,
+                    "deleted": key,
+                    "acked_replicas": receipt.acked,
+                }),
+            ),
+            Err(error) => json(
+                502,
+                serde_json::json!({
+                    "error": format!("replicated delete failed: {error}"),
+                    "code": "replication_write_failed",
+                }),
+            ),
+        };
+    }
+    json(405, serde_json::json!({"error": "method not allowed"}))
+}
+
+fn dispatch_state_purge(method: &str, body: Option<&str>) -> (u16, &'static str, String) {
+    if !method.eq_ignore_ascii_case("POST") {
+        return json(405, serde_json::json!({"error": "method not allowed"}));
+    }
+    let store = match replicated_store() {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    #[derive(serde::Deserialize)]
+    struct PurgeRequest {
+        prefix: String,
+        #[serde(default = "default_purge_max")]
+        max: usize,
+    }
+    fn default_purge_max() -> usize {
+        1_000
+    }
+    let request = match body.map(serde_json::from_str::<PurgeRequest>) {
+        Some(Ok(request)) => request,
+        _ => {
+            return json(
+                400,
+                serde_json::json!({"error": "body must be {\"prefix\": string, \"max\": number}", "code": "bad_request"}),
+            )
+        }
+    };
+    let outcome = crate::cluster::block_on_cluster(store.fleet_purge(&request.prefix, request.max));
+    json(
+        200,
+        serde_json::json!({
+            "schema_version": 1,
+            "deleted": outcome.deleted,
+            "failed": outcome.failed,
+            "truncated": outcome.truncated,
+        }),
+    )
 }
 
 fn dispatch_deployments(method: &str, body: Option<&str>) -> (u16, &'static str, String) {

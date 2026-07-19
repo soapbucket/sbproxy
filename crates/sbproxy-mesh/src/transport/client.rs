@@ -240,6 +240,63 @@ impl PeerClient {
         }
     }
 
+    /// Apply a replicated-record candidate on the remote peer's durable
+    /// replica shard (WOR-1947). The peer persists the winning record
+    /// before replying, so an `Ok` outcome means the record is durable
+    /// there, not merely resident in memory.
+    pub async fn replica_apply(
+        &self,
+        key: String,
+        value: Bytes,
+        ttl_secs: u64,
+    ) -> anyhow::Result<VersionedLwwMergeOutcome> {
+        match self
+            .send_request(CacheOp::ReplicaApply {
+                key,
+                value,
+                ttl_secs,
+            })
+            .await?
+        {
+            CacheResult::VersionedMerged(outcome) => Ok(outcome),
+            CacheResult::Error(error) => Err(anyhow::anyhow!("remote error: {error}")),
+            other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
+        }
+    }
+
+    /// Fetch the full stored replica record (register plus expiry) for
+    /// `key` from the remote peer's replica shard. `Ok(None)` means the
+    /// peer holds no record for the key.
+    pub async fn replica_fetch(&self, key: String) -> anyhow::Result<Option<Bytes>> {
+        match self.send_request(CacheOp::ReplicaFetch { key }).await? {
+            CacheResult::Value(value) => Ok(value),
+            CacheResult::Error(error) => Err(anyhow::anyhow!("remote error: {error}")),
+            other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
+        }
+    }
+
+    /// Request one bounded digest page of the remote peer's replica shard
+    /// for anti-entropy comparison.
+    pub async fn sync_digest(
+        &self,
+        prefix: String,
+        page_token: Option<String>,
+        limit: u32,
+    ) -> anyhow::Result<crate::transport::frame::DigestPage> {
+        match self
+            .send_request(CacheOp::SyncDigest {
+                prefix,
+                page_token,
+                limit,
+            })
+            .await?
+        {
+            CacheResult::DigestPage(page) => Ok(page),
+            CacheResult::Error(error) => Err(anyhow::anyhow!("remote error: {error}")),
+            other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
+        }
+    }
+
     /// Delete `key` on the remote peer. Returns `Ok(())` on ack; the peer
     /// does not distinguish between hit and miss, matching the semantics of
     /// the semantic cache purge API.

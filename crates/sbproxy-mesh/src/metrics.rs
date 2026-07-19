@@ -23,8 +23,9 @@
 use std::sync::LazyLock;
 
 use prometheus::{
-    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge_vec,
-    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+    register_int_gauge_vec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts,
 };
 
 // --- Eviction / membership counters ---
@@ -414,6 +415,120 @@ pub const OUTCOME_MERGED: &str = "merged";
 pub const OUTCOME_STALE_SNAPSHOT: &str = "stale";
 /// `outcome` label for cold-start snapshots that failed to deserialize.
 pub const OUTCOME_CORRUPT: &str = "corrupt";
+
+// --- Replicated substrate (WOR-1947) ---
+
+/// Replicated writes by terminal outcome, as seen by the coordinator.
+///
+/// Labels: `outcome` (`acked` | `quorum_failed`).
+pub static MESH_REPLICATION_WRITES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        Opts::new(
+            "mesh_replication_writes_total",
+            "Replicated substrate writes by coordinator outcome"
+        ),
+        &["outcome"]
+    )
+    .expect("register mesh_replication_writes_total")
+});
+
+/// `outcome` label for [`MESH_REPLICATION_WRITES`]: the configured write
+/// consistency was met.
+pub const REPLICATION_OUTCOME_ACKED: &str = "acked";
+/// `outcome` label for [`MESH_REPLICATION_WRITES`]: fewer replicas acked
+/// than the consistency level required.
+pub const REPLICATION_OUTCOME_QUORUM_FAILED: &str = "quorum_failed";
+
+/// Stale replicas repaired in-line by quorum reads.
+pub static MESH_REPLICATION_READ_REPAIRS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "mesh_replication_read_repairs_total",
+        "Stale replicas repaired in-line by replicated reads"
+    )
+    .expect("register mesh_replication_read_repairs_total")
+});
+
+/// Completed maintenance rounds (handoff + anti-entropy + tombstone GC).
+pub static MESH_ANTI_ENTROPY_ROUNDS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "mesh_anti_entropy_rounds_total",
+        "Completed replicated-substrate maintenance rounds"
+    )
+    .expect("register mesh_anti_entropy_rounds_total")
+});
+
+/// Records reconciled by anti-entropy, by direction.
+///
+/// Labels: `direction` (`push` | `pull`).
+pub static MESH_ANTI_ENTROPY_KEYS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        Opts::new(
+            "mesh_anti_entropy_keys_total",
+            "Records reconciled by replicated-substrate anti-entropy"
+        ),
+        &["direction"]
+    )
+    .expect("register mesh_anti_entropy_keys_total")
+});
+
+/// `direction` label for [`MESH_ANTI_ENTROPY_KEYS`]: a newer local record
+/// was pushed to a peer.
+pub const ANTI_ENTROPY_DIRECTION_PUSH: &str = "push";
+/// `direction` label for [`MESH_ANTI_ENTROPY_KEYS`]: a newer peer record
+/// was pulled into the local shard.
+pub const ANTI_ENTROPY_DIRECTION_PULL: &str = "pull";
+
+/// Tombstone GC decisions.
+///
+/// Labels: `outcome` (`collected` | `deferred`).
+pub static MESH_TOMBSTONE_GC: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        Opts::new(
+            "mesh_tombstone_gc_total",
+            "Ack-aware tombstone garbage collection decisions"
+        ),
+        &["outcome"]
+    )
+    .expect("register mesh_tombstone_gc_total")
+});
+
+/// `outcome` label for [`MESH_TOMBSTONE_GC`]: every replica confirmed the
+/// tombstone past its grace period; it was physically collected.
+pub const GC_OUTCOME_COLLECTED: &str = "collected";
+/// `outcome` label for [`MESH_TOMBSTONE_GC`]: confirmation is still
+/// missing from at least one replica; collection was deferred.
+pub const GC_OUTCOME_DEFERRED: &str = "deferred";
+
+/// Ring-change handoff decisions.
+///
+/// Labels: `outcome` (`moved` | `retained`).
+pub static MESH_HANDOFF_KEYS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        Opts::new(
+            "mesh_handoff_keys_total",
+            "Replicated records handed off after ring changes"
+        ),
+        &["outcome"]
+    )
+    .expect("register mesh_handoff_keys_total")
+});
+
+/// `outcome` label for [`MESH_HANDOFF_KEYS`]: every current replica acked
+/// the record; the local copy was dropped.
+pub const HANDOFF_OUTCOME_MOVED: &str = "moved";
+/// `outcome` label for [`MESH_HANDOFF_KEYS`]: at least one replica did
+/// not ack; the local copy is retained for the next round.
+pub const HANDOFF_OUTCOME_RETAINED: &str = "retained";
+
+/// Records currently held by the local replica shard (live plus
+/// tombstones). Refreshed once per maintenance round.
+pub static MESH_REPLICA_SHARD_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "mesh_replica_shard_entries",
+        "Records held by the local replicated-substrate shard"
+    )
+    .expect("register mesh_replica_shard_entries")
+});
 
 // --- Fixed label values ---
 

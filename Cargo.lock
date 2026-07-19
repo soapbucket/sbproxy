@@ -8756,6 +8756,7 @@ dependencies = [
  "prometheus 0.14.0",
  "rand 0.8.6",
  "rcgen",
+ "redb",
  "redis",
  "rustls",
  "rustls-pki-types",

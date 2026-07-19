@@ -498,6 +498,10 @@ impl MeshConfig {
             // the configured cert/key/CA); the standalone `MeshConfig` path
             // stays plaintext unless a caller sets it after conversion.
             peer_tls: None,
+            // The replicated substrate is wired only through the canonical
+            // `proxy.cluster` path; the legacy extensions block cannot
+            // enable it.
+            replication: None,
         }
     }
 }

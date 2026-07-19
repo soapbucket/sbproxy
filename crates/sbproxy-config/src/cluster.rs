@@ -171,6 +171,90 @@ pub struct ClusterConfig {
     /// Optional signed model deployment authority.
     #[serde(default)]
     pub deployment_authority: Option<ClusterDeploymentAuthorityConfig>,
+    /// Optional replicated durable state substrate (WOR-1947). Absent
+    /// keeps the single-owner in-memory typed-state cache semantics.
+    #[serde(default)]
+    pub replication: Option<ClusterReplicationConfig>,
+}
+
+/// Consistency level for replicated state reads and writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterConsistencyLevel {
+    /// One replica acknowledgement (the coordinator's own shard counts).
+    One,
+    /// A majority of the key's replica set.
+    Quorum,
+    /// Every replica in the key's replica set.
+    All,
+}
+
+/// Replicated durable state substrate configuration (WOR-1947).
+///
+/// Enabling this block requires `state_dir`: the replica shard persists
+/// to `<state_dir>/replicated-state.redb` so a restarted node serves its
+/// committed records from disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClusterReplicationConfig {
+    /// Copies kept per record. Clamped to cluster size at placement time.
+    #[serde(default = "default_replication_factor")]
+    pub factor: usize,
+    /// Acknowledgements required before a write reports success.
+    #[serde(default = "default_write_consistency")]
+    pub write_consistency: ClusterConsistencyLevel,
+    /// Replicas consulted before a read reports its winner.
+    #[serde(default = "default_read_consistency")]
+    pub read_consistency: ClusterConsistencyLevel,
+    /// Cadence of the maintenance loop (anti-entropy, handoff, GC).
+    #[serde(default = "default_anti_entropy_interval_secs")]
+    pub anti_entropy_interval_secs: u64,
+    /// Age a tombstone must reach, with every replica confirming, before
+    /// it is physically collected. Also bounds how long a node may be
+    /// offline before its stored records are quarantined on rejoin.
+    #[serde(default = "default_tombstone_gc_grace_secs")]
+    pub tombstone_gc_grace_secs: u64,
+    /// Maximum records (live plus tombstones) per node shard.
+    #[serde(default = "default_replication_max_entries")]
+    pub max_entries: usize,
+    /// Maximum decoded record value size in bytes.
+    #[serde(default = "default_replication_max_value_bytes")]
+    pub max_value_bytes: usize,
+}
+
+impl Default for ClusterReplicationConfig {
+    fn default() -> Self {
+        Self {
+            factor: default_replication_factor(),
+            write_consistency: default_write_consistency(),
+            read_consistency: default_read_consistency(),
+            anti_entropy_interval_secs: default_anti_entropy_interval_secs(),
+            tombstone_gc_grace_secs: default_tombstone_gc_grace_secs(),
+            max_entries: default_replication_max_entries(),
+            max_value_bytes: default_replication_max_value_bytes(),
+        }
+    }
+}
+
+const fn default_replication_factor() -> usize {
+    2
+}
+const fn default_write_consistency() -> ClusterConsistencyLevel {
+    ClusterConsistencyLevel::Quorum
+}
+const fn default_read_consistency() -> ClusterConsistencyLevel {
+    ClusterConsistencyLevel::Quorum
+}
+const fn default_anti_entropy_interval_secs() -> u64 {
+    30
+}
+const fn default_tombstone_gc_grace_secs() -> u64 {
+    86_400
+}
+const fn default_replication_max_entries() -> usize {
+    65_536
+}
+const fn default_replication_max_value_bytes() -> usize {
+    1024 * 1024
 }
 
 /// Canonical cluster configuration validation failure.
@@ -279,6 +363,41 @@ impl ClusterConfig {
             return Err(ClusterConfigError::invalid(
                 "dead_peer_gc_secs must be between 1 and 86400 seconds",
             ));
+        }
+        if let Some(replication) = &self.replication {
+            if replication.factor == 0 || replication.factor > 8 {
+                return Err(ClusterConfigError::invalid(
+                    "replication.factor must be between 1 and 8",
+                ));
+            }
+            if replication.anti_entropy_interval_secs < 5
+                || replication.anti_entropy_interval_secs > 3_600
+            {
+                return Err(ClusterConfigError::invalid(
+                    "replication.anti_entropy_interval_secs must be between 5 and 3600",
+                ));
+            }
+            // The grace period must dominate the maintenance cadence by a
+            // wide margin: the no-resurrection argument relies on anti-
+            // entropy having repaired every reachable replica well before
+            // a tombstone becomes collectable.
+            if replication.tombstone_gc_grace_secs
+                < replication.anti_entropy_interval_secs.saturating_mul(10)
+            {
+                return Err(ClusterConfigError::invalid(
+                    "replication.tombstone_gc_grace_secs must be at least 10 anti-entropy intervals",
+                ));
+            }
+            if replication.max_entries == 0 || replication.max_entries > 1_048_576 {
+                return Err(ClusterConfigError::invalid(
+                    "replication.max_entries must be between 1 and 1048576",
+                ));
+            }
+            if replication.max_value_bytes == 0 || replication.max_value_bytes > 4 * 1024 * 1024 {
+                return Err(ClusterConfigError::invalid(
+                    "replication.max_value_bytes must be between 1 and 4194304",
+                ));
+            }
         }
         validate_security(&self.security)?;
         if let Some(enrollment) = &self.enrollment {
@@ -604,6 +723,8 @@ pub struct EffectiveClusterConfig {
     pub enrollment: Option<ClusterEnrollmentConfig>,
     /// Optional deployment authority.
     pub deployment_authority: Option<ClusterDeploymentAuthorityConfig>,
+    /// Optional replicated durable state substrate.
+    pub replication: Option<ClusterReplicationConfig>,
     /// Actionable compatibility diagnostics.
     pub diagnostics: Vec<ClusterConfigDiagnostic>,
 }
@@ -643,6 +764,10 @@ pub struct ClusterRestartFingerprint {
     pub enrollment: Option<ClusterEnrollmentConfig>,
     /// Deployment signing authority loaded at startup.
     pub deployment_authority: Option<ClusterDeploymentAuthorityConfig>,
+    /// Replicated substrate bootstrap-time wiring. The shard, transport
+    /// ops, and maintenance loop are constructed at process start, so a
+    /// live replacement cannot take effect.
+    pub replication: Option<ClusterReplicationConfig>,
 }
 
 impl EffectiveClusterConfig {
@@ -665,6 +790,7 @@ impl EffectiveClusterConfig {
             security: self.security.clone(),
             enrollment: self.enrollment.clone(),
             deployment_authority: self.deployment_authority.clone(),
+            replication: self.replication.clone(),
         }
     }
 }
@@ -744,6 +870,7 @@ fn lower_canonical(config: &ClusterConfig, source: ClusterConfigSource) -> Effec
         dead_peer_gc_secs: config.dead_peer_gc_secs,
         enrollment: config.enrollment.clone(),
         deployment_authority: config.deployment_authority.clone(),
+        replication: config.replication.clone(),
         diagnostics: Vec::new(),
     }
 }
@@ -785,6 +912,9 @@ fn lower_legacy(node_id: Option<&str>, mesh: &MeshClusterConfig) -> EffectiveClu
         dead_peer_gc_secs: DEFAULT_DEAD_PEER_GC_SECS,
         enrollment: None,
         deployment_authority: None,
+        // The legacy mesh path has no durable state_dir, so it can never
+        // enable the replicated substrate.
+        replication: None,
         diagnostics: vec![legacy_diagnostic()],
     }
 }

@@ -1253,6 +1253,10 @@ impl ClusterBootstrap for SystemClusterBootstrap {
             dead_peer_gc_secs: config.dead_peer_gc_secs,
             shared_key,
             peer_tls,
+            replication: config
+                .replication
+                .as_ref()
+                .map(|replication| lower_replication(replication, config.state_dir.as_deref())),
             ..Default::default()
         };
         let node_id = identity.node_id.clone();
@@ -1271,6 +1275,37 @@ impl ClusterBootstrap for SystemClusterBootstrap {
             }
         }
         ClusterHandle::distributed(identity, Arc::new(node)).map_err(anyhow::Error::from)
+    }
+}
+
+/// Lower the public replication block into the mesh bootstrap wiring.
+/// The durable shard lives beside the node's other durable identity
+/// state; canonical validation guarantees `state_dir` is present.
+fn lower_replication(
+    replication: &sbproxy_config::cluster::ClusterReplicationConfig,
+    state_dir: Option<&str>,
+) -> sbproxy_mesh::bootstrap::ReplicationBootstrapConfig {
+    use sbproxy_config::cluster::ClusterConsistencyLevel;
+    use sbproxy_mesh::state::replicated::Consistency;
+
+    let lower_level = |level: ClusterConsistencyLevel| match level {
+        ClusterConsistencyLevel::One => Consistency::One,
+        ClusterConsistencyLevel::Quorum => Consistency::Quorum,
+        ClusterConsistencyLevel::All => Consistency::All,
+    };
+    sbproxy_mesh::bootstrap::ReplicationBootstrapConfig {
+        settings: sbproxy_mesh::state::replicated::ReplicationSettings {
+            replication_factor: replication.factor,
+            write_consistency: lower_level(replication.write_consistency),
+            read_consistency: lower_level(replication.read_consistency),
+            anti_entropy_interval_secs: replication.anti_entropy_interval_secs,
+            tombstone_gc_grace_secs: replication.tombstone_gc_grace_secs,
+        },
+        limits: sbproxy_mesh::state::replicated::ShardLimits {
+            max_entries: replication.max_entries,
+            max_value_bytes: replication.max_value_bytes,
+        },
+        durable_path: state_dir.map(|dir| std::path::Path::new(dir).join("replicated-state.redb")),
     }
 }
 
@@ -1421,7 +1456,7 @@ fn cluster_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-fn block_on_cluster<F>(future: F) -> F::Output
+pub(crate) fn block_on_cluster<F>(future: F) -> F::Output
 where
     F: std::future::Future + Send,
     F::Output: Send,
