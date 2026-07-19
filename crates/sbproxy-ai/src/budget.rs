@@ -866,6 +866,18 @@ pub fn estimate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) ->
     estimate_token_cost(model, prompt_tokens, completion_tokens, 0, 0)
 }
 
+/// Estimate input-only USD cost when `model` has an operator or catalog
+/// price.
+///
+/// Unlike [`estimate_cost`], this never applies the pessimistic fallback used
+/// for budget enforcement. Value accounting must not claim avoided dollars
+/// for an unpriced model, so callers get `None` when no real price resolves.
+/// This lookup also avoids emitting the request billing price-source metric.
+pub fn estimate_known_input_cost(model: &str, input_tokens: u64) -> Option<f64> {
+    let (price, _) = resolve_price(model)?;
+    Some((input_tokens as f64) * price.input_per_million / 1_000_000.0)
+}
+
 /// Estimate the USD cost of a token-based request, billing the cached
 /// portion of the prompt at the model's cache-read rate and the
 /// cache-creation portion at its cache-write rate (WOR-1708). `input`

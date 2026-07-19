@@ -113,6 +113,7 @@ pub use streaming::*;
 pub use streaming_analytics::{StreamRegistry, StreamTracker};
 pub use token_estimate::{
     estimate_json_message_tokens, estimate_tokens, estimate_tokens_heuristic,
+    token_count_precision, TokenCountPrecision,
 };
 pub use types::*;
 pub use usage_parser::{select_parser, SseUsageParser, UsageParserHints, UsageTokens};

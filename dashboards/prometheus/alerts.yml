@@ -168,3 +168,23 @@ groups:
         annotations:
           summary: "AI compression state updates are being rejected"
           description: "External compression state operations have failed above 0.1 events/second for 10 minutes. Inspect the operation label plus Redis lease and fence coordination metrics before changing compression policy."
+
+      - alert: SBProxyAICompressionValueUnpriced
+        expr: |
+          (
+            sum by (tenant_id, origin, model) (
+              rate(sbproxy_ai_compression_value_tokens_saved_total[15m])
+            ) > 10
+          )
+          unless on (tenant_id, origin, model)
+          (
+            sum by (tenant_id, origin, model) (
+              rate(sbproxy_ai_compression_value_cost_saved_micros_total[15m])
+            ) > 0
+          )
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Compression value for {{ $labels.model }} has no price"
+          description: "Successful compression is avoiding more than 10 estimated input tokens per second for this model, but no avoided-cost value is being recorded. Configure an input price or accept token-only value reporting for this model."

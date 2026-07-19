@@ -12,7 +12,7 @@
 //! [`sbproxy_model_host::LaneSplit`] tally so the admin value route can
 //! report dollars saved per model and the number survives a restart.
 //! Successful context-compression requests add prompt-free, per-lever target
-//! token and gross avoided-input-cost totals to the same report without
+//! token estimates and gross avoided-input-cost totals to the same report without
 //! changing the local or cloud completion counts.
 //!
 //! ## Shape
@@ -33,20 +33,30 @@
 //! It never fabricates a local completion or folds internal summarizer spend
 //! into the gross avoided-cost value.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use redb::{Database, ReadableTable, TableDefinition};
 
-use sbproxy_model_host::{CloudPrice, LaneSplit, ModelHostConfig, ValueReport};
+use sbproxy_model_host::{
+    CloudPrice, LaneSplit, ModelHostConfig, TokenCountPrecision, ValueReport,
+};
 
 use crate::compression::{CompressionRun, LeverKind, LeverOutcome};
 use crate::usage_sink::{LlmUsageEvent, UsageSink};
 
 /// redb table: served model name -> JSON-encoded [`LaneSplit`].
 const LANES: TableDefinition<&str, &[u8]> = TableDefinition::new("value_lanes_v1");
+
+/// Maximum number of model lanes retained by one value ledger, including the
+/// deterministic overflow lane.
+pub const VALUE_LEDGER_MODEL_LIMIT: usize = 1_000;
+
+/// Stable model key that aggregates value after the model-lane budget fills.
+pub const VALUE_LEDGER_OVERFLOW_MODEL: &str = "__other__";
 
 /// The process-wide value ledger, set once for local-serving or compression
 /// value so the admin value route can read it.
@@ -80,10 +90,11 @@ pub fn value_ledger_or_init_memory() -> Arc<ValueLedger> {
         .clone()
 }
 
-/// Prompt-free target-model savings waiting for a terminal provider success.
+/// Prompt-free target-model estimated savings waiting for provider success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCompressionValue {
     target_model: String,
+    token_count_precision: TokenCountPrecision,
     levers: Vec<PendingCompressionLeverValue>,
 }
 
@@ -91,6 +102,7 @@ impl PendingCompressionValue {
     /// Build pending value from applied levers with positive target-model
     /// token savings. Skips, failures, and zero-savings outcomes are omitted.
     pub fn from_run(target_model: impl Into<String>, run: &CompressionRun) -> Option<Self> {
+        let token_count_precision = run.token_count_precision;
         let levers = run
             .lever_results
             .iter()
@@ -100,10 +112,12 @@ impl PendingCompressionValue {
             .map(|result| PendingCompressionLeverValue {
                 lever: result.lever,
                 tokens_saved: result.tokens_saved,
+                token_count_precision,
             })
             .collect::<Vec<_>>();
         (!levers.is_empty()).then(|| Self {
             target_model: target_model.into(),
+            token_count_precision,
             levers,
         })
     }
@@ -114,9 +128,15 @@ impl PendingCompressionValue {
         &self.target_model
     }
 
-    /// Applied positive per-lever token savings in pipeline order.
+    /// Applied positive per-lever estimated token savings in pipeline order.
     pub fn levers(&self) -> &[PendingCompressionLeverValue] {
         &self.levers
+    }
+
+    /// Precision signal from the target-model counter that produced these
+    /// savings.
+    pub fn token_count_precision(&self) -> TokenCountPrecision {
+        self.token_count_precision
     }
 
     /// Price every per-lever saving as gross avoided input cost for the target
@@ -131,6 +151,7 @@ impl PendingCompressionValue {
                     &self.target_model,
                     pending.tokens_saved,
                 ),
+                token_count_precision: pending.token_count_precision,
             })
             .collect()
     }
@@ -141,6 +162,7 @@ impl PendingCompressionValue {
 pub struct PendingCompressionLeverValue {
     lever: LeverKind,
     tokens_saved: u64,
+    token_count_precision: TokenCountPrecision,
 }
 
 impl PendingCompressionLeverValue {
@@ -149,9 +171,14 @@ impl PendingCompressionLeverValue {
         self.lever
     }
 
-    /// Target-model input tokens avoided.
+    /// Estimated target-model input tokens avoided.
     pub fn tokens_saved(&self) -> u64 {
         self.tokens_saved
+    }
+
+    /// Precision signal from the target-model counter.
+    pub fn token_count_precision(&self) -> TokenCountPrecision {
+        self.token_count_precision
     }
 }
 
@@ -161,6 +188,7 @@ pub struct CompressionValueRecord {
     lever: LeverKind,
     tokens_saved: u64,
     gross_cost_saved_micros: u64,
+    token_count_precision: TokenCountPrecision,
 }
 
 impl CompressionValueRecord {
@@ -169,7 +197,7 @@ impl CompressionValueRecord {
         self.lever
     }
 
-    /// Target-model input tokens avoided.
+    /// Estimated target-model input tokens avoided.
     pub fn tokens_saved(&self) -> u64 {
         self.tokens_saved
     }
@@ -178,10 +206,16 @@ impl CompressionValueRecord {
     pub fn gross_cost_saved_micros(&self) -> u64 {
         self.gross_cost_saved_micros
     }
+
+    /// Precision signal from the target-model counter.
+    pub fn token_count_precision(&self) -> TokenCountPrecision {
+        self.token_count_precision
+    }
 }
 
 fn estimated_input_cost_micros(model: &str, tokens: u64) -> u64 {
-    let micros = crate::budget::estimate_cost(model, tokens, 0) * 1_000_000.0;
+    let micros =
+        crate::budget::estimate_known_input_cost(model, tokens).unwrap_or(0.0) * 1_000_000.0;
     if !micros.is_finite() || micros <= 0.0 {
         return 0;
     }
@@ -191,7 +225,10 @@ fn estimated_input_cost_micros(model: &str, tokens: u64) -> u64 {
 /// Where the ledger keeps its per-model tallies.
 enum Backend {
     /// A durable redb database on disk.
-    Redb(Database),
+    Redb {
+        database: Database,
+        model_keys: parking_lot::Mutex<BTreeSet<String>>,
+    },
     /// An in-memory map (empty path): tests and file-less setups.
     Memory(parking_lot::Mutex<BTreeMap<String, LaneSplit>>),
 }
@@ -199,12 +236,13 @@ enum Backend {
 /// A per-model local-serving and context-compression value tally.
 pub struct ValueLedger {
     backend: Backend,
+    overflow_logged: AtomicBool,
 }
 
 impl std::fmt::Debug for ValueLedger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match &self.backend {
-            Backend::Redb(_) => "redb",
+            Backend::Redb { .. } => "redb",
             Backend::Memory(_) => "memory",
         };
         f.debug_struct("ValueLedger")
@@ -229,14 +267,23 @@ impl ValueLedger {
             .open_table(LANES)
             .context("value ledger: open table")?;
         write.commit().context("value ledger: commit initial")?;
+        let mut model_keys = read_redb_model_keys(&db)?;
+        if model_keys.len() > VALUE_LEDGER_MODEL_LIMIT {
+            ensure_redb_overflow_lane(&db, &mut model_keys)?;
+        }
         Ok(Self {
-            backend: Backend::Redb(db),
+            backend: Backend::Redb {
+                database: db,
+                model_keys: parking_lot::Mutex::new(model_keys),
+            },
+            overflow_logged: AtomicBool::new(false),
         })
     }
 
     fn memory() -> Self {
         Self {
             backend: Backend::Memory(parking_lot::Mutex::new(BTreeMap::new())),
+            overflow_logged: AtomicBool::new(false),
         }
     }
 
@@ -277,12 +324,18 @@ impl ValueLedger {
         lever: LeverKind,
         tokens_saved: u64,
         gross_cost_saved_micros: u64,
+        token_count_precision: TokenCountPrecision,
     ) {
         if tokens_saved == 0 {
             return;
         }
         if let Err(error) = self.try_update_lane(model, |split| {
-            split.record_compression(lever.as_str(), tokens_saved, gross_cost_saved_micros);
+            split.record_compression(
+                lever.as_str(),
+                tokens_saved,
+                gross_cost_saved_micros,
+                token_count_precision,
+            );
         }) {
             tracing::warn!(
                 error = %error,
@@ -299,37 +352,59 @@ impl ValueLedger {
     ) -> anyhow::Result<()> {
         match &self.backend {
             Backend::Memory(map) => {
-                update(map.lock().entry(model.to_string()).or_default());
-                Ok(())
-            }
-            Backend::Redb(db) => {
-                let write = db.begin_write().context("value ledger: begin write")?;
-                {
-                    let mut table = write
-                        .open_table(LANES)
-                        .context("value ledger: open table")?;
-                    // Copy the stored bytes out so the read guard is dropped
-                    // before we insert back into the same table.
-                    let existing = table
-                        .get(model)
-                        .context("value ledger: read lane")?
-                        .map(|guard| guard.value().to_vec());
-                    let mut split: LaneSplit = match existing {
-                        Some(bytes) => {
-                            serde_json::from_slice(&bytes).context("value ledger: decode lane")?
-                        }
-                        None => LaneSplit::default(),
-                    };
-                    update(&mut split);
-                    let encoded =
-                        serde_json::to_vec(&split).context("value ledger: encode lane")?;
-                    table
-                        .insert(model, encoded.as_slice())
-                        .context("value ledger: write lane")?;
+                let mut map = map.lock();
+                let (model_key, overflowed) = bounded_memory_model_key(&mut map, model);
+                update(map.entry(model_key).or_default());
+                drop(map);
+                if overflowed {
+                    self.log_overflow_once();
                 }
-                write.commit().context("value ledger: commit")?;
                 Ok(())
             }
+            Backend::Redb {
+                database,
+                model_keys,
+            } => {
+                let mut model_keys = model_keys.lock();
+                let mut overflowed = false;
+                let model_key = if model_keys.contains(model) {
+                    model.to_string()
+                } else {
+                    let has_overflow = model_keys.contains(VALUE_LEDGER_OVERFLOW_MODEL);
+                    let admission_limit = if has_overflow {
+                        VALUE_LEDGER_MODEL_LIMIT
+                    } else {
+                        VALUE_LEDGER_MODEL_LIMIT.saturating_sub(1)
+                    };
+                    if model_keys.len() < admission_limit {
+                        model.to_string()
+                    } else if has_overflow {
+                        overflowed = true;
+                        VALUE_LEDGER_OVERFLOW_MODEL.to_string()
+                    } else {
+                        ensure_redb_overflow_lane(database, &mut model_keys)?;
+                        overflowed = true;
+                        VALUE_LEDGER_OVERFLOW_MODEL.to_string()
+                    }
+                };
+                update_redb_lane(database, &model_key, update)?;
+                model_keys.insert(model_key);
+                drop(model_keys);
+                if overflowed {
+                    self.log_overflow_once();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn log_overflow_once(&self) {
+        if !self.overflow_logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                model_limit = VALUE_LEDGER_MODEL_LIMIT,
+                overflow_model = VALUE_LEDGER_OVERFLOW_MODEL,
+                "value ledger: model cardinality limit reached; aggregating additional models"
+            );
         }
     }
 
@@ -348,8 +423,8 @@ impl ValueLedger {
     fn report_inner(&self) -> anyhow::Result<ValueReport> {
         let lanes = match &self.backend {
             Backend::Memory(map) => map.lock().clone(),
-            Backend::Redb(db) => {
-                let read = db.begin_read().context("value ledger: begin read")?;
+            Backend::Redb { database, .. } => {
+                let read = database.begin_read().context("value ledger: begin read")?;
                 let table = read.open_table(LANES).context("value ledger: open table")?;
                 let mut lanes = BTreeMap::new();
                 for entry in table
@@ -366,6 +441,172 @@ impl ValueLedger {
         };
         Ok(ValueReport::from_lanes(&lanes))
     }
+}
+
+fn merge_lane(target: &mut LaneSplit, source: LaneSplit) {
+    target.local_completions = target
+        .local_completions
+        .saturating_add(source.local_completions);
+    target.cloud_completions = target
+        .cloud_completions
+        .saturating_add(source.cloud_completions);
+    target.saved_micros = target.saved_micros.saturating_add(source.saved_micros);
+    target.cloud_spent_micros = target
+        .cloud_spent_micros
+        .saturating_add(source.cloud_spent_micros);
+    for (lever, value) in source.compression {
+        target.record_compression(
+            &lever,
+            value.tokens_saved,
+            value.gross_cost_saved_micros,
+            value.token_count_precision,
+        );
+    }
+}
+
+fn bounded_memory_model_key(
+    lanes: &mut BTreeMap<String, LaneSplit>,
+    model: &str,
+) -> (String, bool) {
+    if lanes.contains_key(model) {
+        return (model.to_string(), false);
+    }
+    let has_overflow = lanes.contains_key(VALUE_LEDGER_OVERFLOW_MODEL);
+    let admission_limit = if has_overflow {
+        VALUE_LEDGER_MODEL_LIMIT
+    } else {
+        VALUE_LEDGER_MODEL_LIMIT.saturating_sub(1)
+    };
+    if lanes.len() < admission_limit {
+        return (model.to_string(), false);
+    }
+    if has_overflow {
+        return (VALUE_LEDGER_OVERFLOW_MODEL.to_string(), true);
+    }
+
+    let mut overflow = LaneSplit::default();
+    while lanes.len() >= VALUE_LEDGER_MODEL_LIMIT {
+        let Some(evicted_key) = lanes.keys().next_back().cloned() else {
+            break;
+        };
+        if let Some(evicted) = lanes.remove(&evicted_key) {
+            merge_lane(&mut overflow, evicted);
+        }
+    }
+    merge_lane(
+        lanes
+            .entry(VALUE_LEDGER_OVERFLOW_MODEL.to_string())
+            .or_default(),
+        overflow,
+    );
+    (VALUE_LEDGER_OVERFLOW_MODEL.to_string(), true)
+}
+
+fn read_redb_model_keys(database: &Database) -> anyhow::Result<BTreeSet<String>> {
+    let read = database
+        .begin_read()
+        .context("value ledger: begin model-key read")?;
+    let table = read
+        .open_table(LANES)
+        .context("value ledger: open model-key table")?;
+    let mut model_keys = BTreeSet::new();
+    for entry in table
+        .range::<&str>(..)
+        .context("value ledger: scan model keys")?
+    {
+        let (key, _) = entry.context("value ledger: read model key")?;
+        model_keys.insert(key.value().to_string());
+    }
+    Ok(model_keys)
+}
+
+fn ensure_redb_overflow_lane(
+    database: &Database,
+    model_keys: &mut BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let mut next_keys = model_keys.clone();
+    next_keys.remove(VALUE_LEDGER_OVERFLOW_MODEL);
+
+    let write = database
+        .begin_write()
+        .context("value ledger: begin overflow write")?;
+    {
+        let mut table = write
+            .open_table(LANES)
+            .context("value ledger: open overflow table")?;
+        let existing_overflow = table
+            .get(VALUE_LEDGER_OVERFLOW_MODEL)
+            .context("value ledger: read overflow lane")?
+            .map(|guard| guard.value().to_vec());
+        let mut overflow = match existing_overflow {
+            Some(bytes) => {
+                serde_json::from_slice(&bytes).context("value ledger: decode overflow lane")?
+            }
+            None => LaneSplit::default(),
+        };
+
+        while next_keys.len() >= VALUE_LEDGER_MODEL_LIMIT {
+            let evicted_key = next_keys
+                .iter()
+                .next_back()
+                .cloned()
+                .context("value ledger: missing overflow eviction candidate")?;
+            let evicted_bytes = table
+                .get(evicted_key.as_str())
+                .context("value ledger: read overflow eviction")?
+                .map(|guard| guard.value().to_vec())
+                .context("value ledger: missing overflow eviction lane")?;
+            let evicted: LaneSplit = serde_json::from_slice(&evicted_bytes)
+                .context("value ledger: decode overflow eviction lane")?;
+            merge_lane(&mut overflow, evicted);
+            table
+                .remove(evicted_key.as_str())
+                .context("value ledger: remove overflow eviction lane")?;
+            next_keys.remove(&evicted_key);
+        }
+
+        let encoded =
+            serde_json::to_vec(&overflow).context("value ledger: encode overflow lane")?;
+        table
+            .insert(VALUE_LEDGER_OVERFLOW_MODEL, encoded.as_slice())
+            .context("value ledger: write overflow lane")?;
+    }
+    write
+        .commit()
+        .context("value ledger: commit overflow lane")?;
+    next_keys.insert(VALUE_LEDGER_OVERFLOW_MODEL.to_string());
+    *model_keys = next_keys;
+    Ok(())
+}
+
+fn update_redb_lane(
+    database: &Database,
+    model: &str,
+    update: impl FnOnce(&mut LaneSplit),
+) -> anyhow::Result<()> {
+    let write = database
+        .begin_write()
+        .context("value ledger: begin write")?;
+    {
+        let mut table = write
+            .open_table(LANES)
+            .context("value ledger: open table")?;
+        let existing = table
+            .get(model)
+            .context("value ledger: read lane")?
+            .map(|guard| guard.value().to_vec());
+        let mut split: LaneSplit = match existing {
+            Some(bytes) => serde_json::from_slice(&bytes).context("value ledger: decode lane")?,
+            None => LaneSplit::default(),
+        };
+        update(&mut split);
+        let encoded = serde_json::to_vec(&split).context("value ledger: encode lane")?;
+        table
+            .insert(model, encoded.as_slice())
+            .context("value ledger: write lane")?;
+    }
+    write.commit().context("value ledger: commit")?;
+    Ok(())
 }
 
 /// A [`UsageSink`] that records the
@@ -557,12 +798,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_value_keeps_only_applied_positive_levers_and_prices_target_model() {
+    fn pending_value_keeps_only_applied_positive_levers_and_prices_known_target_model() {
         let run = CompressionRun {
             messages: Vec::new(),
             initial_tokens: 1_050_010,
             final_tokens: 10,
             tokens_saved: 1_050_000,
+            token_count_precision: TokenCountPrecision::ModelTokenizer,
             lever_results: vec![
                 lever_result(LeverKind::WindowFit, LeverOutcome::Applied, 1_000_000),
                 lever_result(LeverKind::SummaryBuffer, LeverOutcome::Applied, 50_000),
@@ -583,17 +825,52 @@ mod tests {
             ],
         };
 
-        let pending = PendingCompressionValue::from_run("wor-1921-unpriced-test-model", &run)
+        let pending = PendingCompressionValue::from_run("gpt-4o", &run)
             .expect("positive applied outcomes create pending value");
-        assert_eq!(pending.target_model(), "wor-1921-unpriced-test-model");
+        assert_eq!(pending.target_model(), "gpt-4o");
         assert_eq!(pending.levers().len(), 2);
         assert_eq!(pending.levers()[0].tokens_saved(), 1_000_000);
+        assert_eq!(
+            pending.token_count_precision(),
+            TokenCountPrecision::ModelTokenizer
+        );
 
         let records = pending.priced_records();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].lever(), LeverKind::WindowFit);
-        assert_eq!(records[0].gross_cost_saved_micros(), 5_000_000);
-        assert_eq!(records[1].gross_cost_saved_micros(), 250_000);
+        assert_eq!(records[0].gross_cost_saved_micros(), 2_500_000);
+        assert_eq!(
+            records[0].token_count_precision(),
+            TokenCountPrecision::ModelTokenizer
+        );
+        assert_eq!(records[1].gross_cost_saved_micros(), 125_000);
+    }
+
+    #[test]
+    fn unpriced_target_model_keeps_tokens_without_claiming_avoided_cost() {
+        let run = CompressionRun {
+            messages: Vec::new(),
+            initial_tokens: 1_000_010,
+            final_tokens: 10,
+            tokens_saved: 1_000_000,
+            token_count_precision: TokenCountPrecision::Heuristic,
+            lever_results: vec![lever_result(
+                LeverKind::WindowFit,
+                LeverOutcome::Applied,
+                1_000_000,
+            )],
+        };
+
+        let pending = PendingCompressionValue::from_run("wor-1921-unpriced-test-model", &run)
+            .expect("positive applied outcome creates pending value");
+        let records = pending.priced_records();
+
+        assert_eq!(records[0].tokens_saved(), 1_000_000);
+        assert_eq!(records[0].gross_cost_saved_micros(), 0);
+        assert_eq!(
+            records[0].token_count_precision(),
+            TokenCountPrecision::Heuristic
+        );
     }
 
     #[test]
@@ -603,6 +880,7 @@ mod tests {
             initial_tokens: 10,
             final_tokens: 10,
             tokens_saved: 0,
+            token_count_precision: TokenCountPrecision::ModelTokenizer,
             lever_results: vec![
                 lever_result(
                     LeverKind::WindowFit,
@@ -630,9 +908,27 @@ mod tests {
         let path = dir.path().join("compression-value.redb");
         {
             let ledger = ValueLedger::open(&path).expect("open");
-            ledger.record_compression("gpt-4o-mini", LeverKind::WindowFit, 500, 75);
-            ledger.record_compression("gpt-4o-mini", LeverKind::WindowFit, 250, 38);
-            ledger.record_compression("gpt-4o-mini", LeverKind::SummaryBuffer, 100, 15);
+            ledger.record_compression(
+                "gpt-4o-mini",
+                LeverKind::WindowFit,
+                500,
+                75,
+                TokenCountPrecision::ModelTokenizer,
+            );
+            ledger.record_compression(
+                "gpt-4o-mini",
+                LeverKind::WindowFit,
+                250,
+                38,
+                TokenCountPrecision::ModelTokenizer,
+            );
+            ledger.record_compression(
+                "gpt-4o-mini",
+                LeverKind::SummaryBuffer,
+                100,
+                15,
+                TokenCountPrecision::ModelTokenizer,
+            );
         }
 
         let report = ValueLedger::open(&path).expect("reopen").report();
@@ -642,6 +938,136 @@ mod tests {
         assert_eq!(report.total_compression_tokens_saved, 850);
         assert_eq!(report.total_compression_gross_cost_saved_micros, 128);
         assert_eq!(report.compression_totals["window_fit"].tokens_saved, 750);
+    }
+
+    #[test]
+    fn memory_ledger_bounds_model_cardinality_with_a_stable_overflow_lane() {
+        let ledger = ValueLedger::open("").expect("memory ledger");
+        for index in 0..999 {
+            ledger.record_compression(
+                &format!("model-{index:04}"),
+                LeverKind::WindowFit,
+                1,
+                0,
+                TokenCountPrecision::Heuristic,
+            );
+        }
+        ledger.record_compression(
+            "overflow-a",
+            LeverKind::WindowFit,
+            7,
+            0,
+            TokenCountPrecision::Heuristic,
+        );
+        ledger.record_compression(
+            "overflow-b",
+            LeverKind::WindowFit,
+            11,
+            0,
+            TokenCountPrecision::Heuristic,
+        );
+
+        let report = ledger.report();
+        assert_eq!(report.models.len(), 1_000);
+        let overflow = report
+            .compression
+            .iter()
+            .find(|value| value.model == "__other__")
+            .expect("overflow lane");
+        assert_eq!(overflow.tokens_saved, 18);
+        assert_eq!(report.total_compression_tokens_saved, 1_017);
+    }
+
+    #[test]
+    fn memory_reserved_overflow_model_does_not_consume_remaining_capacity() {
+        let ledger = ValueLedger::open("").expect("memory ledger");
+        for (model, tokens) in [
+            (VALUE_LEDGER_OVERFLOW_MODEL, 3),
+            ("normal-a", 5),
+            ("normal-b", 7),
+        ] {
+            ledger.record_compression(
+                model,
+                LeverKind::WindowFit,
+                tokens,
+                0,
+                TokenCountPrecision::Heuristic,
+            );
+        }
+
+        let report = ledger.report();
+        assert_eq!(report.models.len(), 3);
+        assert!(report.models.iter().any(|value| value.model == "normal-a"));
+        assert!(report.models.iter().any(|value| value.model == "normal-b"));
+    }
+
+    #[test]
+    fn redb_ledger_persists_the_bounded_overflow_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bounded-value.redb");
+        {
+            let ledger = ValueLedger::open(&path).expect("open");
+            for index in 0..999 {
+                ledger.record_compression(
+                    &format!("model-{index:04}"),
+                    LeverKind::WindowFit,
+                    1,
+                    0,
+                    TokenCountPrecision::Heuristic,
+                );
+            }
+            ledger.record_compression(
+                "overflow-a",
+                LeverKind::WindowFit,
+                7,
+                0,
+                TokenCountPrecision::Heuristic,
+            );
+            ledger.record_compression(
+                "overflow-b",
+                LeverKind::WindowFit,
+                11,
+                0,
+                TokenCountPrecision::Heuristic,
+            );
+        }
+
+        let report = ValueLedger::open(&path).expect("reopen").report();
+        assert_eq!(report.models.len(), 1_000);
+        let overflow = report
+            .compression
+            .iter()
+            .find(|value| value.model == "__other__")
+            .expect("overflow lane");
+        assert_eq!(overflow.tokens_saved, 18);
+        assert_eq!(report.total_compression_tokens_saved, 1_017);
+    }
+
+    #[test]
+    fn redb_reserved_overflow_model_does_not_consume_remaining_capacity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reserved-overflow-value.redb");
+        {
+            let ledger = ValueLedger::open(&path).expect("open");
+            for (model, tokens) in [
+                (VALUE_LEDGER_OVERFLOW_MODEL, 3),
+                ("normal-a", 5),
+                ("normal-b", 7),
+            ] {
+                ledger.record_compression(
+                    model,
+                    LeverKind::WindowFit,
+                    tokens,
+                    0,
+                    TokenCountPrecision::Heuristic,
+                );
+            }
+        }
+
+        let report = ValueLedger::open(&path).expect("reopen").report();
+        assert_eq!(report.models.len(), 3);
+        assert!(report.models.iter().any(|value| value.model == "normal-a"));
+        assert!(report.models.iter().any(|value| value.model == "normal-b"));
     }
 
     #[test]
@@ -672,5 +1098,32 @@ mod tests {
         assert_eq!(report.total_saved_micros, 99);
         assert!(report.compression.is_empty());
         assert!(report.compression_totals.is_empty());
+    }
+
+    #[test]
+    fn legacy_redb_compression_defaults_to_heuristic_precision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy-compression-value.redb");
+        {
+            let database = Database::create(&path).expect("create legacy database");
+            let write = database.begin_write().expect("begin legacy write");
+            {
+                let mut table = write.open_table(LANES).expect("open legacy table");
+                table
+                    .insert(
+                        "legacy-model",
+                        br#"{"local_completions":0,"cloud_completions":0,"saved_micros":0,"cloud_spent_micros":0,"compression":{"window_fit":{"tokens_saved":10,"gross_cost_saved_micros":0}}}"#
+                            .as_slice(),
+                    )
+                    .expect("insert legacy compression lane");
+            }
+            write.commit().expect("commit legacy lane");
+        }
+
+        let report = ValueLedger::open(&path).expect("reopen").report();
+        assert_eq!(
+            report.compression[0].token_count_precision,
+            TokenCountPrecision::Heuristic
+        );
     }
 }

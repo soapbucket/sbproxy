@@ -72,6 +72,39 @@ fn ai_gateway_dashboard_covers_compression_value_and_health() {
 }
 
 #[test]
+fn ai_value_dashboard_covers_realized_compression_tokens_and_cost() {
+    let bytes = std::fs::read(workspace_file("dashboards/grafana/sbproxy-ai-value.json"))
+        .expect("read AI value dashboard");
+    let dashboard: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("AI value dashboard is valid JSON");
+    let panels = dashboard["panels"]
+        .as_array()
+        .expect("dashboard has panels");
+    let titles = panels
+        .iter()
+        .filter_map(|panel| panel["title"].as_str())
+        .collect::<Vec<_>>();
+    assert!(titles.contains(&"Realized Compression Tokens Saved/sec"));
+    assert!(titles.contains(&"Realized Compression Cost Saved ($/hr)"));
+
+    let expressions = panels
+        .iter()
+        .flat_map(|panel| panel["targets"].as_array().into_iter().flatten())
+        .filter_map(|target| target["expr"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for metric in [
+        "sbproxy_ai_compression_value_tokens_saved_total",
+        "sbproxy_ai_compression_value_cost_saved_micros_total",
+    ] {
+        assert!(
+            expressions.contains(metric),
+            "AI value dashboard does not query {metric}"
+        );
+    }
+}
+
+#[test]
 fn prometheus_rules_cover_compression_value_failures_and_coordination() {
     let rules =
         std::fs::read_to_string(workspace_file("dashboards/prometheus/recording-rules.yml"))
@@ -81,19 +114,33 @@ fn prometheus_rules_cover_compression_value_failures_and_coordination() {
         "sbproxy:ai_compression_failure_ratio_5m",
         "sbproxy:ai_compression_latency_p95_5m",
         "sbproxy:ai_compression_tokens_saved_rate_5m",
+        "sbproxy:ai_compression_value_tokens_saved_by_tenant_model_lever_5m",
+        "sbproxy:ai_compression_value_cost_saved_dollars_by_tenant_model_lever_5m",
     ] {
         assert!(rules.contains(record), "missing recording rule {record}");
     }
+    assert!(rules.contains("sbproxy_ai_compression_value_tokens_saved_total"));
+    assert!(rules.contains("sbproxy_ai_compression_value_cost_saved_micros_total"));
 
     let alerts = std::fs::read_to_string(workspace_file("dashboards/prometheus/alerts.yml"))
         .expect("read alert rules");
     for alert in [
         "SBProxyAICompressionFailures",
         "SBProxyAICompressionStateRejections",
+        "SBProxyAICompressionValueUnpriced",
     ] {
         assert!(alerts.contains(alert), "missing alert {alert}");
     }
     assert!(alerts.contains("sbproxy_ai_compression_state_operations_total"));
+    let value_alert = alerts
+        .split("- alert: SBProxyAICompressionValueUnpriced")
+        .nth(1)
+        .expect("unpriced compression value alert")
+        .split("- alert:")
+        .next()
+        .unwrap_or_default();
+    assert!(value_alert.contains("sbproxy_ai_compression_value_tokens_saved_total"));
+    assert!(value_alert.contains("sbproxy_ai_compression_value_cost_saved_micros_total"));
     let state_alert = alerts
         .split("- alert: SBProxyAICompressionStateRejections")
         .nth(1)

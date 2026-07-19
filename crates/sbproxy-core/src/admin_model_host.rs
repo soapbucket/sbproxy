@@ -12,7 +12,7 @@
 //!
 //! `GET /admin/model-host/value` reports per-model local and cloud completion
 //! counts, the micro-USD each local completion saved versus its configured
-//! cloud reference price, and per-lever target tokens and gross input cost
+//! cloud reference price, and per-lever target token estimates and gross input cost
 //! avoided by successful context compression. It reads the request-path value
 //! recorder's ledger (`sbproxy_ai::value_ledger`); before any eligible value is
 //! recorded the report is empty. Read-only, same auth gate.

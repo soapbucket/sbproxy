@@ -36,6 +36,7 @@
 //! `tiktoken-rs`'s own static singletons.
 
 use crate::types::Message;
+pub use sbproxy_model_host::TokenCountPrecision;
 
 /// Per-message framing overhead used by the OpenAI cookbook for
 /// `tiktoken`-based counting. Mirrors the constant `num_tokens_from_messages`
@@ -48,6 +49,16 @@ const TOKENS_PER_MESSAGE: u64 = 3;
 /// Final reply-priming overhead the cookbook adds once after every message
 /// list (`<|start|>assistant<|message|>`).
 const REPLY_PRIMING: u64 = 3;
+
+/// Report which target-model counting path [`estimate_tokens`] and
+/// [`estimate_json_message_tokens`] will use.
+pub fn token_count_precision(model: &str) -> TokenCountPrecision {
+    if tiktoken_rs::bpe_for_model(model).is_ok() {
+        TokenCountPrecision::ModelTokenizer
+    } else {
+        TokenCountPrecision::Heuristic
+    }
+}
 
 /// Estimate prompt tokens for a chat-completion request.
 ///
@@ -237,6 +248,23 @@ mod tests {
             est > REPLY_PRIMING,
             "BPE path must contribute at least one token for non-empty content (got {est})"
         );
+    }
+
+    #[test]
+    fn token_count_precision_is_closed_and_matches_the_model_counter_path() {
+        assert_eq!(
+            token_count_precision("gpt-4o"),
+            TokenCountPrecision::ModelTokenizer
+        );
+        assert_eq!(
+            token_count_precision("some-self-hosted-model"),
+            TokenCountPrecision::Heuristic
+        );
+        assert_eq!(
+            TokenCountPrecision::ModelTokenizer.as_str(),
+            "model_tokenizer"
+        );
+        assert_eq!(TokenCountPrecision::Heuristic.as_str(), "heuristic");
     }
 
     #[test]

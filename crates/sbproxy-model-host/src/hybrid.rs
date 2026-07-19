@@ -6,10 +6,10 @@
 //! Pure pieces that make the local lane feel like one array with the
 //! paid providers. [`savings_micros`] computes the dollars a local
 //! completion saved versus the cloud price it displaced, and
-//! [`LaneSplit`] tallies those savings per model alongside target-model tokens
-//! and gross input cost avoided by context compression. Both dimensions feed
-//! the value-delivered report without conflating compression with a local or
-//! cloud completion.
+//! [`LaneSplit`] tallies those savings per model alongside target-model token
+//! estimates and gross input cost avoided by context compression. Both
+//! dimensions feed the value-delivered report without conflating compression
+//! with a local or cloud completion.
 //!
 //! Deterministic and unit-tested here; the value recorder in
 //! `sbproxy-ai` persists these tallies and the admin API serves them.
@@ -17,6 +17,43 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+/// Precision signal for the target-model token counter used by compression
+/// value accounting.
+///
+/// Both variants are gateway estimates. `ModelTokenizer` means the target
+/// model resolved to a registered BPE tokenizer; `Heuristic` means the
+/// documented character-count fallback was used.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenCountPrecision {
+    /// A registered target-model tokenizer produced the estimate.
+    ModelTokenizer,
+    /// The conservative character-count fallback produced the estimate.
+    #[default]
+    Heuristic,
+}
+
+impl TokenCountPrecision {
+    /// Closed JSON and metric label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelTokenizer => "model_tokenizer",
+            Self::Heuristic => "heuristic",
+        }
+    }
+
+    /// Combine aggregates conservatively: any heuristic contribution makes
+    /// the combined token total heuristic.
+    pub const fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ModelTokenizer, Self::ModelTokenizer) => Self::ModelTokenizer,
+            _ => Self::Heuristic,
+        }
+    }
+}
 
 /// Cloud reference price for a model, in micro-USD per million tokens
 /// (micros avoid float drift and match the ledger's cost unit).
@@ -62,21 +99,45 @@ fn mul_div_round(a: u64, b: u64, denom: u64) -> u64 {
 /// internal summarizer spend remains a separate accounting stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompressionValue {
-    /// Target-model input tokens avoided.
+    /// Estimated target-model input tokens avoided.
     #[serde(default)]
     pub tokens_saved: u64,
     /// Gross target-model input cost avoided, in micro-USD.
     #[serde(default)]
     pub gross_cost_saved_micros: u64,
+    /// Precision of the target-model token counts in this aggregate.
+    ///
+    /// Missing legacy fields default to `heuristic`, the conservative signal.
+    #[serde(default)]
+    pub token_count_precision: TokenCountPrecision,
 }
 
 impl CompressionValue {
+    /// Start an aggregate from one applied compression result.
+    pub fn new(
+        tokens_saved: u64,
+        gross_cost_saved_micros: u64,
+        token_count_precision: TokenCountPrecision,
+    ) -> Self {
+        Self {
+            tokens_saved,
+            gross_cost_saved_micros,
+            token_count_precision,
+        }
+    }
+
     /// Add one applied compression result with saturating arithmetic.
-    pub fn record(&mut self, tokens_saved: u64, gross_cost_saved_micros: u64) {
+    pub fn record(
+        &mut self,
+        tokens_saved: u64,
+        gross_cost_saved_micros: u64,
+        token_count_precision: TokenCountPrecision,
+    ) {
         self.tokens_saved = self.tokens_saved.saturating_add(tokens_saved);
         self.gross_cost_saved_micros = self
             .gross_cost_saved_micros
             .saturating_add(gross_cost_saved_micros);
+        self.token_count_precision = self.token_count_precision.combine(token_count_precision);
     }
 }
 
@@ -123,18 +184,30 @@ impl LaneSplit {
         ));
     }
 
-    /// Record target-model tokens and gross input cost avoided by one
+    /// Record target-model token estimates and gross input cost avoided by one
     /// compression lever. This does not increment either completion lane.
     pub fn record_compression(
         &mut self,
         lever: &str,
         tokens_saved: u64,
         gross_cost_saved_micros: u64,
+        token_count_precision: TokenCountPrecision,
     ) {
-        self.compression
-            .entry(lever.to_string())
-            .or_default()
-            .record(tokens_saved, gross_cost_saved_micros);
+        use std::collections::btree_map::Entry;
+        match self.compression.entry(lever.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(CompressionValue::new(
+                    tokens_saved,
+                    gross_cost_saved_micros,
+                    token_count_precision,
+                ));
+            }
+            Entry::Occupied(mut entry) => {
+                entry
+                    .get_mut()
+                    .record(tokens_saved, gross_cost_saved_micros, token_count_precision)
+            }
+        }
     }
 
     /// Fraction of completions served locally (0.0 when none yet).
@@ -167,9 +240,14 @@ mod tests {
     #[test]
     fn compression_value_saturates_without_changing_lane_counts() {
         let mut split = LaneSplit::default();
-        split.record_compression("window_fit", u64::MAX, u64::MAX - 1);
-        split.record_compression("window_fit", 42, 42);
-        split.record_compression("summary_buffer", 7, 3);
+        split.record_compression(
+            "window_fit",
+            u64::MAX,
+            u64::MAX - 1,
+            TokenCountPrecision::ModelTokenizer,
+        );
+        split.record_compression("window_fit", 42, 42, TokenCountPrecision::ModelTokenizer);
+        split.record_compression("summary_buffer", 7, 3, TokenCountPrecision::ModelTokenizer);
 
         assert_eq!(split.local_completions, 0);
         assert_eq!(split.cloud_completions, 0);
@@ -181,6 +259,22 @@ mod tests {
             u64::MAX
         );
         assert_eq!(split.compression["summary_buffer"].tokens_saved, 7);
+    }
+
+    #[test]
+    fn compression_precision_is_preserved_and_combined_conservatively() {
+        let mut split = LaneSplit::default();
+        split.record_compression("window_fit", 100, 40, TokenCountPrecision::ModelTokenizer);
+        assert_eq!(
+            split.compression["window_fit"].token_count_precision,
+            TokenCountPrecision::ModelTokenizer
+        );
+
+        split.record_compression("window_fit", 50, 20, TokenCountPrecision::Heuristic);
+        assert_eq!(
+            split.compression["window_fit"].token_count_precision,
+            TokenCountPrecision::Heuristic
+        );
     }
 
     #[test]

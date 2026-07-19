@@ -355,8 +355,14 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
-        labels: &["tenant_id", "origin", "model", "lever"],
-        description: "Gross target-model input cost avoided by successful AI context compression, in micro-USD.",
+        labels: &[
+            "tenant_id",
+            "origin",
+            "model",
+            "lever",
+            "token_count_precision",
+        ],
+        description: "Gross known-price target-model input cost avoided by successful AI context compression, in micro-USD.",
         dead_reason: None,
     },
     MetricCapability {
@@ -366,8 +372,14 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
-        labels: &["tenant_id", "origin", "model", "lever"],
-        description: "Target-model input tokens avoided by successful AI context compression.",
+        labels: &[
+            "tenant_id",
+            "origin",
+            "model",
+            "lever",
+            "token_count_precision",
+        ],
+        description: "Estimated target-model input tokens avoided by successful AI context compression.",
         dead_reason: None,
     },
     MetricCapability {

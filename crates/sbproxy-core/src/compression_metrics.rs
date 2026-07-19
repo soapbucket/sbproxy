@@ -637,6 +637,7 @@ mod tests {
             initial_tokens: 100,
             final_tokens: 50,
             tokens_saved: 50,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
             lever_results: vec![
                 LeverResult {
                     lever: LeverKind::SummaryBuffer,
@@ -784,6 +785,7 @@ mod tests {
             initial_tokens: 80,
             final_tokens: 80,
             tokens_saved: 0,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
             lever_results: vec![
                 LeverResult {
                     lever: LeverKind::SummaryBuffer,
@@ -933,6 +935,7 @@ mod tests {
             initial_tokens: 40,
             final_tokens: 40,
             tokens_saved: 0,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
             lever_results: vec![LeverResult {
                 lever: LeverKind::WindowFit,
                 backend: None,
@@ -955,6 +958,7 @@ mod tests {
             initial_tokens: 40,
             final_tokens: 40,
             tokens_saved: 0,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
             lever_results: vec![LeverResult {
                 lever: LeverKind::SummaryBuffer,
                 backend: Some(CompressionBackend::Redis),
@@ -976,6 +980,7 @@ mod tests {
             initial_tokens: 0,
             final_tokens: 0,
             tokens_saved: 0,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::Heuristic,
             lever_results: Vec::new(),
         };
         let empty_labels = [

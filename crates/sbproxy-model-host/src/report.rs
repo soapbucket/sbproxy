@@ -8,13 +8,12 @@
 //! at near-zero marginal cost, alongside what the cloud lane actually
 //! cost. This aggregates the per-model [`crate::hybrid::LaneSplit`] counters
 //! into a report that keeps local-serving value and context-compression value
-//! separate. The admin API can serve it as JSON, Prometheus, or CSV. Pure
-//! aggregation and formatting; wiring it to an admin-API route is the runtime
-//! half.
+//! separate. The admin API currently serves this report as JSON. This module
+//! also provides a pure CSV formatter for callers that need a tabular export.
 
 use std::collections::BTreeMap;
 
-use crate::hybrid::{CompressionValue, LaneSplit};
+use crate::hybrid::{CompressionValue, LaneSplit, TokenCountPrecision};
 
 /// One model's line in the value report.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -38,10 +37,12 @@ pub struct ModelCompressionValue {
     pub model: String,
     /// Closed compression lever name.
     pub lever: String,
-    /// Target-model input tokens avoided.
+    /// Estimated target-model input tokens avoided.
     pub tokens_saved: u64,
     /// Gross target-model input cost avoided, in micro-USD.
     pub gross_cost_saved_micros: u64,
+    /// Precision signal from the target-model token counter.
+    pub token_count_precision: TokenCountPrecision,
 }
 
 /// The aggregate value-delivered report across all target models.
@@ -61,7 +62,7 @@ pub struct ValueReport {
     pub compression: Vec<ModelCompressionValue>,
     /// Aggregate compression value keyed by the closed lever name.
     pub compression_totals: BTreeMap<String, CompressionValue>,
-    /// Total target-model input tokens avoided by compression.
+    /// Total estimated target-model input tokens avoided by compression.
     pub total_compression_tokens_saved: u64,
     /// Total gross target-model input cost avoided by compression, in
     /// micro-USD.
@@ -91,16 +92,23 @@ impl ValueReport {
                 report.total_compression_gross_cost_saved_micros = report
                     .total_compression_gross_cost_saved_micros
                     .saturating_add(value.gross_cost_saved_micros);
-                report
-                    .compression_totals
-                    .entry(lever.clone())
-                    .or_default()
-                    .record(value.tokens_saved, value.gross_cost_saved_micros);
+                use std::collections::btree_map::Entry;
+                match report.compression_totals.entry(lever.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(value.clone());
+                    }
+                    Entry::Occupied(mut entry) => entry.get_mut().record(
+                        value.tokens_saved,
+                        value.gross_cost_saved_micros,
+                        value.token_count_precision,
+                    ),
+                }
                 report.compression.push(ModelCompressionValue {
                     model: model.clone(),
                     lever: lever.clone(),
                     tokens_saved: value.tokens_saved,
                     gross_cost_saved_micros: value.gross_cost_saved_micros,
+                    token_count_precision: value.token_count_precision,
                 });
             }
             report.models.push(ModelValue {
@@ -130,8 +138,10 @@ impl ValueReport {
         }
     }
 
-    /// Render as CSV (one header row + one row per model). The admin
-    /// API also serves JSON and Prometheus; this is the tabular form.
+    /// Render as CSV (one header row plus one row per model).
+    ///
+    /// The admin route currently serves JSON; this formatter is available to
+    /// internal callers and future export surfaces.
     pub fn to_csv(&self) -> String {
         let mut out = String::from(
             "model,local_completions,cloud_completions,saved_micros,cloud_spent_micros,compression_tokens_saved,compression_gross_cost_saved_micros\n",
@@ -230,10 +240,15 @@ mod tests {
     #[test]
     fn exposes_per_model_and_aggregate_compression_value() {
         let mut a = LaneSplit::default();
-        a.record_compression("window_fit", 100, 40);
-        a.record_compression("summary_buffer", 50, 25);
+        a.record_compression("window_fit", 100, 40, TokenCountPrecision::ModelTokenizer);
+        a.record_compression(
+            "summary_buffer",
+            50,
+            25,
+            TokenCountPrecision::ModelTokenizer,
+        );
         let mut b = LaneSplit::default();
-        b.record_compression("window_fit", 200, 80);
+        b.record_compression("window_fit", 200, 80, TokenCountPrecision::ModelTokenizer);
 
         let report = ValueReport::from_lanes(&BTreeMap::from([
             ("alpha".to_string(), a),
@@ -247,6 +262,10 @@ mod tests {
         assert_eq!(report.compression[2].model, "beta");
         assert_eq!(report.compression_totals["window_fit"].tokens_saved, 300);
         assert_eq!(
+            report.compression_totals["window_fit"].token_count_precision,
+            TokenCountPrecision::ModelTokenizer
+        );
+        assert_eq!(
             report.compression_totals["window_fit"].gross_cost_saved_micros,
             120
         );
@@ -259,6 +278,10 @@ mod tests {
         assert_eq!(json["compression"][0]["model"], "alpha");
         assert_eq!(json["compression"][0]["lever"], "summary_buffer");
         assert_eq!(
+            json["compression"][0]["token_count_precision"],
+            "model_tokenizer"
+        );
+        assert_eq!(
             json["compression_totals"]["window_fit"]["tokens_saved"],
             300
         );
@@ -268,8 +291,8 @@ mod tests {
     #[test]
     fn csv_adds_compression_totals_without_dynamic_columns() {
         let mut split = LaneSplit::default();
-        split.record_compression("window_fit", 123, 45);
-        split.record_compression("summary_buffer", 7, 5);
+        split.record_compression("window_fit", 123, 45, TokenCountPrecision::ModelTokenizer);
+        split.record_compression("summary_buffer", 7, 5, TokenCountPrecision::ModelTokenizer);
 
         let csv = ValueReport::from_lanes(&BTreeMap::from([("m".to_string(), split)])).to_csv();
         let lines: Vec<&str> = csv.lines().collect();

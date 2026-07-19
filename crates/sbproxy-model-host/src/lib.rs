@@ -159,7 +159,7 @@ pub use foreign_cache::{
     discover as discover_foreign_models, ForeignCacheSource, ForeignModelFile,
 };
 pub use generation_store::{DeploymentGenerationStoreError, FileDeploymentGenerationStore};
-pub use hybrid::{savings_micros, CloudPrice, CompressionValue, LaneSplit};
+pub use hybrid::{savings_micros, CloudPrice, CompressionValue, LaneSplit, TokenCountPrecision};
 pub use jobs::{
     FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
 };

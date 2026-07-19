@@ -12,14 +12,23 @@ pub fn record_pending_compression_value(
     pending: &sbproxy_ai::PendingCompressionValue,
 ) {
     let ledger = sbproxy_ai::value_ledger::value_ledger_or_init_memory();
-    record_pending_compression_value_to(&ledger, tenant_id, origin, pending);
+    record_pending_compression_value_to(&ledger, pending, |record| {
+        sbproxy_observe::metrics::record_compression_value(
+            tenant_id,
+            origin,
+            pending.target_model(),
+            record.lever().as_str(),
+            record.token_count_precision().as_str(),
+            record.tokens_saved(),
+            record.gross_cost_saved_micros(),
+        );
+    });
 }
 
 fn record_pending_compression_value_to(
     ledger: &sbproxy_ai::ValueLedger,
-    tenant_id: &str,
-    origin: &str,
     pending: &sbproxy_ai::PendingCompressionValue,
+    mut record_metric: impl FnMut(&sbproxy_ai::CompressionValueRecord),
 ) {
     for record in pending.priced_records() {
         ledger.record_compression(
@@ -27,15 +36,9 @@ fn record_pending_compression_value_to(
             record.lever(),
             record.tokens_saved(),
             record.gross_cost_saved_micros(),
+            record.token_count_precision(),
         );
-        sbproxy_observe::metrics::record_compression_value(
-            tenant_id,
-            origin,
-            pending.target_model(),
-            record.lever().as_str(),
-            record.tokens_saved(),
-            record.gross_cost_saved_micros(),
-        );
+        record_metric(&record);
     }
 }
 
@@ -55,6 +58,7 @@ mod tests {
             initial_tokens: 1_500_000,
             final_tokens: 0,
             tokens_saved: 1_500_000,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::Heuristic,
             lever_results: vec![
                 LeverResult {
                     lever: LeverKind::SummaryBuffer,
@@ -80,7 +84,10 @@ mod tests {
             sbproxy_ai::PendingCompressionValue::from_run("wor-1921-unpriced-core-test", &run)
                 .expect("pending value");
 
-        record_pending_compression_value_to(&ledger, "tenant", "origin", &pending);
+        let mut emitted = Vec::new();
+        record_pending_compression_value_to(&ledger, &pending, |record| {
+            emitted.push(*record);
+        });
 
         let report = ledger.report();
         assert_eq!(report.total_local_completions, 0);
@@ -88,11 +95,16 @@ mod tests {
         assert_eq!(report.total_compression_tokens_saved, 1_500_000);
         assert_eq!(
             report.compression_totals["summary_buffer"].gross_cost_saved_micros,
-            2_500_000
+            0
         );
         assert_eq!(
             report.compression_totals["window_fit"].gross_cost_saved_micros,
-            5_000_000
+            0
         );
+        assert_eq!(emitted.len(), 2);
+        assert!(emitted.iter().all(|record| {
+            record.token_count_precision() == sbproxy_ai::TokenCountPrecision::Heuristic
+                && record.gross_cost_saved_micros() == 0
+        }));
     }
 }
