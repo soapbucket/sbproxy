@@ -24,7 +24,7 @@
 //!   every published OpenAI / Azure deployment name to one of those BPEs;
 //!   we delegate to it.
 //! - Anthropic Claude does not publish its BPE vocabulary. We fall back to
-//!   a documented `chars / 4 + 1` heuristic for any model the tiktoken
+//!   a documented `UTF-8 bytes / 4 + 1` heuristic for any model the tiktoken
 //!   prefix table cannot identify. This is the same heuristic the older
 //!   [`crate::context_compress::estimate_message_tokens`] uses and matches
 //!   Anthropic's own published rule of thumb. Reconcile against the real
@@ -65,7 +65,7 @@ pub fn token_count_precision(model: &str) -> TokenCountPrecision {
 /// `model` selects the BPE: GPT-4-class models use `cl100k_base`, GPT-4o
 /// and the o-series use `o200k_base`, anything else (notably Anthropic and
 /// open-source endpoints exposed through this gateway) falls back to a
-/// `chars / 4 + 1` heuristic. The return value is always at least the
+/// `UTF-8 bytes / 4 + 1` heuristic. The return value is always at least the
 /// per-request reply-priming overhead so a request with no parseable
 /// content still books a non-zero reservation against TPM and TPD.
 ///
@@ -88,7 +88,7 @@ pub fn estimate_tokens(model: &str, messages: &[Message]) -> u64 {
     }
 
     // Path B: unknown model (Claude, unknown Azure deployment name,
-    // self-hosted endpoint). Fall back to chars/4 + per-message framing.
+    // self-hosted endpoint). Fall back to UTF-8 bytes/4 + per-message framing.
     // The reconciliation step in `Admission::reconcile` corrects the
     // estimate against the upstream's reported usage; the
     // `sbproxy_ai_token_estimate_error_ratio` histogram surfaces drift so
@@ -96,7 +96,7 @@ pub fn estimate_tokens(model: &str, messages: &[Message]) -> u64 {
     estimate_tokens_heuristic(messages)
 }
 
-/// Heuristic estimator: `chars / 4 + 1` per message, plus per-message
+/// Heuristic estimator: `UTF-8 bytes / 4 + 1` per message, plus per-message
 /// framing and reply priming. Exported under the same name pattern as the
 /// model-specific path so call sites that want to bypass BPE lookup (e.g.
 /// embeddings input that does not parse as `Message`) can reach it.
@@ -183,7 +183,7 @@ fn extra_message_fields_json(message: &serde_json::Value) -> Option<String> {
 }
 
 fn role_tokens_heuristic(role: &str) -> u64 {
-    // Roles are short single words ("system", "user", ...). chars/4 gives
+    // Roles are short single words ("system", "user", ...). bytes/4 gives
     // 1 for everything reasonable; clamp to 1 for the empty role.
     ((role.len() as u64) / 4).max(1)
 }
@@ -300,8 +300,8 @@ mod tests {
     #[test]
     fn unknown_model_falls_back_to_heuristic() {
         // Claude model: tiktoken-rs has no BPE for it, so we hit the
-        // chars/4 path. 40 chars of content -> 10 token estimate from the
-        // content alone, plus per-message overhead and reply priming.
+        // UTF-8 bytes/4 path. 40 ASCII bytes of content -> 10 token estimate
+        // from the content alone, plus per-message overhead and reply priming.
         let content = "a".repeat(40);
         let messages = vec![msg("user", &content)];
         let est = estimate_tokens("claude-3-opus-20240229", &messages);

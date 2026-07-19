@@ -29,9 +29,9 @@
 //! [`ValueSink`] records local completions only when a served model declares a
 //! cloud reference. Cloud-spill attribution remains a follow-up. Compression
 //! value is recorded separately after terminal provider success using the
-//! target model's configured, catalog, or conservative fallback input price.
-//! It never fabricates a local completion or folds internal summarizer spend
-//! into the gross avoided-cost value.
+//! target model's configured or catalog input price. Unknown or unpriced models
+//! remain zero-valued. It never fabricates a local completion or folds internal
+//! summarizer spend into the gross avoided-cost value.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
