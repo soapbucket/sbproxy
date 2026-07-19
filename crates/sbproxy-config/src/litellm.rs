@@ -142,7 +142,7 @@ const KNOWN_SINK_CALLBACKS: &[&str] = &[
     "helicone",
 ];
 
-/// Callbacks that emit a real [`usage_sink`](sbproxy) config entry.
+/// Callbacks that emit a real `usage_sinks` config entry.
 const EMITTABLE_SINK_CALLBACKS: &[&str] = &[
     "langfuse",
     "datadog",
