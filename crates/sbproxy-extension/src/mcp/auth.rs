@@ -6,6 +6,12 @@
 //! shared-key callers fail closed when run-as-user is enabled; stdio
 //! plus run-as-user is a config error until a safe secret-delivery
 //! path exists.
+//!
+//! Follow-up (INT deferred): [`crate::mcp::federation::McpFederation::call_tool`]
+//! and [`crate::mcp::streamable::send_request`] do not yet attach a
+//! minted [`UpstreamAuthorization`] on the wire. Config + mint +
+//! [`attach_authorization`] are ready; the federation dispatch path
+//! still needs an optional header seam without a larger redesign.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

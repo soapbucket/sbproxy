@@ -63,6 +63,10 @@ pub(crate) async fn read_sse_response_capped(
 /// and returns a JSON response (or SSE stream). This implementation
 /// reads the first complete JSON object from the response body.
 /// `max_bytes` bounds how much of the response is ever buffered.
+///
+/// Follow-up: no Authorization header seam yet; callers that mint via
+/// [`super::auth::mint_upstream_authorization`] must thread headers in
+/// a later change (federation `dispatch_request` currently omits them).
 pub async fn send_request(
     client: &reqwest::Client,
     server_url: &str,
