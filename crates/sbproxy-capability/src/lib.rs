@@ -159,8 +159,11 @@ pub enum Registry {
 /// flat line through a system that is on fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Writer {
-    /// A recorder function. The scanner requires at least one call site
-    /// outside the function's own definition and outside test-gated code.
+    /// A recorder function, or a metric static's own `SCREAMING_SNAKE_CASE`
+    /// identifier for crates that drive Prometheus statics directly (the
+    /// mesh crate does). The scanner requires at least one call site (for a
+    /// static: one use of the identifier in code, outside its own
+    /// declaration) outside test-gated regions.
     Recorder(&'static str),
     /// A public field on `ProxyMetrics`, written through `metrics().<field>`.
     /// The scanner requires at least one non-test `.<field>` access.

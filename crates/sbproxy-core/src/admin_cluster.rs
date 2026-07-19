@@ -5,6 +5,9 @@
 //! admin adapters.
 
 use sbproxy_mesh::enrollment::{EnrollmentError, EnrollmentRequest};
+use sbproxy_mesh::metrics::{
+    ENROLLMENT_OUTCOME_ERROR, ENROLLMENT_OUTCOME_OK, ENROLLMENT_REASON_OK, MESH_ENROLLMENT,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -1062,6 +1065,9 @@ fn dispatch_enrollment_with(
         return json(405, serde_json::json!({"error": "method not allowed"}));
     }
     let Some(body) = body.filter(|body| !body.is_empty() && body.len() <= 64 * 1024) else {
+        MESH_ENROLLMENT
+            .with_label_values(&[ENROLLMENT_OUTCOME_ERROR, "invalid_request"])
+            .inc();
         return json(
             400,
             serde_json::json!({"error": "invalid enrollment request", "code": "invalid_request"}),
@@ -1070,34 +1076,66 @@ fn dispatch_enrollment_with(
     let request: EnrollmentRequest = match serde_json::from_str(body) {
         Ok(request) => request,
         Err(_) => {
+            MESH_ENROLLMENT
+                .with_label_values(&[ENROLLMENT_OUTCOME_ERROR, "invalid_request"])
+                .inc();
             return json(
                 400,
                 serde_json::json!({"error": "invalid enrollment request", "code": "invalid_request"}),
-            )
+            );
         }
     };
     let Some(authority) = authority else {
+        MESH_ENROLLMENT
+            .with_label_values(&[ENROLLMENT_OUTCOME_ERROR, "authority_unavailable"])
+            .inc();
         return json(
             503,
             serde_json::json!({"error": "this node is not an enrollment authority", "code": "authority_unavailable"}),
         );
     };
     match authority.enroll(request) {
-        Ok(response) => match serde_json::to_string(&response) {
-            Ok(body) => (200, "application/json", body),
-            Err(error) => {
-                tracing::error!(%error, "serialize cluster enrollment response");
-                json(
-                    500,
-                    serde_json::json!({"error": "cluster enrollment failed", "code": "internal"}),
-                )
+        Ok(response) => {
+            // The authority accepted the request and consumed the token,
+            // so the attempt counts as ok even if response serialization
+            // fails below.
+            MESH_ENROLLMENT
+                .with_label_values(&[ENROLLMENT_OUTCOME_OK, ENROLLMENT_REASON_OK])
+                .inc();
+            match serde_json::to_string(&response) {
+                Ok(body) => (200, "application/json", body),
+                Err(error) => {
+                    tracing::error!(%error, "serialize cluster enrollment response");
+                    json(
+                        500,
+                        serde_json::json!({"error": "cluster enrollment failed", "code": "internal"}),
+                    )
+                }
             }
-        },
+        }
         Err(error) => enrollment_error_response(error),
     }
 }
 
+/// Bounded `reason` label for `mesh_enrollment_total`, mapped explicitly
+/// from the [`EnrollmentError`] variant.
+fn enrollment_error_reason(error: &EnrollmentError) -> &'static str {
+    match error {
+        EnrollmentError::InvalidRequest(_) => "invalid_request",
+        EnrollmentError::AlreadyExists(_) => "already_exists",
+        EnrollmentError::AuthorityMissing(_) => "authority_missing",
+        EnrollmentError::Corrupt(_) => "corrupt",
+        EnrollmentError::TokenRejected(_) => "token_rejected",
+        EnrollmentError::Io(_) => "io",
+        EnrollmentError::Json(_) => "json",
+        EnrollmentError::Crypto(_) => "crypto",
+    }
+}
+
 fn enrollment_error_response(error: EnrollmentError) -> (u16, &'static str, String) {
+    MESH_ENROLLMENT
+        .with_label_values(&[ENROLLMENT_OUTCOME_ERROR, enrollment_error_reason(&error)])
+        .inc();
     match error {
         EnrollmentError::TokenRejected(_) => json(
             401,
