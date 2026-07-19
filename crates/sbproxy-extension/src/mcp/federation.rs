@@ -993,6 +993,7 @@ impl McpFederation {
 
     /// Policy-aware tool call that also forwards upstream HTTP headers
     /// (run-as-user Authorization) on the wire.
+    #[allow(clippy::too_many_arguments)] // policy identity + audit + upstream auth seams
     pub async fn call_tool_with_policy_cause_and_headers(
         &self,
         tool_name: &str,
@@ -1101,7 +1102,13 @@ impl McpFederation {
         // instead of an MCP tools/call.
         if let Some(backing) = &server.openapi {
             return self
-                .call_openapi_tool(server, backing, &federated.name, &arguments, upstream_headers)
+                .call_openapi_tool(
+                    server,
+                    backing,
+                    &federated.name,
+                    &arguments,
+                    upstream_headers,
+                )
                 .await;
         }
 
@@ -2464,15 +2471,15 @@ mod tests {
             .await
             .expect("tool call must succeed");
         assert_eq!(
-            value
-                .pointer("/content/0/text")
-                .and_then(|v| v.as_str()),
+            value.pointer("/content/0/text").and_then(|v| v.as_str()),
             Some("ok")
         );
 
         let captured = seen.lock().unwrap().clone();
         assert!(
-            captured.to_ascii_lowercase().contains("authorization: bearer user-a-token"),
+            captured
+                .to_ascii_lowercase()
+                .contains("authorization: bearer user-a-token"),
             "upstream POST must carry Authorization, got:\n{captured}"
         );
         assert!(
