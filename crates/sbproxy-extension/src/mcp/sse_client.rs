@@ -33,14 +33,16 @@ pub async fn send_via_sse(
     sse_url: &str,
     request: &JsonRpcRequest,
     max_bytes: usize,
+    extra_headers: &[(String, String)],
 ) -> anyhow::Result<JsonRpcResponse> {
-    let resp = client
+    let mut builder = client
         .post(sse_url)
         .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream, application/json")
-        .json(request)
-        .send()
-        .await?;
+        .header("Accept", "text/event-stream, application/json");
+    for (name, value) in extra_headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let resp = builder.json(request).send().await?;
 
     let status = resp.status();
     if !status.is_success() {

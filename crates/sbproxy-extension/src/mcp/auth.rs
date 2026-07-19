@@ -7,11 +7,11 @@
 //! plus run-as-user is a config error until a safe secret-delivery
 //! path exists.
 //!
-//! Follow-up (INT deferred): [`crate::mcp::federation::McpFederation::call_tool`]
-//! and [`crate::mcp::streamable::send_request`] do not yet attach a
-//! minted [`UpstreamAuthorization`] on the wire. Config + mint +
-//! [`attach_authorization`] are ready; the federation dispatch path
-//! still needs an optional header seam without a larger redesign.
+//! Wire path: mint via [`mint_upstream_authorization`], then pass
+//! `(header_name, header_value)` through
+//! [`crate::mcp::federation::McpFederation::call_tool_with_upstream_headers`]
+//! so [`crate::mcp::streamable::send_request`] attaches them on the
+//! outbound POST. Never put credentials in tool arguments.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

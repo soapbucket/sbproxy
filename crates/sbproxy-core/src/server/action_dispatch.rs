@@ -1922,6 +1922,7 @@ pub(super) async fn handle_mcp_action(
                                     audit_cause: audit_cause.as_deref(),
                                     delegation: None,
                                 };
+                                let mut upstream_headers: Vec<(String, String)> = Vec::new();
                                 let outbound_arguments = if run_as_user {
                                     let Some(auth_cfg) = federated
                                         .as_ref()
@@ -1959,13 +1960,8 @@ pub(super) async fn handle_mcp_action(
                                     .await
                                     {
                                         Ok((args, auth)) => {
-                                            // Mint + attach prove distinct per-user
-                                            // Authorization. Federation
-                                            // `call_tool` / `send_request` do not
-                                            // yet accept outbound headers
-                                            // (out-of-lane: federation.rs /
-                                            // streamable.rs); credentials are
-                                            // not forwarded on the wire yet.
+                                            // Validate header shape, then forward
+                                            // on the federation wire (never in args).
                                             let mut headers = http::HeaderMap::new();
                                             if let Err(e) =
                                                 sbproxy_extension::mcp::auth::attach_authorization(
@@ -1983,7 +1979,10 @@ pub(super) async fn handle_mcp_action(
                                                 )
                                                 .await;
                                             }
-                                            let _ = headers;
+                                            upstream_headers.push((
+                                                auth.header_name.clone(),
+                                                auth.header_value.clone(),
+                                            ));
                                             args
                                         }
                                         Err(e) => {
@@ -2022,7 +2021,11 @@ pub(super) async fn handle_mcp_action(
                                         .unwrap_or("unknown"),
                                 );
                                 let call = tracing::Instrument::instrument(
-                                    mcp.federation.call_tool(&name, outbound_arguments),
+                                    mcp.federation.call_tool_with_upstream_headers(
+                                        &name,
+                                        outbound_arguments,
+                                        &upstream_headers,
+                                    ),
                                     tool_span.clone(),
                                 );
                                 let mut outcome = match timeout {

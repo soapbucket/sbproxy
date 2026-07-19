@@ -64,22 +64,25 @@ pub(crate) async fn read_sse_response_capped(
 /// reads the first complete JSON object from the response body.
 /// `max_bytes` bounds how much of the response is ever buffered.
 ///
-/// Follow-up: no Authorization header seam yet; callers that mint via
-/// [`super::auth::mint_upstream_authorization`] must thread headers in
-/// a later change (federation `dispatch_request` currently omits them).
+/// `extra_headers` are attached to the outbound POST (for example a
+/// minted run-as-user `Authorization` from
+/// [`super::auth::mint_upstream_authorization`]). Values are never
+/// logged by this function.
 pub async fn send_request(
     client: &reqwest::Client,
     server_url: &str,
     request: &JsonRpcRequest,
     max_bytes: usize,
+    extra_headers: &[(String, String)],
 ) -> anyhow::Result<JsonRpcResponse> {
-    let resp = client
+    let mut builder = client
         .post(server_url)
         .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .json(request)
-        .send()
-        .await?;
+        .header("Accept", "application/json, text/event-stream");
+    for (name, value) in extra_headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let resp = builder.json(request).send().await?;
 
     let status = resp.status();
     if !status.is_success() {
