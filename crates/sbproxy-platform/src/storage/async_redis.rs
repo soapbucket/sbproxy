@@ -14,6 +14,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     future::Future,
     sync::{atomic::AtomicU64, atomic::Ordering, Arc},
     time::Duration,
@@ -28,7 +29,10 @@ use redis::{
 };
 use tokio::sync::Mutex;
 
-use super::async_kv::AsyncKVStore;
+use super::{
+    async_kv::AsyncKVStore,
+    redis_connection::{RedisTlsConfig, ValidatedRedisConnection},
+};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -55,10 +59,28 @@ impl Default for RedisTimeouts {
 }
 
 /// Configuration for [`AsyncRedisKVStore`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AsyncRedisConfig {
-    /// Connection URL (`redis://host:6379/0` or `rediss://host:6380/0`).
-    pub url: String,
+    source: AsyncRedisClientSource,
+}
+
+#[derive(Clone)]
+enum AsyncRedisClientSource {
+    Dsn(String),
+    Validated(ValidatedRedisConnection),
+}
+
+impl fmt::Debug for AsyncRedisConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let source = match &self.source {
+            AsyncRedisClientSource::Dsn(_) => "dsn",
+            AsyncRedisClientSource::Validated(_) => "validated",
+        };
+        formatter
+            .debug_struct("AsyncRedisConfig")
+            .field("source", &source)
+            .finish()
+    }
 }
 
 /// One bounded Redis `SCAN` response.
@@ -71,21 +93,33 @@ pub struct RedisScanPage {
 }
 
 impl AsyncRedisConfig {
-    /// Construct a new config from a Redis connection URL.
+    /// Construct a new config from a Redis connection string.
     pub fn new(url: &str) -> Self {
         Self {
-            url: url.to_string(),
+            source: AsyncRedisClientSource::Dsn(url.to_string()),
         }
     }
 
-    /// Validate Redis-specific URL semantics without opening a connection.
+    /// Construct a config from an already validated Redis connection.
+    pub fn from_connection(connection: ValidatedRedisConnection) -> Self {
+        Self {
+            source: AsyncRedisClientSource::Validated(connection),
+        }
+    }
+
+    /// Validate Redis connection semantics without opening a connection.
     pub fn validate(&self) -> Result<()> {
-        let client = Client::open(self.url.as_str()).context("invalid Redis connection URL")?;
-        anyhow::ensure!(
-            client.get_connection_info().redis.db >= 0,
-            "invalid Redis database selection"
-        );
-        Ok(())
+        self.client().map(|_| ())
+    }
+
+    fn client(&self) -> Result<Client> {
+        match &self.source {
+            AsyncRedisClientSource::Dsn(dsn) => {
+                ValidatedRedisConnection::new(dsn, RedisTlsConfig::default())
+                    .map(|connection| connection.client())
+            }
+            AsyncRedisClientSource::Validated(connection) => Ok(connection.client()),
+        }
     }
 }
 
@@ -155,8 +189,7 @@ impl AsyncRedisKVStore {
             }
         }
         // Slow path: establish the connection without holding the lock.
-        let client =
-            Client::open(self.config.url.as_str()).context("invalid Redis connection URL")?;
+        let client = self.config.client()?;
         let manager_config = ConnectionManagerConfig::new()
             .set_exponent_base(RECONNECT_EXPONENT_BASE)
             .set_factor(RECONNECT_DELAY_FACTOR_MS)
@@ -436,6 +469,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{RedisTlsConfig, ValidatedRedisConnection};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -458,7 +492,6 @@ mod tests {
     #[test]
     fn config_constructs() {
         let cfg = AsyncRedisConfig::new("redis://127.0.0.1:6379/0");
-        assert_eq!(cfg.url, "redis://127.0.0.1:6379/0");
         cfg.validate().unwrap();
         assert!(AsyncRedisConfig::new("redis://127.0.0.1/not-a-database")
             .validate()
@@ -471,6 +504,42 @@ mod tests {
     #[test]
     fn tls_url_is_accepted_by_the_redis_client() {
         AsyncRedisConfig::new("rediss://127.0.0.1:6380/0")
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn validated_connection_config_debug_redacts_dsn_and_private_ca() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params =
+            rcgen::CertificateParams::new(vec!["sentinel-private-ca.invalid".to_string()]).unwrap();
+        let certificate = params.self_signed(&key).unwrap().pem();
+        let dsn = "rediss://sentinel-user:sentinel-password@sentinel-host.invalid:6380/7";
+        let connection = ValidatedRedisConnection::new(
+            dsn,
+            RedisTlsConfig {
+                root_cert: Some(certificate.as_bytes().to_vec()),
+                ..RedisTlsConfig::default()
+            },
+        )
+        .unwrap();
+
+        let config = AsyncRedisConfig::from_connection(connection);
+        let rendered = format!("{config:?}");
+        for forbidden in [
+            dsn,
+            "sentinel-user",
+            "sentinel-password",
+            "sentinel-host",
+            certificate.as_str(),
+        ] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn legacy_constructor_still_validates_database_selection() {
+        AsyncRedisConfig::new("redis://localhost:6379/7")
             .validate()
             .unwrap();
     }

@@ -8508,6 +8508,7 @@ dependencies = [
  "bytes",
  "compact_str 0.8.1",
  "http 1.4.0",
+ "rcgen",
  "sbproxy-capability",
  "sbproxy-observe",
  "sbproxy-platform",
@@ -8984,9 +8985,13 @@ dependencies = [
  "dashmap",
  "hex",
  "parking_lot",
+ "prometheus 0.14.0",
+ "rcgen",
  "redb",
  "redis",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "sbproxy-plugin",
  "serde",
  "serde_json",
@@ -8994,6 +8999,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
+ "url",
 ]
 
 [[package]]

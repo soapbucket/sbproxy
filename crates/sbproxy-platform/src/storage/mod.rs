@@ -6,6 +6,7 @@ mod file;
 mod memory;
 mod redb_store;
 mod redis;
+mod redis_connection;
 mod sqlite;
 
 pub use async_kv::AsyncKVStore;
@@ -14,6 +15,7 @@ pub use file::FileKVStore;
 pub use memory::MemoryKVStore;
 pub use redb_store::RedbKVStore;
 pub use redis::{RedisConfig, RedisKVStore};
+pub use redis_connection::{RedisTlsConfig, ValidatedRedisConnection};
 pub use sqlite::SqliteKVStore;
 
 use anyhow::Result;
