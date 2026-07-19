@@ -874,7 +874,7 @@ mod tests {
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(error) => return Err(error),
         }
-        if marker != [b'*'] {
+        if marker != *b"*" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "expected RESP array",
@@ -884,7 +884,7 @@ mod tests {
         let mut command = Vec::with_capacity(count);
         for _ in 0..count {
             reader.read_exact(&mut marker)?;
-            if marker != [b'$'] {
+            if marker != *b"$" {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "expected RESP bulk string",
