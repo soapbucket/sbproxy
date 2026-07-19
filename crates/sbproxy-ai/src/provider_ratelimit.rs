@@ -116,9 +116,9 @@ pub struct ProviderRateState {
 
 impl ProviderRateState {
     fn to_snapshot(&self, now: Instant, freshness: Duration) -> ProviderQuotaSnapshot {
-        let quality = if self.reset_at.is_some_and(|r| now >= r) {
-            QuotaSignalQuality::Stale
-        } else if now.saturating_duration_since(self.last_updated) > freshness {
+        let quality = if self.reset_at.is_some_and(|r| now >= r)
+            || now.saturating_duration_since(self.last_updated) > freshness
+        {
             QuotaSignalQuality::Stale
         } else {
             QuotaSignalQuality::KnownFresh

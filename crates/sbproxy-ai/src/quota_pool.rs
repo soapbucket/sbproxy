@@ -25,18 +25,20 @@ pub enum QuotaPoolPolicy {
 }
 
 /// Unit of accounting for pool reservations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaPoolDimension {
     /// One unit per provider attempt / request.
+    #[default]
     Request,
 }
 
 /// Process-local vs cross-replica consistency for pool counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaPoolConsistency {
     /// In-process counters only. No mesh or multi-replica coherence.
+    #[default]
     Local,
     /// Requires an atomic shared backend. Not available without Redis wiring.
     Strong,
@@ -67,18 +69,6 @@ pub struct QuotaPoolConfig {
 
 fn default_window() -> Duration {
     Duration::from_secs(60)
-}
-
-impl Default for QuotaPoolDimension {
-    fn default() -> Self {
-        Self::Request
-    }
-}
-
-impl Default for QuotaPoolConsistency {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 /// Why a pool reservation was denied.

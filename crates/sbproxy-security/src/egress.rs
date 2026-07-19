@@ -93,6 +93,11 @@ pub struct EgressConfig {
 /// Injected host resolver so unit tests never touch the network.
 pub trait HostResolver: Send + Sync {
     /// Resolve `host:port` to socket addresses.
+    ///
+    /// Failures collapse to `()` because callers map any miss to
+    /// [`EgressDenied::DnsResolutionFailed`] and must not surface
+    /// resolver diagnostics (which can leak infra detail).
+    #[allow(clippy::result_unit_err)] // deliberate: opaque fail -> EgressDenied
     fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ()>;
 }
 

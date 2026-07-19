@@ -933,7 +933,7 @@ weird_key: something
             "general_settings.master_key",
         ] {
             assert!(
-                paths.iter().any(|p| *p == required),
+                paths.contains(&required),
                 "silent-drop gate: missing key_accounts row for {required}; have {paths:?}"
             );
         }

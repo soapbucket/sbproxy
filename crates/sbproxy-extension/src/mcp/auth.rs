@@ -289,6 +289,7 @@ fn cache_key(
     hex::encode(hasher.finalize())
 }
 
+#[allow(clippy::too_many_arguments)] // mint needs exchange + subject + egress seams together
 async fn mint_token_exchange(
     token_endpoint: &url::Url,
     audience: &str,
