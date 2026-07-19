@@ -18,6 +18,7 @@ const nav = [
   { to: "/playground", label: "Playground" },
   { to: "/cache", label: "Cache" },
   { to: "/model-host", label: "Model host" },
+  { to: "/storage", label: "Storage" },
   { to: "/audit", label: "Audit" },
   { to: "/cluster", label: "Cluster" },
 ];

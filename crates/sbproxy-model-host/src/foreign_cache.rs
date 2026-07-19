@@ -12,7 +12,10 @@
 //! `~/.cache/huggingface/hub` uses the
 //! `models--Org--Repo/snapshots/<rev>/` layout. This module scans
 //! those caches so `sbproxy doctor` can show an operator what is
-//! already local before anything is pulled.
+//! already local before anything is pulled. The serve-time ensure
+//! path reuses the same scan to import digest-verified files instead
+//! of downloading them, and `sbproxy models list` uses it to mark
+//! models importable from a foreign cache.
 //!
 //! The scan is strictly read-only: it never writes, never locks, and
 //! never follows a symlink whose target resolves outside the cache

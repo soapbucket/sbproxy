@@ -183,9 +183,16 @@ fn markdown_is_deterministic_and_exposes_all_support_levels() {
     assert_eq!(first, second);
     assert!(first.starts_with("# Model-host capability matrix\n*Last modified: 2026-07-13*\n"));
     assert!(first.contains("Registry version: `1`"));
-    for status in ["stable", "preview", "config_only"] {
+    // WOR-1910 gave serve.cache_budget_gib, the last config_only field,
+    // an executable GC consumer, so only stable and preview levels remain
+    // in use.
+    for status in ["stable", "preview"] {
         assert!(first.contains(&format!("`{status}`")), "missing {status}");
     }
+    assert!(
+        !first.contains("`config_only`"),
+        "no registry entry should remain config_only"
+    );
     assert!(first.contains("| `cluster.remote_dispatch` | `cluster` | `preview` |"));
     assert!(
         !first.contains('\u{2014}'),

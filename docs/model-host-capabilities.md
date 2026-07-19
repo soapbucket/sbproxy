@@ -16,7 +16,7 @@ Registry version: `1`
 | `artifact.legacy_download` | `artifact` | `preview` | none | Legacy file downloads lack the complete atomic artifact contract. |
 | `artifact.verified_acquisition` | `artifact` | `stable` | contract.verified_artifact_policy_blocks_unauthorized_network<br>test.artifact_manager<br>test.artifact_policy | Managed artifacts are exact, atomic, resumable, and policy enforced. |
 | `artifact.cache_addressing` | `artifact` | `stable` | contract.cache_directory_changes_artifact_path | Explicit cache directories deterministically change artifact paths. |
-| `artifact.cache_budget` | `artifact` | `stable` | contract.cache_budget_protects_active_artifacts<br>test.artifact_gc | Cache collection enforces LRU budgets without deleting protected artifacts. |
+| `artifact.cache_budget` | `artifact` | `stable` | contract.cache_budget_protects_active_artifacts<br>test.artifact_gc | Cache collection enforces LRU budgets without deleting protected artifacts; the same protected collection runs on demand through the admin gc route. |
 | `artifact.exact_removal` | `artifact` | `stable` | contract.exact_removal_protects_references<br>test.artifact_manager<br>test.models_lifecycle_cli | Exact cache removal is idempotent and rejects configured, resident, pinned, locked, leased, or active artifacts. |
 | `engine.typed_managed_drivers` | `engine` | `stable` | contract.managed_drivers_expose_typed_capabilities<br>test.engine_drivers | Managed engines share typed detect, provision, launch, health, and shutdown contracts over verified local artifacts. |
 | `engine.llama_cpp_managed` | `engine` | `preview` | test.engine_drivers<br>test.cuda_build<br>cert.apple_metal.2026-07-11 | Managed llama.cpp acquires a digest-verified prebuilt binary to serve GGUF models on CPU and Apple Metal. NVIDIA GPU serving is handled by vLLM and SGLang, not llama.cpp. |
@@ -44,7 +44,7 @@ Registry version: `1`
 | `serve.models` | `stable` | `manifest.serve_model_declarations` | `contract.serve_models_change_desired_deployments` |
 | `serve.catalog_file` | `preview` | `manifest.catalog_v2` | `none` |
 | `serve.cache_dir` | `stable` | `artifact.cache_addressing` | `contract.cache_directory_changes_artifact_path` |
-| `serve.cache_budget_gib` | `config_only` | `artifact.cache_budget` | `none` |
+| `serve.cache_budget_gib` | `preview` | `artifact.cache_budget` | `contract.cache_budget_protects_active_artifacts` |
 | `serve.eviction` | `stable` | `lifecycle.single_node_residency` | `contract.eviction_changes_admission` |
 | `serve.engines` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.max_concurrent_requests` | `stable` | `lifecycle.priority_admission` | `contract.priority_gate_changes_dispatch` |

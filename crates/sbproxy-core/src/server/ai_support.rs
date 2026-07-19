@@ -1696,6 +1696,13 @@ fn usage_event_from_context(
         request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
         tag: ctx.ai_policy_sink_tag.clone(),
         priority: ctx.ai_lane_priority.map(|p| p.as_str().to_string()),
+        // WOR-1906: a served (local) request still holds its deployment
+        // permit here, which captured the running engine's version at
+        // route time. Hosted lanes carry no permit, so this stays None.
+        engine_version: ctx
+            .managed_model_permit
+            .as_ref()
+            .and_then(|permit| permit.engine_version()),
     }
 }
 

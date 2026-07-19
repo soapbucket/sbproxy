@@ -189,7 +189,7 @@
           ]
         },
         "cache_budget_gib": {
-          "description": "Support: config_only. Disk budget in GiB for the weight cache before GC. `None` means unbounded (operator manages the disk).",
+          "description": "Support: preview. Disk budget in GiB for the weight cache before GC. `None` means unbounded (operator manages the disk). Collection runs after `models pull` and on demand through the authenticated `POST /admin/model-host/gc` route.",
           "default": null,
           "type": [
             "number",

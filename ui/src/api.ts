@@ -1503,6 +1503,52 @@ export interface ModelManagementErrorResponse {
   actual_revision?: number;
 }
 
+/* ---- Artifact cache storage (WOR-1910) ---- */
+
+// One durable ready artifact in the verified weight cache, as reported by
+// GET /admin/model-host/files. `resident` marks artifacts backing a
+// currently ready replica; the server refuses to delete those.
+export interface ModelHostArtifactFile {
+  logical_model: string;
+  variant_id: string;
+  artifact_digest: string;
+  total_size_bytes: number;
+  last_accessed_ms: number;
+  resident: boolean;
+}
+
+export interface ModelHostFilesResponse {
+  schema_version: number;
+  // Absent when no model host is configured (no artifact cache is open).
+  cache_root?: string;
+  total_bytes: number;
+  artifacts: ModelHostArtifactFile[];
+  // Configured weight-cache disk budget in bytes, when the server reports
+  // it. An explicit null means no budget is configured, so cache GC has
+  // nothing to enforce. Absent on servers that do not report the budget.
+  cache_budget_bytes?: number | null;
+}
+
+// DELETE /admin/model-host/artifacts/{digest} success report. Refusals
+// (resident, configured, pinned, busy) come back as a 409 whose body
+// carries `{code, error}` like the other model-host mutation routes.
+export interface ArtifactRemovalReport {
+  artifact_digest: string;
+  removed: boolean;
+  reclaimed_bytes: number;
+  job_id?: string | null;
+}
+
+// POST /admin/model-host/gc result: deterministic cache-budget collection.
+export interface GcReport {
+  before_bytes: number;
+  after_bytes: number;
+  reclaimed_bytes: number;
+  deleted_artifacts: string[];
+  skipped_artifacts: Record<string, string>;
+  budget_unsatisfied_bytes: number;
+}
+
 export interface ClusterDeploymentBundleDraft {
   catalog_revision: string;
   revision: number;
@@ -1737,6 +1783,15 @@ export const api = {
     sendJson<unknown>("POST", "/admin/model-host/reset", { deployment }),
   modelHostEvict: (deployment: string) =>
     sendJson<unknown>("POST", "/admin/model-host/evict", { deployment }),
+  // Artifact cache storage (WOR-1910): inventory, exact delete, cache GC.
+  modelHostFiles: () =>
+    getJson<ModelHostFilesResponse>("/admin/model-host/files"),
+  deleteModelHostArtifact: (digest: string) =>
+    sendJson<ArtifactRemovalReport>(
+      "DELETE",
+      `/admin/model-host/artifacts/${encodeURIComponent(digest)}`,
+    ),
+  modelHostGc: () => sendJson<GcReport>("POST", "/admin/model-host/gc"),
 
   // Keys
   keys: () => getJson<unknown>("/admin/keys"),

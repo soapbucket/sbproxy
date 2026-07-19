@@ -185,6 +185,10 @@ pub struct ManagedModelPermit {
     manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
     deployment: String,
     admission: sbproxy_model_host::DeploymentAdmissionPermit,
+    /// Resolved engine version captured from the running engine when this
+    /// permit's route reached readiness (WOR-1906). `None` until then, or
+    /// when the engine never reported a version.
+    engine_version: Option<String>,
 }
 
 impl std::fmt::Debug for ManagedModelPermit {
@@ -206,12 +210,21 @@ impl ManagedModelPermit {
             manager,
             deployment,
             admission,
+            engine_version: None,
         }
     }
 
     /// Canonical deployment held by this request.
     pub fn deployment(&self) -> &str {
         &self.deployment
+    }
+
+    /// Resolved version of the running engine that serves this permit's
+    /// deployment, when readiness captured one (WOR-1906). A cheap clone
+    /// so end-of-request usage records can stamp the served engine
+    /// version without touching the runtime manager again.
+    pub fn engine_version(&self) -> Option<String> {
+        self.engine_version.clone()
     }
 
     pub(crate) async fn ensure_ready(
@@ -865,6 +878,60 @@ impl ProductionModelRuntime {
         preparer.map(|preparer| preparer.cached_artifacts())
     }
 
+    /// Assemble the live cache-protection sets for exact artifact removal
+    /// and budget-driven collection (WOR-1910). Mirrors the protection
+    /// `sbproxy models remove` builds: every runtime status digest counts
+    /// as resident, every catalog-resolvable configured deployment counts
+    /// as configured, and a legacy `pinned: true` serve entry pins its
+    /// resolved digest. Read-only: it snapshots committed desired state
+    /// and never touches the artifact cache.
+    pub async fn artifact_cache_protection(
+        &self,
+    ) -> Result<sbproxy_model_host::CacheProtection, String> {
+        let mut protection = sbproxy_model_host::CacheProtection::default();
+        for status in self.statuses().await {
+            if let Some(digest) = status.artifact_digest {
+                protection.resident.insert(digest);
+            }
+        }
+        let desired = self.current_desired();
+        let catalog = self.active_catalog();
+        if desired.deployments.is_empty() {
+            return Ok(protection);
+        }
+        let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&make_probe().probe())
+            .map_err(|error| format!("resolve artifact protection worker: {error}"))?;
+        for compiled in desired.deployments.values() {
+            // Raw `hf:` references have no catalog v2 digest to resolve;
+            // their runtime digest, when one exists, is already protected
+            // as resident above.
+            if compiled.desired.model.starts_with("hf:") {
+                continue;
+            }
+            let artifact = catalog
+                .resolve_artifact(
+                    &sbproxy_model_host::ResolveArtifactRequest {
+                        model: compiled.desired.model.clone(),
+                        variant: compiled.desired.variant.clone(),
+                        engine: compiled.desired.engine,
+                        replicas: compiled.desired.replicas,
+                        heterogeneous_variants: compiled.desired.heterogeneous_variants,
+                    },
+                    &worker,
+                )
+                .map_err(|error| format!("resolve configured artifact protection: {error}"))?;
+            if compiled
+                .legacy_entry
+                .as_ref()
+                .is_some_and(|entry| entry.pinned)
+            {
+                protection.pinned.insert(artifact.artifact_digest.clone());
+            }
+            protection.configured.insert(artifact.artifact_digest);
+        }
+        Ok(protection)
+    }
+
     /// Build one bounded, path-free cluster snapshot from current runtime truth.
     pub async fn node_model_snapshot(
         &self,
@@ -1115,6 +1182,7 @@ impl ProductionModelRuntime {
             manager,
             deployment: deployment.to_string(),
             admission,
+            engine_version: None,
         })
     }
 
@@ -2681,15 +2749,21 @@ pub async fn managed_upstream(
         .admit(&deployment, priority)
         .await
         .map_err(|error| format!("{}: {}", error.reason.as_str(), error.detail))?;
-    let permit = ManagedModelPermit {
+    let mut permit = ManagedModelPermit {
         manager,
         deployment,
         admission,
+        engine_version: None,
     };
     let running = permit
         .ensure_ready(priority)
         .await
         .map_err(|error| format!("{}: {error}", error.reason_code()))?;
+    // Capture the served engine version on the permit, which lives on the
+    // request context through the complete response, so the end-of-request
+    // usage record can answer "what served this" from the ledger alone
+    // (WOR-1906).
+    permit.engine_version = running.engine_version.clone();
     Ok(Some(ManagedLocalUpstream {
         base_url: format!("http://127.0.0.1:{}/v1", running.port),
         public_model,

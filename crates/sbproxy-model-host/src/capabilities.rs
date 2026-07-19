@@ -1151,7 +1151,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "artifact.cache_budget",
         domain: CapabilityDomain::Artifact,
         status: SupportLevel::Stable,
-        summary: "Cache collection enforces LRU budgets without deleting protected artifacts.",
+        summary: "Cache collection enforces LRU budgets without deleting protected artifacts; the same protected collection runs on demand through the admin gc route.",
         evidence: &[
             "contract.cache_budget_protects_active_artifacts",
             "test.artifact_gc",
@@ -1384,11 +1384,14 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         capability_id: "artifact.cache_addressing",
         consumer: Some(ConsumerContract::CacheDirectoryChangesArtifactPath),
     },
+    // WOR-1910: the budget gained an API-triggerable executable consumer
+    // (post-pull collection plus the admin gc route), so the field is no
+    // longer config-only.
     ConfigFieldCapability {
         path: "serve.cache_budget_gib",
-        status: SupportLevel::ConfigOnly,
+        status: SupportLevel::Preview,
         capability_id: "artifact.cache_budget",
-        consumer: None,
+        consumer: Some(ConsumerContract::CacheBudgetProtectsActiveArtifacts),
     },
     ConfigFieldCapability {
         path: "serve.eviction",

@@ -175,8 +175,8 @@ pub use llama_release::{
 #[cfg(feature = "weights")]
 pub use llama_release::{ensure_llama_server, ensure_llama_server_blocking};
 pub use lockfile::{
-    diff_against_cache, read_lockfile, write_lockfile, LockDrift, LockedEngine, LockedModel,
-    Lockfile, LockfileError, LOCKFILE_NAME, LOCKFILE_SCHEMA_VERSION,
+    diff_against_cache, read_lockfile, verify_for_serve, write_lockfile, LockDrift, LockedEngine,
+    LockedModel, Lockfile, LockfileError, LOCKFILE_NAME, LOCKFILE_SCHEMA_VERSION,
 };
 pub use lora::{AdapterRoute, LoraCache};
 pub use manifest::{

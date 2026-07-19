@@ -21,6 +21,17 @@
 //! (WOR-1910): the cache root, exact total bytes, and per-artifact
 //! durable ready metadata including whether the artifact currently backs
 //! a ready deployment replica. Read-only, same auth gate.
+//!
+//! `DELETE /admin/model-host/artifacts/{digest}` removes one exact
+//! verified artifact (WOR-1910) through the same protected
+//! `ArtifactManager::remove` path `sbproxy models remove` uses, so
+//! configured, resident, pinned, leased, and locked artifacts fail
+//! closed with a 409 and a stable reason. `POST /admin/model-host/gc`
+//! runs the same protected LRU collection as the post-pull sweep down to
+//! the configured cache budget and returns the collection report; with
+//! no budget configured it answers 409, because there is no target to
+//! collect toward. Both mutate the cache and sit behind the shared
+//! admin auth gate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -718,6 +729,18 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
         let runtime = crate::server::model_host::model_runtime_manager();
         return dispatch_with_runtime(runtime.as_ref(), method, path_only, body);
     }
+    // WOR-1910: exact protected artifact removal, mirroring the
+    // `sbproxy models remove` path.
+    if let Some(digest) = path_only.strip_prefix("/admin/model-host/artifacts/") {
+        if !method.eq_ignore_ascii_case("DELETE") {
+            return Some((
+                405,
+                JSON,
+                r#"{"error":"method not allowed; use DELETE"}"#.to_string(),
+            ));
+        }
+        return Some(remove_artifact_response(digest));
+    }
     match path_only {
         "/admin/model-host/status" => {
             if !method.eq_ignore_ascii_case("GET") {
@@ -752,6 +775,18 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
                 ));
             }
             Some(files_response())
+        }
+        // WOR-1910: on-demand protected LRU collection down to the
+        // configured cache budget.
+        "/admin/model-host/gc" => {
+            if !method.eq_ignore_ascii_case("POST") {
+                return Some((
+                    405,
+                    JSON,
+                    r#"{"error":"method not allowed; use POST"}"#.to_string(),
+                ));
+            }
+            Some(gc_response())
         }
         // WOR-1765: load (spawn/ready) and evict (unload to free VRAM) a
         // model on demand. keep_alive stays config-driven.
@@ -1121,6 +1156,214 @@ fn files_response() -> Resp {
             artifacts: entries,
         },
     )
+}
+
+/// Whether a path segment is a canonical lowercase SHA-256 artifact digest.
+fn is_artifact_digest(candidate: &str) -> bool {
+    candidate.len() == 64
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Open the verified artifact cache for an admin mutation the same way
+/// `sbproxy models remove` does: over the committed cache root with the
+/// network transport disabled, so removal and collection can never
+/// download bytes. Cross-process safety comes from the cache's own
+/// exclusive mutation, lease, and artifact file locks.
+fn open_admin_artifact_manager(
+    cache_root: std::path::PathBuf,
+) -> Result<sbproxy_model_host::ArtifactManager, sbproxy_model_host::ArtifactError> {
+    sbproxy_model_host::ArtifactManager::new(
+        cache_root,
+        Arc::new(sbproxy_model_host::UnavailableArtifactTransport),
+    )
+}
+
+fn unknown_artifact_response(digest: &str) -> Resp {
+    json_response(
+        404,
+        &serde_json::json!({
+            "error": "artifact is not in the verified cache",
+            "artifact_digest": digest,
+        }),
+    )
+}
+
+/// Build `DELETE /admin/model-host/artifacts/{digest}` (WOR-1910): one
+/// exact, protected artifact removal. Reuses the same
+/// `ArtifactManager::remove` path as `sbproxy models remove`, with the
+/// protection sets assembled from live runtime truth, so API and CLI
+/// removals obey identical configured, resident, pinned, leased, and
+/// locked rules. 200 returns the removal report, 409 carries the stable
+/// protection reason, and an uncached digest is 404.
+fn remove_artifact_response(digest: &str) -> Resp {
+    if !is_artifact_digest(digest) {
+        return (
+            400,
+            JSON,
+            r#"{"error":"invalid artifact digest; expected 64 lowercase hex characters"}"#
+                .to_string(),
+        );
+    }
+    let runtime = crate::server::model_host::model_runtime_manager();
+    let Some(cache_root) = runtime.artifact_cache_root() else {
+        // No model host is configured, so no artifact cache is open and
+        // no digest can be cached: the honest answer is 404.
+        return unknown_artifact_response(digest);
+    };
+    // Blocking-pool thread (spawn_blocking dispatcher); block on the
+    // async protection snapshot and removal, matching load_response.
+    let protection = match tokio::runtime::Handle::current()
+        .block_on(runtime.artifact_cache_protection())
+    {
+        Ok(protection) => protection,
+        Err(error) => {
+            tracing::error!(%error, "assemble artifact removal protection");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact protection unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    let manager = match open_admin_artifact_manager(cache_root) {
+        Ok(manager) => manager,
+        Err(error) => {
+            tracing::error!(%error, "open artifact cache for admin removal");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact cache unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    match tokio::runtime::Handle::current().block_on(manager.remove(digest, &protection)) {
+        Ok(report) if report.removed => {
+            tracing::info!(
+                target: "sbproxy::admin::audit",
+                action = "model_artifact_remove",
+                artifact_digest = %report.artifact_digest,
+                reclaimed_bytes = report.reclaimed_bytes,
+                job_id = ?report.job_id,
+                "admin artifact removal committed"
+            );
+            json_response(200, &report)
+        }
+        Ok(_) => unknown_artifact_response(digest),
+        Err(sbproxy_model_host::ArtifactError::RemovalBlocked { reason, .. }) => json_response(
+            409,
+            &serde_json::json!({
+                "error": format!("artifact removal refused: {reason}"),
+                "reason": reason,
+            }),
+        ),
+        Err(error) => {
+            tracing::error!(%error, "admin artifact removal failed");
+            (
+                502,
+                JSON,
+                r#"{"error":"artifact removal failed; inspect server logs"}"#.to_string(),
+            )
+        }
+    }
+}
+
+/// Build `POST /admin/model-host/gc` (WOR-1910): protected LRU collection
+/// down to the configured cache budget (`proxy.model_host.cache.budget_gib`
+/// or the legacy `serve.cache_budget_gib`). Runs the same
+/// `ArtifactManager::enforce_budget` path as the post-pull sweep with the
+/// protection sets assembled from live runtime truth, and returns the
+/// collection report. Without a configured budget the honest answer is
+/// 409: there is no target to collect toward.
+fn gc_response() -> Resp {
+    let runtime = crate::server::model_host::model_runtime_manager();
+    let desired = runtime.current_desired();
+    let budget_gib = desired.control.cache.budget_gib.or_else(|| {
+        desired
+            .legacy_host_policy
+            .as_ref()
+            .and_then(|policy| policy.cache_budget_gib)
+    });
+    let Some(budget_gib) = budget_gib else {
+        return (
+            409,
+            JSON,
+            r#"{"error":"no cache budget configured"}"#.to_string(),
+        );
+    };
+    if !budget_gib.is_finite() || budget_gib < 0.0 {
+        return (
+            409,
+            JSON,
+            r#"{"error":"configured cache budget is out of range"}"#.to_string(),
+        );
+    }
+    let budget_bytes = (budget_gib * 1024.0 * 1024.0 * 1024.0).floor();
+    if budget_bytes > u64::MAX as f64 {
+        return (
+            409,
+            JSON,
+            r#"{"error":"configured cache budget is out of range"}"#.to_string(),
+        );
+    }
+    let Some(cache_root) = runtime.artifact_cache_root() else {
+        // A budget without a committed cache root means no artifact cache
+        // is open, so there is nothing to collect.
+        return (
+            409,
+            JSON,
+            r#"{"error":"no artifact cache is open"}"#.to_string(),
+        );
+    };
+    // Blocking-pool thread (spawn_blocking dispatcher); block on the
+    // async protection snapshot, matching load_response.
+    let protection = match tokio::runtime::Handle::current()
+        .block_on(runtime.artifact_cache_protection())
+    {
+        Ok(protection) => protection,
+        Err(error) => {
+            tracing::error!(%error, "assemble cache collection protection");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact protection unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    let manager = match open_admin_artifact_manager(cache_root) {
+        Ok(manager) => manager,
+        Err(error) => {
+            tracing::error!(%error, "open artifact cache for admin collection");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact cache unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    match manager.enforce_budget(budget_bytes as u64, &protection) {
+        Ok(report) => {
+            tracing::info!(
+                target: "sbproxy::admin::audit",
+                action = "model_cache_gc",
+                budget_bytes = budget_bytes as u64,
+                reclaimed_bytes = report.reclaimed_bytes,
+                deleted_artifacts = report.deleted_artifacts.len(),
+                budget_unsatisfied_bytes = report.budget_unsatisfied_bytes,
+                "admin cache collection completed"
+            );
+            json_response(200, &report)
+        }
+        Err(error) => {
+            tracing::error!(%error, "admin cache collection failed");
+            (
+                502,
+                JSON,
+                r#"{"error":"cache collection failed; inspect server logs"}"#.to_string(),
+            )
+        }
+    }
 }
 
 fn runtime_error_response(operation: &str, error: sbproxy_model_host::RuntimeManagerError) -> Resp {
@@ -2031,6 +2274,75 @@ models:
         assert_eq!(report["total_bytes"], 0);
         assert_eq!(report["artifacts"], serde_json::json!([]));
         assert!(report.get("cache_root").is_none());
+    }
+
+    #[test]
+    fn artifact_delete_rejects_non_delete_methods() {
+        let digest = "a".repeat(64);
+        let (code, _, _) = dispatch(
+            "GET",
+            &format!("/admin/model-host/artifacts/{digest}"),
+            None,
+        )
+        .expect("artifacts route");
+        assert_eq!(code, 405);
+        let (code, _, _) = dispatch(
+            "POST",
+            &format!("/admin/model-host/artifacts/{digest}"),
+            None,
+        )
+        .expect("artifacts route");
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn artifact_delete_rejects_a_malformed_digest() {
+        // The digest is a path segment used to address cache files, so
+        // anything but exact lowercase SHA-256 hex is rejected up front.
+        for digest in ["not-a-digest", "..", "ABCDEF", ""] {
+            let (code, _, _) = dispatch(
+                "DELETE",
+                &format!("/admin/model-host/artifacts/{digest}"),
+                None,
+            )
+            .expect("artifacts route");
+            assert_eq!(code, 400, "{digest:?}");
+        }
+    }
+
+    #[test]
+    fn artifact_delete_returns_not_found_for_an_unknown_digest() {
+        // With no model host configured there is no open artifact cache,
+        // so no digest is cached and the removal is an honest 404.
+        let digest = "b".repeat(64);
+        let (code, ct, body) = dispatch(
+            "DELETE",
+            &format!("/admin/model-host/artifacts/{digest}"),
+            None,
+        )
+        .expect("artifacts route");
+        assert_eq!(code, 404);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error json");
+        assert_eq!(response["artifact_digest"], digest);
+        assert_eq!(response["error"], "artifact is not in the verified cache");
+    }
+
+    #[test]
+    fn gc_rejects_non_post() {
+        let (code, _, _) = dispatch("GET", "/admin/model-host/gc", None).expect("gc route");
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn gc_without_a_configured_budget_is_a_conflict() {
+        // The empty runtime has no cache budget in canonical or legacy
+        // form, so on-demand collection has no target and answers 409.
+        let (code, ct, body) = dispatch("POST", "/admin/model-host/gc", None).expect("gc route");
+        assert_eq!(code, 409);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error json");
+        assert_eq!(response["error"], "no cache budget configured");
     }
 
     #[tokio::test]

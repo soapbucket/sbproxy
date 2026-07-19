@@ -1048,16 +1048,19 @@ in cache for a later restart.
 The equivalent authenticated routes are:
 
 ```text
-GET  /admin/model-host/catalog
-GET  /admin/model-host/deployments
-PUT  /admin/model-host/deployments
-GET  /admin/model-host/status
-GET  /admin/model-host/files
-POST /admin/model-host/load
-POST /admin/model-host/stop
-POST /admin/model-host/drain
-POST /admin/model-host/evict
-POST /admin/model-host/reset
+GET    /admin/model-host/catalog
+GET    /admin/model-host/deployments
+PUT    /admin/model-host/deployments
+GET    /admin/model-host/status
+GET    /admin/model-host/files
+DELETE /admin/model-host/artifacts/{digest}
+POST   /admin/model-host/gc
+POST   /admin/model-host/load
+POST   /admin/model-host/stop
+POST   /admin/model-host/drain
+POST   /admin/model-host/evict
+POST   /admin/model-host/reset
+GET    /admin/cluster/artifacts
 ```
 
 Load, stop, drain, evict, and reset accept

@@ -73,6 +73,14 @@ pub struct LlmUsageEvent {
     /// latency per lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// Resolved version of the local inference engine that served the
+    /// request (WOR-1906), captured at route time from the running
+    /// engine. Answers "what served this request" from the ledger after
+    /// the engine process is gone. Always `None` for hosted providers,
+    /// and `None` for a served request whose engine never reported a
+    /// version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
 }
 
 /// A destination for completed-call usage events.
@@ -493,6 +501,7 @@ mod tests {
             request_id: None,
             tag: None,
             priority: None,
+            engine_version: None,
         }
     }
 
@@ -544,6 +553,42 @@ mod tests {
         assert_eq!(value["team"], "platform");
         assert_eq!(value["tags"], serde_json::json!(["production", "chat"]));
         assert_eq!(value["metadata"]["cost_center"], "cc-42");
+    }
+
+    #[test]
+    fn engine_version_roundtrips_when_present() {
+        let mut event = sample_event();
+        event.engine_version = Some("0.11.0".to_string());
+
+        let value = serde_json::to_value(&event).expect("serialize usage event");
+        assert_eq!(value["engine_version"], "0.11.0");
+
+        let back: LlmUsageEvent =
+            serde_json::from_value(value).expect("deserialize usage event with engine_version");
+        assert_eq!(back.engine_version.as_deref(), Some("0.11.0"));
+    }
+
+    #[test]
+    fn engine_version_none_is_omitted_and_old_records_still_deserialize() {
+        // None never serializes, so hosted-provider records keep their
+        // pre-WOR-1906 wire shape byte-for-byte (the verifiable ledger
+        // re-derives hashes from this serialization on replay).
+        let value = serde_json::to_value(sample_event()).expect("serialize usage event");
+        assert!(value.get("engine_version").is_none());
+
+        // A record persisted before the field existed deserializes to None.
+        let old: LlmUsageEvent = serde_json::from_value(serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "cost_usd": 0.001,
+            "latency_ms": 200,
+            "status": 200
+        }))
+        .expect("old usage record without engine_version");
+        assert!(old.engine_version.is_none());
     }
 
     #[test]
