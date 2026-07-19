@@ -77,6 +77,7 @@ pub async fn ensure_uv(cache_dir: &std::path::Path, version: &str) -> Result<Pat
     }
 
     let archive = dest_dir.join("uv.tar.gz");
+    crate::artifact::authorize_engine_download(&url)?;
     let resp = reqwest::Client::new()
         .get(&url)
         .send()

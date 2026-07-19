@@ -4,7 +4,7 @@
 
 ![Migrate off LiteLLM](../../docs/assets/migrate-litellm.gif)
 
-A before-and-after pair for [docs/migration-litellm.md](../../docs/migration-litellm.md). `config.yaml` is a small LiteLLM proxy config: two models with rate caps, latency routing, caching, a budget kwarg, and a master key. `sb.yml` is what `sbproxy config import-litellm` produces from it, annotated so you can trace every field back to its LiteLLM source. The two keys the importer could not map (`max_budget`, `master_key`) are warned about on stderr, and the comments in `sb.yml` show where each lands by hand.
+A before-and-after pair for [docs/migration-litellm.md](../../docs/migration-litellm.md). `config.yaml` is a small LiteLLM proxy config: two models with rate caps, latency routing, caching, a budget kwarg, and a master key. `sb.yml` is what `sbproxy config import-litellm` produces from it, annotated so you can trace every field back to its LiteLLM source. A clean `max_budget` emits an action-level `budget:` block; `master_key` still warns for manual auth setup, and the comments in `sb.yml` show where that warning lands.
 
 ## Re-run the import yourself
 
@@ -13,7 +13,7 @@ cd examples/migrate-litellm
 sbproxy config import-litellm config.yaml
 ```
 
-The translated config prints to stdout and two warnings print to stderr, ending with `2 key(s) need manual attention`. The committed `sb.yml` is that stdout plus comments, nothing else. Prove it:
+The translated config prints to stdout and one warning prints to stderr, ending with `1 key(s) need manual attention`. The committed `sb.yml` is that stdout plus comments, nothing else. Prove it:
 
 ```bash
 diff <(sbproxy config import-litellm config.yaml 2>/dev/null) \
@@ -66,4 +66,4 @@ Both sides return the OpenAI chat completion shape, so the diff of the top-level
 
 - [docs/migration-litellm.md](../../docs/migration-litellm.md) - the full migration story this pair belongs to
 - [examples/ai-virtual-keys](../ai-virtual-keys/) - per-team keys, the follow-up for `master_key`
-- [examples/ai-budget](../ai-budget/) - budget enforcement, the follow-up for `max_budget`
+- [examples/ai-budget](../ai-budget/) - budget enforcement shapes beyond the imported `budget:` window

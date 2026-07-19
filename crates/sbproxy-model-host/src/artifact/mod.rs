@@ -21,10 +21,12 @@ pub use cache::{ArtifactCacheMetadata, ArtifactCacheState, ReadyArtifact};
 pub(crate) use gc::explicit_protection_reason;
 pub use gc::{CacheProtection, GcReport, PruneReport, RemoveArtifactReport};
 #[cfg(feature = "weights")]
+pub(crate) use http::authorize_engine_download;
+#[cfg(feature = "weights")]
 pub use http::HttpArtifactTransport;
 pub use http::{
-    ArtifactTransport, ResponseDisposition, SourceCredential, TransportRequest, TransportResponse,
-    UnavailableArtifactTransport,
+    authorize_artifact_url, ArtifactTransport, ResponseDisposition, SourceCredential,
+    TransportRequest, TransportResponse, UnavailableArtifactTransport,
 };
 
 use crate::{

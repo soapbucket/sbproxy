@@ -9,6 +9,7 @@ publish = false
 sbproxy-plugin.workspace = true
 sbproxy-util.workspace = true
 sbproxy-config.workspace = true
+sbproxy-security.workspace = true
 # WOR-152 PR β: MCP federation records
 # `sbproxy_mcp_policy_hook_invocations_total` on every pre-tool-call
 # verdict. The helper lives in sbproxy-observe alongside the other
@@ -79,6 +80,9 @@ tokio.workspace = true
 
 # HTTP client (for MCP upstream transports)
 reqwest.workspace = true
+
+# URL types for run-as-user token-exchange config (WOR-1792)
+url = { workspace = true, features = ["serde"] }
 
 # Lock-free atomic Arc swap (for federation tool registry)
 arc-swap.workspace = true

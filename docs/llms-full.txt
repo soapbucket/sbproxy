@@ -5781,6 +5781,32 @@ routing:
   strategy: token_rate
 ```
 
+### headroom
+
+Routes to the provider with the lowest request-quota pressure from fresh
+provider rate-limit headers (`1 - remaining/limit`). Ties keep enabled-list
+order. Unknown or stale snapshots are advisory only: they sort after known
+fresh observations and never invent a capacity guarantee. Prefer pairing
+with live header updates on the dispatch path; local `token_rate` counters
+remain a separate strategy.
+
+```yaml
+routing:
+  strategy: headroom
+```
+
+### reset_aware
+
+Routes to the provider whose quota window resets soonest among candidates
+waiting for positive capacity. Providers that already report remaining
+capacity sort first. Unknown or stale signals sort last and do not invent
+a reset time. `Retry-After` is accepted as delta-seconds or HTTP-date.
+
+```yaml
+routing:
+  strategy: reset_aware
+```
+
 ### race
 
 ![one request fanned out to every provider, the first 2xx returned and the slow racer cancelled](assets/ai-race-routing.gif)
@@ -6284,7 +6310,7 @@ action:
 - `on_exceed: log` records a warning and a `sbproxy_ai_budget_utilization_ratio` gauge update, then lets the request through.
 - `on_exceed: downgrade` swaps the request's model to the firing limit's `downgrade_to` and proceeds. If `downgrade_to` is unset, the request is blocked.
 - Setting only `max_tokens` and leaving `max_cost_usd` unset (or vice versa) is supported. A limit with neither field is a no-op.
-- A hierarchical view (`org`, `team`, `project`, `user`, `model` keys with 80% warning band) is exposed to in-process callers via `HierarchicalBudget` in `hierarchical_budget.rs`. There is no top-level YAML knob for it today; it is wired by the runtime when the gateway tracks spend.
+- Multiple limits on the same scope with different `period` values (for example daily and monthly) accrue in separate window buckets. Each limit is checked against its own key; the tightest binding that is exceeded fires first in declaration order. There is no separate org/team/project hierarchy tracker: `BudgetScope` is the single enum (`workspace`, `api_key`, `user`, `model`, `origin`, `tag`) used by `BudgetLimit`.
 
 ### Soft-landing (predictive budgets)
 
@@ -6504,23 +6530,45 @@ cache record above the response cap.
 
 ## Per-provider limits
 
-The proxy reads rate limit headers off provider responses and pre-emptively throttles when remaining capacity falls under a configured fraction. Implemented in `provider_ratelimit.rs` as `ProviderRateLimitTracker`.
+The proxy reads rate limit headers off provider responses into advisory
+`ProviderQuotaSnapshot` values and pre-emptively throttles when remaining
+capacity falls under a configured fraction of a *known* limit. Implemented
+in `provider_ratelimit.rs` as `ProviderRateLimitTracker`, wired from
+`ai_dispatch` before retry/reselect so `headroom` and `reset_aware` see
+live signals.
+
+Signal quality is explicit:
+
+| Quality | Meaning | Routing / throttle behavior |
+|---------|---------|-----------------------------|
+| `KnownFresh` | Header-derived observation inside the freshness window | May score pressure / reset; throttle uses real `remaining/limit` |
+| `Stale` | Observed before, but aged past freshness or cleared after reset | Advisory only; must not invent hard guarantees |
+| `Unknown` | Never observed for that provider | No invented capacity; throttle stays off |
 
 Recognised response headers (case-insensitive):
 
 - `x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`
+- `x-ratelimit-limit-requests`, `x-ratelimit-limit-tokens`
 - `x-ratelimit-reset-requests`, `x-ratelimit-reset-tokens` (formats: `1s`, `500ms`, plain seconds)
-- `retry-after` (plain seconds)
+- `retry-after` (delta-seconds or HTTP-date)
 - `anthropic-ratelimit-requests-remaining`, `anthropic-ratelimit-tokens-remaining`
+- `anthropic-ratelimit-requests-limit`, `anthropic-ratelimit-tokens-limit`
 - `anthropic-ratelimit-requests-reset`
 
-The tracker takes a single `throttle_threshold: f64` between 0.0 and 1.0. The implementation throttles when remaining requests fall to or below `floor(1000 * threshold)`, treating 1000 req/min as a baseline. Default: `0.1`, which throttles at 100 remaining requests or fewer.
+A `429` response marks remaining requests as exhausted when the upstream
+omits an explicit remaining count.
+
+The tracker takes a single `throttle_threshold: f64` between 0.0 and 1.0.
+Throttling uses the real limit from headers: remaining requests at or below
+`floor(limit * threshold)`. Without a known limit, remaining alone does not
+invent a synthetic denominator. Hard blocks still apply when remaining
+requests or tokens are reported as zero. Default threshold: `0.1`.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `throttle_threshold` | f64 | `0.1` | Clamped to `[0.0, 1.0]`. Lower values delay throttling until the provider is closer to its hard limit. |
 
-Per-provider throttling is a runtime construct. There is no top-level YAML field; the tracker is instantiated alongside the provider pool and updated from every upstream response.
+Per-provider throttling is a runtime construct. There is no top-level YAML field; the tracker is instantiated alongside the provider router and updated from every upstream response on the dispatch path.
 
 For per-model rate limits configurable in YAML, use `model_rate_limits` on the `action` block. The struct is `ModelRateConfig` in `ratelimit.rs`:
 
@@ -23446,7 +23494,7 @@ With both flows on the gateway, you set token and dollar budgets in one place in
 ================================================================
 
 ## MCP Archestra guardrails
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-19*
 
 WOR-1787 adds a small set of MCP gateway mechanisms borrowed from the
 Archestra teardown. They are implemented inside the sbproxy repository
@@ -23460,7 +23508,9 @@ implemented.
 OpenAPI-backed MCP servers can set an egress policy so REST tool calls
 only reach listed hosts or suffixes. Redirects are followed manually
 and every redirect target is checked before the gateway opens the next
-connection.
+connection. Judge and token-exchange destinations use the shared
+`sbproxy_security::egress` authorizer purposes (`AiJudge`,
+`TokenExchange`) when wired.
 
 ```yaml
 action:
@@ -23501,9 +23551,12 @@ classified as both private data and external communication.
 
 ### Dual-LLM quarantine
 
-The quarantine gate is opt-in. It scans MCP text result blocks for
-configured suspicious patterns and returns a JSON-RPC error instead of
-handing that output back to the caller.
+The quarantine gate is opt-in. When enabled, untrusted MCP tool text
+blocks are evaluated by a secondary LLM judge (`ToolOutputJudge`)
+before any served session-ledger outcome, compaction, or client
+response. The judge call is no-tools, fail-closed (timeout, malformed
+response, and egress denial all quarantine), and emits only a digest
+or closed reason code — never matched text or raw tool output.
 
 ```yaml
 action:
@@ -23511,9 +23564,9 @@ action:
   mode: gateway
   dual_llm_quarantine:
     enabled: true
-    suspicious_patterns:
-      - ignore previous instructions
-      - exfiltrate
+    endpoint: https://judge.example/v1/chat/completions
+    model: judge-model
+    timeout: 10s
 ```
 
 ### Supervised local stdio MCP
@@ -23538,11 +23591,13 @@ action:
 
 ### Run-as-user MCP auth
 
-Upstreams can opt into a bounded caller identity envelope. When
-`run_as_user_auth` is true, outbound tool arguments include
-`_sbproxy_run_as_user` with tenant, subject, source, virtual key name,
-and common attribution fields. Arbitrary JWT claims and metadata are
-not forwarded.
+Upstreams can opt into per-caller upstream Authorization minting.
+When `run_as_user_auth` is true, `upstream_auth` is required and the
+gateway mints an `Authorization` credential for the
+`McpExecutionContext` (inbound principal / optional delegation).
+Identity and tokens never enter tool arguments. Anonymous and
+shared-key callers fail closed. `stdio` plus run-as-user is a config
+error until a safe secret-delivery path exists for local children.
 
 ```yaml
 action:
@@ -23552,13 +23607,20 @@ action:
     - origin: github.example.com
       prefix: gh
       run_as_user_auth: true
+      upstream_auth:
+        type: per_user_credential
+        credential_template: "vault://users/{subject_id}/mcp-token"
 ```
+
+Supported `upstream_auth.type` values: `service_credential`,
+`token_exchange`, and `per_user_credential`.
 
 ### Token compaction
 
 Tool-result compaction is disabled by default. When enabled, oversized
 MCP `content[].text` blocks are truncated at a UTF-8 boundary and
-annotated with omitted byte count metadata.
+annotated with omitted byte count metadata. Compaction runs only after
+quarantine releases the output.
 
 ```yaml
 action:
@@ -23573,8 +23635,10 @@ action:
 
 The implementation has focused unit coverage for egress policy
 matching, redirect-safe OpenAPI egress denial, stdio supervision,
-session risk accumulation, and config compilation for the opt-in
-guards. The full workspace verification remains the release gate.
+session risk accumulation, dual-LLM judge fail-closed behavior,
+run-as-user mint/attach without arg injection, and config compilation
+for the opt-in guards. The full workspace verification remains the
+release gate.
 
 ================================================================
 # docs/mcp.md
@@ -23680,7 +23744,7 @@ struct is `McpActionConfig` in
 | `sessions` | object | unset | Streamable HTTP session management: `{enabled, ttl}` (see [`examples/mcp-sessions`](../examples/mcp-sessions)). |
 | `egress` | object | unset | Default OpenAPI REST egress policy. See [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md). |
 | `token_compaction` | object | unset | Opt-in compaction for large MCP text result blocks. |
-| `dual_llm_quarantine` | object | unset | Opt-in quarantine gate for suspicious MCP text result blocks. |
+| `dual_llm_quarantine` | object | unset | Opt-in dual-LLM judge quarantine for untrusted MCP text result blocks (`enabled`, `endpoint`, optional `model` / `timeout`). Fail closed; reason-code only. |
 | `refresh_interval` | duration | `60s` | How often the background task re-fetches upstream catalogues. Inbound requests always serve the cached snapshot; this is the only steady-state fan-out. |
 | `upstream_connect_timeout` | duration | `5s` | TCP connect deadline per upstream exchange. |
 | `upstream_timeout` | duration | `30s` | Whole-request deadline per upstream exchange (refreshes, calls, reads). Per-server `timeout:` can only shorten it for `tools/call`. |
@@ -23702,7 +23766,8 @@ struct is `McpActionConfig` in
 | `transport` | string | `streamable_http` | `streamable_http`, `sse`, or supervised local `stdio`. |
 | `command` / `args` | string / list | unset | Required command and optional arguments for `transport: stdio`. |
 | `egress` | object | inherited | Per-server OpenAPI REST egress policy. |
-| `run_as_user_auth` | bool | `false` | Attach bounded caller identity to outbound tool arguments. |
+| `run_as_user_auth` | bool | `false` | Mint per-caller upstream `Authorization` via `upstream_auth` (never tool args). |
+| `upstream_auth` | object | unset | Required when `run_as_user_auth` is true. See [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md). |
 
 A `rbac` value that does not match a key in `rbac_policies` is a hard
 config error (see `McpAction::from_parsed` in
@@ -24680,7 +24745,7 @@ before provider dispatch and emits a structured warning.
 
 ## Migrating from LiteLLM
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-19*
 
 ![The importer translating a LiteLLM config, then a completion served through the migrated result](assets/migrate-litellm.gif)
 
@@ -24693,11 +24758,11 @@ sbproxy config import-litellm litellm_config.yaml --out sb.yml
 sbproxy sb.yml
 ```
 
-`import-litellm` reads a LiteLLM `config.yaml` and writes an equivalent SBproxy `sb.yml` with one `ai_proxy` origin. It prints a warnings report to stderr listing every key that needs manual attention, and never fails on an unmapped key (only on a YAML parse error). Clients that already speak the OpenAI API need no change: keep calling `/v1/chat/completions`, `/v1/embeddings`, and the rest. `os.environ/VAR` references become SBproxy's `${VAR}` interpolation.
+`import-litellm` reads a LiteLLM `config.yaml` and writes an equivalent SBproxy `sb.yml` with one `ai_proxy` origin. It prints a warnings report to stderr listing every key that needs manual attention, and never fails on an unmapped key (only on a YAML parse error). Every configured key is accounted for as mapped, warned, or unsupported: nothing under `litellm_params`, `router_settings`, `litellm_settings`, `general_settings`, or the top-level document is silently dropped. Clients that already speak the OpenAI API need no change: keep calling `/v1/chat/completions`, `/v1/embeddings`, and the rest. `os.environ/VAR` references become SBproxy's `${VAR}` interpolation.
 
 ## What you will build
 
-By the end you have an `sb.yml` that answers the same `/v1/chat/completions` calls your clients already make, keeping the public model names, per-model rate caps, and cache behavior your LiteLLM config declared. Anything the importer could not translate lands on a warnings list for you to handle by hand. The repo ships this walkthrough as a runnable pair in [examples/migrate-litellm/](../examples/migrate-litellm/): the LiteLLM `config.yaml`, the imported `sb.yml` annotated field by field, and a compose file that runs both proxies side by side so you can diff their answers before cutting over.
+By the end you have an `sb.yml` that answers the same `/v1/chat/completions` calls your clients already make, keeping the public model names, per-model rate caps, cache behavior, known usage sinks, and clean budget windows your LiteLLM config declared. Anything the importer could not translate lands on a warnings list for you to handle by hand. The repo ships this walkthrough as a runnable pair in [examples/migrate-litellm/](../examples/migrate-litellm/): the LiteLLM `config.yaml`, the imported `sb.yml` annotated field by field, and a compose file that runs both proxies side by side so you can diff their answers before cutting over.
 
 ## Why migrate
 
@@ -24751,9 +24816,13 @@ sbproxy validate sb.yml
 | `litellm_params.api_key` / `api_base` / `api_version` / `organization` | `providers[].api_key` / `base_url` / `api_version` / `organization` |
 | `litellm_params.rpm` / `tpm` | `model_rate_limits[model].requests_per_minute` / `tokens_per_minute` |
 | `litellm_params.weight` | `providers[].weight` |
+| `litellm_params.max_budget` (+ optional `budget_duration`) | action-level `budget.limits[]` with `max_cost_usd` and `period` when every model that sets a budget shares the same cap and window |
 | Two `model_list` entries sharing a `model_name` | a model group: two providers listing that model, load-balanced by the routing strategy |
-| `router_settings.routing_strategy` | `routing` (`simple-shuffle`->`round_robin`, `latency-based-routing`->`lowest_latency`, `usage-based-routing`->`least_token_usage`, `least-busy`->`least_connections`, `cost-based-routing`->`cost_optimized`) |
+| `router_settings.routing_strategy` | `routing` (`simple-shuffle`->`round_robin`, `latency-based-routing`->`lowest_latency`, `usage-based-routing`->`least_token_usage`, `least-busy`->`least_connections`, `cost-based-routing`->`cost_optimized`). Unknown strategy names warn with the original value and fall back to `round_robin` |
 | `litellm_settings.cache` | `semantic_cache.enabled` |
+| `callbacks` / `success_callback` / `failure_callback` of `langfuse`, `datadog`, `otel`, `s3`/`s3_v2`, `gcs_bucket` | `usage_sinks[]` entries (credentials via `${LANGFUSE_*}`, `${DD_API_KEY}`, `${AWS_S3_BUCKET_NAME}`, `${GCS_BUCKET_NAME}`) |
+| Other known sink names (`prometheus`, `helicone`, `langsmith`) | warned as unsupported; configure `usage_sinks` by hand |
+| Unknown keys under `litellm_params`, `router_settings`, `litellm_settings`, `general_settings`, or the top-level document | warned (never silently dropped) |
 | `os.environ/VAR` (anywhere) | `${VAR}` |
 | `general_settings.master_key` | proxy authentication (configure manually) |
 | `general_settings.database_url` | runtime key/spend store (enterprise) |
@@ -24808,27 +24877,26 @@ origins:
       semantic_cache: { enabled: true }
 ```
 
-The committed version of this pair at [examples/migrate-litellm/](../examples/migrate-litellm/) adds two more LiteLLM keys, a budget kwarg and a `master_key`, so you can watch the warning path fire on input the importer cannot translate.
+The committed version of this pair at [examples/migrate-litellm/](../examples/migrate-litellm/) adds a `max_budget` kwarg and a `master_key`. A single clean `max_budget` now emits an action-level `budget:` block; `master_key` still warns for manual auth setup.
 
 ## Run it
 
-Point the importer at the shipped example. It writes `sb.yml` and reports the two keys that need hands:
+Point the importer at the shipped example. It writes `sb.yml` and reports keys that still need hands (for example `master_key`):
 
 ```console
 $ sbproxy config import-litellm examples/migrate-litellm/config.yaml --out sb.yml
 config import-litellm: wrote sb.yml
-warning: model 'claude': litellm_params.max_budget has no sbproxy mapping; review manually
 warning: general_settings.master_key has no direct sbproxy mapping; configure proxy authentication (see the migration guide)
-config import-litellm: 2 key(s) need manual attention (see warnings above)
+config import-litellm: 1 key(s) need manual attention (see warnings above)
 ```
 
-Both warnings are expected here; the [What needs manual migration](#what-needs-manual-migration) section covers them. Validate, then serve:
+The [What needs manual migration](#what-needs-manual-migration) section covers remaining warnings. Validate, then serve:
 
 ```console
 $ sbproxy validate sb.yml
 ok: sb.yml is a valid sbproxy config
 $ export OPENAI_API_KEY=sk-...
-$ export ANTHROPIC_API_KEY=sk-ant-...
+$ export ANTHROPIC_API_KEY=sk-ant...
 $ sbproxy sb.yml
 ```
 
@@ -24857,13 +24925,14 @@ To watch both proxies answer the same request before you retire LiteLLM, run `do
 These have no automatic translation; the importer warns and points here.
 
 - Python hooks given as module paths: `custom_auth`, `custom_sso`, `custom_key_generate`, and callback classes. SBproxy's analog is CEL, Lua, JavaScript, or WebAssembly scripting; rewrite the logic in one of those.
-- Open-ended `litellm_params` keyword arguments: the importer maps the known keys and warns on the rest, so review each warned key. Budget kwargs, for example, become an action-level `budget:` block ([examples/ai-budget](../examples/ai-budget/)).
+- Open-ended `litellm_params` keyword arguments other than the mapped set above: the importer warns on each remaining key. Differing per-model `max_budget` values also warn so you can split them into explicit `budget.limits` rows ([examples/ai-budget](../examples/ai-budget/)).
+- Known sink names without an auto-emitted target yet (`prometheus`, `helicone`, `langsmith`): add a matching `usage_sinks` entry by hand.
 - External guardrail providers (Presidio, Lakera, Aporia, Bedrock): map each to a built-in SBproxy guardrail or an external guardrail adapter.
 - `general_settings.master_key`: set up proxy authentication explicitly. Client keys move out of LiteLLM's database and into config as a `credentials:` block ([examples/ai-virtual-keys](../examples/ai-virtual-keys/)). Do not write a `virtual_keys:` block; that legacy shape is a hard config error.
 
 ## What is deferred
 
-Runtime parity for callback sinks, external guardrail adapters, multi-window budgets, per-error retry policy, and the `/model/info` family of endpoints is tracked separately and lands incrementally. The importer emits a warning for every unmapped `litellm_params` entry and wherever a mapped feature's target is not yet available. One known gap: unknown keys under `litellm_settings`, `general_settings`, and `router_settings` are ignored without a warning today, so diff the emitted sb.yml against your source config before you delete the original.
+Runtime parity for external guardrail adapters, per-error retry policy, and the `/model/info` family of endpoints is tracked separately and lands incrementally. The importer already closes the silent-drop landmine: every unknown key under `litellm_params`, `router_settings`, `litellm_settings`, `general_settings`, and the top-level document is warned, and known sink callbacks / clean budget windows emit real config.
 
 ## You are done when
 

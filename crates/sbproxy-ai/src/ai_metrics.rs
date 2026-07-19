@@ -792,7 +792,8 @@ pub fn record_token_estimate_error(model: &str, estimated: u64, actual: u64) {
 //
 // These are observational counters + an estimated-wasted-USD
 // gauge. Enforcement (budget caps, denial gates) lives in
-// `budget.rs` / `hierarchical_budget.rs`, not here.
+// `budget.rs`, not here. There is no separate hierarchical
+// budget tracker; scopes are flat `BudgetScope` limits.
 
 /// Wasted-token counter, partitioned by waste class + bounded
 /// attribution labels. The same cardinality contract as

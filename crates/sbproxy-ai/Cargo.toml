@@ -61,6 +61,9 @@ futures.workspace = true
 base64.workspace = true
 thiserror.workspace = true
 url.workspace = true
+# WOR-1916: S3/GCS usage sinks write JSON objects via the workspace
+# object_store crate (same backend as storage action / ACME cert store).
+object_store = { workspace = true }
 
 # Embedded provider catalog: gzipped YAML at build time, decompressed
 # on first lookup. flate2 is the standard Rust gzip implementation;

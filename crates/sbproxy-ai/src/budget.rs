@@ -2041,4 +2041,133 @@ mod tests {
             "a cumulative scope must never be evicted"
         );
     }
+
+    // --- WOR-1527 / WOR-1915: crate-root BudgetScope is the live enum ---
+
+    #[test]
+    fn crate_root_budget_scope_is_live_enum_used_by_budget_limit() {
+        // WOR-1915: `sbproxy_ai::BudgetScope` (crate root) must be the
+        // production enum from this module, not a colliding hierarchical
+        // struct. `BudgetLimit.scope` is typed as that enum.
+        let _ = crate::BudgetScope::ApiKey;
+        let limit = BudgetLimit {
+            scope: crate::BudgetScope::Workspace,
+            max_tokens: Some(100),
+            max_cost_usd: None,
+            period: Some("daily".to_string()),
+            downgrade_to: None,
+        };
+        assert_eq!(limit.scope, BudgetScope::Workspace);
+        assert_eq!(limit.scope, crate::BudgetScope::Workspace);
+    }
+
+    #[test]
+    fn multi_window_daily_and_monthly_both_enforce_tightest_blocks() {
+        // WOR-1527: two windows on one scope both accrue independently;
+        // the tighter (daily) binding blocks while the monthly key is still
+        // under its larger cap.
+        let tracker = BudgetTracker::new();
+        let daily = BudgetLimit {
+            scope: crate::BudgetScope::Workspace,
+            max_tokens: Some(1_000),
+            max_cost_usd: None,
+            period: Some("daily".to_string()),
+            downgrade_to: None,
+        };
+        let monthly = BudgetLimit {
+            scope: crate::BudgetScope::Workspace,
+            max_tokens: Some(20_000),
+            max_cost_usd: None,
+            period: Some("monthly".to_string()),
+            downgrade_to: None,
+        };
+        let now = 1_700_000_000u64;
+        let base = BudgetTracker::scope_key(
+            &crate::BudgetScope::Workspace,
+            "host",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let daily_key = windowed_key(&base, daily.window(), now);
+        let monthly_key = windowed_key(&base, monthly.window(), now);
+        assert_ne!(daily_key, monthly_key);
+
+        // Usage that fills the daily cap but stays under the monthly cap.
+        tracker.record_usage(&daily_key, 1_000, 0.0);
+        tracker.record_usage(&monthly_key, 1_000, 0.0);
+
+        assert!(
+            tracker
+                .check_limit(&daily, &daily_key, &OnExceedAction::Block)
+                .is_some(),
+            "daily window must block at its tighter cap"
+        );
+        assert!(
+            tracker
+                .check_limit(&monthly, &monthly_key, &OnExceedAction::Block)
+                .is_none(),
+            "monthly window remains under its larger cap"
+        );
+
+        // Monthly still enforces when its own bucket hits the larger cap.
+        tracker.record_usage(&monthly_key, 19_000, 0.0);
+        assert!(
+            tracker
+                .check_limit(&monthly, &monthly_key, &OnExceedAction::Block)
+                .is_some(),
+            "monthly window must also enforce when its cap is reached"
+        );
+    }
+
+    #[test]
+    fn per_model_multi_window_scopes_enforce_independently() {
+        // WOR-1527: model scope + multi-window. Two models do not share a
+        // bucket; each model's daily key enforces on its own usage.
+        let tracker = BudgetTracker::new();
+        let daily = BudgetLimit {
+            scope: crate::BudgetScope::Model,
+            max_tokens: Some(500),
+            max_cost_usd: None,
+            period: Some("daily".to_string()),
+            downgrade_to: None,
+        };
+        let now = 1_700_000_000u64;
+        let gpt = BudgetTracker::scope_key(
+            &crate::BudgetScope::Model,
+            "host",
+            None,
+            None,
+            Some("gpt-4o"),
+            None,
+            None,
+        )
+        .unwrap();
+        let mini = BudgetTracker::scope_key(
+            &crate::BudgetScope::Model,
+            "host",
+            None,
+            None,
+            Some("gpt-4o-mini"),
+            None,
+            None,
+        )
+        .unwrap();
+        let gpt_key = windowed_key(&gpt, daily.window(), now);
+        let mini_key = windowed_key(&mini, daily.window(), now);
+        assert_ne!(gpt_key, mini_key);
+
+        tracker.record_usage(&gpt_key, 500, 0.0);
+        tracker.record_usage(&mini_key, 100, 0.0);
+
+        assert!(tracker
+            .check_limit(&daily, &gpt_key, &OnExceedAction::Block)
+            .is_some());
+        assert!(tracker
+            .check_limit(&daily, &mini_key, &OnExceedAction::Block)
+            .is_none());
+    }
 }

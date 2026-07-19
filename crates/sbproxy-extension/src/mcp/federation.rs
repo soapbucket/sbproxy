@@ -14,10 +14,11 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
-use super::egress::EgressPolicy;
+use super::egress::{EgressPolicy, SystemHostResolver};
 use super::sse_client::send_via_sse;
 use super::streamable::send_request;
 use super::types::{JsonRpcRequest, JsonRpcResponse};
+use sbproxy_security::egress::EgressPurpose;
 
 /// Outcome of [`McpFederation::call_tool_with_policy`].
 ///
@@ -535,7 +536,7 @@ impl McpFederation {
             id: Some(json!(1)),
         };
 
-        let resp = self.dispatch_request(server, &req).await?;
+        let resp = self.dispatch_request(server, &req, &[]).await?;
 
         if let Some(err) = resp.error {
             anyhow::bail!(
@@ -713,7 +714,7 @@ impl McpFederation {
             })),
             id: Some(json!(1)),
         };
-        let resp = self.dispatch_request(server, &req).await?;
+        let resp = self.dispatch_request(server, &req, &[]).await?;
         if let Some(err) = resp.error {
             anyhow::bail!(
                 "initialize error from {}: {} (code {})",
@@ -742,7 +743,7 @@ impl McpFederation {
             params: None,
             id: Some(json!(1)),
         };
-        let resp = self.dispatch_request(server, &req).await?;
+        let resp = self.dispatch_request(server, &req, &[]).await?;
         if let Some(err) = resp.error {
             anyhow::bail!(
                 "resources/list error from {}: {} (code {})",
@@ -824,7 +825,7 @@ impl McpFederation {
             params: Some(json!({ "uri": resource.upstream_uri })),
             id: Some(json!(1)),
         };
-        let resp = self.dispatch_request(server, &req).await?;
+        let resp = self.dispatch_request(server, &req, &[]).await?;
         if let Some(err) = resp.error {
             anyhow::bail!(
                 "resources/read error from {}: {} (code {})",
@@ -870,8 +871,31 @@ impl McpFederation {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
+        self.call_tool_with_upstream_headers(tool_name, arguments, &[])
+            .await
+    }
+
+    /// Call a tool with optional upstream HTTP headers (WOR-1792).
+    ///
+    /// Use this after [`super::auth::mint_upstream_authorization`] so
+    /// the minted `Authorization` reaches the upstream POST. Headers
+    /// are never logged and never injected into tool arguments.
+    pub async fn call_tool_with_upstream_headers(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        upstream_headers: &[(String, String)],
+    ) -> anyhow::Result<serde_json::Value> {
         match self
-            .call_tool_with_policy(tool_name, arguments, None, "", "")
+            .call_tool_with_policy_cause_and_headers(
+                tool_name,
+                arguments,
+                None,
+                "",
+                "",
+                None,
+                upstream_headers,
+            )
             .await?
         {
             McpCallOutcome::Allowed(value) => Ok(value),
@@ -954,6 +978,31 @@ impl McpFederation {
         correlation_id: &str,
         workspace_id: &str,
         audit_cause: Option<&str>,
+    ) -> anyhow::Result<McpCallOutcome> {
+        self.call_tool_with_policy_cause_and_headers(
+            tool_name,
+            arguments,
+            agent_id,
+            correlation_id,
+            workspace_id,
+            audit_cause,
+            &[],
+        )
+        .await
+    }
+
+    /// Policy-aware tool call that also forwards upstream HTTP headers
+    /// (run-as-user Authorization) on the wire.
+    #[allow(clippy::too_many_arguments)] // policy identity + audit + upstream auth seams
+    pub async fn call_tool_with_policy_cause_and_headers(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        agent_id: Option<&str>,
+        correlation_id: &str,
+        workspace_id: &str,
+        audit_cause: Option<&str>,
+        upstream_headers: &[(String, String)],
     ) -> anyhow::Result<McpCallOutcome> {
         let federated = self
             .resolve_tool(tool_name)
@@ -1053,7 +1102,13 @@ impl McpFederation {
         // instead of an MCP tools/call.
         if let Some(backing) = &server.openapi {
             return self
-                .call_openapi_tool(server, backing, &federated.name, &arguments)
+                .call_openapi_tool(
+                    server,
+                    backing,
+                    &federated.name,
+                    &arguments,
+                    upstream_headers,
+                )
                 .await;
         }
 
@@ -1073,7 +1128,9 @@ impl McpFederation {
             "routing tool call to upstream server"
         );
 
-        let resp = self.dispatch_request(server, &req).await?;
+        let resp = self
+            .dispatch_request(server, &req, upstream_headers)
+            .await?;
 
         if let Some(err) = resp.error {
             anyhow::bail!(
@@ -1104,6 +1161,7 @@ impl McpFederation {
         backing: &OpenApiBacking,
         federated_name: &str,
         arguments: &serde_json::Value,
+        upstream_headers: &[(String, String)],
     ) -> anyhow::Result<McpCallOutcome> {
         let bare = federated_name
             .strip_prefix(&format!("{}.", server.name))
@@ -1131,9 +1189,14 @@ impl McpFederation {
             }
         }
         let base = backing.base_url.trim_end_matches('/');
-        let mut url = Url::parse(&format!("{base}{path}"))
+        let url = Url::parse(&format!("{base}{path}"))
             .map_err(|e| anyhow::anyhow!("invalid OpenAPI REST URL for {federated_name}: {e}"))?;
-        backing.egress_policy.check_url(&url)?;
+        // Deny unlisted hosts before any I/O (WOR-1791 / G2).
+        let resolver = SystemHostResolver;
+        let mut dest = backing
+            .egress_policy
+            .authorize(EgressPurpose::OpenApiTool, url.as_str(), &resolver)
+            .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
 
         let leftovers: serde_json::Map<String, serde_json::Value> = args_obj
             .into_iter()
@@ -1167,7 +1230,10 @@ impl McpFederation {
         let resp = loop {
             let mut builder = self
                 .openapi_client
-                .request(http_method.clone(), url.clone());
+                .request(http_method.clone(), dest.url.clone());
+            for (name, value) in upstream_headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
             if !query.is_empty() {
                 builder = builder.query(&query);
             }
@@ -1178,7 +1244,7 @@ impl McpFederation {
                 sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(
                     &anyhow::anyhow!(e.to_string()),
                 ));
-                anyhow::anyhow!("openapi REST call to {url} failed: {e}")
+                anyhow::anyhow!("openapi REST call to {} failed: {e}", dest.url)
             })?;
             if !resp.status().is_redirection() {
                 break resp;
@@ -1192,13 +1258,14 @@ impl McpFederation {
             };
             redirects += 1;
             if redirects > 10 {
-                anyhow::bail!("openapi REST call to {url} exceeded redirect limit");
+                anyhow::bail!("openapi REST call to {} exceeded redirect limit", dest.url);
             }
-            let next = url
-                .join(location)
-                .map_err(|e| anyhow::anyhow!("invalid OpenAPI redirect target: {e}"))?;
-            backing.egress_policy.check_url(&next)?;
-            url = next;
+            // Re-authorize redirect target before any second connect.
+            let (next, _strip) = backing
+                .egress_policy
+                .authorize_redirect(&dest, location, &resolver)
+                .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
+            dest = next;
         };
         let status = resp.status();
         let body = super::streamable::read_body_capped(resp, self.max_response_bytes).await?;
@@ -1213,14 +1280,33 @@ impl McpFederation {
     }
 
     /// Dispatch a request to an upstream server using the configured transport.
+    ///
+    /// `extra_headers` are attached on HTTP transports (streamable / SSE).
+    /// Non-empty headers on `stdio` fail closed: there is no safe
+    /// secret-delivery path for local child processes yet.
     async fn dispatch_request(
         &self,
         server: &McpServerConfig,
         req: &JsonRpcRequest,
+        extra_headers: &[(String, String)],
     ) -> anyhow::Result<JsonRpcResponse> {
         let result = match server.transport.as_str() {
-            "sse" => send_via_sse(&self.client, &server.url, req, self.max_response_bytes).await,
+            "sse" => {
+                send_via_sse(
+                    &self.client,
+                    &server.url,
+                    req,
+                    self.max_response_bytes,
+                    extra_headers,
+                )
+                .await
+            }
             "stdio" => {
+                if !extra_headers.is_empty() {
+                    anyhow::bail!(
+                        "run-as-user credentials cannot be delivered over stdio transport"
+                    );
+                }
                 super::stdio::send_via_stdio(
                     &server.url,
                     req,
@@ -1230,7 +1316,16 @@ impl McpFederation {
                 .await
             }
             // Default to streamable HTTP for "streamable_http" or unknown.
-            _ => send_request(&self.client, &server.url, req, self.max_response_bytes).await,
+            _ => {
+                send_request(
+                    &self.client,
+                    &server.url,
+                    req,
+                    self.max_response_bytes,
+                    extra_headers,
+                )
+                .await
+            }
         };
         if let Err(e) = &result {
             sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(e));
@@ -2314,6 +2409,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn call_tool_forwards_upstream_authorization_on_wire() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen_thread = Arc::clone(&seen);
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping upstream auth wire test: loopback bind denied: {err}");
+                return;
+            }
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                *seen_thread.lock().unwrap() = req;
+                let body = r#"{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"ok"}]},"id":1}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let server = McpServerConfig {
+            name: "auth-up".to_string(),
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+        };
+        let fed = McpFederation::new(vec![server]);
+        let mut tools = HashMap::new();
+        tools.insert(
+            "echo".to_string(),
+            FederatedTool {
+                name: "echo".to_string(),
+                description: "echo".to_string(),
+                input_schema: json!({"type": "object"}),
+                server_name: "auth-up".to_string(),
+                streaming: false,
+                meta: None,
+            },
+        );
+        fed.seed_tools_for_test(tools);
+
+        let headers = vec![(
+            "authorization".to_string(),
+            "Bearer user-a-token".to_string(),
+        )];
+        let value = fed
+            .call_tool_with_upstream_headers("echo", json!({"q": 1}), &headers)
+            .await
+            .expect("tool call must succeed");
+        assert_eq!(
+            value.pointer("/content/0/text").and_then(|v| v.as_str()),
+            Some("ok")
+        );
+
+        let captured = seen.lock().unwrap().clone();
+        assert!(
+            captured
+                .to_ascii_lowercase()
+                .contains("authorization: bearer user-a-token"),
+            "upstream POST must carry Authorization, got:\n{captured}"
+        );
+        assert!(
+            !captured.contains("_sbproxy_run_as_user"),
+            "identity must not appear in tool args on the wire"
+        );
+    }
+
+    #[tokio::test]
     async fn openapi_tool_denies_unlisted_egress_host_before_io() {
         let fed = McpFederation::new(vec![]);
         let mut routes = HashMap::new();
@@ -2326,9 +2501,10 @@ mod tests {
             tools: vec![],
             routes,
             egress_policy: EgressPolicy {
-                mode: crate::mcp::EgressMode::DenyByDefault,
+                mode: crate::mcp::EgressMode::Enforce,
                 hosts: vec!["other.example.com".to_string()],
                 suffixes: vec![],
+                allow_private: false,
                 scope: "server:api".to_string(),
             },
         };
@@ -2341,12 +2517,79 @@ mod tests {
         };
 
         let err = fed
-            .call_openapi_tool(&server, &backing, "getPet", &json!({"id": "123"}))
+            .call_openapi_tool(&server, &backing, "getPet", &json!({"id": "123"}), &[])
             .await
             .expect_err("unlisted host must be denied before request dispatch");
+        let rendered = format!("{err:#}");
         assert!(
-            err.to_string().contains("api.example.com"),
-            "denial should identify the blocked host, got: {err}"
+            rendered.contains("UnlistedHost"),
+            "denial must use closed EgressDenied vocabulary, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("api.example.com"),
+            "denial must not embed the blocked host, got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_tool_denies_redirect_escape_before_second_connect() {
+        // Mock origin returns a redirect to an unlisted host; policy
+        // must deny before following.
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping redirect egress test: loopback bind denied: {err}");
+                return;
+            }
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let resp = "HTTP/1.1 302 Found\r\nLocation: https://evil.example/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let fed = McpFederation::new(vec![]);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "getPet".to_string(),
+            ("GET".to_string(), "/pets/{id}".to_string()),
+        );
+        let backing = OpenApiBacking {
+            base_url: format!("http://127.0.0.1:{port}"),
+            tools: vec![],
+            routes,
+            egress_policy: EgressPolicy {
+                // allow_private so the loopback mock is reachable; the
+                // redirect target remains unlisted.
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["127.0.0.1".to_string()],
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:api".to_string(),
+            },
+        };
+        let server = McpServerConfig {
+            name: "api".to_string(),
+            url: format!("http://127.0.0.1:{port}"),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: Some(backing.clone()),
+        };
+
+        let err = fed
+            .call_openapi_tool(&server, &backing, "getPet", &json!({"id": "1"}), &[])
+            .await
+            .expect_err("redirect to unlisted host must be denied");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("RedirectToUnlistedHost"),
+            "expected RedirectToUnlistedHost, got: {rendered}"
         );
     }
 

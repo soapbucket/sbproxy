@@ -7,6 +7,7 @@
 pub mod agent_verify;
 pub mod cookie;
 pub mod crypto;
+pub mod egress;
 #[cfg(feature = "tls-fingerprint")]
 pub mod headless_detect;
 pub mod hostfilter;
@@ -23,6 +24,11 @@ pub use crypto::hkdf_derive;
 pub use crypto::{
     aes256gcm_decrypt, aes256gcm_encrypt, hkdf_derive_purpose, random_aes256_key,
     random_aes_gcm_nonce, HkdfPurpose, AES256_KEY_LEN, AES_GCM_NONCE_LEN,
+};
+pub use egress::{
+    AuthorizedDestination, EgressAuthorizer, EgressConfig, EgressDenied, EgressPurpose,
+    GovernedHttpClient, GovernedHttpResponse, GovernedRedirectSeam, HostResolver, PurposeAllowlist,
+    RedirectDecision,
 };
 #[cfg(feature = "tls-fingerprint")]
 pub use headless_detect::{

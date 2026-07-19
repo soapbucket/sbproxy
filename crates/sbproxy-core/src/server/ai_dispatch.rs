@@ -22,6 +22,26 @@ enum DynamicKeyOutcome {
     Deny(u16, String),
 }
 
+/// WOR-1881: feed provider quota headers into the shared router before
+/// retry/reselect so headroom and reset-aware strategies see live signals.
+/// Does not log header values (may contain operational detail; never secrets).
+fn update_router_quota_from_response(
+    router: &sbproxy_ai::Router,
+    provider_name: &str,
+    resp: &reqwest::Response,
+) {
+    let status = resp.status().as_u16();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            let value = value.to_str().ok()?.to_string();
+            Some((name.as_str().to_string(), value))
+        })
+        .collect();
+    router.update_quota_from_headers(provider_name, &headers, status);
+}
+
 fn effective_policy_to_virtual_key(
     policy: &sbproxy_ai::effective_key_policy::EffectiveKeyPolicy,
 ) -> sbproxy_ai::identity::VirtualKeyConfig {
@@ -1418,6 +1438,8 @@ pub(super) async fn handle_ai_proxy(
     // survives across requests. A per-request router would reset that
     // state every call and make the latency/usage-aware strategies inert.
     let router = config.router();
+    let quota_pool_store = config.quota_pool_store().cloned();
+    let quota_pool_name = config.quota_pool.as_ref().map(|pool| pool.name.clone());
     // Serve model discovery locally; other GET surfaces use ordinary dispatch.
     if method == http::Method::GET {
         if matches!(
@@ -2008,6 +2030,8 @@ pub(super) async fn handle_ai_proxy(
             };
             match response_result {
                 Ok(response) => {
+                    // WOR-1881: refresh quota snapshots before failover reselect.
+                    update_router_quota_from_response(&router, &provider.name, &response);
                     let retryable_status = matches!(response.status().as_u16(), 500 | 502 | 503);
                     let has_next = attempt + 1 < provider_order.len();
                     if is_failover
@@ -3767,7 +3791,9 @@ pub(super) async fn handle_ai_proxy(
 
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
-    let max_attempts = if is_failover || content_policy_fallback {
+    // WOR-1880: a configured quota pool must be allowed to advance past a
+    // denied member to the next candidate even outside failover_chain.
+    let max_attempts = if is_failover || content_policy_fallback || config.quota_pool.is_some() {
         config.providers.len()
     } else {
         1
@@ -4099,6 +4125,8 @@ pub(super) async fn handle_ai_proxy(
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     router.record_latency(idx, race_start.elapsed().as_micros() as u64);
+                    // WOR-1881: race losers still contribute quota signals.
+                    update_router_quota_from_response(&router, &config.providers[idx].name, &resp);
                     let outcome = if (200..300).contains(&status) {
                         "success"
                     } else {
@@ -4282,6 +4310,33 @@ pub(super) async fn handle_ai_proxy(
             }
         }
         let provider = &resolved_provider;
+
+        // WOR-1880: fair-share pool reservation. A deny advances to the
+        // next candidate rather than failing the whole request when
+        // alternatives remain.
+        let mut quota_reservation = None;
+        if let (Some(store), Some(pool_name)) =
+            (quota_pool_store.as_ref(), quota_pool_name.as_deref())
+        {
+            match sbproxy_ai::QuotaReservationGuard::reserve(
+                std::sync::Arc::clone(store),
+                pool_name,
+                provider.name.as_str(),
+                1,
+            ) {
+                Ok(guard) => quota_reservation = Some(guard),
+                Err(deny) => {
+                    debug!(
+                        provider = %provider.name,
+                        pool = %pool_name,
+                        deny = ?deny,
+                        attempt = %attempt,
+                        "AI proxy: quota pool denied provider; trying next candidate"
+                    );
+                    continue;
+                }
+            }
+        }
 
         // Map model name for this provider.
         let mut attempt_body = body.clone();
@@ -4509,6 +4564,10 @@ pub(super) async fn handle_ai_proxy(
                 // `lowest_latency` reflect live data on the next request.
                 router.record_latency(provider_idx, attempt_start.elapsed().as_micros() as u64);
                 let status = resp.status().as_u16();
+                // WOR-1881: update quota snapshots before retry/reselect so
+                // headroom and reset-aware strategies see this response's
+                // headers (including 429 Retry-After).
+                update_router_quota_from_response(&router, &provider.name, &resp);
                 // WOR-1545 / WOR-1524: retry on the default status-code set,
                 // or on a per-error-class policy decision when configured.
                 // Classification from status alone is enough for the
@@ -4668,6 +4727,9 @@ pub(super) async fn handle_ai_proxy(
                     upstream_secs,
                 );
                 last_provider_name = provider.name.to_string();
+                if let Some(guard) = quota_reservation.take() {
+                    guard.settle(sbproxy_ai::PoolUsage { units: 1 });
+                }
                 last_resp = Some(resp);
                 break;
             }

@@ -1,10 +1,12 @@
 //! HTTP client for forwarding requests to AI providers.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
@@ -138,6 +140,9 @@ impl Drop for ShadowInflightGuard {
 pub struct AiClient {
     http: reqwest::Client,
     shadow_supervisor: Arc<ShadowSupervisor>,
+    /// Optional purpose-scoped egress authorizer. `None` preserves
+    /// legacy ungated provider calls (omitted `proxy.egress` config).
+    egress: Option<EgressAuthorizer>,
 }
 
 impl AiClient {
@@ -151,7 +156,16 @@ impl AiClient {
                 .build()
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: Arc::new(ShadowSupervisor::default()),
+            egress: None,
         }
+    }
+
+    /// Attach a purpose-scoped egress authorizer. When set, every
+    /// provider URL is authorized for [`EgressPurpose::AiProvider`]
+    /// before any I/O (fail closed).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 
     /// Create a new AI client with a custom shadow supervisor. Used
@@ -164,7 +178,27 @@ impl AiClient {
                 .build()
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: supervisor,
+            egress: None,
         }
+    }
+
+    /// Authorize `url` for AI provider egress when an authorizer is
+    /// configured. Returns the closed [`EgressDenied`] vocabulary.
+    pub fn authorize_provider_url(
+        &self,
+        url: &str,
+        resolver: &dyn HostResolver,
+    ) -> Result<(), EgressDenied> {
+        let Some(auth) = &self.egress else {
+            return Ok(());
+        };
+        auth.authorize(EgressPurpose::AiProvider, url, resolver)
+            .map(|_| ())
+    }
+
+    fn gate_provider_url(&self, url: &str) -> Result<()> {
+        self.authorize_provider_url(url, &PublicPinResolver)
+            .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))
     }
 
     /// Borrow the shadow supervisor (test + diagnostic accessor).
@@ -417,6 +451,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url = build_url(base_url, &translated_path);
+        self.gate_provider_url(&url)?;
 
         let (auth_header, auth_value) = provider.auth_header();
 
@@ -454,6 +489,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url = build_url(base_url, path);
+        self.gate_provider_url(&url)?;
 
         let (auth_header, auth_value) = provider.auth_header();
 
@@ -509,6 +545,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url = build_url(base_url, &translated_path);
+        self.gate_provider_url(&url)?;
 
         let (auth_header, auth_value) = provider.auth_header();
 
@@ -604,6 +641,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url = build_url(base_url, native_path);
+        self.gate_provider_url(&url)?;
         let (auth_header, auth_value) = provider.auth_header();
         let reqwest_method = parse_http_method(method)?;
 
@@ -650,6 +688,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url = build_url(base_url, path);
+        self.gate_provider_url(&url)?;
         let (auth_header, auth_value) = provider.auth_header();
         let reqwest_method = parse_http_method(method)?;
 
@@ -689,6 +728,21 @@ fn parse_http_method(method: &str) -> Result<reqwest::Method> {
         "OPTIONS" => Ok(reqwest::Method::OPTIONS),
         other => reqwest::Method::from_bytes(other.as_bytes())
             .map_err(|e| anyhow::anyhow!("unsupported HTTP method '{other}': {e}")),
+    }
+}
+
+/// Resolver that pins a fixed public address so unit tests and the
+/// pre-flight gate never touch the network. Production GS wiring may
+/// inject a real DNS resolver; until then host/scheme/port checks still
+/// run fail-closed when an authorizer is attached.
+struct PublicPinResolver;
+
+impl HostResolver for PublicPinResolver {
+    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+        Ok(vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )])
     }
 }
 
@@ -759,6 +813,17 @@ impl AiClient {
             let body_owned = body.clone();
             let http = self.http.clone();
             let i = *idx;
+            // Pre-authorize before spawning so an unlisted host is
+            // denied without opening a connection.
+            {
+                let format = provider_format(&provider);
+                let (_translated_body, translated_path) =
+                    translators::translate_request(format, &path_owned, &body_owned);
+                let base_url_owned = provider.effective_base_url();
+                let base_url = base_url_owned.trim_end_matches('/');
+                let url = build_url(base_url, &translated_path);
+                self.gate_provider_url(&url)?;
+            }
             tasks.push(async move {
                 let format = provider_format(&provider);
                 let (translated_body, translated_path) =
@@ -1709,5 +1774,50 @@ mod tests {
         drop(p2);
         drop(p3);
         assert_eq!(supervisor.available(), 2);
+    }
+
+    fn enforce_ai_provider(hosts: &[&str]) -> EgressAuthorizer {
+        use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+        use std::collections::HashMap;
+        let mut allow = PurposeAllowlist::default();
+        for h in hosts {
+            allow.hosts.insert((*h).to_string());
+        }
+        allow.schemes.insert("https".to_string());
+        allow.schemes.insert("http".to_string());
+        allow.ports.insert(443);
+        allow.ports.insert(80);
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::AiProvider, allow);
+        EgressAuthorizer::new(EgressConfig { purposes })
+    }
+
+    #[test]
+    fn provider_egress_denies_unlisted_host_with_closed_vocabulary() {
+        let client = AiClient::new().with_egress(enforce_ai_provider(&["api.openai.com"]));
+        let err = client
+            .authorize_provider_url("https://evil.example/v1/chat", &PublicPinResolver)
+            .expect_err("unlisted host must be denied");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+        assert!(!format!("{err:?}").contains("evil.example"));
+    }
+
+    #[test]
+    fn omitted_egress_preserves_legacy_provider_compatibility() {
+        let client = AiClient::new();
+        client
+            .authorize_provider_url("https://evil.example/v1/chat", &PublicPinResolver)
+            .expect("omitted egress must not deny");
+    }
+
+    #[test]
+    fn enforce_egress_fails_closed_for_unlisted_purpose_host() {
+        let client = AiClient::new().with_egress(enforce_ai_provider(&["api.openai.com"]));
+        assert_eq!(
+            client
+                .authorize_provider_url("https://api.anthropic.com/v1", &PublicPinResolver)
+                .unwrap_err(),
+            EgressDenied::UnlistedHost
+        );
     }
 }

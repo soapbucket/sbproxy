@@ -31,7 +31,6 @@ pub mod governance_crdt;
 pub mod governance_redis;
 pub mod guardrails;
 pub mod handler;
-pub mod hierarchical_budget;
 pub mod identity;
 pub mod ids;
 pub mod image;
@@ -48,6 +47,7 @@ pub mod prompts;
 pub mod provider;
 pub mod provider_ratelimit;
 pub mod providers;
+pub mod quota_pool;
 pub mod ratelimit;
 pub mod realtime;
 pub mod response_dedup;
@@ -70,8 +70,8 @@ pub mod value_ledger;
 
 pub use batch::{BatchJob, BatchStatus, BatchStore, MemoryBatchStore};
 pub use budget::{
-    cheapest_model, estimate_cost, BudgetConfig, BudgetLimit, BudgetTracker, OnExceedAction,
-    UsageRecord,
+    cheapest_model, estimate_cost, BudgetConfig, BudgetLimit, BudgetScope, BudgetTracker,
+    OnExceedAction, UsageRecord,
 };
 pub use client::AiClient;
 pub use concurrency::ConcurrencyLimiter;
@@ -82,7 +82,6 @@ pub use context_overflow::{
 pub use context_relay::ContextRelay;
 pub use degradation::{should_degrade, DegradationConfig};
 pub use handler::*;
-pub use hierarchical_budget::{BudgetCheckResult, BudgetScope, HierarchicalBudget};
 pub use identity::{KeyStore, VirtualKeyConfig};
 pub use ids::{ModelId, ProviderName};
 pub use key_scoping::KeyPermissions;
@@ -93,17 +92,26 @@ pub use multimodal::{
 pub use prompt_cache::{check_cache, has_cache_control, prompt_cache_key};
 pub use prompt_fingerprint::prompt_fingerprint;
 pub use provider::ProviderConfig;
-pub use provider_ratelimit::{ProviderRateLimitTracker, ProviderRateState};
+pub use provider_ratelimit::{
+    ProviderQuotaSnapshot, ProviderRateLimitTracker, ProviderRateState, QuotaSignalQuality,
+    QuotaSignalSource,
+};
 pub use providers::{
     get_provider_info, init_provider_registry, list_providers, reload_provider_registry,
     ProviderFormat, ProviderInfo,
+};
+pub use quota_pool::{
+    rank_by_fair_share, reserve_next_candidate, validate_quota_pool_config, LocalQuotaPool,
+    OverShareRecord, PoolDeny, PoolUsage, QuotaPoolConfig, QuotaPoolConfigError,
+    QuotaPoolConsistency, QuotaPoolDimension, QuotaPoolPolicy, QuotaPoolStore, QuotaReservation,
+    QuotaReservationGuard,
 };
 pub use ratelimit::{
     Admission, ModelRateConfig, ModelRateLimiter, RejectReason, Rejection, SurfaceRateConfig,
     SurfaceRateLimiter, DEFAULT_ESTIMATED_TOKENS, DEFAULT_MAX_KEYS,
 };
 pub use response_dedup::ResponseDedup;
-pub use routing::{Router, RoutingStrategy};
+pub use routing::{FilteredSelectionFallback, Router, RoutingStrategy};
 pub use semantic_cache::{
     CachedAiResponse, CachedHttpResponse, EmbeddingCache, EmbeddingCacheConfig, EmbeddingHit,
     SemanticCache,

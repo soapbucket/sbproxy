@@ -4,11 +4,14 @@
 //! Artifact transport seam and the reqwest implementation.
 
 use std::fmt;
+#[cfg(any(test, feature = "weights"))]
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
+use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use zeroize::Zeroize;
 
 use super::ArtifactError;
@@ -122,11 +125,50 @@ impl ArtifactTransport for UnavailableArtifactTransport {
     }
 }
 
+/// Authorize an artifact / engine download URL when an authorizer is
+/// present. `None` preserves legacy ungated downloads (omitted config).
+pub fn authorize_artifact_url(
+    authorizer: Option<&EgressAuthorizer>,
+    purpose: EgressPurpose,
+    url: &str,
+    resolver: &dyn HostResolver,
+) -> Result<(), EgressDenied> {
+    let Some(auth) = authorizer else {
+        return Ok(());
+    };
+    auth.authorize(purpose, url, resolver).map(|_| ())
+}
+
+/// Engine-download seam: today always omitted-config (legacy). GS may
+/// thread an authorizer later; the call site still goes through the
+/// shared closed vocabulary.
+#[cfg(feature = "weights")]
+pub(crate) fn authorize_engine_download(url: &str) -> Result<(), String> {
+    authorize_artifact_url(None, EgressPurpose::EngineArtifact, url, &PublicPinResolver)
+        .map_err(|e| format!("egress denied: {e:?}"))
+}
+
+/// Resolver that pins a fixed public address so gates never touch the
+/// network during unit tests. Production GS wiring may inject real DNS.
+#[cfg(any(test, feature = "weights"))]
+pub(crate) struct PublicPinResolver;
+
+#[cfg(any(test, feature = "weights"))]
+impl HostResolver for PublicPinResolver {
+    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+        Ok(vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )])
+    }
+}
+
 /// Redirect-following HTTP artifact transport.
 #[cfg(feature = "weights")]
 #[derive(Debug, Clone)]
 pub struct HttpArtifactTransport {
     client: reqwest::Client,
+    egress: Option<EgressAuthorizer>,
 }
 
 #[cfg(feature = "weights")]
@@ -136,7 +178,16 @@ impl HttpArtifactTransport {
         let client = reqwest::Client::builder()
             .build()
             .map_err(|error| ArtifactError::Transport(format!("build HTTP client: {error}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            egress: None,
+        })
+    }
+
+    /// Attach a fail-closed egress authorizer (`EgressPurpose::ModelArtifact`).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 }
 
@@ -146,6 +197,14 @@ impl ArtifactTransport for HttpArtifactTransport {
     async fn get(&self, request: TransportRequest) -> Result<TransportResponse, ArtifactError> {
         use futures::StreamExt;
         use reqwest::header::{AUTHORIZATION, CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
+
+        authorize_artifact_url(
+            self.egress.as_ref(),
+            EgressPurpose::ModelArtifact,
+            &request.url,
+            &PublicPinResolver,
+        )
+        .map_err(|denied| ArtifactError::Transport(format!("egress denied: {denied:?}")))?;
 
         let mut builder = self.client.get(&request.url);
         if request.offset > 0 {
@@ -216,10 +275,13 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
     value.rsplit_once('/')?.1.parse().ok()
 }
 
-#[cfg(all(test, feature = "weights"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+    use std::collections::HashMap;
 
+    #[cfg(feature = "weights")]
     #[test]
     fn source_credentials_are_usable_only_through_the_private_transport_accessor() {
         let secret = b"hf_fixture_secret";
@@ -229,5 +291,60 @@ mod tests {
         assert_eq!(format!("{credential:?}"), "SourceCredential([REDACTED])");
         assert_eq!(credential.to_string(), "[REDACTED]");
         assert!(!format!("{credential:?}").contains("hf_fixture_secret"));
+    }
+
+    fn enforce_model_artifact(hosts: &[&str]) -> EgressAuthorizer {
+        let mut allow = PurposeAllowlist::default();
+        for h in hosts {
+            allow.hosts.insert((*h).to_string());
+        }
+        allow.schemes.insert("https".to_string());
+        allow.ports.insert(443);
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::ModelArtifact, allow);
+        EgressAuthorizer::new(EgressConfig { purposes })
+    }
+
+    #[test]
+    fn model_artifact_egress_denies_unlisted_host_with_shared_vocabulary() {
+        let auth = enforce_model_artifact(&["huggingface.co"]);
+        let err = authorize_artifact_url(
+            Some(&auth),
+            EgressPurpose::ModelArtifact,
+            "https://evil.example/model.bin",
+            &PublicPinResolver,
+        )
+        .expect_err("unlisted artifact host");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+    }
+
+    #[test]
+    fn omitted_egress_preserves_legacy_artifact_compatibility() {
+        authorize_artifact_url(
+            None,
+            EgressPurpose::ModelArtifact,
+            "https://evil.example/model.bin",
+            &PublicPinResolver,
+        )
+        .expect("omitted egress must not deny");
+    }
+
+    #[test]
+    fn engine_artifact_shares_closed_denial_vocabulary() {
+        let mut allow = PurposeAllowlist::default();
+        allow.hosts.insert("github.com".to_string());
+        allow.schemes.insert("https".to_string());
+        allow.ports.insert(443);
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::EngineArtifact, allow);
+        let auth = EgressAuthorizer::new(EgressConfig { purposes });
+        let err = authorize_artifact_url(
+            Some(&auth),
+            EgressPurpose::EngineArtifact,
+            "https://evil.example/llama.tar.gz",
+            &PublicPinResolver,
+        )
+        .expect_err("unlisted engine host");
+        assert_eq!(err, EgressDenied::UnlistedHost);
     }
 }
