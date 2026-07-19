@@ -39,6 +39,31 @@ origins:
     )
 }
 
+fn anthropic_compression_config(upstream_base: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: anthropic
+          api_key: "stub-key"
+          base_url: "{upstream_base}"
+          allow_private_base_url: true
+      compression:
+        levers:
+          - type: window_fit
+            completion_reserve_tokens: 0
+            input_budget_tokens: 96
+      routing:
+        strategy: round_robin
+"#
+    )
+}
+
 #[test]
 fn anthropic_messages_inbound_translates_request_and_response() {
     let upstream = MockUpstream::start(json!({
@@ -100,6 +125,63 @@ fn anthropic_messages_inbound_translates_request_and_response() {
     assert_eq!(parsed["stop_reason"], "end_turn");
     assert_eq!(parsed["usage"]["input_tokens"], 4);
     assert_eq!(parsed["usage"]["output_tokens"], 3);
+}
+
+#[test]
+fn anthropic_native_upstream_receives_the_compressed_message_list() {
+    let upstream = MockUpstream::start(json!({
+        "id": "msg_compressed",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "compressed context received"}],
+        "model": "claude-3-5-sonnet",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 8, "output_tokens": 3}
+    }))
+    .expect("start Anthropic mock");
+    let harness =
+        ProxyHarness::start_with_yaml(&anthropic_compression_config(&upstream.base_url()))
+            .expect("start proxy");
+    let messages = (0..8)
+        .map(|index| {
+            json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("turn {index}: {}", "old context ".repeat(60))
+            })
+        })
+        .chain(std::iter::once(json!({
+            "role": "user",
+            "content": "answer the newest turn"
+        })))
+        .collect::<Vec<_>>();
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "max_tokens": 128,
+        "system": "be concise",
+        "messages": messages
+    });
+
+    let response = harness
+        .post_json("/v1/messages", "ai.localhost", &body, &[])
+        .expect("post compressed Anthropic request");
+
+    assert_eq!(response.status, 200);
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].path, "/v1/messages");
+    let forwarded: serde_json::Value =
+        serde_json::from_slice(&captured[0].body).expect("forwarded Anthropic JSON");
+    let forwarded_messages = forwarded["messages"]
+        .as_array()
+        .expect("forwarded messages");
+    assert!(
+        forwarded_messages.len() < body["messages"].as_array().unwrap().len(),
+        "the native Anthropic provider must receive compressed messages: {forwarded}"
+    );
+    assert_eq!(
+        forwarded_messages.last().unwrap()["content"],
+        "answer the newest turn"
+    );
 }
 
 #[test]

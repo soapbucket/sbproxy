@@ -10,12 +10,12 @@
 //! Read-only; it sits behind the admin server's shared auth gate like
 //! every other `/admin/*` route.
 //!
-//! `GET /admin/model-host/value` reports the value-delivered / dollars
-//! saved half (WOR-1913): per-model local and cloud completion counts and
-//! the micro-USD each local completion saved versus its configured cloud
-//! reference price. It reads the request-path value recorder's ledger
-//! (`sbproxy_ai::value_ledger`); with no reference configured the report
-//! is empty, which is the honest answer. Read-only, same auth gate.
+//! `GET /admin/model-host/value` reports per-model local and cloud completion
+//! counts, the micro-USD each local completion saved versus its configured
+//! cloud reference price, and per-lever target token estimates and gross input cost
+//! avoided by successful context compression. It reads the request-path value
+//! recorder's ledger (`sbproxy_ai::value_ledger`); before any eligible value is
+//! recorded the report is empty. Read-only, same auth gate.
 //!
 //! `GET /admin/model-host/files` reports the verified artifact cache
 //! (WOR-1910): the cache root, exact total bytes, and per-artifact
@@ -1035,10 +1035,9 @@ fn status_response() -> Resp {
 }
 
 fn value_response() -> Resp {
-    // The ledger is populated by the request-path value recorder in
-    // sbproxy-ai. When no serve block configured a reference price the
-    // ledger is unset and the report is empty: no reference, no savings
-    // claim.
+    // The ledger is populated by the request-path local-serving and
+    // compression value recorders in sbproxy-ai. Before either records an
+    // eligible success, the ledger is unset and the report is honestly empty.
     let report = sbproxy_ai::value_ledger::value_ledger()
         .map(|ledger| ledger.report())
         .unwrap_or_default();
@@ -2245,7 +2244,11 @@ models:
         let report: serde_json::Value = serde_json::from_str(&body).expect("value report json");
         assert_eq!(report["total_saved_micros"], 0);
         assert_eq!(report["total_local_completions"], 0);
+        assert_eq!(report["total_compression_tokens_saved"], 0);
+        assert_eq!(report["total_compression_gross_cost_saved_micros"], 0);
         assert!(report["models"].is_array());
+        assert!(report["compression"].is_array());
+        assert!(report["compression_totals"].is_object());
     }
 
     #[test]

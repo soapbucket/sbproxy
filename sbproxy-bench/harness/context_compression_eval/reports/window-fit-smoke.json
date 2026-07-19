@@ -1,0 +1,204 @@
+{
+  "schema_version": 2,
+  "profile": "window_fit-smoke-v1",
+  "input_budget_tokens": 192,
+  "completion_reserve_tokens": 8000,
+  "token_counter": "sbproxy_target_model",
+  "latency_mode": "omitted_for_deterministic_gate",
+  "cases": [
+    {
+      "id": "coding_agent_diff",
+      "corpus": "coding_agent_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 328,
+        "output_tokens": 328,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 328,
+        "output_tokens": 98,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 230,
+      "savings_ratio": 0.70122,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "coding_agent_logs",
+      "corpus": "coding_agent_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 321,
+        "output_tokens": 321,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 321,
+        "output_tokens": 89,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 232,
+      "savings_ratio": 0.722741,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "coding_agent_rg_output",
+      "corpus": "coding_agent_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 414,
+        "output_tokens": 414,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 414,
+        "output_tokens": 103,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 311,
+      "savings_ratio": 0.751208,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "coding_agent_tool_output",
+      "corpus": "coding_agent_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 262,
+        "output_tokens": 262,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 262,
+        "output_tokens": 79,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 183,
+      "savings_ratio": 0.698473,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "ruler_multi_hop_launch",
+      "corpus": "ruler_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 295,
+        "output_tokens": 295,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 295,
+        "output_tokens": 60,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 235,
+      "savings_ratio": 0.79661,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "ruler_retrieval_orbit",
+      "corpus": "ruler_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 309,
+        "output_tokens": 309,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 309,
+        "output_tokens": 57,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 252,
+      "savings_ratio": 0.815534,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    }
+  ],
+  "corpora": {
+    "coding_agent_smoke": {
+      "case_count": 4,
+      "input_tokens": 1325,
+      "output_tokens": 369,
+      "tokens_saved": 956,
+      "savings_ratio": 0.721509,
+      "off_quality_score": 1.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 4,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 4
+      },
+      "reasons": {},
+      "recommendation": "build"
+    },
+    "ruler_smoke": {
+      "case_count": 2,
+      "input_tokens": 604,
+      "output_tokens": 117,
+      "tokens_saved": 487,
+      "savings_ratio": 0.806291,
+      "off_quality_score": 1.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 2,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 2
+      },
+      "reasons": {},
+      "recommendation": "build"
+    }
+  },
+  "overall": {
+    "case_count": 6,
+    "input_tokens": 1929,
+    "output_tokens": 486,
+    "tokens_saved": 1443,
+    "savings_ratio": 0.748056,
+    "off_quality_score": 1.0,
+    "on_quality_score": 1.0,
+    "quality_delta": 0.0,
+    "added_compression_latency_micros": null,
+    "applied_count": 6,
+    "skipped_count": 0,
+    "fallback_count": 0,
+    "skip_rate": 0.0,
+    "outcomes": {
+      "applied": 6
+    },
+    "reasons": {},
+    "recommendation": "build"
+  }
+}

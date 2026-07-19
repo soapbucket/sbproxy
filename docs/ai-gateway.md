@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-19*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -816,6 +816,7 @@ origins:
 | `policies` | list | `[]` | Closed set: `rate_limit` (with `rpm`) and `require_pii_redaction`. There is no per-key tokens-per-minute knob; cap token spend with `attrs.budget.max_tokens`. |
 | `attrs` | object | unset | Attribution: `project`, `user`, `team`, `cost_center`, `tags`, `metadata`, and `budget` (`max_tokens`, `max_cost_usd`, `reset`). The per-key budget is independent of the global `budget` block. |
 | `route_to_model` | string | unset | Pins every request from this credential to one model. |
+| `compression_profile` | string | unset | Selects `on`, `off`, or a named compression profile declared by this AI route. |
 | `inject_tools` | list | `[]` | Provider-native tool definitions injected into requests from this credential. |
 
 At compile time each `ai_provider` credential is lowered onto the runtime key registry (`VirtualKeyConfig` in `crates/sbproxy-ai/src/identity.rs`) that AI dispatch reads. Per-key usage shows up in the attributed spend metrics: filter or `sum by (api_key_id)` on `sbproxy_ai_requests_attributed_total`, `sbproxy_ai_tokens_attributed_total`, and `sbproxy_ai_cost_dollars_attributed_total`.
@@ -836,11 +837,12 @@ Different words, same meaning, no provider call ([config](../examples/semantic-c
 
 Serves cached responses to prompts that mean the same thing without a provider call. Implemented in `semantic_cache.rs` as `EmbeddingCache`: on a miss the dispatcher embeds the prompt once via the configured source, and on later requests a cosine-similarity scan over the stored vectors replays the closest response that meets `threshold`. Vectors are L2-normalised at insert time, eviction is LRU with a `max_entries` cap, entries past `ttl_secs` are dropped lazily on lookup, and every entry is scoped to the calling tenant and credential so one caller's cached response is never replayed to another. Embedding failures fail open to an uncached upstream call.
 
-A captured-session request on a handler whose compression policy contains
-`summary_buffer` bypasses semantic-cache reads and writes. The decision is
-conservative and happens before compression, so the bypass remains in effect
-even if the stateful lever later skips or fails open. A `window_fit`-only
-policy does not bypass the cache. See
+A request bypasses semantic-cache reads and writes when it carries an explicit
+header, governed-key, or CEL compression selector; when its route declares
+named profiles; when the route default has an explicit input budget; or when a
+captured session could use `summary_buffer`. The decision happens before
+lookup and also prevents write-back. A legacy default-only compatibility
+`window_fit` route keeps its prior cache behavior. See
 [Semantic cache interaction](ai-context-compression.md#semantic-cache-interaction).
 
 | Field | Type | Default | Notes |
@@ -1058,19 +1060,28 @@ Per-surface knobs live under `per_surface_rate_limits` (see [Per-surface rate li
 
 The shipped answer to a prompt that approaches a model's context window is an
 ordered, per-handler compression pipeline. `summary_buffer` compacts eligible
-older text into externally stored running summary state. `window_fit` is the
-stateless compatibility lever that applies the existing newest-to-oldest
-message-selection heuristic for a known model window. Levers run in declaration
-order, only strict token
-reductions commit, and a skip or runtime failure leaves the last committed
-messages in place while later levers continue.
+older text into externally stored running summary state. `window_fit` can keep
+the legacy model-window behavior or enforce a positive `input_budget_tokens`
+target with the target-model counter. Levers run in declaration order, only
+strict token reductions commit, and a skip or runtime failure leaves the last
+committed messages in place while later levers continue.
 
 ### Context compression (shipped)
 
-Configure `compression.levers` on the AI action. A stateful summary requires a
-captured session ID and the configured Redis L2 service. Request workers retain
-no canonical session summary in process. `backend: mesh` is rejected until the
-cluster state substrate provides durable replicated session semantics.
+Configure the route default in `compression.levers` and optional named
+pipelines in `compression.profiles`. A request chooses `on`, `off`, or a named
+profile with precedence `X-Compression` header, governed key, CEL, then route
+default. Explicit-budget fitting preserves leading system and developer
+instructions, the newest complete turn, contiguous recent history, and
+OpenAI/Anthropic tool-call groupings.
+
+A stateful summary requires a captured session ID and the configured Redis L2
+service. Request workers retain no canonical session summary in process.
+`proxy.cluster.replication` provides a durable replicated mesh substrate, but
+compression's legacy mesh adapter is not integrated with or validated against
+its `ReplicatedStore` session and Admin lifecycle semantics. Public
+`backend: mesh` selection therefore remains rejected as a separate, unshipped
+integration. There is no OmniRoute dependency, import, or migration path.
 The legacy `resilience.llm_aware.context_compress` switch remains a shorthand
 for one `window_fit` lever only when the explicit block is absent.
 
@@ -1237,9 +1248,12 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 
 Use these to build spending dashboards, set budget alerts, and track provider reliability without any application-level instrumentation.
 
-Context compression adds lever, request, token-savings, state-operation, and
-Redis-coordination metrics under
-`sbproxy_ai_compression_*`. Their exact labels and accounting rules are in
+Context compression adds selection, lever, request, token-savings,
+success-time value, state-operation, and Redis-coordination metrics under
+`sbproxy_ai_compression_*`. The Admin value report keeps per-model, per-lever
+token and gross cost savings separate from local-serving completions and marks
+the counter precision as `model_tokenizer` or `heuristic`. Exact labels and
+accounting rules are in
 [AI context compression metrics](ai-context-compression.md#metrics).
 
 ## Dashboards

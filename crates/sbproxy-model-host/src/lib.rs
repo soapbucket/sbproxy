@@ -159,7 +159,7 @@ pub use foreign_cache::{
     discover as discover_foreign_models, ForeignCacheSource, ForeignModelFile,
 };
 pub use generation_store::{DeploymentGenerationStoreError, FileDeploymentGenerationStore};
-pub use hybrid::{savings_micros, CloudPrice, LaneSplit};
+pub use hybrid::{savings_micros, CloudPrice, CompressionValue, LaneSplit, TokenCountPrecision};
 pub use jobs::{
     FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
 };
@@ -197,7 +197,7 @@ pub use process::{
     EngineReadinessProbe, LoopbackReadinessProbe, TokioCommandExecutor,
 };
 pub use pull::{pull_plan, PullItem, PullMode};
-pub use report::{ModelValue, ValueReport};
+pub use report::{ModelCompressionValue, ModelValue, ValueReport};
 pub use residency::{Admission, ResidencyManager, Resident};
 pub use rollout::{
     filter_desired_state_for_assignments, plan_rollout, AssignedModelDeployment,

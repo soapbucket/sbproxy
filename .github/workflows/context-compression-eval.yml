@@ -1,0 +1,117 @@
+# Deterministic context-compression value and quality smoke gate (WOR-1922).
+
+name: context-compression-eval
+
+on:
+  pull_request:
+    paths:
+      - 'sbproxy-bench/harness/context_compression_eval/**'
+      - 'crates/sbproxy-ai/src/compression/**'
+      - 'crates/sbproxy-ai/src/context_compress.rs'
+      - 'crates/sbproxy-ai/src/context_overflow.rs'
+      - 'crates/sbproxy-ai/src/token_estimate.rs'
+      - 'crates/sbproxy-core/src/compression_runtime.rs'
+      - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
+      - 'e2e/tests/ai_native_inbound.rs'
+      - 'e2e/tests/governed_key_policy.rs'
+      - 'schemas/ai-compression.schema.json'
+      - 'schemas/sb-config.schema.json'
+      - 'Cargo.toml'
+      - '.github/workflows/context-compression-eval.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'sbproxy-bench/harness/context_compression_eval/**'
+      - 'crates/sbproxy-ai/src/compression/**'
+      - 'crates/sbproxy-ai/src/context_compress.rs'
+      - 'crates/sbproxy-ai/src/context_overflow.rs'
+      - 'crates/sbproxy-ai/src/token_estimate.rs'
+      - 'crates/sbproxy-core/src/compression_runtime.rs'
+      - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
+      - 'e2e/tests/ai_native_inbound.rs'
+      - 'e2e/tests/governed_key_policy.rs'
+      - 'schemas/ai-compression.schema.json'
+      - 'schemas/sb-config.schema.json'
+      - 'Cargo.toml'
+      - '.github/workflows/context-compression-eval.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  MANIFEST: sbproxy-bench/harness/context_compression_eval/Cargo.toml
+  HARNESS: sbproxy-bench/harness/context_compression_eval
+
+jobs:
+  context-compression-eval:
+    name: fmt + test + clippy + report drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: context-compression-eval
+          workspaces: sbproxy-bench/harness/context_compression_eval
+
+      - name: install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      - name: format
+        run: cargo fmt --manifest-path "$MANIFEST" -- --check
+
+      - name: test
+        run: cargo test --manifest-path "$MANIFEST" --all-targets --locked
+
+      - name: clippy
+        run: cargo clippy --manifest-path "$MANIFEST" --all-targets --locked -- -D warnings
+
+      - name: deterministic report drift
+        run: |
+          cargo run --manifest-path "$MANIFEST" --locked -- check \
+            --harness-root "$HARNESS" \
+            --input "$HARNESS/fixtures/ruler-smoke.jsonl" \
+            --input "$HARNESS/fixtures/coding-agent-smoke.jsonl" \
+            --provenance "$HARNESS/fixtures/provenance.json" \
+            --input-budget-tokens 192 \
+            --json-report "$HARNESS/reports/window-fit-smoke.json" \
+            --markdown-report "$HARNESS/reports/window-fit-smoke.md"
+
+  compression-request-path:
+    name: production request-path smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: context-compression-request-path
+
+      - name: build sbproxy binary
+        run: cargo build -p sbproxy --locked
+
+      - name: governed selector precedence
+        run: >-
+          cargo test -p sbproxy-e2e --locked --test governed_key_policy
+          dynamic_compression_profile_changes_context_and_header_overrides_it
+          -- --exact --test-threads=1
+
+      - name: Anthropic native compression
+        run: >-
+          cargo test -p sbproxy-e2e --locked --test ai_native_inbound
+          anthropic_native_upstream_receives_the_compressed_message_list
+          -- --exact --test-threads=1

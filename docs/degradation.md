@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-19*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -187,6 +187,34 @@ table, see [AI context compression](ai-context-compression.md).
 
 ---
 
+### AI compression selection and explicit fitting
+
+Request selection has no external dependency. A malformed, repeated, or
+undeclared `X-Compression` header is a caller error and returns `400` before
+cache lookup or provider dispatch. SBproxy never silently replaces a bad
+caller override with the route default. A malformed or undeclared governed-key
+or CEL selector is an operator error; it resolves to `off`, logs the
+content-free `ai_compression_selection` event, and increments
+`sbproxy_ai_compression_selection_total{outcome="invalid_operator"}`. The
+primary request continues without compression.
+
+An explicit `window_fit.input_budget_tokens` target is also dependency-free.
+If the protected instruction prefix or complete newest protocol unit cannot
+fit, the lever skips as `not_eligible` and preserves the original message list.
+It does not drop half of a tool exchange or dispatch old history without the
+current turn.
+
+Semantic-cache bypass is decided before either cache can read. Explicit
+selectors, profile-capable routes, explicit-budget route defaults, and
+session-dependent summaries remain bypassed even when selection resolves to
+`off` or a lever later skips. Legacy default-only compatibility fitting keeps
+its existing cache behavior.
+
+Invalid profile definitions and configured-key references fail configuration
+loading. There is no OmniRoute dependency or imported state to fall back to.
+
+---
+
 ### Dedicated AI compression summarizer
 
 **When down:** the exact summarizer provider times out or returns an invalid
@@ -201,9 +229,13 @@ failures. An expired summary is never reused while Redis awaits physical TTL
 removal.
 
 Selecting `backend: redis` without the Redis L2 wiring is a startup
-configuration error. `backend: mesh` is rejected because the current mesh
-cache is not a durable replicated session store. Runtime failure-open behavior
-begins only after a valid pipeline has been built.
+configuration error. `proxy.cluster.replication` supplies a durable replicated
+mesh substrate, but compression's legacy mesh adapter is not integrated with or
+validated against `ReplicatedStore` for session and Admin lifecycle semantics;
+public `backend: mesh` selection remains rejected. Runtime failure-open
+behavior begins only after a valid pipeline has been built. Redis remains the
+only canonical summary store; worker memory and the mesh never become an
+implicit state fork.
 
 **Log level:** the content-free `ai_compression_summary` event is `DEBUG` when
 all levers skip, `INFO` when at least one applies and none fail, and `WARN` when

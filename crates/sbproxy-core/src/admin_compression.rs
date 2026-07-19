@@ -102,27 +102,34 @@ impl CompressionAdminRegistry {
         let mut stores = Vec::new();
         let mut origins = Vec::new();
         for (index, origin) in pipeline.config.origins.iter().enumerate() {
-            let Some(runtime) = pipeline.compression_runtimes.get(index) else {
+            let Some(runtime_set) = pipeline.compression_runtimes.get_set(index) else {
                 continue;
             };
-            let Some(store) = runtime.admin_store() else {
-                continue;
-            };
-            let backend = store.backend();
-            if !stores
-                .iter()
-                .any(|existing: &AdminStore| existing.backend == backend)
-            {
-                stores.push(AdminStore {
-                    backend,
-                    store: store.clone(),
-                });
+            for runtime in runtime_set.runtimes() {
+                let Some(store) = runtime.admin_store() else {
+                    continue;
+                };
+                let backend = store.backend();
+                if !stores
+                    .iter()
+                    .any(|existing: &AdminStore| existing.backend == backend)
+                {
+                    stores.push(AdminStore {
+                        backend,
+                        store: store.clone(),
+                    });
+                }
+                let normalized_origin = normalize_origin(origin.hostname.as_str());
+                if !origins.iter().any(|existing: &OriginPolicy| {
+                    existing.origin == normalized_origin && existing.backend == backend
+                }) {
+                    origins.push(OriginPolicy {
+                        origin: normalized_origin,
+                        backend,
+                        allow_content: runtime.allows_admin_content_inspection(),
+                    });
+                }
             }
-            origins.push(OriginPolicy {
-                origin: normalize_origin(origin.hostname.as_str()),
-                backend,
-                allow_content: runtime.allows_admin_content_inspection(),
-            });
         }
         if !stores
             .iter()

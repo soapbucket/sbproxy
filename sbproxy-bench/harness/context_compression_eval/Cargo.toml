@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "context-compression-eval"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "context-compression-eval"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+sbproxy-ai = { path = "../../../crates/sbproxy-ai" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

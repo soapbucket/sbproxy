@@ -109,6 +109,17 @@ static COMPRESSION_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("AI compression request counter registers")
 });
 
+static COMPRESSION_SELECTION_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_compression_selection_total",
+            "AI request compression policy resolutions by closed source and outcome"
+        ),
+        &["tenant_id", "source", "outcome"]
+    )
+    .expect("AI compression selection counter registers")
+});
+
 static COMPRESSION_REQUEST_TOKENS_SAVED: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         HistogramOpts::new(
@@ -180,6 +191,52 @@ pub(crate) enum CompressionStateOperation {
     List,
     /// Purge one bounded metadata page.
     Purge,
+}
+
+/// Record one request's policy resolution using closed source and outcome labels.
+pub(crate) fn record_compression_selection(
+    tenant_id: &str,
+    source: &'static str,
+    outcome: &'static str,
+) {
+    let tenant_id = sbproxy_observe::metrics::sanitize_label_budget(
+        "sbproxy_ai_compression_selection_total",
+        "tenant_id",
+        tenant_id,
+    );
+    COMPRESSION_SELECTION_TOTAL
+        .with_label_values(&[&tenant_id, source, outcome])
+        .inc();
+}
+
+/// Record and emit one resolved request policy without exposing selector input.
+pub(crate) fn record_compression_selection_event(
+    tenant_id: &str,
+    source: &'static str,
+    outcome: &'static str,
+    reason: Option<&'static str>,
+) {
+    record_compression_selection(tenant_id, source, outcome);
+    if let Some(reason) = reason {
+        tracing::warn!(
+            target: "ai_compression",
+            event = "ai_compression_selection",
+            tenant_id,
+            source,
+            outcome,
+            reason,
+            "AI compression: request policy resolved"
+        );
+    } else {
+        tracing::info!(
+            target: "ai_compression",
+            event = "ai_compression_selection",
+            tenant_id,
+            source,
+            outcome,
+            "AI compression: request policy resolved"
+        );
+    }
 }
 
 impl CompressionStateOperation {
@@ -267,13 +324,29 @@ pub(crate) fn record_redis_compression_coordination(event: RedisCompressionCoord
 }
 
 fn bounded_identity(metric: &str, tenant_id: &str, api_key_id: Option<&str>) -> (String, String) {
-    let api_key_id = sbproxy_observe::metrics::sanitize_label_budget_tenant(
-        metric,
-        "api_key_id",
-        api_key_id.unwrap_or_default(),
+    bounded_identity_with_sanitizers(
         tenant_id,
-    );
-    let tenant_id = sbproxy_observe::metrics::sanitize_label_budget(metric, "tenant_id", tenant_id);
+        api_key_id,
+        |tenant_id| sbproxy_observe::metrics::sanitize_label_budget(metric, "tenant_id", tenant_id),
+        |api_key_id, tenant_id| {
+            sbproxy_observe::metrics::sanitize_label_budget_tenant(
+                metric,
+                "api_key_id",
+                api_key_id,
+                tenant_id,
+            )
+        },
+    )
+}
+
+fn bounded_identity_with_sanitizers(
+    tenant_id: &str,
+    api_key_id: Option<&str>,
+    sanitize_tenant: impl FnOnce(&str) -> String,
+    sanitize_api_key: impl FnOnce(&str, &str) -> String,
+) -> (String, String) {
+    let tenant_id = sanitize_tenant(tenant_id);
+    let api_key_id = sanitize_api_key(api_key_id.unwrap_or_default(), &tenant_id);
     (tenant_id, api_key_id)
 }
 
@@ -317,10 +390,16 @@ fn target_log(policy: &CompressionPolicy) -> String {
                 "target_summary_tokens": config.target_summary_tokens,
                 "timeout_ms": config.summarizer.timeout_secs.saturating_mul(1_000),
             }),
-            CompressionLeverConfig::WindowFit(config) => serde_json::json!({
-                "lever": "window_fit",
-                "completion_reserve_tokens": config.completion_reserve_tokens,
-            }),
+            CompressionLeverConfig::WindowFit(config) => {
+                let mut target = serde_json::json!({
+                    "lever": "window_fit",
+                    "completion_reserve_tokens": config.completion_reserve_tokens,
+                });
+                if let Some(input_budget_tokens) = config.input_budget_tokens {
+                    target["input_budget_tokens"] = serde_json::json!(input_budget_tokens);
+                }
+                target
+            }
         })
         .collect::<Vec<_>>();
     serde_json::Value::Array(targets).to_string()
@@ -352,6 +431,8 @@ fn emit_compression_summary(
     tenant_id: &str,
     api_key_id: &str,
     cache_bypass: bool,
+    selection_source: &'static str,
+    selection_outcome: &'static str,
     run: &CompressionRun,
 ) {
     let backend = request_backend(run);
@@ -384,6 +465,8 @@ fn emit_compression_summary(
                 backend = backend_label(backend),
                 consistency = consistency_label(backend),
                 cache_bypass,
+                selection_source,
+                selection_outcome,
                 lever_outcomes,
                 targets,
                 "AI context compression pipeline summary"
@@ -403,6 +486,8 @@ pub(crate) fn record_compression_run(
     tenant_id: &str,
     api_key_id: Option<&str>,
     cache_bypass: bool,
+    selection_source: &'static str,
+    selection_outcome: &'static str,
     run: &CompressionRun,
 ) {
     if run.lever_results.is_empty() {
@@ -494,15 +579,24 @@ pub(crate) fn record_compression_run(
         tenant_id,
         api_key_id,
     );
-    emit_compression_summary(policy, &log_tenant, &log_key, cache_bypass == "true", run);
+    emit_compression_summary(
+        policy,
+        &log_tenant,
+        &log_key,
+        cache_bypass == "true",
+        selection_source,
+        selection_outcome,
+        run,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        record_compression_run, record_compression_state_operation,
-        record_redis_compression_coordination, CompressionStateOperation, CompressionStateOutcome,
-        RedisCompressionCoordinationEvent,
+        bounded_identity_with_sanitizers, record_compression_run, record_compression_selection,
+        record_compression_selection_event, record_compression_state_operation,
+        record_redis_compression_coordination, target_log, CompressionStateOperation,
+        CompressionStateOutcome, RedisCompressionCoordinationEvent,
     };
     use sbproxy_ai::compression::{
         CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionRun,
@@ -550,7 +644,33 @@ mod tests {
                 "compression-log-tenant",
                 Some("compression-log-key"),
                 true,
+                "governed_key",
+                "selected",
                 run,
+            );
+        });
+        let bytes = captured.lock().expect("log capture").clone();
+        String::from_utf8(bytes).expect("compression log is UTF-8")
+    }
+
+    fn capture_selection(reason: Option<&'static str>) -> String {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            record_compression_selection_event(
+                "compression-selection-log-tenant",
+                "governed_key",
+                if reason.is_some() {
+                    "invalid_operator"
+                } else {
+                    "selected"
+                },
+                reason,
             );
         });
         let bytes = captured.lock().expect("log capture").clone();
@@ -577,9 +697,34 @@ mod tests {
                 }),
                 CompressionLeverConfig::WindowFit(WindowFitConfig {
                     completion_reserve_tokens: 1_024,
+                    input_budget_tokens: Some(8_192),
                 }),
             ],
+            profiles: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn window_fit_target_omits_an_unconfigured_explicit_budget() {
+        let configured = target_log(&policy());
+        assert!(configured.contains("input_budget_tokens"), "{configured}");
+
+        let mut unconfigured = policy();
+        let window_fit = unconfigured
+            .levers
+            .iter_mut()
+            .find_map(|lever| match lever {
+                CompressionLeverConfig::WindowFit(config) => Some(config),
+                CompressionLeverConfig::SummaryBuffer(_) => None,
+            })
+            .expect("test policy has window_fit");
+        window_fit.input_budget_tokens = None;
+
+        let unconfigured = target_log(&unconfigured);
+        assert!(
+            !unconfigured.contains("input_budget_tokens"),
+            "{unconfigured}"
+        );
     }
 
     fn applied_run() -> CompressionRun {
@@ -591,6 +736,7 @@ mod tests {
             initial_tokens: 100,
             final_tokens: 50,
             tokens_saved: 50,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
             lever_results: vec![
                 LeverResult {
                     lever: LeverKind::SummaryBuffer,
@@ -650,7 +796,15 @@ mod tests {
         let key = "compression-metrics-applied-key";
         let run = applied_run();
 
-        record_compression_run(&policy(), tenant, Some(key), false, &run);
+        record_compression_run(
+            &policy(),
+            tenant,
+            Some(key),
+            false,
+            "route_default",
+            "default",
+            &run,
+        );
 
         let summary_labels = [
             ("tenant_id", tenant),
@@ -706,6 +860,82 @@ mod tests {
     }
 
     #[test]
+    fn policy_selection_metric_uses_only_bounded_dimensions() {
+        let tenant = "compression-selection-tenant";
+        let labels = [
+            ("tenant_id", tenant),
+            ("source", "governed_key"),
+            ("outcome", "disabled"),
+        ];
+        let before = metric_sample("sbproxy_ai_compression_selection_total", &labels).0;
+
+        record_compression_selection(tenant, "governed_key", "disabled");
+
+        let after = metric_sample("sbproxy_ai_compression_selection_total", &labels).0;
+        assert_eq!(after - before, 1.0);
+    }
+
+    #[test]
+    fn policy_selection_emits_exactly_one_resolution_event() {
+        let selected = capture_selection(None);
+        assert_eq!(selected.matches("ai_compression_selection").count(), 1);
+        assert!(selected.contains(" INFO "), "{selected}");
+        assert!(!selected.contains("reason="), "{selected}");
+
+        let invalid = capture_selection(Some("invalid_or_undeclared_operator_selector"));
+        assert_eq!(invalid.matches("ai_compression_selection").count(), 1);
+        assert!(invalid.contains(" WARN "), "{invalid}");
+        assert!(
+            invalid.contains("reason=\"invalid_or_undeclared_operator_selector\""),
+            "{invalid}"
+        );
+    }
+
+    #[test]
+    fn bounded_identity_scopes_api_keys_to_the_bounded_tenant() {
+        use sbproxy_observe::cardinality::{budget_for_label, OTHER_LABEL};
+        use sbproxy_observe::{CardinalityConfig, CardinalityLimiter};
+
+        let limiter = CardinalityLimiter::new(CardinalityConfig {
+            max_per_label: 2,
+            hostname_cap: None,
+        });
+        for index in 0..budget_for_label("tenant_id") {
+            let tenant = format!("compression-cardinality-fill-tenant-{index}");
+            let _ = limiter.sanitize_budget("tenant_id", &tenant);
+        }
+
+        let key_budget = 2;
+        let mut final_identity = (String::new(), String::new());
+        for index in 0..=key_budget {
+            let raw_tenant = format!("compression-cardinality-overflow-tenant-{index}");
+            let raw_key = format!("compression-cardinality-overflow-key-{index}");
+            final_identity = bounded_identity_with_sanitizers(
+                &raw_tenant,
+                Some(&raw_key),
+                |tenant_id| limiter.sanitize_budget("tenant_id", tenant_id),
+                |api_key_id, tenant_id| {
+                    limiter.sanitize_tenant(tenant_id, "api_key_id", api_key_id)
+                },
+            );
+
+            assert_eq!(final_identity.0, OTHER_LABEL);
+            assert_eq!(
+                limiter.tenant_unique_count(&raw_tenant, "api_key_id"),
+                0,
+                "raw overflow tenants must not allocate api-key limiter buckets"
+            );
+        }
+
+        assert_eq!(final_identity, (OTHER_LABEL.into(), OTHER_LABEL.into()));
+        assert_eq!(
+            limiter.tenant_unique_count(OTHER_LABEL, "api_key_id"),
+            key_budget,
+            "overflow tenants must share one bounded api-key limiter bucket"
+        );
+    }
+
+    #[test]
     fn skipped_and_failed_levers_never_record_token_savings() {
         let tenant = "compression-metrics-no-savings-tenant";
         let key = "compression-metrics-no-savings-key";
@@ -714,6 +944,7 @@ mod tests {
             initial_tokens: 80,
             final_tokens: 80,
             tokens_saved: 0,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
             lever_results: vec![
                 LeverResult {
                     lever: LeverKind::SummaryBuffer,
@@ -740,7 +971,15 @@ mod tests {
             ],
         };
 
-        record_compression_run(&policy(), tenant, Some(key), true, &run);
+        record_compression_run(
+            &policy(),
+            tenant,
+            Some(key),
+            true,
+            "route_default",
+            "default",
+            &run,
+        );
 
         for lever in ["summary_buffer", "window_fit"] {
             assert_eq!(
@@ -836,6 +1075,16 @@ mod tests {
         assert!(applied.contains("tokens_saved=50"), "{applied}");
         assert!(applied.contains("min_tokens"), "{applied}");
         assert!(applied.contains("completion_reserve_tokens"), "{applied}");
+        assert!(applied.contains("input_budget_tokens"), "{applied}");
+        assert!(applied.contains("8192"), "{applied}");
+        assert!(
+            applied.contains("selection_source=\"governed_key\""),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("selection_outcome=\"selected\""),
+            "{applied}"
+        );
         assert!(!applied.contains("secret message"), "{applied}");
         assert!(!applied.contains("provider-not-for-telemetry"), "{applied}");
         assert!(!applied.contains("model-not-for-telemetry"), "{applied}");
@@ -845,6 +1094,7 @@ mod tests {
             initial_tokens: 40,
             final_tokens: 40,
             tokens_saved: 0,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
             lever_results: vec![LeverResult {
                 lever: LeverKind::WindowFit,
                 backend: None,
@@ -867,6 +1117,7 @@ mod tests {
             initial_tokens: 40,
             final_tokens: 40,
             tokens_saved: 0,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
             lever_results: vec![LeverResult {
                 lever: LeverKind::SummaryBuffer,
                 backend: Some(CompressionBackend::Redis),
@@ -888,6 +1139,7 @@ mod tests {
             initial_tokens: 0,
             final_tokens: 0,
             tokens_saved: 0,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::Heuristic,
             lever_results: Vec::new(),
         };
         let empty_labels = [

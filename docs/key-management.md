@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-14*
+*Last modified: 2026-07-19*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -237,8 +237,9 @@ The PATCH body is flat. Do not wrap fields under `policy` or `budget`.
 
 - `expected_revision` is required and must be at least `1`.
 - An absent field is unchanged.
-- JSON `null` clears a nullable field such as `name`, `route_to_model`, a limit,
-  a budget cap, attribution, `inject_mcp`, or `expires_at`.
+- JSON `null` clears a nullable field such as `name`, `route_to_model`,
+  `compression_profile`, a limit, a budget cap, attribution, `inject_mcp`, or
+  `expires_at`.
 - A list or map is replaced in full. Use `[]` or `{}` to clear it. The API
   rejects `null` for non-nullable collections such as model/provider lists,
   `tags`, `metadata`, and injected tools. `allowed_tools` is the exception:
@@ -264,6 +265,7 @@ field leaves it unchanged.
 | `require_pii_redaction` | string list | `[]` | same field |
 | `principal_selectors` | selector object list | `[]` | same field |
 | `route_to_model` | string | `null` | same field |
+| `compression_profile` | `on`, `off`, or a valid profile name | `null` | same field |
 | `allowed_tools` | string list | `null` for unrestricted; `[]` denies all | same field |
 | `inject_tools` | tool object list | `[]` | same field |
 | `inject_mcp` | object with a non-empty `ref` | `null` | same field |
@@ -333,7 +335,8 @@ curl -s -u admin:change-me -X PATCH \
   http://127.0.0.1:9090/admin/keys/ab12cd34 \
   -H 'Content-Type: application/json' \
   -d '{"expected_revision":3,"max_requests_per_minute":60,
-       "max_budget_usd":50,"name":"ci-runner"}'
+       "max_budget_usd":50,"compression_profile":"compact",
+       "name":"ci-runner"}'
 ```
 
 A stale write returns `409` without exposing record contents:
@@ -438,6 +441,16 @@ accounting are different guarantees; see
   gateway, for example `{"ref": "toolhub"}`) attaches that gateway's tools to
   the key's requests. Together these make a key a fixed "model plus tools"
   surface.
+- **Context compression:** `compression_profile` selects the AI route's default
+  pipeline with `on`, disables compression with `off`, or selects one named
+  route-local profile. Header `X-Compression` overrides the governed key, CEL
+  is consulted only when the key has no selector, and an absent selector uses
+  the route default. SBproxy strips the request header before upstream
+  dispatch. The Admin API validates selector syntax but cannot prove which AI
+  origin a dynamic key will reach. A syntactically valid profile that is not
+  declared on the eventual route safely resolves to `off` and records
+  `invalid_operator`. Static configured credentials are route-bound, so an
+  undeclared profile is a configuration error at load time.
 - **Principal gate:** `principal_selectors` restricts which inbound identities
   may present the key, matched by `virtual_key`, `team`, `project`, `user`,
   `role`, or `claim`. Empty means any principal.
@@ -541,7 +554,8 @@ curl -s -u admin:change-me -X PATCH http://127.0.0.1:9090/admin/keys/ab12cd34 \
   -d '{"expected_revision":3,"allowed_models":["gpt-4o-mini"],
        "blocked_providers":["unapproved-provider"],"allowed_tools":[],
        "max_requests_per_minute":60,"max_budget_usd":50,
-       "route_to_model":"gpt-4o-mini","require_pii_redaction":["email"],
+       "route_to_model":"gpt-4o-mini","compression_profile":"compact",
+       "require_pii_redaction":["email"],
        "tags":["team:payments"]}'
 ```
 
@@ -641,6 +655,7 @@ proxy:
           blocked_providers: [unapproved-provider]
           allowed_tools: []          # explicit empty list denies all caller tools
           route_to_model: gpt-4o-mini
+          compression_profile: compact
           bypass_prompt_injection: false
           project: payments
           tenant: acme
@@ -655,3 +670,9 @@ proxy:
 ```
 
 See the runnable `examples/ai-dynamic-keys/` config for the full setup.
+
+The secret-free `EffectiveKeyPolicy` schema is version 2. Version 2 carries
+`compression_profile` through configured keys, dynamic records, cache tiers,
+and effective-policy preview. Readers still accept a version 1 policy that
+lacks the field and treat it as unset, so rolling upgrades do not invent a
+selector for an older record.

@@ -28,6 +28,13 @@
       "items": {
         "$ref": "#/definitions/CompressionLeverConfig"
       }
+    },
+    "profiles": {
+      "description": "Route-local named pipelines available to governed policy and requests.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/CompressionProfile"
+      }
     }
   },
   "additionalProperties": false,
@@ -151,6 +158,15 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0.0
+            },
+            "input_budget_tokens": {
+              "description": "Optional hard input-message budget before the target model limit.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 1.0
             }
           },
           "additionalProperties": false
@@ -181,6 +197,33 @@
               "$ref": "#/definitions/DurationSchema"
             }
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompressionProfile": {
+      "description": "One reusable route-local compression pipeline.",
+      "type": "object",
+      "properties": {
+        "state": {
+          "description": "Shared-state backend used by stateful levers in this profile.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CompressionStateConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "levers": {
+          "description": "Compression levers executed in declaration order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CompressionLeverConfig"
+          }
         }
       },
       "additionalProperties": false

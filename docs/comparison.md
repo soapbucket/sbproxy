@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-07-14*
+*Last modified: 2026-07-19*
 
 SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
@@ -77,7 +77,10 @@ SBproxy fits when you need a production reverse proxy *and* an AI gateway in the
 - **You care about overhead.** Sub-millisecond p99 on the proxy path. Idle RSS in single-digit megabytes. LiteLLM wants 4 CPU and 8 GB plus Python, PostgreSQL, and Redis. Managed gateways add a public network hop.
 - **You want scripting that ships in the binary.** CEL for routing (compiled once, evaluates in microseconds), Lua for transforms, JavaScript via QuickJS, and sandboxed WebAssembly for plugins. No C modules to compile, no separate plugin daemon.
 - **You need MCP federation.** SBproxy proxies and federates Model Context Protocol traffic alongside HTTP and AI. No other general-purpose proxy ships this.
-- **You want to self-host without a database.** Single binary. No PostgreSQL. Redis is optional, only needed for distributed rate limiting and shared cache.
+- **You want to self-host without a database.** Single binary. No PostgreSQL.
+  Redis is optional. Configure it for Redis-backed features such as exact
+  distributed rate limiting, shared cache, or canonical `summary_buffer`
+  context-compression state.
 
 ## When to pick something else
 

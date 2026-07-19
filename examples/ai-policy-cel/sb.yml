@@ -8,10 +8,11 @@
 # blocks. The expression returns one action token or a list of them.
 #
 # Recognized actions: allow, block, redact, route_to:<model>,
-# set_sink_tag:<tag>, audit:<priority>.
+# compression:<selector>, set_sink_tag:<tag>, audit:<priority>.
 #
 # Here: route free-tier traffic that asks for the expensive model down to
-# the cheap one, and tag the spend record so it is queryable later.
+# the cheap one, select a named stateless compression profile, and tag the
+# spend record so it is queryable later.
 #
 # The `ai.*` namespace exposes:
 #   ai.surface, ai.model, ai.provider
@@ -49,10 +50,20 @@ origins:
             - gpt-4o
             - gpt-4o-mini
 
+      # The route default is off. CEL can select the named stateless profile.
+      compression:
+        levers: []
+        profiles:
+          compact:
+            levers:
+              - type: window_fit
+                completion_reserve_tokens: 1024
+                input_budget_tokens: 512
+
       ai_policy:
         expression: |
           ai.principal.tier == "free" && ai.model == "gpt-4o"
-            ? ["route_to:gpt-4o-mini", "set_sink_tag:downgraded-free-tier"]
+            ? ["route_to:gpt-4o-mini", "compression:compact", "set_sink_tag:downgraded-free-tier"]
             : ["allow"]
         # Applied when the expression errors or returns an unknown value.
         # Defaults to allow (fail-open) so a policy bug cannot take the

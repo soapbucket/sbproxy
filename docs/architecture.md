@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-19*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -346,11 +346,15 @@ OpenAI-compatible API surface and routes requests to any supported LLM provider.
     |
     v
 +------------------+
+| Compression      |  Resolves X-Compression, governed key, CEL, then route
+| policy           |  default. Pins one default or named runtime before any
+|                  |  semantic-cache lookup and transforms messages safely.
++------------------+
+    |
+    v
++------------------+
 | Router           |  Selects provider and model based on routing strategy
 |                  |  (16 strategies; see the table below).
-|                  |  Optional context compression: with
-|                  |  resilience.llm_aware.context_compress on, history is
-|                  |  trimmed to the model's window before dispatch.
 +------------------+
     |
     v
@@ -381,6 +385,31 @@ OpenAI-compatible API surface and routes requests to any supported LLM provider.
     v
   Client
 ```
+
+### Compression runtime boundary
+
+Each compiled AI origin owns an immutable default compression pipeline, an
+immutable `off` pipeline, and immutable named pipelines. Request dispatch pins
+one of them with precedence header, governed key, CEL, then route default. The
+selector is resolved before either semantic-cache implementation can read or
+arm write-back state. Routes with named profiles or an explicit-budget default,
+and requests with an explicit selector, bypass caches that cannot partition by
+compression behavior. This keeps a cache hit from crossing profile boundaries.
+The legacy default-only compatibility pipeline retains its old cache scope.
+
+`window_fit` is stateless. Explicit-budget fitting preserves the leading
+instruction prefix, newest protocol unit, contiguous recent suffix, and tool
+call/result groups. `summary_buffer` has external state, but its canonical
+record exists only in Redis. Workers keep no canonical conversational state,
+and the cluster mesh is not accepted as a summary backend. Admin deletion and
+purge operate on the same fenced Redis record. There is no OmniRoute runtime,
+import, or migration seam.
+
+Compression produces pending per-lever value after it changes the message list.
+The response phase commits that value only for a billable terminal provider
+success, then updates bounded metrics and the process-wide Admin value ledger.
+Logs and metrics carry closed selectors, outcomes, numeric counts, and timing;
+they never include message or summary content.
 
 ### Provider registry
 

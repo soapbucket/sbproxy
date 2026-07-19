@@ -10,7 +10,7 @@ Most teams run nginx or Traefik for HTTP traffic, then route AI requests through
 - Sub-millisecond p99 proxy overhead at 50k+ rps on commodity hardware
 - Hot reload with zero dropped connections
 - 14-phase compiled pipeline per origin (compiled once, zero per-request allocation)
-- Single binary, no required external dependencies. Redis is optional, only needed for distributed rate limiting and shared cache.
+- Single binary, no required external dependencies. Redis is optional; configure it for Redis-backed features such as exact distributed rate limiting, shared cache, or canonical stateful context summaries.
 - Built in Rust on Cloudflare's Pingora. Source available on GitHub.
 
 ## Documentation
@@ -22,6 +22,7 @@ Most teams run nginx or Traefik for HTTP traffic, then route AI requests through
 - Configuration: https://github.com/soapbucket/sbproxy/blob/main/docs/configuration.md
 - Features: https://github.com/soapbucket/sbproxy/blob/main/docs/features.md
 - AI Gateway: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-gateway.md
+- AI Context Compression: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-context-compression.md
 - AI Crawl Control + Pay Per Crawl: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-crawl-control.md
 - 402 Challenge contract: https://github.com/soapbucket/sbproxy/blob/main/docs/402-challenge.md
 - Content for agents: https://github.com/soapbucket/sbproxy/blob/main/docs/content-for-agents.md

@@ -167,7 +167,7 @@ mod tests {
         // A 20-character single "word" (no whitespace) that is not an
         // exact vocab entry: the real tokenizer looks it up and falls
         // back to exactly one `[UNK]` token. A naive length-based
-        // heuristic (`chars / 4`, the kind of estimate used when there
+        // heuristic (`UTF-8 bytes / 4`, the kind of estimate used when there
         // is no local tokenizer.json to load against) would guess 5.
         // The two numbers disagree, which is the point: this asserts
         // the exact vocab-lookup path ran, not an approximation.

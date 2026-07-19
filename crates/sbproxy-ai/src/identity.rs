@@ -154,6 +154,9 @@ pub struct VirtualKeyConfig {
     /// receive. `None` keeps the client's `model` field unchanged.
     #[serde(default)]
     pub route_to_model: Option<String>,
+    /// Route-local compression selector (`on`, `off`, or a named profile).
+    #[serde(default)]
+    pub compression_profile: Option<String>,
     /// WOR-893: tools injected into the request `body["tools"]` when this
     /// key authenticates the request. Each entry is an opaque JSON
     /// object (the provider's tool-definition shape: OpenAI
@@ -499,6 +502,7 @@ mod tests {
             user: None,
             metadata: HashMap::new(),
             route_to_model: None,
+            compression_profile: None,
             inject_tools: vec![],
             inject_mcp: None,
             enabled,
@@ -527,6 +531,7 @@ mod tests {
             user: None,
             metadata: HashMap::new(),
             route_to_model: None,
+            compression_profile: None,
             inject_tools: vec![],
             inject_mcp: None,
             enabled: true,

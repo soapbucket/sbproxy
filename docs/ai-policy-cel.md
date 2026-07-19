@@ -1,5 +1,6 @@
 # AI policy plane (CEL)
-*Last modified: 2026-07-06*
+
+*Last modified: 2026-07-19*
 
 The AI policy plane is one sandboxed CEL expression that expresses
 cross-cutting rules over the AI decision pipeline. Instead of spreading a
@@ -8,9 +9,9 @@ you write a single expression over the signals the gateway already computes
 and emit a small, closed set of typed actions.
 
 The expression runs on the same sandboxed CEL engine as the rest of
-sbproxy, at line rate, and can only emit actions from a fixed set. There is
-no arbitrary code path: a policy can reroute, redact, block, tag, or audit,
-and nothing else.
+sbproxy, at line rate, and can only emit actions from a fixed set. There is no
+arbitrary code path. A policy can reroute, select a route-local compression
+pipeline, redact, block, tag, or audit, and nothing else.
 
 ## Configuration
 
@@ -25,10 +26,17 @@ action:
       models: [gpt-4o, gpt-4o-mini]
   ai_policy:
     expression: |
-      ai.principal.tier == "free" && ai.guardrails.flagged_count >= 2
-        ? ["redact", "route_to:gpt-4o-mini", "audit:high"]
+      ai.tokens.input_est > 12000
+        ? ["compression:compact", "route_to:gpt-4o-mini", "audit:high"]
         : ["allow"]
     on_error: allow
+  compression:
+    levers: []
+    profiles:
+      compact:
+        levers:
+          - type: window_fit
+            input_budget_tokens: 8192
 ```
 
 The expression returns either one action token (a string) or a list of
@@ -49,6 +57,7 @@ before.
 | `block` | Reject the request before dispatch with a `403`. |
 | `redact` | Mask sensitive content in the prompt (via the origin's PII redactor) and continue. |
 | `route_to:<model>` | Force the request onto a specific model. |
+| `compression:<selector>` | Select `on`, `off`, or one declared route-local compression profile. |
 | `set_sink_tag:<tag>` | Tag the usage record (and the verifiable ledger entry) emitted for this request. |
 | `audit:<priority>` | Emit a structured audit event at the given priority. |
 
@@ -56,6 +65,23 @@ The action set is closed: an unrecognized token at evaluation time falls
 back to `on_error`. The expression itself is compiled (syntax-checked) when
 the policy is first built; a syntax error is logged and the policy is
 disabled (fail-open).
+
+Compression selectors use lowercase ASCII profile names of up to 64 bytes,
+with `_` and `-` allowed after the first letter or digit. A malformed
+`compression:` selector is treated as an invalid operator choice and safely
+disables compression for that request. A valid name that is not declared on
+the route has the same safe-off behavior. Both cases emit the content-free
+`ai_compression_selection` event and increment
+`sbproxy_ai_compression_selection_total` with
+`source="cel_policy", outcome="invalid_operator"`. They do not apply the
+policy-wide `on_error`, because that could enable a route default the operator
+did not select.
+
+The full selector precedence is `X-Compression` header, governed key
+`compression_profile`, CEL, then the route default. A caller header therefore
+overrides a CEL decision. SBproxy strips that header before sending the request
+upstream. See [AI context compression](ai-context-compression.md#profiles-and-request-selection)
+for the shared grammar and rejection rules.
 
 ## The `ai.*` namespace
 
@@ -72,7 +98,14 @@ disabled (fail-open).
 | `ai.guardrails.labels` | list | Labels of the flagging guardrails. |
 | `ai.budget.fraction` | double | Fraction of the tightest active budget window consumed. |
 | `ai.budget.exceeded` | bool | Whether a budget window is already exceeded. |
-| `ai.tokens.input_est` | int | Estimated prompt tokens. |
+| `ai.tokens.input_est` | int | Target-model input estimate for the current uncompressed JSON messages. |
+
+`ai.tokens.input_est` is computed before CEL and before compression. Known
+OpenAI model families use their registered tokenizer; other model names use
+the documented UTF-8 byte-length heuristic. This makes an expression such as
+`ai.tokens.input_est > 12000 ? "compression:compact" : "compression:off"`
+depend on the caller's original context rather than a stale or post-compression
+accounting field.
 
 The guardrail-verdict and budget-fraction dimensions are richest when the
 [guardrail mesh](ai-guardrail-mesh.md) and

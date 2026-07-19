@@ -38,7 +38,7 @@
   "id": null,
   "uid": "sbproxy-ai-value",
   "title": "AI Value (per-tenant, per-credential, per-model)",
-  "description": "Per-credential, multi-tenant, multi-model AI value tracking: spend, tokens, model latency, and value-vs-waste by outcome. Built on the sbproxy_ai_*_attributed_total metrics.",
+  "description": "Per-credential, multi-tenant, multi-model AI value tracking: spend, tokens, model latency, value-vs-waste by outcome, and success-only context-compression value.",
   "tags": [
     "sbproxy",
     "ai",
@@ -541,6 +541,110 @@
           "refId": "A",
           "expr": "histogram_quantile(0.95, sum by (le, model) (rate(sbproxy_ai_request_duration_attributed_seconds_bucket{tenant_id=~\"$tenant\"}[5m])))",
           "legendFormat": "{{model}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Realized Compression Tokens Saved/sec",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Target-model input-token estimates avoided by compression on terminal successful provider responses. The precision legend distinguishes registered model tokenizers from heuristic estimates.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (tenant_id, model, lever, token_count_precision) (rate(sbproxy_ai_compression_value_tokens_saved_total{tenant_id=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{tenant_id}} {{model}} {{lever}} {{token_count_precision}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Realized Compression Cost Saved ($/hr)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Gross target-model input cost avoided on terminal successful provider responses. Unpriced models contribute tokens but zero dollars.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (tenant_id, model, lever, token_count_precision) (rate(sbproxy_ai_compression_value_cost_saved_micros_total{tenant_id=~\"$tenant\"}[5m]))*3600/1000000",
+          "legendFormat": "{{tenant_id}} {{model}} {{lever}} {{token_count_precision}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"

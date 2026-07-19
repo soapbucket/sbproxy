@@ -4,6 +4,7 @@ use crate::compression::outcome::{
     FailureReason, LeverKind, LeverOutcome, LeverResult, RequestOutcome, SkipReason,
 };
 use crate::compression::CompressionBackend;
+use crate::TokenCountPrecision;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::fmt;
@@ -223,6 +224,11 @@ pub trait CompressionLever: Send + Sync {
 pub trait TokenCounter: Send + Sync {
     /// Count tokens for a complete raw JSON message list.
     fn count(&self, model: &str, messages: &[Value]) -> u64;
+
+    /// Precision signal for this counter and target model.
+    fn precision(&self, _model: &str) -> TokenCountPrecision {
+        TokenCountPrecision::Heuristic
+    }
 }
 
 /// Production model-aware estimated-token counter.
@@ -232,6 +238,10 @@ pub struct ModelTokenCounter;
 impl TokenCounter for ModelTokenCounter {
     fn count(&self, model: &str, messages: &[Value]) -> u64 {
         crate::token_estimate::estimate_json_message_tokens(model, messages)
+    }
+
+    fn precision(&self, model: &str) -> TokenCountPrecision {
+        crate::token_estimate::token_count_precision(model)
     }
 }
 
@@ -246,6 +256,8 @@ pub struct CompressionRun {
     pub final_tokens: u64,
     /// Initial-to-final reduction in the shared estimate, counted once.
     pub tokens_saved: u64,
+    /// Target-model tokenizer path used for every token value in this run.
+    pub token_count_precision: TokenCountPrecision,
     /// Ordered result for every lever that ran.
     pub lever_results: Vec<LeverResult>,
 }
@@ -258,6 +270,7 @@ impl fmt::Debug for CompressionRun {
             .field("initial_tokens", &self.initial_tokens)
             .field("final_tokens", &self.final_tokens)
             .field("tokens_saved", &self.tokens_saved)
+            .field("token_count_precision", &self.token_count_precision)
             .field("lever_results", &self.lever_results)
             .finish()
     }
@@ -380,6 +393,7 @@ impl CompressionRunner {
             initial_tokens,
             final_tokens: working_tokens,
             tokens_saved,
+            token_count_precision: self.token_counter.precision(request.model()),
             lever_results,
         };
         debug_assert_eq!(run.applied_tokens_saved(), run.tokens_saved);
@@ -397,6 +411,7 @@ mod tests {
         FailureReason, LeverKind, LeverOutcome, RequestOutcome, SkipReason,
     };
     use crate::compression::CompressionBackend;
+    use crate::TokenCountPrecision;
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
@@ -533,6 +548,7 @@ mod tests {
         assert_eq!(run.initial_tokens, 100);
         assert_eq!(run.final_tokens, 40);
         assert_eq!(run.tokens_saved, 60);
+        assert_eq!(run.token_count_precision, TokenCountPrecision::Heuristic);
         assert_eq!(run.outcome(), RequestOutcome::Applied);
         assert_eq!(run.lever_results.len(), 2);
         assert_eq!(run.lever_results[0].before_tokens, 100);
@@ -662,5 +678,24 @@ mod tests {
         assert_eq!(run.final_tokens, 42);
         assert_eq!(run.tokens_saved, 0);
         assert_eq!(run.outcome(), RequestOutcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn production_counter_stamps_its_target_model_precision_on_the_run() {
+        let runner = CompressionRunner::with_model_counter(vec![]);
+
+        let tokenizer = runner.run(&CompressionRequest::new("gpt-4o"), &[]).await;
+        let heuristic = runner
+            .run(&CompressionRequest::new("self-hosted-model"), &[])
+            .await;
+
+        assert_eq!(
+            tokenizer.token_count_precision,
+            TokenCountPrecision::ModelTokenizer
+        );
+        assert_eq!(
+            heuristic.token_count_precision,
+            TokenCountPrecision::Heuristic
+        );
     }
 }

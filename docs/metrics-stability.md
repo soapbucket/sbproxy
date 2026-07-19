@@ -45,10 +45,13 @@ Every metric SBproxy emits, what writes it, and what we promise about its name.
 | `sbproxy_ai_compression_request_levers_run` | Histogram | `stable` | `beta` | `tenant_id`, `api_key_id`, `outcome`, `backend` | Number of context compression levers executed per request. |
 | `sbproxy_ai_compression_request_tokens_saved` | Histogram | `stable` | `beta` | `tenant_id`, `api_key_id`, `outcome`, `backend` | Initial-to-final reduction in SBproxy's model-aware token estimate once per compression request. |
 | `sbproxy_ai_compression_requests_total` | Counter | `stable` | `beta` | `tenant_id`, `api_key_id`, `outcome`, `backend`, `cache_bypass` | Requests that executed a non-empty AI context compression pipeline. |
+| `sbproxy_ai_compression_selection_total` | Counter | `stable` | `beta` | `tenant_id`, `source`, `outcome` | AI request compression policy resolutions by closed source and outcome. |
 | `sbproxy_ai_compression_state_operation_duration_seconds` | Histogram | `stable` | `beta` | `backend`, `operation`, `outcome` | External AI compression state operation duration in seconds. |
 | `sbproxy_ai_compression_state_operations_total` | Counter | `stable` | `beta` | `backend`, `operation`, `outcome` | External AI compression state operations by backend and closed outcome. |
 | `sbproxy_ai_compression_tokens_saved_total` | Counter | `stable` | `beta` | `tenant_id`, `api_key_id`, `lever` | Reduction in SBproxy's model-aware token estimate from applied AI context compression levers. |
 | `sbproxy_ai_compression_tokens_total` | Counter | `stable` | `beta` | `tenant_id`, `api_key_id`, `lever`, `direction` | SBproxy model-aware token estimates before and after an applied AI context compression lever. |
+| `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross known-price target-model input cost avoided by successful AI context compression, in micro-USD. |
+| `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Estimated target-model input tokens avoided by successful AI context compression. |
 | `sbproxy_ai_context_poisoning_findings_total` | Counter | `stable` | `beta` | `rule_id`, `action` | Context-poisoning guardrail findings. |
 | `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `beta` | `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI cost in USD, partitioned by attribution tag. |
 | `sbproxy_ai_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model` | Micro-USD avoided by a semantic-cache hit. |

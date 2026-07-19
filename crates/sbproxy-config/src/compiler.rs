@@ -719,6 +719,9 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                 if let Some(m) = &cred.route_to_model {
                     vk["route_to_model"] = json!(m);
                 }
+                if let Some(selector) = &cred.compression_profile {
+                    vk["compression_profile"] = json!(selector);
+                }
                 if !cred.inject_tools.is_empty() {
                     vk["inject_tools"] = json!(cred.inject_tools.clone());
                 }
@@ -2127,6 +2130,7 @@ proxy:
       provider: openai
       key: ${OPENAI_API_KEY}
       route_to_model: gpt-4o-mini
+      compression_profile: coding-agent
       allowed_tools: []
       inject_tools:
         - type: function
@@ -2157,6 +2161,11 @@ origins:
         assert_eq!(
             vks[0]["route_to_model"], "gpt-4o-mini",
             "route_to_model must reach the lowered VK; got: {}",
+            vks[0]
+        );
+        assert_eq!(
+            vks[0]["compression_profile"], "coding-agent",
+            "compression_profile must reach the lowered VK; got: {}",
             vks[0]
         );
         let tools = vks[0]["inject_tools"]

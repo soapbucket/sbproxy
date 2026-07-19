@@ -69,3 +69,17 @@ groups:
 
       - record: sbproxy:ai_compression_tokens_saved_rate_5m
         expr: sum(rate(sbproxy_ai_compression_tokens_saved_total[5m]))
+
+      # Success-only realized value. Preserve the target counter precision so
+      # model-tokenizer estimates and heuristic estimates remain separable.
+      - record: sbproxy:ai_compression_value_tokens_saved_by_tenant_model_lever_5m
+        expr: |
+          sum by (tenant_id, origin, model, lever, token_count_precision) (
+            rate(sbproxy_ai_compression_value_tokens_saved_total[5m])
+          )
+
+      - record: sbproxy:ai_compression_value_cost_saved_dollars_by_tenant_model_lever_5m
+        expr: |
+          sum by (tenant_id, origin, model, lever, token_count_precision) (
+            rate(sbproxy_ai_compression_value_cost_saved_micros_total[5m])
+          ) / 1000000

@@ -1,11 +1,12 @@
 # Redis-backed AI context compression
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-19*
 
 This example runs the ordered AI context-compression pipeline with a
 process-wide Redis state backend. A dedicated `openai-summarizer` provider
 reduces older plain-text chat history into a bounded running summary, then
-`window_fit` applies the existing deterministic context-fitting heuristic.
+`window_fit` applies an explicit target-model-counted input budget. The route
+also declares a named `compact` profile that uses only stateless `window_fit`.
 
 Request workers are stateless. The client remains the source of truth for the
 conversation and sends the complete canonical `messages` array on every turn.
@@ -64,6 +65,38 @@ turns. Any request worker can handle a turn because the state key is isolated
 by tenant, AI origin, and the captured session. The raw session ID is not
 stored in the compression record or returned by the compression Admin API.
 
+## Profile selection and explicit budgets
+
+The route default, selected by `on` or by no explicit selector, runs
+`summary_buffer` and then fits the result to 16,384 input tokens. The named
+`compact` profile skips summary state and fits directly to 4,096 input tokens.
+`off` preserves the caller's complete message list.
+
+Selectors resolve in this order: `X-Compression`, governed key
+`compression_profile`, CEL `compression:<selector>`, then route default. A
+header is useful for an explicit caller override:
+
+```bash
+# Route default, including Redis summary state.
+curl -H 'X-Compression: on' ...
+
+# Named stateless profile. No session ID or Redis summary operation is needed.
+curl -H 'X-Compression: compact' ...
+
+# Preserve the complete caller context.
+curl -H 'X-Compression: off' ...
+```
+
+SBproxy strips `X-Compression` before dispatch. It rejects a malformed,
+repeated, or undeclared header with `400`. Invalid governed-key or CEL choices
+resolve safely to `off` and are visible as `invalid_operator` telemetry.
+
+Explicit-budget fitting uses the target-model counter and the smaller of the
+configured budget and known model capacity. It preserves the leading system
+and developer instructions, the complete newest turn, contiguous recent
+history, and complete OpenAI or Anthropic tool exchanges. If protected
+material cannot fit, the lever skips without changing the request.
+
 ## Send two turns
 
 The synthetic history below is intentionally long enough to cross
@@ -93,6 +126,24 @@ jq -n --arg history "$HISTORY" '{
     {role: "user", content: "List the top two delivery risks."}
   ]
 }' > /tmp/sbproxy-compression-turn-1.json
+
+# Exercise the named stateless profile without a captured session.
+curl --fail-with-body -sS \
+  -H 'Host: ai.local' \
+  -H 'Content-Type: application/json' \
+  -H 'X-Compression: compact' \
+  --data-binary @/tmp/sbproxy-compression-turn-1.json \
+  "${SB_DATA_URL}/v1/chat/completions" \
+  | jq -r '.choices[0].message.content'
+
+# Exercise the explicit off override. The request still reaches the provider.
+curl --fail-with-body -sS \
+  -H 'Host: ai.local' \
+  -H 'Content-Type: application/json' \
+  -H 'X-Compression: off' \
+  --data-binary @/tmp/sbproxy-compression-turn-1.json \
+  "${SB_DATA_URL}/v1/chat/completions" \
+  | jq -r '.choices[0].message.content'
 
 curl --fail-with-body -sS \
   -D /tmp/sbproxy-compression-turn-1.headers \
@@ -267,24 +318,103 @@ saving measured once per request:
 sum(sbproxy_ai_compression_request_tokens_saved_sum{tenant_id="compression-redis-demo"})
 ```
 
+Selection decisions are closed and content-free:
+
+```promql
+sum by (source, outcome) (
+  rate(sbproxy_ai_compression_selection_total{tenant_id="compression-redis-demo"}[5m])
+)
+```
+
+After a terminal provider request succeeds, the value counters record each
+applied lever. Their fifth label states whether the target-model count came
+from a registered tokenizer or the heuristic fallback:
+
+```promql
+sum by (model, lever, token_count_precision) (
+  rate(sbproxy_ai_compression_value_tokens_saved_total{tenant_id="compression-redis-demo"}[5m])
+)
+```
+
+```promql
+sum by (model, lever, token_count_precision) (
+  rate(sbproxy_ai_compression_value_cost_saved_micros_total{tenant_id="compression-redis-demo"}[5m])
+) / 1000000
+```
+
+An unknown model price keeps the saved-token estimate and contributes zero
+avoided cost. Neither metric claims exact provider usage.
+
 Counters reset when a process restarts. For a dashboard range that spans
 restarts, use `increase(...[$__range])`; Prometheus applies its normal range
 boundary extrapolation. Use the request histogram's `_bucket` series for
 per-request distributions; never sum buckets to recover token counts.
 For model families without a dedicated tokenizer, the counter uses the
-documented character heuristic and is not reconciled to provider-reported
-usage after dispatch.
+documented UTF-8 byte-length heuristic, not a Unicode character count, and is
+not reconciled to provider-reported usage after dispatch.
 
 Applied pipelines emit one content-free `ai_compression_summary` event. With
 the JSON log format used above, a safely redacted example is:
 
 ```json
-{"timestamp":"<redacted>","level":"INFO","fields":{"message":"AI context compression pipeline summary","event":"ai_compression_summary","tenant_id":"<redacted>","api_key_id":"<redacted>","outcome":"applied","initial_tokens":12480,"final_tokens":1320,"tokens_saved":11160,"levers_run":2,"levers_applied":1,"latency_ms":640,"backend":"redis","consistency":"serialized","cache_bypass":true,"lever_outcomes":"<content-free JSON omitted>","targets":"<configured numeric targets omitted>"},"target":"ai_compression"}
+{"timestamp":"<redacted>","level":"INFO","fields":{"message":"AI context compression pipeline summary","event":"ai_compression_summary","tenant_id":"<redacted>","api_key_id":"<redacted>","outcome":"applied","initial_tokens":12480,"final_tokens":1320,"tokens_saved":11160,"levers_run":2,"levers_applied":1,"latency_ms":640,"backend":"redis","consistency":"serialized","cache_bypass":true,"selection_source":"route_default","selection_outcome":"default","lever_outcomes":"<content-free JSON omitted>","targets":"<configured numeric targets omitted>"},"target":"ai_compression"}
 ```
 
 The event never includes request messages, generated summary text, raw session
 IDs, provider credentials, or raw backend errors. Applied events log at
 `INFO`, failures at `WARN`, and expected skips at `DEBUG`.
+
+Each explicit header, governed-key, or CEL selection emits an
+`ai_compression_selection` event with only tenant, source, outcome, and an
+optional closed reason. Route-default resolution also emits it when named
+profiles or an explicit input budget require semantic-cache separation. It
+does not log the header or profile name. The summary event's `targets` field
+includes `input_budget_tokens` for each explicitly budgeted `window_fit`
+lever.
+
+## Read the value report
+
+The same successful value records are available through the authenticated
+Admin endpoint. Compression stays separate from the local-serving completion
+counts:
+
+```bash
+curl --fail-with-body -sS \
+  -u "admin:${ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/value" \
+  | jq '{compression,compression_totals,total_compression_tokens_saved,total_compression_gross_cost_saved_micros}'
+```
+
+Each row includes `model`, `lever`, `tokens_saved`,
+`gross_cost_saved_micros`, and `token_count_precision`. The precision value is
+`model_tokenizer` for a registered target-model tokenizer and `heuristic` for
+the UTF-8 byte-length fallback. It describes the SBproxy estimate, not the
+provider's billed input count.
+
+## Run the evaluation gate
+
+The repository includes a deterministic off/on smoke evaluation for the real
+runner and explicit-budget `window_fit` path. Its retrieval cases are synthetic
+and its coding-agent shapes are independently authored and sanitized; they are
+not captured production traffic:
+
+```bash
+cd sbproxy-bench/harness/context_compression_eval
+cargo test --locked
+cargo run --locked -- check \
+  --input fixtures/ruler-smoke.jsonl \
+  --input fixtures/coding-agent-smoke.jsonl \
+  --provenance fixtures/provenance.json \
+  --input-budget-tokens 192 \
+  --json-report reports/window-fit-smoke.json \
+  --markdown-report reports/window-fit-smoke.md
+```
+
+The harness also normalizes operator-supplied RULER, HELMET, LongBench-v2, and
+NoLiMa interchange rows. Those adapters import contexts and already generated
+off/on predictions for reporting. They do not download a suite, run a target
+model, or produce an official benchmark score. Official suite runs and
+genuinely captured sanitized traffic remain follow-up work under WOR-1879.
 
 ## Safe degradation
 
@@ -307,6 +437,10 @@ lever keeps the current request's working message list unchanged and the later
 no cross-session reuse. The request can continue to its primary provider with
 the last safe message list while metrics and the redacted summary event expose
 the degraded outcome.
+
+Redis is the only canonical summary store. `backend: mesh` is rejected, and
+there is no worker-memory fallback. This feature has no OmniRoute dependency,
+state import, or migration format; it starts with native SBproxy state.
 
 Monitor these Redis-specific health series:
 

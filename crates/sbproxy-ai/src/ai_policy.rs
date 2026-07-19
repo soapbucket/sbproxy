@@ -23,7 +23,8 @@
 //! ```
 //!
 //! Recognized action tokens (the closed set): `allow`, `block`, `redact`,
-//! `route_to:<model>`, `set_sink_tag:<tag>`, `audit:<priority>`. The
+//! `route_to:<model>`, `compression:<selector>`, `set_sink_tag:<tag>`,
+//! `audit:<priority>`. The
 //! expression is compiled (syntax-validated) when the policy is built; an
 //! unrecognized token or a non-string/list result at evaluation time falls
 //! back to the configured `on_error` action (default `allow`, i.e.
@@ -45,6 +46,14 @@ pub enum AiPolicyAction {
     Redact,
     /// Force the request onto a specific model.
     RouteTo(String),
+    /// Select a route-local request compression pipeline.
+    Compression(crate::compression::CompressionSelector),
+    /// A recognized compression action whose selector is malformed.
+    ///
+    /// Evaluation preserves this as a typed action so the request path can
+    /// disable compression safely instead of applying the policy-wide
+    /// `on_error` fallback.
+    InvalidCompressionSelector,
     /// Tag the usage record emitted for this request.
     SetSinkTag(String),
     /// Emit an audit event at the given priority.
@@ -56,12 +65,20 @@ impl AiPolicyAction {
     pub fn parse(token: &str) -> anyhow::Result<Self> {
         let token = token.trim();
         if let Some((name, arg)) = token.split_once(':') {
+            let name = name.trim();
             let arg = arg.trim();
             if arg.is_empty() {
+                if name == "compression" {
+                    return Ok(Self::InvalidCompressionSelector);
+                }
                 anyhow::bail!("ai policy action '{name}' requires an argument (got '{token}')");
             }
-            return match name.trim() {
+            return match name {
                 "route_to" => Ok(Self::RouteTo(arg.to_string())),
+                "compression" => match crate::compression::CompressionSelector::parse(arg) {
+                    Ok(selector) => Ok(Self::Compression(selector)),
+                    Err(_) => Ok(Self::InvalidCompressionSelector),
+                },
                 "set_sink_tag" => Ok(Self::SetSinkTag(arg.to_string())),
                 "audit" => Ok(Self::Audit(arg.to_string())),
                 other => anyhow::bail!("unknown ai policy action '{other}'"),
@@ -98,6 +115,28 @@ impl AiPolicyDecision {
             AiPolicyAction::RouteTo(m) => Some(m.as_str()),
             _ => None,
         })
+    }
+    /// The first compression selector to apply, if any.
+    pub fn compression_selector(&self) -> Option<&crate::compression::CompressionSelector> {
+        self.actions
+            .iter()
+            .find_map(|action| match action {
+                AiPolicyAction::Compression(selector) => Some(Some(selector)),
+                AiPolicyAction::InvalidCompressionSelector => Some(None),
+                _ => None,
+            })
+            .flatten()
+    }
+    /// True when the first compression action carries a malformed selector.
+    pub fn compression_selector_invalid(&self) -> bool {
+        self.actions
+            .iter()
+            .find_map(|action| match action {
+                AiPolicyAction::Compression(_) => Some(false),
+                AiPolicyAction::InvalidCompressionSelector => Some(true),
+                _ => None,
+            })
+            .unwrap_or(false)
     }
     /// The usage-record tag to apply, if any.
     pub fn sink_tag(&self) -> Option<&str> {
@@ -258,6 +297,12 @@ impl CompiledAiPolicy {
             .map_err(|e| anyhow::anyhow!("ai_policy.expression: {e}"))?;
         let on_error = parse_action_list(&cfg.on_error)
             .map_err(|e| anyhow::anyhow!("ai_policy.on_error: {e}"))?;
+        if on_error
+            .iter()
+            .any(|action| matches!(action, AiPolicyAction::InvalidCompressionSelector))
+        {
+            anyhow::bail!("ai_policy.on_error: invalid compression selector");
+        }
         Ok(Self {
             engine,
             expr,
@@ -360,6 +405,20 @@ mod tests {
             AiPolicyAction::parse("audit:high").unwrap(),
             AiPolicyAction::Audit("high".into())
         );
+        assert_eq!(
+            AiPolicyAction::parse("compression:coding-agent").unwrap(),
+            AiPolicyAction::Compression(crate::compression::CompressionSelector::Profile(
+                "coding-agent".into()
+            ))
+        );
+        assert_eq!(
+            AiPolicyAction::parse("compression:Bad Name").unwrap(),
+            AiPolicyAction::InvalidCompressionSelector
+        );
+        assert_eq!(
+            AiPolicyAction::parse("compression:").unwrap(),
+            AiPolicyAction::InvalidCompressionSelector
+        );
         assert!(AiPolicyAction::parse("nonsense").is_err());
         assert!(AiPolicyAction::parse("route_to:").is_err());
     }
@@ -371,6 +430,19 @@ mod tests {
             on_error: "allow".to_string(),
         });
         assert!(err.is_err(), "syntax error caught at compile time");
+    }
+
+    #[test]
+    fn malformed_compression_selector_in_on_error_fails_to_compile() {
+        let err = CompiledAiPolicy::compile(&AiPolicyConfig {
+            expression: r#""allow""#.to_string(),
+            on_error: "compression:Upper".to_string(),
+        });
+
+        assert!(
+            err.is_err(),
+            "configured on_error selectors must be validated at config load"
+        );
     }
 
     #[test]
@@ -412,6 +484,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.evaluate(&view).route_model(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn decision_exposes_first_compression_selector() {
+        let p = policy(r#"["compression:off", "compression:coding-agent"]"#);
+        let decision = p.evaluate(&AiDecisionView::default());
+
+        assert_eq!(
+            decision.compression_selector(),
+            Some(&crate::compression::CompressionSelector::Off)
+        );
+    }
+
+    #[test]
+    fn malformed_compression_action_is_typed_safe_off_not_policy_on_error() {
+        let policy = CompiledAiPolicy::compile(&AiPolicyConfig {
+            expression: r#""compression:Bad Name""#.into(),
+            on_error: "allow".into(),
+        })
+        .unwrap();
+
+        let decision = policy.evaluate(&AiDecisionView::default());
+
+        assert!(decision.compression_selector().is_none());
+        assert!(decision.compression_selector_invalid());
+        assert_eq!(
+            decision.actions,
+            vec![AiPolicyAction::InvalidCompressionSelector]
+        );
     }
 
     #[test]

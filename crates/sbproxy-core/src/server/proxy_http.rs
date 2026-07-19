@@ -79,6 +79,21 @@ fn final_response_status(
         .unwrap_or(0)
 }
 
+fn is_billable_provider_success(status: u16, provider: Option<&str>) -> bool {
+    (200..300).contains(&status) && provider.is_some_and(|value| !value.is_empty())
+}
+
+fn take_realized_compression_value(
+    ctx: &mut RequestContext,
+    status: u16,
+    terminal_error: bool,
+) -> Option<sbproxy_ai::PendingCompressionValue> {
+    let pending = ctx.pending_compression_value.take();
+    (!terminal_error && is_billable_provider_success(status, ctx.ai_provider.as_deref()))
+        .then_some(pending)
+        .flatten()
+}
+
 fn retry_config_for_action(action: &Action) -> Option<&sbproxy_modules::action::RetryConfig> {
     match action {
         Action::Proxy(proxy) => proxy.retry.as_ref(),
@@ -3990,6 +4005,17 @@ impl ProxyHttp for SbProxy {
         let hostname = ctx.hostname.to_string();
         let status_u16 = final_response_status(ctx, session.response_written());
 
+        // WOR-1921: compression savings become realized value only after the
+        // terminal provider response succeeds. Always take the pending value
+        // so this end-of-request hook cannot record it more than once.
+        if let Some(pending) = take_realized_compression_value(ctx, status_u16, e.is_some()) {
+            crate::compression_value::record_pending_compression_value(
+                ctx.tenant_id.as_str(),
+                ctx.hostname.as_str(),
+                &pending,
+            );
+        }
+
         // WOR-1528 / WOR-1540: hand the completed AI call to the
         // configured usage sinks (the verifiable ledger among them).
         // No-op unless this request dispatched to an AI provider on an
@@ -4319,6 +4345,27 @@ fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn pending_compression_value() -> sbproxy_ai::PendingCompressionValue {
+        let run = sbproxy_ai::compression::CompressionRun {
+            messages: Vec::new(),
+            initial_tokens: 20,
+            final_tokens: 10,
+            tokens_saved: 10,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
+            lever_results: vec![sbproxy_ai::compression::LeverResult {
+                lever: sbproxy_ai::compression::LeverKind::WindowFit,
+                backend: None,
+                outcome: sbproxy_ai::compression::LeverOutcome::Applied,
+                before_tokens: 20,
+                after_tokens: 10,
+                tokens_saved: 10,
+                duration: std::time::Duration::from_millis(1),
+            }],
+        };
+        sbproxy_ai::PendingCompressionValue::from_run("gpt-4o", &run)
+            .expect("pending compression value")
+    }
+
     #[test]
     fn parsed_upstream_url_extracts_host_and_path() {
         let info = parsed_upstream_url("https://api.example.com:8443/v1/base");
@@ -4364,5 +4411,57 @@ mod tests {
         assert_eq!(final_response_status(&ctx, Some(&header)), 429);
         ctx.response_status = None;
         assert_eq!(final_response_status(&ctx, None), 0);
+    }
+
+    #[test]
+    fn compression_value_requires_a_terminal_provider_success() {
+        assert!(is_billable_provider_success(200, Some("openai")));
+        assert!(is_billable_provider_success(299, Some("local")));
+        assert!(!is_billable_provider_success(302, Some("openai")));
+        assert!(!is_billable_provider_success(429, Some("openai")));
+        assert!(!is_billable_provider_success(200, None));
+    }
+
+    #[test]
+    fn terminal_success_realizes_pending_compression_value_exactly_once() {
+        let mut ctx = RequestContext {
+            ai_provider: Some("openai".to_string()),
+            pending_compression_value: Some(pending_compression_value()),
+            ..RequestContext::default()
+        };
+
+        let realized = take_realized_compression_value(&mut ctx, 200, false);
+
+        assert!(realized.is_some());
+        assert!(ctx.pending_compression_value.is_none());
+        assert!(take_realized_compression_value(&mut ctx, 200, false).is_none());
+    }
+
+    #[test]
+    fn terminal_failure_consumes_pending_compression_value_without_realizing_it() {
+        let mut ctx = RequestContext {
+            ai_provider: Some("openai".to_string()),
+            pending_compression_value: Some(pending_compression_value()),
+            ..RequestContext::default()
+        };
+
+        let realized = take_realized_compression_value(&mut ctx, 500, false);
+
+        assert!(realized.is_none());
+        assert!(ctx.pending_compression_value.is_none());
+    }
+
+    #[test]
+    fn fatal_error_after_success_headers_consumes_value_without_realizing_it() {
+        let mut ctx = RequestContext {
+            ai_provider: Some("openai".to_string()),
+            pending_compression_value: Some(pending_compression_value()),
+            ..RequestContext::default()
+        };
+
+        let realized = take_realized_compression_value(&mut ctx, 200, true);
+
+        assert!(realized.is_none());
+        assert!(ctx.pending_compression_value.is_none());
     }
 }

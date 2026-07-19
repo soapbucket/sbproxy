@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-19*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -1179,6 +1179,12 @@ origins:
               timeout: 5s
           - type: window_fit
             completion_reserve_tokens: 1024
+            input_budget_tokens: 16384
+        profiles:
+          compact:
+            levers:
+              - type: window_fit
+                input_budget_tokens: 4096
 ```
 
 Levers execute in declaration order. Each lever sees the message list accepted
@@ -1194,6 +1200,9 @@ Policy fields:
 | `state.ttl` | duration | required | Positive record lifetime. Accepts integer seconds or strings such as `60s`, `5m`, `2h30m`, and `1d`. Newly committed summaries refresh the lifetime; exact-summary reuse does not write or refresh it. |
 | `allow_admin_content_inspection` | bool | `false` | Permit the Admin-only, audit-first content endpoint for records from this handler. Metadata remains available to authenticated readers. This flag alone never grants access. |
 | `levers` | list | `[]` | Compression levers in execution order. An explicitly empty list disables compression for this handler. |
+| `profiles` | map | `{}` | Route-local named compression pipelines. Each entry has its own `levers` and optional `state`. Names use lowercase ASCII letters, digits, `_`, or `-`, begin with a letter or digit, contain from 1 to 64 bytes, and cannot be `on` or `off`. |
+| `profiles.<name>.state` | object | unset | External state for this named profile. Required when the profile contains `summary_buffer`; it does not inherit the route default state. |
+| `profiles.<name>.levers` | list | `[]` | Ordered levers for this named profile. |
 
 `summary_buffer` fields:
 
@@ -1213,9 +1222,27 @@ Policy fields:
 |---|---|---|---|
 | `type` | string | required | Must be `window_fit`. |
 | `completion_reserve_tokens` | int | `1024` | Non-negative completion capacity excluded from the input-message budget. |
+| `input_budget_tokens` | int | unset | Positive explicit input-message budget. The effective budget is the smaller of this value and a known model window minus the completion reserve. Unknown models can still use the explicit value. |
+
+With `input_budget_tokens`, `window_fit` uses the target-model counter for the
+complete JSON message shape. It preserves the contiguous leading `system` and
+`developer` prefix, the complete newest protocol unit, and a contiguous newest
+suffix. OpenAI and Anthropic tool calls stay grouped with their results. If the
+protected material cannot fit, the lever skips and leaves the request
+unchanged. Omitting the field preserves the legacy compatibility behavior.
+
+Requests select `on`, `off`, or a declared profile in this order:
+`X-Compression` header, governed-key `compression_profile`, CEL
+`compression:<selector>`, then route default. A malformed or undeclared header
+returns `400`; SBproxy strips a valid header before upstream dispatch.
+Malformed or undeclared operator-managed key and CEL selectors safely disable
+compression and record `invalid_operator`. See
+[AI context compression](ai-context-compression.md#profiles-and-request-selection)
+for cache behavior, metrics, logs, and examples.
 
 Configuration loading rejects unknown fields within `compression`, `state`,
-each lever, and `summarizer`. It also rejects a zero TTL or timeout, zero
+each profile, each lever, and `summarizer`. It also rejects a zero TTL,
+timeout, or explicit input budget, zero
 `summary_buffer` numeric fields, a summary target greater than or equal to its
 minimum threshold, an empty summarizer model, an unknown summarizer provider,
 a disabled summarizer provider, and a summarizer model not available through
@@ -1224,9 +1251,10 @@ available also fails pipeline construction instead of silently falling back:
 
 - `backend: redis` requires `proxy.l2_cache_settings.driver: redis`. For this
   feature, `params.dsn` must be a `redis://` or `rediss://` URL with a host.
-- `backend: mesh` is rejected because the current cluster cache does not offer
-  the replication, restart restore, ownership handoff, and delete guarantees
-  required for canonical summary state.
+- `backend: mesh` is rejected. `proxy.cluster.replication` supplies a durable
+  replicated substrate, but compression's legacy mesh adapter is not integrated
+  with or validated against `ReplicatedStore` for the required session and Admin
+  lifecycle semantics. That integration remains a separate, unshipped change.
 - `window_fit` is stateless and needs neither dependency.
 
 Request workers retain no conversational state between requests. The
@@ -1297,6 +1325,7 @@ origins:
 | `attrs` | object | | Attribution metadata (`project`, `tags`, `budget`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. The `budget` here is attribution, not an enforced ceiling; enforced spend caps live in the action-level `budget:` block. |
 | `policies` | list | | Sub-policies that fire when this credential matches. `{type: rate_limit, rpm: <n>}` lowers to an enforced per-key requests-per-minute cap; there is no per-key tokens-per-minute knob. `{type: require_pii_redaction, rules: [...]}` gates dispatch on active PII redaction. |
 | `route_to_model` | string | | Pin the upstream `model` field; the client-supplied value is ignored. |
+| `compression_profile` | string | | Select `on`, `off`, or a named profile declared by this AI route. |
 | `inject_tools` | list | | Replace the request's `tools` array with these provider-native entries. |
 
 See [`examples/ai-virtual-keys/sb.yml`](https://github.com/soapbucket/sbproxy/blob/main/examples/ai-virtual-keys/sb.yml) for a runnable two-team setup and [migration-credentials.md](migration-credentials.md) for the field-by-field migration from the legacy shape.

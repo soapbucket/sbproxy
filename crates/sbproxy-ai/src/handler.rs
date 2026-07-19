@@ -5,13 +5,32 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::budget::BudgetConfig;
-use crate::compression::CompressionPolicy;
+use crate::compression::{CompressionPolicy, CompressionSelector};
 use crate::guardrails::GuardrailsConfig;
 use crate::identity::VirtualKeyConfig;
 use crate::ids::ModelId;
 use crate::provider::ProviderConfig;
 use crate::ratelimit::{ModelRateConfig, SurfaceRateConfig};
 use crate::routing::RoutingStrategy;
+
+fn value_ledger_for_sink(
+    ledger: std::sync::Arc<crate::value_ledger::ValueLedger>,
+    path: &std::path::Path,
+) -> std::sync::Arc<crate::value_ledger::ValueLedger> {
+    if !path.as_os_str().is_empty() {
+        if let Err(error) = ledger.promote_to_redb(path) {
+            // This helper runs inside usage_sinks_built, so each handler emits
+            // at most one warning for a failed or conflicting promotion.
+            tracing::warn!(
+                error = %error,
+                requested_path = %path.display(),
+                fallback = "existing_backend",
+                "value ledger: durable promotion failed; keeping existing backend"
+            );
+        }
+    }
+    ledger
+}
 
 /// AI gateway handler configuration.
 #[derive(Debug, Deserialize)]
@@ -260,12 +279,12 @@ impl AiHandlerConfig {
                 let mut ledger_dir: Option<String> = None;
                 for provider in &self.providers {
                     if let Some(serve) = &provider.serve {
-                        references.extend(
-                            crate::value_ledger::ValueSink::references_from_serve(serve),
-                        );
-                        if ledger_dir.is_none() {
+                        let serve_references =
+                            crate::value_ledger::ValueSink::references_from_serve(serve);
+                        if !serve_references.is_empty() && ledger_dir.is_none() {
                             ledger_dir.clone_from(&serve.cache_dir);
                         }
+                        references.extend(serve_references);
                     }
                 }
                 if !references.is_empty() {
@@ -278,27 +297,18 @@ impl AiHandlerConfig {
                     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    // One shared ledger across handlers: reuse the process
-                    // global when already set, else open and register it.
-                    let ledger = match crate::value_ledger::value_ledger() {
-                        Some(existing) => Some(existing),
-                        None => match crate::value_ledger::ValueLedger::open(&path) {
-                            Ok(ledger) => {
-                                let ledger = std::sync::Arc::new(ledger);
-                                let _ = crate::value_ledger::set_value_ledger(ledger.clone());
-                                Some(ledger)
-                            }
-                            Err(error) => {
-                                tracing::error!(error = %error, "value ledger: disabled (failed to open); local savings will not be recorded");
-                                None
-                            }
-                        },
-                    };
-                    if let Some(ledger) = ledger {
-                        sinks.push(std::sync::Arc::new(
-                            crate::value_ledger::ValueSink::new(ledger, references),
-                        ));
-                    }
+                    // Every handler obtains the one stable process facade.
+                    // A configured cache path promotes that facade in place,
+                    // preserving compression and earlier ValueSink references.
+                    // On promotion failure the sink remains active against the
+                    // existing memory or durable backend.
+                    let ledger = value_ledger_for_sink(
+                        crate::value_ledger::value_ledger_or_init_memory(),
+                        &path,
+                    );
+                    sinks.push(std::sync::Arc::new(crate::value_ledger::ValueSink::new(
+                        ledger, references,
+                    )));
                 }
                 sinks
             })
@@ -836,6 +846,27 @@ impl AiHandlerConfig {
         if let Some(compression) = &config.compression {
             compression.validate(&config.providers)?;
         }
+        for (index, key) in config.virtual_keys.iter().enumerate() {
+            let Some(raw_selector) = key.compression_profile.as_deref() else {
+                continue;
+            };
+            let selector = CompressionSelector::parse(raw_selector).map_err(|_| {
+                anyhow::anyhow!(
+                    "ai virtual_keys[{index}].compression_profile must be on, off, or a valid profile name"
+                )
+            })?;
+            if let CompressionSelector::Profile(name) = selector {
+                let declared = config
+                    .compression
+                    .as_ref()
+                    .is_some_and(|policy| policy.profiles.contains_key(&name));
+                if !declared {
+                    anyhow::bail!(
+                        "ai virtual_keys[{index}].compression_profile selects an undeclared profile"
+                    );
+                }
+            }
+        }
         // WOR-1707: install the operator price table (config prices +
         // external rate card) into the process-global consulted by cost
         // estimation. Runs on every config (re)load so prices update
@@ -1086,6 +1117,36 @@ mod tests {
         assert_eq!(sinks[1].name(), "webhook");
         // The lazy accessor returns the same built instances on repeat calls.
         assert_eq!(cfg.usage_sinks().len(), 2);
+    }
+
+    #[test]
+    fn value_sink_initialization_keeps_the_winning_facade_on_path_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let winning_path = dir.path().join("winning.redb");
+        let conflicting_path = dir.path().join("conflicting.redb");
+        let ledger =
+            std::sync::Arc::new(crate::value_ledger::ValueLedger::open("").expect("memory ledger"));
+        ledger
+            .promote_to_redb(&winning_path)
+            .expect("winning promotion");
+
+        let selected = value_ledger_for_sink(ledger.clone(), &conflicting_path);
+        assert!(std::sync::Arc::ptr_eq(&ledger, &selected));
+        selected.record_compression(
+            "handler-fallback",
+            crate::compression::LeverKind::WindowFit,
+            23,
+            0,
+            sbproxy_model_host::TokenCountPrecision::Heuristic,
+        );
+        drop(selected);
+        drop(ledger);
+
+        let report = crate::value_ledger::ValueLedger::open(&winning_path)
+            .expect("reopen winning ledger")
+            .report();
+        assert_eq!(report.total_compression_tokens_saved, 23);
+        assert!(!conflicting_path.exists());
     }
 
     #[test]

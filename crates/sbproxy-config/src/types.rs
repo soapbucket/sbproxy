@@ -1413,6 +1413,9 @@ pub struct SeedKeyConfig {
     /// body `model` before routing.
     #[serde(default)]
     pub route_to_model: Option<String>,
+    /// Route-local compression selector (`on`, `off`, or a named profile).
+    #[serde(default)]
+    pub compression_profile: Option<String>,
     /// Provider tool definitions injected into the request when this key
     /// authenticates, replacing any client-supplied tools.
     #[serde(default)]
@@ -3598,6 +3601,9 @@ pub struct CredentialBlock {
     /// `route_to_model` field on the underlying `VirtualKeyConfig`.
     #[serde(default)]
     pub route_to_model: Option<String>,
+    /// Select `on`, `off`, or a named route-local compression profile.
+    #[serde(default)]
+    pub compression_profile: Option<String>,
     /// Replace the request's `tools` array with these entries. The
     /// shape is provider-native (`function` objects today); the AI
     /// dispatch forwards the array verbatim. Empty == no injection.
