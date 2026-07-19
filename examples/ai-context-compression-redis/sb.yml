@@ -76,3 +76,14 @@ origins:
 
           - type: window_fit
             completion_reserve_tokens: 2048
+            # Explicit target-model-counted input cap for the route default.
+            input_budget_tokens: 16384
+
+        # A caller, governed key, or CEL rule can select this stateless
+        # pipeline without creating or reading Redis summary state.
+        profiles:
+          compact:
+            levers:
+              - type: window_fit
+                completion_reserve_tokens: 2048
+                input_budget_tokens: 4096

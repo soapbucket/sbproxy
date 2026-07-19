@@ -11,6 +11,12 @@ The committed gate is intentionally small and deterministic. It is a
 first-party smoke evaluation, not an official benchmark score for RULER,
 HELMET, LongBench-v2, or NoLiMa.
 
+This is the credential-free harness skeleton scoped by WOR-1922. Official
+suite runs, target-model prediction generation, and evaluation on genuinely
+captured and sanitized coding-agent traffic remain follow-up validation under
+WOR-1879. Synthetic coding-agent shapes in this repository are not described
+as captured production traffic.
+
 ## What the report measures
 
 Each case and corpus reports:

@@ -22,6 +22,7 @@ Most teams run nginx or Traefik for HTTP traffic, then route AI requests through
 - Configuration: https://github.com/soapbucket/sbproxy/blob/main/docs/configuration.md
 - Features: https://github.com/soapbucket/sbproxy/blob/main/docs/features.md
 - AI Gateway: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-gateway.md
+- AI Context Compression: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-context-compression.md
 - AI Crawl Control + Pay Per Crawl: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-crawl-control.md
 - 402 Challenge contract: https://github.com/soapbucket/sbproxy/blob/main/docs/402-challenge.md
 - Content for agents: https://github.com/soapbucket/sbproxy/blob/main/docs/content-for-agents.md

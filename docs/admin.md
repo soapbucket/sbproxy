@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-19*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -189,6 +189,7 @@ token instead of an existing admin operator.
 | GET | `/admin/model-host/deployments` | Complete local desired-state document with authority, read-only state, revision, digest, and deployment map. |
 | PUT | `/admin/model-host/deployments` | Replace the complete local deployment map under `admin_managed` authority with `expected_revision` compare-and-swap. |
 | GET | `/admin/model-host/status` | Managed deployment generation, lifecycle, engine, artifact, memory, device, port, queue, reason, and job state. |
+| GET | `/admin/model-host/value` | Local-serving value plus per-model, per-lever context-compression tokens and gross input cost saved. |
 | POST | `/admin/model-host/load` | Start one configured deployment and wait for ready, `{"deployment":"<id>"}`. |
 | POST | `/admin/model-host/stop` | Drain and stop one configured deployment, `{"deployment":"<id>"}`. |
 | POST | `/admin/model-host/drain` | Alias for the bounded drain and stop operation. |
@@ -289,6 +290,43 @@ See [Admin API reference](admin-api-reference.md#ai-compression-session-state)
 for the complete schemas and status codes, and
 [AI context compression](ai-context-compression.md) for the data-plane policy
 and state model.
+
+### Compression value report
+
+`GET /admin/model-host/value` returns local-serving and context-compression
+value in one JSON document while keeping the two dimensions separate.
+Compression rows are recorded only after a billable terminal provider request
+succeeds. They do not increment `local_completions` or `cloud_completions`.
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/value" \
+  | jq '{compression,compression_totals,total_compression_tokens_saved,total_compression_gross_cost_saved_micros}'
+```
+
+A populated compression row has this shape:
+
+```json
+{
+  "model": "gpt-4o-mini",
+  "lever": "window_fit",
+  "tokens_saved": 18432,
+  "gross_cost_saved_micros": 2765,
+  "token_count_precision": "model_tokenizer"
+}
+```
+
+`compression` is sorted by model and lever. `compression_totals` aggregates by
+the closed lever name, and the two `total_compression_*` fields cover the whole
+report. A known target-model tokenizer produces `model_tokenizer`; the
+documented character fallback produces `heuristic`. Both are SBproxy estimates
+rather than provider billing totals. Unknown model pricing records zero gross
+cost while retaining the saved-token count.
+
+The process-wide ledger stores no prompt or summary content. With a configured
+model-host value database it persists in redb. Compression-only deployments
+use a bounded in-memory ledger. After 1,000 model lanes, new model names
+aggregate into `__other__` so an unbounded model string cannot grow Admin state.
 
 ### Managed model operations
 

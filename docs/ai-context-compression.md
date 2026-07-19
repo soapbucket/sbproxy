@@ -1,10 +1,11 @@
 # AI context compression
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-19*
 
-SBproxy can transform an AI chat request through an ordered, per-handler
-compression pipeline before provider selection and dispatch. Use `window_fit`
-for stateless, deterministic compatibility trimming. Add `summary_buffer` when
+SBproxy can transform an AI chat request through an ordered, route-local
+compression pipeline before provider selection and dispatch. A route can keep
+one default pipeline and declare named profiles for different callers. Use
+`window_fit` for stateless, deterministic trimming. Add `summary_buffer` when
 conversations need a compact running summary stored in Redis so gateway
 workers can restart and successive turns can land on different replicas.
 
@@ -50,13 +51,16 @@ original messages are not stored in the record.
 
 `window_fit` needs no session ID and no external state. The hosted request must
 carry a non-empty effective `model`; otherwise the compression pipeline is not
-invoked. It looks up that model's known context window, subtracts
-`completion_reserve_tokens`, preserves a leading system message, and considers
-the remaining messages from newest to oldest. Its compatibility estimator is
-the message's string `content` byte length divided by four, plus one token. A
-message is kept whenever that estimate fits the remaining budget, so an
-oversized newer message can be skipped while an older smaller message is kept.
-Kept messages return to chronological order before dispatch.
+invoked. It has two modes.
+
+- Compatibility mode omits `input_budget_tokens`. It looks up the model's
+  known context window, subtracts `completion_reserve_tokens`, preserves a
+  leading system message, and applies the legacy newest-to-oldest selection
+  heuristic.
+- Explicit-budget mode sets `input_budget_tokens` to a positive integer. It
+  uses the same target-model counter as compression accounting, works for an
+  unknown model, and enforces the smaller of that configured budget and the
+  known model window minus `completion_reserve_tokens`.
 
 ```yaml
 origins:
@@ -71,18 +75,96 @@ origins:
         levers:
           - type: window_fit
             completion_reserve_tokens: 1024
+            input_budget_tokens: 8192
 ```
 
-The completion reserve defaults to `1024`. If the model window is unknown, or
-the compatibility estimate already fits, the lever skips without changing the
-request. This is deliberately the existing `context_compress` behavior, not an
-exact provider tokenizer or a new hard input-budget guarantee. Explicit input
-budget targeting remains separate work.
+The completion reserve defaults to `1024`. In explicit-budget mode, SBproxy
+counts the complete JSON message shape, including provider-specific fields.
+It preserves the contiguous leading `system` and `developer` instruction
+prefix, requires the complete newest protocol unit to fit, and retains a
+contiguous newest suffix. OpenAI assistant tool calls stay grouped with their
+`tool` or `function` results. Anthropic assistant `tool_use` blocks stay grouped
+with the following user `tool_result` blocks. SBproxy never retains half of a
+tool exchange or drops the current turn while keeping stale history.
+
+If the protected prefix plus newest unit cannot fit, the lever skips as
+`not_eligible` and leaves the request unchanged. If the original request
+already fits, it skips as `not_needed`. An explicit budget therefore provides
+a safe trimming target, but it does not authorize dropping protected
+instructions or breaking the provider protocol.
+
+Without `input_budget_tokens`, an unknown model window skips as
+`unknown_model_window`. Compatibility mode keeps its older estimator and
+selection behavior so existing `context_compress` deployments do not change.
 
 The older `resilience.llm_aware.context_compress: true` switch remains a
 compatibility shorthand for a one-lever `window_fit` policy when no explicit
 `compression` block is present. An explicit `compression` block is
 authoritative, including `levers: []`.
+
+## Profiles and request selection
+
+Named profiles live under the route's `compression.profiles` map. Each profile
+has its own `levers` and optional Redis `state`. Profile names contain from 1
+to 64 bytes, start with a lowercase ASCII letter or digit, and then use only
+lowercase ASCII letters, digits, `_`, or `-`. The reserved values `on` and
+`off` cannot be profile names.
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o]
+      compression:
+        levers:
+          - type: window_fit
+            input_budget_tokens: 16384
+        profiles:
+          compact:
+            levers:
+              - type: window_fit
+                input_budget_tokens: 4096
+```
+
+Selectors use one closed grammar:
+
+| Selector | Pipeline |
+|---|---|
+| `on` | Route default `compression.levers` |
+| `off` | No compression |
+| A declared profile name | That profile's pipeline |
+
+One request resolves exactly one selector in this precedence order:
+
+1. `X-Compression` request header.
+2. Governed key `compression_profile`.
+3. CEL action `compression:<selector>`.
+4. Route default, equivalent to `on`.
+
+The request header is the caller override. SBproxy accepts exactly one header
+value, strips it before upstream dispatch, and returns `400` for malformed
+syntax or an undeclared header profile. The governed-key Admin API and static
+configuration reject malformed selector syntax when it is written. If a
+legacy or externally modified governed record contains a malformed or
+undeclared selector, SBproxy disables compression for that request and records
+`invalid_operator`. CEL uses the same safe operator behavior: a malformed or
+undeclared compression action resolves to `off`, while unrelated CEL errors
+still follow `ai_policy.on_error`.
+
+```bash
+# Select the route default.
+curl -H 'X-Compression: on' ...
+
+# Disable compression for this request, even when the key or CEL selects it.
+curl -H 'X-Compression: off' ...
+
+# Select one named route-local profile.
+curl -H 'X-Compression: compact' ...
+```
 
 ## Stateful summary buffering
 
@@ -288,6 +370,9 @@ claiming restart safety or eventual convergence it cannot provide.
 | `compression.state.ttl` | For `summary_buffer` | Positive seconds or human duration |
 | `compression.allow_admin_content_inspection` | No | Default `false`; enables audited Admin-only content inspection for configured origins |
 | `compression.levers` | No | Ordered list; an explicit empty list disables compression |
+| `compression.profiles` | No | Route-local map of named pipelines selectable by a request, governed key, or CEL |
+| `compression.profiles.<name>.state` | For a profile with `summary_buffer` | `redis`; independent of the route default state |
+| `compression.profiles.<name>.levers` | No | Ordered levers for this named profile; an empty list selects no runtime |
 | `summary_buffer.min_tokens` | Yes | Greater than zero |
 | `summary_buffer.retain_recent_messages` | Yes | Greater than zero |
 | `summary_buffer.target_summary_tokens` | Yes | Greater than zero and smaller than `min_tokens` |
@@ -295,6 +380,7 @@ claiming restart safety or eventual convergence it cannot provide.
 | `summary_buffer.summarizer.model` | Yes | Non-empty model allowed by the handler and configured provider |
 | `summary_buffer.summarizer.timeout` | Yes | Positive seconds or human duration |
 | `window_fit.completion_reserve_tokens` | No | Defaults to `1024` |
+| `window_fit.input_budget_tokens` | No | Positive explicit input-message budget, capped by known model capacity |
 
 Unknown fields in the compression policy, state, lever, or summarizer blocks
 are rejected.
@@ -310,17 +396,26 @@ and opaque cursors.
 
 ## Semantic cache interaction
 
-A handler policy that contains `summary_buffer` bypasses semantic-cache reads
-and writes whenever the request has a captured session. The bypass is decided
-before compression runs and remains in effect even when the summary lever later
-skips or fails open. This prevents a session-dependent summary from sharing a
-cached response with another conversation.
+Semantic-cache keys do not currently partition entries by compression
+behavior. SBproxy therefore bypasses both semantic-cache implementations before
+lookup whenever request-time selection could change the prompt. The same
+decision prevents write-back after an upstream response.
 
 | Policy and request | Semantic cache |
 |---|---|
+| Any explicit header, governed-key, or CEL selector | Bypassed for read and write |
+| Route declares one or more named profiles | Bypassed for every request on that route |
+| Route default uses `input_budget_tokens` | Bypassed for every request on that route |
 | `summary_buffer` and captured session | Bypassed for read and write |
-| `summary_buffer` and no captured session | Not bypassed; summary lever skips `missing_session` |
-| `window_fit` only | Not bypassed |
+| Legacy default-only compatibility `window_fit` | Existing cache scope is unchanged |
+| No compression policy | Existing cache scope is unchanged |
+
+The conservative route-wide bypass for named profiles also applies when a
+particular request selects `off` or the default. It closes cross-profile reuse
+without adding a behavior partition to external semantic-cache interfaces.
+An explicit selector bypasses even on a route that only has the default
+pipeline. The legacy default-only path stays compatible unless its stateful
+session rule requires a bypass.
 
 This rule applies to the semantic cache. It does not disable the separate
 idempotency middleware.
@@ -348,6 +443,7 @@ has applied, the original list remains available to a later fallback such as
 | Summarizer times out or provider fails | `failed`, `summarizer_timeout` or `summarizer_provider` | Last committed messages continue |
 | Summary output is empty, malformed, or too large | `failed`, `invalid_summary` | No state write and no message replacement |
 | Candidate is equal or larger by target-model estimate | `skipped`, `no_savings` | Candidate is discarded; only strict reductions apply |
+| Protected prefix or newest protocol unit exceeds an explicit budget | `skipped`, `not_eligible` | Original messages continue unchanged |
 
 Configuration errors are different from runtime degradation. A
 `summary_buffer` without `compression.state`, an unavailable selected runtime
@@ -378,9 +474,13 @@ The request outcome is failure-first:
 
 ## Metrics
 
-All token measurements use the same model-aware SBproxy counter at the runner
+All token measurements use the same target-model SBproxy counter at the runner
 boundary. A lever is applied only when `after_tokens < before_tokens`.
-Skipped and failed levers report zero saved tokens.
+Skipped and failed levers report zero saved tokens. Known OpenAI model families
+use their registered tokenizer. Other model names use the documented
+character-count fallback. Value reports expose this as
+`token_count_precision: model_tokenizer` or `heuristic`; both values remain
+estimates of the provider's eventual billed usage.
 
 The arithmetic is exact relative to that shared estimate. For model families
 without a dedicated tokenizer, the estimator uses its documented conservative
@@ -401,11 +501,14 @@ double-counted in the request distribution.
 | `sbproxy_ai_compression_ratio` | Histogram | `tenant_id`, `api_key_id`, `lever` | Applied `after_tokens / before_tokens` |
 | `sbproxy_ai_compression_duration_seconds` | Histogram | `tenant_id`, `api_key_id`, `lever`, `outcome`, `backend` | Wall-clock duration of every lever invocation |
 | `sbproxy_ai_compression_requests_total` | Counter | `tenant_id`, `api_key_id`, `outcome`, `backend`, `cache_bypass` | One row per executed non-empty compression pipeline |
+| `sbproxy_ai_compression_selection_total` | Counter | `tenant_id`, `source`, `outcome` | Request policy resolutions with closed selection labels |
 | `sbproxy_ai_compression_request_tokens_saved` | Histogram | `tenant_id`, `api_key_id`, `outcome`, `backend` | One initial-minus-final observation per request |
 | `sbproxy_ai_compression_request_levers_run` | Histogram | `tenant_id`, `api_key_id`, `outcome`, `backend` | Number of configured levers executed per request |
 | `sbproxy_ai_compression_state_operations_total` | Counter | `backend`, `operation`, `outcome` | External state operations |
 | `sbproxy_ai_compression_state_operation_duration_seconds` | Histogram | `backend`, `operation`, `outcome` | External state operation latency |
 | `sbproxy_ai_compression_redis_coordination_total` | Counter | `event` | Redis contention and rejected update events |
+| `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Per-lever target-model input tokens avoided on terminal provider success |
+| `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross target-model input cost avoided on terminal provider success, in micro-USD |
 
 `lever` is `summary_buffer` or `window_fit`. `backend` is `redis` or `none`.
 Request `cache_bypass` is `true` or `false`. State `operation` is
@@ -414,6 +517,13 @@ Request `cache_bypass` is `true` or `false`. State `operation` is
 
 Redis coordination `event` values are `contention`, `lease_expiry`,
 `stale_version`, and `fence_rejection`.
+
+Value `token_count_precision` is `model_tokenizer` or `heuristic`. Selection
+`source` is `header`, `governed_key`, `cel_policy`, or
+`route_default`. Its outcome is `selected`, `disabled`, `default`,
+`invalid_operator`, or `rejected`. The route-default selection is emitted when
+the route has request-selectable or explicitly budgeted behavior; legacy
+default-only routes do not gain a new hot-path metric solely from this change.
 
 The `tenant_id` and public `api_key_id` label values pass through the shared
 cardinality budget. Bearer credentials are never used as metric labels.
@@ -458,16 +568,59 @@ sum by (event) (
 sum by (cache_bypass) (
   rate(sbproxy_ai_compression_requests_total[5m])
 )
+
+# Gross compression value delivered by successful provider requests
+sum by (model, lever, token_count_precision) (
+  rate(sbproxy_ai_compression_value_cost_saved_micros_total[5m])
+) / 1000000
 ```
 
 The bundled Prometheus recording rules and alerts include application rate,
 failure ratio, P95 lever latency, saved-token rate, sustained compression
 failures, and state rejections.
 
+## Value accounting and Admin report
+
+Compression savings become delivered value only after the terminal provider
+attempt succeeds with a billable `2xx` response. A failed attempt, cache hit,
+skipped lever, failed lever, or zero-token reduction does not add value. Each
+applied lever is recorded separately against the target model. Gross avoided
+cost prices the saved input tokens at the target model's known input rate. An
+unknown rate keeps the token saving and records zero cost instead of inventing
+a price. Internal summarizer usage remains in the normal usage stream and is
+not subtracted from this gross figure.
+
+The authenticated endpoint `GET /admin/model-host/value` includes stable
+`compression` rows by model and lever, aggregate `compression_totals`,
+`total_compression_tokens_saved`, and
+`total_compression_gross_cost_saved_micros`. Each compression row and each
+per-lever `compression_totals` entry includes `token_count_precision`. The two
+top-level totals can combine both precision classes. The local-serving
+completion totals remain separate, so compression does not fabricate a local
+or cloud completion.
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/value" \
+  | jq '{compression,compression_totals,total_compression_tokens_saved,total_compression_gross_cost_saved_micros}'
+```
+
+When model hosting configures its durable value ledger, compression shares
+that redb ledger. A compression-only process uses a bounded in-memory ledger.
+The ledger keeps at most 1,000 model lanes and aggregates additional model
+names into `__other__`; metric labels pass through the normal cardinality
+budget. Neither surface contains prompt or summary content.
+
 ## Safe summary log event
 
 Every executed non-empty pipeline emits one structured event with
 `event="ai_compression_summary"` on the `ai_compression` tracing target.
+
+Request policy resolution emits a separate content-free event with
+`event="ai_compression_selection"`, `tenant_id`, `source`, and `outcome`.
+Rejected headers and invalid operator selectors add a closed `reason`. The
+event never logs the selector text, bearer value, profile contents, prompt, or
+summary.
 
 | Request result | Level |
 |---|---|
@@ -488,12 +641,47 @@ The top-level fields are `event`, `tenant_id`, `api_key_id`, `outcome`,
 `duration_ms`. `targets` is a JSON-encoded list. A summary target contains
 `lever`, `min_tokens`, `retain_recent_messages`, `target_summary_tokens`, and
 `timeout_ms`; a window-fit target contains `lever` and
-`completion_reserve_tokens`.
+`completion_reserve_tokens`, plus `input_budget_tokens` when configured.
 
 The event never contains message text, generated or prior summary content, raw
 session IDs, record IDs, request bodies, provider credentials, bearer values,
 or other credential material. `api_key_id` is the sanitized public credential
 identifier used for attribution, not a secret.
+
+## Evaluation gate
+
+The standalone harness at
+`sbproxy-bench/harness/context_compression_eval` compares the real off and on
+runner paths with the same target model and original message array. Its
+committed first-party synthetic retrieval and independently authored,
+sanitized coding-agent-shaped fixtures report input, output,
+and saved tokens; quality delta; closed outcome; optional added latency; and a
+deterministic `build`, `borrow`, or `defer` recommendation. CI runs the tests,
+lint checks, and committed-report drift check whenever compression behavior or
+the harness changes.
+
+```bash
+cd sbproxy-bench/harness/context_compression_eval
+cargo test --locked
+cargo run --locked -- check \
+  --input fixtures/ruler-smoke.jsonl \
+  --input fixtures/coding-agent-smoke.jsonl \
+  --provenance fixtures/provenance.json \
+  --input-budget-tokens 192 \
+  --json-report reports/window-fit-smoke.json \
+  --markdown-report reports/window-fit-smoke.md
+```
+
+Adapters for RULER, HELMET, LongBench-v2, and NoLiMa are import-and-report-only.
+They normalize operator-supplied contexts, references, and already generated
+off/on predictions. The harness does not download those suites, run their
+models, or claim an official benchmark score. Keep their data and licenses in
+operator-managed storage, then use each project's official scorer for
+published results. The harness README documents the interchange and provenance
+manifest. This WOR-1922 skeleton does not generate target-model predictions or
+claim that its coding-agent shapes came from production. Official suite runs
+and genuinely captured, sanitized traffic remain follow-up validation tracked
+under WOR-1879.
 
 ## Operational rollout
 

@@ -6,9 +6,10 @@
 # that requests a model outside its allow-list is rejected with 403
 # before any upstream call. Each credential also declares a budget and
 # tags that surface in the sbproxy_ai_key_* metrics so dashboards can
-# attribute spend per team. Clients send their virtual key in the
-# Authorization header; the gateway matches it locally and swaps in the
-# real upstream key before the call.
+# attribute spend per team. The frontend key selects a compact compression
+# profile while the data key disables compression. Clients send their virtual
+# key in the Authorization header; the gateway matches it locally and swaps
+# in the real upstream key before the call.
 #
 # Setup:
 #   export ANTHROPIC_API_KEY=sk-ant-...
@@ -51,6 +52,8 @@
 # Expected behaviour:
 #   The frontend key is rejected with 403 for Sonnet (not on its
 #   models.allow list); the data key gets both Haiku and Sonnet.
+#   Frontend requests use the compact profile unless X-Compression overrides
+#   it. Data requests use off unless the header overrides it.
 #   Requests are tagged in the sbproxy_ai_key_* counters by name and
 #   tags for per-team attribution. The per-credential budget and
 #   rate_limit below are attribution metadata, not per-key enforced
@@ -82,6 +85,18 @@ origins:
             - claude-haiku-4-5
             - claude-sonnet-4-5
 
+      # The default protects an unknown caller with a conservative explicit
+      # budget. Governed credentials below select compact or off.
+      compression:
+        levers:
+          - type: window_fit
+            input_budget_tokens: 4096
+        profiles:
+          compact:
+            levers:
+              - type: window_fit
+                input_budget_tokens: 1024
+
     # Per-team credentials. Each credential's `models.allow` is an
     # enforced per-key gate: a request for a model outside the list
     # gets a 403. The `attrs.budget` and `policies.rate_limit` blocks
@@ -92,6 +107,7 @@ origins:
         type: ai_provider
         provider: anthropic
         key: ${TEAM_FRONTEND_KEY}
+        compression_profile: compact
         attrs:
           project: frontend
           tags: [team-frontend, tier-haiku]
@@ -109,6 +125,7 @@ origins:
         type: ai_provider
         provider: anthropic
         key: ${TEAM_DATA_KEY}
+        compression_profile: off
         attrs:
           project: data
           tags: [team-data, tier-sonnet]

@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-16*
+*Last modified: 2026-07-19*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -812,6 +812,43 @@ Host-wide settings sit on the `serve:` block itself.
 | `engines` | Per-engine provisioning map (`launch`, `image`, `acquire`, `shm_size_gib`). |
 | `max_concurrent_requests` | Cap on concurrently dispatched served-lane requests. |
 | `queue_timeout_ms` | How long a queued request waits for a slot before failover. Default 30000, read only when `max_concurrent_requests` is set. |
+
+## Value delivered
+
+The authenticated `GET /admin/model-host/value` endpoint reports two separate
+sources of value:
+
+- locally served completions priced against each model's configured
+  `reference`;
+- target-model input tokens and gross input cost avoided by each successful
+  context-compression lever.
+
+Compression does not count as a local or cloud completion. The request path
+records it only after the terminal provider attempt returns a billable `2xx`.
+Each `compression` row names the target `model`, closed `lever`,
+`tokens_saved`, `gross_cost_saved_micros`, and `token_count_precision`.
+`compression_totals` aggregates those rows by lever, and the top-level
+`total_compression_tokens_saved` and
+`total_compression_gross_cost_saved_micros` give the complete compression
+total.
+
+The precision value is `model_tokenizer` when the target model resolves to a
+registered tokenizer, or `heuristic` when SBproxy uses its character-count
+fallback. Unknown input pricing yields zero gross cost and keeps the token
+saving. The amount is gross because dedicated summarizer spend remains in the
+normal usage stream instead of being silently netted out.
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/value" \
+  | jq '{models,compression,compression_totals,total_compression_tokens_saved}'
+```
+
+The same endpoint is available when no local model is configured. In that
+compression-only case, the local-serving arrays are empty and compression uses
+a bounded in-memory ledger. A configured model-host value database gives both
+dimensions the existing redb persistence. The ledger caps model lanes at
+1,000 and combines additional names under `__other__`.
 
 ## Artifacts and cache safety
 

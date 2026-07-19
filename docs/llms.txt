@@ -30,6 +30,14 @@ For human-facing documentation, see `docs/architecture.md`, `docs/configuration.
 - alerts.prometheus: PromQL recording and alerting rules under `deploy/alerts/`.
 - observability_stack: reference Compose stack (Prometheus, Grafana, Tempo, Loki, OTel collector, Phoenix, Langfuse) at `examples/observability-stack/`, pre-provisioned with dashboards, alerts, and seeded LLM trace projects.
 
+## AI context compression
+
+- ai_context_compression.profiles: each AI route can declare a default and named compression pipelines selected by `X-Compression`, governed key, CEL, then route default.
+- ai_context_compression.explicit_budget: `window_fit.input_budget_tokens` enforces the smaller of an explicit input target and known model capacity while preserving instructions, the current turn, contiguous history, and tool exchanges.
+- ai_context_compression.state: stateful `summary_buffer` keeps canonical running-summary state in Redis only; the mesh is rejected and workers retain no canonical conversation state.
+- ai_context_compression.value: successful provider requests record per-lever target-model tokens and gross input cost saved in bounded metrics and `GET /admin/model-host/value`, with tokenizer-versus-heuristic precision.
+- ai_context_compression.eval: a deterministic off/on smoke gate covers synthetic retrieval and coding-agent shapes; external benchmark adapters are import-and-report-only.
+
 ## Audit
 
 - admin_audit_envelope: typed `AdminAuditEvent` carrying actor, action, target, before/after diff, reason, request_id, trace_id, ip, and user_agent; emitted by every state-mutating endpoint.
