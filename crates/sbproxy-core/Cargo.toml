@@ -198,5 +198,6 @@ base64.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber.workspace = true
+rcgen.workspace = true
 tempfile = "3"
 loom = "0.7"

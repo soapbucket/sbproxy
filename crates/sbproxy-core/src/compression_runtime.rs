@@ -10,7 +10,7 @@ use sbproxy_ai::compression::{
     SummarizerError, SummaryBufferLever, WindowFitLever,
 };
 use sbproxy_ai::{AiClient, AiHandlerConfig, ProviderConfig};
-use sbproxy_platform::storage::{AsyncRedisConfig, AsyncRedisKVStore};
+use sbproxy_platform::storage::{AsyncRedisConfig, AsyncRedisKVStore, KVStore};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,9 +25,10 @@ struct RuntimeDependencies {
 impl RuntimeDependencies {
     fn from_process(
         server: &sbproxy_config::ProxyServerConfig,
+        l2_store: Option<&dyn KVStore>,
         redis_required: bool,
     ) -> anyhow::Result<Self> {
-        let redis = redis_dependency(server, redis_required)?;
+        let redis = redis_dependency(server, l2_store, redis_required)?;
         let cluster = crate::cluster::current_cluster_handle();
         let writer_node = cluster
             .as_ref()
@@ -42,9 +43,10 @@ impl RuntimeDependencies {
 
     fn for_validation(
         server: &sbproxy_config::ProxyServerConfig,
+        l2_store: Option<&dyn KVStore>,
         redis_required: bool,
     ) -> anyhow::Result<Self> {
-        let redis = redis_dependency(server, redis_required)?;
+        let redis = redis_dependency(server, l2_store, redis_required)?;
         let writer_node = server
             .cluster
             .as_ref()
@@ -69,6 +71,7 @@ impl RuntimeDependencies {
 
 fn redis_dependency(
     server: &sbproxy_config::ProxyServerConfig,
+    l2_store: Option<&dyn KVStore>,
     required: bool,
 ) -> anyhow::Result<Option<Arc<AsyncRedisKVStore>>> {
     if !required {
@@ -76,8 +79,9 @@ fn redis_dependency(
     }
     match server.l2_cache.as_ref() {
         Some(config) if config.driver == "redis" => {
-            let connection =
-                sbproxy_config::build_l2_redis_connection(&config.params).map_err(|_| {
+            let connection = l2_store
+                .and_then(KVStore::validated_redis_connection)
+                .ok_or_else(|| {
                     anyhow::anyhow!("Redis compression state has invalid connection configuration")
                 })?;
             let async_config = AsyncRedisConfig::from_connection(connection);
@@ -91,8 +95,9 @@ fn redis_dependency(
 /// no active origin currently enables `summary_buffer`.
 pub(crate) fn redis_admin_store(
     server: &sbproxy_config::ProxyServerConfig,
+    l2_store: Option<&dyn KVStore>,
 ) -> Option<Arc<dyn CompressionSessionStore>> {
-    let redis = redis_dependency(server, true).ok().flatten()?;
+    let redis = redis_dependency(server, l2_store, true).ok().flatten()?;
     let store = RedisCompressionStore::new(redis, RedisCompressionStoreConfig::default()).ok()?;
     Some(Arc::new(store))
 }
@@ -144,10 +149,11 @@ impl CompressionRuntimeRegistry {
     /// Bind every non-empty effective AI policy to current process dependencies.
     pub fn from_process(
         server: &sbproxy_config::ProxyServerConfig,
+        l2_store: Option<&dyn KVStore>,
         actions: &[sbproxy_modules::Action],
     ) -> anyhow::Result<Self> {
         let dependencies =
-            RuntimeDependencies::from_process(server, actions_require_redis(actions))?;
+            RuntimeDependencies::from_process(server, l2_store, actions_require_redis(actions))?;
         Self::with_dependencies(actions, dependencies)
     }
 
@@ -155,10 +161,11 @@ impl CompressionRuntimeRegistry {
     /// process-global cluster state. The returned registry is discard-only.
     pub(crate) fn for_validation(
         server: &sbproxy_config::ProxyServerConfig,
+        l2_store: Option<&dyn KVStore>,
         actions: &[sbproxy_modules::Action],
     ) -> anyhow::Result<Self> {
         let dependencies =
-            RuntimeDependencies::for_validation(server, actions_require_redis(actions))?;
+            RuntimeDependencies::for_validation(server, l2_store, actions_require_redis(actions))?;
         Self::with_dependencies(actions, dependencies)
     }
 
@@ -566,6 +573,7 @@ mod tests {
         RuntimeDependencies,
     };
     use async_trait::async_trait;
+    use rcgen::{CertificateParams, KeyPair};
     use sbproxy_ai::budget::{BudgetLimit, BudgetScope};
     use sbproxy_ai::compression::{
         CommitError, CompressionBackend, CompressionConsistency, CompressionRecordId,
@@ -577,6 +585,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tempfile::TempDir;
 
     #[derive(Default)]
     struct TestStore {
@@ -788,16 +797,31 @@ mod tests {
         .expect("handler fixture")
     }
 
-    fn generated_redis_identity() -> (String, String) {
-        let tls_config = sbproxy_config::ProxyServerConfig {
-            https_bind_port: Some(443),
-            ..sbproxy_config::ProxyServerConfig::default()
-        };
-        let tls =
-            sbproxy_tls::TlsState::init(&tls_config, vec!["redis-client.example".to_string()])
-                .expect("initialize test TLS state");
-        tls.generate_self_signed_bootstrap_cert()
-            .expect("generate test Redis client identity")
+    struct GeneratedRedisIdentity {
+        _directory: TempDir,
+        cert_file: String,
+        key_file: String,
+    }
+
+    fn generated_redis_identity() -> GeneratedRedisIdentity {
+        let directory = tempfile::tempdir().expect("create Redis identity fixture directory");
+        let key = KeyPair::generate().expect("generate Redis identity fixture key");
+        let certificate = CertificateParams::new(vec!["redis-client.example".to_string()])
+            .expect("configure Redis identity fixture certificate")
+            .self_signed(&key)
+            .expect("self-sign Redis identity fixture certificate");
+        let cert_file = directory.path().join("client.pem");
+        let key_file = directory.path().join("client-key.pem");
+        std::fs::write(&cert_file, certificate.pem())
+            .expect("write Redis identity fixture certificate");
+        std::fs::write(&key_file, key.serialize_pem())
+            .expect("write Redis identity fixture private key");
+
+        GeneratedRedisIdentity {
+            _directory: directory,
+            cert_file: cert_file.to_string_lossy().into_owned(),
+            key_file: key_file.to_string_lossy().into_owned(),
+        }
     }
 
     fn server_with_l2(params: sbproxy_config::L2CacheParams) -> sbproxy_config::ProxyServerConfig {
@@ -811,16 +835,69 @@ mod tests {
     }
 
     #[test]
+    fn compression_reuses_compiled_l2_tls_snapshot_after_source_files_are_removed() {
+        let identity = generated_redis_identity();
+        let cert_file = &identity.cert_file;
+        let key_file = &identity.key_file;
+        let yaml = format!(
+            r#"
+proxy:
+  l2_cache_settings:
+    driver: redis
+    params:
+      dsn: rediss://default:p%40ss@[::1]:6380/7
+      ca_file: '{cert_file}'
+      cert_file: '{cert_file}'
+      key_file: '{key_file}'
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: summary-provider
+          api_key: test-key
+          models: [summary-model]
+      compression:
+        state:
+          backend: redis
+          ttl: 1h
+        levers:
+          - type: summary_buffer
+            min_tokens: 100
+            retain_recent_messages: 2
+            target_summary_tokens: 20
+            summarizer:
+              provider: summary-provider
+              model: summary-model
+              timeout: 2s
+"#
+        );
+        let compiled = sbproxy_config::compile_config(&yaml)
+            .expect("general L2 must compile and snapshot its TLS material");
+        assert!(compiled.l2_store.is_some());
+
+        std::fs::remove_file(cert_file).expect("remove compiled certificate source");
+        std::fs::remove_file(key_file).expect("remove compiled private-key source");
+
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("compression must reuse the compiled L2 snapshot without rereading files");
+        assert!(pipeline.compression_runtimes.get(0).is_some());
+    }
+
+    #[test]
     fn compression_redis_reuses_private_ca_and_mtls_without_network_io() {
-        let (cert_file, key_file) = generated_redis_identity();
+        let identity = generated_redis_identity();
         let server = server_with_l2(sbproxy_config::L2CacheParams {
             dsn: "rediss://default:p%40ss@[::1]:6380/7".to_string(),
-            ca_file: Some(cert_file.clone()),
-            cert_file: Some(cert_file),
-            key_file: Some(key_file),
+            ca_file: Some(identity.cert_file.clone()),
+            cert_file: Some(identity.cert_file.clone()),
+            key_file: Some(identity.key_file.clone()),
         });
+        let l2_store =
+            sbproxy_config::build_l2_store(server.l2_cache.as_ref().expect("L2 configuration"))
+                .expect("compile general L2 store");
 
-        let dependency = redis_dependency(&server, true)
+        let dependency = redis_dependency(&server, Some(l2_store.as_ref()), true)
             .expect("valid Redis TLS configuration must compile without connecting");
 
         assert!(dependency.is_some());
@@ -828,11 +905,11 @@ mod tests {
 
     #[test]
     fn compression_redis_rejects_the_same_tls_mismatch_as_l2_without_disclosure() {
-        let (cert_file, _) = generated_redis_identity();
+        let identity = generated_redis_identity();
         let dsn = "redis://default:sentinel-compression-password@sentinel-compression-host.invalid:6379/7";
         let server = server_with_l2(sbproxy_config::L2CacheParams {
             dsn: dsn.to_string(),
-            ca_file: Some(cert_file),
+            ca_file: Some(identity.cert_file.clone()),
             ..sbproxy_config::L2CacheParams::default()
         });
         let l2_config = server.l2_cache.as_ref().expect("L2 config");
@@ -841,7 +918,7 @@ mod tests {
             Ok(_) => panic!("blocking L2 store accepted plaintext TLS material"),
             Err(error) => error,
         };
-        let compression_error = match redis_dependency(&server, true) {
+        let compression_error = match redis_dependency(&server, None, true) {
             Ok(_) => panic!("compression state accepted plaintext TLS material"),
             Err(error) => error,
         };
@@ -873,7 +950,7 @@ mod tests {
             ..sbproxy_config::ProxyServerConfig::default()
         };
 
-        CompressionRuntimeRegistry::for_validation(&server, &[])
+        CompressionRuntimeRegistry::for_validation(&server, None, &[])
             .expect("unused compression runtime must not narrow the general L2 contract");
     }
 

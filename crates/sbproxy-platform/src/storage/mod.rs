@@ -23,6 +23,17 @@ use bytes::Bytes;
 
 /// Low-level key-value storage. All implementations must be thread-safe.
 pub trait KVStore: Send + Sync + 'static {
+    /// Clone the already-validated Redis connection snapshot, when this store
+    /// is Redis-backed.
+    ///
+    /// Runtime consumers use this internal seam to share one compiled DSN and
+    /// TLS identity without reopening configuration files. Other backends
+    /// retain the default `None` implementation.
+    #[doc(hidden)]
+    fn validated_redis_connection(&self) -> Option<ValidatedRedisConnection> {
+        None
+    }
+
     /// Get a value by key. Returns None if the key does not exist.
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
 

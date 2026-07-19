@@ -247,10 +247,14 @@ origins:
 
 Selecting Redis without `proxy.l2_cache_settings.driver: redis` is a startup
 configuration error. Invalid DSN semantics, invalid TLS field combinations,
-and bad local PEM material are also rejected before serving. Configuration
-validation does not open a network connection. TLS verification,
-authentication, and database selection happen when the lazy compression
-connection is first used.
+and bad local PEM material are also rejected before serving. Each configuration
+compile reads and validates the Redis PEM files once. The general L2 store and
+compression state adapter then clone the same immutable validated connection
+snapshot; constructing compression or admin adapters later does not reopen
+those files. A configuration reload compiles a new snapshot and therefore
+reads the files for that reload. Configuration validation does not open a
+network connection. TLS verification, authentication, and database selection
+happen when the lazy compression connection is first used.
 
 Once the runtime is active, a Redis connection, TLS, authentication, database,
 or command failure makes the stateful lever fail open for that request. The

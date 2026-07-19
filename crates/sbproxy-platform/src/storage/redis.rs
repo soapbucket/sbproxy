@@ -314,6 +314,10 @@ impl RedisKVStore {
 }
 
 impl KVStore for RedisKVStore {
+    fn validated_redis_connection(&self) -> Option<ValidatedRedisConnection> {
+        Some(self.connection.clone())
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.execute(RedisOperation::Get, || {
             let encoded = Self::encode_key(key);
