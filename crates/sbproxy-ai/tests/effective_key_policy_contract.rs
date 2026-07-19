@@ -31,6 +31,7 @@ fn policy() -> EffectiveKeyPolicy {
         allowed_providers: vec!["openai".into(), "vertex".into()],
         blocked_providers: vec!["vertex".into()],
         route_to_model: Some("gpt-4.1".into()),
+        compression_profile: Some("coding-agent".into()),
         principal_selectors: vec![PrincipalSelector {
             team: Some("platform".into()),
             ..PrincipalSelector::default()
@@ -262,6 +263,17 @@ fn registered_enforcement_test(proof: PolicyEnforcementProof) -> EnforcementTest
             ],
             |policy| assert_eq!(policy.route_to_model.as_deref(), Some("gpt-4.1")),
         ),
+        PolicyEnforcementProof::CompressionSelection => ai_dispatch_test(
+            "compression_selector_precedence_is_header_key_cel_then_default",
+            &[
+                "CompressionSelectionSource::Header",
+                "CompressionSelectionSource::GovernedKey",
+                "CompressionSelectionSource::CelPolicy",
+                "CompressionSelectionSource::RouteDefault",
+                "compression_profile()",
+            ],
+            |policy| assert_eq!(policy.compression_profile.as_deref(), Some("coding-agent")),
+        ),
         PolicyEnforcementProof::PrincipalGate => governed_key_e2e_test(
             "dynamic_principal_selectors_gate_live_jwt_requests",
             &[
@@ -393,6 +405,7 @@ fn every_policy_field_registers_a_concrete_enforcement_test() {
             "allowed_providers",
             "blocked_providers",
             "route_to_model",
+            "compression_profile",
             "principal_selectors",
             "require_pii_redaction",
             "allowed_tools",
@@ -421,7 +434,7 @@ fn every_policy_field_registers_a_concrete_enforcement_test() {
             );
         }
     }
-    assert_eq!(registered_assertions.len(), 14);
+    assert_eq!(registered_assertions.len(), 15);
 }
 
 #[test]

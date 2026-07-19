@@ -109,6 +109,17 @@ static COMPRESSION_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("AI compression request counter registers")
 });
 
+static COMPRESSION_SELECTION_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_compression_selection_total",
+            "AI request compression policy resolutions by closed source and outcome"
+        ),
+        &["tenant_id", "source", "outcome"]
+    )
+    .expect("AI compression selection counter registers")
+});
+
 static COMPRESSION_REQUEST_TOKENS_SAVED: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         HistogramOpts::new(
@@ -180,6 +191,17 @@ pub(crate) enum CompressionStateOperation {
     List,
     /// Purge one bounded metadata page.
     Purge,
+}
+
+/// Record one request's policy resolution using closed source and outcome labels.
+pub(crate) fn record_compression_selection(
+    tenant_id: &str,
+    source: &'static str,
+    outcome: &'static str,
+) {
+    COMPRESSION_SELECTION_TOTAL
+        .with_label_values(&[tenant_id, source, outcome])
+        .inc();
 }
 
 impl CompressionStateOperation {
@@ -500,7 +522,7 @@ pub(crate) fn record_compression_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        record_compression_run, record_compression_state_operation,
+        record_compression_run, record_compression_selection, record_compression_state_operation,
         record_redis_compression_coordination, CompressionStateOperation, CompressionStateOutcome,
         RedisCompressionCoordinationEvent,
     };
@@ -580,6 +602,7 @@ mod tests {
                     input_budget_tokens: None,
                 }),
             ],
+            profiles: std::collections::BTreeMap::new(),
         }
     }
 
@@ -704,6 +727,22 @@ mod tests {
         let levers = metric_sample("sbproxy_ai_compression_request_levers_run", &request_labels);
         assert_eq!(levers.1, 1);
         assert_eq!(levers.2, 2.0);
+    }
+
+    #[test]
+    fn policy_selection_metric_uses_only_bounded_dimensions() {
+        let tenant = "compression-selection-tenant";
+        let labels = [
+            ("tenant_id", tenant),
+            ("source", "governed_key"),
+            ("outcome", "disabled"),
+        ];
+        let before = metric_sample("sbproxy_ai_compression_selection_total", &labels).0;
+
+        record_compression_selection(tenant, "governed_key", "disabled");
+
+        let after = metric_sample("sbproxy_ai_compression_selection_total", &labels).0;
+        assert_eq!(after - before, 1.0);
     }
 
     #[test]

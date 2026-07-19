@@ -151,6 +151,7 @@ pub fn key_record_to_effective_policy(
         allowed_providers: record.allowed_providers.clone(),
         blocked_providers: record.blocked_providers.clone(),
         route_to_model: record.route_to_model.clone(),
+        compression_profile: record.compression_profile.clone(),
         principal_selectors,
         require_pii_redaction: record.require_pii_redaction.clone(),
         allowed_tools: record.allowed_tools.clone(),

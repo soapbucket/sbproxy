@@ -23,7 +23,8 @@
 //! ```
 //!
 //! Recognized action tokens (the closed set): `allow`, `block`, `redact`,
-//! `route_to:<model>`, `set_sink_tag:<tag>`, `audit:<priority>`. The
+//! `route_to:<model>`, `compression:<selector>`, `set_sink_tag:<tag>`,
+//! `audit:<priority>`. The
 //! expression is compiled (syntax-validated) when the policy is built; an
 //! unrecognized token or a non-string/list result at evaluation time falls
 //! back to the configured `on_error` action (default `allow`, i.e.
@@ -45,6 +46,8 @@ pub enum AiPolicyAction {
     Redact,
     /// Force the request onto a specific model.
     RouteTo(String),
+    /// Select a route-local request compression pipeline.
+    Compression(crate::compression::CompressionSelector),
     /// Tag the usage record emitted for this request.
     SetSinkTag(String),
     /// Emit an audit event at the given priority.
@@ -62,6 +65,9 @@ impl AiPolicyAction {
             }
             return match name.trim() {
                 "route_to" => Ok(Self::RouteTo(arg.to_string())),
+                "compression" => Ok(Self::Compression(
+                    crate::compression::CompressionSelector::parse(arg)?,
+                )),
                 "set_sink_tag" => Ok(Self::SetSinkTag(arg.to_string())),
                 "audit" => Ok(Self::Audit(arg.to_string())),
                 other => anyhow::bail!("unknown ai policy action '{other}'"),
@@ -96,6 +102,13 @@ impl AiPolicyDecision {
     pub fn route_model(&self) -> Option<&str> {
         self.actions.iter().find_map(|a| match a {
             AiPolicyAction::RouteTo(m) => Some(m.as_str()),
+            _ => None,
+        })
+    }
+    /// The first compression selector to apply, if any.
+    pub fn compression_selector(&self) -> Option<&crate::compression::CompressionSelector> {
+        self.actions.iter().find_map(|action| match action {
+            AiPolicyAction::Compression(selector) => Some(selector),
             _ => None,
         })
     }
@@ -360,6 +373,12 @@ mod tests {
             AiPolicyAction::parse("audit:high").unwrap(),
             AiPolicyAction::Audit("high".into())
         );
+        assert_eq!(
+            AiPolicyAction::parse("compression:coding-agent").unwrap(),
+            AiPolicyAction::Compression(crate::compression::CompressionSelector::Profile(
+                "coding-agent".into()
+            ))
+        );
         assert!(AiPolicyAction::parse("nonsense").is_err());
         assert!(AiPolicyAction::parse("route_to:").is_err());
     }
@@ -412,6 +431,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.evaluate(&view).route_model(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn decision_exposes_first_compression_selector() {
+        let p = policy(r#"["compression:off", "compression:coding-agent"]"#);
+        let decision = p.evaluate(&AiDecisionView::default());
+
+        assert_eq!(
+            decision.compression_selector(),
+            Some(&crate::compression::CompressionSelector::Off)
+        );
     }
 
     #[test]

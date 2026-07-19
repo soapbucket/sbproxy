@@ -5,12 +5,14 @@ use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use sbproxy_ai::compression::{
     CompressionLever, CompressionLeverConfig, CompressionPolicy, CompressionRequest,
-    CompressionRequestControls, CompressionRun, CompressionRunner, CompressionSessionStore,
-    CompressionStateBackend, InternalSummarizer, SummarizationOutput, SummarizationRequest,
-    SummarizerError, SummaryBufferLever, WindowFitLever,
+    CompressionRequestControls, CompressionRun, CompressionRunner, CompressionSelector,
+    CompressionSessionStore, CompressionStateBackend, InternalSummarizer, SummarizationOutput,
+    SummarizationRequest, SummarizerError, SummaryBufferLever, WindowFitLever,
 };
 use sbproxy_ai::{AiClient, AiHandlerConfig, ProviderConfig};
 use sbproxy_platform::storage::{AsyncRedisConfig, AsyncRedisKVStore, KVStore};
+use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,6 +113,38 @@ pub struct CompressionRuntime {
     writer_node: String,
 }
 
+#[derive(Clone)]
+struct CompiledCompressionPipeline {
+    runtime: Option<Arc<CompressionRuntime>>,
+    behavior_fingerprint: Arc<str>,
+}
+
+/// Immutable default and named compression pipelines for one AI origin.
+pub struct CompressionRuntimeSet {
+    default: CompiledCompressionPipeline,
+    off: CompiledCompressionPipeline,
+    profiles: BTreeMap<String, CompiledCompressionPipeline>,
+}
+
+/// One request-pinned compression pipeline and its cache partition.
+#[derive(Clone)]
+pub struct SelectedCompressionRuntime {
+    runtime: Option<Arc<CompressionRuntime>>,
+    behavior_fingerprint: Arc<str>,
+}
+
+impl SelectedCompressionRuntime {
+    /// Selected runtime, absent for `off` and declared empty profiles.
+    pub fn runtime(&self) -> Option<&Arc<CompressionRuntime>> {
+        self.runtime.as_ref()
+    }
+
+    /// Stable policy behavior identity used to partition semantic caches.
+    pub fn behavior_fingerprint(&self) -> &str {
+        &self.behavior_fingerprint
+    }
+}
+
 /// Immutable request-specific identity, governance, and message-shape inputs.
 pub struct CompressionExecution<'a> {
     /// Effective primary model used for before/after token accounting.
@@ -142,7 +176,7 @@ pub struct CompressionExecution<'a> {
 /// Per-origin compression runtimes parallel to a compiled pipeline's actions.
 #[derive(Default)]
 pub struct CompressionRuntimeRegistry {
-    by_origin: Vec<Option<Arc<CompressionRuntime>>>,
+    by_origin: Vec<Option<Arc<CompressionRuntimeSet>>>,
 }
 
 impl CompressionRuntimeRegistry {
@@ -183,23 +217,24 @@ impl CompressionRuntimeRegistry {
                 by_origin.push(None);
                 continue;
             };
-            if policy.levers.is_empty() {
-                by_origin.push(None);
-                continue;
-            }
-            let runtime = CompressionRuntime::build(
+            let runtime_set = CompressionRuntimeSet::build(
                 policy.into_owned(),
                 &action.config,
                 dependencies.clone(),
             )
             .context("building AI compression runtime")?;
-            by_origin.push(Some(Arc::new(runtime)));
+            by_origin.push(Some(Arc::new(runtime_set)));
         }
         Ok(Self { by_origin })
     }
 
-    /// Return the runtime pinned to one compiled origin, if enabled.
+    /// Return the default runtime pinned to one compiled origin, if enabled.
     pub fn get(&self, origin_idx: usize) -> Option<&Arc<CompressionRuntime>> {
+        self.get_set(origin_idx)?.default.runtime.as_ref()
+    }
+
+    /// Return all compiled compression choices for one origin.
+    pub fn get_set(&self, origin_idx: usize) -> Option<&Arc<CompressionRuntimeSet>> {
         self.by_origin.get(origin_idx).and_then(Option::as_ref)
     }
 
@@ -222,13 +257,132 @@ fn actions_require_redis(actions: &[sbproxy_modules::Action]) -> bool {
         action
             .config
             .effective_compression_policy()
-            .is_some_and(|policy| {
-                policy
-                    .levers
-                    .iter()
-                    .any(|lever| matches!(lever, CompressionLeverConfig::SummaryBuffer(_)))
-            })
+            .is_some_and(|policy| policy_requires_redis(&policy))
     })
+}
+
+fn policy_requires_redis(policy: &CompressionPolicy) -> bool {
+    pipeline_requires_redis(&policy.levers)
+        || policy
+            .profiles
+            .values()
+            .any(|profile| pipeline_requires_redis(&profile.levers))
+}
+
+fn pipeline_requires_redis(levers: &[CompressionLeverConfig]) -> bool {
+    levers
+        .iter()
+        .any(|lever| matches!(lever, CompressionLeverConfig::SummaryBuffer(_)))
+}
+
+impl CompressionRuntimeSet {
+    fn build(
+        policy: CompressionPolicy,
+        handler: &AiHandlerConfig,
+        dependencies: RuntimeDependencies,
+    ) -> anyhow::Result<Self> {
+        let default_policy = CompressionPolicy {
+            state: policy.state,
+            allow_admin_content_inspection: policy.allow_admin_content_inspection,
+            levers: policy.levers,
+            profiles: BTreeMap::new(),
+        };
+        let default = compile_pipeline(default_policy, handler, dependencies.clone())?;
+        let off = compile_pipeline(
+            CompressionPolicy {
+                state: None,
+                allow_admin_content_inspection: policy.allow_admin_content_inspection,
+                levers: Vec::new(),
+                profiles: BTreeMap::new(),
+            },
+            handler,
+            dependencies.clone(),
+        )?;
+        let mut profiles = BTreeMap::new();
+        for (name, profile) in policy.profiles {
+            let profile_policy = CompressionPolicy {
+                state: profile.state,
+                allow_admin_content_inspection: policy.allow_admin_content_inspection,
+                levers: profile.levers,
+                profiles: BTreeMap::new(),
+            };
+            profiles.insert(
+                name,
+                compile_pipeline(profile_policy, handler, dependencies.clone())?,
+            );
+        }
+        Ok(Self {
+            default,
+            off,
+            profiles,
+        })
+    }
+
+    /// Resolve a validated selector. `None` means an undeclared profile.
+    pub fn select(&self, selector: &CompressionSelector) -> Option<SelectedCompressionRuntime> {
+        let compiled = match selector {
+            CompressionSelector::On => &self.default,
+            CompressionSelector::Off => &self.off,
+            CompressionSelector::Profile(name) => self.profiles.get(name)?,
+        };
+        Some(SelectedCompressionRuntime {
+            runtime: compiled.runtime.clone(),
+            behavior_fingerprint: compiled.behavior_fingerprint.clone(),
+        })
+    }
+
+    /// Resolve the route default.
+    pub fn select_default(&self) -> SelectedCompressionRuntime {
+        self.select(&CompressionSelector::On)
+            .expect("the compiled default pipeline is always present")
+    }
+
+    /// Iterate active runtimes for administrative state discovery.
+    pub(crate) fn runtimes(&self) -> impl Iterator<Item = &Arc<CompressionRuntime>> {
+        self.default.runtime.iter().chain(
+            self.profiles
+                .values()
+                .filter_map(|profile| profile.runtime.as_ref()),
+        )
+    }
+}
+
+fn compile_pipeline(
+    policy: CompressionPolicy,
+    handler: &AiHandlerConfig,
+    dependencies: RuntimeDependencies,
+) -> anyhow::Result<CompiledCompressionPipeline> {
+    let behavior_fingerprint = Arc::<str>::from(policy_behavior_fingerprint(&policy)?);
+    let runtime = if policy.levers.is_empty() {
+        None
+    } else {
+        Some(Arc::new(CompressionRuntime::build(
+            policy,
+            handler,
+            dependencies,
+        )?))
+    };
+    Ok(CompiledCompressionPipeline {
+        runtime,
+        behavior_fingerprint,
+    })
+}
+
+fn policy_behavior_fingerprint(policy: &CompressionPolicy) -> anyhow::Result<String> {
+    #[derive(serde::Serialize)]
+    struct Behavior<'a> {
+        contract_version: u8,
+        state: &'a Option<sbproxy_ai::compression::CompressionStateConfig>,
+        levers: &'a [CompressionLeverConfig],
+    }
+
+    let bytes = serde_json::to_vec(&Behavior {
+        contract_version: 1,
+        state: &policy.state,
+        levers: &policy.levers,
+    })
+    .context("serializing compression behavior")?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 impl fmt::Debug for CompressionRuntime {
@@ -569,8 +723,8 @@ fn destination_allowed(value: &str, allowed: &[String], blocked: &[String]) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        redis_dependency, CompressionExecution, CompressionRuntime, CompressionRuntimeRegistry,
-        RuntimeDependencies,
+        policy_requires_redis, redis_dependency, CompressionExecution, CompressionRuntime,
+        CompressionRuntimeRegistry, CompressionRuntimeSet, RuntimeDependencies,
     };
     use async_trait::async_trait;
     use rcgen::{CertificateParams, KeyPair};
@@ -991,6 +1145,109 @@ origins:
                 .expect("stateless runtime builds");
 
         assert!(!runtime.has_stateful_summary());
+    }
+
+    #[test]
+    fn runtime_set_compiles_default_named_and_disabled_profiles_once() {
+        let handler = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "test-key"}],
+            "compression": {
+                "levers": [{"type": "window_fit", "input_budget_tokens": 4_096}],
+                "profiles": {
+                    "disabled": {"levers": []},
+                    "tight": {
+                        "levers": [{"type": "window_fit", "input_budget_tokens": 512}]
+                    }
+                }
+            }
+        }))
+        .expect("handler fixture");
+        let set = CompressionRuntimeSet::build(
+            handler
+                .effective_compression_policy()
+                .expect("compression policy")
+                .into_owned(),
+            &handler,
+            RuntimeDependencies::empty_for_test(),
+        )
+        .expect("runtime set");
+
+        let default = set
+            .select(&sbproxy_ai::compression::CompressionSelector::On)
+            .unwrap();
+        let off = set
+            .select(&sbproxy_ai::compression::CompressionSelector::Off)
+            .unwrap();
+        let disabled = set
+            .select(&sbproxy_ai::compression::CompressionSelector::Profile(
+                "disabled".into(),
+            ))
+            .unwrap();
+        let tight = set
+            .select(&sbproxy_ai::compression::CompressionSelector::Profile(
+                "tight".into(),
+            ))
+            .unwrap();
+
+        assert!(default.runtime().is_some());
+        assert!(off.runtime().is_none());
+        assert!(disabled.runtime().is_none());
+        assert!(tight.runtime().is_some());
+        assert_ne!(default.behavior_fingerprint(), tight.behavior_fingerprint());
+        assert_eq!(off.behavior_fingerprint(), disabled.behavior_fingerprint());
+        assert!(set
+            .select(&sbproxy_ai::compression::CompressionSelector::Profile(
+                "undeclared".into()
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn named_summary_profiles_require_redis_even_when_default_is_empty() {
+        let handler = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "summary-provider",
+                "api_key": "test-key",
+                "models": ["summary-model"]
+            }],
+            "compression": {
+                "levers": [],
+                "profiles": {
+                    "stateful": {
+                        "state": {"backend": "redis", "ttl": "1h"},
+                        "levers": [{
+                            "type": "summary_buffer",
+                            "min_tokens": 100,
+                            "retain_recent_messages": 2,
+                            "target_summary_tokens": 20,
+                            "summarizer": {
+                                "provider": "summary-provider",
+                                "model": "summary-model",
+                                "timeout": "2s"
+                            }
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("handler fixture");
+        let policy = handler
+            .effective_compression_policy()
+            .expect("compression policy")
+            .into_owned();
+        assert!(policy_requires_redis(&policy));
+
+        let error = match CompressionRuntimeSet::build(
+            policy,
+            &handler,
+            RuntimeDependencies::empty_for_test(),
+        ) {
+            Ok(_) => panic!("named stateful profile needs Redis"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("Redis compression state requires"));
     }
 
     #[test]

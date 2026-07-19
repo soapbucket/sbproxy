@@ -496,6 +496,7 @@ fn lower_seed_key(
     rec.require_pii_redaction = seed.require_pii_redaction.clone();
     rec.principal_selectors = seed.principal_selectors.clone();
     rec.route_to_model = seed.route_to_model.clone();
+    rec.compression_profile = seed.compression_profile.clone();
     rec.inject_tools = seed.inject_tools.clone();
     rec.inject_mcp = seed.inject_mcp.clone();
     rec.bypass_prompt_injection = seed.bypass_prompt_injection;
@@ -858,6 +859,7 @@ mod tests {
                 require_pii_redaction: vec![],
                 principal_selectors: vec![],
                 route_to_model: None,
+                compression_profile: Some("coding-agent".into()),
                 inject_tools: vec![],
                 inject_mcp: Some(serde_json::json!({ "ref": "toolhub" })),
                 bypass_prompt_injection: false,
@@ -897,6 +899,7 @@ mod tests {
         assert_eq!(rec.priority.as_deref(), Some("interactive"));
         assert_eq!(rec.allowed_providers, ["openai", "vertex"]);
         assert_eq!(rec.blocked_providers, ["vertex"]);
+        assert_eq!(rec.compression_profile.as_deref(), Some("coding-agent"));
         assert_eq!(rec.allowed_tools, Some(vec!["search".to_string()]));
         assert_eq!(
             rec.inject_mcp,
@@ -977,6 +980,7 @@ mod tests {
                 require_pii_redaction: vec![],
                 principal_selectors: vec![],
                 route_to_model: None,
+                compression_profile: None,
                 inject_tools: vec![],
                 inject_mcp: None,
                 bypass_prompt_injection: false,

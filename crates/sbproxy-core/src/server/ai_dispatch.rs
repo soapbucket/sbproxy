@@ -70,6 +70,7 @@ fn effective_policy_to_virtual_key(
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         route_to_model: policy.route_to_model.clone(),
+        compression_profile: policy.compression_profile.clone(),
         inject_tools: policy.inject_tools.clone(),
         inject_mcp: policy.inject_mcp.as_ref().map(|reference| {
             sbproxy_ai::identity::InjectMcpRef {
@@ -99,6 +100,167 @@ struct ResolvedRequestKey {
     virtual_key: sbproxy_ai::identity::VirtualKeyConfig,
     effective_policy: Option<sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
     policy_origin: ResolvedPolicyOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionSelectionSource {
+    Header,
+    GovernedKey,
+    CelPolicy,
+    RouteDefault,
+}
+
+impl CompressionSelectionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::GovernedKey => "governed_key",
+            Self::CelPolicy => "cel_policy",
+            Self::RouteDefault => "route_default",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompressionSelectionIntent {
+    selector: sbproxy_ai::compression::CompressionSelector,
+    source: CompressionSelectionSource,
+    invalid_operator_selector: bool,
+}
+
+struct BoundCompressionSelection {
+    selected: Option<crate::compression_runtime::SelectedCompressionRuntime>,
+    source: CompressionSelectionSource,
+    invalid_operator_selector: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionSelectionError {
+    InvalidHeader,
+    UnknownHeaderProfile,
+}
+
+impl CompressionSelectionError {
+    const fn client_message(self) -> &'static str {
+        match self {
+            Self::InvalidHeader => {
+                "x-compression must contain exactly one of on, off, or a valid profile name"
+            }
+            Self::UnknownHeaderProfile => "x-compression selects an undeclared profile",
+        }
+    }
+}
+
+fn compression_header_value(
+    headers: &http::HeaderMap,
+) -> Result<Option<String>, CompressionSelectionError> {
+    let mut values = headers.get_all("x-compression").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(CompressionSelectionError::InvalidHeader);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| CompressionSelectionError::InvalidHeader)?
+        .trim();
+    Ok(Some(value.to_string()))
+}
+
+fn resolve_compression_selection_intent(
+    header: Option<&str>,
+    governed_key: Option<&str>,
+    cel: Option<&sbproxy_ai::compression::CompressionSelector>,
+) -> Result<CompressionSelectionIntent, CompressionSelectionError> {
+    if let Some(header) = header {
+        let selector = sbproxy_ai::compression::CompressionSelector::parse(header)
+            .map_err(|_| CompressionSelectionError::InvalidHeader)?;
+        return Ok(CompressionSelectionIntent {
+            selector,
+            source: CompressionSelectionSource::Header,
+            invalid_operator_selector: false,
+        });
+    }
+    if let Some(governed_key) = governed_key {
+        return Ok(
+            match sbproxy_ai::compression::CompressionSelector::parse(governed_key) {
+                Ok(selector) => CompressionSelectionIntent {
+                    selector,
+                    source: CompressionSelectionSource::GovernedKey,
+                    invalid_operator_selector: false,
+                },
+                Err(_) => CompressionSelectionIntent {
+                    selector: sbproxy_ai::compression::CompressionSelector::Off,
+                    source: CompressionSelectionSource::GovernedKey,
+                    invalid_operator_selector: true,
+                },
+            },
+        );
+    }
+    if let Some(cel) = cel {
+        return Ok(CompressionSelectionIntent {
+            selector: cel.clone(),
+            source: CompressionSelectionSource::CelPolicy,
+            invalid_operator_selector: false,
+        });
+    }
+    Ok(CompressionSelectionIntent {
+        selector: sbproxy_ai::compression::CompressionSelector::On,
+        source: CompressionSelectionSource::RouteDefault,
+        invalid_operator_selector: false,
+    })
+}
+
+fn bind_compression_selection(
+    mut intent: CompressionSelectionIntent,
+    runtime_set: Option<&crate::compression_runtime::CompressionRuntimeSet>,
+) -> Result<BoundCompressionSelection, CompressionSelectionError> {
+    let selected = if let Some(runtime_set) = runtime_set {
+        match runtime_set.select(&intent.selector) {
+            Some(selected) => Some(selected),
+            None if intent.source == CompressionSelectionSource::Header => {
+                return Err(CompressionSelectionError::UnknownHeaderProfile);
+            }
+            None => {
+                intent.invalid_operator_selector = true;
+                runtime_set.select(&sbproxy_ai::compression::CompressionSelector::Off)
+            }
+        }
+    } else {
+        match &intent.selector {
+            sbproxy_ai::compression::CompressionSelector::Profile(_)
+                if intent.source == CompressionSelectionSource::Header =>
+            {
+                return Err(CompressionSelectionError::UnknownHeaderProfile);
+            }
+            sbproxy_ai::compression::CompressionSelector::Profile(_) => {
+                intent.invalid_operator_selector = true;
+                None
+            }
+            sbproxy_ai::compression::CompressionSelector::On
+            | sbproxy_ai::compression::CompressionSelector::Off => None,
+        }
+    };
+    Ok(BoundCompressionSelection {
+        selected,
+        source: intent.source,
+        invalid_operator_selector: intent.invalid_operator_selector,
+    })
+}
+
+fn compression_cache_scope(base: String, behavior_fingerprint: Option<&str>) -> String {
+    match behavior_fingerprint {
+        Some(fingerprint) => format!("{base}:compression:{fingerprint}"),
+        None => base,
+    }
+}
+
+fn compression_cache_origin(origin: &str, behavior_fingerprint: Option<&str>) -> String {
+    behavior_fingerprint.map_or_else(
+        || origin.to_string(),
+        |fingerprint| format!("{origin}|sbproxy-compression={fingerprint}"),
+    )
 }
 
 impl ResolvedRequestKey {
@@ -214,6 +376,13 @@ impl ResolvedRequestKey {
         self.policy().map_or_else(
             || self.virtual_key.route_to_model.as_deref(),
             |policy| policy.route_to_model.as_deref(),
+        )
+    }
+
+    fn compression_profile(&self) -> Option<&str> {
+        self.policy().map_or_else(
+            || self.virtual_key.compression_profile.as_deref(),
+            |policy| policy.compression_profile.as_deref(),
         )
     }
 
@@ -2927,6 +3096,7 @@ pub(super) async fn handle_ai_proxy(
     // its closed action set (block / redact / route_to / set_sink_tag /
     // audit). Default off: the hook only runs when an `ai_policy` block is
     // configured and compiled. A policy bug fails open (see `on_error`).
+    let mut cel_compression_selector = None;
     if let Some(policy) = config.ai_policy() {
         let view = sbproxy_ai::ai_policy::AiDecisionView {
             surface: surface_label.to_string(),
@@ -2994,20 +3164,108 @@ pub(super) async fn handle_ai_proxy(
         if let Some(tag) = decision.sink_tag() {
             ctx.ai_policy_sink_tag = Some(tag.to_string());
         }
+        cel_compression_selector = decision.compression_selector().cloned();
     }
 
     ctx.ai_logical_model = (!model.is_empty()).then(|| model.clone());
 
-    // Resolve the compression runtime from the request-pinned pipeline before
-    // any semantic-cache implementation can read or create write-on-miss
-    // state. A captured-session summary policy is conservatively non-cacheable
-    // even if the lever later skips or fails open.
-    let compression_runtime = origin_idx
-        .and_then(|index| pipeline.compression_runtimes.get(index))
+    // Resolve one immutable compression pipeline before either semantic-cache
+    // implementation can read or create write-on-miss state.
+    let compression_header = match compression_header_value(&session.req_header().headers) {
+        Ok(value) => value,
+        Err(error) => {
+            crate::compression_metrics::record_compression_selection(
+                ctx.tenant_id.as_str(),
+                "header",
+                "rejected",
+            );
+            let body = serde_json::json!({
+                "error": {
+                    "message": error.client_message(),
+                    "type": "invalid_request_error",
+                    "code": "invalid_compression_selector"
+                }
+            });
+            let body = serde_json::to_vec(&body).unwrap_or_default();
+            send_response(session, 400, "application/json", &body).await?;
+            return Ok(());
+        }
+    };
+    let runtime_set = origin_idx.and_then(|index| pipeline.compression_runtimes.get_set(index));
+    let intent = resolve_compression_selection_intent(
+        compression_header.as_deref(),
+        resolved_request_vk
+            .as_ref()
+            .and_then(ResolvedRequestKey::compression_profile),
+        cel_compression_selector.as_ref(),
+    )
+    .expect("validated header parsing is stable");
+    let explicit_compression_selection = compression_header.is_some()
+        || resolved_request_vk
+            .as_ref()
+            .and_then(ResolvedRequestKey::compression_profile)
+            .is_some()
+        || cel_compression_selector.is_some();
+    let bound = match bind_compression_selection(intent, runtime_set.map(|set| set.as_ref())) {
+        Ok(bound) => bound,
+        Err(error) => {
+            crate::compression_metrics::record_compression_selection(
+                ctx.tenant_id.as_str(),
+                "header",
+                "rejected",
+            );
+            let body = serde_json::json!({
+                "error": {
+                    "message": error.client_message(),
+                    "type": "invalid_request_error",
+                    "code": "invalid_compression_selector"
+                }
+            });
+            let body = serde_json::to_vec(&body).unwrap_or_default();
+            send_response(session, 400, "application/json", &body).await?;
+            return Ok(());
+        }
+    };
+    if bound.invalid_operator_selector {
+        warn!(
+            compression.source = bound.source.as_str(),
+            compression.reason = "invalid_or_undeclared_operator_selector",
+            "AI compression: operator selector disabled compression"
+        );
+    }
+    let compression_runtime = bound
+        .selected
+        .as_ref()
+        .and_then(|selected| selected.runtime())
         .cloned();
+    let compression_behavior_fingerprint = bound
+        .selected
+        .as_ref()
+        .map(|selected| selected.behavior_fingerprint().to_string());
+    if runtime_set.is_some() || explicit_compression_selection {
+        let outcome = if bound.invalid_operator_selector {
+            "invalid_operator"
+        } else if compression_runtime.is_some() {
+            "selected"
+        } else {
+            "disabled"
+        };
+        crate::compression_metrics::record_compression_selection(
+            ctx.tenant_id.as_str(),
+            bound.source.as_str(),
+            outcome,
+        );
+        info!(
+            compression.source = bound.source.as_str(),
+            compression.outcome = outcome,
+            "AI compression: request policy resolved"
+        );
+    }
     let compression_cache_bypass = compression_runtime
         .as_ref()
         .is_some_and(|runtime| runtime.bypasses_semantic_cache(ctx.session_id.is_some()));
+    let semantic_cache_origin =
+        compression_cache_origin(hostname, compression_behavior_fingerprint.as_deref());
 
     // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
     //
@@ -3039,7 +3297,7 @@ pub(super) async fn handle_ai_proxy(
                     Some(model.clone())
                 };
                 let lookup_req = crate::hooks::LookupRequest {
-                    origin: hostname.to_string(),
+                    origin: semantic_cache_origin.clone(),
                     model_id: model_id.clone(),
                     prompt: extracted_prompt.clone(),
                     request_headers: snapshot_request_headers(session),
@@ -3101,6 +3359,7 @@ pub(super) async fn handle_ai_proxy(
                         outcome.cacheable_status,
                         outcome.max_response_size,
                         model_id,
+                        semantic_cache_origin.clone(),
                     ));
                 }
             }
@@ -3124,6 +3383,8 @@ pub(super) async fn handle_ai_proxy(
                 ctx.tenant_id.as_str(),
                 req_header_value(session, "authorization").as_deref(),
             );
+            let cache_scope =
+                compression_cache_scope(cache_scope, compression_behavior_fingerprint.as_deref());
             if !extracted_prompt.is_empty() {
                 // WOR-1223: vectorize the prompt via the configured source.
                 // Provider hits the embedding API (costs money, egresses the
@@ -4445,8 +4706,9 @@ pub(super) async fn handle_ai_proxy(
             // we do hand the same key to the streaming cache recorder
             // so the enterprise impl can record the chunk stream
             // against it.
-            let semcache_key: Option<String> =
-                semcache_miss.as_ref().map(|(_, key, _, _, _)| key.clone());
+            let semcache_key: Option<String> = semcache_miss
+                .as_ref()
+                .map(|(_, key, _, _, _, _)| key.clone());
             let _ = semcache_miss;
             // SSE event-shape translation for non-OpenAI providers
             //. When the upstream emits Anthropic
@@ -5186,7 +5448,7 @@ pub(super) async fn relay_ai_response_with_cache(
     // the client disconnects mid-body. `store` is async but non-blocking
     // for our purposes: the Redis-backed implementation already uses
     // `spawn_blocking` internally.
-    if let Some((hook, key, cacheable_status, max_size, model_id)) = miss_info {
+    if let Some((hook, key, cacheable_status, max_size, model_id, cache_origin)) = miss_info {
         let status_ok = if cacheable_status.is_empty() {
             status == 200
         } else {
@@ -5201,7 +5463,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 cached_at: std::time::SystemTime::now(),
             };
             let store_req = crate::hooks::StoreRequest {
-                origin: hostname.to_string(),
+                origin: cache_origin,
                 model_id,
                 key: key.clone(),
             };
@@ -7535,6 +7797,129 @@ mod request_policy_tests {
                 Err(CallerToolPolicyError::Malformed)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod compression_selection_tests {
+    use super::{
+        bind_compression_selection, compression_cache_origin, compression_cache_scope,
+        compression_header_value, resolve_compression_selection_intent, CompressionSelectionError,
+        CompressionSelectionSource, ResolvedRequestKey,
+    };
+    use http::{HeaderMap, HeaderValue};
+    use sbproxy_ai::compression::CompressionSelector;
+
+    #[test]
+    fn compression_selector_precedence_is_header_key_cel_then_default() {
+        let cel = CompressionSelector::Profile("cel-profile".into());
+        let header =
+            resolve_compression_selection_intent(Some("off"), Some("key-profile"), Some(&cel))
+                .unwrap();
+        assert_eq!(header.source, CompressionSelectionSource::Header);
+        assert_eq!(header.selector, CompressionSelector::Off);
+
+        let governed_key =
+            resolve_compression_selection_intent(None, Some("key-profile"), Some(&cel)).unwrap();
+        assert_eq!(governed_key.source, CompressionSelectionSource::GovernedKey);
+        assert_eq!(
+            governed_key.selector,
+            CompressionSelector::Profile("key-profile".into())
+        );
+
+        let cel_policy = resolve_compression_selection_intent(None, None, Some(&cel)).unwrap();
+        assert_eq!(cel_policy.source, CompressionSelectionSource::CelPolicy);
+        assert_eq!(cel_policy.selector, cel);
+
+        let route_default = resolve_compression_selection_intent(None, None, None).unwrap();
+        assert_eq!(
+            route_default.source,
+            CompressionSelectionSource::RouteDefault
+        );
+        assert_eq!(route_default.selector, CompressionSelector::On);
+
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "test"}],
+            "virtual_keys": [{
+                "key": "sb_test",
+                "key_id": "key_01",
+                "compression_profile": "off"
+            }]
+        }))
+        .unwrap();
+        let resolved = ResolvedRequestKey::from_configured(
+            config.virtual_keys.into_iter().next().unwrap(),
+            "tenant-a",
+        );
+        assert_eq!(resolved.compression_profile(), Some("off"));
+    }
+
+    #[test]
+    fn malformed_or_unknown_operator_selectors_disable_but_headers_fail() {
+        let invalid_key =
+            resolve_compression_selection_intent(None, Some("Bad Name"), None).unwrap();
+        assert!(invalid_key.invalid_operator_selector);
+        assert_eq!(invalid_key.selector, CompressionSelector::Off);
+
+        let unknown_key =
+            resolve_compression_selection_intent(None, Some("missing"), None).unwrap();
+        let bound = bind_compression_selection(unknown_key, None).unwrap();
+        assert!(bound.invalid_operator_selector);
+        assert!(bound.selected.is_none());
+
+        let unknown_header =
+            resolve_compression_selection_intent(Some("missing"), None, None).unwrap();
+        assert!(matches!(
+            bind_compression_selection(unknown_header, None),
+            Err(CompressionSelectionError::UnknownHeaderProfile)
+        ));
+        assert!(matches!(
+            resolve_compression_selection_intent(Some("Bad Name"), None, None),
+            Err(CompressionSelectionError::InvalidHeader)
+        ));
+    }
+
+    #[test]
+    fn compression_header_requires_one_utf8_value() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(compression_header_value(&headers).unwrap(), None);
+        headers.insert("x-compression", HeaderValue::from_static("  off  "));
+        assert_eq!(
+            compression_header_value(&headers).unwrap().as_deref(),
+            Some("off")
+        );
+        headers.append("x-compression", HeaderValue::from_static("on"));
+        assert_eq!(
+            compression_header_value(&headers),
+            Err(CompressionSelectionError::InvalidHeader)
+        );
+
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.insert(
+            "x-compression",
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header bytes"),
+        );
+        assert_eq!(
+            compression_header_value(&non_utf8),
+            Err(CompressionSelectionError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn compression_fingerprint_partitions_both_semantic_cache_scopes() {
+        assert_eq!(
+            compression_cache_scope("tenant:key".into(), None),
+            "tenant:key"
+        );
+        assert_eq!(compression_cache_origin("ai.example", None), "ai.example");
+        assert_ne!(
+            compression_cache_scope("tenant:key".into(), Some("fingerprint-a")),
+            compression_cache_scope("tenant:key".into(), Some("fingerprint-b"))
+        );
+        assert_ne!(
+            compression_cache_origin("ai.example", Some("fingerprint-a")),
+            compression_cache_origin("ai.example", Some("fingerprint-b"))
+        );
     }
 }
 

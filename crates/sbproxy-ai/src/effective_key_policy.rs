@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Schema version included in effective-policy previews and digest material.
-pub const EFFECTIVE_KEY_POLICY_SCHEMA_VERSION: u16 = 1;
+pub const EFFECTIVE_KEY_POLICY_SCHEMA_VERSION: u16 = 2;
 
 /// Source that produced an effective key policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +120,8 @@ pub enum PolicyEnforcementProof {
     ProviderGate,
     /// The effective route override is applied before model enforcement.
     RouteOverride,
+    /// Request dispatch resolves the key's compression selector by precedence.
+    CompressionSelection,
     /// Inbound principal attributes pass through the selector gate.
     PrincipalGate,
     /// Required PII rules are checked before upstream dispatch.
@@ -148,6 +150,7 @@ impl PolicyEnforcementProof {
             Self::ModelGate => "model_gate",
             Self::ProviderGate => "provider_gate",
             Self::RouteOverride => "route_override",
+            Self::CompressionSelection => "compression_selection",
             Self::PrincipalGate => "principal_gate",
             Self::PiiGuardrail => "pii_guardrail",
             Self::ToolGate => "tool_gate",
@@ -392,6 +395,15 @@ declare_policy_fields! {
     ),
     /// Model route override.
     RouteToModel => ("route_to_model", RouteOverride, Patch, ["route_to_model"], Text, Null),
+    /// Route-local compression selector.
+    CompressionProfile => (
+        "compression_profile",
+        CompressionSelection,
+        Patch,
+        ["compression_profile"],
+        Text,
+        Null
+    ),
     /// Inbound principal selectors.
     PrincipalSelectors => (
         "principal_selectors",
@@ -516,6 +528,8 @@ pub struct EffectiveKeyPolicy {
     pub blocked_providers: Vec<String>,
     /// Optional model override applied before model enforcement.
     pub route_to_model: Option<String>,
+    /// Route-local compression selector applied before cache lookup.
+    pub compression_profile: Option<String>,
     /// Typed inbound-principal selectors. Empty permits any principal.
     pub principal_selectors: Vec<PrincipalSelector>,
     /// PII redaction rules required before upstream dispatch.
@@ -571,6 +585,7 @@ impl EffectiveKeyPolicy {
             allowed_providers: key.allowed_providers.clone(),
             blocked_providers: key.blocked_providers.clone(),
             route_to_model: key.route_to_model.clone(),
+            compression_profile: key.compression_profile.clone(),
             principal_selectors: key
                 .principal_selectors
                 .iter()

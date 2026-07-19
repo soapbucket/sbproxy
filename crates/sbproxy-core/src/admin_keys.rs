@@ -193,6 +193,8 @@ struct KeyMutation {
     principal_selectors: Patch<Vec<serde_json::Value>>,
     /// Pin a model for this key. JSON `null` clears the pin.
     route_to_model: Patch<String>,
+    /// Route-local compression selector. JSON `null` clears the selector.
+    compression_profile: Patch<String>,
     allowed_tools: Patch<Vec<String>>,
     inject_tools: Patch<Vec<serde_json::Value>>,
     /// Federated-MCP injection ref. JSON `null` clears it.
@@ -222,6 +224,11 @@ fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
                 "priority '{p}' is not a lane; use interactive, standard, or batch"
             ));
         }
+    }
+    if let Patch::Value(selector) = &m.compression_profile {
+        sbproxy_ai::compression::CompressionSelector::parse(selector).map_err(|_| {
+            "compression_profile must be on, off, or a valid profile name".to_string()
+        })?;
     }
     if let Patch::Value(v) = &m.inject_mcp {
         let has_ref = v
@@ -325,6 +332,7 @@ fn apply_key_mutation(rec: &mut KeyRecord, m: &KeyMutation) {
     apply_replacement(&mut rec.require_pii_redaction, &m.require_pii_redaction);
     apply_replacement(&mut rec.principal_selectors, &m.principal_selectors);
     apply_nullable(&mut rec.route_to_model, &m.route_to_model);
+    apply_nullable(&mut rec.compression_profile, &m.compression_profile);
     apply_nullable(&mut rec.allowed_tools, &m.allowed_tools);
     apply_replacement(&mut rec.inject_tools, &m.inject_tools);
     apply_nullable(&mut rec.inject_mcp, &m.inject_mcp);
@@ -1481,6 +1489,8 @@ struct KeyView {
     principal_selectors: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     route_to_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compression_profile: Option<String>,
     inject_tools: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inject_mcp: Option<serde_json::Value>,
@@ -1518,6 +1528,7 @@ impl From<&KeyRecord> for KeyView {
             require_pii_redaction: r.require_pii_redaction.clone(),
             principal_selectors: r.principal_selectors.clone(),
             route_to_model: r.route_to_model.clone(),
+            compression_profile: r.compression_profile.clone(),
             inject_tools: r.inject_tools.clone(),
             inject_mcp: r.inject_mcp.clone(),
             bypass_prompt_injection: r.bypass_prompt_injection,
@@ -2190,6 +2201,7 @@ mod tests {
             "/admin/keys",
             Some(
                 r#"{"name":"lanes","priority":"interactive","max_tokens_per_minute":50000,
+                    "compression_profile":"coding-agent",
                     "inject_mcp":{"ref":"toolhub"},"metadata":{"owner":"platform"}}"#,
             ),
         )
@@ -2200,6 +2212,7 @@ mod tests {
         assert_eq!(v["key"]["priority"], "interactive");
         assert_eq!(v["key"]["max_tokens_per_minute"], 50000);
         assert_eq!(v["key"]["inject_mcp"]["ref"], "toolhub");
+        assert_eq!(v["key"]["compression_profile"], "coding-agent");
         assert_eq!(v["key"]["metadata"]["owner"], "platform");
 
         // Unknown lane and a ref-less inject_mcp are 400s, not stored.
@@ -2208,6 +2221,16 @@ mod tests {
                 "PATCH",
                 &format!("/admin/keys/{key_id}"),
                 Some(r#"{"expected_revision":1,"priority":"urgent"}"#)
+            )
+            .unwrap()
+            .0,
+            400
+        );
+        assert_eq!(
+            dispatch(
+                "PATCH",
+                &format!("/admin/keys/{key_id}"),
+                Some(r#"{"expected_revision":1,"compression_profile":"Bad Name"}"#)
             )
             .unwrap()
             .0,
@@ -2228,13 +2251,17 @@ mod tests {
         let resp = dispatch(
             "PATCH",
             &format!("/admin/keys/{key_id}"),
-            Some(r#"{"expected_revision":1,"priority":null,"inject_mcp":null}"#),
+            Some(
+                r#"{"expected_revision":1,"priority":null,"compression_profile":null,
+                    "inject_mcp":null}"#,
+            ),
         )
         .unwrap();
         assert_eq!(resp.0, 200);
         let v = parse(&resp);
         assert_eq!(v["key"]["policy_revision"], 2);
         assert!(v["key"]["priority"].is_null());
+        assert!(v["key"]["compression_profile"].is_null());
         assert!(v["key"]["inject_mcp"].is_null());
     }
 
@@ -2255,7 +2282,8 @@ mod tests {
                     "allowed_tools":["search"],
                     "require_pii_redaction":["email"],
                     "principal_selectors":[{"team":"platform"}],
-                    "route_to_model":"gpt-4.1","inject_tools":[{"name":"search"}],
+                    "route_to_model":"gpt-4.1","compression_profile":"coding-agent",
+                    "inject_tools":[{"name":"search"}],
                     "inject_mcp":{"ref":"toolhub"},"bypass_prompt_injection":true,
                     "project":"search","user":"alice","tags":["prod"],
                     "metadata":{"owner":"platform"},"tenant":"tenant-a",
@@ -2269,6 +2297,7 @@ mod tests {
         assert_eq!(created["key"]["policy_revision"], 1);
         assert_eq!(created["key"]["blocked_providers"], json!(["vertex"]));
         assert_eq!(created["key"]["allowed_tools"], json!(["search"]));
+        assert_eq!(created["key"]["compression_profile"], "coding-agent");
 
         // Absent fields stay unchanged while a concrete value replaces one.
         let resp = dispatch(
@@ -2309,7 +2338,8 @@ mod tests {
                     "priority":null,"max_budget_tokens":null,"max_budget_usd":null,
                     "allowed_models":[],"blocked_models":[],"allowed_providers":[],
                     "blocked_providers":[],"allowed_tools":null,"require_pii_redaction":[],
-                    "principal_selectors":[],"route_to_model":null,"inject_tools":[],
+                    "principal_selectors":[],"route_to_model":null,
+                    "compression_profile":null,"inject_tools":[],
                     "inject_mcp":null,"bypass_prompt_injection":false,
                     "project":null,"user":null,"tags":[],"metadata":{},
                     "tenant":null,"expires_at":null}"#,
@@ -2326,6 +2356,7 @@ mod tests {
             "priority",
             "budget",
             "route_to_model",
+            "compression_profile",
             "allowed_tools",
             "inject_mcp",
             "project",

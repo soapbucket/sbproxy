@@ -20,8 +20,9 @@ mod summary_policy;
 pub mod window_fit;
 
 pub use config::{
-    CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionStateBackend,
-    CompressionStateConfig, SummarizerConfig, SummaryBufferConfig, WindowFitConfig,
+    CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionProfile,
+    CompressionSelector, CompressionStateBackend, CompressionStateConfig, SummarizerConfig,
+    SummaryBufferConfig, WindowFitConfig,
 };
 pub use identity::CompressionRecordId;
 pub use outcome::{

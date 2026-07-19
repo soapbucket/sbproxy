@@ -125,6 +125,9 @@ pub struct KeyRecord {
     /// different one. `None` leaves the client's choice unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_to_model: Option<String>,
+    /// Route-local compression selector (`on`, `off`, or a named profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_profile: Option<String>,
     /// Tool names this key may expose. None is unrestricted, an empty list
     /// denies every caller-supplied tool, and a non-empty list is an allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +204,7 @@ impl KeyRecord {
             require_pii_redaction: Vec::new(),
             principal_selectors: Vec::new(),
             route_to_model: None,
+            compression_profile: None,
             allowed_tools: None,
             inject_tools: Vec::new(),
             inject_mcp: None,

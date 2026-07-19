@@ -993,6 +993,9 @@ impl ProxyHttp for SbProxy {
         upstream_request.remove_header("x-client-cert-organization");
         upstream_request.remove_header("x-client-cert-serial");
         upstream_request.remove_header("x-client-cert-fingerprint");
+        // Internal AI compression policy input. Providers must never receive
+        // this selector, even when compression is disabled or malformed.
+        upstream_request.remove_header("x-compression");
         if let Some(digest) = session.digest().and_then(|d| d.ssl_digest.as_ref()) {
             // SslDigest exists; this is a TLS connection. cert_digest
             // is empty when the peer presented no cert.

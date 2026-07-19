@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::budget::BudgetConfig;
-use crate::compression::CompressionPolicy;
+use crate::compression::{CompressionPolicy, CompressionSelector};
 use crate::guardrails::GuardrailsConfig;
 use crate::identity::VirtualKeyConfig;
 use crate::ids::ModelId;
@@ -835,6 +835,27 @@ impl AiHandlerConfig {
         }
         if let Some(compression) = &config.compression {
             compression.validate(&config.providers)?;
+        }
+        for (index, key) in config.virtual_keys.iter().enumerate() {
+            let Some(raw_selector) = key.compression_profile.as_deref() else {
+                continue;
+            };
+            let selector = CompressionSelector::parse(raw_selector).map_err(|_| {
+                anyhow::anyhow!(
+                    "ai virtual_keys[{index}].compression_profile must be on, off, or a valid profile name"
+                )
+            })?;
+            if let CompressionSelector::Profile(name) = selector {
+                let declared = config
+                    .compression
+                    .as_ref()
+                    .is_some_and(|policy| policy.profiles.contains_key(&name));
+                if !declared {
+                    anyhow::bail!(
+                        "ai virtual_keys[{index}].compression_profile selects an undeclared profile"
+                    );
+                }
+            }
         }
         // WOR-1707: install the operator price table (config prices +
         // external rate card) into the process-global consulted by cost

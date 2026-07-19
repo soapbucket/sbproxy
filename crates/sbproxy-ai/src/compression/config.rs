@@ -4,9 +4,70 @@ use crate::provider::ProviderConfig;
 use anyhow::bail;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
 
 /// Default completion capacity reserved by the legacy window-fit behavior.
 pub const DEFAULT_COMPLETION_RESERVE_TOKENS: u64 = 1_024;
+
+/// Maximum request-selectable compression profile name length.
+pub const MAX_COMPRESSION_PROFILE_NAME_LEN: usize = 64;
+
+/// Closed request selector for a route-local compression pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CompressionSelector {
+    /// Select the route's default compression pipeline.
+    On,
+    /// Disable compression for this request.
+    Off,
+    /// Select one declared route-local named profile.
+    Profile(String),
+}
+
+impl CompressionSelector {
+    /// Parse one exact selector token without accepting surrounding whitespace.
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        if value != value.trim() {
+            bail!("compression selector must not contain surrounding whitespace");
+        }
+        match value {
+            "on" => return Ok(Self::On),
+            "off" => return Ok(Self::Off),
+            _ => {}
+        }
+        if value.is_empty() || value.len() > MAX_COMPRESSION_PROFILE_NAME_LEN {
+            bail!("compression profile name must contain 1 to 64 bytes");
+        }
+        let mut bytes = value.bytes();
+        if !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !bytes.all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+        {
+            bail!(
+                "compression profile name must start with a lowercase ASCII letter or digit and contain only lowercase ASCII letters, digits, '_' or '-'"
+            );
+        }
+        Ok(Self::Profile(value.to_string()))
+    }
+
+    /// Stable selector spelling used by headers, CEL, keys, and logs.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Profile(name) => name,
+        }
+    }
+}
+
+impl fmt::Display for CompressionSelector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// Ordered context-compression policy for one AI handler.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -18,6 +79,21 @@ pub struct CompressionPolicy {
     /// Permit audited Admin-only summary-content inspection.
     #[serde(default)]
     pub allow_admin_content_inspection: bool,
+    /// Compression levers executed in declaration order.
+    #[serde(default)]
+    pub levers: Vec<CompressionLeverConfig>,
+    /// Route-local named pipelines available to governed policy and requests.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, CompressionProfile>,
+}
+
+/// One reusable route-local compression pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompressionProfile {
+    /// Shared-state backend used by stateful levers in this profile.
+    #[serde(default)]
+    pub state: Option<CompressionStateConfig>,
     /// Compression levers executed in declaration order.
     #[serde(default)]
     pub levers: Vec<CompressionLeverConfig>,
@@ -129,68 +205,90 @@ impl CompressionPolicy {
                     .unwrap_or(DEFAULT_COMPLETION_RESERVE_TOKENS),
                 input_budget_tokens: None,
             })],
+            profiles: BTreeMap::new(),
         }
     }
 
     /// Validate policy-local invariants and summarizer provider references.
     pub fn validate(&self, providers: &[ProviderConfig]) -> anyhow::Result<()> {
-        if self.state.as_ref().is_some_and(|state| state.ttl_secs == 0) {
-            bail!("compression.state.ttl must be greater than zero");
-        }
+        validate_pipeline("compression", self.state.as_ref(), &self.levers, providers)?;
 
-        for (index, lever) in self.levers.iter().enumerate() {
-            match lever {
-                CompressionLeverConfig::SummaryBuffer(summary) => {
-                    if self.state.is_none() {
-                        bail!("compression.state is required for summary_buffer");
-                    }
-                    if summary.min_tokens == 0 {
-                        bail!("compression.levers[{index}].min_tokens must be greater than zero");
-                    }
-                    if summary.retain_recent_messages == 0 {
-                        bail!(
-                            "compression.levers[{index}].retain_recent_messages must be greater than zero"
-                        );
-                    }
-                    if summary.target_summary_tokens == 0 {
-                        bail!(
-                            "compression.levers[{index}].target_summary_tokens must be greater than zero"
-                        );
-                    }
-                    if summary.target_summary_tokens >= summary.min_tokens {
-                        bail!(
-                            "compression.levers[{index}].target_summary_tokens must be smaller than min_tokens"
-                        );
-                    }
-                    if summary.summarizer.model.trim().is_empty() {
-                        bail!("compression.levers[{index}].summarizer.model must not be empty");
-                    }
-                    if summary.summarizer.timeout_secs == 0 {
-                        bail!(
-                            "compression.levers[{index}].summarizer.timeout must be greater than zero"
-                        );
-                    }
-                    if !providers
-                        .iter()
-                        .any(|provider| provider.name.as_str() == summary.summarizer.provider)
-                    {
-                        bail!(
-                            "compression.levers[{index}].summarizer.provider {:?} is not configured on this AI handler",
-                            summary.summarizer.provider
-                        );
-                    }
-                }
-                CompressionLeverConfig::WindowFit(window) => {
-                    if window.input_budget_tokens == Some(0) {
-                        bail!(
-                            "compression.levers[{index}].input_budget_tokens must be greater than zero"
-                        );
-                    }
-                }
+        for (name, profile) in &self.profiles {
+            if !matches!(
+                CompressionSelector::parse(name),
+                Ok(CompressionSelector::Profile(_))
+            ) {
+                bail!(
+                    "compression.profiles.{name} is not a valid non-reserved compression profile name"
+                );
             }
+            validate_pipeline(
+                &format!("compression.profiles.{name}"),
+                profile.state.as_ref(),
+                &profile.levers,
+                providers,
+            )?;
         }
         Ok(())
     }
+}
+
+fn validate_pipeline(
+    path: &str,
+    state: Option<&CompressionStateConfig>,
+    levers: &[CompressionLeverConfig],
+    providers: &[ProviderConfig],
+) -> anyhow::Result<()> {
+    if state.is_some_and(|state| state.ttl_secs == 0) {
+        bail!("{path}.state.ttl must be greater than zero");
+    }
+
+    for (index, lever) in levers.iter().enumerate() {
+        match lever {
+            CompressionLeverConfig::SummaryBuffer(summary) => {
+                if state.is_none() {
+                    bail!("{path}.state is required for summary_buffer");
+                }
+                if summary.min_tokens == 0 {
+                    bail!("{path}.levers[{index}].min_tokens must be greater than zero");
+                }
+                if summary.retain_recent_messages == 0 {
+                    bail!(
+                        "{path}.levers[{index}].retain_recent_messages must be greater than zero"
+                    );
+                }
+                if summary.target_summary_tokens == 0 {
+                    bail!("{path}.levers[{index}].target_summary_tokens must be greater than zero");
+                }
+                if summary.target_summary_tokens >= summary.min_tokens {
+                    bail!(
+                        "{path}.levers[{index}].target_summary_tokens must be smaller than min_tokens"
+                    );
+                }
+                if summary.summarizer.model.trim().is_empty() {
+                    bail!("{path}.levers[{index}].summarizer.model must not be empty");
+                }
+                if summary.summarizer.timeout_secs == 0 {
+                    bail!("{path}.levers[{index}].summarizer.timeout must be greater than zero");
+                }
+                if !providers
+                    .iter()
+                    .any(|provider| provider.name.as_str() == summary.summarizer.provider)
+                {
+                    bail!(
+                        "{path}.levers[{index}].summarizer.provider {:?} is not configured on this AI handler",
+                        summary.summarizer.provider
+                    );
+                }
+            }
+            CompressionLeverConfig::WindowFit(window) => {
+                if window.input_budget_tokens == Some(0) {
+                    bail!("{path}.levers[{index}].input_budget_tokens must be greater than zero");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn default_completion_reserve_tokens() -> u64 {
@@ -207,7 +305,7 @@ enum DurationSchema {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressionLeverConfig, CompressionStateBackend};
+    use super::{CompressionLeverConfig, CompressionSelector, CompressionStateBackend};
     use crate::handler::AiHandlerConfig;
 
     fn provider(name: &str) -> serde_json::Value {
@@ -473,5 +571,162 @@ mod tests {
             error.contains("compression.levers[0].input_budget_tokens must be greater than zero"),
             "unexpected validation error: {error}"
         );
+    }
+
+    #[test]
+    fn compression_selector_is_a_bounded_closed_token() {
+        assert_eq!(
+            CompressionSelector::parse("on").unwrap(),
+            CompressionSelector::On
+        );
+        assert_eq!(
+            CompressionSelector::parse("off").unwrap(),
+            CompressionSelector::Off
+        );
+        assert_eq!(
+            CompressionSelector::parse("coding-agent").unwrap(),
+            CompressionSelector::Profile("coding-agent".to_string())
+        );
+        assert_eq!(
+            CompressionSelector::Profile("lean_2".to_string()).to_string(),
+            "lean_2"
+        );
+
+        for invalid in [
+            "",
+            " ON ",
+            "Upper",
+            "has space",
+            "../profile",
+            "profile:other",
+            "_leading",
+        ] {
+            assert!(
+                CompressionSelector::parse(invalid).is_err(),
+                "selector {invalid:?} must be rejected"
+            );
+        }
+        assert!(CompressionSelector::parse(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_named_compression_profiles() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [provider("openai")],
+            "compression": {
+                "levers": [],
+                "profiles": {
+                    "coding-agent": {
+                        "levers": [{
+                            "type": "window_fit",
+                            "input_budget_tokens": 8_192
+                        }]
+                    },
+                    "offload": {
+                        "state": {"backend": "redis", "ttl": "1h"},
+                        "levers": [{
+                            "type": "summary_buffer",
+                            "min_tokens": 4_096,
+                            "retain_recent_messages": 4,
+                            "target_summary_tokens": 512,
+                            "summarizer": {
+                                "provider": "openai",
+                                "model": "gpt-test",
+                                "timeout": "5s"
+                            }
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("named profiles compile");
+
+        let profiles = &config.compression.expect("compression").profiles;
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles["coding-agent"].levers.len(), 1);
+        assert_eq!(
+            profiles["offload"].state.as_ref().unwrap().backend,
+            CompressionStateBackend::Redis
+        );
+    }
+
+    #[test]
+    fn rejects_reserved_invalid_and_self_incomplete_profile_names() {
+        for invalid in ["on", "off", "Upper", "_leading"] {
+            let mut value = serde_json::json!({
+                "providers": [provider("openai")],
+                "compression": {"profiles": {}}
+            });
+            value["compression"]["profiles"][invalid] = serde_json::json!({"levers": []});
+            let error = AiHandlerConfig::from_config(value).unwrap_err().to_string();
+            assert!(error.contains("compression.profiles"), "{invalid}: {error}");
+        }
+
+        let missing_state = serde_json::json!({
+            "providers": [provider("openai")],
+            "compression": {
+                "state": {"backend": "redis", "ttl": "1h"},
+                "profiles": {
+                    "stateful": {
+                        "levers": [{
+                            "type": "summary_buffer",
+                            "min_tokens": 4_096,
+                            "retain_recent_messages": 4,
+                            "target_summary_tokens": 512,
+                            "summarizer": {
+                                "provider": "openai",
+                                "model": "gpt-test",
+                                "timeout": "5s"
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        let error = AiHandlerConfig::from_config(missing_state)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("compression.profiles.stateful.state is required for summary_buffer"),
+            "a profile cannot borrow the default pipeline state: {error}"
+        );
+    }
+
+    #[test]
+    fn configured_keys_may_select_only_declared_profiles() {
+        let valid = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [provider("openai")],
+            "compression": {
+                "profiles": {"coding-agent": {"levers": []}}
+            },
+            "virtual_keys": [{
+                "key": "sb_test",
+                "compression_profile": "coding-agent"
+            }]
+        }))
+        .expect("declared profile selector");
+        assert_eq!(
+            valid.virtual_keys[0].compression_profile.as_deref(),
+            Some("coding-agent")
+        );
+
+        for selector in ["missing", "Bad Name"] {
+            let error = AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [provider("openai")],
+                "compression": {
+                    "profiles": {"coding-agent": {"levers": []}}
+                },
+                "virtual_keys": [{
+                    "key": "sb_test",
+                    "compression_profile": selector
+                }]
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("virtual_keys[0].compression_profile"),
+                "{error}"
+            );
+        }
     }
 }
