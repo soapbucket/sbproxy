@@ -580,6 +580,24 @@ enum ModelsSub {
     Lock(ModelsLockArgs),
     /// Check the verified local cache against the lockfile.
     VerifyLock(ModelsVerifyLockArgs),
+    /// Reclaim content-addressed blobs referenced by no cached artifact.
+    Prune(ModelsPruneArgs),
+}
+
+/// `sbproxy models prune`: reclaim unreferenced weight blobs.
+#[derive(clap::Args, Debug, Default)]
+struct ModelsPruneArgs {
+    /// Cache directory to prune. Defaults to the configured
+    /// `proxy.model_host.cache.directory` (or legacy `serve.cache_dir`)
+    /// when `-f/--config` is given, then the platform default.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Report what would be reclaimed without deleting anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2366,6 +2384,7 @@ fn handle_models_subcommand(
         Some(ModelsSub::Remove(a)) => handle_models_remove(a, config_path),
         Some(ModelsSub::Ps(a)) => handle_models_ps(a),
         Some(ModelsSub::Stop(a)) => handle_models_stop(a),
+        Some(ModelsSub::Prune(a)) => handle_models_prune(a, config_path),
         Some(ModelsSub::Lock(a)) => handle_models_lock(a, config_path),
         Some(ModelsSub::VerifyLock(a)) => handle_models_verify_lock(a, config_path),
     }
@@ -3464,6 +3483,46 @@ fn configured_artifact_protection(
         }
     }
     Ok(protection)
+}
+
+fn handle_models_prune(
+    args: &ModelsPruneArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let configured = configured_model_cache_dir(config_path);
+    let root = model_cache_root(args.cache_dir.as_deref().or(configured.as_deref()));
+    // Prune is local-only: it never fetches, so no transport is wired.
+    let manager = sbproxy_model_host::ArtifactManager::new(
+        root,
+        std::sync::Arc::new(sbproxy_model_host::UnavailableArtifactTransport),
+    )?;
+    let report = manager.prune(args.dry_run)?;
+    let output = models_command_envelope(
+        "models.prune",
+        serde_json::json!({
+            "dry_run": report.dry_run,
+            "orphan_blobs": report.orphan_blobs,
+            "reclaimed_bytes": report.reclaimed_bytes,
+            "before_bytes": report.before_bytes,
+        }),
+    );
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output)?),
+        OutputFormat::Text => {
+            let verb = if report.dry_run {
+                "would reclaim"
+            } else {
+                "reclaimed"
+            };
+            println!(
+                "{verb} {} across {} unreferenced blob(s) ({} cached before prune)",
+                format_cache_size(report.reclaimed_bytes),
+                report.orphan_blobs,
+                format_cache_size(report.before_bytes),
+            );
+        }
+    }
+    Ok(0)
 }
 
 fn handle_models_remove(
