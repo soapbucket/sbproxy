@@ -64,6 +64,7 @@ fn fit_plan(devices: Vec<u32>) -> FitPlan {
         memory: zero_memory(devices),
         moe: None,
         throughput: None,
+        gpu_memory_fraction: None,
     }
 }
 

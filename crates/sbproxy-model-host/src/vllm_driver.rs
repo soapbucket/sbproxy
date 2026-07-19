@@ -37,6 +37,9 @@ pub const DEFAULT_VLLM_IMAGE: &str =
 const DEFAULT_SHM_SIZE_GIB: u64 = 4;
 const CONTAINER_PORT: u16 = 8000;
 const PRIVATE_NETWORK: &str = "sbproxy-model-host";
+/// Fallback vLLM `--gpu-memory-utilization` when the fit did not derive a
+/// device-capacity-aware fraction (e.g. the probe reported no total VRAM).
+const DEFAULT_GPU_MEMORY_UTILIZATION: f32 = 0.90;
 const HEALTH_PATH: &str = "/health";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
@@ -712,13 +715,22 @@ pub fn build_vllm_container_plan(
             "verified snapshot path contains a comma unsupported by OCI mount syntax",
         ));
     }
+    // The private network is `--internal` (no egress) for pinned launches
+    // that serve locally mounted weights. A repo-mode (unpinned raw `hf:`)
+    // launch must self-download from Hugging Face, so it runs on the default
+    // bridge, which has external DNS and egress via the host resolver.
+    let network = if request.artifact.repo.is_some() {
+        "bridge"
+    } else {
+        PRIVATE_NETWORK
+    };
     let mut arguments = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--name".to_string(),
         format!("sbproxy-{}-g{}", request.deployment, request.generation),
         "--network".to_string(),
-        PRIVATE_NETWORK.to_string(),
+        network.to_string(),
     ];
     match runtime {
         ContainerRuntime::Docker => {
@@ -728,7 +740,11 @@ pub fn build_vllm_container_plan(
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            arguments.extend(["--gpus".to_string(), format!("device={devices}")]);
+            // The device set must be double-quoted: `--gpus device=0,1`
+            // makes Docker read the `,1` as a GPU count and reject the
+            // request ("cannot set both Count and DeviceIDs"). The quoted
+            // form is a single device-id spec and works for one or many.
+            arguments.extend(["--gpus".to_string(), format!("\"device={devices}\"")]);
         }
         ContainerRuntime::Podman => {
             for device in &request.selected_devices {
@@ -736,16 +752,40 @@ pub fn build_vllm_container_plan(
             }
         }
     }
+    // Repo mode (unpinned raw `hf:` ref): mount a writable, shared Hugging
+    // Face cache and let vLLM download `--model <repo>` itself. Pinned
+    // mode: mount the verified immutable snapshot read-only and serve it.
+    let (mount_arg, model_arg) = match request.artifact.repo.as_deref() {
+        Some(repo) => (
+            format!("type=bind,src={snapshot},dst=/root/.cache/huggingface"),
+            repo.to_string(),
+        ),
+        None => (
+            format!("type=bind,src={snapshot},dst=/models/model,readonly"),
+            "/models/model".to_string(),
+        ),
+    };
+    if request.artifact.repo.is_some() {
+        arguments.extend([
+            "--env".to_string(),
+            "HF_HOME=/root/.cache/huggingface".to_string(),
+        ]);
+        if std::env::var_os("HF_TOKEN").is_some() {
+            // Pass the token through from the launching process's
+            // environment without placing its value on the argv.
+            arguments.extend(["--env".to_string(), "HF_TOKEN".to_string()]);
+        }
+    }
     arguments.extend([
         "--shm-size".to_string(),
         format!("{shm_size_gib}g"),
         "--mount".to_string(),
-        format!("type=bind,src={snapshot},dst=/models/model,readonly"),
+        mount_arg,
         "-p".to_string(),
         format!("127.0.0.1:{}:{CONTAINER_PORT}", request.port),
         image.to_string(),
         "--model".to_string(),
-        "/models/model".to_string(),
+        model_arg,
         "--host".to_string(),
         "0.0.0.0".to_string(),
         "--port".to_string(),
@@ -756,8 +796,14 @@ pub fn build_vllm_container_plan(
         request.fit.seq_len.to_string(),
         "--max-num-seqs".to_string(),
         request.max_concurrency.to_string(),
-        "--kv-cache-memory-bytes".to_string(),
-        request.fit.memory.kv_bytes.to_string(),
+        "--gpu-memory-utilization".to_string(),
+        format!(
+            "{:.4}",
+            request
+                .fit
+                .gpu_memory_fraction
+                .unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION)
+        ),
     ]);
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
@@ -788,8 +834,14 @@ fn direct_vllm_arguments(request: &LaunchRequest) -> Result<Vec<String>, EngineD
         request.fit.seq_len.to_string(),
         "--max-num-seqs".to_string(),
         request.max_concurrency.to_string(),
-        "--kv-cache-memory-bytes".to_string(),
-        request.fit.memory.kv_bytes.to_string(),
+        "--gpu-memory-utilization".to_string(),
+        format!(
+            "{:.4}",
+            request
+                .fit
+                .gpu_memory_fraction
+                .unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION)
+        ),
     ];
     append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
@@ -853,16 +905,60 @@ fn append_vllm_passthrough_arguments(arguments: &mut Vec<String>, tuning: &crate
         arguments.push("--cpu-offload-gb".to_string());
         arguments.push(gib.to_string());
     }
-    // Chunked prefill: enable it and, when the config pins a chunk size,
-    // pass it through. Auto-tuning the chunk size to a TTFT target waits on
-    // the throughput predictor and is not derived here.
+    // Chunked prefill: enable it and pass a chunk size through. An explicit
+    // `max_batched_tokens` always wins; otherwise a `target_ttft_ms` derives
+    // one at launch time (WOR-1678); with neither, the engine default holds.
     if let Some(chunked_prefill) = &tuning.chunked_prefill {
         arguments.push("--enable-chunked-prefill".to_string());
-        if let Some(max_batched_tokens) = chunked_prefill.max_batched_tokens {
+        let chunk_tokens = chunked_prefill.max_batched_tokens.or_else(|| {
+            chunked_prefill
+                .target_ttft_ms
+                .map(chunk_tokens_for_ttft_target)
+        });
+        if let Some(chunk_tokens) = chunk_tokens {
             arguments.push("--max-num-batched-tokens".to_string());
-            arguments.push(max_batched_tokens.to_string());
+            arguments.push(chunk_tokens.to_string());
         }
     }
+}
+
+/// Conservative prefill throughput assumed by the chunked-prefill
+/// auto-tune, in tokens per second. The fit plan's throughput estimate
+/// models decode (a memory-bandwidth weight read), not compute-bound
+/// prefill, so no clean per-device prefill rate reaches the driver; this
+/// deliberately low constant stands in for it. Any datacenter-class GPU
+/// prefills well above this rate, so the error direction is smaller
+/// chunks: the TTFT target still holds, at some prefill-throughput cost
+/// on faster devices.
+const PREFILL_TOKENS_PER_SEC_ESTIMATE: u64 = 5_000;
+
+/// Auto-tuned chunk sizes are emitted in multiples of this many tokens,
+/// matching vLLM's scheduling granularity.
+const CHUNK_TOKEN_QUANTUM: u64 = 256;
+
+/// Floor on an auto-tuned chunk size, so a tiny TTFT target cannot
+/// starve prefill entirely.
+const MIN_AUTO_CHUNK_TOKENS: u64 = 256;
+
+/// Ceiling on an auto-tuned chunk size; past this, a chunk no longer
+/// buys prefill throughput and only pushes TTFT out.
+const MAX_AUTO_CHUNK_TOKENS: u64 = 16_384;
+
+/// Derive a chunked-prefill chunk size (vLLM `--max-num-batched-tokens`)
+/// from a TTFT target in milliseconds (WOR-1678).
+///
+/// Model: while the engine works through one prefill chunk, a newly
+/// arrived request waits roughly one chunk before its own first token can
+/// be scheduled, so the largest chunk that holds a TTFT target is the
+/// target in seconds times the device's prefill rate. That rate is
+/// approximated by the conservative [`PREFILL_TOKENS_PER_SEC_ESTIMATE`]
+/// constant (see its doc for why no fit-derived signal is used). The
+/// result is rounded down to a multiple of [`CHUNK_TOKEN_QUANTUM`] and
+/// clamped to `[MIN_AUTO_CHUNK_TOKENS, MAX_AUTO_CHUNK_TOKENS]`.
+fn chunk_tokens_for_ttft_target(target_ttft_ms: u64) -> u64 {
+    let raw = target_ttft_ms.saturating_mul(PREFILL_TOKENS_PER_SEC_ESTIMATE) / 1000;
+    (raw / CHUNK_TOKEN_QUANTUM * CHUNK_TOKEN_QUANTUM)
+        .clamp(MIN_AUTO_CHUNK_TOKENS, MAX_AUTO_CHUNK_TOKENS)
 }
 
 fn append_vllm_precision_arguments(arguments: &mut Vec<String>, request: &LaunchRequest) {
@@ -950,8 +1046,10 @@ fn compatibility_command(mode: &VllmLaunchMode) -> (PathBuf, Vec<String>) {
                 "--rm".to_string(),
                 "--network".to_string(),
                 "none".to_string(),
+                // The digest-pinned vLLM images ship `python3`, not a bare
+                // `python`; the base entrypoint is `python3 -m vllm...`.
                 "--entrypoint".to_string(),
-                "python".to_string(),
+                "python3".to_string(),
                 image.clone(),
                 "-c".to_string(),
                 COMPATIBILITY_SCRIPT.to_string(),
@@ -1102,8 +1200,9 @@ fn unix_time_ms() -> Result<u64, EngineDriverError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_tensor_parallel_arguments, append_vllm_passthrough_arguments, digest_pinned_image,
-        DEFAULT_VLLM_IMAGE,
+        append_tensor_parallel_arguments, append_vllm_passthrough_arguments,
+        chunk_tokens_for_ttft_target, digest_pinned_image, DEFAULT_VLLM_IMAGE,
+        MAX_AUTO_CHUNK_TOKENS, MIN_AUTO_CHUNK_TOKENS,
     };
     use crate::{ChunkedPrefill, EngineTuning};
 
@@ -1170,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn chunked_prefill_without_a_chunk_size_only_enables_it() {
+    fn target_ttft_only_auto_tunes_a_chunk_size() {
         let tuning = EngineTuning {
             chunked_prefill: Some(ChunkedPrefill {
                 max_batched_tokens: None,
@@ -1182,9 +1281,55 @@ mod tests {
         append_vllm_passthrough_arguments(&mut arguments, &tuning);
 
         assert!(arguments.iter().any(|a| a == "--enable-chunked-prefill"));
+        // 250 ms at the 5000 tok/s conservative estimate is 1250 tokens,
+        // rounded down to the 256-token quantum.
+        let chunk: u64 = value_after(&arguments, "--max-num-batched-tokens")
+            .parse()
+            .expect("chunk size is numeric");
+        assert_eq!(chunk, 1024);
+        assert_eq!(chunk % 256, 0, "chunk size aligns to the 256-token quantum");
+        assert!((MIN_AUTO_CHUNK_TOKENS..=MAX_AUTO_CHUNK_TOKENS).contains(&chunk));
+    }
+
+    #[test]
+    fn explicit_chunk_size_wins_over_target_ttft() {
+        let tuning = EngineTuning {
+            chunked_prefill: Some(ChunkedPrefill {
+                max_batched_tokens: Some(2048),
+                target_ttft_ms: Some(250),
+            }),
+            ..EngineTuning::default()
+        };
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &tuning);
+
+        assert_eq!(value_after(&arguments, "--max-num-batched-tokens"), "2048");
+    }
+
+    #[test]
+    fn chunked_prefill_with_neither_knob_leaves_the_engine_default() {
+        let tuning = EngineTuning {
+            chunked_prefill: Some(ChunkedPrefill::default()),
+            ..EngineTuning::default()
+        };
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &tuning);
+
+        assert!(arguments.iter().any(|a| a == "--enable-chunked-prefill"));
         assert!(
             !arguments.iter().any(|a| a == "--max-num-batched-tokens"),
-            "the target_ttft_ms auto-tune is not derived here yet"
+            "no chunk size configured means the engine default holds"
         );
+    }
+
+    #[test]
+    fn ttft_auto_tune_clamps_and_quantizes() {
+        // A 1 ms target rounds to zero tokens and clamps up to the floor.
+        assert_eq!(chunk_tokens_for_ttft_target(1), MIN_AUTO_CHUNK_TOKENS);
+        // A one-minute target overshoots the ceiling and clamps down.
+        assert_eq!(chunk_tokens_for_ttft_target(60_000), MAX_AUTO_CHUNK_TOKENS);
+        // A mid-range target rounds down to the 256-token quantum:
+        // 2000 ms at 5000 tok/s is 10000 tokens, floored to 9984.
+        assert_eq!(chunk_tokens_for_ttft_target(2_000), 9_984);
     }
 }

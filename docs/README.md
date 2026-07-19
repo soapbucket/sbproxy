@@ -58,6 +58,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [model-host-certification.md](model-host-certification.md) - the hardware evidence ledger and the GCP NVIDIA procedure reserved for the final integration PR.
 - [serving-engine-benchmark.md](serving-engine-benchmark.md) - vLLM vs SGLang head-to-head on one L4: throughput, prefix-cache behavior, and how the gateway picks an engine.
 - [security-model-host.md](security-model-host.md) - trusted config, verified artifacts, typed process launch, engine acquisition, containers, credentials, and remaining isolation work.
+- [custom-engines.md](custom-engines.md) - why there is no bring-your-own-image command template: the typed-driver seam, the OpenAI-compatible provider escape hatch, and the bar a signed engine descriptor would have to clear.
 - [ai-usage-ledger.md](ai-usage-ledger.md) - the verifiable usage ledger: hash-chained, Ed25519-signed spend receipts you can re-derive and verify.
 - [key-management.md](key-management.md) - dynamic virtual keys: mint, revoke, and rotate at runtime through the admin API, hashed at rest, with a fail-closed policy cache.
 - [ai-policy-cel.md](ai-policy-cel.md) - the unified CEL policy plane: one sandboxed expression over guardrails, budgets, routing, and principal that emits a closed action set.

@@ -1074,6 +1074,7 @@ fn field_is_active(path: &str, config: &ModelHostConfig) -> bool {
             .any(|entry| entry.cpu_offload_gib.is_some()),
         "serve.models[].max_loras" => config.models.iter().any(|entry| entry.max_loras.is_some()),
         "serve.models[].gguf_file" => config.models.iter().any(|entry| entry.gguf_file.is_some()),
+        "serve.models[].modality" => config.models.iter().any(|entry| entry.modality.is_some()),
         _ => false,
     }
 }
@@ -1150,7 +1151,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "artifact.cache_budget",
         domain: CapabilityDomain::Artifact,
         status: SupportLevel::Stable,
-        summary: "Cache collection enforces LRU budgets without deleting protected artifacts.",
+        summary: "Cache collection enforces LRU budgets without deleting protected artifacts; the same protected collection runs on demand through the admin gc route.",
         evidence: &[
             "contract.cache_budget_protects_active_artifacts",
             "test.artifact_gc",
@@ -1184,7 +1185,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "engine.llama_cpp_managed",
         domain: CapabilityDomain::Engine,
         status: SupportLevel::Preview,
-        summary: "Managed llama.cpp supports digest-verified binary acquisition and Linux CUDA source builds; Apple Metal is certified while live CUDA remains deferred.",
+        summary: "Managed llama.cpp acquires a digest-verified prebuilt binary to serve GGUF models on CPU and Apple Metal. NVIDIA GPU serving is handled by vLLM and SGLang, not llama.cpp.",
         evidence: &[
             "test.engine_drivers",
             "test.cuda_build",
@@ -1328,7 +1329,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "platform.nvidia_cuda",
         domain: CapabilityDomain::Platform,
         status: SupportLevel::Preview,
-        summary: "NVIDIA discovery, vLLM, and CUDA llama.cpp have deterministic coverage; live GCP certification is reserved for the final PR group.",
+        summary: "NVIDIA discovery and the vLLM and SGLang container engines have deterministic coverage; live GPU serving is recorded in the certification ledger.",
         evidence: &["test.cuda_build", "test.local_admission"],
         consumer: None,
     },
@@ -1383,11 +1384,14 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         capability_id: "artifact.cache_addressing",
         consumer: Some(ConsumerContract::CacheDirectoryChangesArtifactPath),
     },
+    // WOR-1910: the budget gained an API-triggerable executable consumer
+    // (post-pull collection plus the admin gc route), so the field is no
+    // longer config-only.
     ConfigFieldCapability {
         path: "serve.cache_budget_gib",
-        status: SupportLevel::ConfigOnly,
+        status: SupportLevel::Preview,
         capability_id: "artifact.cache_budget",
-        consumer: None,
+        consumer: Some(ConsumerContract::CacheBudgetProtectsActiveArtifacts),
     },
     ConfigFieldCapability {
         path: "serve.eviction",
@@ -1520,6 +1524,12 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         status: SupportLevel::Stable,
         capability_id: "admin.value_report",
         consumer: Some(ConsumerContract::ReferencePriceRecordsSavings),
+    },
+    ConfigFieldCapability {
+        path: "serve.models[].modality",
+        status: SupportLevel::Preview,
+        capability_id: "engine.typed_managed_drivers",
+        consumer: None,
     },
 ];
 

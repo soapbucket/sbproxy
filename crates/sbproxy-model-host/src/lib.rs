@@ -47,6 +47,7 @@ pub mod device_residency;
 pub mod embedded;
 pub mod engine_driver;
 pub mod fit;
+pub mod foreign_cache;
 pub mod generation_store;
 pub mod hybrid;
 pub mod jobs;
@@ -54,6 +55,7 @@ pub mod kv_tiering;
 pub mod launch;
 pub mod llama_driver;
 pub mod llama_release;
+pub mod lockfile;
 pub mod lora;
 pub mod manifest;
 pub mod node_snapshot;
@@ -153,15 +155,16 @@ pub use fit::{
     FitPlan, GpuDescriptor, GpuProbe, GpuVendor, MemoryEstimate, ModelMetadata, Quant,
     StaticGpuProbe, ThroughputEstimate,
 };
+pub use foreign_cache::{
+    discover as discover_foreign_models, ForeignCacheSource, ForeignModelFile,
+};
 pub use generation_store::{DeploymentGenerationStoreError, FileDeploymentGenerationStore};
 pub use hybrid::{savings_micros, CloudPrice, LaneSplit};
 pub use jobs::{
     FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
 };
 pub use kv_tiering::{KvTier, KvTieringPolicy, TierDecision};
-pub use launch::{
-    build_launch_spec, chunk_size_for_ttft, serving_flags, should_speculate, ProcessEngineLauncher,
-};
+pub use launch::{build_launch_spec, serving_flags, should_speculate, ProcessEngineLauncher};
 pub use llama_driver::{
     LlamaBinarySource, LlamaCppDriver, LlamaDetection, LlamaProvisioned, SystemLlamaBinarySource,
 };
@@ -171,6 +174,10 @@ pub use llama_release::{
 };
 #[cfg(feature = "weights")]
 pub use llama_release::{ensure_llama_server, ensure_llama_server_blocking};
+pub use lockfile::{
+    diff_against_cache, read_lockfile, verify_for_serve, write_lockfile, LockDrift, LockedEngine,
+    LockedModel, Lockfile, LockfileError, LOCKFILE_NAME, LOCKFILE_SCHEMA_VERSION,
+};
 pub use lora::{AdapterRoute, LoraCache};
 pub use manifest::{
     resolve_cache_dir, resolve_cache_dir_default, validate_serve_against_manifest, SourceScheme,

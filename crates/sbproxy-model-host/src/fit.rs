@@ -285,12 +285,32 @@ impl ModelMetadata {
             .or_else(|| v.get("intermediate_size"))
             .and_then(|x| x.as_u64())
             .unwrap_or(0);
+        let hidden_size = hidden.unwrap_or_else(|| head_dim.saturating_mul(attn_heads));
+        // A raw `hf:` reference's config.json rarely carries `num_parameters`,
+        // so `params` arrives as 0. Left at 0 the fit planner sees a
+        // weightless model, keeps it on one GPU, and reports absurd
+        // throughput; estimate the count from the architecture instead so
+        // tensor-parallel and fit decisions are based on the real size.
+        let params = if params > 0 {
+            params
+        } else {
+            estimate_transformer_params(
+                v,
+                layers,
+                hidden_size,
+                attn_heads,
+                kv_heads,
+                head_dim,
+                expert_count,
+                expert_ffn_length,
+            )
+        };
         Some(Self {
             params,
             layers,
             kv_heads,
             head_dim,
-            hidden_size: hidden.unwrap_or_else(|| head_dim.saturating_mul(attn_heads)),
+            hidden_size,
             max_context,
             expert_count,
             expert_ffn_length,
@@ -600,6 +620,13 @@ pub struct FitPlan {
     /// this plan (WOR-1670), when the GPU reports memory bandwidth. Advisory:
     /// it catches "this fits but will be slow" before an engine starts.
     pub throughput: Option<ThroughputEstimate>,
+    /// Fraction of each device's total VRAM the engine should reserve,
+    /// emitted as vLLM/SGLang `--gpu-memory-utilization`. Derived from the
+    /// per-device byte budget and the device capacity so a fit-bounded
+    /// engine honors the same envelope the planner reserved. `None` when
+    /// the device capacity is unknown; the launcher then uses a safe
+    /// default utilization.
+    pub gpu_memory_fraction: Option<f32>,
 }
 
 impl FitPlan {
@@ -697,11 +724,13 @@ pub const DEFAULT_OVERHEAD: f64 = 1.15;
 
 /// A rough throughput prediction for a model + quant on a GPU
 /// (WOR-1670). Decode is memory-bandwidth bound, so single-stream
-/// tokens/sec is the achievable bandwidth divided by the bytes read
-/// per generated token (the weights, at the chosen quant). A real
-/// profiled model (Vidur/Dooly) would be more accurate; this roofline
-/// estimate needs only device specs and catches "this quant fits but
-/// will be painfully slow" before an engine ever starts.
+/// seconds/token is the bytes read per generated token (the weights,
+/// at the chosen quant) over the achievable bandwidth, plus a fixed
+/// per-token host cost ([`PER_TOKEN_OVERHEAD_SECS`]) that dominates
+/// small models. A real profiled model (Vidur/Dooly) would be more
+/// accurate; this two-term estimate needs only device specs and
+/// catches "this quant fits but will be painfully slow" before an
+/// engine ever starts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThroughputEstimate {
     /// Estimated single-stream decode tokens/sec.
@@ -713,15 +742,133 @@ pub struct ThroughputEstimate {
     pub safe_max_batch: u64,
 }
 
+impl ThroughputEstimate {
+    /// Scale a single-device decode estimate for a tensor-parallel group of
+    /// `degree` GPUs. Each GPU holds 1/degree of the weights and streams its
+    /// shard in parallel over NVLink, so single-stream decode (a memory-bound
+    /// weight read) scales roughly linearly with the degree; `bytes_per_token`
+    /// becomes the per-device figure. A degree of 1 is a no-op. Note the
+    /// estimate ignores KV reads and interconnect latency, and the linear
+    /// scaling also divides the fixed per-token overhead across the group,
+    /// which slightly flatters a TP group; the tp=2 A100 calibration point
+    /// in [`estimate_throughput`] still lands within +/-25% of measured.
+    fn scaled_for_tp(mut self, degree: usize) -> Self {
+        let degree = degree.max(1);
+        self.decode_tokens_per_sec *= degree as f64;
+        self.bytes_per_token /= degree as u64;
+        self
+    }
+}
+
 /// Fraction of peak memory bandwidth a real engine sustains during
-/// decode. Empirically 60-80%; use a conservative midpoint.
-pub const DECODE_BANDWIDTH_EFFICIENCY: f64 = 0.7;
+/// decode. Calibrated against live A100 gateway measurements
+/// (WOR-1670): Qwen3-32B bf16 at tp=2 measured ~33 tok/s, which the
+/// old conservative 0.7 under-predicted by ~2.4x. Once the fixed
+/// per-token host cost ([`PER_TOKEN_OVERHEAD_SECS`]) is separated
+/// out, the big-model weight stream runs at roughly 85-90% of peak;
+/// use the lower edge.
+pub const DECODE_BANDWIDTH_EFFICIENCY: f64 = 0.85;
+
+/// Fixed per-token host cost in seconds: scheduler step, sampling, and
+/// kernel-launch overhead every decode step pays regardless of model
+/// size. Derived from the small-model A100 calibration point
+/// (WOR-1670): Qwen3-0.6B bf16 (~1.2e9 bytes of weights) measured
+/// ~200 tok/s on a 1555 GB/s card, so
+/// `1/200 - 1.2e9 / (1555e9 * 0.85) ~= 5.0e-3 - 0.9e-3 ~= 4.1e-3` s.
+/// Small models are dominated by this term (a pure roofline
+/// over-predicted the 0.6B by ~2x); big models barely notice it.
+pub const PER_TOKEN_OVERHEAD_SECS: f64 = 4.1e-3;
+
+/// Fixed per-device VRAM a CUDA inference engine consumes before any KV
+/// cache: the CUDA context, framework allocator, and compiled-graph buffers.
+/// The planner's `runtime_overhead_bytes` models this as a small multiplier
+/// of the working set, which under-counts it badly for small models, so the
+/// `--gpu-memory-utilization` mapping adds this fixed floor on top of the
+/// planned budget. Without it vLLM reserves the planned bytes, spends this
+/// much on its own runtime, and then has too little left for the KV cache it
+/// needs for the model's max sequence length.
+pub const ENGINE_FIXED_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Map a per-device byte budget to a vLLM/SGLang `--gpu-memory-utilization`
+/// fraction of the device's total VRAM. Adds [`ENGINE_FIXED_OVERHEAD_BYTES`]
+/// so the engine has room for its own runtime on top of weights and KV, then
+/// clamps to a safe serving range so a small model still reserves enough for
+/// its KV cache and a large one never over-commits the card.
+pub fn device_memory_fraction(need_bytes: u64, total_vram_bytes: u64) -> Option<f32> {
+    if total_vram_bytes == 0 {
+        return None;
+    }
+    let fraction =
+        need_bytes.saturating_add(ENGINE_FIXED_OVERHEAD_BYTES) as f64 / total_vram_bytes as f64;
+    Some(fraction.clamp(0.2, 0.95) as f32)
+}
+
+/// Estimate a transformer's parameter count from its config.json shape when
+/// the file omits `num_parameters` (common for a raw `hf:` reference). Sums
+/// the (tied) embedding table, per-layer attention (q/k/v/o with GQA), and
+/// the per-layer MLP: one dense gated FFN, or `expert_count` gated experts
+/// for a MoE. Approximate (ignores norms, biases, and the router) but well
+/// within the accuracy the fit planner needs to choose a device count.
+// The shape is already parsed by the caller; threading it in avoids a second
+// parse and keeps the estimate beside the fields it derives from.
+#[allow(clippy::too_many_arguments)]
+fn estimate_transformer_params(
+    v: &serde_json::Value,
+    layers: u64,
+    hidden: u64,
+    _attn_heads: u64,
+    kv_heads: u64,
+    head_dim: u64,
+    expert_count: u64,
+    expert_ffn_length: u64,
+) -> u64 {
+    let vocab = v.get("vocab_size").and_then(|x| x.as_u64()).unwrap_or(0);
+    let intermediate = v
+        .get("intermediate_size")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let kv_dim = kv_heads.saturating_mul(head_dim);
+    // Attention: q_proj + o_proj (hidden x hidden each) + k_proj + v_proj
+    // (hidden x kv_dim each, smaller under grouped-query attention).
+    let attn = hidden
+        .saturating_mul(hidden)
+        .saturating_mul(2)
+        .saturating_add(hidden.saturating_mul(kv_dim).saturating_mul(2));
+    // A gated FFN is 3 matrices (gate, up, down) of hidden x ffn. A MoE layer
+    // has `expert_count` of them over the expert intermediate size; a dense
+    // layer has one over the model intermediate size.
+    let mlp = if expert_count > 0 && expert_ffn_length > 0 {
+        expert_count
+            .saturating_mul(3)
+            .saturating_mul(hidden)
+            .saturating_mul(expert_ffn_length)
+    } else {
+        3u64.saturating_mul(hidden).saturating_mul(intermediate)
+    };
+    let per_layer = attn.saturating_add(mlp);
+    vocab
+        .saturating_mul(hidden)
+        .saturating_add(layers.saturating_mul(per_layer))
+}
 
 /// Estimate decode throughput and a safe batch ceiling for a model +
 /// quant on a GPU. Returns `None` when the GPU does not report memory
-/// bandwidth. Note: for MoE models this is pessimistic, since decode
-/// reads only the active experts, not all weights; treat it as a
-/// lower bound.
+/// bandwidth.
+///
+/// Single-stream decode is modeled as two serial costs per token: the
+/// weight read at the achievable bandwidth, and a fixed host cost, so
+/// `tokens_per_sec = 1 / (bytes_per_token / (bandwidth *`
+/// [`DECODE_BANDWIDTH_EFFICIENCY`]`) + `[`PER_TOKEN_OVERHEAD_SECS`]`)`.
+/// Recomputing the two live A100 (1555 GB/s) calibration points with
+/// these constants (WOR-1670):
+///
+/// - Qwen3-0.6B bf16 (1.2e9 bytes/token):
+///   `1 / (1.2e9 / 1321.75e9 + 4.1e-3) ~= 200` tok/s; measured ~200.
+/// - Qwen3-32B bf16 (~60e9 bytes/token): `~20.2` tok/s single-card,
+///   doubled to ~40 by `scaled_for_tp(2)`; measured ~33 (+22%).
+///
+/// Note: for MoE models this is pessimistic, since decode reads only
+/// the active experts, not all weights; treat it as a lower bound.
 pub fn estimate_throughput(
     gpu: &GpuDescriptor,
     meta: &ModelMetadata,
@@ -731,7 +878,7 @@ pub fn estimate_throughput(
     let bw_gbps = gpu.mem_bandwidth_gbps?;
     let bytes_per_token = meta.weight_bytes(quant).max(1.0);
     let bw_bytes_per_sec = bw_gbps * 1e9 * DECODE_BANDWIDTH_EFFICIENCY;
-    let decode_tps = bw_bytes_per_sec / bytes_per_token;
+    let decode_tps = 1.0 / (bytes_per_token / bw_bytes_per_sec + PER_TOKEN_OVERHEAD_SECS);
 
     // KV per sequence at the planned context; how many fit in the
     // VRAM left after the weights.
@@ -931,9 +1078,14 @@ fn plan_fit_sharded(
                 estimated_vram_bytes: memory.total_bytes,
                 gpu_indexes: devices.to_vec(),
                 seq_len,
+                gpu_memory_fraction: device_memory_fraction(
+                    memory.total_bytes,
+                    gpu.total_vram_bytes,
+                ),
                 memory,
                 moe: None,
-                throughput: estimate_throughput(gpu, meta, quant, seq_len),
+                throughput: estimate_throughput(gpu, meta, quant, seq_len)
+                    .map(|estimate| estimate.scaled_for_tp(devices.len())),
             });
         }
     }
@@ -1116,6 +1268,7 @@ fn plan_moe_spill(
             estimated_vram_bytes: memory.total_bytes,
             gpu_indexes: vec![gpu.index],
             seq_len,
+            gpu_memory_fraction: device_memory_fraction(memory.total_bytes, gpu.total_vram_bytes),
             memory,
             moe: Some(MoePlacement {
                 cpu_moe_layers: spill,
@@ -1867,8 +2020,9 @@ mod tests {
     #[test]
     fn throughput_decode_is_bandwidth_bound() {
         // 14B model at Q4 (~0.56 bytes/param -> ~7.84 GB/token read).
-        // L4 at 300 GB/s * 0.7 efficiency = 210 GB/s effective.
-        // decode tps ~= 210e9 / 7.84e9 ~= 26-27 tok/s.
+        // L4 at 300 GB/s * 0.85 efficiency = 255 GB/s effective, so
+        // ~30.7 ms/token of weight reads + 4.1 ms host overhead
+        // ~= 29 tok/s.
         let est = estimate_throughput(&GpuDescriptor::l4(), &meta_14b(), Quant::Int4, 4096)
             .expect("L4 reports bandwidth");
         assert!(
@@ -1885,6 +2039,62 @@ mod tests {
         let q4 = estimate_throughput(&GpuDescriptor::l4(), &meta_14b(), Quant::Int4, 4096).unwrap();
         let f16 = estimate_throughput(&GpuDescriptor::l4(), &meta_14b(), Quant::F16, 4096).unwrap();
         assert!(q4.decode_tokens_per_sec > f16.decode_tokens_per_sec);
+    }
+
+    // A synthetic NVIDIA A100 40 GiB SXM (Ampere 8.0, 1555 GB/s): the
+    // card the WOR-1670 calibration measurements were taken on.
+    fn a100() -> GpuDescriptor {
+        GpuDescriptor {
+            index: 0,
+            vendor: GpuVendor::Nvidia,
+            name: "NVIDIA A100-SXM4-40GB".to_string(),
+            total_vram_bytes: 40 * GIB,
+            free_vram_bytes: 39 * GIB,
+            compute_utilization: None,
+            memory_occupancy: memory_occupancy(40 * GIB, 39 * GIB),
+            compute_capability: Some((8, 0)),
+            supports_fp8: false,
+            mem_bandwidth_gbps: Some(1555.0),
+        }
+    }
+
+    #[test]
+    fn throughput_matches_a100_calibration_points() {
+        // WOR-1670: two single-stream decode measurements from a live A100
+        // (through the gateway) pin the estimator in both regimes. Each
+        // estimate must land within +/-35% of the measurement.
+        //
+        // Small regime: Qwen3-0.6B bf16 on one A100 measured ~200 tok/s
+        // (fixed per-token host overhead dominates the tiny weight read).
+        let small = estimate_throughput(&a100(), &meta_small(), Quant::F16, 4096)
+            .expect("the A100 reports bandwidth");
+        assert!(
+            small.decode_tokens_per_sec > 200.0 * 0.65
+                && small.decode_tokens_per_sec < 200.0 * 1.35,
+            "0.6B bf16 on one A100: got {} tok/s, measured ~200",
+            small.decode_tokens_per_sec
+        );
+
+        // Big regime: Qwen3-32B bf16 at tp=2 across two A100s measured
+        // ~33 tok/s (the weight read dominates; bandwidth efficiency rules).
+        let meta_32b = ModelMetadata {
+            params: 30_000_000_000,
+            layers: 64,
+            kv_heads: 8,
+            head_dim: 128,
+            hidden_size: 0,
+            max_context: 40960,
+            expert_count: 0,
+            expert_ffn_length: 0,
+        };
+        let big = estimate_throughput(&a100(), &meta_32b, Quant::F16, 4096)
+            .expect("the A100 reports bandwidth")
+            .scaled_for_tp(2);
+        assert!(
+            big.decode_tokens_per_sec > 33.0 * 0.65 && big.decode_tokens_per_sec < 33.0 * 1.35,
+            "32B bf16 at tp=2 on A100: got {} tok/s, measured ~33",
+            big.decode_tokens_per_sec
+        );
     }
 
     #[test]

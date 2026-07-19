@@ -516,6 +516,7 @@ mod tests {
             request_id: rid.map(|s| s.to_string()),
             tag: None,
             priority: None,
+            engine_version: None,
         }
     }
 

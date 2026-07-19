@@ -97,8 +97,10 @@ pub struct ProvisionedEngine {
 /// that sets them. `Default` leaves every knob unset.
 #[derive(Debug, Clone, Default)]
 pub struct EngineTuning {
-    /// Chunked prefill: `--enable-chunked-prefill` and, when a chunk size
-    /// is set, `--max-num-batched-tokens`.
+    /// Chunked prefill: `--enable-chunked-prefill` plus
+    /// `--max-num-batched-tokens` from the explicit chunk size or, when
+    /// only `target_ttft_ms` is set, from the driver's conservative TTFT
+    /// auto-tune (WOR-1678). Neither set leaves the engine default.
     pub chunked_prefill: Option<ChunkedPrefill>,
     /// vLLM auto tool-choice parser: `--enable-auto-tool-choice
     /// --tool-call-parser <name>`.
@@ -467,7 +469,12 @@ impl LaunchRequest {
                 false,
             ));
         }
-        if self.artifact.metadata.trust != "verified" {
+        // A repo-mode (unpinned raw `hf:`) artifact has no verified local
+        // bytes: the engine self-downloads the weights at launch, so the
+        // trust and file-verification invariants below apply only to
+        // pinned, content-addressed snapshots.
+        let repo_mode = self.artifact.repo.is_some();
+        if !repo_mode && self.artifact.metadata.trust != "verified" {
             return Err(EngineDriverError::artifact_not_ready(format!(
                 "artifact {} has trust state {:?}",
                 self.artifact.artifact_digest, self.artifact.metadata.trust
@@ -489,7 +496,7 @@ impl LaunchRequest {
                 "verified snapshot path must be absolute",
             ));
         }
-        if self.artifact.files.len() != self.artifact.metadata.files.len() {
+        if !repo_mode && self.artifact.files.len() != self.artifact.metadata.files.len() {
             return Err(EngineDriverError::artifact_not_ready(
                 "verified file map does not match artifact metadata",
             ));

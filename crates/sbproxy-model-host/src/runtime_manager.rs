@@ -2775,6 +2775,16 @@ impl ProductionDeploymentPreparer {
         self
     }
 
+    /// List durable ready artifact metadata from the verified cache in
+    /// deterministic digest order. Read-only inventory passthrough to
+    /// [`ArtifactManager::cached_artifacts`] for admin surfaces; it never
+    /// touches artifact bytes.
+    pub fn cached_artifacts(
+        &self,
+    ) -> Result<Vec<crate::ArtifactCacheMetadata>, crate::ArtifactError> {
+        self.artifacts.cached_artifacts()
+    }
+
     /// Snapshot path-free worker hardware, engine, and verified-cache truth.
     pub fn node_snapshot_inventory(
         &self,
@@ -2866,6 +2876,68 @@ impl ProductionDeploymentPreparer {
     }
 }
 
+/// Resolve a deployment's model to a [`crate::ResolvedArtifact`], handling
+/// raw `hf:Org/Repo[:QUANT]` references that have no catalog-v2 variant.
+///
+/// A catalog id resolves through the pinned catalog path. A raw `hf:` ref
+/// synthesizes an unpinned artifact ([`crate::ResolvedArtifact::unpinned`]):
+/// there are no bytes to stage, so the container engine self-downloads the
+/// weights from the repo at launch. Modality has no serve-entry field, so a
+/// raw ref defaults to chat; `gguf_file` selects the GGUF format (llama.cpp),
+/// otherwise safetensors (vLLM/SGLang).
+fn resolve_artifact_or_unpinned(
+    catalog: &crate::Catalog,
+    desired: &crate::ModelDeployment,
+    legacy_entry: Option<&crate::config::ServeEntry>,
+    worker: &WorkerProfile,
+) -> Result<crate::ResolvedArtifact, RuntimeManagerError> {
+    if desired.model.starts_with("hf:") {
+        let model_ref = catalog
+            .resolve(&desired.model)
+            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+        let gguf = legacy_entry
+            .and_then(|entry| entry.gguf_file.as_ref())
+            .is_some();
+        let format = if gguf {
+            ArtifactFormat::Gguf
+        } else {
+            ArtifactFormat::Safetensors
+        };
+        let engine = crate::artifact_spec::forced_engine(desired.engine).unwrap_or(if gguf {
+            crate::EngineKind::LlamaCpp
+        } else {
+            crate::EngineKind::Vllm
+        });
+        let context_length = legacy_entry
+            .and_then(|entry| entry.max_context)
+            .unwrap_or(0);
+        let modality = legacy_entry
+            .and_then(|entry| entry.modality)
+            .unwrap_or_default();
+        return Ok(crate::ResolvedArtifact::unpinned(
+            &desired.model,
+            &model_ref.hf_repo,
+            &model_ref.quant,
+            format,
+            engine,
+            context_length,
+            modality,
+        ));
+    }
+    catalog
+        .resolve_artifact(
+            &ResolveArtifactRequest {
+                model: desired.model.clone(),
+                variant: desired.variant.clone(),
+                engine: desired.engine,
+                replicas: desired.replicas,
+                heterogeneous_variants: desired.heterogeneous_variants,
+            },
+            worker,
+        )
+        .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))
+}
+
 #[async_trait]
 impl DeploymentPreparer for ProductionDeploymentPreparer {
     async fn prepare(
@@ -2874,19 +2946,12 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
     ) -> Result<Arc<dyn PreparedDeploymentRuntime>, RuntimeManagerError> {
         let worker = WorkerProfile::from_descriptors(&self.probe.probe())
             .map_err(RuntimeManagerError::Prepare)?;
-        let resolved = self
-            .catalog
-            .resolve_artifact(
-                &ResolveArtifactRequest {
-                    model: request.desired.desired.model.clone(),
-                    variant: request.desired.desired.variant.clone(),
-                    engine: request.desired.desired.engine,
-                    replicas: request.desired.desired.replicas,
-                    heterogeneous_variants: request.desired.desired.heterogeneous_variants,
-                },
-                &worker,
-            )
-            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+        let resolved = resolve_artifact_or_unpinned(
+            &self.catalog,
+            &request.desired.desired,
+            request.desired.legacy_entry.as_ref(),
+            &worker,
+        )?;
         let driver = self.drivers.get(&resolved.engine).cloned().ok_or_else(|| {
             RuntimeManagerError::PrepareInfrastructure(format!(
                 "no managed {:?} driver is registered for deployment {:?}",
@@ -2991,38 +3056,37 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
         // then reads it back from the cache.
         let worker = WorkerProfile::from_descriptors(&self.probe.probe())
             .map_err(RuntimeManagerError::Prepare)?;
-        let resolved = self
-            .catalog
-            .resolve_artifact(
-                &ResolveArtifactRequest {
-                    model: request.desired.desired.model.clone(),
-                    variant: request.desired.desired.variant.clone(),
-                    engine: request.desired.desired.engine,
-                    replicas,
-                    heterogeneous_variants: request.desired.desired.heterogeneous_variants,
-                },
-                &worker,
-            )
-            .map_err(|error| RuntimeManagerError::Prepare(error.to_string()))?;
+        let resolved = resolve_artifact_or_unpinned(
+            &self.catalog,
+            &request.desired.desired,
+            request.desired.legacy_entry.as_ref(),
+            &worker,
+        )?;
         let params_fallback = self
             .catalog
             .get(&resolved.logical_model)
             .map(|entry| crate::parse_params(&entry.params))
             .unwrap_or(0);
         let pull_policy = request.desired.desired.pull;
-        let ready = self
-            .artifacts
-            .ensure(
-                &resolved,
-                AcquisitionContext {
-                    intent: PullIntent::Startup,
-                    network: self.network_policy,
-                    pull_policy,
-                    credential: None,
-                },
-            )
-            .await
-            .map_err(RuntimeManagerError::from)?;
+        let ready = if resolved.is_unpinned() {
+            self.artifacts
+                .ensure_unpinned(&resolved)
+                .await
+                .map_err(RuntimeManagerError::from)?
+        } else {
+            self.artifacts
+                .ensure(
+                    &resolved,
+                    AcquisitionContext {
+                        intent: PullIntent::Startup,
+                        network: self.network_policy,
+                        pull_policy,
+                        credential: None,
+                    },
+                )
+                .await
+                .map_err(RuntimeManagerError::from)?
+        };
         let metadata = ready_metadata(self.metadata.as_ref(), &resolved, &ready, params_fallback)
             .await
             .ok_or_else(|| {
@@ -3031,12 +3095,18 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
                     resolved.artifact_digest
                 ))
             })?;
+        // A raw `hf:` ref carries no declared context, so fall back to the
+        // shape the weights declare (config.json) rather than capping the
+        // served model to a 1-token context.
         let seq_len = request
             .desired
             .legacy_entry
             .as_ref()
             .and_then(|entry| entry.max_context)
-            .unwrap_or(resolved.context_length.max(1));
+            .filter(|value| *value > 0)
+            .or_else(|| Some(resolved.context_length).filter(|value| *value > 0))
+            .or_else(|| Some(metadata.max_context).filter(|value| *value > 0))
+            .unwrap_or(1);
         let kv_quant = request
             .desired
             .legacy_entry
@@ -3129,19 +3199,25 @@ impl ProductionPreparedDeployment {
             } else {
                 intent
             };
-        let ready = self
-            .artifacts
-            .ensure(
-                &self.resolved,
-                AcquisitionContext {
-                    intent: artifact_intent,
-                    network: self.network_policy,
-                    pull_policy,
-                    credential: None,
-                },
-            )
-            .await
-            .map_err(RuntimeManagerError::from)?;
+        let ready = if self.resolved.is_unpinned() {
+            self.artifacts
+                .ensure_unpinned(&self.resolved)
+                .await
+                .map_err(RuntimeManagerError::from)?
+        } else {
+            self.artifacts
+                .ensure(
+                    &self.resolved,
+                    AcquisitionContext {
+                        intent: artifact_intent,
+                        network: self.network_policy,
+                        pull_policy,
+                        credential: None,
+                    },
+                )
+                .await
+                .map_err(RuntimeManagerError::from)?
+        };
         self.artifact_cached.store(true, Ordering::SeqCst);
         *self.last_job_id.lock().await = Some(ready.job.id.clone());
         Ok(ready)
@@ -3185,7 +3261,10 @@ impl ProductionPreparedDeployment {
                     .legacy_entry
                     .as_ref()
                     .and_then(|entry| entry.max_context)
-                    .unwrap_or(self.resolved.context_length.max(1));
+                    .filter(|value| *value > 0)
+                    .or_else(|| Some(self.resolved.context_length).filter(|value| *value > 0))
+                    .or_else(|| Some(metadata.max_context).filter(|value| *value > 0))
+                    .unwrap_or(1);
                 let concurrency = self.desired.desired.max_concurrency.unwrap_or(1);
                 crate::fit::plan_fit_auto_kv_with_margin_and_concurrency(
                     self.probe.as_ref(),
@@ -3213,6 +3292,21 @@ impl ProductionPreparedDeployment {
         } else {
             fit.gpu_indexes.clone()
         };
+        tracing::info!(
+            deployment = %self.id,
+            model = %self.resolved.logical_model,
+            engine = ?self.resolved.engine,
+            modality = ?self.resolved.modality,
+            quant = %fit.quant_name,
+            devices = ?selected_devices,
+            seq_len = fit.seq_len,
+            estimated_vram_bytes = fit.estimated_vram_bytes,
+            gpu_memory_fraction = ?fit.gpu_memory_fraction,
+            estimated_decode_tokens_per_sec =
+                ?fit.throughput.as_ref().map(|t| t.decode_tokens_per_sec),
+            moe_cpu_layers = ?fit.moe.as_ref().map(|placement| placement.cpu_moe_layers),
+            "model-host fit plan selected",
+        );
         // Serving tuning comes from the legacy `serve:` entry when present, and
         // otherwise from the canonical deployment's own fields.
         let extra_args = self
@@ -3415,12 +3509,26 @@ fn provisioning_for(
     container_runtime: bool,
 ) -> EngineProvisioning {
     if request.desired.origin == crate::DesiredDeploymentOrigin::LegacyServe {
-        return request
+        if let Some(configured) = request
             .legacy_host_policy
             .as_ref()
             .and_then(|policy| policy.engines.get(&kind))
-            .cloned()
-            .unwrap_or_default();
+        {
+            return configured.clone();
+        }
+        // WOR-1917: an unconfigured legacy `serve:` entry gets the same
+        // container-first default as a managed deployment, so easy
+        // self-hosting works without an explicit `engines:` block wherever
+        // a container runtime is present. An explicit engine policy above
+        // still wins.
+        if let Some(provisioning) = container_first_default(
+            kind,
+            container_runtime,
+            request.desired.desired.engine_image.as_deref(),
+        ) {
+            return provisioning;
+        }
+        return EngineProvisioning::default();
     }
     let managed_kind = match kind {
         EngineKind::Vllm => sbproxy_config::ManagedEngineKind::Vllm,

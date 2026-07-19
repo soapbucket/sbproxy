@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Cluster status, metrics, and one-time enrollment admin adapters.
+//! Cluster status, metrics, artifact-usage, and one-time enrollment
+//! admin adapters.
 
 use sbproxy_mesh::enrollment::{EnrollmentError, EnrollmentRequest};
 use serde::Serialize;
@@ -16,6 +17,7 @@ pub const STATUS_PATH: &str = "/admin/cluster/status";
 /// Authenticated signed cluster deployment read and publication endpoint.
 pub const DEPLOYMENTS_PATH: &str = "/admin/cluster/deployments";
 const METRICS_PATH: &str = "/admin/cluster/metrics";
+const ARTIFACTS_PATH: &str = "/admin/cluster/artifacts";
 
 #[derive(Debug, Clone, Serialize)]
 struct ClusterStatusResponse {
@@ -131,6 +133,7 @@ pub fn dispatch(
         STATUS_PATH => Some(dispatch_status(method)),
         DEPLOYMENTS_PATH => Some(dispatch_deployments(method, body)),
         METRICS_PATH => Some(dispatch_metrics(method)),
+        ARTIFACTS_PATH => Some(dispatch_artifacts(method)),
         ENROLL_PATH => Some(dispatch_enrollment(method, body)),
         _ => None,
     }
@@ -643,6 +646,161 @@ fn dispatch_metrics(method: &str) -> (u16, &'static str, String) {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ClusterArtifactsResponse {
+    schema_version: u32,
+    nodes: Vec<ClusterArtifactsNode>,
+    models: Vec<ClusterArtifactsModel>,
+    partial: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterArtifactsNode {
+    node_id: String,
+    total_bytes: u64,
+    artifact_count: usize,
+    snapshot_age_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterArtifactsModel {
+    logical_model: String,
+    total_bytes: u64,
+    node_count: usize,
+}
+
+// WOR-1910: fleet artifact disk usage aggregated from the node snapshots
+// already collected in the cluster model directory. Without a configured
+// cluster the local verified cache is the whole fleet, reported as one
+// "local" node.
+fn dispatch_artifacts(method: &str) -> (u16, &'static str, String) {
+    if !method.eq_ignore_ascii_case("GET") {
+        return json(405, serde_json::json!({"error": "method not allowed"}));
+    }
+    match crate::cluster::current_model_directory() {
+        // The process-wide directory exists even without a configured
+        // cluster; an empty membership means this node is the fleet, so
+        // report the local cache rather than an empty aggregate.
+        Some(directory) => {
+            let view = directory.load();
+            if view.nodes.is_empty() {
+                local_artifacts_response()
+            } else {
+                artifacts_response_from_directory(&view, unix_time_ms())
+            }
+        }
+        None => local_artifacts_response(),
+    }
+}
+
+fn artifacts_response_from_directory(
+    view: &sbproxy_ai::model_directory::ModelDirectoryView,
+    now: u64,
+) -> (u16, &'static str, String) {
+    let mut partial = false;
+    let mut nodes = Vec::with_capacity(view.nodes.len());
+    let mut models: BTreeMap<String, (u64, BTreeSet<String>)> = BTreeMap::new();
+    for node in &view.nodes {
+        let Some(snapshot) = node.snapshot.as_ref() else {
+            // A member without an accepted snapshot has unknown cache
+            // truth, so the aggregate is explicitly partial.
+            partial = true;
+            continue;
+        };
+        let mut total_bytes: u64 = 0;
+        let mut artifact_count = 0usize;
+        for artifact in &snapshot.artifacts {
+            // Snapshots include synthesized zero-byte "missing" rows for
+            // runtime digests absent from the inventory; only bytes on
+            // disk count toward usage.
+            if artifact.completed_bytes == 0 {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(artifact.completed_bytes);
+            artifact_count += 1;
+            let entry = models.entry(artifact.model.clone()).or_default();
+            entry.0 = entry.0.saturating_add(artifact.completed_bytes);
+            entry.1.insert(node.node_id.clone());
+        }
+        nodes.push(ClusterArtifactsNode {
+            node_id: node.node_id.clone(),
+            total_bytes,
+            artifact_count,
+            snapshot_age_ms: now.saturating_sub(snapshot.published_at_unix_ms),
+        });
+    }
+    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    render_artifacts_response(nodes, models, partial)
+}
+
+fn local_artifacts_response() -> (u16, &'static str, String) {
+    let runtime = crate::server::model_host::model_runtime_manager();
+    let mut total_bytes: u64 = 0;
+    let mut artifact_count = 0usize;
+    let mut models: BTreeMap<String, (u64, BTreeSet<String>)> = BTreeMap::new();
+    match runtime.cached_artifacts() {
+        // No model host is configured, so no artifact cache is open and
+        // the single-node inventory is honestly empty.
+        None => {}
+        Some(Ok(artifacts)) => {
+            for artifact in artifacts {
+                total_bytes = total_bytes.saturating_add(artifact.total_size_bytes);
+                artifact_count += 1;
+                let entry = models.entry(artifact.logical_model).or_default();
+                entry.0 = entry.0.saturating_add(artifact.total_size_bytes);
+                entry.1.insert("local".to_string());
+            }
+        }
+        Some(Err(error)) => {
+            tracing::error!(%error, "list local artifact inventory for cluster aggregate");
+            return json(
+                502,
+                serde_json::json!({"error": "artifact inventory unavailable; inspect server logs"}),
+            );
+        }
+    }
+    let nodes = vec![ClusterArtifactsNode {
+        node_id: "local".to_string(),
+        total_bytes,
+        artifact_count,
+        snapshot_age_ms: 0,
+    }];
+    render_artifacts_response(nodes, models, false)
+}
+
+fn render_artifacts_response(
+    nodes: Vec<ClusterArtifactsNode>,
+    models: BTreeMap<String, (u64, BTreeSet<String>)>,
+    partial: bool,
+) -> (u16, &'static str, String) {
+    let models = models
+        .into_iter()
+        .map(
+            |(logical_model, (total_bytes, model_nodes))| ClusterArtifactsModel {
+                logical_model,
+                total_bytes,
+                node_count: model_nodes.len(),
+            },
+        )
+        .collect();
+    let response = ClusterArtifactsResponse {
+        schema_version: 1,
+        nodes,
+        models,
+        partial,
+    };
+    match serde_json::to_string(&response) {
+        Ok(body) => (200, "application/json", body),
+        Err(error) => {
+            tracing::error!(%error, "serialize cluster artifacts response");
+            json(
+                500,
+                serde_json::json!({"error": "cluster artifacts failed"}),
+            )
+        }
+    }
+}
+
 fn dispatch_enrollment(method: &str, body: Option<&str>) -> (u16, &'static str, String) {
     dispatch_enrollment_with(method, body, crate::cluster::current_enrollment_authority())
 }
@@ -741,6 +899,158 @@ mod tests {
         let (status, content_type, _) = dispatch("GET", METRICS_PATH, None).expect("matched");
         assert!(status == 200 || status == 404, "status {status}");
         assert_eq!(content_type, "application/json");
+    }
+
+    #[test]
+    fn artifacts_contract_is_method_aware() {
+        assert_eq!(
+            dispatch("POST", ARTIFACTS_PATH, None).expect("matched").0,
+            405
+        );
+    }
+
+    #[test]
+    fn artifacts_contract_reports_the_single_node_equivalent_without_a_cluster() {
+        // Without a configured cluster the local verified cache is the
+        // whole fleet: one "local" node, zero snapshot age, not partial.
+        let (status, content_type, body) = local_artifacts_response();
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("artifacts JSON");
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["partial"], false);
+        assert_eq!(body["nodes"].as_array().expect("nodes array").len(), 1);
+        assert_eq!(body["nodes"][0]["node_id"], "local");
+        assert_eq!(body["nodes"][0]["snapshot_age_ms"], 0);
+        assert!(body["nodes"][0]["total_bytes"].is_u64());
+        assert!(body["nodes"][0]["artifact_count"].is_u64());
+        assert!(body["models"].is_array());
+    }
+
+    #[test]
+    fn artifacts_contract_aggregates_node_snapshots_and_marks_missing_ones_partial() {
+        use sbproxy_ai::model_directory::{
+            DirectoryMember, DirectoryMemberState, DirectorySnapshotEnvelope,
+            DirectorySnapshotRead, ModelDirectory,
+        };
+        use sbproxy_model_host::node_snapshot::{
+            ModelPlaneHealth, NodeArtifactSnapshot, NodeArtifactState, NodeHealthSnapshot,
+            NodeHealthState, NodeIdentitySnapshot, NodeModelSnapshot, NodeRole,
+            NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        };
+
+        let snapshot = NodeModelSnapshot {
+            schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+            node: NodeIdentitySnapshot {
+                node_id: "worker-a".to_string(),
+                roles: BTreeSet::from([NodeRole::Worker]),
+                labels: BTreeMap::new(),
+                model_endpoint: Some("https://worker-a.internal:9443".to_string()),
+            },
+            health: NodeHealthSnapshot {
+                state: NodeHealthState::Unhealthy,
+                reason_codes: vec!["engine_unhealthy".to_string()],
+                model_plane: ModelPlaneHealth::Unavailable,
+            },
+            engines: Vec::new(),
+            devices: Vec::new(),
+            artifacts: vec![
+                NodeArtifactSnapshot {
+                    artifact_digest: "a".repeat(64),
+                    model: "qwen2.5-0.5b-instruct".to_string(),
+                    variant: "q4_k_m".to_string(),
+                    state: NodeArtifactState::Ready,
+                    completed_bytes: 1_000,
+                    total_bytes: Some(1_000),
+                    last_accessed_unix_ms: Some(900),
+                    reason_code: None,
+                },
+                NodeArtifactSnapshot {
+                    artifact_digest: "b".repeat(64),
+                    model: "qwen3-8b".to_string(),
+                    variant: "q8_0".to_string(),
+                    state: NodeArtifactState::Partial,
+                    completed_bytes: 250,
+                    total_bytes: None,
+                    last_accessed_unix_ms: None,
+                    reason_code: None,
+                },
+                // Synthesized zero-byte rows carry no disk usage and
+                // must not count as cached artifacts.
+                NodeArtifactSnapshot {
+                    artifact_digest: "c".repeat(64),
+                    model: "qwen3-8b".to_string(),
+                    variant: "q8_0".to_string(),
+                    state: NodeArtifactState::Missing,
+                    completed_bytes: 0,
+                    total_bytes: None,
+                    last_accessed_unix_ms: None,
+                    reason_code: None,
+                },
+            ],
+            replicas: Vec::new(),
+            placement_weight: 0,
+            active_deployment_digest: Some("d".repeat(64)),
+            generation: 4,
+            published_at_unix_ms: 1_000,
+            expires_at_unix_ms: 31_000,
+        };
+        let directory = ModelDirectory::new();
+        let view = directory
+            .refresh(
+                1_100,
+                vec![
+                    DirectoryMember {
+                        node_id: "worker-a".to_string(),
+                        address: Some("10.0.0.12:7946".to_string()),
+                        state: DirectoryMemberState::Alive,
+                        last_ack_age_ms: 25,
+                        incarnation: 2,
+                    },
+                    DirectoryMember {
+                        node_id: "worker-b".to_string(),
+                        address: Some("10.0.0.13:7946".to_string()),
+                        state: DirectoryMemberState::Alive,
+                        last_ack_age_ms: 25,
+                        incarnation: 1,
+                    },
+                ],
+                BTreeMap::from([(
+                    "worker-a".to_string(),
+                    DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+                        publisher_node_id: "worker-a".to_string(),
+                        schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+                        generation: 4,
+                        published_at_unix_ms: 1_000,
+                        expires_at_unix_ms: 31_000,
+                        authenticated_identity: None,
+                        payload: serde_json::to_value(snapshot).expect("snapshot JSON"),
+                    }),
+                )]),
+            )
+            .expect("directory view");
+
+        let (status, _, body) = artifacts_response_from_directory(&view, 1_200);
+
+        assert_eq!(status, 200);
+        let body: serde_json::Value = serde_json::from_str(&body).expect("artifacts JSON");
+        assert_eq!(body["schema_version"], 1);
+        // worker-b has no accepted snapshot, so its cache truth is
+        // unknown and the aggregate says so.
+        assert_eq!(body["partial"], true);
+        assert_eq!(body["nodes"].as_array().expect("nodes array").len(), 1);
+        assert_eq!(body["nodes"][0]["node_id"], "worker-a");
+        assert_eq!(body["nodes"][0]["total_bytes"], 1_250);
+        assert_eq!(body["nodes"][0]["artifact_count"], 2);
+        assert_eq!(body["nodes"][0]["snapshot_age_ms"], 200);
+        let models = body["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["logical_model"], "qwen2.5-0.5b-instruct");
+        assert_eq!(models[0]["total_bytes"], 1_000);
+        assert_eq!(models[0]["node_count"], 1);
+        assert_eq!(models[1]["logical_model"], "qwen3-8b");
+        assert_eq!(models[1]["total_bytes"], 250);
+        assert_eq!(models[1]["node_count"], 1);
     }
 
     #[test]

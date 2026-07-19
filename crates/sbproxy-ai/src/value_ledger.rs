@@ -310,6 +310,7 @@ mod tests {
             request_id: None,
             tag: None,
             priority: None,
+            engine_version: None,
         }
     }
 

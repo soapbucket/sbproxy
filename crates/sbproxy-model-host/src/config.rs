@@ -562,6 +562,15 @@ pub struct ServeEntry {
     /// claim: sbproxy never guesses a cloud reference price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<ReferenceModel>,
+    /// The task this served model performs (WOR-1908 / WOR-1675). A catalog
+    /// entry carries its own modality, but a raw `hf:Org/Repo` reference has
+    /// none, so declare it here to serve an embedding or rerank model:
+    /// it drives the engine's runtime-owned `--task` flag (vLLM `embed` /
+    /// `score`) and zeroes the KV-cache term in the fit. Defaults to chat
+    /// (autoregressive generation) when omitted.
+    /// Support: preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modality: Option<crate::catalog::Modality>,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -581,9 +590,11 @@ pub struct ModelHostConfig {
     /// the platform default (`$HF_HOME` / `~/.cache/sbproxy/models`).
     #[serde(default)]
     pub cache_dir: Option<String>,
-    /// Support: config_only.
+    /// Support: preview.
     /// Disk budget in GiB for the weight cache before GC. `None`
-    /// means unbounded (operator manages the disk).
+    /// means unbounded (operator manages the disk). Collection runs
+    /// after `models pull` and on demand through the authenticated
+    /// `POST /admin/model-host/gc` route.
     #[serde(default)]
     pub cache_budget_gib: Option<f64>,
     /// What to do under VRAM pressure. Defaults to LRU eviction.
@@ -1149,6 +1160,7 @@ models:
             max_loras: None,
             gguf_file: None,
             reference: None,
+            modality: None,
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");
