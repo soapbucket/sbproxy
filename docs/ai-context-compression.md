@@ -623,11 +623,15 @@ normal cardinality budget. Neither surface contains prompt or summary content.
 Every executed non-empty pipeline emits one structured event with
 `event="ai_compression_summary"` on the `ai_compression` tracing target.
 
-Request policy resolution emits a separate content-free event with
-`event="ai_compression_selection"`, `tenant_id`, `source`, and `outcome`.
-Rejected headers and invalid operator selectors add a closed `reason`. The
-event never logs the selector text, bearer value, profile contents, prompt, or
-summary.
+An explicit header, governed-key, or CEL selection emits a separate
+content-free event with `event="ai_compression_selection"`, `tenant_id`,
+`source`, and `outcome`. Routes with named profiles or an explicit input budget
+also emit that event for their route-default resolution because those routes
+require semantic-cache separation. Legacy default-only routes without either
+feature omit the selection event; an executed non-empty pipeline still emits
+the summary event above. Rejected headers and invalid operator selectors add a
+closed `reason`. The event never logs the selector text, bearer value, profile
+contents, prompt, or summary.
 
 | Request result | Level |
 |---|---|

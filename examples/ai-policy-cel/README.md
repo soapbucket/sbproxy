@@ -33,7 +33,7 @@ The response `model` comes back as `gpt-4o-mini`: the policy rerouted it. A
 request without the free tier header is served as `gpt-4o` unchanged.
 
 The CEL expression sees `ai.tokens.input_est` before compression. Known OpenAI
-models use a registered tokenizer; unknown models use the character-count
+models use a registered tokenizer; unknown models use the UTF-8 byte-length
 fallback. The selected `compact` profile has an explicit 512-token input
 budget, so a long free-tier request is trimmed without Redis or worker-local
 conversation state:

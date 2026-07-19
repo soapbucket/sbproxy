@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Both variants are gateway estimates. `ModelTokenizer` means the target
 /// model resolved to a registered BPE tokenizer; `Heuristic` means the
-/// documented character-count fallback was used.
+/// documented UTF-8 byte-length fallback was used.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 pub enum TokenCountPrecision {
     /// A registered target-model tokenizer produced the estimate.
     ModelTokenizer,
-    /// The conservative character-count fallback produced the estimate.
+    /// The conservative UTF-8 byte-length fallback produced the estimate.
     #[default]
     Heuristic,
 }

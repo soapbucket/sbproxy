@@ -102,7 +102,7 @@ for the shared grammar and rejection rules.
 
 `ai.tokens.input_est` is computed before CEL and before compression. Known
 OpenAI model families use their registered tokenizer; other model names use
-the documented character-count heuristic. This makes an expression such as
+the documented UTF-8 byte-length heuristic. This makes an expression such as
 `ai.tokens.input_est > 12000 ? "compression:compact" : "compression:off"`
 depend on the caller's original context rather than a stale or post-compression
 accounting field.

@@ -1222,7 +1222,7 @@ pub(super) fn record_ai_response_span_metadata(span: &tracing::Span, body: &[u8]
 /// (OpenAI chat shape), falling back to `choices[].text` (legacy
 /// completions), then runs the canonical token estimator
 /// ([`sbproxy_ai::estimate_tokens`], which uses the model's BPE when
-/// known and a `chars/4` heuristic otherwise). Returns 0 when the body
+/// known and a UTF-8 byte-length heuristic otherwise). Returns 0 when the body
 /// yields no assistant text (so the caller can decide not to debit).
 ///
 /// This is intentionally a coarse safety-net estimate: it only runs on

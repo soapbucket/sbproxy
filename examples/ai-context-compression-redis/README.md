@@ -364,11 +364,13 @@ The event never includes request messages, generated summary text, raw session
 IDs, provider credentials, or raw backend errors. Applied events log at
 `INFO`, failures at `WARN`, and expected skips at `DEBUG`.
 
-Every request-selectable resolution also emits an
+Each explicit header, governed-key, or CEL selection emits an
 `ai_compression_selection` event with only tenant, source, outcome, and an
-optional closed reason. It does not log the header or profile name. The
-summary event's `targets` field includes `input_budget_tokens` for each
-explicitly budgeted `window_fit` lever.
+optional closed reason. Route-default resolution also emits it when named
+profiles or an explicit input budget require semantic-cache separation. It
+does not log the header or profile name. The summary event's `targets` field
+includes `input_budget_tokens` for each explicitly budgeted `window_fit`
+lever.
 
 ## Read the value report
 
