@@ -15,8 +15,8 @@
 //! * [`gossip`] / [`gossip_loop`] implement the SWIM-style heartbeat
 //!   protocol: random probes, PING-REQ witnesses, state-change
 //!   piggybacking for dissemination.
-//! * [`membership_protocol`] / [`consistency`] / [`split_brain`] /
-//!   [`leader`] handle cluster-wide coordination concerns.
+//! * [`isolation`] / [`split_brain`] detect network partitions and
+//!   quarantine an isolated node until it rejoins a majority.
 //! * [`transport`] carries gossip and request traffic over encrypted UDP
 //!   + TCP endpoints.
 //! * [`crypto`] / [`encryption`] / [`peer_auth`] secure the wire ([`peer_auth`]
@@ -38,7 +38,6 @@ pub mod bridge;
 pub mod cluster_handle;
 pub mod cluster_metrics;
 pub mod config;
-pub mod consistency;
 pub mod crypto;
 pub mod discovery;
 pub mod encryption;
@@ -46,10 +45,7 @@ pub mod enrollment;
 pub mod federation;
 pub mod gossip;
 pub mod gossip_loop;
-pub mod health_monitor;
 pub mod isolation;
-pub mod leader;
-pub mod membership_protocol;
 pub mod metrics;
 pub mod node;
 pub mod node_handle;

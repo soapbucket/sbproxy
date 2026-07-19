@@ -118,9 +118,11 @@ The mesh tier makes the L2 a gossip cluster instead of Redis: a SWIM membership
 protocol feeds a consistent-hash ring, and reads and writes route to the replica
 that owns a key, so the resolution order is L1, then the mesh cache, then the
 store. A durable shared store still sits behind it as the source of truth (Redis,
-or a secrets manager for a Redis-free fleet); the mesh keeps the cache coherent
-and carries CRDT-based per-key spend and rate counters across replicas. Bootstrap
-it with a `cache.mesh:` block of seed peers plus gossip and transport ports:
+or a secrets manager for a Redis-free fleet); the mesh keeps the cache coherent.
+Governed-key spend and rate counters are separate from this cache tier: see
+[Governed admission: strict and approximate](#governed-admission-strict-and-approximate)
+for how approximate mode merges each node's settled usage. Bootstrap the mesh
+tier with a `cache.mesh:` block of seed peers plus gossip and transport ports:
 
 ```yaml
 cache:

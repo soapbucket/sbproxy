@@ -2,9 +2,9 @@
 //!
 //! Two wire formats live side-by-side in this module:
 //!
-//! * The legacy gossip wire format ([`MeshMessage`], [`StateDelta`], and
-//!   the [`encode`] / [`decode`] helpers) used for CRDT-backed
-//!   membership/state deltas and simple ping/pong liveness.
+//! * The legacy gossip wire format ([`MeshMessage`] and the [`encode`] /
+//!   [`decode`] helpers) used for membership updates and simple
+//!   ping/pong liveness.
 //! * The J2 cross-node cache RPC transport ([`frame`], [`server`],
 //!   [`client`]) used by the distributed cache for routed get/put/delete
 //!   against a peer's shard.
@@ -38,23 +38,10 @@ use serde::{Deserialize, Serialize};
 pub enum MeshMessage {
     /// Membership update (gossip).
     MembershipUpdate(crate::node::NodeInfo),
-    /// CRDT state delta.
-    StateDelta(StateDelta),
     /// Ping for failure detection; carries a correlation ID.
     Ping(String),
     /// Pong reply to a ping; echoes the same correlation ID.
     Pong(String),
-}
-
-/// A bundle of CRDT deltas to be replicated to peers.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StateDelta {
-    /// (name, counter delta) pairs.
-    pub counter_deltas: Vec<(String, crate::state::counter::GCounter)>,
-    /// (name, set delta) pairs.
-    pub set_deltas: Vec<(String, crate::state::set::ORSet)>,
-    /// (name, register delta) pairs.
-    pub register_deltas: Vec<(String, crate::state::register::LWWRegister)>,
 }
 
 /// JSON-encode a [`MeshMessage`] for transmission on the wire.
@@ -80,7 +67,6 @@ pub fn decode(data: &[u8]) -> anyhow::Result<MeshMessage> {
 mod tests {
     use super::*;
     use crate::node::{NodeId, NodeInfo};
-    use crate::state::{counter::GCounter, register::LWWRegister, set::ORSet};
 
     fn make_node_info(name: &str) -> NodeInfo {
         NodeInfo::new(
@@ -126,74 +112,6 @@ mod tests {
                 assert_eq!(ni.gossip_port, 7946);
             }
             other => panic!("expected MembershipUpdate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn state_delta_with_counter_roundtrip() {
-        let mut counter = GCounter::new();
-        counter.increment("node-a", 42);
-
-        let delta = StateDelta {
-            counter_deltas: vec![("rate-limit:api".to_string(), counter)],
-            set_deltas: vec![],
-            register_deltas: vec![],
-        };
-        let msg = MeshMessage::StateDelta(delta);
-        let bytes = encode(&msg).expect("encode");
-        let back = decode(&bytes).expect("decode");
-        match back {
-            MeshMessage::StateDelta(d) => {
-                assert_eq!(d.counter_deltas.len(), 1);
-                assert_eq!(d.counter_deltas[0].0, "rate-limit:api");
-                assert_eq!(d.counter_deltas[0].1.value(), 42);
-            }
-            other => panic!("expected StateDelta, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn state_delta_with_set_roundtrip() {
-        let mut set = ORSet::new();
-        set.add("10.0.0.1", "node-a");
-
-        let delta = StateDelta {
-            counter_deltas: vec![],
-            set_deltas: vec![("blocked-ips".to_string(), set)],
-            register_deltas: vec![],
-        };
-        let msg = MeshMessage::StateDelta(delta);
-        let bytes = encode(&msg).expect("encode");
-        let back = decode(&bytes).expect("decode");
-        match back {
-            MeshMessage::StateDelta(d) => {
-                assert_eq!(d.set_deltas.len(), 1);
-                assert!(d.set_deltas[0].1.contains("10.0.0.1"));
-            }
-            other => panic!("expected StateDelta, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn state_delta_with_register_roundtrip() {
-        let mut reg = LWWRegister::new();
-        reg.set_at("session-data".to_string(), "node-a", 12345);
-
-        let delta = StateDelta {
-            counter_deltas: vec![],
-            set_deltas: vec![],
-            register_deltas: vec![("session:abc".to_string(), reg)],
-        };
-        let msg = MeshMessage::StateDelta(delta);
-        let bytes = encode(&msg).expect("encode");
-        let back = decode(&bytes).expect("decode");
-        match back {
-            MeshMessage::StateDelta(d) => {
-                assert_eq!(d.register_deltas.len(), 1);
-                assert_eq!(d.register_deltas[0].1.get(), Some("session-data"));
-                assert_eq!(d.register_deltas[0].1.timestamp(), 12345);
-            }
-            other => panic!("expected StateDelta, got {other:?}"),
         }
     }
 

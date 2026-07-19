@@ -887,9 +887,6 @@ fn apply_resolved_virtual_key_context(
         ctx.ai_key_tpm_bucket = Some(safe_runtime_key_id(key).to_string());
     }
     apply_resolved_key_lane(ctx, resolved);
-    if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
-        counters.record_request(safe_runtime_key_id(key));
-    }
 
     Ok(())
 }
