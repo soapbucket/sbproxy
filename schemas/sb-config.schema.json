@@ -4024,6 +4024,14 @@
             "null"
           ]
         },
+        "compression_profile": {
+          "description": "Route-local compression selector (`on`, `off`, or a named profile).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "inject_tools": {
           "description": "Provider tool definitions injected into the request when this key authenticates, replacing any client-supplied tools.",
           "default": [],
@@ -4752,6 +4760,14 @@
         },
         "route_to_model": {
           "description": "Pin the upstream `model` field. When set, the AI dispatch rewrites the request's `model` before sending it to the provider; the client-supplied value is ignored. Mirrors the `route_to_model` field on the underlying `VirtualKeyConfig`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "compression_profile": {
+          "description": "Select `on`, `off`, or a named route-local compression profile.",
           "default": null,
           "type": [
             "string",
