@@ -46,6 +46,7 @@ embedded = ["dep:mistralrs", "dep:axum"]
 [dependencies]
 sbproxy-util.workspace = true
 sbproxy-config.workspace = true
+sbproxy-security.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }

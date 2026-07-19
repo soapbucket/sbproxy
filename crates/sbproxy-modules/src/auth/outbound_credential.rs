@@ -18,12 +18,16 @@
 //! broker JWT re-sign, DPoP / mTLS binding, multi-source entitlements)
 //! are deliberately out of this module.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use dashmap::DashMap;
+use sbproxy_security::egress::{
+    EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver,
+};
 use serde::Deserialize;
 
 /// RFC 8693 grant type for token exchange.
@@ -241,6 +245,31 @@ fn parse_token_response(body: &[u8]) -> Result<(String, Option<u64>)> {
     Ok((token, expires_in))
 }
 
+/// Authorize a token-endpoint URL when an authorizer is present.
+/// `None` preserves legacy ungated token exchange (omitted config).
+pub fn authorize_token_endpoint(
+    authorizer: Option<&EgressAuthorizer>,
+    url: &str,
+    resolver: &dyn HostResolver,
+) -> Result<(), EgressDenied> {
+    let Some(auth) = authorizer else {
+        return Ok(());
+    };
+    auth.authorize(EgressPurpose::TokenExchange, url, resolver)
+        .map(|_| ())
+}
+
+struct PublicPinResolver;
+
+impl HostResolver for PublicPinResolver {
+    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+        Ok(vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )])
+    }
+}
+
 /// Resolve the outbound credential for `cfg`.
 ///
 /// `subject_token` is the inbound caller's token (required for
@@ -255,8 +284,22 @@ pub async fn resolve(
     subject_token: Option<&str>,
     secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
 ) -> Result<MintedCredential> {
+    resolve_with_egress(cfg, http, subject_token, secret_lookup, None).await
+}
+
+/// Like [`resolve`], with an optional fail-closed egress authorizer for
+/// token-endpoint HTTP (`EgressPurpose::TokenExchange`).
+pub async fn resolve_with_egress(
+    cfg: &OutboundCredentialConfig,
+    http: &reqwest::Client,
+    subject_token: Option<&str>,
+    secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
+    egress: Option<&EgressAuthorizer>,
+) -> Result<MintedCredential> {
     match cfg {
         OutboundCredentialConfig::TokenExchange(c) => {
+            authorize_token_endpoint(egress, &c.token_endpoint, &PublicPinResolver)
+                .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
             let subject =
                 subject_token.context("token_exchange requires an inbound subject token")?;
             validate_subject_token(subject, &c.subject_token_issuers, c.act_depth_cap)?;
@@ -293,6 +336,8 @@ pub async fn resolve(
             })
         }
         OutboundCredentialConfig::ClientCredentials(c) => {
+            authorize_token_endpoint(egress, &c.token_endpoint, &PublicPinResolver)
+                .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
             let secret = secret_lookup(&c.client_secret)?;
             let mut form: Vec<(&str, &str)> = vec![("grant_type", "client_credentials")];
             if let Some(scope) = c.scope.as_deref() {
@@ -601,5 +646,64 @@ mod tests {
             .expect("exchange succeeds");
         assert_eq!(cred.header_value, "Bearer minted-abc");
         assert_eq!(cred.expires_in, Some(3600));
+    }
+
+    fn enforce_token_exchange(hosts: &[&str]) -> EgressAuthorizer {
+        use std::collections::HashMap;
+        use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+        let mut allow = PurposeAllowlist::default();
+        for h in hosts {
+            allow.hosts.insert((*h).to_string());
+        }
+        allow.schemes.insert("https".to_string());
+        allow.schemes.insert("http".to_string());
+        allow.ports.insert(443);
+        allow.ports.insert(80);
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::TokenExchange, allow);
+        EgressAuthorizer::new(EgressConfig { purposes })
+    }
+
+    #[test]
+    fn token_exchange_egress_denies_unlisted_host_with_shared_vocabulary() {
+        let auth = enforce_token_exchange(&["idp.example.com"]);
+        let err = authorize_token_endpoint(
+            Some(&auth),
+            "https://evil.example/token",
+            &PublicPinResolver,
+        )
+        .expect_err("unlisted token endpoint");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+        assert!(!format!("{err:?}").contains("evil.example"));
+    }
+
+    #[test]
+    fn omitted_egress_preserves_legacy_token_exchange_compatibility() {
+        authorize_token_endpoint(None, "https://evil.example/token", &PublicPinResolver)
+            .expect("omitted egress must not deny");
+    }
+
+    #[tokio::test]
+    async fn token_exchange_enforce_fails_closed_before_io() {
+        let cfg = OutboundCredentialConfig::TokenExchange(TokenExchangeConfig {
+            token_endpoint: "https://evil.example/token".to_string(),
+            audience: "https://api.example.com".to_string(),
+            scope: None,
+            subject_token_issuers: vec![],
+            allowed_audiences: vec![],
+            act_depth_cap: 4,
+            client_id: None,
+            client_secret: None,
+        });
+        let http = reqwest::Client::new();
+        let auth = enforce_token_exchange(&["idp.example.com"]);
+        let subject = jwt(serde_json::json!({"iss": "https://issuer", "sub": "user"}));
+        let err = resolve_with_egress(&cfg, &http, Some(&subject), &no_secret(), Some(&auth))
+            .await
+            .expect_err("unlisted endpoint must fail closed");
+        assert!(
+            format!("{err:#}").contains("UnlistedHost"),
+            "expected UnlistedHost, got: {err:#}"
+        );
     }
 }

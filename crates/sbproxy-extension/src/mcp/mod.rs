@@ -57,7 +57,7 @@ pub use cassette_drift::{
     tools_from_value, CassetteContract, CassetteDriftChange, CassetteDriftEvent, CassetteDriftKind,
     CassetteDriftReport, CassetteFieldContract, CassetteToolContract, CASSETTE_DRIFT_EVENT_TYPE,
 };
-pub use egress::{EgressDenied, EgressMode, EgressPolicy};
+pub use egress::{EgressDenied, EgressMode, EgressPolicy, SystemHostResolver};
 pub use federation::{
     FederatedTool, FederationIoSettings, McpCallOutcome, McpFederation, McpServerConfig,
     NamespaceMode, OpenApiBacking, SerializedToolEntry, SerializedTools, ToolVersioningGate,

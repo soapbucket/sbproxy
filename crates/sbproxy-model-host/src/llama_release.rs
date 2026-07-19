@@ -279,6 +279,7 @@ async fn install_release(
     let archive_path = staging.join(format!("llama.{}", archive_ext(platform)));
 
     // Download.
+    crate::artifact::authorize_engine_download(url)?;
     let resp = reqwest::Client::new()
         .get(url)
         .send()

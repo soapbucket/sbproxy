@@ -10,6 +10,11 @@
 //! Sinks must be non-blocking on the request hot path and must never propagate
 //! a failure: a broken sink cannot fail the request it is logging.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use sbproxy_security::egress::{
+    EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver,
+};
 use serde::{Deserialize, Serialize};
 
 /// A record of one completed LLM call, handed to every configured sink.
@@ -138,11 +143,37 @@ impl UsageSink for JsonlFileSink {
     }
 }
 
+/// Authorize an HTTP usage-sink / webhook URL when an authorizer is
+/// present. `None` preserves legacy ungated transport (omitted config).
+pub fn authorize_usage_http(
+    authorizer: Option<&EgressAuthorizer>,
+    purpose: EgressPurpose,
+    url: &str,
+    resolver: &dyn HostResolver,
+) -> Result<(), EgressDenied> {
+    let Some(auth) = authorizer else {
+        return Ok(());
+    };
+    auth.authorize(purpose, url, resolver).map(|_| ())
+}
+
+struct PublicPinResolver;
+
+impl HostResolver for PublicPinResolver {
+    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+        Ok(vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )])
+    }
+}
+
 /// A sink that POSTs each event as JSON to a webhook URL, fire-and-forget.
 #[derive(Debug)]
 pub struct WebhookSink {
     url: String,
     client: reqwest::Client,
+    egress: Option<EgressAuthorizer>,
 }
 
 impl WebhookSink {
@@ -151,12 +182,28 @@ impl WebhookSink {
         Self {
             url: url.into(),
             client: reqwest::Client::new(),
+            egress: None,
         }
+    }
+
+    /// Attach a fail-closed egress authorizer (`EgressPurpose::Webhook`).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 }
 
 impl UsageSink for WebhookSink {
     fn record(&self, event: &LlmUsageEvent) {
+        if let Err(denied) = authorize_usage_http(
+            self.egress.as_ref(),
+            EgressPurpose::Webhook,
+            &self.url,
+            &PublicPinResolver,
+        ) {
+            tracing::warn!(reason = ?denied, "usage sink: webhook egress denied");
+            return;
+        }
         let body = match serde_json::to_vec(event) {
             Ok(b) => b,
             Err(e) => {
@@ -294,6 +341,7 @@ pub struct LangfuseSink {
     public_key: String,
     secret_key: String,
     client: reqwest::Client,
+    egress: Option<EgressAuthorizer>,
 }
 
 impl LangfuseSink {
@@ -305,12 +353,28 @@ impl LangfuseSink {
             public_key: public_key.into(),
             secret_key: secret_key.into(),
             client: reqwest::Client::new(),
+            egress: None,
         }
+    }
+
+    /// Attach a fail-closed egress authorizer (`EgressPurpose::UsageSink`).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 }
 
 impl UsageSink for LangfuseSink {
     fn record(&self, event: &LlmUsageEvent) {
+        if let Err(denied) = authorize_usage_http(
+            self.egress.as_ref(),
+            EgressPurpose::UsageSink,
+            &self.url,
+            &PublicPinResolver,
+        ) {
+            tracing::warn!(reason = ?denied, "usage sink: langfuse egress denied");
+            return;
+        }
         let timestamp = chrono::Utc::now().to_rfc3339();
         let id = event
             .request_id
@@ -345,6 +409,7 @@ pub struct DatadogSink {
     api_key: String,
     service: String,
     client: reqwest::Client,
+    egress: Option<EgressAuthorizer>,
 }
 
 impl DatadogSink {
@@ -356,12 +421,28 @@ impl DatadogSink {
             api_key: api_key.into(),
             service: service.into(),
             client: reqwest::Client::new(),
+            egress: None,
         }
+    }
+
+    /// Attach a fail-closed egress authorizer (`EgressPurpose::UsageSink`).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 }
 
 impl UsageSink for DatadogSink {
     fn record(&self, event: &LlmUsageEvent) {
+        if let Err(denied) = authorize_usage_http(
+            self.egress.as_ref(),
+            EgressPurpose::UsageSink,
+            &self.url,
+            &PublicPinResolver,
+        ) {
+            tracing::warn!(reason = ?denied, "usage sink: datadog egress denied");
+            return;
+        }
         let body = datadog_log_body(event, &self.service);
         let url = self.url.clone();
         let key = self.api_key.clone();
@@ -950,5 +1031,64 @@ mod tests {
         for sink in &sinks {
             sink.record(&event);
         }
+    }
+
+    fn enforce_purpose(purpose: EgressPurpose, hosts: &[&str]) -> EgressAuthorizer {
+        use std::collections::HashMap;
+        use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+        let mut allow = PurposeAllowlist::default();
+        for h in hosts {
+            allow.hosts.insert((*h).to_string());
+        }
+        allow.schemes.insert("https".to_string());
+        allow.ports.insert(443);
+        let mut purposes = HashMap::new();
+        purposes.insert(purpose, allow);
+        EgressAuthorizer::new(EgressConfig { purposes })
+    }
+
+    #[test]
+    fn webhook_egress_denies_unlisted_host_with_shared_vocabulary() {
+        let auth = enforce_purpose(EgressPurpose::Webhook, &["collector.example.com"]);
+        let err = authorize_usage_http(
+            Some(&auth),
+            EgressPurpose::Webhook,
+            "https://evil.example/ingest",
+            &PublicPinResolver,
+        )
+        .expect_err("unlisted webhook host");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+    }
+
+    #[test]
+    fn usage_sink_egress_denies_unlisted_host_with_shared_vocabulary() {
+        let auth = enforce_purpose(EgressPurpose::UsageSink, &["cloud.langfuse.com"]);
+        let err = authorize_usage_http(
+            Some(&auth),
+            EgressPurpose::UsageSink,
+            "https://evil.example/api/public/ingestion",
+            &PublicPinResolver,
+        )
+        .expect_err("unlisted usage-sink host");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+    }
+
+    #[test]
+    fn omitted_egress_preserves_legacy_usage_sink_compatibility() {
+        authorize_usage_http(
+            None,
+            EgressPurpose::Webhook,
+            "https://evil.example/ingest",
+            &PublicPinResolver,
+        )
+        .expect("omitted egress must not deny");
+    }
+
+    #[test]
+    fn enforce_webhook_sink_skips_post_when_denied() {
+        // record() must not panic and must not attempt I/O when denied.
+        let sink = WebhookSink::new("https://evil.example/ingest")
+            .with_egress(enforce_purpose(EgressPurpose::Webhook, &["collector.example.com"]));
+        sink.record(&sample_event());
     }
 }
