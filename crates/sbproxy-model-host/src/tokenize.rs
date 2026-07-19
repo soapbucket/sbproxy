@@ -15,7 +15,54 @@
 //! With the feature compiled in, callers get this exact count instead
 //! of a length-based heuristic.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
 use serde::Serialize;
+
+/// Process-wide cache of parsed tokenizers keyed by the on-disk
+/// `tokenizer.json` path, so a resident model parses its tokenizer once
+/// (they are multi-megabyte files) and every subsequent request reuses it.
+/// The cache is cheap to clone (`Arc` inside) and safe to share across the
+/// request path. A path that fails to load is remembered as absent so a
+/// broken tokenizer is not re-read on every request.
+#[derive(Clone, Default)]
+pub struct TokenizerCache {
+    entries: Arc<Mutex<HashMap<PathBuf, Option<Arc<tokenizers::Tokenizer>>>>>,
+}
+
+impl TokenizerCache {
+    /// Empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Count tokens in `text` against the tokenizer at `path`, loading and
+    /// caching it on first use. Returns `None` when the tokenizer is
+    /// missing or unparsable, so the caller can fall back to its estimate
+    /// rather than fail the request.
+    pub fn count(&self, path: &Path, text: &str) -> Option<usize> {
+        let tokenizer = self.load(path)?;
+        tokenizer
+            .encode(text, false)
+            .ok()
+            .map(|encoding| encoding.get_ids().len())
+    }
+
+    fn load(&self, path: &Path) -> Option<Arc<tokenizers::Tokenizer>> {
+        let mut entries = self.entries.lock().expect("tokenizer cache lock");
+        if let Some(cached) = entries.get(path) {
+            return cached.clone();
+        }
+        let loaded = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| tokenizers::Tokenizer::from_bytes(&bytes).ok())
+            .map(Arc::new);
+        entries.insert(path.to_path_buf(), loaded.clone());
+        loaded
+    }
+}
 
 /// One chat message for template rendering. Matches the shape HF chat
 /// templates expect (`message.role`, `message.content`).
@@ -154,5 +201,23 @@ mod tests {
     #[test]
     fn malformed_template_is_an_error() {
         assert!(render_chat_template("{% for %}", &[], false).is_err());
+    }
+
+    #[test]
+    fn cache_counts_from_disk_and_reuses_the_parse() {
+        let dir = std::env::temp_dir().join(format!("sbproxy-tok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokenizer.json");
+        std::fs::write(&path, TINY_TOKENIZER).unwrap();
+
+        let cache = TokenizerCache::new();
+        assert_eq!(cache.count(&path, "hello world"), Some(2));
+        // A second call reuses the cached parse (and still counts).
+        assert_eq!(cache.count(&path, "hello world foo"), Some(3));
+
+        // A missing tokenizer is a soft miss, not a panic, so the caller
+        // falls back to its estimate.
+        assert_eq!(cache.count(&dir.join("absent.json"), "hi"), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

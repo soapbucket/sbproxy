@@ -56,6 +56,79 @@ const MODEL_PLANE_UNAVAILABLE: u8 = 0;
 const MODEL_PLANE_DEGRADED: u8 = 1;
 const MODEL_PLANE_READY: u8 = 2;
 
+/// An exact prompt token count for a managed deployment, with the served
+/// context window it was checked against (WOR-1671).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptTokenFit {
+    /// Prompt tokens counted against the model's own tokenizer.
+    pub tokens: usize,
+    /// The served context window (the engine's `--max-model-len`).
+    pub context_limit: u64,
+}
+
+impl PromptTokenFit {
+    /// Whether the prompt fits the served context window. A prompt that
+    /// exactly fills the window leaves no room to generate, so it does not
+    /// fit.
+    pub fn fits(&self) -> bool {
+        (self.tokens as u64) < self.context_limit
+    }
+}
+
+/// Process-wide cache of parsed tokenizers, shared by every managed
+/// deployment so a model's `tokenizer.json` is parsed once, not per request.
+fn tokenizer_cache() -> &'static sbproxy_model_host::TokenizerCache {
+    static CACHE: std::sync::OnceLock<sbproxy_model_host::TokenizerCache> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(sbproxy_model_host::TokenizerCache::new)
+}
+
+/// Build the text to count for a chat request. When a `tokenizer_config.json`
+/// with a string `chat_template` is available, render the messages through
+/// it (with a generation prompt) so the count matches what the engine
+/// tokenizes; on any missing template or render failure, fall back to
+/// concatenating each message's role and content, which is a small, safe
+/// undercount rather than a hard failure.
+fn render_prompt_for_count(
+    tokenizer_config_path: Option<&std::path::Path>,
+    messages: &[serde_json::Value],
+) -> String {
+    let chat_messages: Vec<sbproxy_model_host::ChatMessage> = messages
+        .iter()
+        .map(|message| {
+            sbproxy_model_host::ChatMessage::new(
+                message.get("role").and_then(|v| v.as_str()).unwrap_or(""),
+                message
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        })
+        .collect();
+    if let Some(template) = tokenizer_config_path
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|config| {
+            config
+                .get("chat_template")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+    {
+        if let Ok(rendered) =
+            sbproxy_model_host::render_chat_template(&template, &chat_messages, true)
+        {
+            return rendered;
+        }
+    }
+    chat_messages
+        .iter()
+        .map(|message| format!("{}: {}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Successful durable admin deployment revision and its runtime effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminDeploymentRevisionResult {
@@ -876,6 +949,30 @@ impl ProductionModelRuntime {
             .expect("model runtime snapshot-preparer lock")
             .clone();
         preparer.map(|preparer| preparer.cached_artifacts())
+    }
+
+    /// Count a managed deployment's prompt tokens against the model's own
+    /// tokenizer and check them against the served context window
+    /// (WOR-1671). Returns `None` when the deployment is not running or
+    /// shipped no tokenizer, so the caller keeps its length-based estimate.
+    /// When a `chat_template` is available it is rendered before counting,
+    /// matching what the engine tokenizes; otherwise the message content is
+    /// counted directly (a small, safe undercount).
+    pub fn prompt_token_fit(
+        &self,
+        deployment: &str,
+        messages: &[serde_json::Value],
+    ) -> Option<PromptTokenFit> {
+        let context = self
+            .active_manager()
+            .deployment_serving_context(deployment)?;
+        let tokenizer_path = context.tokenizer_path.as_deref()?;
+        let text = render_prompt_for_count(context.tokenizer_config_path.as_deref(), messages);
+        let tokens = tokenizer_cache().count(tokenizer_path, &text)?;
+        Some(PromptTokenFit {
+            tokens,
+            context_limit: context.context_limit,
+        })
     }
 
     /// Assemble the live cache-protection sets for exact artifact removal
@@ -2787,6 +2884,64 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_token_fit_reserves_room_to_generate() {
+        // A prompt that exactly fills the window leaves no room to generate,
+        // so it does not fit; anything shorter does.
+        assert!(PromptTokenFit {
+            tokens: 99,
+            context_limit: 100,
+        }
+        .fits());
+        assert!(!PromptTokenFit {
+            tokens: 100,
+            context_limit: 100,
+        }
+        .fits());
+        assert!(!PromptTokenFit {
+            tokens: 101,
+            context_limit: 100,
+        }
+        .fits());
+    }
+
+    #[test]
+    fn render_prompt_for_count_uses_the_template_then_falls_back() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "be terse"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+
+        // With a tokenizer_config.json carrying a chat_template, the render
+        // path runs and its markers appear in the counted text.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("tokenizer_config.json");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&serde_json::json!({
+                "chat_template":
+                    "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}<|assistant|>"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let rendered = render_prompt_for_count(Some(config.as_path()), &messages);
+        assert_eq!(rendered, "<|system|>be terse<|user|>hi<|assistant|>");
+
+        // No template path: fall back to concatenated role/content, never a
+        // panic or empty string.
+        let fallback = render_prompt_for_count(None, &messages);
+        assert_eq!(fallback, "system: be terse\nuser: hi");
+
+        // A malformed template also falls back rather than failing.
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, br#"{"chat_template":"{% for %}"}"#).unwrap();
+        assert_eq!(
+            render_prompt_for_count(Some(bad.as_path()), &messages),
+            "system: be terse\nuser: hi"
+        );
+    }
 
     #[derive(Clone)]
     struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

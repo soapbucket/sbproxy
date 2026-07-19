@@ -213,6 +213,7 @@ pub use runtime_manager::{
     DeploymentRuntimeState, DeploymentRuntimeStatus, ModelRuntimeManager,
     PreparedDeploymentRuntime, PreparedRevision, PreparedRuntimePhase, PreparedRuntimeTelemetry,
     ProductionDeploymentPreparer, ReconcilePlan, ReconcileReport, RuntimeManagerError,
+    ServingContext,
 };
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
 pub use sglang_driver::{
@@ -225,7 +226,7 @@ pub use supervisor::{
 };
 pub use supply_chain::{scan_pickle, select_weight_file, SupplyChainError, WeightFormat};
 #[cfg(feature = "tokenizer")]
-pub use tokenize::{count_tokens, render_chat_template, ChatMessage};
+pub use tokenize::{count_tokens, render_chat_template, ChatMessage, TokenizerCache};
 pub use vllm_driver::{
     build_vllm_container_plan, ContainerRuntime, SystemVllmHost, VllmCompatibilityReport,
     VllmComponentStatus, VllmContainerPlan, VllmDriver, VllmHost, VllmLaunchMode,
