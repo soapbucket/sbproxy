@@ -324,13 +324,29 @@ pub(crate) fn record_redis_compression_coordination(event: RedisCompressionCoord
 }
 
 fn bounded_identity(metric: &str, tenant_id: &str, api_key_id: Option<&str>) -> (String, String) {
-    let api_key_id = sbproxy_observe::metrics::sanitize_label_budget_tenant(
-        metric,
-        "api_key_id",
-        api_key_id.unwrap_or_default(),
+    bounded_identity_with_sanitizers(
         tenant_id,
-    );
-    let tenant_id = sbproxy_observe::metrics::sanitize_label_budget(metric, "tenant_id", tenant_id);
+        api_key_id,
+        |tenant_id| sbproxy_observe::metrics::sanitize_label_budget(metric, "tenant_id", tenant_id),
+        |api_key_id, tenant_id| {
+            sbproxy_observe::metrics::sanitize_label_budget_tenant(
+                metric,
+                "api_key_id",
+                api_key_id,
+                tenant_id,
+            )
+        },
+    )
+}
+
+fn bounded_identity_with_sanitizers(
+    tenant_id: &str,
+    api_key_id: Option<&str>,
+    sanitize_tenant: impl FnOnce(&str) -> String,
+    sanitize_api_key: impl FnOnce(&str, &str) -> String,
+) -> (String, String) {
+    let tenant_id = sanitize_tenant(tenant_id);
+    let api_key_id = sanitize_api_key(api_key_id.unwrap_or_default(), &tenant_id);
     (tenant_id, api_key_id)
 }
 
@@ -577,9 +593,10 @@ pub(crate) fn record_compression_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        record_compression_run, record_compression_selection, record_compression_selection_event,
-        record_compression_state_operation, record_redis_compression_coordination, target_log,
-        CompressionStateOperation, CompressionStateOutcome, RedisCompressionCoordinationEvent,
+        bounded_identity_with_sanitizers, record_compression_run, record_compression_selection,
+        record_compression_selection_event, record_compression_state_operation,
+        record_redis_compression_coordination, target_log, CompressionStateOperation,
+        CompressionStateOutcome, RedisCompressionCoordinationEvent,
     };
     use sbproxy_ai::compression::{
         CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionRun,
@@ -871,6 +888,50 @@ mod tests {
         assert!(
             invalid.contains("reason=\"invalid_or_undeclared_operator_selector\""),
             "{invalid}"
+        );
+    }
+
+    #[test]
+    fn bounded_identity_scopes_api_keys_to_the_bounded_tenant() {
+        use sbproxy_observe::cardinality::{budget_for_label, OTHER_LABEL};
+        use sbproxy_observe::{CardinalityConfig, CardinalityLimiter};
+
+        let limiter = CardinalityLimiter::new(CardinalityConfig {
+            max_per_label: 2,
+            hostname_cap: None,
+        });
+        for index in 0..budget_for_label("tenant_id") {
+            let tenant = format!("compression-cardinality-fill-tenant-{index}");
+            let _ = limiter.sanitize_budget("tenant_id", &tenant);
+        }
+
+        let key_budget = 2;
+        let mut final_identity = (String::new(), String::new());
+        for index in 0..=key_budget {
+            let raw_tenant = format!("compression-cardinality-overflow-tenant-{index}");
+            let raw_key = format!("compression-cardinality-overflow-key-{index}");
+            final_identity = bounded_identity_with_sanitizers(
+                &raw_tenant,
+                Some(&raw_key),
+                |tenant_id| limiter.sanitize_budget("tenant_id", tenant_id),
+                |api_key_id, tenant_id| {
+                    limiter.sanitize_tenant(tenant_id, "api_key_id", api_key_id)
+                },
+            );
+
+            assert_eq!(final_identity.0, OTHER_LABEL);
+            assert_eq!(
+                limiter.tenant_unique_count(&raw_tenant, "api_key_id"),
+                0,
+                "raw overflow tenants must not allocate api-key limiter buckets"
+            );
+        }
+
+        assert_eq!(final_identity, (OTHER_LABEL.into(), OTHER_LABEL.into()));
+        assert_eq!(
+            limiter.tenant_unique_count(OTHER_LABEL, "api_key_id"),
+            key_budget,
+            "overflow tenants must share one bounded api-key limiter bucket"
         );
     }
 
