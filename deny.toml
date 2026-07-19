@@ -260,4 +260,12 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # WOR-1772: pingora is patched to our fork (dynamic rustls cert resolver).
-allow-git = ["https://github.com/soapbucket/pingora"]
+# WOR-1861: mistral.rs 0.9 (and its candle transitive) are only on git; the
+# 0.9 release is not yet on crates.io. Both are pulled solely by the opt-in
+# `embedded` cargo feature, never the default build. Re-pin to crates.io and
+# drop these once mistral.rs 0.9 publishes.
+allow-git = [
+    "https://github.com/soapbucket/pingora",
+    "https://github.com/EricLBuehler/mistral.rs",
+    "https://github.com/huggingface/candle.git",
+]

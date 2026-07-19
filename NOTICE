@@ -225,6 +225,11 @@ Copyright The approx authors
 Licensed under the Apache License, Version 2.0
 https://github.com/brendanzab/approx
 
+backon
+Copyright The backon authors
+Licensed under the Apache License, Version 2.0
+https://github.com/Xuanwo/backon
+
 hf-hub
 Copyright The HuggingFace Inc. team
 Licensed under the Apache License, Version 2.0
@@ -269,6 +274,11 @@ safetensors
 Copyright The HuggingFace Inc. team
 Licensed under the Apache License, Version 2.0
 https://github.com/huggingface/safetensors
+
+seccompiler
+Copyright The seccompiler authors (rust-vmm)
+Licensed under the Apache License, Version 2.0
+https://github.com/rust-vmm/seccompiler
 
 simba
 Copyright The simba authors (dimforge)
