@@ -872,3 +872,78 @@ origins:
         .expect("compile rejects split cluster bootstrap");
     assert!(format!("{error:#}").contains("gossip_port"));
 }
+
+#[test]
+fn replication_block_parses_with_defaults_and_threads_through() {
+    let proxy = parse(
+        r#"
+cluster:
+  cluster_id: prod-a
+  node_id: worker-a
+  roles: [gateway]
+  state_dir: /var/lib/sbproxy/cluster
+  security:
+    mode: shared_key
+    shared_key: env:SBPROXY_CLUSTER_KEY
+    development: true
+  replication: {}
+"#,
+    );
+    let configured = proxy.cluster.as_ref().expect("typed cluster block");
+    configured.validate().expect("valid replication defaults");
+    let replication = configured.replication.as_ref().expect("replication block");
+    assert_eq!(replication.factor, 2);
+    assert_eq!(replication.anti_entropy_interval_secs, 30);
+    assert_eq!(replication.tombstone_gc_grace_secs, 86_400);
+
+    let effective = resolve_effective_cluster(&proxy)
+        .expect("effective cluster")
+        .expect("cluster enabled");
+    assert_eq!(
+        effective.replication.as_ref().map(|r| r.factor),
+        Some(2),
+        "replication must survive lowering to the effective config"
+    );
+    // Replication wiring is process-owned, so it must participate in the
+    // restart fingerprint.
+    let mut changed = effective.clone();
+    changed.replication = None;
+    assert_ne!(
+        effective.restart_fingerprint(),
+        changed.restart_fingerprint()
+    );
+}
+
+#[test]
+fn replication_validation_rejects_unsafe_tunables() {
+    let base = r#"
+cluster:
+  cluster_id: prod-a
+  node_id: worker-a
+  roles: [gateway]
+  state_dir: /var/lib/sbproxy/cluster
+  security:
+    mode: shared_key
+    shared_key: env:SBPROXY_CLUSTER_KEY
+    development: true
+  replication:
+"#;
+    for (fragment, expectation) in [
+        ("    factor: 0\n", "factor of zero"),
+        ("    factor: 9\n", "factor above the bound"),
+        ("    anti_entropy_interval_secs: 1\n", "interval below 5s"),
+        (
+            "    anti_entropy_interval_secs: 60\n    tombstone_gc_grace_secs: 120\n",
+            "grace below ten anti-entropy intervals",
+        ),
+        ("    max_entries: 0\n", "zero capacity"),
+        ("    max_value_bytes: 8388608\n", "value bound above 4 MiB"),
+    ] {
+        let proxy = parse(&format!("{base}{fragment}"));
+        let configured = proxy.cluster.as_ref().expect("typed cluster block");
+        assert!(
+            configured.validate().is_err(),
+            "validation must reject {expectation}"
+        );
+    }
+}

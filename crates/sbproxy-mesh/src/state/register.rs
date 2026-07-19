@@ -203,6 +203,28 @@ impl VersionedLwwRegister {
         if self.tombstone && !candidate.tombstone {
             return VersionedLwwMergeOutcome::TombstoneRetained;
         }
+        self.merge_after_tombstone_fence(candidate)
+    }
+
+    /// Merge a candidate with the logical version as the primary fence.
+    ///
+    /// Unlike [`Self::merge`], a live candidate carrying a strictly higher
+    /// logical version replaces a tombstone. The replicated substrate needs
+    /// this: a coordinator that read the tombstone (proving causality) must
+    /// be able to re-create the key, while a stale live copy at a lower or
+    /// equal version is still fenced out. [`Self::merge`] keeps the
+    /// tombstone-blocks-all-live behavior the typed cluster state relies on.
+    pub fn merge_causal(&mut self, candidate: &Self) -> VersionedLwwMergeOutcome {
+        if self.tombstone
+            && !candidate.tombstone
+            && candidate.logical_version <= self.logical_version
+        {
+            return VersionedLwwMergeOutcome::TombstoneRetained;
+        }
+        self.merge_after_tombstone_fence(candidate)
+    }
+
+    fn merge_after_tombstone_fence(&mut self, candidate: &Self) -> VersionedLwwMergeOutcome {
         if candidate.logical_version < self.logical_version {
             return VersionedLwwMergeOutcome::StaleRejected;
         }
@@ -443,6 +465,54 @@ mod tests {
         assert_eq!(live.merge(&tombstone), VersionedLwwMergeOutcome::Replaced);
         assert!(live.is_tombstone());
         assert_eq!(live.logical_version(), 6);
+    }
+
+    #[test]
+    fn causal_merge_lets_a_higher_version_live_write_recreate_a_deleted_key() {
+        let mut tombstone =
+            VersionedLwwRegister::tombstone("deleted".to_string(), "node-a", 1_000, 6, Some(5));
+        let recreate = versioned_live("fresh", "node-b", 2_000, 7, Some(6));
+
+        assert_eq!(
+            tombstone.merge_causal(&recreate),
+            VersionedLwwMergeOutcome::Replaced
+        );
+        assert!(!tombstone.is_tombstone());
+        assert_eq!(tombstone.value(), Some("fresh"));
+        assert_eq!(tombstone.logical_version(), 7);
+    }
+
+    #[test]
+    fn causal_merge_still_fences_stale_and_equal_version_live_writes() {
+        let mut tombstone =
+            VersionedLwwRegister::tombstone("deleted".to_string(), "node-a", 1_000, 6, Some(5));
+
+        let stale = versioned_live("sensitive", "node-z", 2_000, 5, Some(4));
+        assert_eq!(
+            tombstone.merge_causal(&stale),
+            VersionedLwwMergeOutcome::TombstoneRetained
+        );
+
+        let concurrent = versioned_live("sensitive", "node-z", 2_000, 6, Some(5));
+        assert_eq!(
+            tombstone.merge_causal(&concurrent),
+            VersionedLwwMergeOutcome::TombstoneRetained
+        );
+        assert!(tombstone.is_tombstone());
+    }
+
+    #[test]
+    fn causal_merge_matches_merge_for_live_on_live_updates() {
+        let mut a = versioned_live("v1", "node-a", 1_000, 5, Some(4));
+        let newer = versioned_live("v2", "node-b", 1_500, 6, Some(5));
+        assert_eq!(a.merge_causal(&newer), VersionedLwwMergeOutcome::Replaced);
+
+        let mut b = versioned_live("v2", "node-b", 1_500, 6, Some(5));
+        let stale = versioned_live("v1", "node-a", 9_999, 5, Some(4));
+        assert_eq!(
+            b.merge_causal(&stale),
+            VersionedLwwMergeOutcome::StaleRejected
+        );
     }
 
     #[test]

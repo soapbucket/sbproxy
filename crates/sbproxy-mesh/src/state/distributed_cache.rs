@@ -84,6 +84,33 @@ impl ConsistentHashRing {
         }
         seen.len()
     }
+
+    /// Return the preference list for `key`: the first `n` distinct real
+    /// nodes reached by walking the ring clockwise from the key's hash.
+    ///
+    /// The first element is the same node [`Self::get_node`] returns, so a
+    /// preference list of length 1 degenerates to single-owner routing.
+    /// When the ring holds fewer than `n` distinct nodes the list is the
+    /// entire membership; callers that need a fixed replication factor must
+    /// treat a short list as a degraded (but still usable) placement.
+    pub fn get_nodes(&self, key: &str, n: usize) -> Vec<String> {
+        if self.ring.is_empty() || n == 0 {
+            return Vec::new();
+        }
+        let h = hash_key(key);
+        let start = self.ring.partition_point(|(ring_hash, _)| *ring_hash < h);
+        let mut out: Vec<String> = Vec::with_capacity(n);
+        for offset in 0..self.ring.len() {
+            let (_, id) = &self.ring[(start + offset) % self.ring.len()];
+            if !out.iter().any(|existing| existing == id) {
+                out.push(id.clone());
+                if out.len() == n {
+                    break;
+                }
+            }
+        }
+        out
+    }
 }
 
 // --- Entry ---
@@ -378,6 +405,30 @@ impl<V: Clone + Send + Sync + 'static> DistributedCache<V> {
     pub fn responsible_node(&self, key: &str) -> Option<String> {
         let ring = self.ring.lock().unwrap();
         ring.get_node(key).map(|s| s.to_string())
+    }
+
+    /// Return the preference list for `key` (see
+    /// [`ConsistentHashRing::get_nodes`]). Shares the same ring the gossip
+    /// loop mutates on join/eviction, so the list always reflects current
+    /// membership as this node sees it.
+    pub fn preference_nodes(&self, key: &str, n: usize) -> Vec<String> {
+        let ring = self.ring.lock().unwrap();
+        ring.get_nodes(key, n)
+    }
+
+    /// Distinct node IDs currently in the ring, sorted. The replicated
+    /// substrate uses this as its membership view so data placement and
+    /// maintenance always agree with routing.
+    pub fn member_nodes(&self) -> Vec<String> {
+        let ring = self.ring.lock().unwrap();
+        let mut seen: Vec<String> = Vec::new();
+        for (_, id) in &ring.ring {
+            if !seen.iter().any(|existing| existing == id) {
+                seen.push(id.clone());
+            }
+        }
+        seen.sort();
+        seen
     }
 
     /// Local node identifier this cache was constructed with.
@@ -686,6 +737,52 @@ mod tests {
         }
         // With 50 keys and 3 nodes + 100 vnodes, all nodes should own at least one key
         assert!(!owners.is_empty());
+    }
+
+    #[test]
+    fn preference_list_starts_at_owner_and_holds_distinct_nodes() {
+        let mut ring = ConsistentHashRing::new(64);
+        ring.add_node("node-a");
+        ring.add_node("node-b");
+        ring.add_node("node-c");
+        for i in 0..50 {
+            let key = format!("key-{i}");
+            let prefs = ring.get_nodes(&key, 2);
+            assert_eq!(prefs.len(), 2);
+            assert_eq!(prefs[0], ring.get_node(&key).unwrap());
+            assert_ne!(prefs[0], prefs[1]);
+        }
+    }
+
+    #[test]
+    fn preference_list_short_ring_returns_full_membership() {
+        let mut ring = ConsistentHashRing::new(16);
+        ring.add_node("node-a");
+        ring.add_node("node-b");
+        let prefs = ring.get_nodes("some-key", 3);
+        assert_eq!(prefs.len(), 2);
+        assert_ne!(prefs[0], prefs[1]);
+    }
+
+    #[test]
+    fn preference_list_empty_ring_or_zero_n_is_empty() {
+        let ring = ConsistentHashRing::new(16);
+        assert!(ring.get_nodes("k", 2).is_empty());
+        let mut ring = ConsistentHashRing::new(16);
+        ring.add_node("node-a");
+        assert!(ring.get_nodes("k", 0).is_empty());
+    }
+
+    #[test]
+    fn preference_list_is_stable_for_a_key() {
+        let mut ring = ConsistentHashRing::new(64);
+        ring.add_node("node-a");
+        ring.add_node("node-b");
+        ring.add_node("node-c");
+        let first = ring.get_nodes("stable-key", 3);
+        let second = ring.get_nodes("stable-key", 3);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
     }
 
     #[test]

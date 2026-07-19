@@ -2232,6 +2232,18 @@
               "type": "null"
             }
           ]
+        },
+        "replication": {
+          "description": "Optional replicated durable state substrate (WOR-1947). Absent keeps the single-owner in-memory typed-state cache semantics.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClusterReplicationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -2377,6 +2389,91 @@
           "type": "string"
         }
       }
+    },
+    "ClusterReplicationConfig": {
+      "description": "Replicated durable state substrate configuration (WOR-1947).\n\nEnabling this block requires `state_dir`: the replica shard persists to `<state_dir>/replicated-state.redb` so a restarted node serves its committed records from disk.",
+      "type": "object",
+      "properties": {
+        "factor": {
+          "description": "Copies kept per record. Clamped to cluster size at placement time.",
+          "default": 2,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "write_consistency": {
+          "description": "Acknowledgements required before a write reports success.",
+          "default": "quorum",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClusterConsistencyLevel"
+            }
+          ]
+        },
+        "read_consistency": {
+          "description": "Replicas consulted before a read reports its winner.",
+          "default": "quorum",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClusterConsistencyLevel"
+            }
+          ]
+        },
+        "anti_entropy_interval_secs": {
+          "description": "Cadence of the maintenance loop (anti-entropy, handoff, GC).",
+          "default": 30,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tombstone_gc_grace_secs": {
+          "description": "Age a tombstone must reach, with every replica confirming, before it is physically collected. Also bounds how long a node may be offline before its stored records are quarantined on rejoin.",
+          "default": 86400,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_entries": {
+          "description": "Maximum records (live plus tombstones) per node shard.",
+          "default": 65536,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_value_bytes": {
+          "description": "Maximum decoded record value size in bytes.",
+          "default": 1048576,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ClusterConsistencyLevel": {
+      "description": "Consistency level for replicated state reads and writes.",
+      "oneOf": [
+        {
+          "description": "One replica acknowledgement (the coordinator's own shard counts).",
+          "type": "string",
+          "enum": [
+            "one"
+          ]
+        },
+        {
+          "description": "A majority of the key's replica set.",
+          "type": "string",
+          "enum": [
+            "quorum"
+          ]
+        },
+        {
+          "description": "Every replica in the key's replica set.",
+          "type": "string",
+          "enum": [
+            "all"
+          ]
+        }
+      ]
     },
     "SecretsConfig": {
       "description": "Top-level secrets management configuration.\n\nControls which vault backend is used to resolve `secret:` references in config values and how secret rotation is handled.",

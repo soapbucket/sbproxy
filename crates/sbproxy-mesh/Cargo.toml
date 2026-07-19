@@ -31,6 +31,9 @@ prometheus = { workspace = true }
 postcard = { version = "1", features = ["use-std"] }
 # Async Redis client for the backend/redis.rs persistence + federation paths.
 redis = { workspace = true }
+# Durable replica shard for the replicated state substrate (WOR-1947). Same
+# embedded KV the rest of the workspace standardizes on.
+redb = { workspace = true }
 # Storage trait surface (PersistentKv + EphemeralKv + SetKv) + RedisStore.
 sbproxy-storage = { workspace = true, features = ["redis"] }
 # AES-256-GCM encryption for gossip + transport (opt-in via shared_key).

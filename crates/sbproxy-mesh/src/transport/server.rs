@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -23,6 +24,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::crypto::Cipher;
 use crate::metrics::{CRYPTO_KIND_TRANSPORT, MESH_CRYPTO_DECRYPT_FAILED};
 use crate::state::distributed_cache::DistributedCache;
+use crate::state::replicated::ReplicaShard;
 
 use super::frame::{read_frame, write_frame, CacheOp, CacheResult, Request, Response};
 
@@ -43,6 +45,11 @@ pub struct TransportServer {
     /// OS picks an ephemeral port; tests read this back to target the
     /// server.
     local_port: u16,
+    /// Replica shard behind the WOR-1947 replicated ops. Installed after
+    /// construction (the shard needs the node's durable directory, which
+    /// bootstrap wires later); requests arriving before installation get
+    /// a clean "not enabled" error rather than a hang.
+    replica_shard: Arc<ArcSwapOption<ReplicaShard>>,
 }
 
 impl TransportServer {
@@ -95,6 +102,8 @@ impl TransportServer {
         let local_port = listener.local_addr()?.port();
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let replica_shard: Arc<ArcSwapOption<ReplicaShard>> = Arc::new(ArcSwapOption::empty());
+        let replica_for_loop = replica_shard.clone();
 
         let join = tokio::spawn(async move {
             loop {
@@ -111,11 +120,13 @@ impl TransportServer {
                                 let cache = cache.clone();
                                 let cipher = cipher.clone();
                                 let tls = tls.clone();
+                                let replica = replica_for_loop.clone();
                                 tokio::spawn(async move {
                                     match tls {
                                         Some(acceptor) => match acceptor.accept(stream).await {
                                             Ok(tls_stream) => {
-                                                handle_connection(tls_stream, cache, cipher).await
+                                                handle_connection(tls_stream, cache, cipher, replica)
+                                                    .await
                                             }
                                             Err(e) => tracing::warn!(
                                                 peer = %addr,
@@ -123,7 +134,9 @@ impl TransportServer {
                                                 "transport: peer TLS handshake failed"
                                             ),
                                         },
-                                        None => handle_connection(stream, cache, cipher).await,
+                                        None => {
+                                            handle_connection(stream, cache, cipher, replica).await
+                                        }
                                     }
                                 });
                             }
@@ -144,7 +157,16 @@ impl TransportServer {
             _join: join,
             shutdown: Some(shutdown_tx),
             local_port,
+            replica_shard,
         })
+    }
+
+    /// Install the durable replica shard behind the replicated ops
+    /// (`ReplicaApply` / `ReplicaFetch` / `SyncDigest`). Until this is
+    /// called those ops answer with a "not enabled" error. Existing
+    /// connections pick the shard up on their next request.
+    pub fn install_replica_shard(&self, shard: Arc<ReplicaShard>) {
+        self.replica_shard.store(Some(shard));
     }
 
     /// Signal the accept loop to stop. Idempotent and non-blocking; the
@@ -192,6 +214,7 @@ async fn handle_connection<S>(
     stream: S,
     cache: Arc<DistributedCache<Bytes>>,
     cipher: Option<Cipher>,
+    replica: Arc<ArcSwapOption<ReplicaShard>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -280,6 +303,36 @@ async fn handle_connection<S>(
             } => match cache.merge_versioned_local_with_ttl(&key, value, ttl_secs) {
                 Ok(outcome) => CacheResult::VersionedMerged(outcome),
                 Err(_) => CacheResult::Error("invalid versioned mesh state".to_string()),
+            },
+            // WOR-1947 replicated substrate. Dispatch stays local, like
+            // every other arm: the sending coordinator picked this node
+            // as a replica; recursing here would amplify writes.
+            CacheOp::ReplicaApply {
+                key,
+                value,
+                ttl_secs,
+            } => match replica.load_full() {
+                Some(shard) => match shard.apply_encoded(&key, &value, ttl_secs) {
+                    Ok(outcome) => CacheResult::VersionedMerged(outcome),
+                    Err(e) => CacheResult::Error(e.to_string()),
+                },
+                None => CacheResult::Error("replicated substrate not enabled".to_string()),
+            },
+            CacheOp::ReplicaFetch { key } => match replica.load_full() {
+                Some(shard) => CacheResult::Value(shard.fetch_encoded(&key)),
+                None => CacheResult::Error("replicated substrate not enabled".to_string()),
+            },
+            CacheOp::SyncDigest {
+                prefix,
+                page_token,
+                limit,
+            } => match replica.load_full() {
+                Some(shard) => CacheResult::DigestPage(shard.digest_page(
+                    &prefix,
+                    page_token.as_deref(),
+                    limit as usize,
+                )),
+                None => CacheResult::Error("replicated substrate not enabled".to_string()),
             },
         };
 

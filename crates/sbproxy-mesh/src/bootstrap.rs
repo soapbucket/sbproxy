@@ -102,6 +102,12 @@ pub struct BootstrapConfig {
     /// certificate and verifies peers' on every outbound connection. `None`
     /// keeps the plaintext transport (the pre-mTLS behavior).
     pub peer_tls: Option<PeerTlsParams>,
+
+    /// WOR-1947: optional replicated durable state substrate. When set,
+    /// bootstrap opens the durable replica shard, installs it behind the
+    /// transport's replica ops, and spawns the maintenance loop. `None`
+    /// leaves the substrate off (single-owner cache semantics only).
+    pub replication: Option<ReplicationBootstrapConfig>,
 }
 
 /// Peer-mTLS material for the mesh transport, already resolved to PEM by the
@@ -117,6 +123,19 @@ pub struct PeerTlsParams {
     /// Enrolled identity proof issuer for canonical clusters. Compatibility
     /// mTLS may omit this and retain shared-SAN behavior.
     pub identity_authenticator: Option<Arc<crate::peer_identity::PeerIdentityAuthenticator>>,
+}
+
+/// Replicated-substrate wiring consumed by [`bootstrap`].
+#[derive(Debug, Clone)]
+pub struct ReplicationBootstrapConfig {
+    /// Replication factor, consistency levels, cadence, GC grace.
+    pub settings: crate::state::replicated::ReplicationSettings,
+    /// Shard capacity and value-size bounds.
+    pub limits: crate::state::replicated::ShardLimits,
+    /// Durable shard file. `None` runs the shard memory-only, which
+    /// keeps replication but gives up restart durability; canonical
+    /// cluster config always supplies a path via `state_dir`.
+    pub durable_path: Option<std::path::PathBuf>,
 }
 
 impl Default for BootstrapConfig {
@@ -140,6 +159,7 @@ impl Default for BootstrapConfig {
             // L2: 5 minutes is long enough to absorb transient partitions
             // without letting the Dead row leak forever.
             dead_peer_gc_secs: 300,
+            replication: None,
         }
     }
 }
@@ -192,6 +212,18 @@ pub async fn bootstrap(
             vec![]
         }
     };
+
+    // A symmetric seed list (every node ships the same seeds, which is the
+    // natural shape for static fleet config and the Kubernetes operator)
+    // includes this node's own advertised address. Keep it out of the peer
+    // set: otherwise the node enters its own ring twice, once under its
+    // node ID and once as an address alias no join message ever replaces,
+    // and consistent-hash placement (including the WOR-1947 replica sets)
+    // can count one physical node as two members.
+    let peers: Vec<String> = peers
+        .into_iter()
+        .filter(|peer| Some(peer.as_str()) != config.gossip_advertise_addr.as_deref())
+        .collect();
 
     // --- K3: derive the cluster cipher (if configured) ---
     //
@@ -406,6 +438,48 @@ pub async fn bootstrap(
         }
     };
 
+    // --- WOR-1947: replicated durable state substrate ---
+    //
+    // Constructed before the transport server moves into the handle so the
+    // shard can be installed behind the ReplicaApply/ReplicaFetch/SyncDigest
+    // ops. Unlike the fail-warn paths above, a durable shard that cannot
+    // open FAILS the bootstrap: silently continuing without durability
+    // would violate the substrate's restart guarantee.
+    let replica_shard = match &config.replication {
+        Some(replication) => {
+            let clock: crate::state::replicated::MeshClock = Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or_default()
+            });
+            let grace_ms = replication
+                .settings
+                .tombstone_gc_grace_secs
+                .saturating_mul(1_000);
+            let shard = match &replication.durable_path {
+                Some(path) => crate::state::replicated::ReplicaShard::open(
+                    path,
+                    replication.limits,
+                    grace_ms,
+                    clock,
+                )
+                .map_err(|e| anyhow::anyhow!("open replicated state shard: {e}"))?,
+                None => crate::state::replicated::ReplicaShard::in_memory(
+                    replication.limits,
+                    grace_ms,
+                    clock,
+                ),
+            };
+            let shard = Arc::new(shard);
+            if let Some(server) = transport_server.as_ref() {
+                server.install_replica_shard(shard.clone());
+            }
+            Some(shard)
+        }
+        None => None,
+    };
+
     node = node
         .with_transport(transport_server, transport_pool, peer_addr_map)
         .with_identity_authenticator(
@@ -414,6 +488,28 @@ pub async fn bootstrap(
                 .as_ref()
                 .and_then(|params| params.identity_authenticator.clone()),
         );
+
+    if let (Some(shard), Some(replication)) = (replica_shard, &config.replication) {
+        let lookup = node.peer_addr_lookup();
+        let is_isolated: crate::state::replicated::IsolationFn = match node.isolation_observer() {
+            Some(observer) => Arc::new(move || observer.is_isolated()),
+            None => Arc::new(|| false),
+        };
+        let store = Arc::new(crate::state::replicated::ReplicatedStore::new(
+            shard,
+            node.distributed_cache(),
+            node.transport_pool(),
+            Arc::new(lookup),
+            is_isolated,
+            replication.settings.clone(),
+        ));
+        crate::state::replicated::ReplicatedStore::spawn_maintenance(&store);
+        tracing::info!(
+            factor = replication.settings.replication_factor,
+            "replicated state substrate enabled"
+        );
+        node = node.with_replicated_store(store);
+    }
 
     Ok(node)
 }
@@ -473,6 +569,7 @@ mod tests {
             // its own coverage in `gossip_loop::tests`.
             dead_peer_gc_secs: 60,
             peer_tls: None,
+            replication: None,
         }
     }
 
@@ -487,6 +584,35 @@ mod tests {
             .expect("bootstrap ok");
         assert_eq!(node.peers(), peers.as_slice());
         assert_eq!(node.node_id(), "n1");
+    }
+
+    #[tokio::test]
+    async fn symmetric_seed_list_filters_own_advertised_address() {
+        // Every node in a static fleet ships the same seed list, so this
+        // node's own address arrives via discovery. It must not become a
+        // ring member: that alias is never replaced by a join and would
+        // let placement count one physical node twice.
+        let peers = vec![
+            "10.0.0.1:7946".to_string(),
+            "10.0.0.2:7946".to_string(),
+            "10.0.0.3:7946".to_string(),
+        ];
+        let discovery: Vec<Box<dyn Discovery>> = vec![Box::new(StaticDiscovery(peers))];
+        let mut config = test_bootstrap_config();
+        config.gossip_advertise_addr = Some("10.0.0.1:7946".to_string());
+
+        let node = bootstrap(&discovery, &config, "n1".to_string())
+            .await
+            .expect("bootstrap ok");
+        assert_eq!(
+            node.peers(),
+            ["10.0.0.2:7946".to_string(), "10.0.0.3:7946".to_string()].as_slice()
+        );
+        assert!(!node
+            .distributed_cache()
+            .member_nodes()
+            .iter()
+            .any(|member| member == "10.0.0.1:7946"));
     }
 
     #[tokio::test]

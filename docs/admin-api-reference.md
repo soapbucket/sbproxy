@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-19*
 
 The embedded admin server publishes a small set of HTTP routes for
 operator tooling: liveness probes, request log, per-target health, managed
@@ -770,6 +770,88 @@ CA-signed node identity material. Token replay, role or label escalation,
 authority-role escalation, malformed CSRs, and oversized requests fail closed.
 Use `sbproxy cluster enroll` instead of constructing this wire document by
 hand.
+
+### `GET /admin/cluster/state`
+
+Fleet-complete listing of the replicated state substrate (see
+[mesh-replication.md](mesh-replication.md)). Requires
+`proxy.cluster.replication`; without it every `/admin/cluster/state*`
+route returns `404` with code `replication_disabled`. Query parameters:
+`prefix` (default empty, meaning everything), `page_token` (opaque, from
+the previous page), `limit` (default 200, capped at 1000).
+
+```json
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "key": "session:tenant-a:42",
+      "holder": "gateway-b",
+      "logical_version": 7,
+      "tombstone": false,
+      "timestamp_ms": 1783790000000,
+      "written_by": "gateway-a"
+    }
+  ],
+  "next_page_token": "eyJub2RlIjoi...",
+  "unreachable": []
+}
+```
+
+A key replicated on N nodes appears once per holder; collapse by `key`
+client-side. Members that could not be queried are named in
+`unreachable` instead of being silently skipped. Pagination survives
+topology changes: a token pointing at a departed member resumes at the
+next surviving member.
+
+### `GET`, `PUT /admin/cluster/state/key?key=<key>`
+
+Single-record quorum read and write. `GET` reconciles the configured
+number of replicas, repairs stale ones in line, and returns `404` with
+`"found": false` for missing or deleted keys:
+
+```json
+{
+  "schema_version": 1,
+  "key": "session:tenant-a:42",
+  "found": true,
+  "value_base64": "eyJzdW1tYXJ5IjoiLi4uIn0",
+  "value_utf8": "{\"summary\":\"...\"}",
+  "replicas_answered": 2,
+  "repaired": 0
+}
+```
+
+`PUT` takes the raw record value as the request body plus an optional
+`ttl_secs` query parameter (`0` or absent means no expiry), and reports
+the acknowledged replica count and the record's logical version:
+
+```json
+{"schema_version": 1, "key": "session:tenant-a:42", "acked_replicas": 2, "logical_version": 8}
+```
+
+A write that cannot meet the configured write consistency returns `502`
+with code `replication_write_failed`.
+
+### `DELETE /admin/cluster/state?key=<key>`
+
+Replicated delete: replicates a tombstone through the same quorum path
+as writes, so the deletion holds across restarts, healed partitions,
+and rebalances. Returns `{"schema_version": 1, "deleted": "<key>",
+"acked_replicas": 2}`.
+
+### `POST /admin/cluster/state/purge`
+
+Bounded replicated purge. Body: `{"prefix": "session:tenant-a:", "max": 1000}`
+(`max` defaults to 1000, capped at 10000). Every distinct live key under
+the prefix is deleted through the replicated tombstone path:
+
+```json
+{"schema_version": 1, "deleted": 412, "failed": 0, "truncated": false}
+```
+
+`truncated: true` means the key budget ran out first; repeat the call to
+continue.
 
 ---
 

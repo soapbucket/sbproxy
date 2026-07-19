@@ -94,6 +94,39 @@ pub enum CacheOp {
         /// Lifetime in seconds applied only when the candidate wins.
         ttl_secs: u64,
     },
+    /// Apply a replicated-record candidate to the receiver's durable
+    /// replica shard using the causal merge (WOR-1947). Unlike
+    /// `MergeVersioned` this targets the replicated substrate, persists
+    /// the winning record before acking, and lets a strictly newer live
+    /// candidate re-create a tombstoned key.
+    ReplicaApply {
+        /// Replicated record key.
+        key: String,
+        /// JSON-encoded versioned register candidate.
+        value: Bytes,
+        /// Lifetime in seconds; `0` means no expiry.
+        ttl_secs: u64,
+    },
+    /// Fetch the full versioned register (including tombstones) for `key`
+    /// from the receiver's replica shard. Replies with
+    /// [`CacheResult::Value`] carrying the JSON-encoded register, or
+    /// `Value(None)` when the shard holds no record.
+    ReplicaFetch {
+        /// Replicated record key.
+        key: String,
+    },
+    /// Request one bounded page of the receiver's replica-shard digest for
+    /// anti-entropy comparison. Replies with [`CacheResult::DigestPage`].
+    SyncDigest {
+        /// Only keys starting with this prefix are digested; empty means
+        /// the whole shard.
+        prefix: String,
+        /// Resume after this key (exclusive); `None` starts from the
+        /// beginning.
+        page_token: Option<String>,
+        /// Maximum digest entries in the reply page.
+        limit: u32,
+    },
 }
 
 /// Server reply to a [`Request`]. Carries the original `request_id` so the
@@ -125,6 +158,36 @@ pub enum CacheResult {
     Purged(u64),
     /// Closed result of an atomic version-aware LWW merge.
     VersionedMerged(VersionedLwwMergeOutcome),
+    /// One bounded page of a replica-shard digest, replying to
+    /// [`CacheOp::SyncDigest`].
+    DigestPage(DigestPage),
+}
+
+/// Compact per-key summary used by anti-entropy digest exchange. Carries
+/// enough version metadata to decide push/pull direction without shipping
+/// record values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyDigest {
+    /// Replicated record key.
+    pub key: String,
+    /// Monotonic application logical version of the stored register.
+    pub logical_version: u64,
+    /// LWW timestamp of the stored register, for equal-version diffing.
+    pub timestamp_ms: u64,
+    /// Stable writer node of the stored register, for equal-version diffing.
+    pub node_id: String,
+    /// Whether the stored register is a deletion marker.
+    pub tombstone: bool,
+}
+
+/// One page of [`KeyDigest`] entries plus the resume token for the next
+/// page. `next_page_token = None` means the scan is complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigestPage {
+    /// Digest entries, lexicographically ordered by key.
+    pub entries: Vec<KeyDigest>,
+    /// Resume-after key for the following page; `None` when exhausted.
+    pub next_page_token: Option<String>,
 }
 
 // --- Framing helpers ---
@@ -367,6 +430,88 @@ mod tests {
             decoded.result,
             CacheResult::VersionedMerged(VersionedLwwMergeOutcome::ConflictRetained)
         ));
+    }
+
+    #[tokio::test]
+    async fn replica_ops_wire_roundtrip() {
+        let apply = Request {
+            request_id: 200,
+            op: CacheOp::ReplicaApply {
+                key: "repl:k".to_string(),
+                value: Bytes::from_static(b"register-json"),
+                ttl_secs: 30,
+            },
+        };
+        let bytes = crate::transport::wire::encode(&apply).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
+        assert!(matches!(
+            back.op,
+            CacheOp::ReplicaApply { ttl_secs: 30, .. }
+        ));
+
+        let fetch = Request {
+            request_id: 201,
+            op: CacheOp::ReplicaFetch {
+                key: "repl:k".to_string(),
+            },
+        };
+        let bytes = crate::transport::wire::encode(&fetch).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
+        match back.op {
+            CacheOp::ReplicaFetch { key } => assert_eq!(key, "repl:k"),
+            other => panic!("expected ReplicaFetch, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_digest_wire_roundtrip_with_page() {
+        let req = Request {
+            request_id: 300,
+            op: CacheOp::SyncDigest {
+                prefix: "repl:".to_string(),
+                page_token: Some("repl:m".to_string()),
+                limit: 128,
+            },
+        };
+        let bytes = crate::transport::wire::encode(&req).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
+        match back.op {
+            CacheOp::SyncDigest {
+                prefix,
+                page_token,
+                limit,
+            } => {
+                assert_eq!(prefix, "repl:");
+                assert_eq!(page_token.as_deref(), Some("repl:m"));
+                assert_eq!(limit, 128);
+            }
+            other => panic!("expected SyncDigest, got {:?}", other),
+        }
+
+        let resp = Response {
+            request_id: 300,
+            result: CacheResult::DigestPage(DigestPage {
+                entries: vec![KeyDigest {
+                    key: "repl:k".to_string(),
+                    logical_version: 4,
+                    timestamp_ms: 1_000,
+                    node_id: "node-a".to_string(),
+                    tombstone: true,
+                }],
+                next_page_token: Some("repl:k".to_string()),
+            }),
+        };
+        let bytes = crate::transport::wire::encode(&resp).expect("serialize");
+        let back: Response = crate::transport::wire::decode(&bytes).expect("deserialize");
+        match back.result {
+            CacheResult::DigestPage(page) => {
+                assert_eq!(page.entries.len(), 1);
+                assert!(page.entries[0].tombstone);
+                assert_eq!(page.entries[0].logical_version, 4);
+                assert_eq!(page.next_page_token.as_deref(), Some("repl:k"));
+            }
+            other => panic!("expected DigestPage, got {:?}", other),
+        }
     }
 
     #[tokio::test]
