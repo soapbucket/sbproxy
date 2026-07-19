@@ -18,12 +18,18 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::crypto::Cipher;
+use crate::metrics::{
+    MESH_TRANSPORT_RPC_DURATION, MESH_TRANSPORT_RPC_ERRORS, TRANSPORT_RPC_KIND_CONNECT,
+    TRANSPORT_RPC_KIND_DECODE, TRANSPORT_RPC_KIND_DECRYPT, TRANSPORT_RPC_KIND_ENCODE,
+    TRANSPORT_RPC_KIND_IO, TRANSPORT_RPC_KIND_REMOTE, TRANSPORT_RPC_KIND_TLS,
+};
 use crate::state::register::VersionedLwwMergeOutcome;
 
 use super::frame::{read_frame, write_frame, CacheOp, CacheResult, Request, Response};
@@ -98,6 +104,21 @@ impl AsyncWrite for MeshConn {
             MeshConn::Plain(s) => Pin::new(s).poll_shutdown(cx),
             MeshConn::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
+    }
+}
+
+/// Bounded `op` label for [`MESH_TRANSPORT_RPC_DURATION`], derived from
+/// the [`CacheOp`] variant.
+fn cache_op_label(op: &CacheOp) -> &'static str {
+    match op {
+        CacheOp::Get { .. } => "get",
+        CacheOp::Put { .. } => "put",
+        CacheOp::Delete { .. } => "delete",
+        CacheOp::PurgePrefix { .. } => "purge_prefix",
+        CacheOp::MergeVersioned { .. } => "merge_versioned",
+        CacheOp::ReplicaApply { .. } => "replica_apply",
+        CacheOp::ReplicaFetch { .. } => "replica_fetch",
+        CacheOp::SyncDigest { .. } => "sync_digest",
     }
 }
 
@@ -179,7 +200,12 @@ impl PeerClient {
     pub async fn get(&self, key: String) -> anyhow::Result<Option<Bytes>> {
         match self.send_request(CacheOp::Get { key }).await? {
             CacheResult::Value(v) => Ok(v),
-            CacheResult::Error(e) => Err(anyhow::anyhow!("remote error: {}", e)),
+            CacheResult::Error(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {}", e))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {:?}", other)),
         }
     }
@@ -214,7 +240,12 @@ impl PeerClient {
             .await?
         {
             CacheResult::Acked => Ok(()),
-            CacheResult::Error(e) => Err(anyhow::anyhow!("remote error: {}", e)),
+            CacheResult::Error(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {}", e))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {:?}", other)),
         }
     }
@@ -235,7 +266,12 @@ impl PeerClient {
             .await?
         {
             CacheResult::VersionedMerged(outcome) => Ok(outcome),
-            CacheResult::Error(error) => Err(anyhow::anyhow!("remote error: {error}")),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
         }
     }
@@ -259,7 +295,12 @@ impl PeerClient {
             .await?
         {
             CacheResult::VersionedMerged(outcome) => Ok(outcome),
-            CacheResult::Error(error) => Err(anyhow::anyhow!("remote error: {error}")),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
         }
     }
@@ -270,7 +311,12 @@ impl PeerClient {
     pub async fn replica_fetch(&self, key: String) -> anyhow::Result<Option<Bytes>> {
         match self.send_request(CacheOp::ReplicaFetch { key }).await? {
             CacheResult::Value(value) => Ok(value),
-            CacheResult::Error(error) => Err(anyhow::anyhow!("remote error: {error}")),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
         }
     }
@@ -292,7 +338,12 @@ impl PeerClient {
             .await?
         {
             CacheResult::DigestPage(page) => Ok(page),
-            CacheResult::Error(error) => Err(anyhow::anyhow!("remote error: {error}")),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
         }
     }
@@ -303,7 +354,12 @@ impl PeerClient {
     pub async fn delete(&self, key: String) -> anyhow::Result<()> {
         match self.send_request(CacheOp::Delete { key }).await? {
             CacheResult::Acked => Ok(()),
-            CacheResult::Error(e) => Err(anyhow::anyhow!("remote error: {}", e)),
+            CacheResult::Error(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {}", e))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {:?}", other)),
         }
     }
@@ -324,7 +380,12 @@ impl PeerClient {
     pub async fn purge_prefix(&self, prefix: String) -> anyhow::Result<u64> {
         match self.send_request(CacheOp::PurgePrefix { prefix }).await? {
             CacheResult::Purged(n) => Ok(n),
-            CacheResult::Error(e) => Err(anyhow::anyhow!("remote error: {}", e)),
+            CacheResult::Error(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {}", e))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {:?}", other)),
         }
     }
@@ -336,13 +397,18 @@ impl PeerClient {
     /// Any transport error clears `inner.stream` so the next call starts by
     /// reconnecting.
     async fn send_request(&self, op: CacheOp) -> anyhow::Result<CacheResult> {
+        let started = Instant::now();
+        let op_label = cache_op_label(&op);
         let mut guard = self.inner.lock().await;
 
         // --- Ensure we're connected ---
         if guard.stream.is_none() {
-            let tcp = TcpStream::connect(&self.addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("connect to {} failed: {}", self.addr, e))?;
+            let tcp = TcpStream::connect(&self.addr).await.map_err(|e| {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_CONNECT])
+                    .inc();
+                anyhow::anyhow!("connect to {} failed: {}", self.addr, e)
+            })?;
             // Small perf win on the wire side: coalescing is almost never
             // beneficial for a request/response RPC.
             let _ = tcp.set_nodelay(true);
@@ -352,6 +418,9 @@ impl PeerClient {
                         .connect(t.server_name.clone(), tcp)
                         .await
                         .map_err(|e| {
+                            MESH_TRANSPORT_RPC_ERRORS
+                                .with_label_values(&[TRANSPORT_RPC_KIND_TLS])
+                                .inc();
                             anyhow::anyhow!("TLS handshake to {} failed: {}", self.addr, e)
                         })?,
                 )),
@@ -363,8 +432,12 @@ impl PeerClient {
         let request_id = guard.next_id;
         guard.next_id = guard.next_id.wrapping_add(1);
         let req = Request { request_id, op };
-        let plaintext = crate::transport::wire::encode(&req)
-            .map_err(|e| anyhow::anyhow!("request serialize failed: {}", e))?;
+        let plaintext = crate::transport::wire::encode(&req).map_err(|e| {
+            MESH_TRANSPORT_RPC_ERRORS
+                .with_label_values(&[TRANSPORT_RPC_KIND_ENCODE])
+                .inc();
+            anyhow::anyhow!("request serialize failed: {}", e)
+        })?;
 
         // K3: seal the request body when encryption is configured. The
         // server's matching `read_frame + open` step mirrors this.
@@ -393,6 +466,9 @@ impl PeerClient {
         let resp_bytes = match io_result {
             Ok(b) => b,
             Err(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_IO])
+                    .inc();
                 guard.stream = None;
                 return Err(e);
             }
@@ -405,6 +481,9 @@ impl PeerClient {
             Some(c) => match c.open(&resp_bytes) {
                 Some(pt) => pt,
                 None => {
+                    MESH_TRANSPORT_RPC_ERRORS
+                        .with_label_values(&[TRANSPORT_RPC_KIND_DECRYPT])
+                        .inc();
                     guard.stream = None;
                     return Err(anyhow::anyhow!(
                         "response from {} failed AEAD decrypt",
@@ -415,8 +494,12 @@ impl PeerClient {
             None => resp_bytes,
         };
 
-        let resp: Response = crate::transport::wire::decode(&resp_plain)
-            .map_err(|e| anyhow::anyhow!("response deserialize failed: {}", e))?;
+        let resp: Response = crate::transport::wire::decode(&resp_plain).map_err(|e| {
+            MESH_TRANSPORT_RPC_ERRORS
+                .with_label_values(&[TRANSPORT_RPC_KIND_DECODE])
+                .inc();
+            anyhow::anyhow!("response deserialize failed: {}", e)
+        })?;
         if resp.request_id != request_id {
             // Pipelined implementations would fix this up via a pending
             // map. In the serial MVP a mismatch is a bug; tear the
@@ -428,6 +511,9 @@ impl PeerClient {
                 resp.request_id
             ));
         }
+        MESH_TRANSPORT_RPC_DURATION
+            .with_label_values(&[op_label])
+            .observe(started.elapsed().as_secs_f64());
         Ok(resp.result)
     }
 }

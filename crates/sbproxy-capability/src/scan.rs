@@ -35,6 +35,15 @@ use crate::{MetricCapability, RegistryError, SupportLevel, Writer};
 /// Labels Prometheus itself attaches, which no metric declares.
 const IMPLICIT_LABELS: &[&str] = &["job", "instance", "le", "quantile", "__name__"];
 
+/// Metric-name prefixes this registry sanctions.
+///
+/// `sbproxy_` covers the proxy and its gateway surfaces; `mesh_` covers
+/// the clustering substrate (SWIM membership, replication, cross-node
+/// transport). Both [`declared_metrics`] and [`references_in`] recognize
+/// exactly these prefixes: a declaration or query outside them is
+/// invisible to the drift guard.
+const SANCTIONED_PREFIXES: &[&str] = &["sbproxy_", "mesh_"];
+
 /// Directories scanned for PromQL: dashboards and alert rules alike.
 ///
 /// The old guard looked at `dashboards/grafana/` only, which is precisely the
@@ -278,7 +287,8 @@ const METRIC_CTORS: &[&str] = &[
     "Gauge::new(",
 ];
 
-/// Every metric family name declared anywhere under `crates/`.
+/// Every metric family name declared anywhere under `crates/`, for each
+/// prefix in `SANCTIONED_PREFIXES`.
 ///
 /// This is the direction that keeps the registry honest as the code grows: a
 /// metric added to `metrics.rs` without a registry entry fails the build,
@@ -291,26 +301,31 @@ pub fn declared_metrics(root: &Path) -> BTreeSet<String> {
         let text = strip_comments(&source.text);
         let bytes = text.as_bytes();
 
-        for (at, _) in text.match_indices("\"sbproxy_") {
-            // The literal must be the first argument of a declaration.
-            let mut j = at;
-            while j > 0 && bytes[j - 1].is_ascii_whitespace() {
-                j -= 1;
-            }
-            let head = &text[..j];
-            if !METRIC_CTORS.iter().any(|ctor| head.ends_with(ctor)) {
-                continue;
-            }
+        for prefix in SANCTIONED_PREFIXES {
+            let quoted = format!("\"{prefix}");
+            for (at, _) in text.match_indices(&quoted) {
+                // The literal must be the first argument of a declaration.
+                let mut j = at;
+                while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                    j -= 1;
+                }
+                let head = &text[..j];
+                if !METRIC_CTORS.iter().any(|ctor| head.ends_with(ctor)) {
+                    continue;
+                }
 
-            let start = at + 1;
-            let mut end = start;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-                end += 1;
-            }
-            // A dynamically composed name (`sbproxy_{lane}_...`) stops at the
-            // brace and is not a literal declaration.
-            if bytes.get(end) == Some(&b'"') {
-                out.insert(text[start..end].to_string());
+                let start = at + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                // A dynamically composed name (`sbproxy_{lane}_...`) stops at
+                // the brace and is not a literal declaration.
+                if bytes.get(end) == Some(&b'"') {
+                    out.insert(text[start..end].to_string());
+                }
             }
         }
     }
@@ -373,6 +388,44 @@ fn count_tokens(haystack: &str, needle: &str) -> usize {
         from = end;
     }
     count
+}
+
+/// Whether a writer symbol names a Prometheus metric static
+/// (`SCREAMING_SNAKE_CASE`) rather than a recorder function.
+///
+/// The mesh crate drives its metrics through `LazyLock` statics directly
+/// (`MESH_PEER_EVICTED.with_label_values(..).inc()`) instead of recorder
+/// functions, so its registry entries name the static's identifier and the
+/// scanner counts uses of that identifier as call sites.
+fn is_metric_static(symbol: &str) -> bool {
+    symbol
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// Blank out the contents of double-quoted string literals, preserving
+/// byte offsets.
+///
+/// Needed for static-writer counting: the registry entry itself contains
+/// `Writer::Recorder("MESH_...")`, and a bare-identifier count that read
+/// string literals would report every static live because its own registry
+/// row names it.
+fn blank_string_literals(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out: Vec<u8> = bytes.to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let end = skip_string(src, i);
+            for byte in out.iter_mut().take(end.saturating_sub(1)).skip(i + 1) {
+                *byte = b' ';
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
 }
 
 /// Local names a `use` statement binds a recorder to via `... as <alias>`.
@@ -447,34 +500,56 @@ fn recorder_aliases(text: &str, symbol: &str) -> Vec<String> {
 /// catch, and it looks identical to a metric that was never wired: the
 /// declaration is still there, the recorder still compiles, the scrape still
 /// emits a zero. Only the call site is gone.
+///
+/// A `Writer::Recorder` may name a recorder function, or (see
+/// `is_metric_static`) a metric static's own `SCREAMING_SNAKE_CASE`
+/// identifier for crates that drive Prometheus statics directly. For a
+/// static, comments and string literals are blanked before counting so a
+/// rustdoc cross-reference or the registry row itself cannot pass as a call
+/// site; any remaining use of the identifier outside its own declaration
+/// implies a live driver, because an import the production build never uses
+/// fails the workspace's deny-warnings gate.
 pub fn verify_writers(metrics: &[MetricCapability], root: &Path) -> Vec<RegistryError> {
     let sources = rust_sources(root);
     let mut errors = Vec::new();
 
     for metric in metrics {
+        let is_static = matches!(metric.writer, Writer::Recorder(name) if is_metric_static(name));
         let (symbol, call, define) = match metric.writer {
+            Writer::Recorder(name) if is_static => {
+                (name, name.to_string(), Some(format!("static {name}:")))
+            }
             Writer::Recorder(name) => (name, format!("{name}("), Some(format!("fn {name}("))),
             Writer::Field(name) => (name, format!(".{name}"), None),
             Writer::Nothing => continue,
         };
-        // A recorder can be called under an import alias; a field cannot.
-        let follow_aliases = matches!(metric.writer, Writer::Recorder(_));
+        // A recorder can be called under an import alias; a field cannot,
+        // and a static's bare-identifier count already covers any alias's
+        // rebinding `use`.
+        let follow_aliases = matches!(metric.writer, Writer::Recorder(_)) && !is_static;
 
         let mut calls = 0usize;
         let mut defined = define.is_none();
         for source in &sources {
-            calls += count_tokens(&source.text, &call);
+            let text = if is_static {
+                std::borrow::Cow::Owned(blank_string_literals(&strip_comments(&source.text)))
+            } else {
+                std::borrow::Cow::Borrowed(source.text.as_str())
+            };
+            calls += count_tokens(&text, &call);
             if follow_aliases {
-                for alias in recorder_aliases(&source.text, symbol) {
-                    calls += count_tokens(&source.text, &format!("{alias}("));
+                for alias in recorder_aliases(&text, symbol) {
+                    calls += count_tokens(&text, &format!("{alias}("));
                 }
             }
             if let Some(define) = &define {
-                if source.text.contains(define.as_str()) {
+                if text.contains(define.as_str()) {
                     defined = true;
-                    // The definition is itself a `name(` match. Do not let a
-                    // recorder count as its own caller.
-                    calls -= count_tokens(&source.text, define);
+                    // The definition is itself a match for the call needle
+                    // (`fn name(` contains `name(`; `static NAME:` contains
+                    // the bare `NAME`). Do not let a writer count as its own
+                    // caller.
+                    calls -= count_tokens(&text, define);
                 }
             }
         }
@@ -636,8 +711,15 @@ fn references_in(text: &str, file: &str) -> Vec<MetricReference> {
         while i < bytes.len() {
             // Compare bytes, not chars: dashboard JSON is full of multi-byte
             // characters in titles and descriptions, and `line[i..]` panics the
-            // moment `i` lands inside one.
-            if !bytes[i..].starts_with(b"sbproxy_") {
+            // moment `i` lands inside one. A sanctioned prefix mid-identifier
+            // (`semcache_mesh_x`) is not a metric name, hence the boundary
+            // check on the byte before the match.
+            let at_prefix = SANCTIONED_PREFIXES
+                .iter()
+                .any(|prefix| bytes[i..].starts_with(prefix.as_bytes()));
+            let at_boundary =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if !at_prefix || !at_boundary {
                 i += 1;
                 continue;
             }
@@ -913,6 +995,59 @@ writer: Writer::Recorder("record_rate_limit_suspend"),
 pub fn record_rate_limit_suspend(ws: &str) {}
 "#;
         assert!(recorder_aliases(src, "record_rate_limit_suspend").is_empty());
+    }
+
+    #[test]
+    fn a_mesh_prefixed_reference_is_recognized() {
+        // The mesh_ prefix is sanctioned alongside sbproxy_ (WOR-1900);
+        // dashboards and alert rules reading mesh_* series are subject to
+        // the same drift guard.
+        let refs = references_in(
+            r#"sum(rate(mesh_gossip_retry_total{target="node-b"}[5m]))"#,
+            "deploy/alerts/mesh.yml",
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].metric, "mesh_gossip_retry_total");
+        assert!(refs[0].labels.contains("target"));
+    }
+
+    #[test]
+    fn a_sanctioned_prefix_mid_identifier_is_not_a_reference() {
+        // `semcache_mesh_hits_total` contains "mesh_" but is not a mesh_
+        // family; the boundary check must reject the mid-identifier match.
+        let refs = references_in("rate(semcache_mesh_hits_total[5m])", "x.yml");
+        assert_eq!(refs, vec![]);
+    }
+
+    #[test]
+    fn a_static_writer_counts_uses_and_not_its_own_declaration() {
+        // Mesh metrics are driven through the static itself, so the
+        // registry names the static ident. Its declaration, rustdoc
+        // cross-references, and the registry row's string literal must not
+        // count; a real method call must.
+        let src = r#"
+/// See [`MESH_THING`] for the label contract.
+pub static MESH_THING: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(Opts::new("mesh_thing_total", "x"), &["kind"])
+        .expect("register mesh_thing_total")
+});
+
+fn live() {
+    MESH_THING.with_label_values(&["kind"]).inc();
+}
+"#;
+        assert!(is_metric_static("MESH_THING"));
+        assert!(!is_metric_static("record_thing"));
+        let text = blank_string_literals(&strip_comments(src));
+        let uses = count_tokens(&text, "MESH_THING");
+        let declarations = count_tokens(&text, "static MESH_THING:");
+        assert_eq!(declarations, 1);
+        assert_eq!(uses - declarations, 1, "only the method call is a use");
+        // The registry row alone must not make a static look live.
+        let row = blank_string_literals(&strip_comments(
+            r#"writer: Writer::Recorder("MESH_THING"),"#,
+        ));
+        assert_eq!(count_tokens(&row, "MESH_THING"), 0);
     }
 
     #[test]

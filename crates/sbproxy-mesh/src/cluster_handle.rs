@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::gossip_loop::{PeerEntry, PeerState};
 use crate::isolation::IsolationObserver;
+use crate::metrics::{
+    MESH_OWNER_ROUTE, OWNER_ROUTE_OUTCOME_LOCAL, OWNER_ROUTE_OUTCOME_REMOTE,
+    OWNER_ROUTE_OUTCOME_UNREACHABLE,
+};
 use crate::state::distributed_cache::DistributedCache;
 use crate::state::register::{VersionedLwwMergeOutcome, VersionedLwwRegister};
 use crate::MeshNode;
@@ -729,18 +733,37 @@ impl ClusterHandle {
         match &self.inner.backend {
             ClusterBackend::Local { state } => state
                 .merge_versioned_local_with_ttl(&storage_key, Bytes::from(bytes), ttl_secs)
+                .inspect(|_| {
+                    MESH_OWNER_ROUTE
+                        .with_label_values(&[OWNER_ROUTE_OUTCOME_LOCAL])
+                        .inc();
+                })
                 .map_err(|error| ClusterStateError::Transport(error.to_string())),
-            ClusterBackend::Distributed { mesh } => mesh
-                .distributed_cache()
-                .merge_versioned_routed_with_ttl(
-                    &storage_key,
-                    Bytes::from(bytes),
-                    ttl_secs,
-                    &mesh.transport_pool(),
-                    mesh.peer_addr_lookup(),
-                )
-                .await
-                .map_err(|error| ClusterStateError::Transport(error.to_string())),
+            ClusterBackend::Distributed { mesh } => {
+                let cache = mesh.distributed_cache();
+                let routed_outcome = routed_write_outcome(&cache, &storage_key);
+                match cache
+                    .merge_versioned_routed_with_ttl(
+                        &storage_key,
+                        Bytes::from(bytes),
+                        ttl_secs,
+                        &mesh.transport_pool(),
+                        mesh.peer_addr_lookup(),
+                    )
+                    .await
+                {
+                    Ok(outcome) => {
+                        MESH_OWNER_ROUTE.with_label_values(&[routed_outcome]).inc();
+                        Ok(outcome)
+                    }
+                    Err(error) => {
+                        MESH_OWNER_ROUTE
+                            .with_label_values(&[OWNER_ROUTE_OUTCOME_UNREACHABLE])
+                            .inc();
+                        Err(ClusterStateError::Transport(error.to_string()))
+                    }
+                }
+            }
         }
     }
 
@@ -1118,11 +1141,17 @@ impl ClusterHandle {
             .responsible_node(storage_key)
             .unwrap_or_else(|| self.inner.identity.node_id.clone());
         if owner == cache.local_node_id() {
+            MESH_OWNER_ROUTE
+                .with_label_values(&[OWNER_ROUTE_OUTCOME_LOCAL])
+                .inc();
             return cache
                 .get_local(storage_key)
                 .map_or(RawStateRead::Missing, RawStateRead::Present);
         }
         let Some(mesh) = self.mesh_node() else {
+            MESH_OWNER_ROUTE
+                .with_label_values(&[OWNER_ROUTE_OUTCOME_UNREACHABLE])
+                .inc();
             return RawStateRead::Unreachable(owner);
         };
         let address = {
@@ -1133,15 +1162,36 @@ impl ClusterHandle {
             guard.get(&owner).cloned()
         };
         let Some(address) = address else {
+            MESH_OWNER_ROUTE
+                .with_label_values(&[OWNER_ROUTE_OUTCOME_UNREACHABLE])
+                .inc();
             return RawStateRead::Unreachable(owner);
         };
         let Some(client) = mesh.transport_pool().try_client_for_node(&owner, &address) else {
+            MESH_OWNER_ROUTE
+                .with_label_values(&[OWNER_ROUTE_OUTCOME_UNREACHABLE])
+                .inc();
             return RawStateRead::Unreachable(owner);
         };
         match client.get(storage_key.to_string()).await {
-            Ok(Some(bytes)) => RawStateRead::Present(bytes),
-            Ok(None) => RawStateRead::Missing,
-            Err(_) => RawStateRead::Unreachable(owner),
+            Ok(Some(bytes)) => {
+                MESH_OWNER_ROUTE
+                    .with_label_values(&[OWNER_ROUTE_OUTCOME_REMOTE])
+                    .inc();
+                RawStateRead::Present(bytes)
+            }
+            Ok(None) => {
+                MESH_OWNER_ROUTE
+                    .with_label_values(&[OWNER_ROUTE_OUTCOME_REMOTE])
+                    .inc();
+                RawStateRead::Missing
+            }
+            Err(_) => {
+                MESH_OWNER_ROUTE
+                    .with_label_values(&[OWNER_ROUTE_OUTCOME_UNREACHABLE])
+                    .inc();
+                RawStateRead::Unreachable(owner)
+            }
         }
     }
 
@@ -1154,19 +1204,36 @@ impl ClusterHandle {
         match &self.inner.backend {
             ClusterBackend::Local { state } => {
                 state.put_local_with_ttl(storage_key, value, ttl_secs);
+                MESH_OWNER_ROUTE
+                    .with_label_values(&[OWNER_ROUTE_OUTCOME_LOCAL])
+                    .inc();
                 Ok(())
             }
-            ClusterBackend::Distributed { mesh } => mesh
-                .distributed_cache()
-                .put_routed_with_ttl(
-                    storage_key,
-                    value,
-                    ttl_secs,
-                    &mesh.transport_pool(),
-                    mesh.peer_addr_lookup(),
-                )
-                .await
-                .map_err(|error| ClusterStateError::Transport(error.to_string())),
+            ClusterBackend::Distributed { mesh } => {
+                let cache = mesh.distributed_cache();
+                let routed_outcome = routed_write_outcome(&cache, storage_key);
+                match cache
+                    .put_routed_with_ttl(
+                        storage_key,
+                        value,
+                        ttl_secs,
+                        &mesh.transport_pool(),
+                        mesh.peer_addr_lookup(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        MESH_OWNER_ROUTE.with_label_values(&[routed_outcome]).inc();
+                        Ok(())
+                    }
+                    Err(error) => {
+                        MESH_OWNER_ROUTE
+                            .with_label_values(&[OWNER_ROUTE_OUTCOME_UNREACHABLE])
+                            .inc();
+                        Err(ClusterStateError::Transport(error.to_string()))
+                    }
+                }
+            }
         }
     }
 }
@@ -1175,6 +1242,19 @@ enum RawStateRead {
     Present(Bytes),
     Missing,
     Unreachable(String),
+}
+
+/// [`MESH_OWNER_ROUTE`] `outcome` label a routed write reports on success:
+/// `local` when this node owns the key, `remote` when the owner is a peer.
+fn routed_write_outcome(cache: &DistributedCache<Bytes>, storage_key: &str) -> &'static str {
+    let locally_owned = cache
+        .responsible_node(storage_key)
+        .is_none_or(|owner| owner == cache.local_node_id());
+    if locally_owned {
+        OWNER_ROUTE_OUTCOME_LOCAL
+    } else {
+        OWNER_ROUTE_OUTCOME_REMOTE
+    }
 }
 
 fn member_from_peer(peer: &PeerEntry, reachable: bool) -> ClusterMember {
