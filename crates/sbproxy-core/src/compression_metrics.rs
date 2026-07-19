@@ -199,8 +199,13 @@ pub(crate) fn record_compression_selection(
     source: &'static str,
     outcome: &'static str,
 ) {
+    let tenant_id = sbproxy_observe::metrics::sanitize_label_budget(
+        "sbproxy_ai_compression_selection_total",
+        "tenant_id",
+        tenant_id,
+    );
     COMPRESSION_SELECTION_TOTAL
-        .with_label_values(&[tenant_id, source, outcome])
+        .with_label_values(&[&tenant_id, source, outcome])
         .inc();
 }
 
@@ -342,6 +347,7 @@ fn target_log(policy: &CompressionPolicy) -> String {
             CompressionLeverConfig::WindowFit(config) => serde_json::json!({
                 "lever": "window_fit",
                 "completion_reserve_tokens": config.completion_reserve_tokens,
+                "input_budget_tokens": config.input_budget_tokens,
             }),
         })
         .collect::<Vec<_>>();
@@ -374,6 +380,8 @@ fn emit_compression_summary(
     tenant_id: &str,
     api_key_id: &str,
     cache_bypass: bool,
+    selection_source: &'static str,
+    selection_outcome: &'static str,
     run: &CompressionRun,
 ) {
     let backend = request_backend(run);
@@ -406,6 +414,8 @@ fn emit_compression_summary(
                 backend = backend_label(backend),
                 consistency = consistency_label(backend),
                 cache_bypass,
+                selection_source,
+                selection_outcome,
                 lever_outcomes,
                 targets,
                 "AI context compression pipeline summary"
@@ -425,6 +435,8 @@ pub(crate) fn record_compression_run(
     tenant_id: &str,
     api_key_id: Option<&str>,
     cache_bypass: bool,
+    selection_source: &'static str,
+    selection_outcome: &'static str,
     run: &CompressionRun,
 ) {
     if run.lever_results.is_empty() {
@@ -516,7 +528,15 @@ pub(crate) fn record_compression_run(
         tenant_id,
         api_key_id,
     );
-    emit_compression_summary(policy, &log_tenant, &log_key, cache_bypass == "true", run);
+    emit_compression_summary(
+        policy,
+        &log_tenant,
+        &log_key,
+        cache_bypass == "true",
+        selection_source,
+        selection_outcome,
+        run,
+    );
 }
 
 #[cfg(test)]
@@ -572,6 +592,8 @@ mod tests {
                 "compression-log-tenant",
                 Some("compression-log-key"),
                 true,
+                "governed_key",
+                "selected",
                 run,
             );
         });
@@ -599,7 +621,7 @@ mod tests {
                 }),
                 CompressionLeverConfig::WindowFit(WindowFitConfig {
                     completion_reserve_tokens: 1_024,
-                    input_budget_tokens: None,
+                    input_budget_tokens: Some(8_192),
                 }),
             ],
             profiles: std::collections::BTreeMap::new(),
@@ -674,7 +696,15 @@ mod tests {
         let key = "compression-metrics-applied-key";
         let run = applied_run();
 
-        record_compression_run(&policy(), tenant, Some(key), false, &run);
+        record_compression_run(
+            &policy(),
+            tenant,
+            Some(key),
+            false,
+            "route_default",
+            "default",
+            &run,
+        );
 
         let summary_labels = [
             ("tenant_id", tenant),
@@ -780,7 +810,15 @@ mod tests {
             ],
         };
 
-        record_compression_run(&policy(), tenant, Some(key), true, &run);
+        record_compression_run(
+            &policy(),
+            tenant,
+            Some(key),
+            true,
+            "route_default",
+            "default",
+            &run,
+        );
 
         for lever in ["summary_buffer", "window_fit"] {
             assert_eq!(
@@ -876,6 +914,16 @@ mod tests {
         assert!(applied.contains("tokens_saved=50"), "{applied}");
         assert!(applied.contains("min_tokens"), "{applied}");
         assert!(applied.contains("completion_reserve_tokens"), "{applied}");
+        assert!(applied.contains("input_budget_tokens"), "{applied}");
+        assert!(applied.contains("8192"), "{applied}");
+        assert!(
+            applied.contains("selection_source=\"governed_key\""),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("selection_outcome=\"selected\""),
+            "{applied}"
+        );
         assert!(!applied.contains("secret message"), "{applied}");
         assert!(!applied.contains("provider-not-for-telemetry"), "{applied}");
         assert!(!applied.contains("model-not-for-telemetry"), "{applied}");

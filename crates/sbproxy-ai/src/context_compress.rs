@@ -95,9 +95,10 @@ pub fn fit_messages_to_model(
 ///
 /// When the model window is known, the effective budget is capped at the
 /// model window minus `completion_reserve_tokens`. Unknown models can still be
-/// fitted because the operator supplied an explicit capacity. The first system
-/// message is protected, and assistant tool calls remain grouped with their
-/// consecutive tool results.
+/// fitted because the operator supplied an explicit capacity. The contiguous
+/// leading system/developer instruction prefix is protected, assistant tool
+/// calls remain grouped with their results, and retained history is always a
+/// contiguous newest suffix.
 pub fn fit_messages_to_input_budget(
     messages: &[serde_json::Value],
     model: &str,
@@ -112,31 +113,52 @@ pub fn fit_messages_to_input_budget(
     let count = |candidate: &[serde_json::Value]| {
         crate::token_estimate::estimate_json_message_tokens(model, candidate)
     };
+    let reply_priming = count(&[]);
 
     if count(messages) <= budget {
         return ExplicitBudgetFit::NotNeeded;
     }
 
-    let protected_system = messages
-        .first()
-        .filter(|message| message_role(message) == Some("system"));
-    if protected_system.is_some_and(|message| count(std::slice::from_ref(message)) > budget) {
+    let protected_prefix_len = messages
+        .iter()
+        .take_while(|message| matches!(message_role(message), Some("system" | "developer")))
+        .count();
+    let mut selected_tokens = if protected_prefix_len == 0 {
+        reply_priming
+    } else {
+        count(&messages[..protected_prefix_len])
+    };
+    if selected_tokens > budget {
         return ExplicitBudgetFit::CannotMeetBudget;
     }
 
-    let start = usize::from(protected_system.is_some());
-    let units = protocol_units(messages, start);
+    let units = protocol_units(messages, protected_prefix_len);
     let mut selected = Vec::<Range<usize>>::new();
+    let mut units = units.into_iter().rev();
 
-    for unit in units.into_iter().rev() {
-        selected.push(unit);
-        let candidate = collect_candidate(messages, protected_system.is_some(), &selected);
-        if count(&candidate) > budget {
-            selected.pop();
+    // The newest protocol unit is the current turn. Dispatching older context
+    // without it changes the request's meaning, so a budget that cannot hold
+    // that complete unit is ineligible rather than an invitation to keep
+    // smaller, stale units.
+    if let Some(newest) = units.next() {
+        let newest_tokens = count(&messages[newest.clone()]).saturating_sub(reply_priming);
+        selected_tokens = selected_tokens.saturating_add(newest_tokens);
+        if selected_tokens > budget {
+            return ExplicitBudgetFit::CannotMeetBudget;
         }
+        selected.push(newest);
     }
 
-    let candidate = collect_candidate(messages, protected_system.is_some(), &selected);
+    for unit in units {
+        let unit_tokens = count(&messages[unit.clone()]).saturating_sub(reply_priming);
+        if selected_tokens.saturating_add(unit_tokens) > budget {
+            break;
+        }
+        selected_tokens += unit_tokens;
+        selected.push(unit);
+    }
+
+    let candidate = collect_candidate(messages, protected_prefix_len, &selected);
     if count(&candidate) > budget || (candidate.is_empty() && !messages.is_empty()) {
         ExplicitBudgetFit::CannotMeetBudget
     } else {
@@ -154,16 +176,24 @@ fn protocol_units(messages: &[serde_json::Value], start: usize) -> Vec<Range<usi
     while index < messages.len() {
         let unit_start = index;
         index += 1;
-        let starts_tool_exchange = message_role(&messages[unit_start]) == Some("assistant")
+        let starts_openai_tool_exchange = message_role(&messages[unit_start]) == Some("assistant")
             && (messages[unit_start]
                 .get("tool_calls")
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|calls| !calls.is_empty())
                 || messages[unit_start].get("function_call").is_some());
-        if starts_tool_exchange {
-            while index < messages.len()
-                && matches!(message_role(&messages[index]), Some("tool" | "function"))
-            {
+        let starts_anthropic_tool_exchange = message_role(&messages[unit_start])
+            == Some("assistant")
+            && messages[unit_start]
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                    })
+                });
+        if starts_openai_tool_exchange || starts_anthropic_tool_exchange {
+            while index < messages.len() && is_tool_result_message(&messages[index]) {
                 index += 1;
             }
         }
@@ -174,21 +204,34 @@ fn protocol_units(messages: &[serde_json::Value], start: usize) -> Vec<Range<usi
 
 fn collect_candidate(
     messages: &[serde_json::Value],
-    has_protected_system: bool,
+    protected_prefix_len: usize,
     selected_newest_first: &[Range<usize>],
 ) -> Vec<serde_json::Value> {
     let selected_len = selected_newest_first
         .iter()
         .map(|range| range.len())
         .sum::<usize>();
-    let mut candidate = Vec::with_capacity(selected_len + usize::from(has_protected_system));
-    if has_protected_system {
-        candidate.push(messages[0].clone());
-    }
+    let mut candidate = Vec::with_capacity(selected_len + protected_prefix_len);
+    candidate.extend(messages[..protected_prefix_len].iter().cloned());
     for range in selected_newest_first.iter().rev() {
         candidate.extend(messages[range.clone()].iter().cloned());
     }
     candidate
+}
+
+fn is_tool_result_message(message: &serde_json::Value) -> bool {
+    if matches!(message_role(message), Some("tool" | "function")) {
+        return true;
+    }
+    message_role(message) == Some("user")
+        && message
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+                })
+            })
 }
 
 #[cfg(test)]
@@ -344,5 +387,95 @@ mod tests {
         assert_eq!(result[1]["content"], "first");
         assert_eq!(result[2]["content"], "second");
         assert_eq!(result[3]["content"], "third");
+    }
+
+    #[test]
+    fn explicit_budget_never_drops_an_oversized_newest_turn_for_older_context() {
+        let messages = vec![user("old and small"), user(&"newest ".repeat(500))];
+        let old_only_budget =
+            crate::token_estimate::estimate_json_message_tokens("unknown-model", &messages[..1]);
+
+        assert_eq!(
+            fit_messages_to_input_budget(&messages, "unknown-model", 0, old_only_budget,),
+            ExplicitBudgetFit::CannotMeetBudget
+        );
+    }
+
+    #[test]
+    fn explicit_budget_preserves_contiguous_system_and_developer_prefix() {
+        let messages = vec![
+            json!({"role": "system", "content": "system rule"}),
+            json!({"role": "developer", "content": "developer rule"}),
+            user(&"old ".repeat(200)),
+            user("newest"),
+        ];
+        let expected = vec![
+            messages[0].clone(),
+            messages[1].clone(),
+            messages[3].clone(),
+        ];
+        let budget =
+            crate::token_estimate::estimate_json_message_tokens("unknown-model", &expected);
+
+        assert_eq!(
+            fit_messages_to_input_budget(&messages, "unknown-model", 0, budget),
+            ExplicitBudgetFit::Candidate(expected)
+        );
+    }
+
+    #[test]
+    fn explicit_budget_retains_a_contiguous_newest_suffix() {
+        let messages = vec![
+            user("old small context"),
+            user(&"oversized middle ".repeat(300)),
+            user("newest turn"),
+        ];
+        let non_contiguous = vec![messages[0].clone(), messages[2].clone()];
+        let budget =
+            crate::token_estimate::estimate_json_message_tokens("unknown-model", &non_contiguous);
+
+        assert_eq!(
+            fit_messages_to_input_budget(&messages, "unknown-model", 0, budget),
+            ExplicitBudgetFit::Candidate(vec![messages[2].clone()])
+        );
+    }
+
+    #[test]
+    fn explicit_budget_groups_anthropic_tool_use_with_tool_result() {
+        let messages = vec![
+            user(&"old ".repeat(200)),
+            json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {}}]
+            }),
+            json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}]
+            }),
+            user("use the result"),
+        ];
+        let expected = messages[1..].to_vec();
+        let budget =
+            crate::token_estimate::estimate_json_message_tokens("unknown-model", &expected);
+
+        assert_eq!(
+            fit_messages_to_input_budget(&messages, "unknown-model", 0, budget),
+            ExplicitBudgetFit::Candidate(expected)
+        );
+    }
+
+    #[test]
+    fn explicit_budget_handles_large_histories_in_one_pass() {
+        let messages = (0..10_000)
+            .map(|index| user(&format!("message {index}")))
+            .collect::<Vec<_>>();
+        let expected = messages[messages.len() - 100..].to_vec();
+        let budget =
+            crate::token_estimate::estimate_json_message_tokens("unknown-model", &expected);
+
+        assert_eq!(
+            fit_messages_to_input_budget(&messages, "unknown-model", 0, budget),
+            ExplicitBudgetFit::Candidate(expected)
+        );
     }
 }

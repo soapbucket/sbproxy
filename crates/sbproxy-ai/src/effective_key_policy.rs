@@ -529,6 +529,7 @@ pub struct EffectiveKeyPolicy {
     /// Optional model override applied before model enforcement.
     pub route_to_model: Option<String>,
     /// Route-local compression selector applied before cache lookup.
+    #[serde(default)]
     pub compression_profile: Option<String>,
     /// Typed inbound-principal selectors. Empty permits any principal.
     pub principal_selectors: Vec<PrincipalSelector>,

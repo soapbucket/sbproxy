@@ -182,6 +182,7 @@ pub struct WindowFitConfig {
     pub completion_reserve_tokens: u64,
     /// Optional hard input-message budget before the target model limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub input_budget_tokens: Option<u64>,
 }
 

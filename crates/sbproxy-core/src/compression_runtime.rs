@@ -117,6 +117,7 @@ pub struct CompressionRuntime {
 struct CompiledCompressionPipeline {
     runtime: Option<Arc<CompressionRuntime>>,
     behavior_fingerprint: Arc<str>,
+    uses_explicit_input_budget: bool,
 }
 
 /// Immutable default and named compression pipelines for one AI origin.
@@ -126,7 +127,7 @@ pub struct CompressionRuntimeSet {
     profiles: BTreeMap<String, CompiledCompressionPipeline>,
 }
 
-/// One request-pinned compression pipeline and its cache partition.
+/// One request-pinned compression pipeline and its behavior identity.
 #[derive(Clone)]
 pub struct SelectedCompressionRuntime {
     runtime: Option<Arc<CompressionRuntime>>,
@@ -139,7 +140,7 @@ impl SelectedCompressionRuntime {
         self.runtime.as_ref()
     }
 
-    /// Stable policy behavior identity used to partition semantic caches.
+    /// Stable policy behavior identity.
     pub fn behavior_fingerprint(&self) -> &str {
         &self.behavior_fingerprint
     }
@@ -337,6 +338,12 @@ impl CompressionRuntimeSet {
             .expect("the compiled default pipeline is always present")
     }
 
+    /// Whether new request-selectable or explicitly budgeted behavior must
+    /// avoid semantic caches that cannot partition by compression behavior.
+    pub fn requires_semantic_cache_bypass(&self) -> bool {
+        !self.profiles.is_empty() || self.default.uses_explicit_input_budget
+    }
+
     /// Iterate active runtimes for administrative state discovery.
     pub(crate) fn runtimes(&self) -> impl Iterator<Item = &Arc<CompressionRuntime>> {
         self.default.runtime.iter().chain(
@@ -353,6 +360,12 @@ fn compile_pipeline(
     dependencies: RuntimeDependencies,
 ) -> anyhow::Result<CompiledCompressionPipeline> {
     let behavior_fingerprint = Arc::<str>::from(policy_behavior_fingerprint(&policy)?);
+    let uses_explicit_input_budget = policy.levers.iter().any(|lever| {
+        matches!(
+            lever,
+            CompressionLeverConfig::WindowFit(config) if config.input_budget_tokens.is_some()
+        )
+    });
     let runtime = if policy.levers.is_empty() {
         None
     } else {
@@ -365,6 +378,7 @@ fn compile_pipeline(
     Ok(CompiledCompressionPipeline {
         runtime,
         behavior_fingerprint,
+        uses_explicit_input_budget,
     })
 }
 
@@ -506,6 +520,8 @@ impl CompressionRuntime {
         tenant_id: &str,
         api_key_id: Option<&str>,
         cache_bypass: bool,
+        selection_source: &'static str,
+        selection_outcome: &'static str,
         run: &CompressionRun,
     ) {
         crate::compression_metrics::record_compression_run(
@@ -513,6 +529,8 @@ impl CompressionRuntime {
             tenant_id,
             api_key_id,
             cache_bypass,
+            selection_source,
+            selection_outcome,
             run,
         );
     }
@@ -1190,6 +1208,7 @@ origins:
             .unwrap();
 
         assert!(default.runtime().is_some());
+        assert!(set.requires_semantic_cache_bypass());
         assert!(off.runtime().is_none());
         assert!(disabled.runtime().is_none());
         assert!(tight.runtime().is_some());
@@ -1200,6 +1219,43 @@ origins:
                 "undeclared".into()
             ))
             .is_none());
+    }
+
+    #[test]
+    fn explicit_input_budget_bypasses_unpartitioned_semantic_caches() {
+        let explicit = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "test-key"}],
+            "compression": {
+                "levers": [{"type": "window_fit", "input_budget_tokens": 4_096}]
+            }
+        }))
+        .expect("explicit-budget handler");
+        let explicit_set = CompressionRuntimeSet::build(
+            explicit
+                .effective_compression_policy()
+                .expect("compression policy")
+                .into_owned(),
+            &explicit,
+            RuntimeDependencies::empty_for_test(),
+        )
+        .expect("explicit-budget runtime set");
+        assert!(explicit_set.requires_semantic_cache_bypass());
+
+        let legacy = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "test-key"}],
+            "compression": {"levers": [{"type": "window_fit"}]}
+        }))
+        .expect("legacy handler");
+        let legacy_set = CompressionRuntimeSet::build(
+            legacy
+                .effective_compression_policy()
+                .expect("compression policy")
+                .into_owned(),
+            &legacy,
+            RuntimeDependencies::empty_for_test(),
+        )
+        .expect("legacy runtime set");
+        assert!(!legacy_set.requires_semantic_cache_bypass());
     }
 
     #[test]
@@ -1329,7 +1385,14 @@ origins:
             .run(execution(Some("restart-key"), &[], &[], None), &history())
             .await;
         request.await.expect("first runtime called the summarizer");
-        first_runtime.record_telemetry("tenant-a", Some("restart-key"), true, &first);
+        first_runtime.record_telemetry(
+            "tenant-a",
+            Some("restart-key"),
+            true,
+            "route_default",
+            "default",
+            &first,
+        );
         assert_eq!(*store.commit_count.lock().unwrap(), 1);
 
         let replacement_runtime = runtime(&handler, store.clone());

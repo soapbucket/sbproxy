@@ -263,14 +263,21 @@ fn registered_enforcement_test(proof: PolicyEnforcementProof) -> EnforcementTest
             ],
             |policy| assert_eq!(policy.route_to_model.as_deref(), Some("gpt-4.1")),
         ),
-        PolicyEnforcementProof::CompressionSelection => ai_dispatch_test(
-            "compression_selector_precedence_is_header_key_cel_then_default",
+        PolicyEnforcementProof::CompressionSelection => governed_key_e2e_test(
+            "dynamic_compression_profile_changes_context_and_header_overrides_it",
             &[
-                "CompressionSelectionSource::Header",
-                "CompressionSelectionSource::GovernedKey",
-                "CompressionSelectionSource::CelPolicy",
-                "CompressionSelectionSource::RouteDefault",
-                "compression_profile()",
+                "\"compression_profile\": \"off\"",
+                "\"compression_profile\": \"on\"",
+                "\"compression_profile\": \"compact\"",
+                "the governed off selector must preserve the complete caller context",
+                "the route default must be distinct from off",
+                "on and the named compact profile must forward visibly different context",
+                "the governed compact profile must reduce the forwarded context",
+                "the header must override the governed compression profile",
+                "x-compression: off must preserve the complete caller context",
+                "the internal selection header must never reach the provider",
+                "CEL must select a profile from the pre-compression token estimate",
+                "the live CEL-selected profile must reduce the forwarded context",
             ],
             |policy| assert_eq!(policy.compression_profile.as_deref(), Some("coding-agent")),
         ),
@@ -666,6 +673,22 @@ fn serialized_effective_policy_has_no_secret_or_hash_fields() {
         assert!(!object.contains_key(forbidden), "found {forbidden}");
     }
     assert_eq!(object.get("key_id"), Some(&json!("key_01")));
+}
+
+#[test]
+fn effective_policy_v1_without_compression_profile_still_decodes() {
+    let mut value = serde_json::to_value(policy()).expect("effective policy JSON");
+    value["schema_version"] = json!(1);
+    value
+        .as_object_mut()
+        .expect("effective policy object")
+        .remove("compression_profile");
+
+    let decoded: EffectiveKeyPolicy =
+        serde_json::from_value(value).expect("v1 effective policy remains readable");
+
+    assert_eq!(decoded.schema_version, 1);
+    assert!(decoded.compression_profile.is_none());
 }
 
 #[test]

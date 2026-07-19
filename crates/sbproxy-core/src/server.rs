@@ -182,7 +182,7 @@ pub async fn shutdown_cache_revalidate_tasks() {
 /// Pending semantic-cache write produced by a cache-miss path.
 ///
 /// Tuple components: (hook, prompt key, cacheable upstream statuses,
-/// max response size in bytes, model id, compression-scoped origin). When populated, the AI relay
+/// max response size in bytes, model id, origin). When populated, the AI relay
 /// dispatches `hook.store` after the upstream response is forwarded,
 /// subject to the status and size gates.
 type PendingSemcacheMiss = (
