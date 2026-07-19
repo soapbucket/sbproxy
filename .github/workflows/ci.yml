@@ -152,12 +152,21 @@ jobs:
 
       # These tests are ignored in the default local lane because they require
       # a redis-server executable. CI installs Redis above and invokes them
-      # explicitly so the Lua scripts, delete fencing, NOSCRIPT reload, and
-      # connection recovery are verified against a real server on every PR.
-      - name: Redis compression state (Lua fencing + recovery)
+      # explicitly so secure DSN semantics, Lua scripts, delete fencing,
+      # NOSCRIPT reload, and connection recovery are verified against real
+      # server processes on every PR.
+      - name: Redis live state (secure DSN + Lua fencing + recovery)
         if: steps.filter.outputs.code == 'true'
         run: |
           redis-server --version
+          tls_probe_output="$(redis-server --port 0 --tls-port 1 2>&1 || true)"
+          if ! grep -q 'No tls-cert-file configured' <<<"${tls_probe_output}"; then
+            echo "::error::redis-server lacks the TLS support required by secure Redis tests"
+            exit 1
+          fi
+          unset tls_probe_output
+          cargo test -p sbproxy-platform --test redis_secure -- \
+            --ignored --nocapture --test-threads=1
           cargo test -p sbproxy-core --locked --lib \
             'compression_store::redis::tests::live_redis_' -- \
             --ignored --test-threads=1
