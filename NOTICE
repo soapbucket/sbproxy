@@ -214,6 +214,13 @@ Crates: ciborium, ciborium-io, ciborium-ll.
 
 ===========================================================================
 
+backon
+Copyright the backon contributors
+Licensed under the Apache License, Version 2.0
+https://github.com/Xuanwo/backon
+
+===========================================================================
+
 The following crates are pulled in only by the embedded model-host
 engine (mistral.rs, behind the off-by-default `embedded` cargo feature)
 and are licensed under the Apache License, Version 2.0. Where a crate is
