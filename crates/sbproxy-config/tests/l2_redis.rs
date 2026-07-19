@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Error;
-use sbproxy_config::{build_l2_redis_connection, L2CacheParams, ProxyServerConfig};
+use sbproxy_config::{build_l2_redis_connection, L2CacheConfig, L2CacheParams, ProxyServerConfig};
 
 const MAX_REDIS_TLS_FILE_BYTES: usize = 1_048_576;
 
@@ -37,6 +37,53 @@ fn assert_safe_error(error: &Error, expected: &str, forbidden: &[&str]) {
         assert!(
             !chain.contains(value),
             "error chain exposed forbidden Redis configuration material: {chain}"
+        );
+    }
+}
+
+#[test]
+fn l2_redis_params_debug_exposes_only_configuration_presence() {
+    let params = L2CacheParams {
+        dsn: "rediss://sentinel-user:sentinel-password@sentinel-host.invalid:6380/7".to_string(),
+        ca_file: Some("/sentinel/tls/ca.pem".to_string()),
+        cert_file: Some("/sentinel/tls/client.pem".to_string()),
+        key_file: Some("/sentinel/tls/client-key.pem".to_string()),
+    };
+
+    assert_eq!(
+        format!("{params:?}"),
+        "L2CacheParams { dsn_configured: true, ca_file_configured: true, cert_file_configured: true, key_file_configured: true }"
+    );
+}
+
+#[test]
+fn l2_redis_enclosing_config_debug_uses_redacted_params() {
+    let config = L2CacheConfig {
+        driver: "redis".to_string(),
+        params: L2CacheParams {
+            dsn: "rediss://sentinel-user:sentinel-password@sentinel-host.invalid:6380/7"
+                .to_string(),
+            ca_file: Some("/sentinel/tls/ca.pem".to_string()),
+            cert_file: Some("/sentinel/tls/client.pem".to_string()),
+            key_file: Some("/sentinel/tls/client-key.pem".to_string()),
+        },
+    };
+
+    let debug = format!("{config:?}");
+    assert_eq!(
+        debug,
+        "L2CacheConfig { driver: \"redis\", params: L2CacheParams { dsn_configured: true, ca_file_configured: true, cert_file_configured: true, key_file_configured: true } }"
+    );
+    for forbidden in [
+        "sentinel-user",
+        "sentinel-password",
+        "sentinel-host",
+        "/7",
+        "/sentinel/tls",
+    ] {
+        assert!(
+            !debug.contains(forbidden),
+            "enclosing config Debug exposed Redis material: {debug}"
         );
     }
 }

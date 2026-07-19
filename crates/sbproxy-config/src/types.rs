@@ -2150,7 +2150,7 @@ pub struct L2CacheConfig {
 ///
 /// Kept separate from `L2CacheConfig` so future drivers can add fields
 /// (auth, pool size) without churning the parent struct.
-#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 pub struct L2CacheParams {
     /// Redis connection DSN. Supports `redis://`, `rediss://`, credentials,
     /// bracketed IPv6 addresses, and a non-negative logical database.
@@ -2167,6 +2167,18 @@ pub struct L2CacheParams {
     /// Must be configured together with `cert_file` and requires `rediss://`.
     #[serde(default)]
     pub key_file: Option<String>,
+}
+
+impl std::fmt::Debug for L2CacheParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("L2CacheParams")
+            .field("dsn_configured", &!self.dsn.is_empty())
+            .field("ca_file_configured", &self.ca_file.is_some())
+            .field("cert_file_configured", &self.cert_file.is_some())
+            .field("key_file_configured", &self.key_file.is_some())
+            .finish()
+    }
 }
 
 // --- Cache Reserve Config ---

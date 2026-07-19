@@ -3508,6 +3508,21 @@ mod redis_revocation_store_tests {
 
         assert!(get_or_init_revocation_store("invalid-dsn.example", &config).is_none());
     }
+
+    #[test]
+    fn invalid_revocation_store_log_uses_static_unavailable_message() {
+        let source = include_str!("request_phase.rs");
+        let obsolete = ["revocation store backend not yet", " implemented"].concat();
+
+        assert!(
+            source.contains("warn!(\"olp introspect: revocation store unavailable\");"),
+            "invalid revocation-store construction must report unavailability"
+        );
+        assert!(
+            !source.contains(&obsolete),
+            "shipped Redis support must not be described as unimplemented"
+        );
+    }
 }
 
 /// WOR-808 PR10: per-IP token-bucket rate limiter for the
@@ -3691,7 +3706,7 @@ async fn handle_olp_introspect_or_revoke(
     let store = match get_or_init_revocation_store(aud_hint, &introspect_cfg.revocation_store) {
         Some(s) => s,
         None => {
-            warn!("olp introspect: revocation store backend not yet implemented (PR10/PR11)");
+            warn!("olp introspect: revocation store unavailable");
             let body = br#"{"error":"temporarily_unavailable"}"#;
             send_response(session, 503, "application/json", body).await?;
             return Ok(());

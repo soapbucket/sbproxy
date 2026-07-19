@@ -1176,10 +1176,10 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
-    // Instantiate the L2 cache backend (Redis) if configured. The store is
-    // created lazily, so this call just records the target address without
-    // opening a connection yet. Any concrete failure surfaces the first
-    // time a request tries to use it.
+    // Instantiate the L2 cache backend (Redis) if configured. DSN semantics,
+    // TLS field combinations, and local PEM material are validated here at
+    // startup. Only the network connection is lazy; reachability, TLS handshake,
+    // authentication, and database-selection failures surface on first use.
     let l2_store = match &config_file.proxy.l2_cache {
         Some(cfg) => Some(build_l2_store(cfg)?),
         None => None,
