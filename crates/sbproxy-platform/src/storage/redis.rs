@@ -628,20 +628,34 @@ fn classify_redis_error(
 }
 
 fn has_tls_error_source(error: &RedisError) -> bool {
-    let mut source = StdError::source(error);
-    while let Some(cause) = source {
-        if cause.is::<rustls::Error>() {
-            return true;
+    if let Some(mut source) = StdError::source(error) {
+        loop {
+            if source.is::<rustls::Error>() {
+                return true;
+            }
+            if source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::InvalidData)
+            {
+                return true;
+            }
+            let Some(next) = source.source() else {
+                return false;
+            };
+            source = next;
         }
-        if cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::InvalidData)
-        {
-            return true;
-        }
-        source = cause.source();
     }
-    false
+
+    // redis 0.28 keeps its io::Error only behind the legacy cause() hook,
+    // whose non-'static trait object cannot be downcast safely. Its public
+    // predicates still identify timeouts, refused connections, dropped
+    // connections, and reconnect-class transport failures. The remaining
+    // opaque IoError shape on a validated rediss connection is a TLS setup or
+    // handshake failure.
+    !(error.is_timeout()
+        || error.is_connection_refusal()
+        || error.is_connection_dropped()
+        || error.is_unrecoverable_error())
 }
 
 fn should_invalidate(error: &RedisError) -> bool {
@@ -947,6 +961,61 @@ mod tests {
         )
         .unwrap();
         RedisKVStore::new(RedisConfig::new(connection))
+    }
+
+    #[test]
+    fn classifies_structural_tls_io_shapes_without_relabeling_plain_transport() {
+        let invalid_tls_record = RedisError::from(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sentinel TLS record failure",
+        ));
+        assert_eq!(
+            classify_redis_error(&invalid_tls_record, ErrorPhase::Connect, true),
+            RedisFailureReason::Tls
+        );
+        assert_eq!(
+            classify_redis_error(&invalid_tls_record, ErrorPhase::Connect, false),
+            RedisFailureReason::Transport
+        );
+
+        let other_tls = RedisError::from(io::Error::other("sentinel TLS handshake failure"));
+        assert_eq!(
+            classify_redis_error(&other_tls, ErrorPhase::Connect, true),
+            RedisFailureReason::Tls
+        );
+
+        let cause_less_tls = RedisError::from((
+            ErrorKind::IoError,
+            "opaque handshake failure",
+            "sentinel detail".to_string(),
+        ));
+        assert_eq!(
+            classify_redis_error(&cause_less_tls, ErrorPhase::Connect, true),
+            RedisFailureReason::Tls
+        );
+
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::NotFound,
+        ] {
+            let transport = RedisError::from(io::Error::new(kind, "sentinel transport failure"));
+            assert_eq!(
+                classify_redis_error(&transport, ErrorPhase::Connect, true),
+                RedisFailureReason::Transport
+            );
+        }
+
+        let timeout = RedisError::from(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "sentinel connect timeout",
+        ));
+        assert_eq!(
+            classify_redis_error(&timeout, ErrorPhase::Connect, true),
+            RedisFailureReason::ConnectTimeout
+        );
     }
 
     #[test]
