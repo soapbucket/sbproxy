@@ -126,27 +126,46 @@ pub fn estimate_json_message_tokens(model: &str, messages: &[serde_json::Value])
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            content: match message.as_object() {
-                Some(object) => object
-                    .get("content")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-                None => message.clone(),
-            },
+            content: projected_message_content(message),
         })
         .collect::<Vec<_>>();
     let mut tokens = estimate_tokens(model, &projected);
 
     if let Ok(bpe) = tiktoken_rs::bpe_for_model(model) {
+        for content in messages.iter().filter_map(structured_content_json) {
+            tokens += bpe.encode_with_special_tokens(&content).len() as u64;
+        }
         for extra in messages.iter().filter_map(extra_message_fields_json) {
             tokens += bpe.encode_with_special_tokens(&extra).len() as u64;
         }
     } else {
+        for content in messages.iter().filter_map(structured_content_json) {
+            tokens += (content.len() as u64 / 4).max(1);
+        }
         for extra in messages.iter().filter_map(extra_message_fields_json) {
             tokens += (extra.len() as u64 / 4).max(1);
         }
     }
     tokens
+}
+
+fn projected_message_content(message: &serde_json::Value) -> serde_json::Value {
+    match message.as_object() {
+        Some(object) => match object.get("content") {
+            Some(content) if !content.is_array() => content.clone(),
+            _ => serde_json::Value::Null,
+        },
+        None if message.is_array() => serde_json::Value::Null,
+        None => message.clone(),
+    }
+}
+
+fn structured_content_json(message: &serde_json::Value) -> Option<String> {
+    let content = message
+        .as_object()
+        .and_then(|object| object.get("content"))
+        .unwrap_or(message);
+    content.is_array().then(|| content.to_string())
 }
 
 fn extra_message_fields_json(message: &serde_json::Value) -> Option<String> {
@@ -175,7 +194,9 @@ fn role_tokens_heuristic(role: &str) -> u64 {
 /// either a bare string or an array of typed parts (text + image_url for
 /// multimodal). We count text parts only; image inputs are token-counted by
 /// the upstream out of band and would require model-specific lookup that
-/// belongs in the multimodal module rather than here.
+/// belongs in the multimodal module rather than here. The complete-JSON
+/// compression counter handles structured arrays separately in
+/// [`estimate_json_message_tokens`].
 fn content_tokens_with_bpe(bpe: &tiktoken_rs::CoreBPE, content: &serde_json::Value) -> u64 {
     match content {
         serde_json::Value::String(s) => bpe.encode_with_special_tokens(s).len() as u64,
@@ -298,19 +319,73 @@ mod tests {
     }
 
     #[test]
-    fn multimodal_content_counts_text_parts() {
-        // Multimodal content with one text part and one image_url. The
-        // image is intentionally ignored; only the text contributes.
-        let messages = vec![Message {
+    fn raw_json_multimodal_content_counts_complete_structured_parts() {
+        let text_only = vec![json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "What is in this image?"}]
+        })];
+        let with_image = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+            ]
+        })];
+        assert!(
+            estimate_json_message_tokens("gpt-4o", &with_image)
+                > estimate_json_message_tokens("gpt-4o", &text_only),
+            "non-text structured parts must contribute to the input estimate"
+        );
+    }
+
+    #[test]
+    fn typed_admission_estimator_keeps_legacy_text_only_multimodal_counting() {
+        let text_only = vec![Message {
+            role: "user".to_string(),
+            content: json!([{"type": "text", "text": "What is in this image?"}]),
+        }];
+        let with_image = vec![Message {
             role: "user".to_string(),
             content: json!([
                 {"type": "text", "text": "What is in this image?"},
                 {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
             ]),
         }];
-        let est = estimate_tokens("gpt-4o", &messages);
-        // Sanity: at least the per-message overhead + reply priming.
-        assert!(est > REPLY_PRIMING);
+
+        assert_eq!(
+            estimate_tokens("gpt-4o", &with_image),
+            estimate_tokens("gpt-4o", &text_only),
+            "the complete-JSON change is scoped to compression accounting"
+        );
+    }
+
+    #[test]
+    fn structured_content_blocks_count_their_complete_json() {
+        let small = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": "ok"
+            }]
+        })];
+        let large = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": "tool payload ".repeat(1_000)
+            }]
+        })];
+
+        for model in ["gpt-4o", "unknown-self-hosted-model"] {
+            let small_tokens = estimate_json_message_tokens(model, &small);
+            let large_tokens = estimate_json_message_tokens(model, &large);
+            assert!(
+                large_tokens > small_tokens.saturating_add(100),
+                "{model} must count structured content payloads: small={small_tokens}, large={large_tokens}"
+            );
+        }
     }
 
     #[test]

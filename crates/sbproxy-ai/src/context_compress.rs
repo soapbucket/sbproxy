@@ -465,6 +465,37 @@ mod tests {
     }
 
     #[test]
+    fn explicit_budget_counts_anthropic_tool_payloads_before_admitting_the_newest_unit() {
+        let small = vec![
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "lookup",
+                    "input": {"query": "small"}
+                }]
+            }),
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": "ok"
+                }]
+            }),
+        ];
+        let mut large = small.clone();
+        large[1]["content"][0]["content"] = json!("tool payload ".repeat(1_000));
+        let budget = crate::token_estimate::estimate_json_message_tokens("unknown-model", &small);
+
+        assert_eq!(
+            fit_messages_to_input_budget(&large, "unknown-model", 0, budget),
+            ExplicitBudgetFit::CannotMeetBudget
+        );
+    }
+
+    #[test]
     fn explicit_budget_handles_large_histories_in_one_pass() {
         let messages = (0..10_000)
             .map(|index| user(&format!("message {index}")))
