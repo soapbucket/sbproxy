@@ -609,14 +609,11 @@ fn classify_redis_error(
     match error.kind() {
         ErrorKind::AuthenticationFailed => RedisFailureReason::Auth,
         ErrorKind::IoError => {
-            if uses_tls && has_tls_error_source(error) {
+            if uses_tls && has_tls_error_source(error, phase) {
                 RedisFailureReason::Tls
             } else {
                 RedisFailureReason::Transport
             }
-        }
-        ErrorKind::InvalidClientConfig if uses_tls && matches!(phase, ErrorPhase::Connect) => {
-            RedisFailureReason::Tls
         }
         ErrorKind::InvalidClientConfig
         | ErrorKind::ParseError
@@ -627,35 +624,26 @@ fn classify_redis_error(
     }
 }
 
-fn has_tls_error_source(error: &RedisError) -> bool {
-    if let Some(mut source) = StdError::source(error) {
-        loop {
-            if source.is::<rustls::Error>() {
-                return true;
-            }
-            if source
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::InvalidData)
-            {
-                return true;
-            }
-            let Some(next) = source.source() else {
-                return false;
-            };
-            source = next;
+fn has_tls_error_source(error: &RedisError, phase: ErrorPhase) -> bool {
+    let mut source = StdError::source(error);
+    while let Some(cause) = source {
+        if cause.is::<rustls::Error>() {
+            return true;
         }
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .is_some_and(|inner| inner.is::<rustls::Error>())
+        {
+            return true;
+        }
+        source = cause.source();
     }
 
-    // redis 0.28 keeps its io::Error only behind the legacy cause() hook,
-    // whose non-'static trait object cannot be downcast safely. Its public
-    // predicates still identify timeouts, refused connections, dropped
-    // connections, and reconnect-class transport failures. The remaining
-    // opaque IoError shape on a validated rediss connection is a TLS setup or
-    // handshake failure.
-    !(error.is_timeout()
-        || error.is_connection_refusal()
-        || error.is_connection_dropped()
-        || error.is_unrecoverable_error())
+    // Redis converts direct rustls setup failures to detail-backed IoError
+    // values before a connection exists. Presence is sufficient here; never
+    // inspect or expose the potentially sensitive detail text.
+    matches!(phase, ErrorPhase::Connect) && error.detail().is_some()
 }
 
 fn should_invalidate(error: &RedisError) -> bool {
@@ -965,23 +953,39 @@ mod tests {
 
     #[test]
     fn classifies_structural_tls_io_shapes_without_relabeling_plain_transport() {
-        let invalid_tls_record = RedisError::from(io::Error::new(
+        let invalid_transport_record = RedisError::from(io::Error::new(
             io::ErrorKind::InvalidData,
-            "sentinel TLS record failure",
+            "sentinel invalid transport data",
         ));
         assert_eq!(
-            classify_redis_error(&invalid_tls_record, ErrorPhase::Connect, true),
-            RedisFailureReason::Tls
-        );
-        assert_eq!(
-            classify_redis_error(&invalid_tls_record, ErrorPhase::Connect, false),
+            classify_redis_error(&invalid_transport_record, ErrorPhase::Connect, true),
             RedisFailureReason::Transport
         );
 
-        let other_tls = RedisError::from(io::Error::other("sentinel TLS handshake failure"));
+        let nested_tls_record = RedisError::from(io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::General("sentinel TLS record failure".to_string()),
+        ));
+        let redis_source = StdError::source(&nested_tls_record).expect("redis io source");
+        let io_source = redis_source
+            .downcast_ref::<io::Error>()
+            .expect("redis source is io error");
+        assert!(io_source
+            .get_ref()
+            .is_some_and(|source| source.is::<rustls::Error>()));
         assert_eq!(
-            classify_redis_error(&other_tls, ErrorPhase::Connect, true),
+            classify_redis_error(&nested_tls_record, ErrorPhase::Connect, true),
             RedisFailureReason::Tls
+        );
+        assert_eq!(
+            classify_redis_error(&nested_tls_record, ErrorPhase::Connect, false),
+            RedisFailureReason::Transport
+        );
+
+        let other_transport = RedisError::from(io::Error::other("sentinel transport failure"));
+        assert_eq!(
+            classify_redis_error(&other_transport, ErrorPhase::Connect, true),
+            RedisFailureReason::Transport
         );
 
         let cause_less_tls = RedisError::from((
@@ -993,6 +997,10 @@ mod tests {
             classify_redis_error(&cause_less_tls, ErrorPhase::Connect, true),
             RedisFailureReason::Tls
         );
+        assert_eq!(
+            classify_redis_error(&cause_less_tls, ErrorPhase::Command, true),
+            RedisFailureReason::Transport
+        );
 
         for kind in [
             io::ErrorKind::ConnectionRefused,
@@ -1000,6 +1008,11 @@ mod tests {
             io::ErrorKind::NotConnected,
             io::ErrorKind::UnexpectedEof,
             io::ErrorKind::NotFound,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::AddrNotAvailable,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Unsupported,
         ] {
             let transport = RedisError::from(io::Error::new(kind, "sentinel transport failure"));
             assert_eq!(
@@ -1015,6 +1028,15 @@ mod tests {
         assert_eq!(
             classify_redis_error(&timeout, ErrorPhase::Connect, true),
             RedisFailureReason::ConnectTimeout
+        );
+
+        let invalid_client_config = RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "sentinel client configuration failure",
+        ));
+        assert_eq!(
+            classify_redis_error(&invalid_client_config, ErrorPhase::Connect, true),
+            RedisFailureReason::Protocol
         );
     }
 
