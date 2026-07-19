@@ -1,13 +1,13 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-07-14*
+*Last modified: 2026-07-18*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
 ## Principles
 
-1. The proxy MUST always start, even if dependencies are down.
-2. The proxy MUST keep serving traffic during dependency outages.
+1. A policy that selects shared runtime state must have that state wiring at startup.
+2. Once active, the proxy MUST keep serving traffic during dependency outages where the feature contract is fail-open.
 3. Degradation must be visible in metrics and logs.
 4. Recovery is automatic. No manual intervention required.
 
@@ -17,7 +17,8 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 |---|---|---|---|---|
 | Upstream target (`proxy` or `load_balancer`) | Connection error / timeout | Active health checks + outlier detection + circuit breaker eject the target. Retries pick the next healthy peer. With every target ejected, the LB falls back to the unfiltered list rather than 502'ing the client. | Auto on next probe success / breaker recovery window | `sbproxy_requests_total{status}`, `sbproxy_origin_requests_total{origin,method,status}` |
 | AI provider (OpenAI, Anthropic, OpenRouter, ...) | 5xx, timeout, rate-limit | Routing strategy picks the next provider in the chain (`fallback_chain` / `cost_optimized`). All-providers-failed returns 502. | Auto on next successful request | `sbproxy_ai_failovers_total`, `sbproxy_ai_provider_errors_total` |
-| Redis (`proxy.l2_cache_settings`) | Connection / command failure | Per-origin in-memory cache and per-process rate-limit counters take over. Cross-replica state is suspended until reconnect. This is the general request-level rate limiter; it is separate from governed AI key budgets, below. | Auto-reconnect with exponential backoff | None dedicated; the L2 cache path logs connection and command errors |
+| Redis (`proxy.l2_cache_settings`) | Connection / command failure | General response caching and rate limiting fall back to per-process behavior. AI `summary_buffer` state never falls back to worker memory: that lever fails open, preserves the last committed message list, and lets later levers run. | Auto-reconnect; summary updates resume on a later request | `sbproxy_ai_compression_state_operations_total`, `sbproxy_ai_compression_redis_coordination_total` for compression state |
+| Dedicated AI compression summarizer | Timeout, provider failure, invalid output, policy denial, or budget denial | `summary_buffer` skips safe admission denials or fails open on runtime errors. The primary AI request continues with the last committed messages, and a later `window_fit` lever still runs. | Next eligible request retries under the configured policy and timeout | `sbproxy_ai_compression_lever_total`, `sbproxy_ai_compression_requests_total`, `sbproxy_ai_compression_duration_seconds` |
 | Governed-key budget backend (`key_management.governance.backend`, strict tier only) | Connection / command failure | Only affects keys governed under `consistency: strict`. The default `approximate` tier does not depend on this backend at all; its per-node counters keep disseminating over the cluster mesh. For a strict key, a reserve call that cannot reach the backend denies the request (`503`) by default (`failure_mode: closed`); `failure_mode: allow_unreserved` admits it instead without a reservation. A settle call on an already-admitted request is unaffected by `failure_mode` and stays best-effort. | Auto-reconnect; enforcement resumes on the next successful call | `sbproxy_governance_fail_open_total{key_id}` on `allow_unreserved`; also logged at WARN (fail-open/fail-closed) or DEBUG (other reserve/settle errors) |
 | ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
 | Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None dedicated; resolver failures are logged at WARN |
@@ -114,7 +115,14 @@ action:
 
 **When down:** Redis connect or command fails.
 
-**Fallback:** the proxy keeps using the per-origin in-memory cache. Rate-limit counters become node-local; with multiple replicas, slightly more traffic may sneak through the global limit until Redis recovers. Response cache entries written during the outage are local and not shared. Reconnects use exponential backoff with a circuit breaker so a sustained outage does not pile up retry attempts.
+**Fallback:** for the general L2 consumers, the proxy keeps using the per-origin in-memory cache. Rate-limit counters become node-local; with multiple replicas, slightly more traffic may sneak through the global limit until Redis recovers. Response cache entries written during the outage are local and not shared. Reconnects use exponential backoff with a circuit breaker so a sustained outage does not pile up retry attempts.
+
+AI context summary state is intentionally different. When an AI handler selects
+`compression.state.backend: redis`, Redis is the only canonical summary store.
+On a connection or command failure, `summary_buffer` records
+`state_unavailable`, preserves the last committed message list, and continues
+to later levers and upstream dispatch. It never creates a worker-local summary
+fork.
 
 **Log level:** `ERROR` on initial disconnect, `WARN` per reconnect attempt, `INFO` on recovery.
 
@@ -128,6 +136,39 @@ proxy:
     params:
       dsn: redis://redis.internal:6379/0
 ```
+
+For strict Redis leases, fences, coordination events, and the full fail-open
+table, see [AI context compression](ai-context-compression.md).
+
+---
+
+### Dedicated AI compression summarizer
+
+**When down:** the exact summarizer provider times out or returns an invalid
+response. Credential policy and budget admission can also decline the internal
+summary call without contacting the provider.
+
+**Fallback:** runtime failures are failure-open for the caller's primary AI
+request. The failed lever keeps the last committed message list and later
+levers continue. Safe admission conditions such as `policy_denied`,
+`budget_denied`, `lock_contended`, and `state_expired` are skips rather than
+failures. An expired summary is never reused while Redis awaits physical TTL
+removal.
+
+Selecting `backend: redis` without the Redis L2 wiring is a startup
+configuration error. `backend: mesh` is rejected because the current mesh
+cache is not a durable replicated session store. Runtime failure-open behavior
+begins only after a valid pipeline has been built.
+
+**Log level:** the content-free `ai_compression_summary` event is `DEBUG` when
+all levers skip, `INFO` when at least one applies and none fail, and `WARN` when
+any lever fails.
+
+**Alert:** the bundled rules alert on a sustained compression failure ratio and
+on state errors or rejected Redis updates.
+
+**Config and full behavior:** see
+[AI context compression](ai-context-compression.md).
 
 ---
 

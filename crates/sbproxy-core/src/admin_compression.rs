@@ -95,6 +95,10 @@ pub(crate) struct CompressionAdminRegistry {
 impl CompressionAdminRegistry {
     pub(crate) fn from_current_pipeline() -> Self {
         let pipeline = crate::reload::current_pipeline();
+        Self::from_pipeline(&pipeline)
+    }
+
+    fn from_pipeline(pipeline: &crate::pipeline::CompiledPipeline) -> Self {
         let mut stores = Vec::new();
         let mut origins = Vec::new();
         for (index, origin) in pipeline.config.origins.iter().enumerate() {
@@ -119,6 +123,19 @@ impl CompressionAdminRegistry {
                 backend,
                 allow_content: runtime.allows_admin_content_inspection(),
             });
+        }
+        if !stores
+            .iter()
+            .any(|entry| entry.backend == CompressionBackend::Redis)
+        {
+            if let Some(store) =
+                crate::compression_runtime::redis_admin_store(&pipeline.config.server)
+            {
+                stores.push(AdminStore {
+                    backend: CompressionBackend::Redis,
+                    store,
+                });
+            }
         }
         Self::finish(stores, origins)
     }
@@ -274,19 +291,12 @@ async fn list_records(path: &str, registry: &CompressionAdminRegistry) -> AdminC
         Ok(query) => query,
         Err(response) => return response,
     };
-    const ALLOWED: [&str; 7] = [
-        "tenant", "origin", "backend", "expired", "conflict", "cursor", "limit",
-    ];
+    const ALLOWED: [&str; 6] = ["tenant", "origin", "backend", "conflict", "cursor", "limit"];
     if query.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
         return bad_request("unknown query parameter");
     }
     let backend = match query.get("backend").map(|value| parse_backend(value)) {
         Some(Ok(backend)) => Some(backend),
-        Some(Err(response)) => return response,
-        None => None,
-    };
-    let expired = match query.get("expired").map(|value| parse_bool(value)) {
-        Some(Ok(value)) => Some(value),
         Some(Err(response)) => return response,
         None => None,
     };
@@ -313,8 +323,8 @@ async fn list_records(path: &str, registry: &CompressionAdminRegistry) -> AdminC
     let request = ListRequest {
         tenant_id,
         origin,
-        expired,
-        expiration_cutoff_unix_ms: unix_time_ms(),
+        expired: None,
+        expiration_cutoff_unix_ms: 0,
         conflict,
         cursor: None,
         limit,
@@ -576,7 +586,6 @@ async fn delete_record(
 struct PurgeBody {
     tenant: Option<String>,
     origin: Option<String>,
-    expired_before: Option<u64>,
     conflict: Option<bool>,
     backend: Option<String>,
     cursor: Option<String>,
@@ -594,15 +603,16 @@ async fn purge_records(
         Some(body) => body,
         None => return bad_request("invalid purge request"),
     };
-    let has_scope = body.tenant.is_some()
-        || body.origin.is_some()
-        || body.expired_before.is_some()
-        || body.conflict.is_some();
-    if !has_scope && !body.all {
-        return bad_request("purge requires an explicit scope");
+    let has_destructive_scope = body.tenant.is_some() || body.origin.is_some();
+    let has_scoped_filters = has_destructive_scope || body.conflict.is_some();
+    if !has_destructive_scope && !body.all {
+        return bad_request("purge requires a tenant or origin scope");
     }
     if body.all && body.confirmation.as_deref() != Some(PURGE_CONFIRMATION) {
         return bad_request("all-record purge confirmation is invalid");
+    }
+    if body.all && has_scoped_filters {
+        return bad_request("all-record purge cannot include scoped filters");
     }
     if body
         .tenant
@@ -628,7 +638,7 @@ async fn purge_records(
     let request = PurgeRequest {
         tenant_id: body.tenant,
         origin,
-        expired_before_unix_ms: body.expired_before,
+        expired_before_unix_ms: None,
         conflict: body.conflict,
         cursor: None,
         limit,
@@ -748,7 +758,6 @@ fn parse_limit(value: Option<&String>) -> Result<u16, AdminCompressionResponse> 
 fn parse_backend(value: &str) -> Result<CompressionBackend, AdminCompressionResponse> {
     match value {
         "redis" => Ok(CompressionBackend::Redis),
-        "mesh" => Ok(CompressionBackend::Mesh),
         _ => Err(bad_request("invalid backend")),
     }
 }
@@ -1068,6 +1077,27 @@ mod tests {
         )
     }
 
+    #[test]
+    fn disabled_summary_policy_keeps_the_configured_redis_admin_store() {
+        let mut pipeline = crate::pipeline::CompiledPipeline::default();
+        pipeline.config.server.l2_cache = Some(sbproxy_config::L2CacheConfig {
+            driver: "redis".to_string(),
+            params: sbproxy_config::L2CacheParams {
+                dsn: "redis://redis.internal:6379/0".to_string(),
+            },
+        });
+
+        let registry = CompressionAdminRegistry::from_pipeline(&pipeline);
+        assert_eq!(
+            registry
+                .selected_stores(Some(CompressionBackend::Redis))
+                .len(),
+            1,
+            "external records must remain manageable after summary_buffer is disabled"
+        );
+        assert!(registry.origins.is_empty());
+    }
+
     #[tokio::test]
     async fn metadata_routes_are_bounded_filterable_content_free_and_fail_closed() {
         let store = Arc::new(TestStore::default());
@@ -1082,7 +1112,7 @@ mod tests {
 
         let response = dispatch_with_registry(
             "GET",
-            "/admin/compression/sessions?tenant=tenant-a&origin=API.Example.COM.&backend=redis&expired=false&conflict=false&limit=999",
+            "/admin/compression/sessions?tenant=tenant-a&origin=API.Example.COM.&backend=redis&conflict=false&limit=999",
             None,
             Some(&readonly),
             None,
@@ -1098,7 +1128,7 @@ mod tests {
         let request = store.list_requests.lock().unwrap().pop().unwrap();
         assert_eq!(request.tenant_id.as_deref(), Some("tenant-a"));
         assert_eq!(request.origin.as_deref(), Some("api.example.com"));
-        assert_eq!(request.expired, Some(false));
+        assert_eq!(request.expired, None);
         assert_eq!(request.conflict, Some(false));
         assert_eq!(request.limit, 500);
 
@@ -1133,6 +1163,32 @@ mod tests {
             store.list_requests.lock().unwrap().last().unwrap().limit,
             100
         );
+
+        let mesh_filter = dispatch_with_registry(
+            "GET",
+            "/admin/compression/sessions?backend=mesh",
+            None,
+            Some(&readonly),
+            None,
+            &registry,
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mesh_filter.status, 400);
+
+        let expired_filter = dispatch_with_registry(
+            "GET",
+            "/admin/compression/sessions?expired=true",
+            None,
+            Some(&readonly),
+            None,
+            &registry,
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(expired_filter.status, 400);
 
         *store.list_next_cursor.lock().unwrap() = Some("store-next".to_string());
         let first_page = dispatch_with_registry(
@@ -1434,6 +1490,24 @@ mod tests {
         .unwrap();
         assert_eq!(unsafe_purge.status, 400);
 
+        for body in [r#"{"conflict":false}"#, r#"{"conflict":true}"#] {
+            let conflict_only = dispatch_with_registry(
+                "POST",
+                "/admin/compression/sessions/purge",
+                Some(body),
+                Some(&session_admin),
+                Some("csrf-a"),
+                &registry,
+                &audit,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                conflict_only.status, 400,
+                "conflict is a broad filter, not a destructive boundary"
+            );
+        }
+
         let wrong_confirmation = dispatch_with_registry(
             "POST",
             "/admin/compression/sessions/purge",
@@ -1446,6 +1520,45 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(wrong_confirmation.status, 400);
+
+        let mixed_all_scope = dispatch_with_registry(
+            "POST",
+            "/admin/compression/sessions/purge",
+            Some(r#"{"all":true,"confirmation":"purge-compression-sessions","tenant":"tenant-a"}"#),
+            Some(&session_admin),
+            Some("csrf-a"),
+            &registry,
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mixed_all_scope.status, 400);
+
+        let zero_expiry = dispatch_with_registry(
+            "POST",
+            "/admin/compression/sessions/purge",
+            Some(r#"{"expired_before":0}"#),
+            Some(&session_admin),
+            Some("csrf-a"),
+            &registry,
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(zero_expiry.status, 400);
+
+        let expired_scope = dispatch_with_registry(
+            "POST",
+            "/admin/compression/sessions/purge",
+            Some(r#"{"expired_before":1234}"#),
+            Some(&session_admin),
+            Some("csrf-a"),
+            &registry,
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(expired_scope.status, 400);
 
         let scoped = dispatch_with_registry(
             "POST",

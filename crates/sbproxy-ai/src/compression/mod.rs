@@ -14,12 +14,14 @@ pub mod runner;
 pub mod store;
 /// Stateful running-summary compression lever.
 pub mod summary_buffer;
+/// Stable behavior identity for summary-buffer state lineages.
+mod summary_policy;
 /// Compatibility adapter for deterministic model-window fitting.
 pub mod window_fit;
 
 pub use config::{
-    CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionStateConfig,
-    SummarizerConfig, SummaryBufferConfig, WindowFitConfig,
+    CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionStateBackend,
+    CompressionStateConfig, SummarizerConfig, SummaryBufferConfig, WindowFitConfig,
 };
 pub use identity::CompressionRecordId;
 pub use outcome::{
@@ -38,4 +40,5 @@ pub use summary_buffer::{
     InternalSummarizer, SummarizationOutput, SummarizationRequest, SummarizerError,
     SummaryBufferLever,
 };
+pub use summary_policy::SummaryPolicyFingerprint;
 pub use window_fit::WindowFitLever;

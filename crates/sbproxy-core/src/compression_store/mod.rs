@@ -1,6 +1,6 @@
 //! External state adapters for AI compression sessions.
 
-/// Eventual LWW adapter over the shared process mesh.
+/// Experimental mesh adapter retained for hardening work; not public-config selectable.
 pub mod mesh;
 /// Strict lease-serialized Redis adapter.
 pub mod redis;

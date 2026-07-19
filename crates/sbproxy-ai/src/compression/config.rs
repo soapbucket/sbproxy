@@ -28,7 +28,7 @@ pub struct CompressionPolicy {
 #[serde(deny_unknown_fields)]
 pub struct CompressionStateConfig {
     /// Existing process-wide state subsystem to reuse.
-    pub backend: CompressionBackend,
+    pub backend: CompressionStateBackend,
     /// Record lifetime, in seconds after deserialization.
     #[serde(
         rename = "ttl",
@@ -38,7 +38,15 @@ pub struct CompressionStateConfig {
     pub ttl_secs: u64,
 }
 
-/// Supported external state backends.
+/// State backends safe to select from public compression configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionStateBackend {
+    /// Strict Redis lease, fence, and compare-and-set storage.
+    Redis,
+}
+
+/// Backend identity exposed by store adapters and administrative metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionBackend {
@@ -184,7 +192,7 @@ enum DurationSchema {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressionBackend, CompressionLeverConfig};
+    use super::{CompressionLeverConfig, CompressionStateBackend};
     use crate::handler::AiHandlerConfig;
 
     fn provider(name: &str) -> serde_json::Value {
@@ -230,7 +238,7 @@ mod tests {
         let policy = config.compression.as_ref().expect("explicit policy");
 
         let state = policy.state.as_ref().expect("state config");
-        assert_eq!(state.backend, CompressionBackend::Redis);
+        assert_eq!(state.backend, CompressionStateBackend::Redis);
         assert_eq!(state.ttl_secs, 24 * 60 * 60);
         assert!(!policy.allow_admin_content_inspection);
         assert_eq!(policy.levers.len(), 2);
@@ -252,6 +260,18 @@ mod tests {
             }
             other => panic!("expected window_fit second, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_mesh_as_a_compression_state_backend() {
+        let mut value = valid_config();
+        value["compression"]["state"]["backend"] = serde_json::json!("mesh");
+
+        let error = AiHandlerConfig::from_config(value).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown variant `mesh`") && error.contains("`redis`"),
+            "mesh must not be accepted until the cluster substrate provides durable replicated state: {error}"
+        );
     }
 
     #[test]

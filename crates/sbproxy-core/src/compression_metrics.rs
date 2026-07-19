@@ -1,6 +1,5 @@
 //! Metrics and content-free summary events for AI context compression.
 
-use crate::compression_store::MeshCompressionEvent;
 use prometheus::{
     register_histogram_vec, register_int_counter_vec, HistogramOpts, HistogramVec, IntCounterVec,
     Opts,
@@ -51,7 +50,7 @@ static COMPRESSION_TOKENS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         Opts::new(
             "sbproxy_ai_compression_tokens_total",
-            "Target-model tokens before and after an applied AI context compression lever"
+            "SBproxy model-aware token estimates before and after an applied AI context compression lever"
         ),
         &["tenant_id", "api_key_id", "lever", "direction"]
     )
@@ -62,7 +61,7 @@ static COMPRESSION_TOKENS_SAVED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|
     register_int_counter_vec!(
         Opts::new(
             "sbproxy_ai_compression_tokens_saved_total",
-            "Target-model tokens removed by applied AI context compression levers"
+            "Reduction in SBproxy's model-aware token estimate from applied AI context compression levers"
         ),
         &["tenant_id", "api_key_id", "lever"]
     )
@@ -73,7 +72,7 @@ static COMPRESSION_RATIO: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         HistogramOpts::new(
             "sbproxy_ai_compression_ratio",
-            "Final-to-initial token ratio for applied AI context compression levers"
+            "Final-to-initial SBproxy token-estimate ratio for applied AI context compression levers"
         )
         .buckets(vec![0.05, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0]),
         &["tenant_id", "api_key_id", "lever"]
@@ -114,7 +113,7 @@ static COMPRESSION_REQUEST_TOKENS_SAVED: LazyLock<HistogramVec> = LazyLock::new(
     register_histogram_vec!(
         HistogramOpts::new(
             "sbproxy_ai_compression_request_tokens_saved",
-            "Initial-to-final target-model tokens saved once per compression request"
+            "Initial-to-final reduction in SBproxy's model-aware token estimate once per compression request"
         )
         .buckets(TOKEN_BUCKETS.to_vec()),
         &["tenant_id", "api_key_id", "outcome", "backend"]
@@ -166,17 +165,6 @@ static COMPRESSION_REDIS_COORDINATION_TOTAL: LazyLock<IntCounterVec> = LazyLock:
         &["event"]
     )
     .expect("AI compression Redis coordination counter registers")
-});
-
-static COMPRESSION_MESH_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
-        Opts::new(
-            "sbproxy_ai_compression_mesh_events_total",
-            "Mesh compression convergence, conflict, and tombstone events"
-        ),
-        &["event"]
-    )
-    .expect("AI compression mesh event counter registers")
 });
 
 /// Closed external state operation names emitted by both adapters.
@@ -274,13 +262,6 @@ pub(crate) fn record_compression_state_operation(
 /// Record one closed Redis coordination event.
 pub(crate) fn record_redis_compression_coordination(event: RedisCompressionCoordinationEvent) {
     COMPRESSION_REDIS_COORDINATION_TOTAL
-        .with_label_values(&[event.as_str()])
-        .inc();
-}
-
-/// Record one closed mesh convergence event.
-pub(crate) fn record_mesh_compression_event(event: MeshCompressionEvent) {
-    COMPRESSION_MESH_EVENTS_TOTAL
         .with_label_values(&[event.as_str()])
         .inc();
 }
@@ -519,15 +500,14 @@ pub(crate) fn record_compression_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        record_compression_run, record_compression_state_operation, record_mesh_compression_event,
+        record_compression_run, record_compression_state_operation,
         record_redis_compression_coordination, CompressionStateOperation, CompressionStateOutcome,
         RedisCompressionCoordinationEvent,
     };
-    use crate::compression_store::MeshCompressionEvent;
     use sbproxy_ai::compression::{
         CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionRun,
-        CompressionStateConfig, FailureReason, LeverKind, LeverOutcome, LeverResult, SkipReason,
-        SummarizerConfig, SummaryBufferConfig, WindowFitConfig,
+        CompressionStateBackend, CompressionStateConfig, FailureReason, LeverKind, LeverOutcome,
+        LeverResult, SkipReason, SummarizerConfig, SummaryBufferConfig, WindowFitConfig,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -580,7 +560,7 @@ mod tests {
     fn policy() -> CompressionPolicy {
         CompressionPolicy {
             state: Some(CompressionStateConfig {
-                backend: CompressionBackend::Redis,
+                backend: CompressionStateBackend::Redis,
                 ttl_secs: 3_600,
             }),
             allow_admin_content_inspection: false,
@@ -846,19 +826,6 @@ mod tests {
         )
         .0;
         assert_eq!(redis_after - redis_before, 1.0);
-
-        let mesh_before = metric_sample(
-            "sbproxy_ai_compression_mesh_events_total",
-            &[("event", "conflict_winner")],
-        )
-        .0;
-        record_mesh_compression_event(MeshCompressionEvent::ConflictWinner);
-        let mesh_after = metric_sample(
-            "sbproxy_ai_compression_mesh_events_total",
-            &[("event", "conflict_winner")],
-        )
-        .0;
-        assert_eq!(mesh_after - mesh_before, 1.0);
     }
 
     #[test]
@@ -923,6 +890,16 @@ mod tests {
             tokens_saved: 0,
             lever_results: Vec::new(),
         };
+        let empty_labels = [
+            ("tenant_id", "compression-log-tenant"),
+            ("api_key_id", "compression-log-key"),
+            ("outcome", "skipped"),
+            ("backend", "none"),
+            ("cache_bypass", "true"),
+        ];
+        let before = metric_sample("sbproxy_ai_compression_requests_total", &empty_labels).0;
         assert!(capture_summary(&empty).is_empty());
+        let after = metric_sample("sbproxy_ai_compression_requests_total", &empty_labels).0;
+        assert_eq!(after, before, "empty pipelines must not emit metrics");
     }
 }

@@ -1,8 +1,11 @@
-//! Eventual LWW compression session state over the shared process mesh.
+//! Experimental LWW compression session state over the shared process mesh.
+//!
+//! This adapter is retained for mesh hardening work. It is not selectable from
+//! SBproxy's public compression configuration because the current mesh cannot
+//! guarantee replicated durability, ownership handoff, or tombstone propagation.
 
 use crate::compression_metrics::{
-    record_compression_state_operation, record_mesh_compression_event, CompressionStateOperation,
-    CompressionStateOutcome,
+    record_compression_state_operation, CompressionStateOperation, CompressionStateOutcome,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -23,7 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_ADMIN_PAGE_SIZE: u16 = 100;
+const MAX_ADMIN_PAGE_SIZE: u16 = 500;
 const MAX_CURSOR_BYTES: usize = 512 * 1024;
 const MAX_LOCAL_LOCK_CAPACITY: usize = 65_536;
 const MAX_LOCAL_SNAPSHOT_CAPACITY: usize = 4_096;
@@ -347,7 +350,6 @@ impl MeshCompressionStore {
             VersionedLwwMergeOutcome::TombstoneRetained => MeshCompressionEvent::TombstoneRetained,
             VersionedLwwMergeOutcome::Unchanged => return,
         };
-        record_mesh_compression_event(event);
         self.events.record(event);
     }
 
@@ -610,7 +612,6 @@ impl CompressionSessionStore for MeshCompressionStore {
                     VersionedLwwMergeOutcome::Replaced
                     | VersionedLwwMergeOutcome::ConflictReplaced
                     | VersionedLwwMergeOutcome::Unchanged => {
-                        record_mesh_compression_event(MeshCompressionEvent::TombstoneWritten);
                         self.events.record(MeshCompressionEvent::TombstoneWritten);
                         return Ok(DeleteResult {
                             deleted,
@@ -839,6 +840,28 @@ mod tests {
             local_lock_capacity: capacity,
             local_snapshot_capacity: 64,
         }
+    }
+
+    #[test]
+    fn admin_page_limit_accepts_five_hundred_and_rejects_more() {
+        let request = ListRequest {
+            tenant_id: None,
+            origin: None,
+            expired: None,
+            expiration_cutoff_unix_ms: 0,
+            conflict: None,
+            cursor: None,
+            limit: 500,
+        };
+
+        assert_eq!(validate_list_request(&request), Ok(()));
+        assert_eq!(
+            validate_list_request(&ListRequest {
+                limit: 501,
+                ..request
+            }),
+            Err(StoreError::InvalidRequest)
+        );
     }
 
     #[tokio::test]

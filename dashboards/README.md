@@ -75,7 +75,7 @@ rule_files:
 | SBProxyGuardrailSpike | warning | Guardrail block rate > 10/min for 1 minute |
 | SBProxyHighTokenUsage | info | Over 1M output tokens in the last hour |
 | SBProxyAICompressionFailures | warning | Compression failure ratio > 10% for 10 minutes |
-| SBProxyAICompressionStateRejections | warning | Compression state or coordination rejections > 0.1/sec for 10 minutes |
+| SBProxyAICompressionStateRejections | warning | Compression state-operation errors > 0.1/sec for 10 minutes |
 
 ## Recording Rules
 
@@ -99,7 +99,7 @@ rule_files:
 | `sbproxy:ai_compression_application_rate_5m` | Fraction of compression lever invocations that applied (5m window) |
 | `sbproxy:ai_compression_failure_ratio_5m` | Fraction of non-empty compression requests with any failed lever (5m window) |
 | `sbproxy:ai_compression_latency_p95_5m` | Compression lever P95 latency (5m window) |
-| `sbproxy:ai_compression_tokens_saved_rate_5m` | Exact tokens removed by applied compression levers per second (5m window) |
+| `sbproxy:ai_compression_tokens_saved_rate_5m` | Reduction in SBproxy's shared token estimate from applied compression levers per second (5m window) |
 
 ## Metric names reference
 

@@ -531,7 +531,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
+          "unit": "percentunit",
           "color": {
             "mode": "palette-classic"
           }
@@ -551,15 +551,15 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (lever, outcome) (rate(sbproxy_ai_compression_lever_total[5m]))",
-          "legendFormat": "{{lever}} {{outcome}}",
+          "expr": "sbproxy:ai_compression_application_rate_5m",
+          "legendFormat": "applied / all levers",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           }
         }
       ],
-      "description": "Applied, skipped, and failed compression lever invocations. Skips are expected when context is already within target."
+      "description": "Fraction of compression lever invocations that applied a strictly reducing transformation over the last five minutes."
     },
     {
       "id": 10,
@@ -605,7 +605,7 @@
           }
         }
       ],
-      "description": "Exact target-model tokens removed by applied levers per second. Only strict reductions increment this counter."
+      "description": "Reduction in SBproxy's model-aware token estimate per second from applied levers. Only strict reductions increment this counter."
     },
     {
       "id": 11,
@@ -815,7 +815,7 @@
       "type": "timeseries",
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 56
       },
@@ -854,52 +854,6 @@
         }
       ],
       "description": "Redis lease contention, expiry, stale-version, and fencing events."
-    },
-    {
-      "id": 16,
-      "title": "Mesh Compression Convergence",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 56
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "color": {
-            "mode": "palette-classic"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (event) (rate(sbproxy_ai_compression_mesh_events_total[5m]))",
-          "legendFormat": "{{event}}",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          }
-        }
-      ],
-      "description": "Mesh convergence, equal-version conflicts, stale writes, and tombstone behavior."
     }
   ],
   "templating": {

@@ -5,14 +5,20 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 
+use super::SummaryPolicyFingerprint;
+
 const RECORD_ID_NAMESPACE: &[u8] = b"sbproxy:compression-session:v1";
+const POLICY_RECORD_ID_NAMESPACE: &[u8] = b"sbproxy:compression-session-policy:v2";
 
 /// Opaque identifier for one tenant, AI origin, and captured session tuple.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CompressionRecordId([u8; 32]);
 
 impl CompressionRecordId {
-    /// Derive a domain-separated ID without retaining the raw session value.
+    /// Derive a policy-agnostic domain-separated ID without retaining the raw session value.
+    ///
+    /// Stateful request-path levers must use [`Self::derive_for_summary_policy`]
+    /// so rolling behavior changes cannot share a stored lineage.
     pub fn derive(tenant_id: &str, origin: &str, session_id: [u8; 16]) -> Self {
         let normalized_origin = normalize_origin(origin);
         let mut digest = Sha256::new();
@@ -20,6 +26,23 @@ impl CompressionRecordId {
         update_length_delimited(&mut digest, tenant_id.as_bytes());
         update_length_delimited(&mut digest, normalized_origin.as_bytes());
         update_length_delimited(&mut digest, &session_id);
+        Self(digest.finalize().into())
+    }
+
+    /// Derive a summary-state ID isolated by its complete behavior fingerprint.
+    pub fn derive_for_summary_policy(
+        tenant_id: &str,
+        origin: &str,
+        session_id: [u8; 16],
+        policy: SummaryPolicyFingerprint,
+    ) -> Self {
+        let normalized_origin = normalize_origin(origin);
+        let mut digest = Sha256::new();
+        update_length_delimited(&mut digest, POLICY_RECORD_ID_NAMESPACE);
+        update_length_delimited(&mut digest, tenant_id.as_bytes());
+        update_length_delimited(&mut digest, normalized_origin.as_bytes());
+        update_length_delimited(&mut digest, &session_id);
+        update_length_delimited(&mut digest, policy.as_bytes());
         Self(digest.finalize().into())
     }
 
@@ -108,7 +131,22 @@ fn update_length_delimited(digest: &mut Sha256, value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::CompressionRecordId;
+    use crate::compression::{SummarizerConfig, SummaryBufferConfig, SummaryPolicyFingerprint};
     use std::str::FromStr;
+    use std::time::Duration;
+
+    fn summary_config() -> SummaryBufferConfig {
+        SummaryBufferConfig {
+            min_tokens: 12_000,
+            retain_recent_messages: 8,
+            target_summary_tokens: 2_048,
+            summarizer: SummarizerConfig {
+                provider: "anthropic-internal".to_string(),
+                model: "claude-summary-v1".to_string(),
+                timeout_secs: 5,
+            },
+        }
+    }
 
     #[test]
     fn record_id_matches_stable_length_delimited_vector() {
@@ -118,6 +156,29 @@ mod tests {
         assert_eq!(
             id.to_string(),
             "670bb7bb610f3600675ee2fcb45db09ca3c6557dc7865b87311355ee1c9d1bb8"
+        );
+    }
+
+    #[test]
+    fn policy_record_id_matches_stable_length_delimited_vector() {
+        let session = std::array::from_fn(|index| index as u8);
+        let policy =
+            SummaryPolicyFingerprint::current(&summary_config(), Duration::from_secs(86_400));
+        let id = CompressionRecordId::derive_for_summary_policy(
+            "tenant-a",
+            "API.Example.COM.",
+            session,
+            policy,
+        );
+
+        assert_eq!(
+            id.to_string(),
+            "cee8c51340c1413d8b85a56c6f51928a92b12fa00e1e8cfd761c3cd0fb28ce47"
+        );
+        assert_ne!(
+            id,
+            CompressionRecordId::derive("tenant-a", "API.Example.COM.", session),
+            "a mixed rollout must not reuse policy-agnostic v1 state"
         );
     }
 

@@ -97,7 +97,7 @@ pub struct CompressionRecordMetadata {
     pub protected_prefix_count: usize,
     /// Number of original history messages represented by the record.
     pub covered_history_count: usize,
-    /// Target-model tokens represented by the covered history.
+    /// SBproxy model-aware token estimate for the covered history.
     pub covered_input_tokens: u64,
     /// Bounded generated output token count, without generated content.
     pub summary_tokens: u64,

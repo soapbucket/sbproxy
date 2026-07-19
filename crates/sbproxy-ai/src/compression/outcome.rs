@@ -45,6 +45,8 @@ pub enum SkipReason {
     StructuredRequest,
     /// Stored history digests do not match the incoming branch.
     BranchMismatch,
+    /// Stored state reached its logical expiration before Redis removed it.
+    StateExpired,
     /// No additional eligible history needs summarization.
     NoNewHistory,
     /// Prior summary plus new source exceeds the summarizer input window.
@@ -71,6 +73,7 @@ impl SkipReason {
             Self::InsufficientHistory => "insufficient_history",
             Self::StructuredRequest => "structured_request",
             Self::BranchMismatch => "branch_mismatch",
+            Self::StateExpired => "state_expired",
             Self::NoNewHistory => "no_new_history",
             Self::SummarizerInputTooLarge => "summarizer_input_too_large",
             Self::BudgetDenied => "budget_denied",
@@ -143,11 +146,11 @@ pub struct LeverResult {
     pub backend: Option<CompressionBackend>,
     /// Applied, skipped, or failed classification.
     pub outcome: LeverOutcome,
-    /// Target-model tokens in the committed working list before the lever.
+    /// Model-aware token estimate before the lever.
     pub before_tokens: u64,
-    /// Target-model tokens in the committed working list after the lever.
+    /// Model-aware token estimate after the lever.
     pub after_tokens: u64,
-    /// Exact committed reduction, always zero for skips and failures.
+    /// Committed reduction in the shared estimate, zero for skips and failures.
     pub tokens_saved: u64,
     /// Wall-clock time added by the lever invocation.
     pub duration: Duration,

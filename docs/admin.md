@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-18*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -80,7 +80,10 @@ curl -sk -u admin:change-this https://127.0.0.1:9090/metrics
 
 ## Authentication and roles
 
-Every non-probe request authenticates one of two ways:
+Protected control routes authenticate one of two ways. `POST /admin/login`,
+`POST /admin/logout`, and `GET /admin/session` run before the general gate so a
+browser can establish, revoke, or discover session state; they do not expose
+protected control data.
 
 - **HTTP Basic**, using the top-level `username` / `password`. Best for
   CI and scripts. The top-level admin always has the full `admin` role.
@@ -91,9 +94,11 @@ Every non-probe request authenticates one of two ways:
   revokes it. The signing key is per process, so a restart logs everyone
   out.
 
-Because the cookie is `HttpOnly`, state-changing requests made with a
-session must echo the CSRF token in an `X-CSRF-Token` header (a
-double-submit an attacker cannot forge). Basic-auth requests are exempt.
+Because the cookie is `HttpOnly`, protected state-changing requests made with
+a session must echo the CSRF token in an `X-CSRF-Token` header (a double-submit
+an attacker cannot forge). Basic-auth requests are exempt. Login, logout,
+session discovery, and cluster enrollment use their route-specific rules;
+logout does not require a CSRF header.
 
 Roles (`operators`) give role-based access. Each operator logs in with
 its own credentials and gets a role:
@@ -113,11 +118,12 @@ proxy:
         role: admin        # every route
 ```
 
-A `read_only` operator can read config, metrics, logs, and status but
-cannot create keys, edit config, reload, or otherwise mutate. Every
-authenticated mutation emits a structured event on the
-`sbproxy::admin::audit` tracing target with the operator's identity. Persistence
-depends on the configured tracing sink.
+A `read_only` operator can read config, metrics, logs, and status but cannot
+create keys, edit config, reload, or otherwise mutate. Protected mutations that
+pass the general Admin gate emit a structured event on the
+`sbproxy::admin::audit` tracing target with the operator's identity. Session
+establishment, discovery, and logout use their route-specific behavior.
+Persistence depends on the configured tracing sink.
 
 ## Remote access and CORS
 
@@ -144,9 +150,10 @@ origin can call the API cross-origin.
 
 ## What it can do
 
-Everything below is reachable at `http(s)://<bind>:<port>`. The probe
-routes are unauthenticated; the rest need auth (Basic or a session), and
-mutations need the `admin` role. The one exception is
+Everything below is reachable at `http(s)://<bind>:<port>`. Probe and session
+establishment/discovery routes are unauthenticated; protected routes need auth
+(top-level Basic or a session), and protected mutations need the `admin` role.
+The separate enrollment exception is
 `POST /admin/cluster/enroll`, which authenticates an expiring one-time cluster
 token instead of an existing admin operator.
 
@@ -164,6 +171,7 @@ token instead of an existing admin operator.
 |---|---|---|
 | POST | `/admin/login` | Verify credentials, set the session cookie, return a CSRF token. |
 | POST | `/admin/logout` | Revoke the session and clear the cookie. |
+| GET | `/admin/session` | Report whether the request carries a valid browser session and its role. |
 
 **Config and pipeline.**
 
@@ -191,6 +199,96 @@ token instead of an existing admin operator.
 | POST | `/admin/cluster/deployments` | Authority-only strict deployment draft publication. Non-authority nodes return `deployment_authority_read_only`. |
 | POST | `/admin/cluster/enroll` | Exchange a valid one-time enrollment token and locally generated CSR for installed cluster identity material. |
 | GET | `/admin/cluster/metrics` | Fleet-aggregated metrics (mesh tier; see [observability.md](observability.md)). |
+
+**AI compression session state.**
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/admin/compression/sessions` | List bounded, content-free session metadata with filters and cursor pagination. |
+| GET | `/admin/compression/sessions/{id}` | Read content-free metadata for one opaque record ID. |
+| GET | `/admin/compression/sessions/{id}/content` | Inspect one live, unexpired running summary when the caller is an Admin and that AI handler explicitly opts in. |
+| DELETE | `/admin/compression/sessions/{id}` | Delete one Redis summary record and advance its stale-writer fence. |
+| POST | `/admin/compression/sessions/purge` | Delete one explicitly scoped, bounded Redis page. |
+
+### Compression session operations
+
+Metadata reads allow either `read_only` or `admin`. They never return the
+running summary, raw session ID, raw messages, or message digests. Listing
+accepts `tenant`, `origin`, `backend=redis`, `conflict=true|false`, `cursor`,
+and `limit`. The default limit is 100 and the maximum is 500. Redis removes
+records at their TTL, so expired records are not retained for listing.
+
+Content inspection has a stricter contract. It requires the `admin` role and
+`allow_admin_content_inspection: true` on the current `ai_proxy` handler that
+owns the record. The default is denied. Every content-inspection attempt that
+reaches the compression route is emitted to the `sbproxy::admin::audit`
+tracing target before a response is returned, including disabled inspection,
+invalid IDs, missing or expired records, backend errors, and successful reads.
+The event is content-free. The built-in sink is tracing, so durable retention
+depends on the configured tracing collector. If an installed sink reports a
+failure, the endpoint returns `503` without the summary. A successful response
+carries `Cache-Control: no-store`, `Pragma: no-cache`, and
+`X-Content-Type-Options: nosniff`.
+
+`DELETE` and purge require the `admin` role. A browser session must also send
+its `X-CSRF-Token`; HTTP Basic requests remain CSRF-exempt. Deleting a missing
+record is idempotent and returns `200` with `"deleted": false`. Redis deletion
+advances a fence and invalidates an in-flight lease before it can recreate the
+record. A later eligible request with the same captured session can create a
+fresh summary; deletion removes summary state, not the caller's session.
+
+Purge always operates on a bounded page and returns a continuation cursor.
+At least one of `tenant` or `origin` is required. `conflict`, `backend`,
+`cursor`, and `limit` narrow a page but do not count as a destructive scope.
+This prevents the normal `conflict: false` value from acting as an all-record
+purge. An unfiltered purge must send both `"all": true` and the exact
+`"confirmation": "purge-compression-sessions"`. Backend, corrupt-record, and
+unsupported-schema failures during list or purge return a content-free `503`
+rather than a partial metadata response.
+
+Redis list and purge scan the shared Redis namespace using bounded pages and
+opaque cursors. Metadata, delete, and purge remain available from the global
+Redis L2 configuration after `summary_buffer` is disabled. Content inspection
+still requires an active origin policy with explicit opt-in.
+
+The following commands use the same HTTP Basic convention as the other admin
+examples. They assume at least one compression record exists:
+
+```bash
+export SB_ADMIN_URL=http://127.0.0.1:9090
+export SB_ADMIN_PASSWORD='replace-me'
+
+# Read a metadata page, then select one opaque ID from it.
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/compression/sessions?tenant=tenant-a&limit=100" \
+  | jq '{records,next_cursor}'
+SB_COMPRESSION_RECORD_ID="$(
+  curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+    "${SB_ADMIN_URL}/admin/compression/sessions?tenant=tenant-a&limit=1" \
+    | jq -er '.records[0].id'
+)"
+
+# With the default handler setting, content inspection is denied with 403.
+curl -sS -i -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/compression/sessions/${SB_COMPRESSION_RECORD_ID}/content"
+
+# Delete one record. Repeating this returns deleted=false.
+curl -fsS -X DELETE -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/compression/sessions/${SB_COMPRESSION_RECORD_ID}" \
+  | jq
+
+# Purge at most 100 records for one tenant.
+curl -fsS -X POST -u "admin:${SB_ADMIN_PASSWORD}" \
+  -H 'Content-Type: application/json' \
+  --data '{"tenant":"tenant-a","limit":100}' \
+  "${SB_ADMIN_URL}/admin/compression/sessions/purge" \
+  | jq
+```
+
+See [Admin API reference](admin-api-reference.md#ai-compression-session-state)
+for the complete schemas and status codes, and
+[AI context compression](ai-context-compression.md) for the data-plane policy
+and state model.
 
 ### Managed model operations
 

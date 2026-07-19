@@ -1,19 +1,15 @@
 //! Runtime binding for ordered AI context compression.
 
-use crate::compression_store::{
-    MeshCompressionStore, MeshCompressionStoreConfig, RedisCompressionStore,
-    RedisCompressionStoreConfig,
-};
+use crate::compression_store::{RedisCompressionStore, RedisCompressionStoreConfig};
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use sbproxy_ai::compression::{
-    CompressionBackend, CompressionLever, CompressionLeverConfig, CompressionPolicy,
-    CompressionRequest, CompressionRequestControls, CompressionRun, CompressionRunner,
-    CompressionSessionStore, InternalSummarizer, SummarizationOutput, SummarizationRequest,
+    CompressionLever, CompressionLeverConfig, CompressionPolicy, CompressionRequest,
+    CompressionRequestControls, CompressionRun, CompressionRunner, CompressionSessionStore,
+    CompressionStateBackend, InternalSummarizer, SummarizationOutput, SummarizationRequest,
     SummarizerError, SummaryBufferLever, WindowFitLever,
 };
 use sbproxy_ai::{AiClient, AiHandlerConfig, ProviderConfig};
-use sbproxy_mesh::ClusterHandle;
 use sbproxy_platform::storage::{AsyncRedisConfig, AsyncRedisKVStore};
 use std::fmt;
 use std::sync::Arc;
@@ -22,32 +18,41 @@ use std::time::Duration;
 #[derive(Clone)]
 struct RuntimeDependencies {
     redis: Option<Arc<AsyncRedisKVStore>>,
-    mesh: Option<ClusterHandle>,
     ai_client: Arc<AiClient>,
     writer_node: String,
 }
 
 impl RuntimeDependencies {
-    fn from_process(server: &sbproxy_config::ProxyServerConfig) -> anyhow::Result<Self> {
-        let redis = match server.l2_cache.as_ref() {
-            Some(config) if config.driver == "redis" => {
-                validate_redis_dsn(&config.params.dsn)?;
-                Some(AsyncRedisKVStore::new(AsyncRedisConfig::new(
-                    &config.params.dsn,
-                )))
-            }
-            _ => None,
-        };
+    fn from_process(
+        server: &sbproxy_config::ProxyServerConfig,
+        redis_required: bool,
+    ) -> anyhow::Result<Self> {
+        let redis = redis_dependency(server, redis_required)?;
         let cluster = crate::cluster::current_cluster_handle();
         let writer_node = cluster
             .as_ref()
             .map(|handle| handle.identity().node_id.clone())
             .unwrap_or_else(|| "standalone".to_string());
-        let mesh = cluster.filter(|handle| handle.mesh_node().is_some());
         Ok(Self {
             redis,
-            mesh,
             ai_client: crate::server::ai_client(),
+            writer_node,
+        })
+    }
+
+    fn for_validation(
+        server: &sbproxy_config::ProxyServerConfig,
+        redis_required: bool,
+    ) -> anyhow::Result<Self> {
+        let redis = redis_dependency(server, redis_required)?;
+        let writer_node = server
+            .cluster
+            .as_ref()
+            .map(|cluster| cluster.node_id.clone())
+            .unwrap_or_else(|| "validation".to_string());
+        Ok(Self {
+            redis,
+            ai_client: Arc::new(AiClient::new()),
             writer_node,
         })
     }
@@ -56,18 +61,51 @@ impl RuntimeDependencies {
     fn empty_for_test() -> Self {
         Self {
             redis: None,
-            mesh: None,
             ai_client: Arc::new(AiClient::new()),
             writer_node: "test-node".to_string(),
         }
     }
 }
 
+fn redis_dependency(
+    server: &sbproxy_config::ProxyServerConfig,
+    required: bool,
+) -> anyhow::Result<Option<Arc<AsyncRedisKVStore>>> {
+    if !required {
+        return Ok(None);
+    }
+    match server.l2_cache.as_ref() {
+        Some(config) if config.driver == "redis" => {
+            validate_redis_dsn(&config.params.dsn)?;
+            Ok(Some(AsyncRedisKVStore::new(AsyncRedisConfig::new(
+                &config.params.dsn,
+            ))))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Build the canonical Redis adapter for Admin lifecycle operations even when
+/// no active origin currently enables `summary_buffer`.
+pub(crate) fn redis_admin_store(
+    server: &sbproxy_config::ProxyServerConfig,
+) -> Option<Arc<dyn CompressionSessionStore>> {
+    let redis = redis_dependency(server, true).ok().flatten()?;
+    let store = RedisCompressionStore::new(redis, RedisCompressionStoreConfig::default()).ok()?;
+    Some(Arc::new(store))
+}
+
 fn validate_redis_dsn(dsn: &str) -> anyhow::Result<()> {
     let parsed = url::Url::parse(dsn).context("Redis compression state has an invalid DSN")?;
-    if !matches!(parsed.scheme(), "redis" | "rediss") || parsed.host_str().is_none() {
+    if !matches!(parsed.scheme(), "redis" | "rediss")
+        || parsed.host_str().is_none()
+        || parsed.fragment().is_some()
+    {
         bail!("Redis compression state has an invalid DSN");
     }
+    AsyncRedisConfig::new(dsn)
+        .validate()
+        .map_err(|_| anyhow::anyhow!("Redis compression state has an invalid DSN"))?;
     Ok(())
 }
 
@@ -120,7 +158,19 @@ impl CompressionRuntimeRegistry {
         server: &sbproxy_config::ProxyServerConfig,
         actions: &[sbproxy_modules::Action],
     ) -> anyhow::Result<Self> {
-        let dependencies = RuntimeDependencies::from_process(server)?;
+        let dependencies =
+            RuntimeDependencies::from_process(server, actions_require_redis(actions))?;
+        Self::with_dependencies(actions, dependencies)
+    }
+
+    /// Validate runtime bindings against declared dependencies without using
+    /// process-global cluster state. The returned registry is discard-only.
+    pub(crate) fn for_validation(
+        server: &sbproxy_config::ProxyServerConfig,
+        actions: &[sbproxy_modules::Action],
+    ) -> anyhow::Result<Self> {
+        let dependencies =
+            RuntimeDependencies::for_validation(server, actions_require_redis(actions))?;
         Self::with_dependencies(actions, dependencies)
     }
 
@@ -167,6 +217,23 @@ impl CompressionRuntimeRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_origin.is_empty()
     }
+}
+
+fn actions_require_redis(actions: &[sbproxy_modules::Action]) -> bool {
+    actions.iter().any(|action| {
+        let sbproxy_modules::Action::AiProxy(action) = action else {
+            return false;
+        };
+        action
+            .config
+            .effective_compression_policy()
+            .is_some_and(|policy| {
+                policy
+                    .levers
+                    .iter()
+                    .any(|lever| matches!(lever, CompressionLeverConfig::SummaryBuffer(_)))
+            })
+    })
 }
 
 impl fmt::Debug for CompressionRuntime {
@@ -233,7 +300,7 @@ impl CompressionRuntime {
                 .context("compression state is required for summary_buffer")?;
             let ttl = Duration::from_secs(state.ttl_secs);
             match state.backend {
-                CompressionBackend::Redis => {
+                CompressionStateBackend::Redis => {
                     let redis = dependencies.redis.clone().context(
                         "Redis compression state requires proxy.l2_cache_settings.driver: redis",
                     )?;
@@ -246,22 +313,6 @@ impl CompressionRuntime {
                     )
                     .map_err(|_| {
                         anyhow::anyhow!("Redis compression state configuration is invalid")
-                    })?;
-                    Some(Arc::new(adapter))
-                }
-                CompressionBackend::Mesh => {
-                    let mesh = dependencies.mesh.clone().context(
-                        "mesh compression state requires an active distributed proxy.cluster",
-                    )?;
-                    let adapter = MeshCompressionStore::new(
-                        mesh,
-                        MeshCompressionStoreConfig {
-                            tombstone_ttl: ttl,
-                            ..MeshCompressionStoreConfig::default()
-                        },
-                    )
-                    .map_err(|_| {
-                        anyhow::anyhow!("mesh compression state configuration is invalid")
                     })?;
                     Some(Arc::new(adapter))
                 }
@@ -522,7 +573,10 @@ fn destination_allowed(value: &str, allowed: &[String], blocked: &[String]) -> b
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressionExecution, CompressionRuntime, RuntimeDependencies};
+    use super::{
+        validate_redis_dsn, CompressionExecution, CompressionRuntime, CompressionRuntimeRegistry,
+        RuntimeDependencies,
+    };
     use async_trait::async_trait;
     use sbproxy_ai::budget::{BudgetLimit, BudgetScope};
     use sbproxy_ai::compression::{
@@ -540,6 +594,7 @@ mod tests {
     struct TestStore {
         record: Mutex<Option<CompressionSessionRecord>>,
         commit_error: Mutex<Option<CommitError>>,
+        commit_count: Mutex<u64>,
     }
 
     #[async_trait]
@@ -583,6 +638,7 @@ mod tests {
                 return Err(error);
             }
             *self.record.lock().unwrap() = Some(record.clone());
+            *self.commit_count.lock().unwrap() += 1;
             Ok(())
         }
 
@@ -745,6 +801,55 @@ mod tests {
     }
 
     #[test]
+    fn compression_redis_dsn_accepts_plaintext_and_tls_transports() {
+        assert!(validate_redis_dsn("redis://redis.internal:6379/0").is_ok());
+        assert!(validate_redis_dsn("rediss://redis.internal:6380/0").is_ok());
+    }
+
+    #[test]
+    fn compression_redis_dsn_rejects_invalid_database_paths_before_startup() {
+        let error = validate_redis_dsn("redis://redis.internal/not-a-database")
+            .expect_err("Redis database selection must be parsed during validation");
+
+        assert!(error.to_string().contains("invalid DSN"));
+        assert!(!format!("{error:#}").contains("redis://"));
+    }
+
+    #[test]
+    fn compression_redis_dsn_rejects_negative_database_before_startup() {
+        let error = validate_redis_dsn("redis://redis.internal/-1")
+            .expect_err("Redis database selection must be non-negative");
+
+        assert!(error.to_string().contains("invalid DSN"));
+        assert!(!format!("{error:#}").contains("redis://"));
+    }
+
+    #[test]
+    fn compression_redis_dsn_rejects_insecure_tls_escape_hatch() {
+        let error = validate_redis_dsn("rediss://redis.internal:6380/0#insecure")
+            .expect_err("compression state must never disable TLS certificate verification");
+
+        assert!(error.to_string().contains("invalid DSN"));
+        assert!(!format!("{error:#}").contains("rediss://"));
+    }
+
+    #[test]
+    fn unrelated_l2_cache_keeps_accepting_its_legacy_bare_address() {
+        let server = sbproxy_config::ProxyServerConfig {
+            l2_cache: Some(sbproxy_config::L2CacheConfig {
+                driver: "redis".to_string(),
+                params: sbproxy_config::L2CacheParams {
+                    dsn: "redis.internal:6379".to_string(),
+                },
+            }),
+            ..sbproxy_config::ProxyServerConfig::default()
+        };
+
+        CompressionRuntimeRegistry::for_validation(&server, &[])
+            .expect("unused compression runtime must not narrow the general L2 contract");
+    }
+
+    #[test]
     fn summary_buffer_requires_selected_redis_runtime() {
         let handler = handler("redis");
         let policy = handler
@@ -760,23 +865,6 @@ mod tests {
             .to_string()
             .contains("Redis compression state requires"));
         assert!(!error.to_string().contains("redis://"));
-    }
-
-    #[test]
-    fn summary_buffer_requires_distributed_mesh_runtime() {
-        let handler = handler("mesh");
-        let policy = handler
-            .effective_compression_policy()
-            .expect("explicit policy")
-            .into_owned();
-
-        let error =
-            CompressionRuntime::build(policy, &handler, RuntimeDependencies::empty_for_test())
-                .expect_err("missing mesh must fail startup");
-
-        assert!(error
-            .to_string()
-            .contains("mesh compression state requires"));
     }
 
     #[test]
@@ -866,6 +954,37 @@ mod tests {
             serde_json::from_str(request.split_once("\r\n\r\n").expect("request body").1).unwrap();
         assert_eq!(body["model"], "summary-model");
         assert_eq!(body["max_tokens"], 20);
+    }
+
+    #[tokio::test]
+    async fn replacement_runtime_reuses_external_state_without_resummarizing() {
+        let (base_url, request) = serve_summary().await;
+        let handler = handler_with_base_url(&base_url);
+        let store = Arc::new(TestStore::default());
+        let first_runtime = runtime(&handler, store.clone());
+
+        let first = first_runtime
+            .run(execution(Some("restart-key"), &[], &[], None), &history())
+            .await;
+        request.await.expect("first runtime called the summarizer");
+        first_runtime.record_telemetry("tenant-a", Some("restart-key"), true, &first);
+        assert_eq!(*store.commit_count.lock().unwrap(), 1);
+
+        let replacement_runtime = runtime(&handler, store.clone());
+        let replacement = replacement_runtime
+            .run(execution(Some("restart-key"), &[], &[], None), &history())
+            .await;
+
+        assert_eq!(replacement.messages, first.messages);
+        assert_eq!(replacement.tokens_saved, first.tokens_saved);
+        assert_eq!(*store.commit_count.lock().unwrap(), 1);
+
+        let metric_names = prometheus::gather()
+            .into_iter()
+            .map(|family| family.name().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(metric_names.contains("sbproxy_ai_compression_tokens_saved_total"));
+        assert!(metric_names.contains("sbproxy_ai_compression_request_tokens_saved"));
     }
 
     #[tokio::test]

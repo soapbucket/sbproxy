@@ -989,6 +989,12 @@ impl Default for CompiledPipeline {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PipelineConstructionMode {
+    Runtime,
+    Validation,
+}
+
 impl CompiledPipeline {
     /// Compile a config into a full pipeline with modules instantiated.
     ///
@@ -996,6 +1002,19 @@ impl CompiledPipeline {
     /// auth, and policy JSON values into typed enum variants. Fails if
     /// any origin has an invalid or unrecognized module config.
     pub fn from_config(config: CompiledConfig) -> anyhow::Result<Self> {
+        Self::from_config_with_mode(config, PipelineConstructionMode::Runtime)
+    }
+
+    /// Compile every module against declared dependencies without consulting
+    /// process-global runtime state. Intended for CLI validation only.
+    pub fn from_config_for_validation(config: CompiledConfig) -> anyhow::Result<Self> {
+        Self::from_config_with_mode(config, PipelineConstructionMode::Validation)
+    }
+
+    fn from_config_with_mode(
+        config: CompiledConfig,
+        mode: PipelineConstructionMode,
+    ) -> anyhow::Result<Self> {
         let mut actions = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
         let mut policies = Vec::with_capacity(config.origins.len());
@@ -1291,11 +1310,20 @@ impl CompiledPipeline {
                 None => (None, None),
             };
 
-        let compression_runtimes =
-            crate::compression_runtime::CompressionRuntimeRegistry::from_process(
-                &config.server,
-                &actions,
-            )?;
+        let compression_runtimes = match mode {
+            PipelineConstructionMode::Runtime => {
+                crate::compression_runtime::CompressionRuntimeRegistry::from_process(
+                    &config.server,
+                    &actions,
+                )?
+            }
+            PipelineConstructionMode::Validation => {
+                crate::compression_runtime::CompressionRuntimeRegistry::for_validation(
+                    &config.server,
+                    &actions,
+                )?
+            }
+        };
 
         let pipeline = Self {
             config,

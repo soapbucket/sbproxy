@@ -128,7 +128,7 @@ pub struct CompressionSessionRecord {
     pub covered_history_count: usize,
     /// Digest of the complete covered original history.
     pub covered_history_digest: MessageDigest,
-    /// Target-model tokens represented by the covered original history.
+    /// SBproxy model-aware token estimate for the covered original history.
     pub covered_input_tokens: u64,
     /// Summarizer-reported or conservatively estimated output tokens.
     pub summary_tokens: u64,

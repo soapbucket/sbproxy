@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const LUA_MAX_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
-const MAX_ADMIN_PAGE_SIZE: u16 = 100;
+const MAX_ADMIN_PAGE_SIZE: u16 = 500;
 const MAX_CURSOR_BYTES: usize = 64 * 1024;
 const MAX_CURSOR_PENDING_KEYS: usize = 4_096;
 
@@ -697,8 +697,8 @@ fn decode_cursor(
 #[cfg(test)]
 mod tests {
     use super::{
-        redis_keys, RedisCompressionExecutor, RedisCompressionStore, RedisCompressionStoreConfig,
-        ACQUIRE_LUA, COMMIT_LUA, DELETE_LUA, RELEASE_LUA,
+        redis_keys, validate_list_request, RedisCompressionExecutor, RedisCompressionStore,
+        RedisCompressionStoreConfig, ACQUIRE_LUA, COMMIT_LUA, DELETE_LUA, RELEASE_LUA,
     };
     use async_trait::async_trait;
     use sbproxy_ai::compression::{
@@ -708,6 +708,7 @@ mod tests {
     use sbproxy_platform::storage::RedisScanPage;
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex};
@@ -779,6 +780,28 @@ mod tests {
             scan_count: 16,
             max_scan_rounds: 4,
         }
+    }
+
+    #[test]
+    fn admin_page_limit_accepts_five_hundred_and_rejects_more() {
+        let request = ListRequest {
+            tenant_id: None,
+            origin: None,
+            expired: None,
+            expiration_cutoff_unix_ms: 0,
+            conflict: None,
+            cursor: None,
+            limit: 500,
+        };
+
+        assert_eq!(validate_list_request(&request), Ok(()));
+        assert_eq!(
+            validate_list_request(&ListRequest {
+                limit: 501,
+                ..request
+            }),
+            Err(StoreError::InvalidRequest)
+        );
     }
 
     fn id(seed: u8) -> CompressionRecordId {
@@ -1162,14 +1185,37 @@ mod tests {
         panic!("disposable redis-server did not become ready");
     }
 
+    fn flush_redis_scripts(url: &str) {
+        let address = url
+            .strip_prefix("redis://")
+            .expect("test Redis URL must use redis://");
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .write_all(b"*2\r\n$6\r\nSCRIPT\r\n$5\r\nFLUSH\r\n")
+            .unwrap();
+        let mut response = [0_u8; 5];
+        stream.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"+OK\r\n");
+    }
+
+    fn live_store(url: &str) -> RedisCompressionStore {
+        let redis = sbproxy_platform::storage::AsyncRedisKVStore::new(
+            sbproxy_platform::storage::AsyncRedisConfig::new(url),
+        );
+        RedisCompressionStore::new(redis, config()).unwrap()
+    }
+
     #[tokio::test]
     #[ignore = "requires the redis-server executable"]
     async fn live_redis_serializes_writers_fences_deletes_and_paginates() {
         let (_redis_process, url) = spawn_redis();
-        let redis = sbproxy_platform::storage::AsyncRedisKVStore::new(
-            sbproxy_platform::storage::AsyncRedisConfig::new(&url),
-        );
-        let store = RedisCompressionStore::new(redis, config()).unwrap();
+        let store = live_store(&url);
         let record_id = id(20);
 
         let first = store
@@ -1321,5 +1367,117 @@ mod tests {
             .unwrap();
         assert_eq!(second_page.records.len(), 1);
         assert_ne!(first_page.records[0].id, second_page.records[0].id);
+
+        drop(store);
+        let restarted_redis = sbproxy_platform::storage::AsyncRedisKVStore::new(
+            sbproxy_platform::storage::AsyncRedisConfig::new(&url),
+        );
+        let restarted = RedisCompressionStore::new(restarted_redis, config()).unwrap();
+        assert_eq!(
+            restarted
+                .load(&id(21))
+                .await
+                .unwrap()
+                .expect("external state survives adapter restart")
+                .logical_version,
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the redis-server executable"]
+    async fn live_redis_concurrent_delete_never_allows_writer_to_resurrect_state() {
+        let (_redis_process, url) = spawn_redis();
+        let store = live_store(&url);
+        let record_id = id(30);
+
+        let initial = store
+            .acquire_update(&record_id, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .commit(
+                &initial,
+                None,
+                &record(1, "tenant-a", "api.example.com"),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        store.release(initial).await.unwrap();
+
+        let in_flight = store
+            .acquire_update(&record_id, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let candidate = record(2, "tenant-a", "api.example.com");
+        let delete_store = live_store(&url);
+        let commit_store = live_store(&url);
+        let (deleted, commit) = tokio::join!(
+            delete_store.delete(&record_id),
+            commit_store.commit(&in_flight, Some(1), &candidate, Duration::from_secs(60),)
+        );
+
+        assert!(deleted.unwrap().deleted);
+        assert!(matches!(commit, Ok(()) | Err(CommitError::LeaseLost)));
+        assert_eq!(store.load(&record_id).await.unwrap(), None);
+        assert_eq!(
+            store
+                .commit(
+                    &in_flight,
+                    Some(1),
+                    &record(2, "tenant-a", "api.example.com"),
+                    Duration::from_secs(60),
+                )
+                .await,
+            Err(CommitError::LeaseLost)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the redis-server executable"]
+    async fn live_redis_recovers_every_compression_script_after_script_flush() {
+        let (_redis_process, url) = spawn_redis();
+        let store = live_store(&url);
+        let warm_id = id(31);
+
+        let warm = store
+            .acquire_update(&warm_id, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .commit(
+                &warm,
+                None,
+                &record(1, "tenant-a", "api.example.com"),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        store.release(warm).await.unwrap();
+        assert!(store.delete(&warm_id).await.unwrap().deleted);
+
+        flush_redis_scripts(&url);
+
+        let recovered_id = id(32);
+        let recovered = store
+            .acquire_update(&recovered_id, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .commit(
+                &recovered,
+                None,
+                &record(1, "tenant-a", "api.example.com"),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        store.release(recovered).await.unwrap();
+        assert!(store.delete(&recovered_id).await.unwrap().deleted);
     }
 }

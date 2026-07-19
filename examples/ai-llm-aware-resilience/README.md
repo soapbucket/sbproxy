@@ -26,3 +26,11 @@ content-policy, and context-window are not).
 export OPENAI_API_KEY=sk-...
 make run CONFIG=examples/ai-llm-aware-resilience/sb.yml
 ```
+
+## Stateful context compression
+
+The `context_compress` boolean above is the legacy deterministic window-fit
+path. For the ordered pipeline with running summaries, explicit state, session
+lifecycle operations, and compression telemetry, use this runnable example:
+
+- [Redis-backed AI context compression](../ai-context-compression-redis/)

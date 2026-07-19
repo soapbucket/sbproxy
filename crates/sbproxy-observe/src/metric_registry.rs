@@ -239,17 +239,6 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
-        name: "sbproxy_ai_compression_mesh_events_total",
-        kind: MetricKind::Counter,
-        writer: Writer::Recorder("record_mesh_compression_event"),
-        support: SupportLevel::Stable,
-        compat: CompatTier::Beta,
-        registry: Registry::Default,
-        labels: &["event"],
-        description: "Mesh compression convergence, conflict, and tombstone events.",
-        dead_reason: None,
-    },
-    MetricCapability {
         name: "sbproxy_ai_compression_ratio",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_compression_run"),
@@ -257,7 +246,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["tenant_id", "api_key_id", "lever"],
-        description: "Final-to-initial token ratio for applied AI context compression levers.",
+        description: "Final-to-initial SBproxy token-estimate ratio for applied AI context compression levers.",
         dead_reason: None,
     },
     MetricCapability {
@@ -290,7 +279,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["tenant_id", "api_key_id", "outcome", "backend"],
-        description: "Initial-to-final target-model tokens saved once per compression request.",
+        description: "Initial-to-final reduction in SBproxy's model-aware token estimate once per compression request.",
         dead_reason: None,
     },
     MetricCapability {
@@ -334,7 +323,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["tenant_id", "api_key_id", "lever"],
-        description: "Target-model tokens removed by applied AI context compression levers.",
+        description: "Reduction in SBproxy's model-aware token estimate from applied AI context compression levers.",
         dead_reason: None,
     },
     MetricCapability {
@@ -345,7 +334,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["tenant_id", "api_key_id", "lever", "direction"],
-        description: "Target-model tokens before and after an applied AI context compression lever.",
+        description: "SBproxy model-aware token estimates before and after an applied AI context compression lever.",
         dead_reason: None,
     },
     MetricCapability {

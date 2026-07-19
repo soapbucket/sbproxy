@@ -44,7 +44,7 @@
           "description": "Existing process-wide state subsystem to reuse.",
           "allOf": [
             {
-              "$ref": "#/definitions/CompressionBackend"
+              "$ref": "#/definitions/CompressionStateBackend"
             }
           ]
         },
@@ -59,21 +59,14 @@
       },
       "additionalProperties": false
     },
-    "CompressionBackend": {
-      "description": "Supported external state backends.",
+    "CompressionStateBackend": {
+      "description": "State backends safe to select from public compression configuration.",
       "oneOf": [
         {
           "description": "Strict Redis lease, fence, and compare-and-set storage.",
           "type": "string",
           "enum": [
             "redis"
-          ]
-        },
-        {
-          "description": "Eventual last-writer-wins mesh storage.",
-          "type": "string",
-          "enum": [
-            "mesh"
           ]
         }
       ]

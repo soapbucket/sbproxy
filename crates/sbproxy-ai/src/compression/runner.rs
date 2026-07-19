@@ -219,13 +219,13 @@ pub trait CompressionLever: Send + Sync {
     ) -> CompressionDecision;
 }
 
-/// Target-model token counting used to validate every candidate consistently.
+/// Model-aware estimated-token counting used to validate every candidate.
 pub trait TokenCounter: Send + Sync {
     /// Count tokens for a complete raw JSON message list.
     fn count(&self, model: &str, messages: &[Value]) -> u64;
 }
 
-/// Production target-model token counter.
+/// Production model-aware estimated-token counter.
 #[derive(Debug, Default)]
 pub struct ModelTokenCounter;
 
@@ -235,16 +235,16 @@ impl TokenCounter for ModelTokenCounter {
     }
 }
 
-/// Completed ordered compression run and exact token accounting.
+/// Completed ordered compression run and estimator-relative token accounting.
 #[derive(Clone, PartialEq)]
 pub struct CompressionRun {
     /// Final committed message list.
     pub messages: Vec<Value>,
-    /// Target-model token count before the first lever.
+    /// Model-aware token estimate before the first lever.
     pub initial_tokens: u64,
-    /// Target-model token count after the last committed lever.
+    /// Model-aware token estimate after the last committed lever.
     pub final_tokens: u64,
-    /// Exact initial-to-final reduction, counted once.
+    /// Initial-to-final reduction in the shared estimate, counted once.
     pub tokens_saved: u64,
     /// Ordered result for every lever that ran.
     pub lever_results: Vec<LeverResult>,
