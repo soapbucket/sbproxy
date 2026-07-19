@@ -31,7 +31,6 @@ pub mod governance_crdt;
 pub mod governance_redis;
 pub mod guardrails;
 pub mod handler;
-pub mod hierarchical_budget;
 pub mod identity;
 pub mod ids;
 pub mod image;
@@ -70,8 +69,8 @@ pub mod value_ledger;
 
 pub use batch::{BatchJob, BatchStatus, BatchStore, MemoryBatchStore};
 pub use budget::{
-    cheapest_model, estimate_cost, BudgetConfig, BudgetLimit, BudgetTracker, OnExceedAction,
-    UsageRecord,
+    cheapest_model, estimate_cost, BudgetConfig, BudgetLimit, BudgetScope, BudgetTracker,
+    OnExceedAction, UsageRecord,
 };
 pub use client::AiClient;
 pub use concurrency::ConcurrencyLimiter;
@@ -82,7 +81,6 @@ pub use context_overflow::{
 pub use context_relay::ContextRelay;
 pub use degradation::{should_degrade, DegradationConfig};
 pub use handler::*;
-pub use hierarchical_budget::{BudgetCheckResult, BudgetScope, HierarchicalBudget};
 pub use identity::{KeyStore, VirtualKeyConfig};
 pub use ids::{ModelId, ProviderName};
 pub use key_scoping::KeyPermissions;
