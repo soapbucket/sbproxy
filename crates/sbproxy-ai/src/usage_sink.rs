@@ -542,13 +542,10 @@ enum ObjectStoreKind {
 /// A sink that writes each usage event as a JSON object to S3 or GCS,
 /// fire-and-forget.
 ///
-/// The workspace already vendors `object_store` (see `sbproxy-tls` /
-/// `sbproxy-modules`), but `sbproxy-ai` does not depend on it yet - INT
-/// must add `object_store = { workspace = true }` to
-/// `crates/sbproxy-ai/Cargo.toml` (and refresh `Cargo.lock` if needed)
-/// to activate real puts. Until then this sink serializes the event and
-/// fails closed (log + return) so a missing bucket or unwired backend
-/// never breaks dispatch.
+/// Builds the backend from the process environment (`AWS_*` /
+/// `GOOGLE_APPLICATION_CREDENTIALS`, etc.) on each put. An empty bucket,
+/// missing credentials, or a put failure logs and returns — never panics
+/// or propagates to the request hot path.
 #[derive(Debug)]
 pub struct ObjectStoreSink {
     kind: ObjectStoreKind,
@@ -598,16 +595,17 @@ impl UsageSink for ObjectStoreSink {
         let sink_name = self.name().to_string();
         let object_key = object_store_object_key(&prefix, event);
         tokio::spawn(async move {
-            // Fail closed until INT wires `object_store` into sbproxy-ai.
             // Never log the event body (may carry governed metadata the
             // operator treats as sensitive); bucket + key are enough.
-            let _ = (kind, body);
-            tracing::warn!(
-                sink = %sink_name,
-                bucket = %bucket,
-                object_key = %object_key,
-                "usage sink: object store put failed"
-            );
+            if let Err(e) = object_store_put(kind, &bucket, &object_key, body).await {
+                tracing::warn!(
+                    error = %e,
+                    sink = %sink_name,
+                    bucket = %bucket,
+                    object_key = %object_key,
+                    "usage sink: object store put failed"
+                );
+            }
         });
     }
 
@@ -617,6 +615,42 @@ impl UsageSink for ObjectStoreSink {
             ObjectStoreKind::Gcs => "gcs",
         }
     }
+}
+
+/// Put `body` to `bucket`/`object_key` via the matching object_store
+/// backend. Credentials come from the environment. Returns an error on
+/// build or put failure so the caller can log without panicking.
+async fn object_store_put(
+    kind: ObjectStoreKind,
+    bucket: &str,
+    object_key: &str,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    use object_store::path::Path as ObjectPath;
+    use object_store::{ObjectStore, PutPayload};
+
+    let store: std::sync::Arc<dyn ObjectStore> = match kind {
+        ObjectStoreKind::S3 => {
+            let store = object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|e| format!("s3 store build: {e}"))?;
+            std::sync::Arc::new(store)
+        }
+        ObjectStoreKind::Gcs => {
+            let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|e| format!("gcs store build: {e}"))?;
+            std::sync::Arc::new(store)
+        }
+    };
+    let path = ObjectPath::from(object_key);
+    store
+        .put(&path, PutPayload::from(body))
+        .await
+        .map_err(|e| format!("put: {e}"))?;
+    Ok(())
 }
 
 /// Build a stable object key under `prefix` for `event`. Prefers
@@ -1010,6 +1044,21 @@ mod tests {
         assert_eq!(sinks[0].name(), "otel");
         assert_eq!(sinks[1].name(), "s3");
         assert_eq!(sinks[2].name(), "gcs");
+    }
+
+    #[test]
+    fn object_store_object_key_prefers_request_id_under_prefix() {
+        let mut event = sample_event();
+        event.request_id = Some("req-42".into());
+        assert_eq!(
+            object_store_object_key("llm/", &event),
+            "llm/req-42.json"
+        );
+        assert_eq!(
+            object_store_object_key("llm", &event),
+            "llm/req-42.json"
+        );
+        assert_eq!(object_store_object_key("", &event), "req-42.json");
     }
 
     #[tokio::test]

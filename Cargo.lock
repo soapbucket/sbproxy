@@ -8369,6 +8369,7 @@ dependencies = [
  "hex",
  "lru",
  "minijinja",
+ "object_store",
  "parking_lot",
  "prometheus 0.14.0",
  "rand 0.8.6",
@@ -8669,6 +8670,7 @@ dependencies = [
  "sbproxy-config",
  "sbproxy-observe",
  "sbproxy-plugin",
+ "sbproxy-security",
  "sbproxy-util",
  "semver",
  "serde",
@@ -8678,6 +8680,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid 1.23.1",
  "wasi-common",
  "wasmtime",
@@ -8830,6 +8833,7 @@ dependencies = [
  "reqwest 0.12.28",
  "sbproxy-ai",
  "sbproxy-config",
+ "sbproxy-security",
  "sbproxy-util",
  "schemars 0.8.22",
  "serde",
@@ -11364,6 +11368,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
