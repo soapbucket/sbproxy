@@ -8,7 +8,12 @@ on:
       - 'sbproxy-bench/harness/context_compression_eval/**'
       - 'crates/sbproxy-ai/src/compression/**'
       - 'crates/sbproxy-ai/src/context_compress.rs'
+      - 'crates/sbproxy-ai/src/context_overflow.rs'
       - 'crates/sbproxy-ai/src/token_estimate.rs'
+      - 'crates/sbproxy-core/src/compression_runtime.rs'
+      - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
+      - 'schemas/ai-compression.schema.json'
+      - 'schemas/sb-config.schema.json'
       - 'Cargo.toml'
       - '.github/workflows/context-compression-eval.yml'
   push:
@@ -18,7 +23,12 @@ on:
       - 'sbproxy-bench/harness/context_compression_eval/**'
       - 'crates/sbproxy-ai/src/compression/**'
       - 'crates/sbproxy-ai/src/context_compress.rs'
+      - 'crates/sbproxy-ai/src/context_overflow.rs'
       - 'crates/sbproxy-ai/src/token_estimate.rs'
+      - 'crates/sbproxy-core/src/compression_runtime.rs'
+      - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
+      - 'schemas/ai-compression.schema.json'
+      - 'schemas/sb-config.schema.json'
       - 'Cargo.toml'
       - '.github/workflows/context-compression-eval.yml'
 
@@ -72,5 +82,6 @@ jobs:
             --input "$HARNESS/fixtures/ruler-smoke.jsonl" \
             --input "$HARNESS/fixtures/coding-agent-smoke.jsonl" \
             --provenance "$HARNESS/fixtures/provenance.json" \
+            --input-budget-tokens 192 \
             --json-report "$HARNESS/reports/window-fit-smoke.json" \
             --markdown-report "$HARNESS/reports/window-fit-smoke.md"

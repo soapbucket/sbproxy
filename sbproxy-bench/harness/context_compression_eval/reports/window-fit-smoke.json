@@ -1,6 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "profile": "window_fit-smoke-v1",
+  "input_budget_tokens": 192,
+  "completion_reserve_tokens": 8000,
   "token_counter": "sbproxy_target_model",
   "latency_mode": "omitted_for_deterministic_gate",
   "cases": [

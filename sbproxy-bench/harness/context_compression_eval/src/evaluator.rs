@@ -17,6 +17,8 @@ pub struct EvalConfig {
     pub profile: String,
     /// Completion reserve used by the real window-fit lever.
     pub completion_reserve_tokens: u64,
+    /// Explicit input-message budget used by the real window-fit lever.
+    pub input_budget_tokens: u64,
     /// Include observed wall-clock latency in this non-gated artifact.
     pub measure_latency: bool,
 }
@@ -121,6 +123,10 @@ pub struct EvalReport {
     pub schema_version: u32,
     /// Named compression profile evaluated.
     pub profile: String,
+    /// Explicit input-message budget evaluated by window fit.
+    pub input_budget_tokens: u64,
+    /// Completion capacity excluded from a known target model's input budget.
+    pub completion_reserve_tokens: u64,
     /// Token counter contract used by both arms.
     pub token_counter: String,
     /// Whether latency values are observed or intentionally omitted.
@@ -141,10 +147,13 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
     if config.profile.trim().is_empty() {
         bail!("evaluation profile must not be empty");
     }
-
+    if config.input_budget_tokens == 0 {
+        bail!("evaluation input budget must be greater than zero");
+    }
     let off_runner = CompressionRunner::with_model_counter(Vec::new());
     let window_fit_config: WindowFitConfig = serde_json::from_value(serde_json::json!({
-        "completion_reserve_tokens": config.completion_reserve_tokens
+        "completion_reserve_tokens": config.completion_reserve_tokens,
+        "input_budget_tokens": config.input_budget_tokens
     }))?;
     let on_runner = CompressionRunner::with_model_counter(vec![Arc::new(WindowFitLever::new(
         window_fit_config,
@@ -231,8 +240,10 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
     let overall = aggregate(&rows.iter().collect::<Vec<_>>());
 
     Ok(EvalReport {
-        schema_version: 1,
+        schema_version: 2,
         profile: config.profile.clone(),
+        input_budget_tokens: config.input_budget_tokens,
+        completion_reserve_tokens: config.completion_reserve_tokens,
         token_counter: "sbproxy_target_model".to_string(),
         latency_mode: if config.measure_latency {
             "observed_wall_clock"

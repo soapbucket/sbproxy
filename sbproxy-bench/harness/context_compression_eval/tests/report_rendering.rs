@@ -23,6 +23,7 @@ async fn report() -> EvalReport {
         &EvalConfig {
             profile: "window_fit-smoke-v1".to_string(),
             completion_reserve_tokens: 8_000,
+            input_budget_tokens: 192,
             measure_latency: false,
         },
     )
@@ -47,6 +48,8 @@ async fn json_and_markdown_are_byte_stable() {
     assert!(first_markdown.ends_with('\n'));
     assert!(first_markdown.contains("# Context Compression Evaluation"));
     assert!(first_markdown.contains("window_fit-smoke-v1"));
+    assert!(first_markdown.contains("Input budget: `192` tokens"));
+    assert!(first_markdown.contains("Completion reserve: `8000` tokens"));
     assert!(first_markdown.contains("coding_agent_smoke"));
     assert!(first_markdown.contains("omitted_for_deterministic_gate"));
     assert!(first_markdown.contains("build"));

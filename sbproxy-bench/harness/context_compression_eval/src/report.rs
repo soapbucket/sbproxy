@@ -21,6 +21,14 @@ pub fn render_markdown(report: &EvalReport) -> String {
         escape_inline(&report.profile)
     ));
     output.push_str(&format!(
+        "- Input budget: `{}` tokens\n",
+        report.input_budget_tokens
+    ));
+    output.push_str(&format!(
+        "- Completion reserve: `{}` tokens\n",
+        report.completion_reserve_tokens
+    ));
+    output.push_str(&format!(
         "- Token counter: `{}`\n",
         escape_inline(&report.token_counter)
     ));

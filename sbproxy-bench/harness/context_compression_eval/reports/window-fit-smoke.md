@@ -3,6 +3,8 @@
 This is a first-party smoke evaluation, not an official third-party benchmark score.
 
 - Profile: `window_fit-smoke-v1`
+- Input budget: `192` tokens
+- Completion reserve: `8000` tokens
 - Token counter: `sbproxy_target_model`
 - Latency mode: `omitted_for_deterministic_gate`
 

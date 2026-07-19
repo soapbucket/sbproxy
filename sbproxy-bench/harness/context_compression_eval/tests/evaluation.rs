@@ -26,6 +26,7 @@ async fn evaluates_identical_arms_through_real_window_fit() {
         &EvalConfig {
             profile: "window_fit-smoke-v1".to_string(),
             completion_reserve_tokens: 8_000,
+            input_budget_tokens: 192,
             measure_latency: false,
         },
     )
@@ -56,6 +57,51 @@ async fn evaluates_identical_arms_through_real_window_fit() {
 }
 
 #[tokio::test]
+async fn explicit_input_budget_evaluates_unknown_target_models() {
+    let mut case = long_case();
+    case.id = "private-model-budget".to_string();
+    case.target_model = "operator-private-model".to_string();
+
+    let report = evaluate_cases(
+        &[case],
+        &EvalConfig {
+            profile: "window-fit-explicit-budget-v1".to_string(),
+            completion_reserve_tokens: 0,
+            input_budget_tokens: 192,
+            measure_latency: false,
+        },
+    )
+    .await
+    .expect("explicit input budget supports unknown target models");
+
+    assert_eq!(report.input_budget_tokens, 192);
+    assert_eq!(report.completion_reserve_tokens, 0);
+    assert_eq!(report.cases[0].outcome, "applied");
+    assert!(report.cases[0].on.output_tokens <= 192);
+    assert!(report.cases[0].tokens_saved > 0);
+    assert_eq!(report.cases[0].on.quality_score, Some(1.0));
+}
+
+#[tokio::test]
+async fn rejects_zero_input_budget() {
+    let error = evaluate_cases(
+        &[long_case()],
+        &EvalConfig {
+            profile: "window_fit_zero_budget".to_string(),
+            completion_reserve_tokens: 0,
+            input_budget_tokens: 0,
+            measure_latency: false,
+        },
+    )
+    .await
+    .expect_err("zero is not a valid production input budget");
+
+    assert!(error
+        .to_string()
+        .contains("evaluation input budget must be greater than zero"));
+}
+
+#[tokio::test]
 async fn rejects_savings_without_quality_evidence() {
     let mut case = long_case();
     case.id = "missing-quality".to_string();
@@ -68,6 +114,7 @@ async fn rejects_savings_without_quality_evidence() {
         &EvalConfig {
             profile: "window_fit-smoke-v1".to_string(),
             completion_reserve_tokens: 8_000,
+            input_budget_tokens: 192,
             measure_latency: false,
         },
     )
@@ -94,6 +141,7 @@ async fn scores_imported_predictions_against_reference_answers() {
         &EvalConfig {
             profile: "window_fit-smoke-v1".to_string(),
             completion_reserve_tokens: 8_000,
+            input_budget_tokens: 192,
             measure_latency: false,
         },
     )
@@ -114,6 +162,7 @@ async fn observed_mode_reports_added_compression_latency() {
         &EvalConfig {
             profile: "window_fit-smoke-v1".to_string(),
             completion_reserve_tokens: 8_000,
+            input_budget_tokens: 192,
             measure_latency: true,
         },
     )

@@ -65,9 +65,12 @@ struct ReportArgs {
     /// Named compression profile shown in the report.
     #[arg(long, default_value = "window_fit-smoke-v1")]
     profile: String,
-    /// Completion reserve that gives the smoke corpus a small input budget.
+    /// Completion reserve subtracted from a known target model window.
     #[arg(long, default_value_t = 8_000)]
     completion_reserve_tokens: u64,
+    /// Explicit input-message budget evaluated by the window-fit arm.
+    #[arg(long, default_value_t = 192)]
+    input_budget_tokens: u64,
     /// JSON report path.
     #[arg(long)]
     json_report: PathBuf,
@@ -130,6 +133,7 @@ async fn generate(args: &ReportArgs, measure_latency: bool) -> Result<(String, S
         &EvalConfig {
             profile: args.profile.clone(),
             completion_reserve_tokens: args.completion_reserve_tokens,
+            input_budget_tokens: args.input_budget_tokens,
             measure_latency,
         },
     )

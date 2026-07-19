@@ -35,6 +35,8 @@ fn generate_then_check_detects_report_drift() {
         "fixtures/coding-agent-smoke.jsonl",
         "--provenance",
         "fixtures/provenance.json",
+        "--input-budget-tokens",
+        "192",
         "--json-report",
         json_report.to_str().expect("UTF-8 scratch path"),
         "--markdown-report",
@@ -51,9 +53,9 @@ fn generate_then_check_detects_report_drift() {
         "generate failed: {}",
         String::from_utf8_lossy(&generated.stderr)
     );
-    assert!(fs::read_to_string(&json_report)
-        .expect("JSON report")
-        .contains("\"ruler_smoke\""));
+    let json = fs::read_to_string(&json_report).expect("JSON report");
+    assert!(json.contains("\"ruler_smoke\""));
+    assert!(json.contains("\"input_budget_tokens\": 192"));
     assert!(fs::read_to_string(&markdown_report)
         .expect("Markdown report")
         .contains("coding_agent_smoke"));
@@ -92,6 +94,8 @@ fn committed_report_matches_deterministic_regeneration() {
             "fixtures/coding-agent-smoke.jsonl",
             "--provenance",
             "fixtures/provenance.json",
+            "--input-budget-tokens",
+            "192",
             "--json-report",
             "reports/window-fit-smoke.json",
             "--markdown-report",

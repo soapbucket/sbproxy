@@ -36,6 +36,7 @@ cargo run --locked -- generate \
   --input fixtures/ruler-smoke.jsonl \
   --input fixtures/coding-agent-smoke.jsonl \
   --provenance fixtures/provenance.json \
+  --input-budget-tokens 192 \
   --json-report /tmp/context-compression-observed.json \
   --markdown-report /tmp/context-compression-observed.md \
   --measure-latency
@@ -54,14 +55,17 @@ cargo run --locked -- check \
   --input fixtures/ruler-smoke.jsonl \
   --input fixtures/coding-agent-smoke.jsonl \
   --provenance fixtures/provenance.json \
+  --input-budget-tokens 192 \
   --json-report reports/window-fit-smoke.json \
   --markdown-report reports/window-fit-smoke.md
 ```
 
 To intentionally update the committed reports, replace `check` with
-`generate`, review both files, then run `check` again. The smoke profile uses a
-large completion reserve to create a small deterministic input budget for
-`gpt-4`; it does not represent a production recommendation by itself.
+`generate`, review both files, then run `check` again. The smoke profile passes
+the production `input_budget_tokens` setting explicitly. For `gpt-4`, the
+effective budget is the smaller of `--input-budget-tokens 192` and the known
+model window minus the 8,000-token completion reserve. The profile does not
+represent a production recommendation by itself.
 
 The recommendation thresholds are deliberately simple:
 
@@ -91,6 +95,14 @@ the off and on message arrays. This deterministic scorer needs no provider
 credential, GPU, or network access.
 
 ## External benchmark adapter
+
+The adapter path is import-and-report-only. It does not run a target model and
+does not generate off/on predictions. Operators generate both predictions with
+their chosen benchmark runner and model, then supply them through the
+interchange below. The harness reports exact match for those imported
+predictions and separately measures production window-fit token changes. It
+does not claim that an imported prediction was generated from the harness's
+compressed message array.
 
 External data stays outside this repository. The operator exports a row from
 the benchmark into this generic JSONL interchange:

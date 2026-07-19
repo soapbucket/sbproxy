@@ -14,8 +14,12 @@ fn readme_and_workflow_cover_reproducibility_and_external_data_boundaries() {
         "operator-supplied",
         "not an official benchmark score",
         "--measure-latency",
+        "--input-budget-tokens",
         "target-model",
         "coding-agent",
+        "import-and-report-only",
+        "does not run a target model",
+        "does not generate off/on predictions",
     ] {
         assert!(readme.contains(required), "README missing `{required}`");
     }
@@ -33,5 +37,21 @@ fn readme_and_workflow_cover_reproducibility_and_external_data_boundaries() {
     assert!(workflow.contains("cargo clippy --manifest-path"));
     assert!(workflow.contains("cargo run --manifest-path"));
     assert!(workflow.matches("--locked").count() >= 3);
+    assert!(workflow.contains("--input-budget-tokens 192"));
     assert!(workflow.contains(" check"));
+    for production_path in [
+        "crates/sbproxy-core/src/compression_runtime.rs",
+        "crates/sbproxy-core/src/server/ai_dispatch.rs",
+        "crates/sbproxy-ai/src/compression/**",
+        "crates/sbproxy-ai/src/context_compress.rs",
+        "crates/sbproxy-ai/src/context_overflow.rs",
+        "crates/sbproxy-ai/src/token_estimate.rs",
+        "schemas/ai-compression.schema.json",
+        "schemas/sb-config.schema.json",
+    ] {
+        assert!(
+            workflow.matches(production_path).count() >= 2,
+            "workflow must run for pull requests and main pushes that change `{production_path}`"
+        );
+    }
 }
