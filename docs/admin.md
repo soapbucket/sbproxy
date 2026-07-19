@@ -329,12 +329,15 @@ its local and cloud completion totals remain zero. The actual compression value
 stays in `compression` and `compression_totals`.
 
 The process-wide ledger stores no prompt or summary content. The current redb
-path requires an AI handler with at least one
-`providers[].serve.models[].reference` in the provider-level compatibility form
-and a `providers[].serve.cache_dir`; the file is
-`<cache_dir>/value-ledger.redb`. `proxy.model_host.cache.directory` does not
-currently activate value-ledger persistence. Otherwise compression uses a
-bounded in-memory ledger.
+path requires one provider-level `providers[].serve` block that both contains
+at least one `models[].reference` and sets `cache_dir`; the file is
+`<cache_dir>/value-ledger.redb`. A qualifying block that initializes later
+promotes the same shared in-memory ledger in place and merges existing totals,
+so preexisting value sinks and Admin readers remain valid. The first successful
+durable path is canonical; a conflicting later path emits a bounded warning and
+keeps using it. `proxy.model_host.cache.directory` does not currently activate
+value-ledger persistence. Otherwise compression uses a bounded in-memory
+ledger.
 
 The ledger holds at most 1,000 model lanes total, including `__other__`. Once
 999 non-overflow model names have been admitted, additional names aggregate

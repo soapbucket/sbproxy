@@ -848,9 +848,13 @@ The same endpoint is available when no local model is configured. In that
 compression-only case, `models` contains a zeroed local-serving row for each
 compression target, while all local and cloud completion totals remain zero.
 Compression uses a bounded in-memory ledger unless an AI handler initializes
-the current durable compatibility path: at least one
-`providers[].serve.models[].reference` plus `providers[].serve.cache_dir`, which
-stores the process-wide ledger at `<cache_dir>/value-ledger.redb`.
+the current durable compatibility path: one provider-level
+`providers[].serve` block must both contain at least one `models[].reference`
+and set `cache_dir`, which stores the process-wide ledger at
+`<cache_dir>/value-ledger.redb`. Later activation promotes the same shared
+in-memory ledger in place and merges existing totals, preserving preexisting
+value sinks and Admin readers. The first successful durable path is canonical;
+a conflicting later path emits a bounded warning and keeps using it.
 `proxy.model_host.cache.directory` does not currently activate that ledger.
 
 The ledger caps the complete lane set at 1,000 entries, including the

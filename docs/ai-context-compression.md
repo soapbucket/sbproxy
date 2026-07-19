@@ -605,13 +605,17 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
   | jq '{compression,compression_totals,total_compression_tokens_saved,total_compression_gross_cost_saved_micros}'
 ```
 
-The current durable path is the provider-level `serve:` compatibility form. On
-an AI handler with at least one `providers[].serve.models[].reference`, setting
-`providers[].serve.cache_dir` places the process-wide ledger at
-`<cache_dir>/value-ledger.redb`, and compression on that handler shares it.
-`proxy.model_host.cache.directory` does not currently activate value-ledger
-persistence. If no referenced inline served model initializes the durable path,
-compression uses a bounded in-memory ledger.
+The current durable path is the provider-level `serve:` compatibility form. A
+`providers[].serve` block activates it when that same block contains at least
+one `models[].reference` and sets `cache_dir`; the process-wide ledger then uses
+`<cache_dir>/value-ledger.redb`. If compression already initialized the shared
+ledger in memory, activation promotes that ledger object in place and atomically
+merges its totals with existing redb rows, so existing value sinks and Admin
+readers remain valid. The first successfully activated durable path is
+canonical; a conflicting later path emits a bounded warning and continues on
+the canonical ledger. `proxy.model_host.cache.directory` does not currently
+activate value-ledger persistence. Without a qualifying block, compression
+uses a bounded in-memory ledger.
 
 The ledger keeps at most 1,000 model lanes total, including the deterministic
 `__other__` overflow lane. Once 999 non-overflow model names have been admitted,
