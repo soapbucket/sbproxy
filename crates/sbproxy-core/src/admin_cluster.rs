@@ -22,6 +22,8 @@ const ARTIFACTS_PATH: &str = "/admin/cluster/artifacts";
 const STATE_PATH: &str = "/admin/cluster/state";
 /// Authenticated bounded replicated-state purge (WOR-1947).
 const STATE_PURGE_PATH: &str = "/admin/cluster/state/purge";
+/// Authenticated single-record read and write on the replicated substrate.
+const STATE_KEY_PATH: &str = "/admin/cluster/state/key";
 
 #[derive(Debug, Clone, Serialize)]
 struct ClusterStatusResponse {
@@ -142,8 +144,90 @@ pub fn dispatch(
         ENROLL_PATH => Some(dispatch_enrollment(method, body)),
         STATE_PATH => Some(dispatch_state(method, query)),
         STATE_PURGE_PATH => Some(dispatch_state_purge(method, body)),
+        STATE_KEY_PATH => Some(dispatch_state_key(method, query, body)),
         _ => None,
     }
+}
+
+/// Single-record read and write through the replicated quorum paths.
+fn dispatch_state_key(
+    method: &str,
+    query: Option<&str>,
+    body: Option<&str>,
+) -> (u16, &'static str, String) {
+    let store = match replicated_store() {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let Some(key) = query_param(query, "key").filter(|key| !key.is_empty()) else {
+        return json(
+            400,
+            serde_json::json!({"error": "missing key query parameter", "code": "bad_request"}),
+        );
+    };
+    if method.eq_ignore_ascii_case("GET") {
+        return match crate::cluster::block_on_cluster(store.get(&key)) {
+            Ok(outcome) => {
+                let value_base64 = outcome.value.as_ref().map(|value| {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.encode(value)
+                });
+                let value_utf8 = outcome
+                    .value
+                    .as_ref()
+                    .and_then(|value| std::str::from_utf8(value).ok().map(str::to_string));
+                json(
+                    if outcome.value.is_some() { 200 } else { 404 },
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "key": key,
+                        "found": outcome.value.is_some(),
+                        "value_base64": value_base64,
+                        "value_utf8": value_utf8,
+                        "replicas_answered": outcome.responses,
+                        "repaired": outcome.repaired,
+                    }),
+                )
+            }
+            Err(error) => json(
+                502,
+                serde_json::json!({
+                    "error": format!("replicated read failed: {error}"),
+                    "code": "replication_read_failed",
+                }),
+            ),
+        };
+    }
+    if method.eq_ignore_ascii_case("PUT") {
+        let Some(value) = body else {
+            return json(
+                400,
+                serde_json::json!({"error": "request body is the record value", "code": "bad_request"}),
+            );
+        };
+        let ttl_secs = query_param(query, "ttl_secs")
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        return match crate::cluster::block_on_cluster(store.put(&key, value.as_bytes(), ttl_secs)) {
+            Ok(receipt) => json(
+                200,
+                serde_json::json!({
+                    "schema_version": 1,
+                    "key": key,
+                    "acked_replicas": receipt.acked,
+                    "logical_version": receipt.register.logical_version(),
+                }),
+            ),
+            Err(error) => json(
+                502,
+                serde_json::json!({
+                    "error": format!("replicated write failed: {error}"),
+                    "code": "replication_write_failed",
+                }),
+            ),
+        };
+    }
+    json(405, serde_json::json!({"error": "method not allowed"}))
 }
 
 // --- WOR-1947 replicated-state admin ---

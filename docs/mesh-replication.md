@@ -159,7 +159,8 @@ duplicate effects, any number of retries.
 
 ## Admin surface
 
-Three authenticated admin routes operate on the whole fleet:
+Authenticated admin routes operate on the whole fleet (full request
+and response shapes in [admin-api-reference.md](admin-api-reference.md)):
 
 - `GET /admin/cluster/state?prefix=&page_token=&limit=` walks every
   current member and lists each record every holder still has. Entries
@@ -169,6 +170,9 @@ Three authenticated admin routes operate on the whole fleet:
   the next surviving member instead of failing or looping. Members that
   could not be queried are listed in `unreachable` rather than silently
   skipped.
+- `GET` and `PUT /admin/cluster/state/key?key=` read and write one
+  record through the configured consistency levels; `PUT` takes the raw
+  value as the request body and an optional `ttl_secs` parameter.
 - `DELETE /admin/cluster/state?key=` performs a replicated delete with
   the configured write consistency.
 - `POST /admin/cluster/state/purge` with `{"prefix": "...", "max": 1000}`
