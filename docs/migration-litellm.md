@@ -1,6 +1,6 @@
 # Migrating from LiteLLM
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-19*
 
 ![The importer translating a LiteLLM config, then a completion served through the migrated result](assets/migrate-litellm.gif)
 
@@ -13,11 +13,11 @@ sbproxy config import-litellm litellm_config.yaml --out sb.yml
 sbproxy sb.yml
 ```
 
-`import-litellm` reads a LiteLLM `config.yaml` and writes an equivalent SBproxy `sb.yml` with one `ai_proxy` origin. It prints a warnings report to stderr listing every key that needs manual attention, and never fails on an unmapped key (only on a YAML parse error). Clients that already speak the OpenAI API need no change: keep calling `/v1/chat/completions`, `/v1/embeddings`, and the rest. `os.environ/VAR` references become SBproxy's `${VAR}` interpolation.
+`import-litellm` reads a LiteLLM `config.yaml` and writes an equivalent SBproxy `sb.yml` with one `ai_proxy` origin. It prints a warnings report to stderr listing every key that needs manual attention, and never fails on an unmapped key (only on a YAML parse error). Every configured key is accounted for as mapped, warned, or unsupported: nothing under `litellm_params`, `router_settings`, `litellm_settings`, `general_settings`, or the top-level document is silently dropped. Clients that already speak the OpenAI API need no change: keep calling `/v1/chat/completions`, `/v1/embeddings`, and the rest. `os.environ/VAR` references become SBproxy's `${VAR}` interpolation.
 
 ## What you will build
 
-By the end you have an `sb.yml` that answers the same `/v1/chat/completions` calls your clients already make, keeping the public model names, per-model rate caps, and cache behavior your LiteLLM config declared. Anything the importer could not translate lands on a warnings list for you to handle by hand. The repo ships this walkthrough as a runnable pair in [examples/migrate-litellm/](../examples/migrate-litellm/): the LiteLLM `config.yaml`, the imported `sb.yml` annotated field by field, and a compose file that runs both proxies side by side so you can diff their answers before cutting over.
+By the end you have an `sb.yml` that answers the same `/v1/chat/completions` calls your clients already make, keeping the public model names, per-model rate caps, cache behavior, known usage sinks, and clean budget windows your LiteLLM config declared. Anything the importer could not translate lands on a warnings list for you to handle by hand. The repo ships this walkthrough as a runnable pair in [examples/migrate-litellm/](../examples/migrate-litellm/): the LiteLLM `config.yaml`, the imported `sb.yml` annotated field by field, and a compose file that runs both proxies side by side so you can diff their answers before cutting over.
 
 ## Why migrate
 
@@ -71,9 +71,13 @@ sbproxy validate sb.yml
 | `litellm_params.api_key` / `api_base` / `api_version` / `organization` | `providers[].api_key` / `base_url` / `api_version` / `organization` |
 | `litellm_params.rpm` / `tpm` | `model_rate_limits[model].requests_per_minute` / `tokens_per_minute` |
 | `litellm_params.weight` | `providers[].weight` |
+| `litellm_params.max_budget` (+ optional `budget_duration`) | action-level `budget.limits[]` with `max_cost_usd` and `period` when every model that sets a budget shares the same cap and window |
 | Two `model_list` entries sharing a `model_name` | a model group: two providers listing that model, load-balanced by the routing strategy |
-| `router_settings.routing_strategy` | `routing` (`simple-shuffle`->`round_robin`, `latency-based-routing`->`lowest_latency`, `usage-based-routing`->`least_token_usage`, `least-busy`->`least_connections`, `cost-based-routing`->`cost_optimized`) |
+| `router_settings.routing_strategy` | `routing` (`simple-shuffle`->`round_robin`, `latency-based-routing`->`lowest_latency`, `usage-based-routing`->`least_token_usage`, `least-busy`->`least_connections`, `cost-based-routing`->`cost_optimized`). Unknown strategy names warn with the original value and fall back to `round_robin` |
 | `litellm_settings.cache` | `semantic_cache.enabled` |
+| `callbacks` / `success_callback` / `failure_callback` of `langfuse`, `datadog`, `otel`, `s3`/`s3_v2`, `gcs_bucket` | `usage_sinks[]` entries (credentials via `${LANGFUSE_*}`, `${DD_API_KEY}`, `${AWS_S3_BUCKET_NAME}`, `${GCS_BUCKET_NAME}`) |
+| Other known sink names (`prometheus`, `helicone`, `langsmith`) | warned as unsupported; configure `usage_sinks` by hand |
+| Unknown keys under `litellm_params`, `router_settings`, `litellm_settings`, `general_settings`, or the top-level document | warned (never silently dropped) |
 | `os.environ/VAR` (anywhere) | `${VAR}` |
 | `general_settings.master_key` | proxy authentication (configure manually) |
 | `general_settings.database_url` | runtime key/spend store (enterprise) |
@@ -128,27 +132,26 @@ origins:
       semantic_cache: { enabled: true }
 ```
 
-The committed version of this pair at [examples/migrate-litellm/](../examples/migrate-litellm/) adds two more LiteLLM keys, a budget kwarg and a `master_key`, so you can watch the warning path fire on input the importer cannot translate.
+The committed version of this pair at [examples/migrate-litellm/](../examples/migrate-litellm/) adds a `max_budget` kwarg and a `master_key`. A single clean `max_budget` now emits an action-level `budget:` block; `master_key` still warns for manual auth setup.
 
 ## Run it
 
-Point the importer at the shipped example. It writes `sb.yml` and reports the two keys that need hands:
+Point the importer at the shipped example. It writes `sb.yml` and reports keys that still need hands (for example `master_key`):
 
 ```console
 $ sbproxy config import-litellm examples/migrate-litellm/config.yaml --out sb.yml
 config import-litellm: wrote sb.yml
-warning: model 'claude': litellm_params.max_budget has no sbproxy mapping; review manually
 warning: general_settings.master_key has no direct sbproxy mapping; configure proxy authentication (see the migration guide)
-config import-litellm: 2 key(s) need manual attention (see warnings above)
+config import-litellm: 1 key(s) need manual attention (see warnings above)
 ```
 
-Both warnings are expected here; the [What needs manual migration](#what-needs-manual-migration) section covers them. Validate, then serve:
+The [What needs manual migration](#what-needs-manual-migration) section covers remaining warnings. Validate, then serve:
 
 ```console
 $ sbproxy validate sb.yml
 ok: sb.yml is a valid sbproxy config
 $ export OPENAI_API_KEY=sk-...
-$ export ANTHROPIC_API_KEY=sk-ant-...
+$ export ANTHROPIC_API_KEY=sk-ant...
 $ sbproxy sb.yml
 ```
 
@@ -177,13 +180,14 @@ To watch both proxies answer the same request before you retire LiteLLM, run `do
 These have no automatic translation; the importer warns and points here.
 
 - Python hooks given as module paths: `custom_auth`, `custom_sso`, `custom_key_generate`, and callback classes. SBproxy's analog is CEL, Lua, JavaScript, or WebAssembly scripting; rewrite the logic in one of those.
-- Open-ended `litellm_params` keyword arguments: the importer maps the known keys and warns on the rest, so review each warned key. Budget kwargs, for example, become an action-level `budget:` block ([examples/ai-budget](../examples/ai-budget/)).
+- Open-ended `litellm_params` keyword arguments other than the mapped set above: the importer warns on each remaining key. Differing per-model `max_budget` values also warn so you can split them into explicit `budget.limits` rows ([examples/ai-budget](../examples/ai-budget/)).
+- Known sink names without an auto-emitted target yet (`prometheus`, `helicone`, `langsmith`): add a matching `usage_sinks` entry by hand.
 - External guardrail providers (Presidio, Lakera, Aporia, Bedrock): map each to a built-in SBproxy guardrail or an external guardrail adapter.
 - `general_settings.master_key`: set up proxy authentication explicitly. Client keys move out of LiteLLM's database and into config as a `credentials:` block ([examples/ai-virtual-keys](../examples/ai-virtual-keys/)). Do not write a `virtual_keys:` block; that legacy shape is a hard config error.
 
 ## What is deferred
 
-Runtime parity for callback sinks, external guardrail adapters, multi-window budgets, per-error retry policy, and the `/model/info` family of endpoints is tracked separately and lands incrementally. The importer emits a warning for every unmapped `litellm_params` entry and wherever a mapped feature's target is not yet available. One known gap: unknown keys under `litellm_settings`, `general_settings`, and `router_settings` are ignored without a warning today, so diff the emitted sb.yml against your source config before you delete the original.
+Runtime parity for external guardrail adapters, per-error retry policy, and the `/model/info` family of endpoints is tracked separately and lands incrementally. The importer already closes the silent-drop landmine: every unknown key under `litellm_params`, `router_settings`, `litellm_settings`, `general_settings`, and the top-level document is warned, and known sink callbacks / clean budget windows emit real config.
 
 ## You are done when
 

@@ -1,0 +1,22 @@
+# Silent-drop regression fixture: unknown keys under every settings section
+# plus the top-level document must warn (never vanish), known sink callbacks
+# must emit usage_sinks, and a clean max_budget must emit a budget window.
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      max_budget: 10.0
+      budget_duration: daily
+      some_unknown_kwarg: 42
+router_settings:
+  routing_strategy: latency-based-routing
+  totally_unknown_router_knob: true
+litellm_settings:
+  cache: true
+  unknown_flag: true
+  callbacks: ["otel", "s3", "langfuse"]
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  totally_unknown_general_knob: 1
+weird_key: something
