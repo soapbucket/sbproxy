@@ -1,5 +1,5 @@
 # Enterprise
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-19*
 
 What's in OSS, what the enterprise tier adds, and how to talk to us
 about it.
@@ -12,12 +12,14 @@ management, and scripting (CEL, Lua, JavaScript, WebAssembly) all ship
 in this repository. There is no feature ceiling on the runtime itself.
 
 The clustering substrate is open source too: gossip mesh membership,
-consistent-hash routing, leader election, federation, service discovery,
-and a distributed cache all live in the `sbproxy-mesh` crate (Apache 2.0).
+consistent-hash routing, federation, service discovery, and a
+distributed cache all live in the `sbproxy-mesh` crate (Apache 2.0).
 The dynamic key plane uses it for a clusterwide policy cache, so a key
 minted on one replica is usable on any and a revocation on one denies on
-the rest. Per-key spend counters are node-local today; cluster-wide budget
-coherence uses a shared backend until CRDT-based dissemination lands.
+the rest. Governed keys count spend and rate usage cluster-wide by
+default: the approximate tier has each node merge every peer's settled
+usage on a short cadence. Point a key's governance at a shared backend
+when a limit has to be exact under concurrent traffic.
 
 The enterprise tier adds capabilities that only matter once you are
 running SBproxy at organizational scale or under regulator pressure.
@@ -28,8 +30,8 @@ None of them are required to use SBproxy in production.
 ### Cluster-distributed semantic cache
 
 The clustering substrate itself (gossip mesh, consistent-hash routing,
-leader election, federation, five service-discovery providers, and the
-distributed cache) is open source in `sbproxy-mesh`, and the single-node
+federation, five service-discovery providers, and the distributed
+cache) is open source in `sbproxy-mesh`, and the single-node
 semantic cache ships in the OSS AI gateway. The enterprise tier adds the
 cluster-distributed layer: LSH-bucketed embeddings shared across the
 cluster, cluster-wide purge propagation, and per-origin and per-model

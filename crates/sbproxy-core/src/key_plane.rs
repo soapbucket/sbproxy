@@ -619,21 +619,6 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     ));
     install_key_plane(plane);
 
-    // WOR-1563: with the mesh tier, install the per-key spend + rate CRDT
-    // counters. These are node-local writers today; the gossip dissemination
-    // that would make them coherent across the fleet is WOR-1887, still open.
-    // Fleet-wide caps need a shared backend until then.
-    if cfg.cache.tier == KeyCacheTier::Mesh {
-        let node_id = cfg
-            .cache
-            .mesh_node_id
-            .clone()
-            .unwrap_or_else(default_node_id);
-        crate::mesh_counters::install_mesh_counters(Arc::new(
-            crate::mesh_counters::MeshKeyCounters::new(node_id),
-        ));
-    }
-
     // Cross-replica invalidation: subscribe to the Redis channel so a peer's
     // mutation drops the matching local cache entry. Runs forever on the key
     // runtime, reconnecting on error.
