@@ -53,18 +53,20 @@ impl ValidatedRedisConnection {
 
     fn build(dsn: &str, tls: RedisTlsConfig) -> Result<Self> {
         let trimmed = dsn.trim();
+        let has_scheme = trimmed.contains("://");
+        anyhow::ensure!(has_scheme || !trimmed.contains('@'));
         let is_legacy = !trimmed.contains("://")
             && !trimmed.contains('/')
             && !trimmed.contains('?')
             && !trimmed.contains('#');
         let normalized = if is_legacy {
-            let bracketed = trimmed.starts_with('[') && trimmed.contains(']');
-            anyhow::ensure!(bracketed || trimmed.matches(':').count() <= 1);
+            validate_legacy_authority(trimmed)?;
             format!("redis://{trimmed}")
         } else {
             trimmed.to_string()
         };
 
+        validate_url_authority(&normalized)?;
         let parsed = Url::parse(&normalized)?;
         anyhow::ensure!(matches!(parsed.scheme(), "redis" | "rediss"));
         anyhow::ensure!(parsed.host().is_some());
@@ -136,6 +138,71 @@ impl ValidatedRedisConnection {
     }
 }
 
+fn validate_legacy_authority(authority: &str) -> Result<()> {
+    anyhow::ensure!(!authority.is_empty());
+
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let closing_bracket = bracketed
+            .find(']')
+            .ok_or_else(|| anyhow!(INVALID_CONNECTION))?;
+        anyhow::ensure!(closing_bracket > 0);
+        let suffix = &bracketed[closing_bracket + 1..];
+        if !suffix.is_empty() {
+            let port = suffix
+                .strip_prefix(':')
+                .ok_or_else(|| anyhow!(INVALID_CONNECTION))?;
+            validate_explicit_port(port)?;
+        }
+        return Ok(());
+    }
+
+    anyhow::ensure!(!authority.contains(['[', ']']));
+    match authority.split_once(':') {
+        Some((host, port)) => {
+            anyhow::ensure!(!host.is_empty() && !port.contains(':'));
+            validate_explicit_port(port)
+        }
+        None => Ok(()),
+    }
+}
+
+fn validate_url_authority(dsn: &str) -> Result<()> {
+    let (_, remainder) = dsn
+        .split_once("://")
+        .ok_or_else(|| anyhow!(INVALID_CONNECTION))?;
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    anyhow::ensure!(!authority.is_empty());
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_and_port)| host_and_port);
+    anyhow::ensure!(!host_and_port.is_empty());
+
+    if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        let closing_bracket = bracketed
+            .find(']')
+            .ok_or_else(|| anyhow!(INVALID_CONNECTION))?;
+        anyhow::ensure!(closing_bracket > 0);
+        let suffix = &bracketed[closing_bracket + 1..];
+        if !suffix.is_empty() {
+            let port = suffix
+                .strip_prefix(':')
+                .ok_or_else(|| anyhow!(INVALID_CONNECTION))?;
+            validate_explicit_port(port)?;
+        }
+    } else if let Some((host, port)) = host_and_port.rsplit_once(':') {
+        anyhow::ensure!(!host.is_empty());
+        validate_explicit_port(port)?;
+    }
+
+    Ok(())
+}
+
+fn validate_explicit_port(port: &str) -> Result<()> {
+    anyhow::ensure!(!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,11 +223,72 @@ mod tests {
             "localhost",
             "localhost:6380",
             "127.0.0.1:6379",
+            "[::1]",
             "[::1]:6379",
         ] {
             let config = ValidatedRedisConnection::new(input, RedisTlsConfig::default()).unwrap();
             assert!(!config.uses_tls());
         }
+    }
+
+    #[test]
+    fn rejects_schemeless_credentials_and_malformed_legacy_authorities() {
+        for input in [
+            "user:password@host",
+            ":password@host",
+            "@host",
+            "host@",
+            "[::1]suffix",
+            "[::1]suffix:6379",
+            "host:6379:6380",
+            "host::6379",
+        ] {
+            let error =
+                ValidatedRedisConnection::new(input, RedisTlsConfig::default()).unwrap_err();
+            assert_eq!(error.to_string(), "invalid Redis connection configuration");
+            assert_eq!(error.chain().count(), 1);
+        }
+    }
+
+    #[test]
+    fn rejects_empty_or_non_numeric_explicit_ports() {
+        for input in [
+            "localhost:",
+            "localhost:not-a-port",
+            "[::1]:",
+            "[::1]:not-a-port",
+            "redis://localhost:/7",
+            "redis://localhost:not-a-port/7",
+            "redis://default:secret@localhost:/7",
+            "redis://[::1]:/7",
+            "redis://[::1]:not-a-port/7",
+        ] {
+            let error =
+                ValidatedRedisConnection::new(input, RedisTlsConfig::default()).unwrap_err();
+            assert_eq!(error.to_string(), "invalid Redis connection configuration");
+            assert_eq!(error.chain().count(), 1);
+        }
+    }
+
+    #[test]
+    fn cloned_client_retains_auth_ipv6_port_and_database_selection() {
+        let connection = ValidatedRedisConnection::new(
+            "redis://acl-user:p%40ss%2Fword@[::1]:6380/7",
+            RedisTlsConfig::default(),
+        )
+        .unwrap();
+        let client = connection.client();
+        let info = client.get_connection_info();
+
+        let (host, port) = match &info.addr {
+            redis::ConnectionAddr::Tcp(host, port) => (host.as_str(), *port),
+            _ => panic!("expected a plaintext TCP Redis address"),
+        };
+        assert_eq!(host, "::1");
+        assert_eq!(port, 6380);
+        assert_eq!(info.redis.username.as_deref(), Some("acl-user"));
+        assert_eq!(info.redis.password.as_deref(), Some("p@ss/word"));
+        assert_eq!(info.redis.db, 7);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use redis::{
@@ -40,6 +40,108 @@ const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_EXPONENT_BASE: u64 = 2;
 const RECONNECT_DELAY_FACTOR_MS: u64 = 25;
 const RECONNECT_RETRIES: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+enum RedisErrorAction {
+    Connect,
+    ScriptLoad,
+    EvalSha,
+    EvalShaAfterReload,
+    Scan,
+    Get,
+    Set,
+    SetWithExpiry,
+    Incr,
+    Expire,
+    IncrBy,
+    Delete,
+}
+
+impl RedisErrorAction {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Connect => "connecting to Redis failed",
+            Self::ScriptLoad => "redis SCRIPT LOAD failed",
+            Self::EvalSha => "redis EVALSHA failed",
+            Self::EvalShaAfterReload => "redis EVALSHA failed after NOSCRIPT reload",
+            Self::Scan => "redis SCAN failed",
+            Self::Get => "redis GET failed",
+            Self::Set => "redis SET failed",
+            Self::SetWithExpiry => "redis SET EX failed",
+            Self::Incr => "redis INCR failed",
+            Self::Expire => "redis EXPIRE failed",
+            Self::IncrBy => "redis INCRBY failed",
+            Self::Delete => "redis DEL failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RedisErrorReason {
+    Timeout,
+    Transport,
+    Authentication,
+    Configuration,
+    ScriptUnavailable,
+    Command,
+}
+
+impl RedisErrorReason {
+    fn from_error(error: &redis::RedisError) -> Self {
+        if error.is_timeout() {
+            return Self::Timeout;
+        }
+        match error.kind() {
+            ErrorKind::IoError
+            | ErrorKind::Moved
+            | ErrorKind::Ask
+            | ErrorKind::TryAgain
+            | ErrorKind::ClusterDown
+            | ErrorKind::MasterDown
+            | ErrorKind::MasterNameNotFoundBySentinel
+            | ErrorKind::NoValidReplicasFoundBySentinel
+            | ErrorKind::EmptySentinelList
+            | ErrorKind::ClusterConnectionNotFound => Self::Transport,
+            ErrorKind::AuthenticationFailed => Self::Authentication,
+            ErrorKind::InvalidClientConfig => Self::Configuration,
+            ErrorKind::NoScriptError => Self::ScriptUnavailable,
+            _ => Self::Command,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Timeout => "Redis transport timed out",
+            Self::Transport => "Redis transport failed",
+            Self::Authentication => "Redis authentication failed",
+            Self::Configuration => "Redis client configuration failed",
+            Self::ScriptUnavailable => "Redis script unavailable",
+            Self::Command => "Redis command failed",
+        }
+    }
+}
+
+fn sanitize_redis_error(action: RedisErrorAction, error: &redis::RedisError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: {}",
+        action.message(),
+        RedisErrorReason::from_error(error).message()
+    )
+}
+
+enum RedisQueryError {
+    Connection(anyhow::Error),
+    Command(redis::RedisError),
+}
+
+impl RedisQueryError {
+    fn into_public_error(self, action: RedisErrorAction) -> anyhow::Error {
+        match self {
+            Self::Connection(error) => error,
+            Self::Command(error) => sanitize_redis_error(action, &error),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RedisTimeouts {
@@ -207,7 +309,7 @@ impl AsyncRedisKVStore {
                 self.timeouts.connect.as_millis()
             )
         })?
-        .context("connecting to Redis")?;
+        .map_err(|error| sanitize_redis_error(RedisErrorAction::Connect, &error))?;
         let candidate = CachedConnection {
             generation: self
                 .next_connection_generation
@@ -235,17 +337,14 @@ impl AsyncRedisKVStore {
         }
     }
 
-    async fn query_redis<T>(&self, command: &mut redis::Cmd) -> redis::RedisResult<T>
+    async fn query_redis<T>(
+        &self,
+        command: &mut redis::Cmd,
+    ) -> std::result::Result<T, RedisQueryError>
     where
         T: FromRedisValue,
     {
-        let mut cached = self.conn().await.map_err(|error| {
-            redis::RedisError::from((
-                ErrorKind::IoError,
-                "opening managed Redis connection",
-                error.to_string(),
-            ))
-        })?;
+        let mut cached = self.conn().await.map_err(RedisQueryError::Connection)?;
         let result = command.query_async(&mut cached.manager).await;
         if result
             .as_ref()
@@ -253,14 +352,16 @@ impl AsyncRedisKVStore {
         {
             self.invalidate_connection(cached.generation).await;
         }
-        result
+        result.map_err(RedisQueryError::Command)
     }
 
-    async fn query<T>(&self, command: &mut redis::Cmd, context: &'static str) -> Result<T>
+    async fn query<T>(&self, command: &mut redis::Cmd, action: RedisErrorAction) -> Result<T>
     where
         T: FromRedisValue,
     {
-        self.query_redis(command).await.context(context)
+        self.query_redis(command)
+            .await
+            .map_err(|error| error.into_public_error(action))
     }
 
     /// Execute a Lua script through `EVALSHA`, loading or reloading it as needed.
@@ -300,13 +401,13 @@ impl AsyncRedisKVStore {
 
         match self.evalsha(&script_hash, keys, args).await {
             Ok(value) => Ok(value),
-            Err(error) if error.kind() == ErrorKind::NoScriptError => {
+            Err(RedisQueryError::Command(error)) if error.kind() == ErrorKind::NoScriptError => {
                 let reloaded_hash = self.load_script(script_source).await?;
                 self.evalsha(&reloaded_hash, keys, args)
                     .await
-                    .context("redis EVALSHA failed after NOSCRIPT reload")
+                    .map_err(|error| error.into_public_error(RedisErrorAction::EvalShaAfterReload))
             }
-            Err(error) => Err(error).context("redis EVALSHA failed"),
+            Err(error) => Err(error.into_public_error(RedisErrorAction::EvalSha)),
         }
     }
 
@@ -314,7 +415,7 @@ impl AsyncRedisKVStore {
         let script_hash: String = self
             .query(
                 redis::cmd("SCRIPT").arg("LOAD").arg(script_source),
-                "redis SCRIPT LOAD failed",
+                RedisErrorAction::ScriptLoad,
             )
             .await?;
         self.script_hashes
@@ -329,7 +430,7 @@ impl AsyncRedisKVStore {
         script_hash: &str,
         keys: &[String],
         args: &[String],
-    ) -> redis::RedisResult<Vec<String>> {
+    ) -> std::result::Result<Vec<String>, RedisQueryError> {
         let mut command = redis::cmd("EVALSHA");
         command.arg(script_hash).arg(keys.len());
         for key in keys {
@@ -359,7 +460,7 @@ impl AsyncRedisKVStore {
                         .arg(pattern)
                         .arg("COUNT")
                         .arg(count),
-                    "redis SCAN failed",
+                    RedisErrorAction::Scan,
                 )
                 .await?;
             Ok(RedisScanPage { next_cursor, keys })
@@ -373,7 +474,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.with_operation_deadline("GET", async {
             let value: Option<Vec<u8>> = self
-                .query(redis::cmd("GET").arg(key), "redis GET failed")
+                .query(redis::cmd("GET").arg(key), RedisErrorAction::Get)
                 .await?;
             Ok(value.map(Bytes::from))
         })
@@ -382,7 +483,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
 
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.with_operation_deadline("SET", async {
-            self.query::<()>(redis::cmd("SET").arg(key).arg(value), "redis SET failed")
+            self.query::<()>(redis::cmd("SET").arg(key).arg(value), RedisErrorAction::Set)
                 .await?;
             Ok(())
         })
@@ -392,7 +493,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
     async fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl_secs: u64) -> Result<()> {
         self.with_operation_deadline("SET with TTL", async {
             if ttl_secs == 0 {
-                self.query::<()>(redis::cmd("SET").arg(key).arg(value), "redis SET failed")
+                self.query::<()>(redis::cmd("SET").arg(key).arg(value), RedisErrorAction::Set)
                     .await?;
             } else {
                 self.query::<()>(
@@ -401,7 +502,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
                         .arg(value)
                         .arg("EX")
                         .arg(ttl_secs),
-                    "redis SET EX failed",
+                    RedisErrorAction::SetWithExpiry,
                 )
                 .await?;
             }
@@ -419,12 +520,12 @@ impl AsyncKVStore for AsyncRedisKVStore {
             // TTL. If stricter atomicity is needed later, switch to a Lua
             // script via EVAL.
             let value: i64 = self
-                .query(redis::cmd("INCR").arg(key), "redis INCR failed")
+                .query(redis::cmd("INCR").arg(key), RedisErrorAction::Incr)
                 .await?;
             if ttl_secs > 0 {
                 self.query::<bool>(
                     redis::cmd("EXPIRE").arg(key).arg(ttl_secs),
-                    "redis EXPIRE failed",
+                    RedisErrorAction::Expire,
                 )
                 .await?;
             }
@@ -441,13 +542,13 @@ impl AsyncKVStore for AsyncRedisKVStore {
             let value: i64 = self
                 .query(
                     redis::cmd("INCRBY").arg(key).arg(amount),
-                    "redis INCRBY failed",
+                    RedisErrorAction::IncrBy,
                 )
                 .await?;
             if ttl_secs > 0 {
                 self.query::<bool>(
                     redis::cmd("EXPIRE").arg(key).arg(ttl_secs),
-                    "redis EXPIRE failed",
+                    RedisErrorAction::Expire,
                 )
                 .await?;
             }
@@ -458,7 +559,7 @@ impl AsyncKVStore for AsyncRedisKVStore {
 
     async fn delete(&self, key: &[u8]) -> Result<()> {
         self.with_operation_deadline("DEL", async {
-            self.query::<i64>(redis::cmd("DEL").arg(key), "redis DEL failed")
+            self.query::<i64>(redis::cmd("DEL").arg(key), RedisErrorAction::Delete)
                 .await?;
             Ok(())
         })
@@ -542,6 +643,37 @@ mod tests {
         AsyncRedisConfig::new("redis://localhost:6379/7")
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn redis_error_sanitization_drops_endpoint_bearing_source_chains() {
+        let source = redis::RedisError::from((
+            ErrorKind::IoError,
+            "TLS connection failed",
+            "rediss://sentinel-user:sentinel-password@sentinel-host.invalid:6380/7: \
+             certificate is not valid for 203.0.113.77; key sentinel-key; value sentinel-value"
+                .to_string(),
+        ));
+        assert!(source.to_string().contains("sentinel-host.invalid"));
+
+        let error = sanitize_redis_error(RedisErrorAction::Get, &source);
+        let rendered = format!("{error:#}");
+
+        assert_eq!(rendered, "redis GET failed: Redis transport failed");
+        assert_eq!(error.chain().count(), 1);
+        for forbidden in [
+            "sentinel-user",
+            "sentinel-password",
+            "sentinel-host",
+            "203.0.113.77",
+            "6380",
+            "/7",
+            "certificate",
+            "sentinel-key",
+            "sentinel-value",
+        ] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
     }
 
     #[test]
