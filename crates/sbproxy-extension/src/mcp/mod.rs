@@ -29,6 +29,7 @@ pub mod discovery;
 pub mod egress;
 pub mod federation;
 pub mod openapi_convert;
+pub mod quarantine;
 pub mod rest_to_mcp;
 /// Tool rollout plane: multiple live versions of one tool with
 /// per-consumer resolution (call `_meta`, session requirements,
