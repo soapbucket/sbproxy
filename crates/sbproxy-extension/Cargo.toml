@@ -81,6 +81,9 @@ tokio.workspace = true
 # HTTP client (for MCP upstream transports)
 reqwest.workspace = true
 
+# URL types for run-as-user token-exchange config (WOR-1792)
+url = { workspace = true, features = ["serde"] }
+
 # Lock-free atomic Arc swap (for federation tool registry)
 arc-swap.workspace = true
 

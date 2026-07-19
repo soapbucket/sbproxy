@@ -19,9 +19,11 @@
 //! - [`access_control`] - Principal-aware tool ACLs and per-tool quotas.
 //! - [`schema_drift`] / [`cassette_drift`] - CI drift detection (drift CLI).
 //! - [`egress`] - Deterministic allowlist for gateway-originated traffic.
+//! - [`auth`] - Run-as-user upstream credential minting (WOR-1792).
 //! - [`stdio`] - Supervised local stdio MCP transport.
 
 pub mod access_control;
+pub mod auth;
 pub mod cassette_drift;
 pub mod codemode_ts;
 pub mod compat;

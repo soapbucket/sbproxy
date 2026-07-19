@@ -410,6 +410,9 @@ fn cred_cache() -> &'static DashMap<String, CachedCred> {
 /// local format with no network round-trip, and caching a static secret
 /// across config reloads would risk staleness). Tokens whose endpoint
 /// reported no `expires_in` are not cached.
+///
+/// Prefer [`resolve_cached_isolated`] for run-as-user paths so tokens
+/// for user A are never served to user B when subject tokens collide.
 pub async fn resolve_cached(
     origin_id: &str,
     cfg: &OutboundCredentialConfig,
@@ -417,8 +420,24 @@ pub async fn resolve_cached(
     subject_token: Option<&str>,
     secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
 ) -> Result<MintedCredential> {
+    resolve_cached_isolated(origin_id, "", cfg, http, subject_token, secret_lookup, None).await
+}
+
+/// Like [`resolve_cached`], with an explicit non-secret `isolation_key`
+/// (delegation subject id / principal `sub`) in the cache key so
+/// distinct users never share a minted token entry. Also accepts an
+/// optional egress authorizer for token-endpoint HTTP.
+pub async fn resolve_cached_isolated(
+    origin_id: &str,
+    isolation_key: &str,
+    cfg: &OutboundCredentialConfig,
+    http: &reqwest::Client,
+    subject_token: Option<&str>,
+    secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
+    egress: Option<&EgressAuthorizer>,
+) -> Result<MintedCredential> {
     if matches!(cfg, OutboundCredentialConfig::VaultSecret(_)) {
-        return resolve(cfg, http, subject_token, secret_lookup).await;
+        return resolve_with_egress(cfg, http, subject_token, secret_lookup, egress).await;
     }
 
     let subject_fp = subject_token
@@ -427,7 +446,9 @@ pub async fn resolve_cached(
             hex::encode(Sha256::digest(t.as_bytes()))
         })
         .unwrap_or_default();
-    let key = format!("{origin_id}\u{0}{subject_fp}");
+    // isolation_key is a subject id, never a secret. Including it
+    // prevents cross-user cache hits when subject tokens collide.
+    let key = format!("{origin_id}\u{0}{isolation_key}\u{0}{subject_fp}");
 
     if let Some(entry) = cred_cache().get(&key) {
         if entry
@@ -439,7 +460,7 @@ pub async fn resolve_cached(
         }
     }
 
-    let cred = resolve(cfg, http, subject_token, secret_lookup).await?;
+    let cred = resolve_with_egress(cfg, http, subject_token, secret_lookup, egress).await?;
     // Cache only when the endpoint reported a lifetime; reuse it until
     // 30s before expiry to avoid serving a token that dies in flight.
     if let Some(secs) = cred.expires_in {
@@ -705,5 +726,93 @@ mod tests {
             format!("{err:#}").contains("UnlistedHost"),
             "expected UnlistedHost, got: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn cached_isolated_tokens_do_not_cross_users() {
+        // Two users share the same inbound subject token string. Without
+        // isolation_key in the cache key, user B would receive user A's
+        // minted credential. Serve distinct tokens per accept.
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "skipping outbound credential cache isolation test: loopback bind denied: {err}"
+                );
+                return;
+            }
+            Err(err) => panic!("failed to bind outbound credential test listener: {err}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for token in ["minted-for-a", "minted-for-b"] {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let mut buf = [0u8; 8192];
+                    let _ = s.read(&mut buf);
+                    let body = format!(
+                        r#"{{"access_token":"{token}","token_type":"Bearer","expires_in":3600}}"#
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let cfg = OutboundCredentialConfig::TokenExchange(TokenExchangeConfig {
+            token_endpoint: format!("http://127.0.0.1:{port}/token"),
+            audience: "https://api.example.com".to_string(),
+            scope: None,
+            subject_token_issuers: vec![],
+            allowed_audiences: vec![],
+            act_depth_cap: 4,
+            client_id: None,
+            client_secret: None,
+        });
+        let shared_subject = jwt(serde_json::json!({"iss": "https://issuer", "sub": "shared"}));
+        let http = reqwest::Client::new();
+        let a = resolve_cached_isolated(
+            "origin-1",
+            "user-a",
+            &cfg,
+            &http,
+            Some(&shared_subject),
+            &no_secret(),
+            None,
+        )
+        .await
+        .expect("user a mint");
+        let b = resolve_cached_isolated(
+            "origin-1",
+            "user-b",
+            &cfg,
+            &http,
+            Some(&shared_subject),
+            &no_secret(),
+            None,
+        )
+        .await
+        .expect("user b mint");
+        assert_eq!(a.header_value, "Bearer minted-for-a");
+        assert_eq!(b.header_value, "Bearer minted-for-b");
+        assert_ne!(a.header_value, b.header_value);
+
+        // Same isolation key must reuse the cached entry (no third accept).
+        let a_again = resolve_cached_isolated(
+            "origin-1",
+            "user-a",
+            &cfg,
+            &http,
+            Some(&shared_subject),
+            &no_secret(),
+            None,
+        )
+        .await
+        .expect("user a cache hit");
+        assert_eq!(a_again.header_value, a.header_value);
     }
 }
