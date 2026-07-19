@@ -179,9 +179,12 @@ Check:
 ## Redis shared state is degraded
 
 With `proxy.l2_cache_settings` on Redis, a runtime connection failure does not
-stop general traffic. Shared response cache and rate-limit state degrade to
-per-process behavior until Redis recovers. `summary_buffer` also fails open for
-the primary AI request, but it does not create worker-local summary state.
+stop general traffic. A response-cache lookup failure bypasses the cache and
+does not write that request's upstream response to an outage cache. A shared
+rate-limit operation failure admits the request fail-open instead of switching
+to a local bucket. `summary_buffer` also fails open for the primary AI request,
+but it does not create worker-local summary state. Other L2 consumers retain
+their feature-specific failure posture.
 
 Check:
 
@@ -201,9 +204,10 @@ Check:
   certificate, client key, username, and database as separate `redis-cli`
   options. Run `PING` or `DBSIZE`; do not run `KEYS`, `SCAN`, or `GET` during a
   privacy-sensitive incident.
-- Expected during an outage: rate-limit counters become node-local, and
-  response-cache entries written during the outage stay local. See
-  [degradation.md](degradation.md).
+- Expected during an outage: failed response-cache lookups fetch from the
+  upstream and do not arm cache write-back for that request. Failed shared
+  rate-limit increments admit the request without consulting a local bucket.
+  See [degradation.md](degradation.md).
 - Reconnection is automatic. Broken connections leave the pool, and a later
   operation opens a new connection. Fix Redis or the trust/authentication
   configuration, then send a new cache miss or shared-state operation. SBproxy
@@ -223,14 +227,22 @@ response:
 | `server` | Redis application errors, including a server-side `SELECT` rejection |
 | `protocol` | Invalid or unexpected Redis protocol data |
 
-Health logging is transition-based. The first failure from an unknown or
-healthy state is `WARN`, repeated failures are `DEBUG`, and the first successful
-operation after failure is `INFO`. Safe events look like this:
+The platform health events named `redis store health failed`,
+`redis store health remains failed`, and `redis store health recovered` are
+transition-based. The first failure from an unknown or healthy state is
+`WARN`, repeated platform health failures are `DEBUG`, and the first successful
+operation after failure is `INFO`. Safe platform events look like this:
 
 ```text
 WARN operation="get" reason="tls" redis store health failed
 INFO operation="get" redis store health recovered
 ```
+
+That `WARN` to `DEBUG` to `INFO` sequence applies only to the platform health
+events. Response-cache lookup, write, and invalidation call sites and the shared
+rate-limit increment call site can emit a separate `WARN` for every failed
+operation. Repeated consumer warnings do not mean that the platform transition
+suppression failed.
 
 The three Redis L2 metric families use only closed labels:
 
@@ -246,11 +258,14 @@ curl -fsS http://127.0.0.1:8080/metrics |
   values above and `pool_timeout`, `connect_timeout`, `command_timeout`, `tls`,
   `auth`, `transport`, `server`, or `protocol`.
 
-No Redis metric or transition log includes the endpoint, tenant, application
+No Redis metric or platform transition log includes the endpoint, tenant, application
 key, username, database, credential, certificate path, or free-form server
-error. Alert on connection errors or operation errors when running more than
-one replica because the application can continue while shared-state guarantees
-are degraded.
+error. Consumer warnings have their own fixed message text and are not governed
+by the platform transition cadence. Correlate them with the closed-label
+metrics; do not paste a DSN, expanded configuration, credential, cache key, or
+cache value into a diagnostic command or incident ticket. Alert on connection
+errors or operation errors when running more than one replica because the
+application can continue while shared-state guarantees are degraded.
 
 ## TLS handshake fails
 

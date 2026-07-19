@@ -19,5 +19,4 @@ origins:
       url: https://test.sbproxy.dev
     response_cache:
       enabled: true
-      ttl_seconds: 60
-      cache_control: false
+      ttl_secs: 60

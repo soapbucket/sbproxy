@@ -4064,7 +4064,7 @@ origins:
         requests_per_minute: 100
     response_cache:
       enabled: true
-      ttl_seconds: 300
+      ttl_secs: 300
 ```
 
 The messenger DSN above is intentionally shown separately. Do not add the L2

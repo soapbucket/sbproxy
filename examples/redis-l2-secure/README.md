@@ -115,8 +115,12 @@ zero in a fresh example.
 
 Stop the running SBproxy process with `Ctrl-C` before each probe. Configuration
 still validates because network establishment is intentionally lazy. The first
-cache operation triggers the connection failure and falls back to process-local
-cache behavior.
+cache operation triggers the connection failure, bypasses the cache, and
+continues to the upstream. A failed lookup does not arm response write-back, so
+that request does not create either a Redis entry or a process-local outage
+entry. This example does not enable rate limiting; when a configured shared
+rate-limit operation fails, SBproxy admits the request fail-open instead of
+switching to a local bucket.
 
 Start with the untrusted CA:
 
@@ -133,9 +137,11 @@ curl -fsS -o /dev/null -H 'Host: redis-l2.local' \
   'http://127.0.0.1:8080/get?redis_l2_secure=wrong-ca'
 ```
 
-The first Redis failure produces one content-free warning with `reason="tls"`.
-It contains no DSN, endpoint, database, key, value, certificate path, username,
-or password.
+The first Redis failure produces a platform `WARN` named
+`redis store health failed` with `reason="tls"`. That platform event contains no
+DSN, endpoint, database, key, value, certificate path, username, or password.
+The response-cache call site also emits `cache lookup error, bypassing cache` at
+`WARN` for the failed lookup.
 
 Stop that process, then start with the wrong password:
 
@@ -151,10 +157,14 @@ curl -fsS -o /dev/null -H 'Host: redis-l2.local' \
   'http://127.0.0.1:8080/get?redis_l2_secure=wrong-password'
 ```
 
-The transition warning uses `reason="auth"` and does not include the server's
-response text. Repeated failures stay at `DEBUG` until a successful operation
-moves the store back to healthy and emits one content-free `INFO` recovery
-event.
+The platform transition warning uses `reason="auth"` and does not include the
+server's response text. Repeated platform events named
+`redis store health remains failed` stay at `DEBUG` until a successful operation
+moves the store back to healthy and emits the `INFO` event
+`redis store health recovered`. Response-cache call sites can still emit their
+own `WARN` for every failed operation. Correlate those fixed messages with the
+closed-label metrics below; do not paste the expanded DSN, credentials, cache
+keys, or cache values into shell history or an incident ticket.
 
 ## Query the Redis L2 metrics
 
