@@ -360,10 +360,41 @@ The new levers use the existing bounded compression metrics and redacted
 summary event for invocation, outcome, reason, latency, before/after estimates,
 per-lever savings, and request-total savings.
 
+The primary monitoring metrics remain:
+
+- `sbproxy_ai_compression_lever_total` for per-lever outcomes and closed
+  reasons;
+- `sbproxy_ai_compression_tokens_total`,
+  `sbproxy_ai_compression_tokens_saved_total`, and
+  `sbproxy_ai_compression_ratio` for estimated token movement;
+- `sbproxy_ai_compression_duration_seconds` for per-lever latency;
+- `sbproxy_ai_compression_requests_total`,
+  `sbproxy_ai_compression_request_tokens_saved`, and
+  `sbproxy_ai_compression_request_levers_run` for the complete pipeline; and
+- `sbproxy_ai_compression_value_tokens_saved_total` and
+  `sbproxy_ai_compression_value_cost_saved_micros_total` for success-only
+  target-model value attribution.
+
+Existing Grafana queries group by the closed `lever` label, so the three new
+lever values appear without creating parallel metric families. Existing
+recording rules and alerts continue to cover request failure ratio, p95 lever
+latency, savings rate, and value-accounting gaps. The pull request updates the
+application-rate panel description from "strictly reducing transformation" to
+"committed transformation" because `position_reorder` can apply with zero
+savings. It does not create noisy per-lever alert copies.
+
 `rag_select` and `compact_serialization` feed the value ledger only when an
 applied result saves at least one token. `position_reorder` can record
 `applied` with zero savings and never creates an avoided-token or avoided-cost
 claim. No metric label contains marker-controlled text.
+
+Every executed non-empty pipeline also emits exactly one structured
+`ai_compression_summary` log. A fully skipped pipeline logs at `DEBUG`, an
+applied pipeline without failure logs at `INFO`, and any failed lever logs the
+request summary at `WARN`. The event contains only identities, closed outcomes,
+token estimates, savings, latency, cache-bypass state, and content-free lever
+configuration. It never contains query text, chunks, scores, marker IDs,
+request bodies, or credentials.
 
 The serialized policy behavior fingerprint includes every new config field.
 
