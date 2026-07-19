@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use futures::future::{BoxFuture, FutureExt, Shared};
 use futures::{stream, StreamExt};
@@ -167,6 +167,25 @@ pub trait DeploymentPreparer: Send + Sync {
     }
 }
 
+/// What the gateway needs to count and gate a request before forwarding it
+/// to a running local engine: the on-disk tokenizer for an exact prompt
+/// token count, and the served context window to reject an over-long prompt
+/// pre-flight instead of letting the engine fail opaquely (WOR-1671).
+#[derive(Debug, Clone)]
+pub struct ServingContext {
+    /// Path to the model's `tokenizer.json`, when it was fetched with the
+    /// model. `None` leaves the caller on its length-based estimate.
+    pub tokenizer_path: Option<std::path::PathBuf>,
+    /// Path to the model's `tokenizer_config.json`, which carries the Jinja
+    /// `chat_template`. Rendering it before counting matches the tokens the
+    /// engine actually sees; without it the caller counts message content
+    /// directly (a small, safe undercount).
+    pub tokenizer_config_path: Option<std::path::PathBuf>,
+    /// The served context window (the engine's `--max-model-len`): the
+    /// maximum prompt-plus-generation tokens this deployment accepts.
+    pub context_limit: u64,
+}
+
 /// One statically validated deployment generation that can be started and stopped.
 #[async_trait]
 pub trait PreparedDeploymentRuntime: Send + Sync {
@@ -177,6 +196,12 @@ pub trait PreparedDeploymentRuntime: Send + Sync {
     ) -> Result<crate::MemoryEstimate, RuntimeManagerError>;
     /// Acquire verified artifacts, provision the engine, and reach readiness.
     async fn start(&self, intent: PullIntent) -> Result<RunningEngine, RuntimeManagerError>;
+    /// The tokenizer and context window for a launched generation, once it
+    /// has reached readiness. `None` before launch or when the model
+    /// shipped no tokenizer; the request path then keeps its estimate.
+    fn serving_context(&self) -> Option<Arc<ServingContext>> {
+        None
+    }
     /// Check a generation that previously reached readiness.
     async fn health(
         &self,
@@ -2115,6 +2140,19 @@ impl ModelRuntimeManager {
         statuses
     }
 
+    /// The tokenizer and context window of a launched deployment, for the
+    /// gateway's pre-request token count and context-fit gate (WOR-1671).
+    /// Returns the first ready replica's context, or `None` when the
+    /// deployment is not running or shipped no tokenizer.
+    pub fn deployment_serving_context(&self, deployment: &str) -> Option<Arc<ServingContext>> {
+        self.snapshot
+            .load_full()
+            .slots
+            .get(deployment)?
+            .iter()
+            .find_map(|slot| slot.runtime.serving_context())
+    }
+
     /// Snapshot current per-device reservations for diagnostics and tests.
     pub async fn residency_reservations(&self) -> Vec<crate::DeviceReservation> {
         self.residency.lock().await.reservations()
@@ -3076,6 +3114,7 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             last_job_id: Mutex::new(None),
             activation: Mutex::new(None),
             supervisor: Mutex::new(supervisor),
+            serving_context: ArcSwapOption::empty(),
             _artifact_lease: artifact_lease,
         }))
     }
@@ -3199,6 +3238,9 @@ struct ProductionPreparedDeployment {
     last_job_id: Mutex<Option<String>>,
     activation: Mutex<Option<PreparedActivation>>,
     supervisor: Mutex<crate::EngineSupervisor>,
+    /// Tokenizer path and context window captured at launch for the
+    /// gateway's pre-request token count and context-fit gate (WOR-1671).
+    serving_context: ArcSwapOption<ServingContext>,
     _artifact_lease: crate::ArtifactLease,
 }
 
@@ -3411,7 +3453,19 @@ impl PreparedDeploymentRuntime for ProductionPreparedDeployment {
             Ordering::SeqCst,
         );
         let port = allocate_loopback_port()?;
-        supervisor
+        // Capture the tokenizer path and served context window before the
+        // artifact and fit move into the launch request, so the gateway can
+        // count prompt tokens exactly and gate over-long prompts (WOR-1671).
+        let serving_context = Arc::new(ServingContext {
+            tokenizer_path: ready
+                .file("tokenizer.json")
+                .map(std::path::Path::to_path_buf),
+            tokenizer_config_path: ready
+                .file("tokenizer_config.json")
+                .map(std::path::Path::to_path_buf),
+            context_limit: prepared.fit.seq_len,
+        });
+        let running = supervisor
             .ensure_ready(
                 &provisioned,
                 &LaunchRequest {
@@ -3431,7 +3485,13 @@ impl PreparedDeploymentRuntime for ProductionPreparedDeployment {
                 },
             )
             .await
-            .map_err(RuntimeManagerError::Engine)
+            .map_err(RuntimeManagerError::Engine)?;
+        self.serving_context.store(Some(serving_context));
+        Ok(running)
+    }
+
+    fn serving_context(&self) -> Option<Arc<ServingContext>> {
+        self.serving_context.load_full()
     }
 
     async fn health(&self, running: &RunningEngine) -> Result<EngineHealth, RuntimeManagerError> {

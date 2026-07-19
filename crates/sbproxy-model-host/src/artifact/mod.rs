@@ -377,6 +377,21 @@ impl ArtifactManager {
                     return Err(error);
                 }
             }
+
+            // Best-effort prefetch of the tokenizer and its config so the
+            // gateway can count prompt tokens against the model's own
+            // tokenizer, and (for a future raw-prompt engine) render its
+            // chat template. Some models ship neither; a miss just leaves
+            // the request path on its length heuristic, so a failure here
+            // is not fatal to the pull.
+            for optional in ["tokenizer.json", "tokenizer_config.json"] {
+                if let Ok(path) = self
+                    .ensure_legacy_file(&repo, &artifact.revision, optional, None, None)
+                    .await
+                {
+                    files.insert(optional.to_string(), path);
+                }
+            }
         }
 
         let hf_home = self.cache.root().join("hf-home");

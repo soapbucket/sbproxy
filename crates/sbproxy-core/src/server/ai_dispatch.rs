@@ -3913,6 +3913,46 @@ pub(super) async fn handle_ai_proxy(
                     ctx.managed_model_permit = Some(upstream.permit);
                     ctx.managed_route_class =
                         Some(sbproxy_ai::managed_replica::ManagedRouteClass::Local);
+
+                    // Pre-flight context-fit gate (WOR-1671): count the
+                    // prompt against the served model's own tokenizer and
+                    // refuse an over-context prompt with a legible error,
+                    // rather than forwarding a request the engine will only
+                    // reject after a full cold path. A model that shipped no
+                    // tokenizer, or a non-chat body, skips the gate.
+                    if let Some(messages) = body.get("messages").and_then(|value| value.as_array())
+                    {
+                        let deployment = ctx
+                            .managed_model_permit
+                            .as_ref()
+                            .map(|permit| permit.deployment().to_string());
+                        if let Some(fit) = deployment.and_then(|deployment| {
+                            crate::server::model_host::model_runtime_manager()
+                                .prompt_token_fit(&deployment, messages)
+                        }) {
+                            if !fit.fits() {
+                                warn!(
+                                    provider = %resolved_provider.name,
+                                    prompt_tokens = fit.tokens,
+                                    context_limit = fit.context_limit,
+                                    "AI proxy: refusing an over-context prompt for a local model"
+                                );
+                                let deny_body = serde_json::json!({
+                                    "error": {
+                                        "type": "context_length_exceeded",
+                                        "message": format!(
+                                            "prompt is {} tokens but the served model's context \
+                                             window is {}; shorten the prompt or messages",
+                                            fit.tokens, fit.context_limit
+                                        ),
+                                    }
+                                });
+                                let bytes = serde_json::to_vec(&deny_body).unwrap_or_default();
+                                send_response(session, 400, "application/json", &bytes).await?;
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
