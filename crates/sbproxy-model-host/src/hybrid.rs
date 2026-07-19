@@ -6,11 +6,15 @@
 //! Pure pieces that make the local lane feel like one array with the
 //! paid providers. [`savings_micros`] computes the dollars a local
 //! completion saved versus the cloud price it displaced, and
-//! [`LaneSplit`] tallies those savings per model. That is the number
-//! that justifies the GPU and feeds the value-delivered report.
+//! [`LaneSplit`] tallies those savings per model alongside target-model tokens
+//! and gross input cost avoided by context compression. Both dimensions feed
+//! the value-delivered report without conflating compression with a local or
+//! cloud completion.
 //!
 //! Deterministic and unit-tested here; the value recorder in
 //! `sbproxy-ai` persists these tallies and the admin API serves them.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -51,9 +55,34 @@ fn mul_div_round(a: u64, b: u64, denom: u64) -> u64 {
     (num / denom as u128) as u64
 }
 
-/// A running tally of local-versus-cloud outcomes for the value
-/// report: how many completions each lane served and the micro-USD
-/// saved by keeping the local ones off the paid API.
+/// Value delivered by one context-compression lever.
+///
+/// The token count comes from the target-model counter used by the
+/// compression runner. Cost is the gross target-model input cost avoided;
+/// internal summarizer spend remains a separate accounting stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressionValue {
+    /// Target-model input tokens avoided.
+    #[serde(default)]
+    pub tokens_saved: u64,
+    /// Gross target-model input cost avoided, in micro-USD.
+    #[serde(default)]
+    pub gross_cost_saved_micros: u64,
+}
+
+impl CompressionValue {
+    /// Add one applied compression result with saturating arithmetic.
+    pub fn record(&mut self, tokens_saved: u64, gross_cost_saved_micros: u64) {
+        self.tokens_saved = self.tokens_saved.saturating_add(tokens_saved);
+        self.gross_cost_saved_micros = self
+            .gross_cost_saved_micros
+            .saturating_add(gross_cost_saved_micros);
+    }
+}
+
+/// A running per-model tally for the value report: how many completions each
+/// lane served, the micro-USD saved by local serving, and independently the
+/// value delivered by each context-compression lever.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneSplit {
     /// Completions served locally.
@@ -64,6 +93,12 @@ pub struct LaneSplit {
     pub saved_micros: u64,
     /// Total micro-USD actually spent on the cloud lane.
     pub cloud_spent_micros: u64,
+    /// Context-compression value keyed by the closed lever name.
+    ///
+    /// Defaulting this additive field keeps redb rows written by earlier
+    /// releases readable.
+    #[serde(default)]
+    pub compression: BTreeMap<String, CompressionValue>,
 }
 
 impl LaneSplit {
@@ -88,6 +123,20 @@ impl LaneSplit {
         ));
     }
 
+    /// Record target-model tokens and gross input cost avoided by one
+    /// compression lever. This does not increment either completion lane.
+    pub fn record_compression(
+        &mut self,
+        lever: &str,
+        tokens_saved: u64,
+        gross_cost_saved_micros: u64,
+    ) {
+        self.compression
+            .entry(lever.to_string())
+            .or_default()
+            .record(tokens_saved, gross_cost_saved_micros);
+    }
+
     /// Fraction of completions served locally (0.0 when none yet).
     pub fn local_fraction(&self) -> f64 {
         let total = self.local_completions + self.cloud_completions;
@@ -102,6 +151,37 @@ impl LaneSplit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_lane_split_json_defaults_compression_value() {
+        let split: LaneSplit = serde_json::from_str(
+            r#"{"local_completions":2,"cloud_completions":1,"saved_micros":21000,"cloud_spent_micros":10500}"#,
+        )
+        .expect("legacy lane split decodes");
+
+        assert!(split.compression.is_empty());
+        assert_eq!(split.local_completions, 2);
+        assert_eq!(split.saved_micros, 21_000);
+    }
+
+    #[test]
+    fn compression_value_saturates_without_changing_lane_counts() {
+        let mut split = LaneSplit::default();
+        split.record_compression("window_fit", u64::MAX, u64::MAX - 1);
+        split.record_compression("window_fit", 42, 42);
+        split.record_compression("summary_buffer", 7, 3);
+
+        assert_eq!(split.local_completions, 0);
+        assert_eq!(split.cloud_completions, 0);
+        assert_eq!(split.saved_micros, 0);
+        assert_eq!(split.cloud_spent_micros, 0);
+        assert_eq!(split.compression["window_fit"].tokens_saved, u64::MAX);
+        assert_eq!(
+            split.compression["window_fit"].gross_cost_saved_micros,
+            u64::MAX
+        );
+        assert_eq!(split.compression["summary_buffer"].tokens_saved, 7);
+    }
 
     #[test]
     fn savings_matches_cloud_price() {

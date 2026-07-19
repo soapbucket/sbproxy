@@ -65,6 +65,8 @@ pub mod compression_metrics;
 pub mod compression_runtime;
 /// External Redis and mesh adapters for AI compression session state.
 pub mod compression_store;
+/// Success-path bridge for prompt-free, per-lever AI compression value.
+pub mod compression_value;
 pub mod context;
 pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.

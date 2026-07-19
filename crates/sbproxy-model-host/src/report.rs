@@ -6,14 +6,15 @@
 //! The headline number that justifies the GPU: what the equivalent
 //! hosted API would have charged for every completion served locally
 //! at near-zero marginal cost, alongside what the cloud lane actually
-//! cost. This aggregates the per-model [`crate::hybrid::LaneSplit`]
-//! counters (WOR-1657) into a report the admin API can serve as JSON,
-//! Prometheus, or CSV. Pure aggregation and formatting; wiring it to an
-//! admin-API route is the runtime half.
+//! cost. This aggregates the per-model [`crate::hybrid::LaneSplit`] counters
+//! into a report that keeps local-serving value and context-compression value
+//! separate. The admin API can serve it as JSON, Prometheus, or CSV. Pure
+//! aggregation and formatting; wiring it to an admin-API route is the runtime
+//! half.
 
 use std::collections::BTreeMap;
 
-use crate::hybrid::LaneSplit;
+use crate::hybrid::{CompressionValue, LaneSplit};
 
 /// One model's line in the value report.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -30,7 +31,20 @@ pub struct ModelValue {
     pub cloud_spent_micros: u64,
 }
 
-/// The aggregate value-delivered report across all local models.
+/// One model and compression lever's contribution to the value report.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelCompressionValue {
+    /// Target model whose input tokens were avoided.
+    pub model: String,
+    /// Closed compression lever name.
+    pub lever: String,
+    /// Target-model input tokens avoided.
+    pub tokens_saved: u64,
+    /// Gross target-model input cost avoided, in micro-USD.
+    pub gross_cost_saved_micros: u64,
+}
+
+/// The aggregate value-delivered report across all target models.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ValueReport {
     /// Per-model lines, sorted by model name for a stable rendering.
@@ -43,6 +57,15 @@ pub struct ValueReport {
     pub total_local_completions: u64,
     /// Total cloud completions.
     pub total_cloud_completions: u64,
+    /// Per-model, per-lever compression value in stable model/lever order.
+    pub compression: Vec<ModelCompressionValue>,
+    /// Aggregate compression value keyed by the closed lever name.
+    pub compression_totals: BTreeMap<String, CompressionValue>,
+    /// Total target-model input tokens avoided by compression.
+    pub total_compression_tokens_saved: u64,
+    /// Total gross target-model input cost avoided by compression, in
+    /// micro-USD.
+    pub total_compression_gross_cost_saved_micros: u64,
 }
 
 impl ValueReport {
@@ -61,6 +84,25 @@ impl ValueReport {
             report.total_cloud_completions = report
                 .total_cloud_completions
                 .saturating_add(split.cloud_completions);
+            for (lever, value) in &split.compression {
+                report.total_compression_tokens_saved = report
+                    .total_compression_tokens_saved
+                    .saturating_add(value.tokens_saved);
+                report.total_compression_gross_cost_saved_micros = report
+                    .total_compression_gross_cost_saved_micros
+                    .saturating_add(value.gross_cost_saved_micros);
+                report
+                    .compression_totals
+                    .entry(lever.clone())
+                    .or_default()
+                    .record(value.tokens_saved, value.gross_cost_saved_micros);
+                report.compression.push(ModelCompressionValue {
+                    model: model.clone(),
+                    lever: lever.clone(),
+                    tokens_saved: value.tokens_saved,
+                    gross_cost_saved_micros: value.gross_cost_saved_micros,
+                });
+            }
             report.models.push(ModelValue {
                 model: model.clone(),
                 local_completions: split.local_completions,
@@ -92,16 +134,28 @@ impl ValueReport {
     /// API also serves JSON and Prometheus; this is the tabular form.
     pub fn to_csv(&self) -> String {
         let mut out = String::from(
-            "model,local_completions,cloud_completions,saved_micros,cloud_spent_micros\n",
+            "model,local_completions,cloud_completions,saved_micros,cloud_spent_micros,compression_tokens_saved,compression_gross_cost_saved_micros\n",
         );
         for m in &self.models {
+            let (compression_tokens_saved, compression_cost_saved_micros) = self
+                .compression
+                .iter()
+                .filter(|value| value.model == m.model)
+                .fold((0_u64, 0_u64), |(tokens, cost), value| {
+                    (
+                        tokens.saturating_add(value.tokens_saved),
+                        cost.saturating_add(value.gross_cost_saved_micros),
+                    )
+                });
             out.push_str(&format!(
-                "{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{}\n",
                 m.model,
                 m.local_completions,
                 m.cloud_completions,
                 m.saved_micros,
-                m.cloud_spent_micros
+                m.cloud_spent_micros,
+                compression_tokens_saved,
+                compression_cost_saved_micros,
             ));
         }
         out
@@ -171,5 +225,58 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert!(lines[0].starts_with("model,local_completions"));
         assert_eq!(lines.len(), 3); // header + 2 models
+    }
+
+    #[test]
+    fn exposes_per_model_and_aggregate_compression_value() {
+        let mut a = LaneSplit::default();
+        a.record_compression("window_fit", 100, 40);
+        a.record_compression("summary_buffer", 50, 25);
+        let mut b = LaneSplit::default();
+        b.record_compression("window_fit", 200, 80);
+
+        let report = ValueReport::from_lanes(&BTreeMap::from([
+            ("alpha".to_string(), a),
+            ("beta".to_string(), b),
+        ]));
+
+        assert_eq!(report.compression.len(), 3);
+        assert_eq!(report.compression[0].model, "alpha");
+        assert_eq!(report.compression[0].lever, "summary_buffer");
+        assert_eq!(report.compression[1].lever, "window_fit");
+        assert_eq!(report.compression[2].model, "beta");
+        assert_eq!(report.compression_totals["window_fit"].tokens_saved, 300);
+        assert_eq!(
+            report.compression_totals["window_fit"].gross_cost_saved_micros,
+            120
+        );
+        assert_eq!(report.total_compression_tokens_saved, 350);
+        assert_eq!(report.total_compression_gross_cost_saved_micros, 145);
+        assert_eq!(report.total_local_completions, 0);
+        assert_eq!(report.total_cloud_completions, 0);
+
+        let json = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(json["compression"][0]["model"], "alpha");
+        assert_eq!(json["compression"][0]["lever"], "summary_buffer");
+        assert_eq!(
+            json["compression_totals"]["window_fit"]["tokens_saved"],
+            300
+        );
+        assert_eq!(json["total_compression_tokens_saved"], 350);
+    }
+
+    #[test]
+    fn csv_adds_compression_totals_without_dynamic_columns() {
+        let mut split = LaneSplit::default();
+        split.record_compression("window_fit", 123, 45);
+        split.record_compression("summary_buffer", 7, 5);
+
+        let csv = ValueReport::from_lanes(&BTreeMap::from([("m".to_string(), split)])).to_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "model,local_completions,cloud_completions,saved_micros,cloud_spent_micros,compression_tokens_saved,compression_gross_cost_saved_micros"
+        );
+        assert_eq!(lines[1], "m,0,0,0,0,130,50");
     }
 }

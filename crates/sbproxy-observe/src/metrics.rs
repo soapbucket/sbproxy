@@ -252,6 +252,14 @@ pub struct ProxyMetrics {
     /// Counter `sbproxy_ai_cost_saved_micros_total` of micro-USD a
     /// semantic-cache hit avoided, labelled by tenant, origin, and model.
     pub ai_cost_saved_micros: IntCounterVec,
+    /// Counter `sbproxy_ai_compression_value_tokens_saved_total` of
+    /// target-model input tokens avoided by successful compression, labelled
+    /// by tenant, origin, model, and closed lever.
+    pub ai_compression_value_tokens_saved: IntCounterVec,
+    /// Counter `sbproxy_ai_compression_value_cost_saved_micros_total` of gross
+    /// target-model input cost avoided by successful compression, labelled by
+    /// tenant, origin, model, and closed lever.
+    pub ai_compression_value_cost_saved_micros: IntCounterVec,
 
     // --- Agent detection (WOR-592) ---
     /// Counter `sbproxy_agent_detect_total` of agent-detect scorer
@@ -439,6 +447,24 @@ impl ProxyMetrics {
                 "Micro-USD avoided by a semantic-cache hit",
             ),
             &["tenant", "origin", "model"],
+        )
+        .unwrap();
+
+        let ai_compression_value_tokens_saved = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_ai_compression_value_tokens_saved_total",
+                "Target-model input tokens avoided by successful context compression",
+            ),
+            &["tenant_id", "origin", "model", "lever"],
+        )
+        .unwrap();
+
+        let ai_compression_value_cost_saved_micros = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_ai_compression_value_cost_saved_micros_total",
+                "Gross target-model input cost avoided by successful context compression, in micro-USD",
+            ),
+            &["tenant_id", "origin", "model", "lever"],
         )
         .unwrap();
 
@@ -673,6 +699,12 @@ impl ProxyMetrics {
             .register(Box::new(ai_cost_saved_micros.clone()))
             .unwrap();
         registry
+            .register(Box::new(ai_compression_value_tokens_saved.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ai_compression_value_cost_saved_micros.clone()))
+            .unwrap();
+        registry
             .register(Box::new(agent_detect_total.clone()))
             .unwrap();
         registry
@@ -737,6 +769,8 @@ impl ProxyMetrics {
             inference_duration,
             ai_tokens_saved,
             ai_cost_saved_micros,
+            ai_compression_value_tokens_saved,
+            ai_compression_value_cost_saved_micros,
             agent_detect_total,
             agent_detect_score,
             agent_detect_inference_seconds,
@@ -1170,6 +1204,49 @@ pub fn record_cache_savings(
             .ai_cost_saved_micros
             .with_label_values(&[tenant.as_str(), origin.as_str(), model.as_str()])
             .inc_by(cost_micros);
+    }
+}
+
+/// Record per-lever value delivered by successful AI context compression.
+///
+/// `lever` is accepted only from the closed production set. Unknown values and
+/// records without positive token savings are not emitted. A positive token
+/// result may have zero cost after micro-USD rounding. Tenant, origin, and
+/// model labels pass through the bounded cardinality limiter; prompt and
+/// summary content never enter this interface.
+pub fn record_compression_value(
+    tenant_id: &str,
+    origin: &str,
+    model: &str,
+    lever: &str,
+    tokens_saved: u64,
+    gross_cost_saved_micros: u64,
+) {
+    const METRIC: &str = "sbproxy_ai_compression_value_tokens_saved_total";
+
+    if tokens_saved == 0 {
+        return;
+    }
+    let lever = match lever {
+        "summary_buffer" => "summary_buffer",
+        "window_fit" => "window_fit",
+        _ => return,
+    };
+    let tenant_id = sanitize_label_budget(METRIC, "tenant_id", tenant_id);
+    let origin = sanitize_label_budget_tenant(METRIC, "origin", origin, &tenant_id);
+    let model = sanitize_label_budget_tenant(METRIC, "model", model, &tenant_id);
+    let labels = [tenant_id.as_str(), origin.as_str(), model.as_str(), lever];
+    if tokens_saved > 0 {
+        metrics()
+            .ai_compression_value_tokens_saved
+            .with_label_values(&labels)
+            .inc_by(tokens_saved);
+    }
+    if gross_cost_saved_micros > 0 {
+        metrics()
+            .ai_compression_value_cost_saved_micros
+            .with_label_values(&labels)
+            .inc_by(gross_cost_saved_micros);
     }
 }
 
@@ -3718,6 +3795,12 @@ mod tests {
         m.ai_cost_saved_micros
             .with_label_values(&["acme", "o", "gpt-4o"])
             .inc_by(900);
+        m.ai_compression_value_tokens_saved
+            .with_label_values(&["acme", "o", "gpt-4o", "window_fit"])
+            .inc_by(120);
+        m.ai_compression_value_cost_saved_micros
+            .with_label_values(&["acme", "o", "gpt-4o", "window_fit"])
+            .inc_by(900);
         m.agent_detect_total
             .with_label_values(&["claude-code-cli", "unsigned-named"])
             .inc();
@@ -3735,6 +3818,8 @@ mod tests {
             "sbproxy_inference_duration_seconds",
             "sbproxy_ai_tokens_saved_total",
             "sbproxy_ai_cost_saved_micros_total",
+            "sbproxy_ai_compression_value_tokens_saved_total",
+            "sbproxy_ai_compression_value_cost_saved_micros_total",
             "sbproxy_agent_detect_total",
             "sbproxy_agent_detect_score",
             "sbproxy_agent_detect_inference_seconds",
@@ -3744,6 +3829,38 @@ mod tests {
                 "missing metric {expected}"
             );
         }
+    }
+
+    #[test]
+    fn compression_value_records_positive_closed_levers_only() {
+        let before = metrics()
+            .ai_compression_value_tokens_saved
+            .with_label_values(&["tenant-a", "origin-a", "gpt-4o", "window_fit"])
+            .get();
+        let before_cost = metrics()
+            .ai_compression_value_cost_saved_micros
+            .with_label_values(&["tenant-a", "origin-a", "gpt-4o", "window_fit"])
+            .get();
+
+        record_compression_value("tenant-a", "origin-a", "gpt-4o", "window_fit", 120, 900);
+        record_compression_value("tenant-a", "origin-a", "gpt-4o", "not-a-lever", 50, 50);
+        record_compression_value("tenant-a", "origin-a", "gpt-4o", "window_fit", 0, 0);
+        record_compression_value("tenant-a", "origin-a", "gpt-4o", "window_fit", 0, 50);
+
+        assert_eq!(
+            metrics()
+                .ai_compression_value_tokens_saved
+                .with_label_values(&["tenant-a", "origin-a", "gpt-4o", "window_fit"])
+                .get(),
+            before + 120
+        );
+        assert_eq!(
+            metrics()
+                .ai_compression_value_cost_saved_micros
+                .with_label_values(&["tenant-a", "origin-a", "gpt-4o", "window_fit"])
+                .get(),
+            before_cost + 900
+        );
     }
 
     #[test]

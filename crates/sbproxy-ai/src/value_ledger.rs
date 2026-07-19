@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Per-completion local-vs-cloud savings recorder (WOR-1913).
+//! Per-model value recorder for local serving and context compression.
 //!
 //! When a served model declares a `reference:` cloud price (see
 //! `sbproxy_model_host::config::ReferenceModel`), every completion it
@@ -11,23 +11,27 @@
 //! usage event stream into a durable, per-served-model
 //! [`sbproxy_model_host::LaneSplit`] tally so the admin value route can
 //! report dollars saved per model and the number survives a restart.
+//! Successful context-compression requests add prompt-free, per-lever target
+//! token and gross avoided-input-cost totals to the same report without
+//! changing the local or cloud completion counts.
 //!
 //! ## Shape
 //!
-//! [`ValueLedger`] stores one `LaneSplit` per served model in a redb
-//! database (the workspace embedded KV store), keyed by the served model
-//! name. An empty path selects an in-memory backend for tests and for
-//! setups that want the recorder without a file. [`ValueSink`] is the
-//! [`UsageSink`] that folds each finished
-//! request into the ledger when its served model has a configured
-//! reference price.
+//! [`ValueLedger`] stores one `LaneSplit` per target model, keyed by model
+//! name. A configured model-host cache uses redb, the workspace embedded KV
+//! store. An empty path selects an in-memory backend for tests and
+//! compression-only setups. [`ValueSink`] is the [`UsageSink`] that folds each
+//! finished local completion into the ledger when its served model has a
+//! configured reference price.
 //!
-//! ## Only the local lane, for now
+//! ## Independent value dimensions
 //!
-//! This pass records only local completions (a served model with a
-//! reference). Cloud-spill attribution, the other lane of the report, is
-//! left as follow-up so the number the value route shows is exactly the
-//! dollars a configured local model saved, never a guessed cloud figure.
+//! [`ValueSink`] records local completions only when a served model declares a
+//! cloud reference. Cloud-spill attribution remains a follow-up. Compression
+//! value is recorded separately after terminal provider success using the
+//! target model's configured, catalog, or conservative fallback input price.
+//! It never fabricates a local completion or folds internal summarizer spend
+//! into the gross avoided-cost value.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -38,13 +42,14 @@ use redb::{Database, ReadableTable, TableDefinition};
 
 use sbproxy_model_host::{CloudPrice, LaneSplit, ModelHostConfig, ValueReport};
 
+use crate::compression::{CompressionRun, LeverKind, LeverOutcome};
 use crate::usage_sink::{LlmUsageEvent, UsageSink};
 
 /// redb table: served model name -> JSON-encoded [`LaneSplit`].
 const LANES: TableDefinition<&str, &[u8]> = TableDefinition::new("value_lanes_v1");
 
-/// The process-wide value ledger, set once when a `serve:` block
-/// configured reference prices so the admin value route can read it.
+/// The process-wide value ledger, set once for local-serving or compression
+/// value so the admin value route can read it.
 static VALUE_LEDGER: OnceLock<Arc<ValueLedger>> = OnceLock::new();
 
 /// Register the process-wide value ledger. Called once at boot when the
@@ -55,11 +60,132 @@ pub fn set_value_ledger(ledger: Arc<ValueLedger>) -> Result<(), &'static str> {
         .map_err(|_| "value ledger already set")
 }
 
-/// The process-wide value ledger, when the value recorder is active. The
-/// admin value route reads this; `None` means no reference prices were
-/// configured, which is the honest empty-report answer.
+/// The process-wide value ledger, when a value recorder is active. The admin
+/// value route reads this; `None` means no local-serving or compression value
+/// has been recorded, which is the honest empty-report answer.
 pub fn value_ledger() -> Option<Arc<ValueLedger>> {
     VALUE_LEDGER.get().cloned()
+}
+
+/// Return the process-wide ledger, installing an in-memory ledger when no
+/// durable model-host ledger was configured.
+///
+/// Compression-only deployments use this path so the admin value response is
+/// populated without creating worker-local durable state. Callers should
+/// initialize configured usage sinks before this function so a declared
+/// model-host cache directory retains precedence.
+pub fn value_ledger_or_init_memory() -> Arc<ValueLedger> {
+    VALUE_LEDGER
+        .get_or_init(|| Arc::new(ValueLedger::memory()))
+        .clone()
+}
+
+/// Prompt-free target-model savings waiting for a terminal provider success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCompressionValue {
+    target_model: String,
+    levers: Vec<PendingCompressionLeverValue>,
+}
+
+impl PendingCompressionValue {
+    /// Build pending value from applied levers with positive target-model
+    /// token savings. Skips, failures, and zero-savings outcomes are omitted.
+    pub fn from_run(target_model: impl Into<String>, run: &CompressionRun) -> Option<Self> {
+        let levers = run
+            .lever_results
+            .iter()
+            .filter(|result| {
+                matches!(result.outcome, LeverOutcome::Applied) && result.tokens_saved > 0
+            })
+            .map(|result| PendingCompressionLeverValue {
+                lever: result.lever,
+                tokens_saved: result.tokens_saved,
+            })
+            .collect::<Vec<_>>();
+        (!levers.is_empty()).then(|| Self {
+            target_model: target_model.into(),
+            levers,
+        })
+    }
+
+    /// Target model used by the compression runner's token counter and by
+    /// avoided-input-cost pricing.
+    pub fn target_model(&self) -> &str {
+        &self.target_model
+    }
+
+    /// Applied positive per-lever token savings in pipeline order.
+    pub fn levers(&self) -> &[PendingCompressionLeverValue] {
+        &self.levers
+    }
+
+    /// Price every per-lever saving as gross avoided input cost for the target
+    /// model. This is intended for the terminal provider-success path.
+    pub fn priced_records(&self) -> Vec<CompressionValueRecord> {
+        self.levers
+            .iter()
+            .map(|pending| CompressionValueRecord {
+                lever: pending.lever,
+                tokens_saved: pending.tokens_saved,
+                gross_cost_saved_micros: estimated_input_cost_micros(
+                    &self.target_model,
+                    pending.tokens_saved,
+                ),
+            })
+            .collect()
+    }
+}
+
+/// One applied lever's target-model token saving, before success-time pricing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCompressionLeverValue {
+    lever: LeverKind,
+    tokens_saved: u64,
+}
+
+impl PendingCompressionLeverValue {
+    /// Closed compression lever.
+    pub fn lever(&self) -> LeverKind {
+        self.lever
+    }
+
+    /// Target-model input tokens avoided.
+    pub fn tokens_saved(&self) -> u64 {
+        self.tokens_saved
+    }
+}
+
+/// Success-time compression value ready for the ledger and metrics surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionValueRecord {
+    lever: LeverKind,
+    tokens_saved: u64,
+    gross_cost_saved_micros: u64,
+}
+
+impl CompressionValueRecord {
+    /// Closed compression lever.
+    pub fn lever(&self) -> LeverKind {
+        self.lever
+    }
+
+    /// Target-model input tokens avoided.
+    pub fn tokens_saved(&self) -> u64 {
+        self.tokens_saved
+    }
+
+    /// Gross target-model input cost avoided, in micro-USD.
+    pub fn gross_cost_saved_micros(&self) -> u64 {
+        self.gross_cost_saved_micros
+    }
+}
+
+fn estimated_input_cost_micros(model: &str, tokens: u64) -> u64 {
+    let micros = crate::budget::estimate_cost(model, tokens, 0) * 1_000_000.0;
+    if !micros.is_finite() || micros <= 0.0 {
+        return 0;
+    }
+    micros.round().min(u64::MAX as f64) as u64
 }
 
 /// Where the ledger keeps its per-model tallies.
@@ -70,7 +196,7 @@ enum Backend {
     Memory(parking_lot::Mutex<BTreeMap<String, LaneSplit>>),
 }
 
-/// A durable per-served-model local-vs-cloud savings tally.
+/// A per-model local-serving and context-compression value tally.
 pub struct ValueLedger {
     backend: Backend,
 }
@@ -93,9 +219,7 @@ impl ValueLedger {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         if path.as_os_str().is_empty() {
-            return Ok(Self {
-                backend: Backend::Memory(parking_lot::Mutex::new(BTreeMap::new())),
-            });
+            return Ok(Self::memory());
         }
         let db = Database::create(path)
             .with_context(|| format!("open value ledger at {}", path.display()))?;
@@ -108,6 +232,12 @@ impl ValueLedger {
         Ok(Self {
             backend: Backend::Redb(db),
         })
+    }
+
+    fn memory() -> Self {
+        Self {
+            backend: Backend::Memory(parking_lot::Mutex::new(BTreeMap::new())),
+        }
     }
 
     /// Record one completion served locally for `model`, adding the cloud
@@ -133,12 +263,43 @@ impl ValueLedger {
         completion_tokens: u64,
         price: CloudPrice,
     ) -> anyhow::Result<()> {
+        self.try_update_lane(model, |split| {
+            split.record_local(prompt_tokens, completion_tokens, price);
+        })
+    }
+
+    /// Record target-model input value delivered by one applied compression
+    /// lever. The operation is best effort and never changes local or cloud
+    /// completion counts.
+    pub fn record_compression(
+        &self,
+        model: &str,
+        lever: LeverKind,
+        tokens_saved: u64,
+        gross_cost_saved_micros: u64,
+    ) {
+        if tokens_saved == 0 {
+            return;
+        }
+        if let Err(error) = self.try_update_lane(model, |split| {
+            split.record_compression(lever.as_str(), tokens_saved, gross_cost_saved_micros);
+        }) {
+            tracing::warn!(
+                error = %error,
+                lever = lever.as_str(),
+                "value ledger: record_compression failed"
+            );
+        }
+    }
+
+    fn try_update_lane(
+        &self,
+        model: &str,
+        update: impl FnOnce(&mut LaneSplit),
+    ) -> anyhow::Result<()> {
         match &self.backend {
             Backend::Memory(map) => {
-                map.lock()
-                    .entry(model.to_string())
-                    .or_default()
-                    .record_local(prompt_tokens, completion_tokens, price);
+                update(map.lock().entry(model.to_string()).or_default());
                 Ok(())
             }
             Backend::Redb(db) => {
@@ -159,7 +320,7 @@ impl ValueLedger {
                         }
                         None => LaneSplit::default(),
                     };
-                    split.record_local(prompt_tokens, completion_tokens, price);
+                    update(&mut split);
                     let encoded =
                         serde_json::to_vec(&split).context("value ledger: encode lane")?;
                     table
@@ -282,6 +443,10 @@ impl UsageSink for ValueSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::{
+        CompressionRun, FailureReason, LeverKind, LeverOutcome, LeverResult, SkipReason,
+    };
+    use std::time::Duration;
 
     fn cloud() -> CloudPrice {
         CloudPrice {
@@ -377,5 +542,135 @@ mod tests {
         let (reference_model, price) = references.get("qwen").expect("qwen reference");
         assert_eq!(reference_model, "gpt-4o");
         assert_eq!(price.completion_micros_per_mtok, 15_000_000);
+    }
+
+    fn lever_result(lever: LeverKind, outcome: LeverOutcome, tokens_saved: u64) -> LeverResult {
+        LeverResult {
+            lever,
+            backend: None,
+            outcome,
+            before_tokens: tokens_saved.saturating_add(10),
+            after_tokens: 10,
+            tokens_saved,
+            duration: Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn pending_value_keeps_only_applied_positive_levers_and_prices_target_model() {
+        let run = CompressionRun {
+            messages: Vec::new(),
+            initial_tokens: 1_050_010,
+            final_tokens: 10,
+            tokens_saved: 1_050_000,
+            lever_results: vec![
+                lever_result(LeverKind::WindowFit, LeverOutcome::Applied, 1_000_000),
+                lever_result(LeverKind::SummaryBuffer, LeverOutcome::Applied, 50_000),
+                lever_result(
+                    LeverKind::WindowFit,
+                    LeverOutcome::Skipped {
+                        reason: SkipReason::NoSavings,
+                    },
+                    0,
+                ),
+                lever_result(
+                    LeverKind::SummaryBuffer,
+                    LeverOutcome::Failed {
+                        reason: FailureReason::Internal,
+                    },
+                    25,
+                ),
+            ],
+        };
+
+        let pending = PendingCompressionValue::from_run("wor-1921-unpriced-test-model", &run)
+            .expect("positive applied outcomes create pending value");
+        assert_eq!(pending.target_model(), "wor-1921-unpriced-test-model");
+        assert_eq!(pending.levers().len(), 2);
+        assert_eq!(pending.levers()[0].tokens_saved(), 1_000_000);
+
+        let records = pending.priced_records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].lever(), LeverKind::WindowFit);
+        assert_eq!(records[0].gross_cost_saved_micros(), 5_000_000);
+        assert_eq!(records[1].gross_cost_saved_micros(), 250_000);
+    }
+
+    #[test]
+    fn pending_value_is_absent_for_skips_failures_and_zero_savings() {
+        let run = CompressionRun {
+            messages: Vec::new(),
+            initial_tokens: 10,
+            final_tokens: 10,
+            tokens_saved: 0,
+            lever_results: vec![
+                lever_result(
+                    LeverKind::WindowFit,
+                    LeverOutcome::Skipped {
+                        reason: SkipReason::NotNeeded,
+                    },
+                    0,
+                ),
+                lever_result(
+                    LeverKind::SummaryBuffer,
+                    LeverOutcome::Failed {
+                        reason: FailureReason::Internal,
+                    },
+                    2,
+                ),
+            ],
+        };
+
+        assert!(PendingCompressionValue::from_run("gpt-4o-mini", &run).is_none());
+    }
+
+    #[test]
+    fn compression_value_survives_reopen_without_completion_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("compression-value.redb");
+        {
+            let ledger = ValueLedger::open(&path).expect("open");
+            ledger.record_compression("gpt-4o-mini", LeverKind::WindowFit, 500, 75);
+            ledger.record_compression("gpt-4o-mini", LeverKind::WindowFit, 250, 38);
+            ledger.record_compression("gpt-4o-mini", LeverKind::SummaryBuffer, 100, 15);
+        }
+
+        let report = ValueLedger::open(&path).expect("reopen").report();
+        assert_eq!(report.total_local_completions, 0);
+        assert_eq!(report.total_cloud_completions, 0);
+        assert_eq!(report.total_saved_micros, 0);
+        assert_eq!(report.total_compression_tokens_saved, 850);
+        assert_eq!(report.total_compression_gross_cost_saved_micros, 128);
+        assert_eq!(report.compression_totals["window_fit"].tokens_saved, 750);
+    }
+
+    #[test]
+    fn legacy_redb_lane_without_compression_fields_remains_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy-value.redb");
+        {
+            let database = Database::create(&path).expect("create legacy database");
+            let write = database.begin_write().expect("begin legacy write");
+            {
+                let mut table = write.open_table(LANES).expect("open legacy table");
+                table
+                    .insert(
+                        "legacy-model",
+                        br#"{"local_completions":3,"cloud_completions":1,"saved_micros":99,"cloud_spent_micros":25}"#
+                            .as_slice(),
+                    )
+                    .expect("insert legacy lane");
+            }
+            write.commit().expect("commit legacy lane");
+        }
+
+        let report = ValueLedger::open(&path)
+            .expect("open upgraded ledger")
+            .report();
+        assert_eq!(report.total_local_completions, 3);
+        assert_eq!(report.total_cloud_completions, 1);
+        assert_eq!(report.total_saved_micros, 99);
+        assert!(report.compression.is_empty());
+        assert!(report.compression_totals.is_empty());
     }
 }

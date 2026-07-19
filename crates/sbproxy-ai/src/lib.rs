@@ -116,4 +116,7 @@ pub use token_estimate::{
 };
 pub use types::*;
 pub use usage_parser::{select_parser, SseUsageParser, UsageParserHints, UsageTokens};
-pub use value_ledger::{ValueLedger, ValueSink};
+pub use value_ledger::{
+    CompressionValueRecord, PendingCompressionLeverValue, PendingCompressionValue, ValueLedger,
+    ValueSink,
+};
