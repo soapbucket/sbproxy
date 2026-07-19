@@ -270,12 +270,12 @@ fn compression_selection_outcome(
 ) -> &'static str {
     if invalid_operator_selector {
         "invalid_operator"
+    } else if !runtime_selected {
+        "disabled"
     } else if source == CompressionSelectionSource::RouteDefault {
         "default"
-    } else if runtime_selected {
-        "selected"
     } else {
-        "disabled"
+        "selected"
     }
 }
 
@@ -8000,6 +8000,10 @@ mod compression_selection_tests {
         );
         assert_eq!(
             compression_selection_outcome(CompressionSelectionSource::Header, false, false),
+            "disabled"
+        );
+        assert_eq!(
+            compression_selection_outcome(CompressionSelectionSource::RouteDefault, false, false),
             "disabled"
         );
         assert_eq!(
