@@ -388,6 +388,181 @@ fn default_dd_site() -> String {
     "datadoghq.com".to_string()
 }
 
+/// A sink that emits each usage event through the existing tracing /
+/// OpenInference seam (GenAI + `llm.*` attributes), fire-and-forget.
+///
+/// Export to an OTLP collector is handled by the process-wide observe
+/// pipeline (`sbproxy-observe`); this sink never blocks dispatch and
+/// never propagates a failure. INT may later wire a direct OTel metrics
+/// path by adding `opentelemetry` to `sbproxy-ai` if needed.
+#[derive(Debug, Default)]
+pub struct OtelSink;
+
+impl OtelSink {
+    /// Create an OTel usage sink that records via tracing attributes.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl UsageSink for OtelSink {
+    fn record(&self, event: &LlmUsageEvent) {
+        // Clone the safe attribution fields only: no raw prompts, tool
+        // output, tokens, or DSNs - matching the LiteLLM-style redaction
+        // contract already enforced by [`LlmUsageEvent`]'s shape.
+        let provider = event.provider.clone();
+        let model = event.model.clone();
+        let prompt_tokens = event.prompt_tokens;
+        let completion_tokens = event.completion_tokens;
+        let total_tokens = event.total_tokens;
+        let cost_usd = event.cost_usd;
+        let latency_ms = event.latency_ms;
+        let status = event.status;
+        let key_id = event.key_id.clone();
+        let tenant_id = event.tenant_id.clone();
+        let request_id = event.request_id.clone();
+        tokio::spawn(async move {
+            // Emit through the existing OpenInference / GenAI attribute
+            // vocabulary (`tracing_spans`). The process-wide observe
+            // pipeline exports these when OTLP is configured.
+            let span = tracing::info_span!(
+                "sbproxy.ai.usage_sink",
+                "gen_ai.system" = %provider,
+                "gen_ai.request.model" = %model,
+                "gen_ai.usage.input_tokens" = prompt_tokens,
+                "gen_ai.usage.output_tokens" = completion_tokens,
+                "llm.token_count.prompt" = prompt_tokens,
+                "llm.token_count.completion" = completion_tokens,
+                "llm.token_count.total" = total_tokens,
+                "gen_ai.usage.cost" = cost_usd,
+                "llm.usage.total_cost" = cost_usd,
+                "sbproxy.ai.latency_ms" = latency_ms,
+                "http.response.status_code" = status,
+                "sbproxy.key_id" = key_id.as_deref().unwrap_or(""),
+                "sbproxy.tenant_id" = tenant_id.as_deref().unwrap_or(""),
+                "gen_ai.response.id" = request_id.as_deref().unwrap_or(""),
+            );
+            let _entered = span.enter();
+        });
+    }
+
+    fn name(&self) -> &str {
+        "otel"
+    }
+}
+
+/// Which object-store backend a [`ObjectStoreSink`] targets.
+#[derive(Debug, Clone, Copy)]
+enum ObjectStoreKind {
+    S3,
+    Gcs,
+}
+
+/// A sink that writes each usage event as a JSON object to S3 or GCS,
+/// fire-and-forget.
+///
+/// The workspace already vendors `object_store` (see `sbproxy-tls` /
+/// `sbproxy-modules`), but `sbproxy-ai` does not depend on it yet - INT
+/// must add `object_store = { workspace = true }` to
+/// `crates/sbproxy-ai/Cargo.toml` (and refresh `Cargo.lock` if needed)
+/// to activate real puts. Until then this sink serializes the event and
+/// fails closed (log + return) so a missing bucket or unwired backend
+/// never breaks dispatch.
+#[derive(Debug)]
+pub struct ObjectStoreSink {
+    kind: ObjectStoreKind,
+    bucket: String,
+    prefix: String,
+}
+
+impl ObjectStoreSink {
+    /// Create an S3 usage sink for `bucket` under `prefix`.
+    pub fn s3(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self {
+            kind: ObjectStoreKind::S3,
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Create a GCS usage sink for `bucket` under `prefix`.
+    pub fn gcs(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self {
+            kind: ObjectStoreKind::Gcs,
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+        }
+    }
+}
+
+impl UsageSink for ObjectStoreSink {
+    fn record(&self, event: &LlmUsageEvent) {
+        if self.bucket.is_empty() {
+            tracing::warn!(
+                sink = self.name(),
+                "usage sink: object store bucket missing"
+            );
+            return;
+        }
+        let body = match serde_json::to_vec(event) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "usage sink: failed to serialize event");
+                return;
+            }
+        };
+        let kind = self.kind;
+        let bucket = self.bucket.clone();
+        let prefix = self.prefix.clone();
+        let sink_name = self.name().to_string();
+        let object_key = object_store_object_key(&prefix, event);
+        tokio::spawn(async move {
+            // Fail closed until INT wires `object_store` into sbproxy-ai.
+            // Never log the event body (may carry governed metadata the
+            // operator treats as sensitive); bucket + key are enough.
+            let _ = (kind, body);
+            tracing::warn!(
+                sink = %sink_name,
+                bucket = %bucket,
+                object_key = %object_key,
+                "usage sink: object store put failed"
+            );
+        });
+    }
+
+    fn name(&self) -> &str {
+        match self.kind {
+            ObjectStoreKind::S3 => "s3",
+            ObjectStoreKind::Gcs => "gcs",
+        }
+    }
+}
+
+/// Build a stable object key under `prefix` for `event`. Prefers
+/// `request_id` when present so at-least-once delivery collapses on
+/// overwrite; otherwise falls back to a timestamped unique name.
+fn object_store_object_key(prefix: &str, event: &LlmUsageEvent) -> String {
+    let leaf = event
+        .request_id
+        .as_deref()
+        .map(|id| format!("{id}.json"))
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}-{}.json",
+                event.provider,
+                event.model.replace('/', "_"),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            )
+        });
+    if prefix.is_empty() {
+        leaf
+    } else if prefix.ends_with('/') {
+        format!("{prefix}{leaf}")
+    } else {
+        format!("{prefix}/{leaf}")
+    }
+}
+
 /// Declarative config for a usage sink, parsed from the action's
 /// `usage_sinks` list.
 #[derive(Debug, Clone, Deserialize)]
@@ -441,6 +616,24 @@ pub enum UsageSinkConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         service: Option<String>,
     },
+    /// Emit events through the process OTel / OpenInference seam.
+    Otel,
+    /// Write events as JSON objects to an S3 bucket.
+    S3 {
+        /// Destination bucket name.
+        bucket: String,
+        /// Key prefix (e.g. `llm/`). Empty when omitted.
+        #[serde(default)]
+        prefix: String,
+    },
+    /// Write events as JSON objects to a GCS bucket.
+    Gcs {
+        /// Destination bucket name.
+        bucket: String,
+        /// Key prefix (e.g. `llm/`). Empty when omitted.
+        #[serde(default)]
+        prefix: String,
+    },
 }
 
 impl UsageSinkConfig {
@@ -468,6 +661,13 @@ impl UsageSinkConfig {
                 api_key,
                 service.clone().unwrap_or_else(|| "sbproxy".to_string()),
             )),
+            UsageSinkConfig::Otel => std::sync::Arc::new(OtelSink::new()),
+            UsageSinkConfig::S3 { bucket, prefix } => {
+                std::sync::Arc::new(ObjectStoreSink::s3(bucket, prefix))
+            }
+            UsageSinkConfig::Gcs { bucket, prefix } => {
+                std::sync::Arc::new(ObjectStoreSink::gcs(bucket, prefix))
+            }
         }
     }
 }
@@ -693,6 +893,62 @@ mod tests {
                 assert!(service.is_none());
             }
             other => panic!("expected datadog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_otel_and_object_store_sink_configs() {
+        let cfgs: Vec<UsageSinkConfig> = serde_json::from_str(
+            r#"[
+                {"type":"otel"},
+                {"type":"s3","bucket":"usage","prefix":"llm/"},
+                {"type":"gcs","bucket":"usage","prefix":"llm/"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(cfgs.len(), 3);
+        match &cfgs[0] {
+            UsageSinkConfig::Otel => {}
+            other => panic!("expected otel, got {other:?}"),
+        }
+        match &cfgs[1] {
+            UsageSinkConfig::S3 { bucket, prefix } => {
+                assert_eq!(bucket, "usage");
+                assert_eq!(prefix, "llm/");
+            }
+            other => panic!("expected s3, got {other:?}"),
+        }
+        match &cfgs[2] {
+            UsageSinkConfig::Gcs { bucket, prefix } => {
+                assert_eq!(bucket, "usage");
+                assert_eq!(prefix, "llm/");
+            }
+            other => panic!("expected gcs, got {other:?}"),
+        }
+        let sinks = build_sinks(&cfgs);
+        assert_eq!(sinks[0].name(), "otel");
+        assert_eq!(sinks[1].name(), "s3");
+        assert_eq!(sinks[2].name(), "gcs");
+    }
+
+    #[tokio::test]
+    async fn sink_failure_does_not_panic_or_propagate() {
+        // Broken / missing destinations must log and return: never panic or
+        // surface an error that would break usage dispatch.
+        let sinks = build_sinks(&[
+            UsageSinkConfig::Otel,
+            UsageSinkConfig::S3 {
+                bucket: String::new(),
+                prefix: "llm/".into(),
+            },
+            UsageSinkConfig::Gcs {
+                bucket: String::new(),
+                prefix: "llm/".into(),
+            },
+        ]);
+        let event = sample_event();
+        for sink in &sinks {
+            sink.record(&event);
         }
     }
 }
