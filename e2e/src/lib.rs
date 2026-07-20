@@ -121,7 +121,17 @@ fn configured_binary_path(var: &str) -> Option<PathBuf> {
         if value.is_empty() {
             None
         } else {
-            Some(PathBuf::from(value))
+            let path = PathBuf::from(value);
+            // Cargo runs test binaries with the package directory as the
+            // working directory, so a relative override like
+            // "target/debug/sbproxy" (the natural spelling when invoking
+            // cargo from the workspace root) would resolve under e2e/ and
+            // miss. Anchor relative overrides to the workspace root.
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                Some(workspace_root().join(path))
+            }
         }
     })
 }

@@ -167,15 +167,27 @@ fn chat(base_url: &str, token: &str) -> u16 {
 }
 
 fn admin_get(admin_port: u16, path: &str) -> Value {
-    client()
-        .get(format!("http://127.0.0.1:{admin_port}{path}"))
-        .basic_auth("admin", Some("secret"))
-        .send()
-        .expect("admin request")
-        .error_for_status()
-        .expect("admin status")
-        .json::<Value>()
-        .expect("admin JSON")
+    // The admin surface rate limits per client IP. Convergence polling in
+    // this suite can exhaust that budget on slow runners, and a 429 means
+    // "alive but throttled", not a failure, so back off and retry rather
+    // than panicking mid-wait.
+    for _ in 0..30 {
+        let response = client()
+            .get(format!("http://127.0.0.1:{admin_port}{path}"))
+            .basic_auth("admin", Some("secret"))
+            .send()
+            .expect("admin request");
+        if response.status().as_u16() == 429 {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        return response
+            .error_for_status()
+            .expect("admin status")
+            .json::<Value>()
+            .expect("admin JSON");
+    }
+    panic!("admin endpoint {path} still rate limited after 60s of backoff");
 }
 
 /// Poll `/admin/cluster/status` until this node sees `expected` total nodes,
@@ -188,13 +200,26 @@ fn wait_for_cluster_size(admin_port: u16, expected: u64, timeout: Duration) {
     loop {
         let status = admin_get(admin_port, "/admin/cluster/status");
         let total = status["summary"]["total_nodes"].as_u64().unwrap_or(0);
-        let healthy = status["summary"]["healthy_nodes"].as_u64().unwrap_or(0);
-        if total >= expected && healthy >= expected {
+        // Gateway-only nodes report health "degraded" with
+        // model_plane_unavailable in steady state, so counting
+        // summary.healthy_nodes would never converge for this topology.
+        // What this suite needs is gossip membership: every expected node
+        // present and alive.
+        let alive = status["nodes"]
+            .as_array()
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .filter(|node| node["membership_state"] == "alive")
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        if total >= expected && alive >= expected {
             return;
         }
         if Instant::now() >= deadline {
             panic!(
-                "admin port {admin_port} did not converge to {expected} healthy cluster \
+                "admin port {admin_port} did not converge to {expected} alive cluster \
                  nodes within {timeout:?}; last status: {status}"
             );
         }
