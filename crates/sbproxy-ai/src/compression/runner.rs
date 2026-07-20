@@ -435,7 +435,10 @@ mod tests {
     use crate::compression::outcome::{
         FailureReason, LeverKind, LeverOutcome, RequestOutcome, SkipReason,
     };
-    use crate::compression::CompressionBackend;
+    use crate::compression::{
+        inspect_marked_context, CompressionBackend, PositionReorderConfig, PositionReorderLever,
+        RetrievalRanking,
+    };
     use crate::TokenCountPrecision;
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -521,6 +524,23 @@ mod tests {
         CompressionDecision::Candidate {
             messages: messages(tokens, label),
         }
+    }
+
+    fn marked_chunk(id: &str, score: &str) -> String {
+        format!(
+            "<sbproxy-chunk id=\"{id}\" score=\"{score}\" format=\"text\">\nbody-{id}\n</sbproxy-chunk>"
+        )
+    }
+
+    fn marked_block(chunks: &[String]) -> String {
+        let mut rendered =
+            String::from("<sbproxy-retrieval>\n<sbproxy-query>\nquery\n</sbproxy-query>\n");
+        for chunk in chunks {
+            rendered.push_str(chunk);
+            rendered.push('\n');
+        }
+        rendered.push_str("</sbproxy-retrieval>");
+        rendered
     }
 
     #[test]
@@ -672,6 +692,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn position_reorder_applies_with_zero_savings_through_production_runner() {
+        let source = marked_block(&[
+            marked_chunk("1", "1"),
+            marked_chunk("2", "0.8"),
+            marked_chunk("3", "0.6"),
+            marked_chunk("4", "0.4"),
+        ]);
+        let original = vec![json!({"role": "user", "content": source, "tokens": 100})];
+        let lever = PositionReorderLever::new(PositionReorderConfig {
+            ranking: RetrievalRanking::Supplied,
+        });
+        let runner = CompressionRunner::new(
+            vec![Arc::new(lever)],
+            Arc::new(FieldTokenCounter::default()),
+        );
+
+        let run = runner
+            .run(&CompressionRequest::new("gpt-target"), &original)
+            .await;
+
+        let snapshot = inspect_marked_context(&run.messages)
+            .expect("valid marked context")
+            .expect("marked context present");
+        let ids = snapshot.blocks[0]
+            .chunks
+            .iter()
+            .map(|chunk| chunk.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["1", "3", "4", "2"]);
+        assert_eq!(run.initial_tokens, 100);
+        assert_eq!(run.final_tokens, 100);
+        assert_eq!(run.tokens_saved, 0);
+        assert_eq!(run.applied_tokens_saved(), 0);
+        assert_eq!(run.lever_results[0].lever, LeverKind::PositionReorder);
+        assert_eq!(run.lever_results[0].outcome, LeverOutcome::Applied);
+        assert_eq!(run.lever_results[0].tokens_saved, 0);
+        assert_eq!(run.outcome(), RequestOutcome::Applied);
+    }
+
+    #[tokio::test]
     async fn non_expanding_unchanged_equal_candidate_skips_as_not_needed() {
         let original = messages(100, "original");
         let (lever, _) = ScriptedLever::new(
@@ -702,7 +762,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_expanding_larger_candidate_skips_as_no_savings() {
+    async fn position_reorder_non_expanding_rule_rejects_artificial_expansion() {
         let (lever, _) = ScriptedLever::new(LeverKind::PositionReorder, candidate(120, "expanded"));
         let runner = CompressionRunner::new(
             vec![Arc::new(
