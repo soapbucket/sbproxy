@@ -240,14 +240,24 @@ fn default_sd_ipv6() -> bool {
 pub struct RetryConfig {
     /// Maximum total request attempts (including the original). A
     /// value of `0` or `1` disables retries. Default: 1 (no retry).
-    #[serde(default = "default_retry_attempts")]
+    /// Values above [`MAX_RETRY_ATTEMPTS`] are rejected at config
+    /// load: the proxy loop never runs more tries than that, so a
+    /// larger value would silently mean something else.
+    #[serde(
+        default = "default_retry_attempts",
+        deserialize_with = "deserialize_retry_attempts"
+    )]
     pub max_attempts: u32,
     /// Conditions under which to retry. Recognized values:
     ///   * `"connect_error"`: TCP connect failure
     ///   * `"timeout"`: connect or idle timeout
     ///
     /// Numeric status codes may be written as YAML numbers
-    /// (`retry_on: [502]`) or strings (`retry_on: ["502"]`).
+    /// (`retry_on: [502]`) or strings (`retry_on: ["502"]`) and must
+    /// fall in `100..=599`. Any other entry is rejected at config
+    /// load rather than silently never matching. An explicitly empty
+    /// list is also rejected: it would make the whole `retry` block
+    /// dead config.
     #[serde(
         default = "default_retry_on",
         deserialize_with = "deserialize_retry_on"
@@ -270,6 +280,12 @@ impl Default for RetryConfig {
     }
 }
 
+/// Ceiling on `retry.max_attempts`. Pingora's proxy loop tries an
+/// upstream at most 16 times per request (`pingora-core`'s
+/// `DEFAULT_MAX_RETRIES`), so a larger configured value could never be
+/// honored.
+pub const MAX_RETRY_ATTEMPTS: u32 = 16;
+
 fn default_retry_attempts() -> u32 {
     1
 }
@@ -282,25 +298,62 @@ fn default_retry_backoff_ms() -> u64 {
     100
 }
 
+fn deserialize_retry_attempts<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u32::deserialize(deserializer)?;
+    if value > MAX_RETRY_ATTEMPTS {
+        return Err(serde::de::Error::custom(format!(
+            "retry.max_attempts is {value} but the proxy loop caps total \
+             attempts at {MAX_RETRY_ATTEMPTS}; use a value in 0..={MAX_RETRY_ATTEMPTS}"
+        )));
+    }
+    Ok(value)
+}
+
 fn deserialize_retry_on<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
+    // u64 (not u16) so an out-of-range number reaches the range check
+    // below and produces the specific error instead of an opaque
+    // untagged-enum mismatch.
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum RetryOnValue {
         String(String),
-        Number(u16),
+        Number(u64),
     }
 
     let values = Vec::<RetryOnValue>::deserialize(deserializer)?;
-    Ok(values
+    if values.is_empty() {
+        return Err(serde::de::Error::custom(
+            "retry.retry_on must not be empty; omit the field to keep the \
+             [connect_error, timeout] default",
+        ));
+    }
+    values
         .into_iter()
-        .map(|value| match value {
-            RetryOnValue::String(s) => s,
-            RetryOnValue::Number(n) => n.to_string(),
+        .map(|value| {
+            let raw = match value {
+                RetryOnValue::String(s) => s,
+                RetryOnValue::Number(n) => n.to_string(),
+            };
+            let entry = raw.trim();
+            if entry.eq_ignore_ascii_case("connect_error") || entry.eq_ignore_ascii_case("timeout")
+            {
+                return Ok(entry.to_ascii_lowercase());
+            }
+            match entry.parse::<u16>() {
+                Ok(status) if (100..=599).contains(&status) => Ok(status.to_string()),
+                _ => Err(serde::de::Error::custom(format!(
+                    "retry.retry_on entry {raw:?} is not \"connect_error\", \
+                     \"timeout\", or an HTTP status code in 100..=599"
+                ))),
+            }
         })
-        .collect())
+        .collect()
 }
 
 impl RetryConfig {
@@ -323,6 +376,19 @@ impl RetryConfig {
             .iter()
             .filter_map(|s| s.trim().parse::<u16>().ok())
             .any(|configured| configured == status)
+    }
+
+    /// Returns true when another attempt is allowed after
+    /// `retries_used` retries have already been recorded.
+    ///
+    /// `retries_used == 0` means the original attempt is the one that
+    /// just failed. `max_attempts` counts total attempts including the
+    /// original, so `max_attempts: 3` permits `retries_used` 0 and 1
+    /// (attempts 2 and 3 overall). Connect-error and status-code
+    /// retries share one counter, so a mixed failure sequence is
+    /// capped at `max_attempts` total attempts, not per source.
+    pub fn attempts_remaining(&self, retries_used: u32) -> bool {
+        self.enabled() && retries_used + 1 < self.max_attempts
     }
 
     /// Backoff delay in milliseconds for the given attempt number
@@ -353,6 +419,80 @@ backoff_ms: 10
         assert!(cfg.allows_status(503));
         assert!(!cfg.allows_status(504));
         assert_eq!(cfg.retry_on, ["connect_error", "502", "503"]);
+    }
+
+    #[test]
+    fn retry_on_accepts_status_range_boundaries() {
+        let cfg: RetryConfig =
+            serde_yaml::from_str("max_attempts: 2\nretry_on: [100, 599]").expect("retry config");
+        assert!(cfg.allows_status(100));
+        assert!(cfg.allows_status(599));
+    }
+
+    #[test]
+    fn retry_on_rejects_out_of_range_status() {
+        for entry in ["99", "600", "999", "70000"] {
+            let err = serde_yaml::from_str::<RetryConfig>(&format!(
+                "max_attempts: 2\nretry_on: [{entry}]"
+            ))
+            .expect_err("out-of-range status must be rejected");
+            assert!(
+                err.to_string().contains("100..=599"),
+                "error for {entry} must name the valid range: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_on_rejects_unknown_condition_string() {
+        let err = serde_yaml::from_str::<RetryConfig>("max_attempts: 2\nretry_on: [5xx]")
+            .expect_err("unknown condition must be rejected");
+        assert!(
+            err.to_string().contains("5xx"),
+            "error must name the entry: {err}"
+        );
+    }
+
+    #[test]
+    fn retry_on_rejects_explicit_empty_list() {
+        let err = serde_yaml::from_str::<RetryConfig>("max_attempts: 2\nretry_on: []")
+            .expect_err("empty retry_on is dead config and must be rejected");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn absent_retry_on_keeps_default_conditions() {
+        let cfg: RetryConfig = serde_yaml::from_str("max_attempts: 2").expect("retry config");
+        assert_eq!(cfg.retry_on, ["connect_error", "timeout"]);
+    }
+
+    #[test]
+    fn max_attempts_above_proxy_loop_ceiling_rejected() {
+        let err = serde_yaml::from_str::<RetryConfig>("max_attempts: 17")
+            .expect_err("max_attempts above the proxy-loop ceiling must be rejected");
+        assert!(err.to_string().contains("16"), "{err}");
+        let cfg: RetryConfig = serde_yaml::from_str("max_attempts: 16").expect("ceiling is valid");
+        assert_eq!(cfg.max_attempts, 16);
+    }
+
+    #[test]
+    fn attempts_remaining_caps_total_attempts() {
+        let cfg: RetryConfig =
+            serde_yaml::from_str("max_attempts: 3\nretry_on: [503]").expect("retry config");
+        // Original attempt failed (0 retries used): two more allowed.
+        assert!(cfg.attempts_remaining(0));
+        assert!(cfg.attempts_remaining(1));
+        // Third attempt failed: cap reached.
+        assert!(!cfg.attempts_remaining(2));
+        assert!(!cfg.attempts_remaining(3));
+    }
+
+    #[test]
+    fn attempts_remaining_false_when_retries_disabled() {
+        for yaml in ["max_attempts: 0", "max_attempts: 1"] {
+            let cfg: RetryConfig = serde_yaml::from_str(yaml).expect("retry config");
+            assert!(!cfg.attempts_remaining(0), "{yaml} must disable retries");
+        }
     }
 }
 

@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Status-code retries across a load balancer.
+#
+# A `retry` block whose `retry_on` lists response statuses makes the
+# proxy discard a matching upstream response before any bytes reach
+# the client and run target selection again. The first target here
+# points at a local port you run a deliberately failing backend on;
+# the second is the healthy placeholder upstream. With
+# `algorithm: round_robin` the retry pass advances to the next
+# target, so a request that lands on the failing backend still
+# returns 200 from the healthy one.
+#
+# Only safe/idempotent requests with replayable bodies are retried;
+# other matches pass through unchanged with an
+# x-sbproxy-retry-skip-reason header. Each fired retry increments
+# sbproxy_upstream_status_retries_total{origin, status}.
+#
+# Hash-based algorithms (ip_hash, uri_hash, header_hash, cookie_hash)
+# re-select the same target on a retry until outlier detection, a
+# circuit breaker, or an active health check ejects it. round_robin
+# needs none of that to move on.
+#
+# Run:
+#   make run CONFIG=examples/retry-on-status/sb.yml
+#
+# In a second terminal, run a backend that always answers 503:
+#   python3 -c '
+#   import http.server
+#   class H(http.server.BaseHTTPRequestHandler):
+#       def do_GET(self):
+#           self.send_response(503); self.send_header("Content-Length", "0"); self.end_headers()
+#   http.server.HTTPServer(("127.0.0.1", 9503), H).serve_forever()'
+#
+# Test:
+#   curl -i -H 'Host: localhost' http://127.0.0.1:8080/get
+#   # Always 200: requests that hit the failing target are retried
+#   # on the healthy one.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: http://127.0.0.1:9503
+          weight: 1
+        - url: https://test.sbproxy.dev
+          weight: 1
+      retry:
+        max_attempts: 2
+        retry_on:
+          - 503
+        backoff_ms: 100

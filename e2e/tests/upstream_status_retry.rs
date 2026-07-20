@@ -359,6 +359,33 @@ fn proxy_skips_status_retry_while_request_body_is_still_streaming() {
 }
 
 #[test]
+fn proxy_returns_real_status_when_upstream_always_fails_and_cap_reached() {
+    let upstream = MockUpstream::start_with_status(json!({"always": "failing"}), 503)
+        .expect("failing upstream");
+    let proxy = ProxyHarness::start_with_yaml(&proxy_retry_config(
+        &upstream.base_url(),
+        "cap.localhost",
+        "503",
+    ))
+    .expect("proxy");
+
+    let resp = proxy.get("/", "cap.localhost").expect("GET");
+
+    assert_eq!(resp.status, 503, "the real upstream status must surface");
+    assert_eq!(
+        resp.headers
+            .get("x-sbproxy-retry-skip-reason")
+            .map(String::as_str),
+        Some("max_attempts_exhausted")
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        2,
+        "max_attempts: 2 means exactly one retry, then stop"
+    );
+}
+
+#[test]
 fn load_balancer_retries_configured_status_on_next_target() {
     let failing = MockUpstream::start_with_status(json!({"target": "failing"}), 502)
         .expect("failing upstream");
@@ -394,4 +421,54 @@ origins:
     assert_eq!(resp.json().expect("json")["target"], "healthy");
     assert_eq!(failing.captured().len(), 1);
     assert_eq!(healthy.captured().len(), 1);
+}
+
+#[test]
+fn load_balancer_returns_real_status_when_every_target_fails_and_cap_reached() {
+    let failing_a =
+        MockUpstream::start_with_status(json!({"target": "a"}), 503).expect("failing upstream a");
+    let failing_b =
+        MockUpstream::start_with_status(json!({"target": "b"}), 503).expect("failing upstream b");
+
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "lb-exhausted.localhost":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: "{}"
+          weight: 1
+        - url: "{}"
+          weight: 1
+      retry:
+        max_attempts: 2
+        retry_on: [503]
+        backoff_ms: 0
+"#,
+        failing_a.base_url(),
+        failing_b.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("proxy");
+
+    let resp = proxy.get("/", "lb-exhausted.localhost").expect("GET");
+
+    assert_eq!(
+        resp.status, 503,
+        "with every target failing, the client must see the real status after the cap"
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-sbproxy-retry-skip-reason")
+            .map(String::as_str),
+        Some("max_attempts_exhausted")
+    );
+    assert_eq!(
+        failing_a.captured().len() + failing_b.captured().len(),
+        2,
+        "max_attempts: 2 means the original attempt plus exactly one retry"
+    );
 }

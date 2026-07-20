@@ -288,6 +288,13 @@ pub struct ProxyMetrics {
     pub cache_results: CounterVec,
     /// Circuit breaker state transitions with origin, from_state, and to_state labels.
     pub circuit_breaker_transitions: CounterVec,
+    /// Counter `sbproxy_upstream_status_retries_total` of upstream
+    /// retries triggered by a configured response status
+    /// (`retry.retry_on`), labelled by origin and the matched status.
+    /// Incremented once per scheduled retry, at decision time; matched
+    /// statuses that are skipped (method not idempotent, body not
+    /// replayable, cap reached) do not count.
+    pub upstream_status_retries: IntCounterVec,
 
     // --- Cache Reserve metrics ---
     /// Counter `sbproxy_cache_reserve_hits_total` of reserve hits served
@@ -586,6 +593,17 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let upstream_status_retries = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_upstream_status_retries_total",
+                "Upstream retries triggered by a configured response status",
+            ),
+            // status stays low-cardinality: only statuses an operator
+            // listed in `retry.retry_on` (validated 100..=599) appear.
+            &["origin", "status"],
+        )
+        .unwrap();
+
         // --- Cache Reserve counters (W5-A) ---
 
         let cache_reserve_hits = IntCounterVec::new(
@@ -744,6 +762,9 @@ impl ProxyMetrics {
             .register(Box::new(circuit_breaker_transitions.clone()))
             .unwrap();
         registry
+            .register(Box::new(upstream_status_retries.clone()))
+            .unwrap();
+        registry
             .register(Box::new(cache_reserve_hits.clone()))
             .unwrap();
         registry
@@ -794,6 +815,7 @@ impl ProxyMetrics {
             policy_triggers,
             cache_results,
             circuit_breaker_transitions,
+            upstream_status_retries,
             cache_reserve_hits,
             cache_reserve_misses,
             cache_reserve_writes,
@@ -2011,6 +2033,21 @@ pub fn record_circuit_breaker(origin: &str, from_state: &str, to_state: &str) {
     metrics()
         .circuit_breaker_transitions
         .with_label_values(&[origin.as_str(), from_state, to_state])
+        .inc();
+}
+
+/// Increment `sbproxy_upstream_status_retries_total{origin, status}`.
+///
+/// Called once per status-triggered upstream retry, at the moment the
+/// retry is scheduled. Matched statuses that are skipped (method not
+/// idempotent, body not replayable, `max_attempts` reached) are not
+/// counted; they surface via `x-sbproxy-retry-skip-reason` instead.
+pub fn record_upstream_status_retry(origin: &str, status: u16) {
+    let origin = sanitize_label("origin", origin);
+    let status = status.to_string();
+    metrics()
+        .upstream_status_retries
+        .with_label_values(&[origin.as_str(), status.as_str()])
         .inc();
 }
 
