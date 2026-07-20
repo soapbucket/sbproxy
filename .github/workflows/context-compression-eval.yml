@@ -13,6 +13,7 @@ on:
       - 'crates/sbproxy-core/src/compression_runtime.rs'
       - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
       - 'e2e/tests/ai_native_inbound.rs'
+      - 'e2e/tests/context_compression_phase1.rs'
       - 'e2e/tests/governed_key_policy.rs'
       - 'schemas/ai-compression.schema.json'
       - 'schemas/sb-config.schema.json'
@@ -30,6 +31,7 @@ on:
       - 'crates/sbproxy-core/src/compression_runtime.rs'
       - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
       - 'e2e/tests/ai_native_inbound.rs'
+      - 'e2e/tests/context_compression_phase1.rs'
       - 'e2e/tests/governed_key_policy.rs'
       - 'schemas/ai-compression.schema.json'
       - 'schemas/sb-config.schema.json'
@@ -54,13 +56,15 @@ jobs:
   context-compression-eval:
     name: fmt + test + clippy + report drift
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - uses: taiki-e/install-action@nextest
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -74,7 +78,7 @@ jobs:
         run: cargo fmt --manifest-path "$MANIFEST" -- --check
 
       - name: test
-        run: cargo test --manifest-path "$MANIFEST" --all-targets --locked
+        run: cargo nextest run --manifest-path "$MANIFEST" --all-targets --locked
 
       - name: clippy
         run: cargo clippy --manifest-path "$MANIFEST" --all-targets --locked -- -D warnings
@@ -83,10 +87,38 @@ jobs:
         run: |
           cargo run --manifest-path "$MANIFEST" --locked -- check \
             --harness-root "$HARNESS" \
+            --pipeline-config "$HARNESS/pipelines/rag-select-smoke.json" \
+            --input "$HARNESS/fixtures/rag-select-smoke.jsonl" \
+            --provenance "$HARNESS/fixtures/provenance.json" \
+            --json-report "$HARNESS/reports/rag-select-smoke.json" \
+            --markdown-report "$HARNESS/reports/rag-select-smoke.md"
+          cargo run --manifest-path "$MANIFEST" --locked -- check \
+            --harness-root "$HARNESS" \
+            --pipeline-config "$HARNESS/pipelines/compact-serialization-smoke.json" \
+            --input "$HARNESS/fixtures/compact-serialization-smoke.jsonl" \
+            --provenance "$HARNESS/fixtures/provenance.json" \
+            --json-report "$HARNESS/reports/compact-serialization-smoke.json" \
+            --markdown-report "$HARNESS/reports/compact-serialization-smoke.md"
+          cargo run --manifest-path "$MANIFEST" --locked -- check \
+            --harness-root "$HARNESS" \
+            --pipeline-config "$HARNESS/pipelines/position-reorder-smoke.json" \
+            --input "$HARNESS/fixtures/position-reorder-smoke.jsonl" \
+            --provenance "$HARNESS/fixtures/provenance.json" \
+            --json-report "$HARNESS/reports/position-reorder-smoke.json" \
+            --markdown-report "$HARNESS/reports/position-reorder-smoke.md"
+          cargo run --manifest-path "$MANIFEST" --locked -- check \
+            --harness-root "$HARNESS" \
+            --pipeline-config "$HARNESS/pipelines/phase1-pipeline-smoke.json" \
+            --input "$HARNESS/fixtures/phase1-pipeline-smoke.jsonl" \
+            --provenance "$HARNESS/fixtures/provenance.json" \
+            --json-report "$HARNESS/reports/phase1-pipeline-smoke.json" \
+            --markdown-report "$HARNESS/reports/phase1-pipeline-smoke.md"
+          cargo run --manifest-path "$MANIFEST" --locked -- check \
+            --harness-root "$HARNESS" \
+            --pipeline-config "$HARNESS/pipelines/window-fit-smoke.json" \
             --input "$HARNESS/fixtures/ruler-smoke.jsonl" \
             --input "$HARNESS/fixtures/coding-agent-smoke.jsonl" \
             --provenance "$HARNESS/fixtures/provenance.json" \
-            --input-budget-tokens 192 \
             --json-report "$HARNESS/reports/window-fit-smoke.json" \
             --markdown-report "$HARNESS/reports/window-fit-smoke.md"
 
@@ -103,6 +135,11 @@ jobs:
 
       - name: build sbproxy binary
         run: cargo build -p sbproxy --locked
+
+      - name: Phase 1 request path
+        run: >-
+          cargo test -p sbproxy-e2e --locked --test context_compression_phase1
+          -- --test-threads=1
 
       - name: governed selector precedence
         run: >-

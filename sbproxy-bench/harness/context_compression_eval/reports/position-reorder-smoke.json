@@ -1,0 +1,111 @@
+{
+  "schema_version": 4,
+  "profile": "position-reorder-smoke-v1",
+  "pipeline": [
+    {
+      "type": "position_reorder",
+      "ranking": "supplied"
+    }
+  ],
+  "token_counter": "sbproxy_target_model",
+  "latency_mode": "omitted_for_deterministic_gate",
+  "verified_provenance": {
+    "manifest_sha256": "f96e77cd1248de3c5d0dc9d528e0a21e768a4d335a599caa5d2084f94afbb5b3",
+    "artifacts": [
+      {
+        "path": "fixtures/position-reorder-smoke.jsonl",
+        "corpus": "position_reorder_smoke",
+        "provenance": "independently_authored_sanitized_shape",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "4152dea5357521514de016917b9620df9ec1a8bc8f20961b054b2c7d0f55f591"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "position_required_center_to_edge",
+      "corpus": "position_reorder_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "edge_placement",
+      "off": {
+        "input_tokens": 278,
+        "output_tokens": 278,
+        "quality_score": 0.0
+      },
+      "on": {
+        "input_tokens": 278,
+        "output_tokens": 278,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 0,
+      "savings_ratio": 0.0,
+      "quality_delta": 1.0,
+      "levers": [
+        {
+          "lever": "position_reorder",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 278,
+          "after_tokens": 278,
+          "tokens_saved": 0
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": 1.0,
+        "min_quality_delta": 1.0,
+        "require_non_expanding": true
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    }
+  ],
+  "corpora": {
+    "position_reorder_smoke": {
+      "case_count": 1,
+      "input_tokens": 278,
+      "output_tokens": 278,
+      "tokens_saved": 0,
+      "savings_ratio": 0.0,
+      "off_quality_score": 0.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 1.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 1,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 1
+      },
+      "reasons": {},
+      "acceptance_passed": true,
+      "recommendation": "build"
+    }
+  },
+  "overall": {
+    "case_count": 1,
+    "input_tokens": 278,
+    "output_tokens": 278,
+    "tokens_saved": 0,
+    "savings_ratio": 0.0,
+    "off_quality_score": 0.0,
+    "on_quality_score": 1.0,
+    "quality_delta": 1.0,
+    "added_compression_latency_micros": null,
+    "applied_count": 1,
+    "skipped_count": 0,
+    "fallback_count": 0,
+    "skip_rate": 0.0,
+    "outcomes": {
+      "applied": 1
+    },
+    "reasons": {},
+    "acceptance_passed": true,
+    "recommendation": "build"
+  }
+}

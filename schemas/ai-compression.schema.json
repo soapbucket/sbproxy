@@ -177,6 +177,135 @@
             }
           },
           "additionalProperties": false
+        },
+        {
+          "description": "Retrieval-aware selection of marked context chunks.",
+          "type": "object",
+          "required": [
+            "max_chunks",
+            "min_tokens",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "rag_select"
+              ]
+            },
+            "min_tokens": {
+              "description": "Minimum marked-context tokens before selection is eligible.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1.0
+            },
+            "ranking": {
+              "description": "Ranking source used to compare marked chunks.",
+              "default": "auto",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/RetrievalRanking"
+                }
+              ]
+            },
+            "max_chunks": {
+              "description": "Maximum number of marked chunks retained.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 1.0
+            },
+            "min_relevance_percent": {
+              "description": "Minimum accepted relevance percentage, from 0 through 100.",
+              "default": 0,
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 100.0,
+              "minimum": 0.0
+            },
+            "drop_empty": {
+              "description": "Drop marked chunks whose selected content is empty.",
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Deterministic compact serialization of supported structured content.",
+          "type": "object",
+          "required": [
+            "min_tokens",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "compact_serialization"
+              ]
+            },
+            "min_tokens": {
+              "description": "Minimum marked-context tokens before serialization is eligible.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1.0
+            },
+            "tabular": {
+              "description": "Optional tabular compaction rules.",
+              "default": {
+                "enabled": false,
+                "min_rows": 8
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TabularSerializationConfig"
+                }
+              ],
+              "if": {
+                "required": [
+                  "enabled"
+                ],
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "min_rows": {
+                    "minimum": 2.0
+                  }
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Reorder marked context to mitigate lost-in-the-middle effects.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "position_reorder"
+              ]
+            },
+            "ranking": {
+              "description": "Ranking source used to order marked chunks.",
+              "default": "auto",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/RetrievalRanking"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -204,6 +333,51 @@
               "$ref": "#/definitions/DurationSchema"
             }
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RetrievalRanking": {
+      "description": "Ranking source used by retrieval-aware compression levers.",
+      "oneOf": [
+        {
+          "description": "Select supplied scores when complete, otherwise use lexical ranking.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "Require caller-supplied relevance scores.",
+          "type": "string",
+          "enum": [
+            "supplied"
+          ]
+        },
+        {
+          "description": "Rank marked context with deterministic lexical relevance.",
+          "type": "string",
+          "enum": [
+            "lexical"
+          ]
+        }
+      ]
+    },
+    "TabularSerializationConfig": {
+      "description": "Tabular serialization eligibility controls.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable tabular serialization of supported row collections.",
+          "default": false,
+          "type": "boolean"
+        },
+        "min_rows": {
+          "description": "Minimum row count required when tabular serialization is enabled.",
+          "default": 8,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false

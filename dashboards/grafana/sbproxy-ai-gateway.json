@@ -559,7 +559,7 @@
           }
         }
       ],
-      "description": "Fraction of compression lever invocations that applied a strictly reducing transformation over the last five minutes."
+      "description": "Fraction of compression lever invocations that committed a transformation over the last five minutes."
     },
     {
       "id": 10,

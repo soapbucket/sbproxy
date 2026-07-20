@@ -107,4 +107,69 @@ mod tests {
                 && record.gross_cost_saved_micros() == 0
         }));
     }
+
+    #[test]
+    fn records_reducing_stateless_value_but_omits_position_reorder_everywhere() {
+        let ledger = sbproxy_ai::ValueLedger::open("").expect("memory ledger");
+        let run = CompressionRun {
+            messages: Vec::new(),
+            initial_tokens: 1_500_000,
+            final_tokens: 0,
+            tokens_saved: 1_500_000,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
+            lever_results: vec![
+                LeverResult {
+                    lever: LeverKind::RagSelect,
+                    backend: None,
+                    outcome: LeverOutcome::Applied,
+                    before_tokens: 1_500_000,
+                    after_tokens: 1_000_000,
+                    tokens_saved: 500_000,
+                    duration: Duration::from_millis(1),
+                },
+                LeverResult {
+                    lever: LeverKind::CompactSerialization,
+                    backend: None,
+                    outcome: LeverOutcome::Applied,
+                    before_tokens: 1_000_000,
+                    after_tokens: 300_000,
+                    tokens_saved: 700_000,
+                    duration: Duration::from_millis(1),
+                },
+                LeverResult {
+                    lever: LeverKind::PositionReorder,
+                    backend: None,
+                    outcome: LeverOutcome::Applied,
+                    before_tokens: 300_000,
+                    after_tokens: 0,
+                    tokens_saved: 300_000,
+                    duration: Duration::from_millis(1),
+                },
+            ],
+        };
+        let pending = sbproxy_ai::PendingCompressionValue::from_run("gpt-4o", &run)
+            .expect("reducing stateless levers create pending value");
+
+        let mut emitted = Vec::new();
+        record_pending_compression_value_to(&ledger, &pending, |record| emitted.push(*record));
+
+        let report = ledger.report();
+        assert_eq!(report.total_compression_tokens_saved, 1_200_000);
+        assert_eq!(
+            report.compression_totals["rag_select"].tokens_saved,
+            500_000
+        );
+        assert_eq!(
+            report.compression_totals["compact_serialization"].tokens_saved,
+            700_000
+        );
+        assert!(!report.compression_totals.contains_key("position_reorder"));
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|record| record.lever())
+                .collect::<Vec<_>>(),
+            [LeverKind::RagSelect, LeverKind::CompactSerialization]
+        );
+    }
 }

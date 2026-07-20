@@ -1,11 +1,18 @@
 //! Ordered AI context-compression policies and execution.
 
+/// Deterministic compact serialization of marked JSON chunks.
+pub mod compact_serialization;
 /// Typed compression policy configuration.
 pub mod config;
 /// Opaque domain-separated session record identity.
 pub mod identity;
+mod marked_context;
 /// Closed compression outcomes and accounting records.
 pub mod outcome;
+/// Lost-in-the-middle mitigation through relevance-based position reordering.
+pub mod position_reorder;
+/// Retrieval-aware selection for explicitly marked context.
+pub mod rag_select;
 /// Versioned external summary-state records and canonical message digests.
 pub mod record;
 /// Sequential asynchronous compression execution.
@@ -19,19 +26,28 @@ mod summary_policy;
 /// Compatibility adapter for deterministic model-window fitting.
 pub mod window_fit;
 
+pub use compact_serialization::CompactSerializationLever;
 pub use config::{
-    CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionProfile,
-    CompressionSelector, CompressionStateBackend, CompressionStateConfig, SummarizerConfig,
-    SummaryBufferConfig, WindowFitConfig,
+    CompactSerializationConfig, CompressionBackend, CompressionLeverConfig, CompressionPolicy,
+    CompressionProfile, CompressionSelector, CompressionStateBackend, CompressionStateConfig,
+    PositionReorderConfig, RagSelectConfig, RetrievalRanking, SummarizerConfig,
+    SummaryBufferConfig, TabularSerializationConfig, WindowFitConfig,
 };
 pub use identity::CompressionRecordId;
+pub use marked_context::table::{decode_sbproxy_table_v1, TableDecodeError};
+pub use marked_context::{
+    inspect_marked_context, MarkedContextError, MarkedContextSnapshot, RetrievalBlockSnapshot,
+    RetrievalChunkSnapshot,
+};
 pub use outcome::{
     FailureReason, LeverKind, LeverOutcome, LeverResult, RequestOutcome, SkipReason,
 };
+pub use position_reorder::PositionReorderLever;
+pub use rag_select::RagSelectLever;
 pub use record::{CompressionSessionRecord, MessageDigest, RecordKind, RECORD_SCHEMA_VERSION};
 pub use runner::{
-    CompressionDecision, CompressionLever, CompressionRequest, CompressionRequestControls,
-    CompressionRun, CompressionRunner, ModelTokenCounter, TokenCounter,
+    CompressionCommitRule, CompressionDecision, CompressionLever, CompressionRequest,
+    CompressionRequestControls, CompressionRun, CompressionRunner, ModelTokenCounter, TokenCounter,
 };
 pub use store::{
     CommitError, CompressionConsistency, CompressionRecordMetadata, CompressionSessionStore,

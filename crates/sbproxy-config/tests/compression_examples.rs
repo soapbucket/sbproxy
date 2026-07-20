@@ -52,6 +52,22 @@ fn external_state_example_compiles_and_selects_redis() {
         .expect("ordered compression levers");
     assert_eq!(levers[0]["type"].as_str(), Some("summary_buffer"));
     assert_eq!(levers[1]["type"].as_str(), Some("window_fit"));
+
+    let compact_levers = compression["profiles"]["compact"]["levers"]
+        .as_sequence()
+        .expect("ordered compact profile levers");
+    assert_eq!(
+        compact_levers
+            .iter()
+            .map(|lever| lever["type"].as_str().expect("lever type"))
+            .collect::<Vec<_>>(),
+        [
+            "rag_select",
+            "compact_serialization",
+            "position_reorder",
+            "window_fit",
+        ]
+    );
 }
 
 #[test]

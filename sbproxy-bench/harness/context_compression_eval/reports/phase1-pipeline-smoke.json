@@ -1,0 +1,156 @@
+{
+  "schema_version": 4,
+  "profile": "phase1-pipeline-smoke-v1",
+  "pipeline": [
+    {
+      "type": "rag_select",
+      "min_tokens": 1,
+      "ranking": "supplied",
+      "max_chunks": 3,
+      "min_relevance_percent": 20,
+      "drop_empty": false
+    },
+    {
+      "type": "compact_serialization",
+      "min_tokens": 1,
+      "tabular": {
+        "enabled": true,
+        "min_rows": 20
+      }
+    },
+    {
+      "type": "position_reorder",
+      "ranking": "supplied"
+    },
+    {
+      "type": "window_fit",
+      "completion_reserve_tokens": 8000,
+      "input_budget_tokens": 512
+    }
+  ],
+  "token_counter": "sbproxy_target_model",
+  "latency_mode": "omitted_for_deterministic_gate",
+  "verified_provenance": {
+    "manifest_sha256": "f96e77cd1248de3c5d0dc9d528e0a21e768a4d335a599caa5d2084f94afbb5b3",
+    "artifacts": [
+      {
+        "path": "fixtures/phase1-pipeline-smoke.jsonl",
+        "corpus": "phase1_pipeline_smoke",
+        "provenance": "independently_authored_sanitized_shape",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "fb175128fb4acd655b69bbc983ca21db5e9019708a05a257dbd1f8f0e320bc91"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "phase1_combined_launch_key",
+      "corpus": "phase1_pipeline_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 1873,
+        "output_tokens": 1873,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 1873,
+        "output_tokens": 487,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 1386,
+      "savings_ratio": 0.739989,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "rag_select",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 1873,
+          "after_tokens": 876,
+          "tokens_saved": 997
+        },
+        {
+          "lever": "compact_serialization",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 876,
+          "after_tokens": 487,
+          "tokens_saved": 389
+        },
+        {
+          "lever": "position_reorder",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 487,
+          "after_tokens": 487,
+          "tokens_saved": 0
+        },
+        {
+          "lever": "window_fit",
+          "outcome": "skipped",
+          "reason": "not_eligible",
+          "before_tokens": 487,
+          "after_tokens": 487,
+          "tokens_saved": 0
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": 0.2,
+        "min_on_quality_score": 1.0,
+        "min_quality_delta": 0.0,
+        "require_non_expanding": true
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    }
+  ],
+  "corpora": {
+    "phase1_pipeline_smoke": {
+      "case_count": 1,
+      "input_tokens": 1873,
+      "output_tokens": 487,
+      "tokens_saved": 1386,
+      "savings_ratio": 0.739989,
+      "off_quality_score": 1.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 1,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 1
+      },
+      "reasons": {},
+      "acceptance_passed": true,
+      "recommendation": "build"
+    }
+  },
+  "overall": {
+    "case_count": 1,
+    "input_tokens": 1873,
+    "output_tokens": 487,
+    "tokens_saved": 1386,
+    "savings_ratio": 0.739989,
+    "off_quality_score": 1.0,
+    "on_quality_score": 1.0,
+    "quality_delta": 0.0,
+    "added_compression_latency_micros": null,
+    "applied_count": 1,
+    "skipped_count": 0,
+    "fallback_count": 0,
+    "skip_rate": 0.0,
+    "outcomes": {
+      "applied": 1
+    },
+    "reasons": {},
+    "acceptance_passed": true,
+    "recommendation": "build"
+  }
+}

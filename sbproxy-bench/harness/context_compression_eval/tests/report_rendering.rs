@@ -1,6 +1,8 @@
 use context_compression_eval::{
-    evaluate_cases, render_json, render_markdown, EvalCase, EvalConfig, EvalReport, QualitySpec,
+    evaluate_cases, render_json, render_markdown, AcceptanceSpec, EvalCase, EvalConfig, EvalReport,
+    QualitySpec,
 };
+use sbproxy_ai::compression::{CompressionLeverConfig, WindowFitConfig};
 use serde_json::json;
 
 async fn report() -> EvalReport {
@@ -17,13 +19,16 @@ async fn report() -> EvalReport {
         quality: QualitySpec::EvidenceRetention {
             required_evidence: vec!["EVIDENCE::failure=timeout".to_string()],
         },
+        acceptance: AcceptanceSpec::default(),
     };
     evaluate_cases(
         &[case],
         &EvalConfig {
             profile: "window_fit-smoke-v1".to_string(),
-            completion_reserve_tokens: 8_000,
-            input_budget_tokens: 192,
+            levers: vec![CompressionLeverConfig::WindowFit(WindowFitConfig {
+                completion_reserve_tokens: 8_000,
+                input_budget_tokens: Some(192),
+            })],
             measure_latency: false,
         },
     )
@@ -48,8 +53,10 @@ async fn json_and_markdown_are_byte_stable() {
     assert!(first_markdown.ends_with('\n'));
     assert!(first_markdown.contains("# Context Compression Evaluation"));
     assert!(first_markdown.contains("window_fit-smoke-v1"));
-    assert!(first_markdown.contains("Input budget: `192` tokens"));
-    assert!(first_markdown.contains("Completion reserve: `8000` tokens"));
+    assert!(first_markdown.contains("Report schema: `4`"));
+    assert!(first_markdown.contains("No verified provenance is attached to this in-memory report."));
+    assert!(first_markdown.contains("\"type\":\"window_fit\""));
+    assert!(first_markdown.contains("## Ordered lever results"));
     assert!(first_markdown.contains("coding_agent_smoke"));
     assert!(first_markdown.contains("omitted_for_deterministic_gate"));
     assert!(first_markdown.contains("build"));

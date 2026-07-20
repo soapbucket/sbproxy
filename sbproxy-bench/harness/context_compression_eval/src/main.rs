@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use context_compression_eval::{
-    adapt_external_jsonl, evaluate_cases, load_provenance, parse_cases, render_json,
-    render_markdown, verify_fixture_set, EvalConfig, ExternalSuite,
+    adapt_external_jsonl, build_stateless_levers, evaluate_cases, load_provenance, parse_cases,
+    render_json, render_markdown, verify_fixture_set, EvalConfig, EvalPipelineFile, EvalReport,
+    ExternalSuite, FixtureArtifact, Recommendation, VerifiedProvenanceSummary,
 };
 
 #[derive(Debug, Parser)]
@@ -53,6 +54,9 @@ enum Command {
 
 #[derive(Debug, Clone, Args)]
 struct ReportArgs {
+    /// Checked ordered compression pipeline configuration.
+    #[arg(long)]
+    pipeline_config: PathBuf,
     /// Normalized JSONL input. Repeat for multiple corpora.
     #[arg(long, required = true)]
     input: Vec<PathBuf>,
@@ -62,15 +66,6 @@ struct ReportArgs {
     /// Root against which provenance paths are resolved.
     #[arg(long, default_value = ".")]
     harness_root: PathBuf,
-    /// Named compression profile shown in the report.
-    #[arg(long, default_value = "window_fit-smoke-v1")]
-    profile: String,
-    /// Completion reserve subtracted from a known target model window.
-    #[arg(long, default_value_t = 8_000)]
-    completion_reserve_tokens: u64,
-    /// Explicit input-message budget evaluated by the window-fit arm.
-    #[arg(long, default_value_t = 192)]
-    input_budget_tokens: u64,
     /// JSON report path.
     #[arg(long)]
     json_report: PathBuf,
@@ -86,12 +81,18 @@ async fn main() -> Result<()> {
             reports,
             measure_latency,
         } => {
-            let (json, markdown) = generate(&reports, measure_latency).await?;
+            let (_, json, markdown) = generate(&reports, measure_latency).await?;
             write_file(&reports.json_report, &json)?;
             write_file(&reports.markdown_report, &markdown)?;
         }
         Command::Check { reports } => {
-            let (json, markdown) = generate(&reports, false).await?;
+            let (report, json, markdown) = generate(&reports, false).await?;
+            if report.overall.recommendation != Recommendation::Build {
+                bail!(
+                    "overall recommendation is {}, expected build",
+                    recommendation_label(report.overall.recommendation)
+                );
+            }
             check_file(&reports.json_report, &json, "JSON")?;
             check_file(&reports.markdown_report, &markdown, "Markdown")?;
         }
@@ -110,12 +111,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn generate(args: &ReportArgs, measure_latency: bool) -> Result<(String, String)> {
+async fn generate(
+    args: &ReportArgs,
+    measure_latency: bool,
+) -> Result<(EvalReport, String, String)> {
+    let pipeline = load_pipeline(&args.pipeline_config)?;
     let provenance_bytes = fs::read(&args.provenance)
         .with_context(|| format!("read provenance {}", args.provenance.display()))?;
     let provenance = load_provenance(provenance_bytes.as_slice())?;
     verify_fixture_set(&args.harness_root, &provenance)?;
-    verify_inputs_covered(args, &provenance)?;
+    let selected_artifacts = verify_inputs_covered(args, &provenance)?;
 
     let mut cases = Vec::new();
     let mut ids = BTreeSet::new();
@@ -128,43 +133,78 @@ async fn generate(args: &ReportArgs, measure_latency: bool) -> Result<(String, S
             cases.push(case);
         }
     }
-    let report = evaluate_cases(
+    let mut report = evaluate_cases(
         &cases,
         &EvalConfig {
-            profile: args.profile.clone(),
-            completion_reserve_tokens: args.completion_reserve_tokens,
-            input_budget_tokens: args.input_budget_tokens,
+            profile: pipeline.profile,
+            levers: pipeline.levers,
             measure_latency,
         },
     )
     .await?;
-    Ok((render_json(&report)?, render_markdown(&report)))
+    report.verified_provenance = Some(VerifiedProvenanceSummary::from_verified_inputs(
+        &provenance_bytes,
+        selected_artifacts,
+    ));
+    let json = render_json(&report)?;
+    let markdown = render_markdown(&report);
+    Ok((report, json, markdown))
+}
+
+fn load_pipeline(path: &Path) -> Result<EvalPipelineFile> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read pipeline config {}", path.display()))?;
+    let pipeline: EvalPipelineFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse pipeline config {}", path.display()))?;
+    if pipeline.schema_version != 1 {
+        bail!(
+            "unsupported pipeline schema version {}",
+            pipeline.schema_version
+        );
+    }
+    if pipeline.profile.trim().is_empty() {
+        bail!("pipeline profile must not be empty");
+    }
+    build_stateless_levers(&pipeline.levers)?;
+    Ok(pipeline)
+}
+
+fn recommendation_label(recommendation: Recommendation) -> &'static str {
+    match recommendation {
+        Recommendation::Build => "build",
+        Recommendation::Borrow => "borrow",
+        Recommendation::Defer => "defer",
+    }
 }
 
 fn verify_inputs_covered(
     args: &ReportArgs,
     manifest: &context_compression_eval::ProvenanceManifest,
-) -> Result<()> {
+) -> Result<Vec<FixtureArtifact>> {
     let covered = manifest
         .artifacts
         .iter()
         .map(|artifact| {
             let path = args.harness_root.join(&artifact.path);
-            fs::canonicalize(&path)
-                .with_context(|| format!("resolve covered input {}", path.display()))
+            let resolved = fs::canonicalize(&path)
+                .with_context(|| format!("resolve covered input {}", path.display()))?;
+            Ok((resolved, artifact))
         })
-        .collect::<Result<BTreeSet<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
+    let mut selected = Vec::with_capacity(args.input.len());
     for input in &args.input {
         let resolved = fs::canonicalize(input)
             .with_context(|| format!("resolve input {}", input.display()))?;
-        if !covered.contains(&resolved) {
+        let Some((_, artifact)) = covered.iter().find(|(path, _)| path == &resolved) else {
             bail!(
                 "input {} is not covered by the provenance manifest",
                 input.display()
             );
-        }
+        };
+        selected.push((*artifact).clone());
     }
-    Ok(())
+    selected.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(selected)
 }
 
 fn write_file(path: &Path, contents: &str) -> Result<()> {

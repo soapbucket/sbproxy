@@ -6,7 +6,8 @@ This example runs the ordered AI context-compression pipeline with a
 process-wide Redis state backend. A dedicated `openai-summarizer` provider
 reduces older plain-text chat history into a bounded running summary, then
 `window_fit` applies an explicit target-model-counted input budget. The route
-also declares a named `compact` profile that uses only stateless `window_fit`.
+also declares a stateless `compact` profile that runs `rag_select`,
+`compact_serialization`, `position_reorder`, and `window_fit` in that order.
 
 Request workers are stateless. The client remains the source of truth for the
 conversation and sends the complete canonical `messages` array on every turn.
@@ -69,8 +70,10 @@ stored in the compression record or returned by the compression Admin API.
 
 The route default, selected by `on` or by no explicit selector, runs
 `summary_buffer` and then fits the result to 16,384 input tokens. The named
-`compact` profile skips summary state and fits directly to 4,096 input tokens.
-`off` preserves the caller's complete message list.
+`compact` profile selects marked retrieval chunks, compacts safe structured
+chunks, moves relevant evidence toward the edges, and fits the result to 4,096
+input tokens. It does not read or write summary state. `off` preserves the
+caller's complete message list.
 
 Selectors resolve in this order: `X-Compression`, governed key
 `compression_profile`, CEL `compression:<selector>`, then route default. A
@@ -96,6 +99,110 @@ configured budget and known model capacity. It preserves the leading system
 and developer instructions, the complete newest turn, contiguous recent
 history, and complete OpenAI or Anthropic tool exchanges. If protected
 material cannot fit, the lever skips without changing the request.
+
+This route declares a named profile, so semantic-cache reads and writes are
+bypassed for every request on the route. The cache key does not partition by
+compression behavior yet. The same bypass applies to any selected pipeline
+that contains `rag_select`, `compact_serialization`, or `position_reorder`.
+
+## Marked retrieval context
+
+The three retrieval-aware levers act only on explicit blocks inside a
+string-valued `content` field with role `user` or `tool`. They do not infer
+retrieval context from ordinary text. Marker-like text in `system`,
+`developer`, or `assistant` content remains protected.
+
+A block uses this exact line-delimited grammar:
+
+```text
+<sbproxy-retrieval>
+<sbproxy-query>
+Which deployment evidence explains the outage?
+</sbproxy-query>
+<sbproxy-chunk id="deploy-log" score="0.95" format="text">
+The checkout deployment failed because catalog-v42 was missing.
+</sbproxy-chunk>
+</sbproxy-retrieval>
+```
+
+The block, query, and chunk tags occupy complete lines. Tags are lowercase and
+exact. A block cannot nest and contains exactly one non-empty query followed
+by zero or more chunks. Each chunk opening tag uses attributes in this order:
+`id`, optional `score`, then `format`. The ID contains from 1 to 64 ASCII
+letters, digits, `.`, `_`, or `-`. A score is finite and falls from 0 through
+1. Formats are `text`, `json`, and the rendered `sbproxy_table_v1`. A query or
+chunk body cannot contain its own closing tag as a complete line. LF and CRLF
+are accepted, but one block must use a consistent line ending.
+
+The parser accepts at most 32 blocks per request, 1,024 chunks per block, and
+4,096 chunks per request. Each retrieval-aware lever parses the complete
+working message list. If any apparent block is malformed or exceeds a limit,
+that lever skips without committing a partial rewrite. Later levers still run.
+In particular, a later `window_fit` may trim the request, so a retrieval skip
+does not promise that the whole provider request stays unchanged.
+
+Ranking has three modes. `auto` uses supplied scores only when every chunk in
+the block has one; otherwise it uses deterministic lexical ranking. `supplied`
+requires every score and skips a block with a missing score. `lexical` ignores
+scores and ranks normalized TF-IDF similarity between the marked query and
+each chunk. Stable source order breaks ties.
+
+`rag_select` keeps the query and ranks each block independently. It applies
+`min_relevance_percent`, then `max_chunks`. With `drop_empty: true`, a block
+whose chunks are all removed remains as a valid wrapper containing its query.
+`compact_serialization` considers only marked JSON chunks. It first removes
+insignificant JSON whitespace. A uniform top-level array of scalar-valued
+objects can use `sbproxy_table_v1`: one sorted JSON column array followed by
+tab-separated canonical JSON scalar rows. The public Table v1 decoder returns
+the exact original JSON `Value`; insignificant whitespace and object-key order
+are not part of that promise.
+
+`position_reorder` ranks the surviving chunks and places rank 1 at the start,
+rank 2 at the end, rank 3 after rank 1, and rank 4 before rank 2. It changes
+only chunk order. Because this is a non-expanding transformation, it can apply
+with zero tokens saved.
+
+This command sends a valid marked block through the stateless profile:
+
+```bash
+export SB_DATA_URL=${SB_DATA_URL:-http://127.0.0.1:8080}
+
+MARKED_CONTEXT="$(cat <<'MARKERS'
+Caller note before the marked block.
+<sbproxy-retrieval>
+<sbproxy-query>
+Which deployment evidence explains the outage?
+</sbproxy-query>
+<sbproxy-chunk id="distractor" score="0.10" format="text">
+The office lunch menu changed on Tuesday.
+</sbproxy-chunk>
+<sbproxy-chunk id="required" score="0.95" format="text">
+The checkout deployment failed because catalog-v42 was missing.
+</sbproxy-chunk>
+<sbproxy-chunk id="context" score="0.30" format="text">
+The deployment started at 12:01 UTC.
+</sbproxy-chunk>
+<sbproxy-chunk id="useful" score="0.70" format="text">
+The catalog service reported ImagePullBackOff.
+</sbproxy-chunk>
+</sbproxy-retrieval>
+Caller note after the marked block.
+MARKERS
+)"
+
+jq -n --arg content "$MARKED_CONTEXT" '{
+  model: "gpt-4o",
+  messages: [{role: "user", content: $content}]
+}' > /tmp/sbproxy-compression-marked.json
+
+curl --fail-with-body -sS \
+  -H 'Host: ai.local' \
+  -H 'Content-Type: application/json' \
+  -H 'X-Compression: compact' \
+  --data-binary @/tmp/sbproxy-compression-marked.json \
+  "${SB_DATA_URL}/v1/chat/completions" \
+  | jq -r '.choices[0].message.content'
+```
 
 ## Send two turns
 
@@ -292,10 +399,11 @@ curl --fail-with-body -sS \
 ```
 
 `sbproxy_ai_compression_tokens_saved_total` is an integer counter incremented
-from SBproxy's model-aware estimate for each applied lever. Since every
-accepted lever must strictly reduce the working message list, summing the lever
-counters gives the exact cumulative initial-to-final reduction in that shared
-estimate for the process:
+from SBproxy's model-aware estimate for each applied lever. `summary_buffer`,
+`window_fit`, `rag_select`, and `compact_serialization` commit only a strict
+reduction. `position_reorder` may commit a changed, non-expanding order with
+zero savings. Summing the lever counters still gives the exact cumulative
+initial-to-final reduction in that shared estimate for the process:
 
 ```promql
 sum(sbproxy_ai_compression_tokens_saved_total{tenant_id="compression-redis-demo"})
@@ -306,6 +414,18 @@ Break the same estimate-relative counter down by lever:
 ```promql
 sum by (lever) (
   sbproxy_ai_compression_tokens_saved_total{tenant_id="compression-redis-demo"}
+)
+```
+
+Use the invocation counter to see applied reorder operations, including the
+valid zero-saving case:
+
+```promql
+sum by (lever, outcome, reason) (
+  rate(sbproxy_ai_compression_lever_total{
+    tenant_id="compression-redis-demo",
+    lever=~"rag_select|compact_serialization|position_reorder"
+  }[5m])
 )
 ```
 
@@ -326,8 +446,10 @@ sum by (source, outcome) (
 )
 ```
 
-After a terminal provider request succeeds, the value counters record each
-applied lever. Their fifth label states whether the target-model count came
+After a terminal provider request succeeds, the value counters record applied
+levers that reduced the estimate. `position_reorder` is intentionally absent
+from value accounting because its valid contribution can be structural with
+zero tokens saved. The fifth label states whether the target-model count came
 from a registered tokenizer or the heuristic fallback:
 
 ```promql
@@ -353,8 +475,14 @@ For model families without a dedicated tokenizer, the counter uses the
 documented UTF-8 byte-length heuristic, not a Unicode character count, and is
 not reconciled to provider-reported usage after dispatch.
 
-Applied pipelines emit one content-free `ai_compression_summary` event. With
-the JSON log format used above, a safely redacted example is:
+Metric dimensions are bounded. Lever, outcome, reason, backend, selection
+source, and selection outcome use closed label sets. Tenant and public API key
+identifiers pass through the shared cardinality budget; request text, marker
+IDs, queries, chunk bodies, scores, and credentials never become labels.
+
+Every executed non-empty pipeline emits exactly one content-free
+`ai_compression_summary` event. With the JSON log format used above, a safely
+redacted example is:
 
 ```json
 {"timestamp":"<redacted>","level":"INFO","fields":{"message":"AI context compression pipeline summary","event":"ai_compression_summary","tenant_id":"<redacted>","api_key_id":"<redacted>","outcome":"applied","initial_tokens":12480,"final_tokens":1320,"tokens_saved":11160,"levers_run":2,"levers_applied":1,"latency_ms":640,"backend":"redis","consistency":"serialized","cache_bypass":true,"selection_source":"route_default","selection_outcome":"default","lever_outcomes":"<content-free JSON omitted>","targets":"<configured numeric targets omitted>"},"target":"ai_compression"}
@@ -369,8 +497,11 @@ Each explicit header, governed-key, or CEL selection emits an
 optional closed reason. Route-default resolution also emits it when named
 profiles or an explicit input budget require semantic-cache separation. It
 does not log the header or profile name. The summary event's `targets` field
-includes `input_budget_tokens` for each explicitly budgeted `window_fit`
-lever.
+includes only configured controls. Retrieval targets contain
+`rag_select.min_tokens`, ranking mode, `max_chunks`, relevance percentage,
+`drop_empty`, compact-serialization threshold and tabular controls, or the
+position-reorder ranking mode. A WindowFit target includes
+`input_budget_tokens` when configured.
 
 ## Read the value report
 
@@ -393,28 +524,30 @@ provider's billed input count.
 
 ## Run the evaluation gate
 
-The repository includes a deterministic off/on smoke evaluation for the real
-runner and explicit-budget `window_fit` path. Its retrieval cases are synthetic
-and its coding-agent shapes are independently authored and sanitized; they are
-not captured production traffic:
+The repository includes deterministic off/on smoke evaluation for the real
+runner and production stateless levers. Its retrieval cases and coding-agent
+shapes are independently authored, synthetic structural evidence. They are
+not captured production traffic and do not measure target-model answer
+quality:
 
 ```bash
 cd sbproxy-bench/harness/context_compression_eval
-cargo test --locked
+cargo nextest run --all-targets --locked
 cargo run --locked -- check \
-  --input fixtures/ruler-smoke.jsonl \
-  --input fixtures/coding-agent-smoke.jsonl \
+  --pipeline-config pipelines/phase1-pipeline-smoke.json \
+  --input fixtures/phase1-pipeline-smoke.jsonl \
   --provenance fixtures/provenance.json \
-  --input-budget-tokens 192 \
-  --json-report reports/window-fit-smoke.json \
-  --markdown-report reports/window-fit-smoke.md
+  --json-report reports/phase1-pipeline-smoke.json \
+  --markdown-report reports/phase1-pipeline-smoke.md
 ```
 
-The harness also normalizes operator-supplied RULER, HELMET, LongBench-v2, and
-NoLiMa interchange rows. Those adapters import contexts and already generated
-off/on predictions for reporting. They do not download a suite, run a target
-model, or produce an official benchmark score. Official suite runs and
-genuinely captured sanitized traffic remain follow-up work under WOR-1879.
+CI checks report pairs for `rag-select-smoke`,
+`compact-serialization-smoke`, `position-reorder-smoke`,
+`phase1-pipeline-smoke`, and `window-fit-smoke`. The harness also normalizes
+operator-supplied RULER, HELMET, LongBench-v2, and NoLiMa interchange rows.
+Those adapters import contexts and already generated off/on predictions for
+reporting. They do not download a suite, run a target model, or produce an
+official benchmark score.
 
 ## Safe degradation
 

@@ -38,6 +38,30 @@ pub struct FixtureArtifact {
     pub sha256: String,
 }
 
+/// Verified provenance attached to a detached evaluation report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedProvenanceSummary {
+    /// Lowercase SHA-256 digest of the exact provenance manifest bytes.
+    pub manifest_sha256: String,
+    /// Verified metadata for only the fixture inputs selected by this report.
+    pub artifacts: Vec<FixtureArtifact>,
+}
+
+impl VerifiedProvenanceSummary {
+    /// Build a stable summary after the caller verifies the manifest and selected inputs.
+    pub fn from_verified_inputs(
+        manifest_bytes: &[u8],
+        mut artifacts: Vec<FixtureArtifact>,
+    ) -> Self {
+        artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+        Self {
+            manifest_sha256: sha256_hex(manifest_bytes),
+            artifacts,
+        }
+    }
+}
+
 /// Parse a strict provenance manifest.
 pub fn load_provenance(mut reader: impl Read) -> Result<ProvenanceManifest> {
     let mut bytes = Vec::new();

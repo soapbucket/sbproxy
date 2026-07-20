@@ -85,6 +85,22 @@ origins:
         profiles:
           compact:
             levers:
+              - type: rag_select
+                min_tokens: 512
+                ranking: auto
+                max_chunks: 8
+                min_relevance_percent: 15
+                drop_empty: true
+
+              - type: compact_serialization
+                min_tokens: 128
+                tabular:
+                  enabled: true
+                  min_rows: 8
+
+              - type: position_reorder
+                ranking: auto
+
               - type: window_fit
                 completion_reserve_tokens: 2048
                 input_budget_tokens: 4096

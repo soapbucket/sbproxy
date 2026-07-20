@@ -1,0 +1,115 @@
+{
+  "schema_version": 4,
+  "profile": "rag-select-smoke-v1",
+  "pipeline": [
+    {
+      "type": "rag_select",
+      "min_tokens": 1,
+      "ranking": "supplied",
+      "max_chunks": 2,
+      "min_relevance_percent": 50,
+      "drop_empty": false
+    }
+  ],
+  "token_counter": "sbproxy_target_model",
+  "latency_mode": "omitted_for_deterministic_gate",
+  "verified_provenance": {
+    "manifest_sha256": "f96e77cd1248de3c5d0dc9d528e0a21e768a4d335a599caa5d2084f94afbb5b3",
+    "artifacts": [
+      {
+        "path": "fixtures/rag-select-smoke.jsonl",
+        "corpus": "rag_select_smoke",
+        "provenance": "independently_authored_sanitized_shape",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "2f6dabbc2d7b8c91c4b9f957beafc2c86ae3cf04cd0b035f802b6dc57c032e80"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "rag_select_ranked_signal",
+      "corpus": "rag_select_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 1398,
+        "output_tokens": 1398,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 1398,
+        "output_tokens": 126,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 1272,
+      "savings_ratio": 0.909871,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "rag_select",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 1398,
+          "after_tokens": 126,
+          "tokens_saved": 1272
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": 0.4,
+        "min_on_quality_score": 1.0,
+        "min_quality_delta": 0.0,
+        "require_non_expanding": true
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    }
+  ],
+  "corpora": {
+    "rag_select_smoke": {
+      "case_count": 1,
+      "input_tokens": 1398,
+      "output_tokens": 126,
+      "tokens_saved": 1272,
+      "savings_ratio": 0.909871,
+      "off_quality_score": 1.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 1,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 1
+      },
+      "reasons": {},
+      "acceptance_passed": true,
+      "recommendation": "build"
+    }
+  },
+  "overall": {
+    "case_count": 1,
+    "input_tokens": 1398,
+    "output_tokens": 126,
+    "tokens_saved": 1272,
+    "savings_ratio": 0.909871,
+    "off_quality_score": 1.0,
+    "on_quality_score": 1.0,
+    "quality_delta": 0.0,
+    "added_compression_latency_micros": null,
+    "applied_count": 1,
+    "skipped_count": 0,
+    "fallback_count": 0,
+    "skip_rate": 0.0,
+    "outcomes": {
+      "applied": 1
+    },
+    "reasons": {},
+    "acceptance_passed": true,
+    "recommendation": "build"
+  }
+}

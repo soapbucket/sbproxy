@@ -10,6 +10,12 @@ pub enum LeverKind {
     SummaryBuffer,
     /// Deterministic target-window fitting.
     WindowFit,
+    /// Retrieval-aware selection of marked context chunks.
+    RagSelect,
+    /// Deterministic compact serialization of supported structured content.
+    CompactSerialization,
+    /// Reordering of marked context to mitigate position effects.
+    PositionReorder,
 }
 
 impl LeverKind {
@@ -18,6 +24,9 @@ impl LeverKind {
         match self {
             Self::SummaryBuffer => "summary_buffer",
             Self::WindowFit => "window_fit",
+            Self::RagSelect => "rag_select",
+            Self::CompactSerialization => "compact_serialization",
+            Self::PositionReorder => "position_reorder",
         }
     }
 }
@@ -57,6 +66,20 @@ pub enum SkipReason {
     PolicyDenied,
     /// A bounded coordination permit was unavailable.
     LockContended,
+    /// No marked context was present in the request.
+    NoMarkedContext,
+    /// Marked context could not be parsed without ambiguity.
+    MalformedMarkedContext,
+    /// Marked context exceeded the lever's bounded processing limit.
+    MarkedContextTooLarge,
+    /// A required caller-supplied relevance score was absent.
+    MissingRelevanceScore,
+    /// Selection rules retained no marked context chunks.
+    NoSelectedChunks,
+    /// Structured content could not be transformed safely.
+    UnsafeStructuredShape,
+    /// Marked context already had the requested order.
+    AlreadyOrdered,
 }
 
 impl SkipReason {
@@ -79,6 +102,13 @@ impl SkipReason {
             Self::BudgetDenied => "budget_denied",
             Self::PolicyDenied => "policy_denied",
             Self::LockContended => "lock_contended",
+            Self::NoMarkedContext => "no_marked_context",
+            Self::MalformedMarkedContext => "malformed_marked_context",
+            Self::MarkedContextTooLarge => "marked_context_too_large",
+            Self::MissingRelevanceScore => "missing_relevance_score",
+            Self::NoSelectedChunks => "no_selected_chunks",
+            Self::UnsafeStructuredShape => "unsafe_structured_shape",
+            Self::AlreadyOrdered => "already_ordered",
         }
     }
 }
@@ -123,7 +153,7 @@ impl FailureReason {
 /// Result category for one lever invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeverOutcome {
-    /// A strictly token-reducing replacement was committed.
+    /// A transformation was committed.
     Applied,
     /// The lever did not need or could not safely attempt a replacement.
     Skipped {
@@ -175,5 +205,43 @@ impl RequestOutcome {
             Self::Skipped => "skipped",
             Self::Failed => "failed",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LeverKind, SkipReason};
+
+    #[test]
+    fn stateless_lever_kinds_have_stable_labels() {
+        assert_eq!(LeverKind::RagSelect.as_str(), "rag_select");
+        assert_eq!(
+            LeverKind::CompactSerialization.as_str(),
+            "compact_serialization"
+        );
+        assert_eq!(LeverKind::PositionReorder.as_str(), "position_reorder");
+    }
+
+    #[test]
+    fn stateless_skip_reasons_have_stable_labels() {
+        assert_eq!(SkipReason::NoMarkedContext.as_str(), "no_marked_context");
+        assert_eq!(
+            SkipReason::MalformedMarkedContext.as_str(),
+            "malformed_marked_context"
+        );
+        assert_eq!(
+            SkipReason::MarkedContextTooLarge.as_str(),
+            "marked_context_too_large"
+        );
+        assert_eq!(
+            SkipReason::MissingRelevanceScore.as_str(),
+            "missing_relevance_score"
+        );
+        assert_eq!(SkipReason::NoSelectedChunks.as_str(), "no_selected_chunks");
+        assert_eq!(
+            SkipReason::UnsafeStructuredShape.as_str(),
+            "unsafe_structured_shape"
+        );
+        assert_eq!(SkipReason::AlreadyOrdered.as_str(), "already_ordered");
     }
 }

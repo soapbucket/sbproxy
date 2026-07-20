@@ -5,7 +5,7 @@ use clap::ValueEnum;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{EvalCase, QualitySpec};
+use crate::{AcceptanceSpec, EvalCase, QualitySpec};
 
 /// External suite label accepted by the generic interchange adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -91,6 +91,7 @@ pub fn adapt_external_jsonl(
                     off_prediction: external.off_prediction,
                     on_prediction: external.on_prediction,
                 },
+                acceptance: AcceptanceSpec::default(),
             })
         })
         .collect::<Result<Vec<_>>>()?;

@@ -103,15 +103,18 @@ pub struct PendingCompressionValue {
 }
 
 impl PendingCompressionValue {
-    /// Build pending value from applied levers with positive target-model
-    /// token savings. Skips, failures, and zero-savings outcomes are omitted.
+    /// Build pending value from applied reducing levers with positive
+    /// target-model token savings. Skips, failures, zero-savings outcomes,
+    /// and position-only reordering are omitted.
     pub fn from_run(target_model: impl Into<String>, run: &CompressionRun) -> Option<Self> {
         let token_count_precision = run.token_count_precision;
         let levers = run
             .lever_results
             .iter()
             .filter(|result| {
-                matches!(result.outcome, LeverOutcome::Applied) && result.tokens_saved > 0
+                matches!(result.outcome, LeverOutcome::Applied)
+                    && result.tokens_saved > 0
+                    && result.lever != LeverKind::PositionReorder
             })
             .map(|result| PendingCompressionLeverValue {
                 lever: result.lever,
@@ -987,6 +990,49 @@ mod tests {
             TokenCountPrecision::ModelTokenizer
         );
         assert_eq!(records[1].gross_cost_saved_micros(), 125_000);
+    }
+
+    #[test]
+    fn pending_value_accepts_reducing_stateless_levers_but_never_position_reorder() {
+        let run = CompressionRun {
+            messages: Vec::new(),
+            initial_tokens: 1_500_010,
+            final_tokens: 10,
+            tokens_saved: 1_500_000,
+            token_count_precision: TokenCountPrecision::ModelTokenizer,
+            lever_results: vec![
+                lever_result(LeverKind::RagSelect, LeverOutcome::Applied, 500_000),
+                lever_result(
+                    LeverKind::CompactSerialization,
+                    LeverOutcome::Applied,
+                    700_000,
+                ),
+                lever_result(LeverKind::PositionReorder, LeverOutcome::Applied, 300_000),
+            ],
+        };
+
+        let pending = PendingCompressionValue::from_run("gpt-4o", &run)
+            .expect("reducing stateless levers create pending value");
+        assert_eq!(
+            pending
+                .levers()
+                .iter()
+                .map(PendingCompressionLeverValue::lever)
+                .collect::<Vec<_>>(),
+            [LeverKind::RagSelect, LeverKind::CompactSerialization]
+        );
+        assert_eq!(
+            pending
+                .levers()
+                .iter()
+                .map(PendingCompressionLeverValue::tokens_saved)
+                .sum::<u64>(),
+            1_200_000
+        );
+        assert!(pending
+            .priced_records()
+            .iter()
+            .all(|record| record.lever() != LeverKind::PositionReorder));
     }
 
     #[test]
