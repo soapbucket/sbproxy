@@ -20,6 +20,59 @@ struct Line<'a> {
     ending: Option<LineEnding>,
 }
 
+struct LineCursor<'a> {
+    content: &'a str,
+    position: usize,
+}
+
+impl<'a> LineCursor<'a> {
+    fn new(content: &'a str) -> Self {
+        Self {
+            content,
+            position: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for LineCursor<'a> {
+    type Item = Line<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.position == self.content.len() {
+            return None;
+        }
+
+        let start = self.position;
+        let bytes = self.content.as_bytes();
+        let newline = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| start + offset);
+        let Some(newline) = newline else {
+            self.position = self.content.len();
+            return Some(Line {
+                text: &self.content[start..],
+                start,
+                content_end: self.content.len(),
+                ending: None,
+            });
+        };
+
+        let (content_end, ending) = if newline > start && bytes[newline - 1] == b'\r' {
+            (newline - 1, LineEnding::CrLf)
+        } else {
+            (newline, LineEnding::Lf)
+        };
+        self.position = newline + 1;
+        Some(Line {
+            text: &self.content[start..content_end],
+            start,
+            content_end,
+            ending: Some(ending),
+        })
+    }
+}
+
 #[derive(Default)]
 struct ParseCounts {
     blocks: usize,
@@ -29,7 +82,6 @@ struct ParseCounts {
 struct ParsedBlock {
     block: RetrievalBlock,
     end: usize,
-    next_line: usize,
 }
 
 struct ParsedChunkOpen<'a> {
@@ -80,19 +132,16 @@ fn parse_document(
     content: &str,
     counts: &mut ParseCounts,
 ) -> Result<Option<Vec<Segment>>, MarkedContextError> {
-    let lines = complete_lines(content);
+    let mut lines = LineCursor::new(content);
     let mut segments = Vec::new();
     let mut literal_start = 0;
-    let mut line_index = 0;
     let mut found = false;
 
-    while line_index < lines.len() {
-        let line = lines[line_index];
+    while let Some(line) = lines.next() {
         if is_orphan_sentinel(line.text) {
             return Err(MarkedContextError::Malformed);
         }
         if line.text != RETRIEVAL_OPEN {
-            line_index += 1;
             continue;
         }
 
@@ -105,10 +154,9 @@ fn parse_document(
         segments.push(Segment::Literal(
             content[literal_start..line.start].to_string(),
         ));
-        let parsed = parse_block(content, &lines, line_index, counts)?;
+        let parsed = parse_block(content, &mut lines, line, counts)?;
         segments.push(Segment::Retrieval(parsed.block));
         literal_start = parsed.end;
-        line_index = parsed.next_line;
     }
 
     if !found {
@@ -118,26 +166,20 @@ fn parse_document(
     Ok(Some(segments))
 }
 
-fn parse_block(
-    content: &str,
-    lines: &[Line<'_>],
-    open_index: usize,
+fn parse_block<'a>(
+    content: &'a str,
+    lines: &mut LineCursor<'a>,
+    open: Line<'a>,
     counts: &mut ParseCounts,
 ) -> Result<ParsedBlock, MarkedContextError> {
-    let line_ending = lines[open_index]
-        .ending
-        .ok_or(MarkedContextError::Malformed)?;
-    let query_open_index = open_index + 1;
-    let query_open = lines
-        .get(query_open_index)
-        .ok_or(MarkedContextError::Malformed)?;
+    let line_ending = open.ending.ok_or(MarkedContextError::Malformed)?;
+    let query_open = lines.next().ok_or(MarkedContextError::Malformed)?;
     if query_open.text != QUERY_OPEN || query_open.ending != Some(line_ending) {
         return Err(MarkedContextError::Malformed);
     }
 
-    let query_body_start = line_after(query_open);
-    let query_close_index = find_query_close(lines, query_open_index + 1)?;
-    let query_close = lines[query_close_index];
+    let query_body_start = line_after(&query_open);
+    let query_close = find_query_close(lines)?;
     if query_close.ending != Some(line_ending) {
         return Err(MarkedContextError::Malformed);
     }
@@ -148,9 +190,8 @@ fn parse_block(
 
     let mut chunks = Vec::new();
     let mut ids = BTreeSet::new();
-    let mut next_index = query_close_index + 1;
     loop {
-        let next = lines.get(next_index).ok_or(MarkedContextError::Malformed)?;
+        let next = lines.next().ok_or(MarkedContextError::Malformed)?;
         if next.text == RETRIEVAL_CLOSE {
             if next.ending.is_some_and(|ending| ending != line_ending) {
                 return Err(MarkedContextError::Malformed);
@@ -163,7 +204,6 @@ fn parse_block(
                     changed: false,
                 },
                 end: next.content_end,
-                next_line: next_index + 1,
             });
         }
         if next.text == RETRIEVAL_OPEN {
@@ -181,9 +221,8 @@ fn parse_block(
             return Err(MarkedContextError::Malformed);
         }
 
-        let chunk_body_start = line_after(next);
-        let close_index = find_chunk_close(lines, next_index + 1)?;
-        let close = lines[close_index];
+        let chunk_body_start = line_after(&next);
+        let close = find_chunk_close(lines)?;
         if close.ending != Some(line_ending) {
             return Err(MarkedContextError::Malformed);
         }
@@ -199,32 +238,29 @@ fn parse_block(
             original_rendering: content[next.start..close.content_end].to_string(),
             changed: false,
         });
-        next_index = close_index + 1;
     }
 }
 
-fn find_query_close(lines: &[Line<'_>], mut index: usize) -> Result<usize, MarkedContextError> {
-    while let Some(line) = lines.get(index) {
+fn find_query_close<'a>(lines: &mut LineCursor<'a>) -> Result<Line<'a>, MarkedContextError> {
+    for line in lines {
         if line.text == QUERY_CLOSE {
-            return Ok(index);
+            return Ok(line);
         }
         if line.text == RETRIEVAL_OPEN {
             return Err(MarkedContextError::Malformed);
         }
-        index += 1;
     }
     Err(MarkedContextError::Malformed)
 }
 
-fn find_chunk_close(lines: &[Line<'_>], mut index: usize) -> Result<usize, MarkedContextError> {
-    while let Some(line) = lines.get(index) {
+fn find_chunk_close<'a>(lines: &mut LineCursor<'a>) -> Result<Line<'a>, MarkedContextError> {
+    for line in lines {
         if line.text == CHUNK_CLOSE {
-            return Ok(index);
+            return Ok(line);
         }
         if line.text == RETRIEVAL_OPEN {
             return Err(MarkedContextError::Malformed);
         }
-        index += 1;
     }
     Err(MarkedContextError::Malformed)
 }
@@ -298,38 +334,6 @@ fn body_before_close(
 
 fn line_after(line: &Line<'_>) -> usize {
     line.content_end + line.ending.map_or(0, |ending| ending.as_str().len())
-}
-
-fn complete_lines(content: &str) -> Vec<Line<'_>> {
-    let bytes = content.as_bytes();
-    let mut lines = Vec::new();
-    let mut start = 0;
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte != b'\n' {
-            continue;
-        }
-        let (content_end, ending) = if index > start && bytes[index - 1] == b'\r' {
-            (index - 1, LineEnding::CrLf)
-        } else {
-            (index, LineEnding::Lf)
-        };
-        lines.push(Line {
-            text: &content[start..content_end],
-            start,
-            content_end,
-            ending: Some(ending),
-        });
-        start = index + 1;
-    }
-    if start < content.len() {
-        lines.push(Line {
-            text: &content[start..],
-            start,
-            content_end: content.len(),
-            ending: None,
-        });
-    }
-    lines
 }
 
 #[cfg(test)]
@@ -493,6 +497,26 @@ mod tests {
             .is_none());
         assert!(parse_marked_messages(&messages)
             .expect("protected content is ignored")
+            .is_none());
+        assert_eq!(messages, original);
+    }
+
+    #[test]
+    fn accepts_many_unmarked_lines_without_a_semantic_line_limit() {
+        let mut content = String::new();
+        for index in 0..100_000 {
+            content.push_str("ordinary literal line");
+            content.push_str(if index % 2 == 0 { "\n" } else { "\r\n" });
+        }
+        content.push_str("final literal line without a terminator");
+        let messages = vec![message("user", content)];
+        let original = messages.clone();
+
+        assert!(parse_marked_messages(&messages)
+            .expect("unmarked lines are valid")
+            .is_none());
+        assert!(inspect_marked_context(&messages)
+            .expect("unmarked lines are valid")
             .is_none());
         assert_eq!(messages, original);
     }
