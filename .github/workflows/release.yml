@@ -254,6 +254,11 @@ jobs:
         with:
           shared-key: certify-model-host-apple-silicon
 
+      # sbproxy-classifier-proto's build script requires protoc; macOS
+      # runners do not ship it, unlike the preprovisioned Linux images.
+      - name: install protoc
+        run: brew install protobuf
+
       - name: build release binary
         run: cargo build --release -p sbproxy --locked
 
