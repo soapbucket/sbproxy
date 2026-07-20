@@ -197,6 +197,7 @@ struct StrictModelDeployment {
     pull: sbproxy_model_host::PullPolicy,
     #[serde(default)]
     warm: bool,
+    #[serde(default)]
     cold_start: sbproxy_model_host::ColdStartPolicy,
     #[serde(default)]
     keep_alive_secs: Option<u64>,
@@ -2371,5 +2372,25 @@ models:
             assert_eq!(ct, JSON);
             assert!(body.contains("\"reason_code\":\"unknown_deployment\""));
         }
+    }
+
+    #[test]
+    fn minimal_deployment_body_deserializes_with_every_optional_field_defaulted() {
+        // The strict admin mirror of ModelDeployment must accept the same
+        // minimal body the canonical struct accepts. A field added here
+        // without #[serde(default)] breaks every existing admin client and
+        // only surfaces in the tag-time e2e, which is how a required
+        // cold_start slipped into a release candidate.
+        let body = r#"{
+            "expected_revision": null,
+            "deployments": { "m": { "model": "hf:org/model" } }
+        }"#;
+        let request: DeploymentPutRequest =
+            serde_json::from_str(body).expect("minimal deployment body must deserialize");
+        let deployment = request.deployments.get("m").expect("deployment entry");
+        assert_eq!(
+            deployment.cold_start,
+            sbproxy_model_host::ColdStartPolicy::default()
+        );
     }
 }
