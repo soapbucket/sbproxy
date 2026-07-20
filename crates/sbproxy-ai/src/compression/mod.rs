@@ -4,6 +4,7 @@
 pub mod config;
 /// Opaque domain-separated session record identity.
 pub mod identity;
+mod marked_context;
 /// Closed compression outcomes and accounting records.
 pub mod outcome;
 /// Versioned external summary-state records and canonical message digests.
@@ -26,6 +27,10 @@ pub use config::{
     SummaryBufferConfig, TabularSerializationConfig, WindowFitConfig,
 };
 pub use identity::CompressionRecordId;
+pub use marked_context::{
+    inspect_marked_context, MarkedContextError, MarkedContextSnapshot, RetrievalBlockSnapshot,
+    RetrievalChunkSnapshot,
+};
 pub use outcome::{
     FailureReason, LeverKind, LeverOutcome, LeverResult, RequestOutcome, SkipReason,
 };
