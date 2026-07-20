@@ -169,6 +169,24 @@ origins:
               - type: window_fit
                 completion_reserve_tokens: 0
                 input_budget_tokens: 96
+          phase1:
+            levers:
+              - type: rag_select
+                min_tokens: 1
+                ranking: supplied
+                max_chunks: 1
+                min_relevance_percent: 0
+                drop_empty: false
+              - type: compact_serialization
+                min_tokens: 1
+                tabular:
+                  enabled: true
+                  min_rows: 8
+              - type: position_reorder
+                ranking: supplied
+              - type: window_fit
+                completion_reserve_tokens: 0
+                input_budget_tokens: 96
     policies:
       - type: prompt_injection_v2
         action: block
@@ -245,13 +263,26 @@ origins:
       compression:
         levers: []
         profiles:
-          compact:
+          phase1:
             levers:
+              - type: rag_select
+                min_tokens: 1
+                ranking: supplied
+                max_chunks: 1
+                min_relevance_percent: 0
+                drop_empty: false
+              - type: compact_serialization
+                min_tokens: 1
+                tabular:
+                  enabled: true
+                  min_rows: 8
+              - type: position_reorder
+                ranking: supplied
               - type: window_fit
                 completion_reserve_tokens: 0
                 input_budget_tokens: 96
       ai_policy:
-        expression: 'ai.tokens.input_est > 96 ? ["compression:compact"] : ["compression:off"]'
+        expression: 'ai.tokens.input_est > 96 ? ["compression:phase1"] : ["compression:off"]'
         on_error: allow
 "#,
         store_path = store_path.display(),
@@ -893,6 +924,10 @@ fn dynamic_compression_profile_changes_context_and_header_overrides_it() {
         &world,
         json!({"name": "compact-context", "compression_profile": "compact"}),
     );
+    let phase1 = mint(
+        &world,
+        json!({"name": "phase1-context", "compression_profile": "phase1"}),
+    );
     let messages = (0..10)
         .map(|index| {
             json!({
@@ -906,6 +941,23 @@ fn dynamic_compression_profile_changes_context_and_header_overrides_it() {
         })))
         .collect::<Vec<_>>();
     let body = json!({"model": "gpt-client", "messages": messages});
+    let marked_content = concat!(
+        "unmarked prefix\n",
+        "<sbproxy-retrieval>\n",
+        "<sbproxy-query>\nwhich deployment evidence matters\n</sbproxy-query>\n",
+        "<sbproxy-chunk id=\"distractor\" score=\"0.1\" format=\"text\">\n",
+        "unrelated archive material repeated repeated repeated\n",
+        "</sbproxy-chunk>\n",
+        "<sbproxy-chunk id=\"required\" score=\"0.9\" format=\"text\">\n",
+        "required deployment evidence survives\n",
+        "</sbproxy-chunk>\n",
+        "</sbproxy-retrieval>\n",
+        "unmarked suffix"
+    );
+    let marked_body = json!({
+        "model": "gpt-client",
+        "messages": [{"role": "user", "content": marked_content}]
+    });
 
     let before = capture_counts(&world);
     assert_status(
@@ -956,14 +1008,33 @@ fn dynamic_compression_profile_changes_context_and_header_overrides_it() {
         "the route default must be distinct from off"
     );
 
-    let authorization = format!("Bearer {}", compact.token);
+    let before = capture_counts(&world);
+    assert_status(
+        &chat(&world, POLICY_HOST, Some(&phase1.token), &marked_body),
+        200,
+        "a governed Phase 1 profile must dispatch",
+    );
+    let phase1_capture = only_new_capture(&world, before);
+    let phase1_body = capture_json(&phase1_capture);
+    assert_ne!(
+        phase1_body["messages"][0]["content"], marked_body["messages"][0]["content"],
+        "the governed Phase 1 profile must change explicitly marked context"
+    );
+    assert!(
+        phase1_body["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("required deployment evidence survives")),
+        "the governed Phase 1 profile must retain required evidence"
+    );
+
+    let authorization = format!("Bearer {}", phase1.token);
     let before = capture_counts(&world);
     let response = world
         .proxy
         .post_json(
             "/v1/chat/completions",
             POLICY_HOST,
-            &body,
+            &marked_body,
             &[
                 ("authorization", authorization.as_str()),
                 ("x-compression", "off"),
@@ -978,7 +1049,7 @@ fn dynamic_compression_profile_changes_context_and_header_overrides_it() {
     let uncompressed_capture = only_new_capture(&world, before);
     assert_eq!(
         capture_json(&uncompressed_capture)["messages"],
-        body["messages"],
+        marked_body["messages"],
         "x-compression: off must preserve the complete caller context"
     );
     assert!(

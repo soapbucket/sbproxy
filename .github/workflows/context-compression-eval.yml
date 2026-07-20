@@ -13,6 +13,7 @@ on:
       - 'crates/sbproxy-core/src/compression_runtime.rs'
       - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
       - 'e2e/tests/ai_native_inbound.rs'
+      - 'e2e/tests/context_compression_phase1.rs'
       - 'e2e/tests/governed_key_policy.rs'
       - 'schemas/ai-compression.schema.json'
       - 'schemas/sb-config.schema.json'
@@ -30,6 +31,7 @@ on:
       - 'crates/sbproxy-core/src/compression_runtime.rs'
       - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
       - 'e2e/tests/ai_native_inbound.rs'
+      - 'e2e/tests/context_compression_phase1.rs'
       - 'e2e/tests/governed_key_policy.rs'
       - 'schemas/ai-compression.schema.json'
       - 'schemas/sb-config.schema.json'
@@ -133,6 +135,11 @@ jobs:
 
       - name: build sbproxy binary
         run: cargo build -p sbproxy --locked
+
+      - name: Phase 1 request path
+        run: >-
+          cargo test -p sbproxy-e2e --locked --test context_compression_phase1
+          -- --test-threads=1
 
       - name: governed selector precedence
         run: >-

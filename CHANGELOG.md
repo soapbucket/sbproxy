@@ -15,13 +15,18 @@ the next version cut.
 - **Request-selectable AI context compression.** Declare named route-local
   profiles and explicit input budgets, then select them through
   `X-Compression`, governed virtual keys, or CEL with deterministic precedence
-  and safe invalid-selector behavior. Stateful summaries use Redis as the
-  canonical session store while request workers remain stateless; authenticated
-  Admin APIs list, inspect metadata for, and purge that state. Per-lever token
-  savings now appear in bounded metrics and structured logs; gross-cost value
-  appears in bounded value metrics, dashboards, and the model-host value
-  report. A deterministic synthetic evaluation harness guards production
-  window-fit behavior.
+  and safe invalid-selector behavior. Phase 1 adds `rag_select`,
+  `compact_serialization`, and `position_reorder` for explicit line-delimited
+  retrieval blocks. The levers use deterministic ranking, reversible
+  `sbproxy_table_v1` encoding, closed fail-open outcomes, and semantic-cache
+  bypass before the final `window_fit` bound. Stateful summaries use Redis as
+  the canonical session store while request workers remain stateless;
+  authenticated Admin APIs list, inspect metadata for, and purge that state.
+  Per-lever results now appear in bounded metrics and one content-free summary
+  event per executed pipeline; reducing levers also feed bounded value metrics,
+  dashboards, and the model-host value report. Live request-path acceptance and
+  five independently authored structural smoke reports cover the production
+  stateless pipeline.
 - **MCP tool rollout plane.** Publish several versions of one tool at once
   and roll out breaking changes without breaking callers: a `rollout:` block
   under the `mcp` action's `tool_versioning` declares versions, where each
