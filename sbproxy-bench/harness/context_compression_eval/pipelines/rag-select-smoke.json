@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "profile": "rag-select-smoke-v1",
+  "levers": [
+    {
+      "type": "rag_select",
+      "min_tokens": 1,
+      "ranking": "supplied",
+      "max_chunks": 2,
+      "min_relevance_percent": 50,
+      "drop_empty": false
+    }
+  ]
+}

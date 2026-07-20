@@ -5,17 +5,56 @@
 This standalone Rust harness compares context compression off and on with the
 same target model and original message array. The off arm uses an empty public
 `CompressionRunner`. The on arm uses the real public `CompressionRunner` and
-`WindowFitLever`. Both arms use sbproxy's target-model token counter.
+an ordered typed pipeline of production stateless levers. Both arms start from
+identical messages and use sbproxy's target-model token counter.
 
 The committed gate is intentionally small and deterministic. It is a
 first-party smoke evaluation, not an official benchmark score for RULER,
 HELMET, LongBench-v2, or NoLiMa.
 
-This is the credential-free harness skeleton scoped by WOR-1922. Official
-suite runs, target-model prediction generation, and evaluation on genuinely
-captured and sanitized coding-agent traffic remain follow-up validation under
-WOR-1879. Synthetic coding-agent shapes in this repository are not described
-as captured production traffic.
+This is the credential-free harness scoped by WOR-1922. Official suite runs
+and target-model prediction generation remain outside this deterministic
+gate. Synthetic coding-agent shapes in this repository are independently
+authored and are not described as captured production traffic.
+
+## Marked context contract
+
+Retrieval-aware levers act only on explicit markers inside a string-valued
+message `content` field. A block has this exact nesting:
+
+```text
+<sbproxy-retrieval>
+<sbproxy-query>
+opaque query text
+</sbproxy-query>
+<sbproxy-chunk id="stable-id" score="0.9" format="text">
+opaque chunk body
+</sbproxy-chunk>
+</sbproxy-retrieval>
+```
+
+`<sbproxy-query>` appears once before the block's `<sbproxy-chunk` entries.
+Chunk IDs select structural quality evidence. `score` is a finite supplied
+ranking value when a pipeline uses supplied ranking. Supported format labels
+are `text`, `json`, and `sbproxy_table_v1`. Text outside
+`<sbproxy-retrieval>` blocks remains literal and is never inferred to be
+retrieval context. Malformed or oversized markers leave the whole request
+unchanged under fail-open behavior and emit only a sanitized closed skip
+reason.
+
+## Typed stateless pipelines
+
+Each checked pipeline file has `schema_version: 1`, a report profile, and an
+ordered `levers` array that deserializes directly to production
+`CompressionLeverConfig`. The harness builds the actual `RagSelectLever`,
+`CompactSerializationLever`, `PositionReorderLever`, and `WindowFitLever`
+objects in declaration order. Summary buffering requires external state and
+is rejected with `stateful levers are not supported by the deterministic
+harness`.
+
+The report CLI requires `--pipeline-config`. Profile and lever-specific
+budgets come only from that checked file, so command-line defaults cannot
+silently change committed evidence.
 
 ## What the report measures
 
@@ -24,7 +63,9 @@ Each case and corpus reports:
 - target-model input, output, and saved tokens;
 - saved-token ratio;
 - off and on quality plus quality delta;
-- applied, skipped, or failed outcome and its closed reason;
+- every ordered lever's applied, skipped, or failed outcome and token
+  accounting;
+- case and aggregate acceptance status;
 - optional added compression latency; and
 - a deterministic `build`, `borrow`, or `defer` recommendation.
 
@@ -39,10 +80,10 @@ non-gated report with observed microseconds:
 ```bash
 cd sbproxy-bench/harness/context_compression_eval
 cargo run --locked -- generate \
+  --pipeline-config pipelines/window-fit-smoke.json \
   --input fixtures/ruler-smoke.jsonl \
   --input fixtures/coding-agent-smoke.jsonl \
   --provenance fixtures/provenance.json \
-  --input-budget-tokens 192 \
   --json-report /tmp/context-compression-observed.json \
   --markdown-report /tmp/context-compression-observed.md \
   --measure-latency
@@ -56,24 +97,45 @@ The harness is outside the root workspace and owns its lockfile. Always use
 ```bash
 cd sbproxy-bench/harness/context_compression_eval
 
-cargo test --locked
+cargo nextest run --all-targets --locked
 cargo run --locked -- check \
+  --pipeline-config pipelines/window-fit-smoke.json \
   --input fixtures/ruler-smoke.jsonl \
   --input fixtures/coding-agent-smoke.jsonl \
   --provenance fixtures/provenance.json \
-  --input-budget-tokens 192 \
   --json-report reports/window-fit-smoke.json \
   --markdown-report reports/window-fit-smoke.md
 ```
 
 To intentionally update the committed reports, replace `check` with
-`generate`, review both files, then run `check` again. The smoke profile passes
-the production `input_budget_tokens` setting explicitly. For `gpt-4`, the
-effective budget is the smaller of `--input-budget-tokens 192` and the known
-model window minus the 8,000-token completion reserve. The profile does not
-represent a production recommendation by itself.
+`generate`, review both files, then run `check` again. The window-fit pipeline
+passes the production `input_budget_tokens` setting explicitly in
+`pipelines/window-fit-smoke.json`. For `gpt-4`, the effective budget is the
+smaller of 192 tokens and the known model window minus the 8,000-token
+completion reserve.
 
-The recommendation thresholds are deliberately simple:
+CI runs the matching `check` command for all five deterministic report pairs:
+
+- `reports/rag-select-smoke.json` and `reports/rag-select-smoke.md`;
+- `reports/compact-serialization-smoke.json` and
+  `reports/compact-serialization-smoke.md`;
+- `reports/position-reorder-smoke.json` and
+  `reports/position-reorder-smoke.md`;
+- `reports/phase1-pipeline-smoke.json` and
+  `reports/phase1-pipeline-smoke.md`; and
+- `reports/window-fit-smoke.json` and `reports/window-fit-smoke.md`.
+
+`check` rejects byte drift and also rejects a regenerated overall
+recommendation other than `build`.
+
+Cases may declare explicit acceptance gates. `min_savings_ratio` and
+`min_on_quality_score` must be finite values from 0 through 1.
+`min_quality_delta` must be finite from -1 through 1. `require_non_expanding`
+requires treatment tokens to be no greater than control tokens. When every
+case declares acceptance, `build` requires every gate to pass and no lever to
+fail.
+
+Cases without explicit acceptance preserve the earlier smoke fallback:
 
 - `build`: at least 20% aggregate savings, treatment quality at least 0.98,
   quality delta no worse than -0.02, and no compression failures;
@@ -82,6 +144,19 @@ The recommendation thresholds are deliberately simple:
 - `defer`: all other results, including missing quality.
 
 A case that saves tokens without both off and on quality results is invalid.
+
+## Structural quality scorers
+
+`structured_equivalence` selects one marked chunk by ID. Ordinary `json` is
+parsed to `serde_json::Value`; public `sbproxy_table_v1` is decoded through
+`decode_sbproxy_table_v1` to the same type. The arm scores 1 only when its
+exact normalized value equals the control value.
+
+`edge_placement` finds the selected chunk in its own containing block. For
+chunk ordinal `i` among `n` chunks, it uses nearest-edge distance
+`d = min(i, n - 1 - i)` and maximum distance `m = floor((n - 1) / 2)`. The
+score is `1 - d / m`; when `m` is zero, a one-chunk block scores 1 and both
+chunks in a two-chunk block score 1. Edges score 1 and the center scores 0.
 
 ## Committed smoke fixtures
 
@@ -92,13 +167,27 @@ contains independently authored and sanitized shapes for tool output, git
 diffs, `rg` output, and logs. It contains no credentials, customer prompts,
 absolute user paths, or raw session identifiers.
 
+Four lever-specific fixtures use independently authored sanitized shapes:
+
+- `rag-select-smoke.jsonl` has useful ranked evidence and long ranked
+  distractors;
+- `compact-serialization-smoke.jsonl` has exactly 200 uniform rows in one
+  marked JSON chunk and requires at least 30% whole-request savings with
+  treatment quality 1.0;
+- `position-reorder-smoke.jsonl` starts required evidence at the center and
+  requires non-expansion plus a positive quality delta; and
+- `phase1-pipeline-smoke.jsonl` requires marked query and evidence retention
+  plus positive savings through the recommended four-lever order.
+
 `fixtures/provenance.json` pins each fixture's origin, Apache-2.0 license,
 privacy declarations, official-score declaration, corpus identity, and exact
 SHA-256 checksum. Generation fails if an input is not covered by the manifest.
+The committed fixture set contains no customer data. It does not claim official benchmark scores.
 
-The smoke quality scorer measures whether declared evidence markers survive
-the off and on message arrays. This deterministic scorer needs no provider
-credential, GPU, or network access.
+Evidence-retention and structural scores are deterministic. They need no
+provider credential, GPU, or network access. They are acceptance evidence for
+these bounded shapes, not an official benchmark score and not evidence of
+target-model answer quality on external suites.
 
 ## External benchmark adapter
 

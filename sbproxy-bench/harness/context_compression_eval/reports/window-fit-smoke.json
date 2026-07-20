@@ -1,8 +1,13 @@
 {
-  "schema_version": 2,
-  "profile": "window_fit-smoke-v1",
-  "input_budget_tokens": 192,
-  "completion_reserve_tokens": 8000,
+  "schema_version": 3,
+  "profile": "window-fit-smoke-v1",
+  "pipeline": [
+    {
+      "type": "window_fit",
+      "completion_reserve_tokens": 8000,
+      "input_budget_tokens": 192
+    }
+  ],
   "token_counter": "sbproxy_target_model",
   "latency_mode": "omitted_for_deterministic_gate",
   "cases": [
@@ -24,6 +29,23 @@
       "tokens_saved": 230,
       "savings_ratio": 0.70122,
       "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 328,
+          "after_tokens": 98,
+          "tokens_saved": 230
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
       "added_compression_latency_micros": null,
       "outcome": "applied",
       "reason": null
@@ -46,6 +68,23 @@
       "tokens_saved": 232,
       "savings_ratio": 0.722741,
       "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 321,
+          "after_tokens": 89,
+          "tokens_saved": 232
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
       "added_compression_latency_micros": null,
       "outcome": "applied",
       "reason": null
@@ -68,6 +107,23 @@
       "tokens_saved": 311,
       "savings_ratio": 0.751208,
       "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 414,
+          "after_tokens": 103,
+          "tokens_saved": 311
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
       "added_compression_latency_micros": null,
       "outcome": "applied",
       "reason": null
@@ -90,6 +146,23 @@
       "tokens_saved": 183,
       "savings_ratio": 0.698473,
       "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 262,
+          "after_tokens": 79,
+          "tokens_saved": 183
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
       "added_compression_latency_micros": null,
       "outcome": "applied",
       "reason": null
@@ -112,6 +185,23 @@
       "tokens_saved": 235,
       "savings_ratio": 0.79661,
       "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 295,
+          "after_tokens": 60,
+          "tokens_saved": 235
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
       "added_compression_latency_micros": null,
       "outcome": "applied",
       "reason": null
@@ -134,6 +224,23 @@
       "tokens_saved": 252,
       "savings_ratio": 0.815534,
       "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 309,
+          "after_tokens": 57,
+          "tokens_saved": 252
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
       "added_compression_latency_micros": null,
       "outcome": "applied",
       "reason": null
@@ -158,6 +265,7 @@
         "applied": 4
       },
       "reasons": {},
+      "acceptance_passed": true,
       "recommendation": "build"
     },
     "ruler_smoke": {
@@ -178,6 +286,7 @@
         "applied": 2
       },
       "reasons": {},
+      "acceptance_passed": true,
       "recommendation": "build"
     }
   },
@@ -199,6 +308,7 @@
       "applied": 6
     },
     "reasons": {},
+    "acceptance_passed": true,
     "recommendation": "build"
   }
 }

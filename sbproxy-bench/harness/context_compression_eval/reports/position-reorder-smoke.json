@@ -1,0 +1,97 @@
+{
+  "schema_version": 3,
+  "profile": "position-reorder-smoke-v1",
+  "pipeline": [
+    {
+      "type": "position_reorder",
+      "ranking": "supplied"
+    }
+  ],
+  "token_counter": "sbproxy_target_model",
+  "latency_mode": "omitted_for_deterministic_gate",
+  "cases": [
+    {
+      "id": "position_required_center_to_edge",
+      "corpus": "position_reorder_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "edge_placement",
+      "off": {
+        "input_tokens": 278,
+        "output_tokens": 278,
+        "quality_score": 0.0
+      },
+      "on": {
+        "input_tokens": 278,
+        "output_tokens": 278,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 0,
+      "savings_ratio": 0.0,
+      "quality_delta": 1.0,
+      "levers": [
+        {
+          "lever": "position_reorder",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 278,
+          "after_tokens": 278,
+          "tokens_saved": 0
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": 1.0,
+        "min_quality_delta": 1.0,
+        "require_non_expanding": true
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    }
+  ],
+  "corpora": {
+    "position_reorder_smoke": {
+      "case_count": 1,
+      "input_tokens": 278,
+      "output_tokens": 278,
+      "tokens_saved": 0,
+      "savings_ratio": 0.0,
+      "off_quality_score": 0.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 1.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 1,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 1
+      },
+      "reasons": {},
+      "acceptance_passed": true,
+      "recommendation": "build"
+    }
+  },
+  "overall": {
+    "case_count": 1,
+    "input_tokens": 278,
+    "output_tokens": 278,
+    "tokens_saved": 0,
+    "savings_ratio": 0.0,
+    "off_quality_score": 0.0,
+    "on_quality_score": 1.0,
+    "quality_delta": 1.0,
+    "added_compression_latency_micros": null,
+    "applied_count": 1,
+    "skipped_count": 0,
+    "fallback_count": 0,
+    "skip_rate": 0.0,
+    "outcomes": {
+      "applied": 1
+    },
+    "reasons": {},
+    "acceptance_passed": true,
+    "recommendation": "build"
+  }
+}

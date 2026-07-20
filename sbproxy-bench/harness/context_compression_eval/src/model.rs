@@ -2,8 +2,21 @@ use std::collections::BTreeSet;
 use std::io::BufRead;
 
 use anyhow::{anyhow, Context, Result};
+use sbproxy_ai::compression::CompressionLeverConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Checked, ordered compression pipeline consumed by the evaluation CLI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalPipelineFile {
+    /// Pipeline file schema version.
+    pub schema_version: u32,
+    /// Stable profile name copied into generated reports.
+    pub profile: String,
+    /// Ordered typed production compression levers.
+    pub levers: Vec<CompressionLeverConfig>,
+}
 
 /// One normalized, provider-independent evaluation case.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,6 +34,99 @@ pub struct EvalCase {
     pub messages: Vec<Value>,
     /// Deterministic or imported-prediction quality contract.
     pub quality: QualitySpec,
+    /// Case-local deterministic acceptance gates.
+    #[serde(default)]
+    pub acceptance: AcceptanceSpec,
+}
+
+/// Optional deterministic acceptance gates for one evaluation case.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceSpec {
+    /// Minimum request-level token reduction ratio, in the inclusive 0 to 1 range.
+    pub min_savings_ratio: Option<f64>,
+    /// Minimum treatment quality score, in the inclusive 0 to 1 range.
+    pub min_on_quality_score: Option<f64>,
+    /// Minimum treatment-minus-control quality delta, in the inclusive -1 to 1 range.
+    pub min_quality_delta: Option<f64>,
+    /// Require the treatment token count not to exceed the control token count.
+    #[serde(default)]
+    pub require_non_expanding: bool,
+}
+
+impl AcceptanceSpec {
+    /// Whether this case declares any explicit acceptance gate.
+    pub fn is_explicit(&self) -> bool {
+        self.min_savings_ratio.is_some()
+            || self.min_on_quality_score.is_some()
+            || self.min_quality_delta.is_some()
+            || self.require_non_expanding
+    }
+
+    /// Evaluate the declared gates against one off/on result.
+    pub fn passes(
+        &self,
+        off_tokens: u64,
+        on_tokens: u64,
+        on_quality_score: Option<f64>,
+        quality_delta: Option<f64>,
+    ) -> bool {
+        if self.require_non_expanding && on_tokens > off_tokens {
+            return false;
+        }
+        let savings_ratio = if off_tokens == 0 {
+            if on_tokens == 0 {
+                0.0
+            } else {
+                f64::NEG_INFINITY
+            }
+        } else {
+            (off_tokens as f64 - on_tokens as f64) / off_tokens as f64
+        };
+        if self
+            .min_savings_ratio
+            .is_some_and(|minimum| savings_ratio < minimum)
+        {
+            return false;
+        }
+        if self
+            .min_on_quality_score
+            .is_some_and(|minimum| on_quality_score.is_none_or(|quality| quality < minimum))
+        {
+            return false;
+        }
+        if self
+            .min_quality_delta
+            .is_some_and(|minimum| quality_delta.is_none_or(|delta| delta < minimum))
+        {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn validate(&self, case_id: &str) -> Result<()> {
+        validate_threshold(
+            case_id,
+            "min_savings_ratio",
+            self.min_savings_ratio,
+            0.0,
+            1.0,
+        )?;
+        validate_threshold(
+            case_id,
+            "min_on_quality_score",
+            self.min_on_quality_score,
+            0.0,
+            1.0,
+        )?;
+        validate_threshold(
+            case_id,
+            "min_quality_delta",
+            self.min_quality_delta,
+            -1.0,
+            1.0,
+        )
+    }
 }
 
 /// Quality evidence available without invoking an external model.
@@ -40,6 +146,16 @@ pub enum QualitySpec {
         off_prediction: String,
         /// Prediction generated from the compressed arm.
         on_prediction: String,
+    },
+    /// Compare a selected marked JSON/table chunk with the control value.
+    StructuredEquivalence {
+        /// Stable marked chunk identifier to decode in both arms.
+        chunk_id: String,
+    },
+    /// Score a selected chunk's normalized proximity to its containing block's edge.
+    EdgePlacement {
+        /// Stable marked chunk identifier to locate in both arms.
+        chunk_id: String,
     },
 }
 
@@ -70,6 +186,30 @@ pub fn parse_cases(reader: impl BufRead) -> Result<Vec<EvalCase>> {
         if !ids.insert(case.id.as_str()) {
             return Err(anyhow!("duplicate case id `{}`", case.id));
         }
+        case.acceptance.validate(&case.id)?;
     }
     Ok(cases)
+}
+
+fn validate_threshold(
+    case_id: &str,
+    name: &str,
+    value: Option<f64>,
+    minimum: f64,
+    maximum: f64,
+) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !value.is_finite() || !(minimum..=maximum).contains(&value) {
+        let range = if minimum == 0.0 {
+            "0 and 1"
+        } else {
+            "-1 and 1"
+        };
+        return Err(anyhow!(
+            "case `{case_id}` acceptance {name} must be finite and between {range}"
+        ));
+    }
+    Ok(())
 }

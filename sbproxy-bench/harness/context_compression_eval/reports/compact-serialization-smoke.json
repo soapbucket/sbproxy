@@ -1,0 +1,101 @@
+{
+  "schema_version": 3,
+  "profile": "compact-serialization-smoke-v1",
+  "pipeline": [
+    {
+      "type": "compact_serialization",
+      "min_tokens": 1,
+      "tabular": {
+        "enabled": true,
+        "min_rows": 200
+      }
+    }
+  ],
+  "token_counter": "sbproxy_target_model",
+  "latency_mode": "omitted_for_deterministic_gate",
+  "cases": [
+    {
+      "id": "compact_uniform_inventory_200",
+      "corpus": "compact_serialization_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "structured_equivalence",
+      "off": {
+        "input_tokens": 7065,
+        "output_tokens": 7065,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 7065,
+        "output_tokens": 3476,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 3589,
+      "savings_ratio": 0.507997,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "compact_serialization",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 7065,
+          "after_tokens": 3476,
+          "tokens_saved": 3589
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": 0.3,
+        "min_on_quality_score": 1.0,
+        "min_quality_delta": 0.0,
+        "require_non_expanding": true
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    }
+  ],
+  "corpora": {
+    "compact_serialization_smoke": {
+      "case_count": 1,
+      "input_tokens": 7065,
+      "output_tokens": 3476,
+      "tokens_saved": 3589,
+      "savings_ratio": 0.507997,
+      "off_quality_score": 1.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 1,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 1
+      },
+      "reasons": {},
+      "acceptance_passed": true,
+      "recommendation": "build"
+    }
+  },
+  "overall": {
+    "case_count": 1,
+    "input_tokens": 7065,
+    "output_tokens": 3476,
+    "tokens_saved": 3589,
+    "savings_ratio": 0.507997,
+    "off_quality_score": 1.0,
+    "on_quality_score": 1.0,
+    "quality_delta": 0.0,
+    "added_compression_latency_micros": null,
+    "applied_count": 1,
+    "skipped_count": 0,
+    "fallback_count": 0,
+    "skip_rate": 0.0,
+    "outcomes": {
+      "applied": 1
+    },
+    "reasons": {},
+    "acceptance_passed": true,
+    "recommendation": "build"
+  }
+}

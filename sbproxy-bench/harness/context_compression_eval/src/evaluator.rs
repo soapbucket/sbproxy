@@ -3,24 +3,70 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use sbproxy_ai::compression::{
-    CompressionRequest, CompressionRunner, LeverOutcome, WindowFitConfig, WindowFitLever,
+    decode_sbproxy_table_v1, inspect_marked_context, CompactSerializationLever, CompressionLever,
+    CompressionLeverConfig, CompressionRequest, CompressionRunner, LeverOutcome,
+    PositionReorderLever, RagSelectLever, RequestOutcome, WindowFitLever,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{EvalCase, QualitySpec};
+use crate::{AcceptanceSpec, EvalCase, QualitySpec};
 
 /// Immutable settings shared by every case in one evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalConfig {
     /// Named profile shown in reports.
     pub profile: String,
-    /// Completion reserve used by the real window-fit lever.
-    pub completion_reserve_tokens: u64,
-    /// Explicit input-message budget used by the real window-fit lever.
-    pub input_budget_tokens: u64,
+    /// Ordered production compression levers evaluated by the treatment arm.
+    pub levers: Vec<CompressionLeverConfig>,
     /// Include observed wall-clock latency in this non-gated artifact.
     pub measure_latency: bool,
+}
+
+/// Build the production stateless levers selected by a deterministic evaluation.
+pub fn build_stateless_levers(
+    configs: &[CompressionLeverConfig],
+) -> Result<Vec<Arc<dyn CompressionLever>>> {
+    configs
+        .iter()
+        .map(|config| match config {
+            CompressionLeverConfig::RagSelect(config) => {
+                if config.min_tokens == 0 {
+                    bail!("rag_select min_tokens must be greater than zero");
+                }
+                if config.max_chunks == 0 {
+                    bail!("rag_select max_chunks must be greater than zero");
+                }
+                if config.min_relevance_percent > 100 {
+                    bail!("rag_select min_relevance_percent must not exceed 100");
+                }
+                Ok(Arc::new(RagSelectLever::new(config.clone())) as Arc<dyn CompressionLever>)
+            }
+            CompressionLeverConfig::CompactSerialization(config) => {
+                if config.min_tokens == 0 {
+                    bail!("compact_serialization min_tokens must be greater than zero");
+                }
+                if config.tabular.enabled && config.tabular.min_rows < 2 {
+                    bail!("compact_serialization tabular min_rows must be at least 2 when enabled");
+                }
+                Ok(Arc::new(CompactSerializationLever::new(config.clone()))
+                    as Arc<dyn CompressionLever>)
+            }
+            CompressionLeverConfig::PositionReorder(config) => {
+                Ok(Arc::new(PositionReorderLever::new(config.clone()))
+                    as Arc<dyn CompressionLever>)
+            }
+            CompressionLeverConfig::WindowFit(config) => {
+                if config.input_budget_tokens == Some(0) {
+                    bail!("evaluation input budget must be greater than zero");
+                }
+                Ok(Arc::new(WindowFitLever::new(config.clone())) as Arc<dyn CompressionLever>)
+            }
+            CompressionLeverConfig::SummaryBuffer(_) => {
+                bail!("stateful levers are not supported by the deterministic harness")
+            }
+        })
+        .collect()
 }
 
 /// Deterministic build decision for one corpus or complete report.
@@ -47,6 +93,24 @@ pub struct ArmReport {
     pub quality_score: Option<f64>,
 }
 
+/// One ordered production lever result without wall-clock data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseLeverReport {
+    /// Stable production lever name.
+    pub lever: String,
+    /// Applied, skipped, or failed outcome.
+    pub outcome: String,
+    /// Closed skip or failure reason, when present.
+    pub reason: Option<String>,
+    /// Target-model tokens before this lever.
+    pub before_tokens: u64,
+    /// Target-model tokens after this lever.
+    pub after_tokens: u64,
+    /// Committed tokens saved by this lever.
+    pub tokens_saved: u64,
+}
+
 /// One off/on comparison.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,7 +125,7 @@ pub struct CaseReport {
     pub quality_metric: String,
     /// Uncompressed control arm.
     pub off: ArmReport,
-    /// Window-fit treatment arm.
+    /// Ordered compression treatment arm.
     pub on: ArmReport,
     /// Target-model tokens avoided by the treatment.
     pub tokens_saved: u64,
@@ -69,6 +133,12 @@ pub struct CaseReport {
     pub savings_ratio: f64,
     /// Treatment quality minus control quality.
     pub quality_delta: Option<f64>,
+    /// Ordered accounting for every configured treatment lever.
+    pub levers: Vec<CaseLeverReport>,
+    /// Declared case-local deterministic acceptance gates.
+    pub acceptance: AcceptanceSpec,
+    /// Whether every declared case-local acceptance gate passed.
+    pub acceptance_passed: bool,
     /// Observed lever latency, omitted in deterministic drift artifacts.
     pub added_compression_latency_micros: Option<u64>,
     /// Closed compression request outcome.
@@ -99,9 +169,9 @@ pub struct AggregateReport {
     pub quality_delta: Option<f64>,
     /// Total observed compression latency, absent from deterministic reports.
     pub added_compression_latency_micros: Option<u64>,
-    /// Cases where window fit committed a reduction.
+    /// Cases where at least one treatment lever applied and none failed.
     pub applied_count: u64,
-    /// Cases where window fit made no change for a closed skip reason.
+    /// Cases where every treatment lever skipped.
     pub skipped_count: u64,
     /// Failed cases that fell back to the unchanged working message list.
     pub fallback_count: u64,
@@ -111,6 +181,8 @@ pub struct AggregateReport {
     pub outcomes: BTreeMap<String, u64>,
     /// Closed skip and failure reason counts.
     pub reasons: BTreeMap<String, u64>,
+    /// Whether every case in this aggregate passed its declared acceptance gates.
+    pub acceptance_passed: bool,
     /// Deterministic action recommendation.
     pub recommendation: Recommendation,
 }
@@ -123,10 +195,8 @@ pub struct EvalReport {
     pub schema_version: u32,
     /// Named compression profile evaluated.
     pub profile: String,
-    /// Explicit input-message budget evaluated by window fit.
-    pub input_budget_tokens: u64,
-    /// Completion capacity excluded from a known target model's input budget.
-    pub completion_reserve_tokens: u64,
+    /// Ordered typed production compression pipeline.
+    pub pipeline: Vec<CompressionLeverConfig>,
     /// Token counter contract used by both arms.
     pub token_counter: String,
     /// Whether latency values are observed or intentionally omitted.
@@ -139,7 +209,7 @@ pub struct EvalReport {
     pub overall: AggregateReport,
 }
 
-/// Evaluate every case with identical input through off and real window-fit arms.
+/// Evaluate every case with identical input through control and typed treatment arms.
 pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<EvalReport> {
     if cases.is_empty() {
         bail!("evaluation requires at least one case");
@@ -147,34 +217,36 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
     if config.profile.trim().is_empty() {
         bail!("evaluation profile must not be empty");
     }
-    if config.input_budget_tokens == 0 {
-        bail!("evaluation input budget must be greater than zero");
+    for case in cases {
+        case.acceptance.validate(&case.id)?;
     }
     let off_runner = CompressionRunner::with_model_counter(Vec::new());
-    let window_fit_config: WindowFitConfig = serde_json::from_value(serde_json::json!({
-        "completion_reserve_tokens": config.completion_reserve_tokens,
-        "input_budget_tokens": config.input_budget_tokens
-    }))?;
-    let on_runner = CompressionRunner::with_model_counter(vec![Arc::new(WindowFitLever::new(
-        window_fit_config,
-    ))]);
+    let on_runner = CompressionRunner::with_model_counter(build_stateless_levers(&config.levers)?);
 
     let mut rows = Vec::with_capacity(cases.len());
     for case in cases {
         let request = CompressionRequest::new(&case.target_model);
         let off = off_runner.run(&request, &case.messages).await;
         let on = on_runner.run(&request, &case.messages).await;
-        let off_quality = score_quality(&case.quality, &off.messages, false);
-        let on_quality = score_quality(&case.quality, &on.messages, true);
-        let lever = on.lever_results.first();
-        let (outcome, reason) = match lever.map(|result| result.outcome) {
-            Some(LeverOutcome::Applied) => ("applied", None),
-            Some(LeverOutcome::Skipped { reason }) => {
-                ("skipped", Some(reason.as_str().to_string()))
-            }
-            Some(LeverOutcome::Failed { reason }) => ("failed", Some(reason.as_str().to_string())),
-            None => ("skipped", Some("empty_pipeline".to_string())),
-        };
+        let off_quality = score_quality(&case.quality, &off.messages, &off.messages, false);
+        let on_quality = score_quality(&case.quality, &off.messages, &on.messages, true);
+        let outcome = on.outcome();
+        let reason = run_reason(outcome, &on.lever_results);
+        let levers = on
+            .lever_results
+            .iter()
+            .map(|result| {
+                let (outcome, reason) = lever_outcome(result.outcome);
+                CaseLeverReport {
+                    lever: result.lever.as_str().to_string(),
+                    outcome: outcome.to_string(),
+                    reason,
+                    before_tokens: result.before_tokens,
+                    after_tokens: result.after_tokens,
+                    tokens_saved: result.tokens_saved,
+                }
+            })
+            .collect();
         let latency = if config.measure_latency {
             Some(
                 on.lever_results
@@ -196,6 +268,9 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
                 case.id
             );
         }
+        let acceptance_passed =
+            case.acceptance
+                .passes(off.final_tokens, on.final_tokens, on_quality, quality_delta);
         rows.push(CaseReport {
             id: case.id.clone(),
             corpus: case.corpus.clone(),
@@ -203,6 +278,8 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
             quality_metric: match &case.quality {
                 QualitySpec::EvidenceRetention { .. } => "evidence_retention",
                 QualitySpec::ExactMatch { .. } => "exact_match_accuracy",
+                QualitySpec::StructuredEquivalence { .. } => "structured_equivalence",
+                QualitySpec::EdgePlacement { .. } => "edge_placement",
             }
             .to_string(),
             off: ArmReport {
@@ -218,8 +295,11 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
             tokens_saved: on.tokens_saved,
             savings_ratio,
             quality_delta,
+            levers,
+            acceptance: case.acceptance.clone(),
+            acceptance_passed,
             added_compression_latency_micros: latency,
-            outcome: outcome.to_string(),
+            outcome: outcome.as_str().to_string(),
             reason,
         });
     }
@@ -240,10 +320,9 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
     let overall = aggregate(&rows.iter().collect::<Vec<_>>());
 
     Ok(EvalReport {
-        schema_version: 2,
+        schema_version: 3,
         profile: config.profile.clone(),
-        input_budget_tokens: config.input_budget_tokens,
-        completion_reserve_tokens: config.completion_reserve_tokens,
+        pipeline: config.levers.clone(),
         token_counter: "sbproxy_target_model".to_string(),
         latency_mode: if config.measure_latency {
             "observed_wall_clock"
@@ -257,7 +336,42 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
     })
 }
 
-fn score_quality(spec: &QualitySpec, messages: &[Value], treatment_arm: bool) -> Option<f64> {
+fn lever_outcome(outcome: LeverOutcome) -> (&'static str, Option<String>) {
+    match outcome {
+        LeverOutcome::Applied => ("applied", None),
+        LeverOutcome::Skipped { reason } => ("skipped", Some(reason.as_str().to_string())),
+        LeverOutcome::Failed { reason } => ("failed", Some(reason.as_str().to_string())),
+    }
+}
+
+fn run_reason(
+    outcome: RequestOutcome,
+    results: &[sbproxy_ai::compression::LeverResult],
+) -> Option<String> {
+    match outcome {
+        RequestOutcome::Applied => None,
+        RequestOutcome::Failed => results.iter().find_map(|result| match result.outcome {
+            LeverOutcome::Failed { reason } => Some(reason.as_str().to_string()),
+            LeverOutcome::Applied | LeverOutcome::Skipped { .. } => None,
+        }),
+        RequestOutcome::Skipped => {
+            if results.is_empty() {
+                return Some("empty_pipeline".to_string());
+            }
+            results.iter().find_map(|result| match result.outcome {
+                LeverOutcome::Skipped { reason } => Some(reason.as_str().to_string()),
+                LeverOutcome::Applied | LeverOutcome::Failed { .. } => None,
+            })
+        }
+    }
+}
+
+fn score_quality(
+    spec: &QualitySpec,
+    control_messages: &[Value],
+    messages: &[Value],
+    treatment_arm: bool,
+) -> Option<f64> {
     match spec {
         QualitySpec::EvidenceRetention { required_evidence } => {
             if required_evidence.is_empty() {
@@ -295,7 +409,66 @@ fn score_quality(spec: &QualitySpec, messages: &[Value], treatment_arm: bool) ->
                 },
             )
         }
+        QualitySpec::StructuredEquivalence { chunk_id } => {
+            let control = selected_structured_value(control_messages, chunk_id)?;
+            let candidate = selected_structured_value(messages, chunk_id);
+            Some(if candidate.as_ref() == Some(&control) {
+                1.0
+            } else {
+                0.0
+            })
+        }
+        QualitySpec::EdgePlacement { chunk_id } => {
+            edge_placement_score(control_messages, chunk_id)?;
+            Some(edge_placement_score(messages, chunk_id).unwrap_or(0.0))
+        }
     }
+}
+
+fn selected_structured_value(messages: &[Value], chunk_id: &str) -> Option<Value> {
+    let snapshot = inspect_marked_context(messages).ok().flatten()?;
+    let mut selected = snapshot
+        .blocks
+        .iter()
+        .flat_map(|block| block.chunks.iter())
+        .filter(|chunk| chunk.id == chunk_id);
+    let chunk = selected.next()?;
+    if selected.next().is_some() {
+        return None;
+    }
+    match chunk.format.as_str() {
+        "json" => serde_json::from_str(&chunk.body).ok(),
+        "sbproxy_table_v1" => decode_sbproxy_table_v1(&chunk.body).ok(),
+        _ => None,
+    }
+}
+
+fn edge_placement_score(messages: &[Value], chunk_id: &str) -> Option<f64> {
+    let snapshot = inspect_marked_context(messages).ok().flatten()?;
+    let mut scores = snapshot.blocks.iter().filter_map(|block| {
+        let mut matches = block
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, chunk)| chunk.id == chunk_id);
+        let (ordinal, _) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        let maximum_distance = block.chunks.len().saturating_sub(1) / 2;
+        if maximum_distance == 0 {
+            return Some(1.0);
+        }
+        let nearest_edge = ordinal.min(block.chunks.len() - 1 - ordinal);
+        Some(round_six(
+            1.0 - nearest_edge as f64 / maximum_distance as f64,
+        ))
+    });
+    let score = scores.next()?;
+    if scores.next().is_some() {
+        return None;
+    }
+    Some(score)
 }
 
 fn normalize_answer(value: &str) -> String {
@@ -307,9 +480,9 @@ fn normalize_answer(value: &str) -> String {
 }
 
 fn aggregate(rows: &[&CaseReport]) -> AggregateReport {
-    let input_tokens = rows.iter().map(|row| row.off.output_tokens).sum();
-    let output_tokens = rows.iter().map(|row| row.on.output_tokens).sum();
-    let tokens_saved = input_tokens - output_tokens;
+    let input_tokens: u64 = rows.iter().map(|row| row.off.output_tokens).sum();
+    let output_tokens: u64 = rows.iter().map(|row| row.on.output_tokens).sum();
+    let tokens_saved = input_tokens.saturating_sub(output_tokens);
     let off_scores = rows
         .iter()
         .filter_map(|row| row.off.quality_score)
@@ -345,11 +518,15 @@ fn aggregate(rows: &[&CaseReport]) -> AggregateReport {
     let skipped_count = outcomes.get("skipped").copied().unwrap_or_default();
     let fallback_count = outcomes.get("failed").copied().unwrap_or_default();
     let skip_rate = ratio(skipped_count, rows.len() as u64);
+    let acceptance_passed = rows.iter().all(|row| row.acceptance_passed);
+    let all_cases_have_explicit_acceptance = rows.iter().all(|row| row.acceptance.is_explicit());
     let recommendation = recommend(
         savings_ratio,
         on_quality_score,
         quality_delta,
         fallback_count,
+        acceptance_passed,
+        all_cases_have_explicit_acceptance,
     );
 
     AggregateReport {
@@ -368,6 +545,7 @@ fn aggregate(rows: &[&CaseReport]) -> AggregateReport {
         skip_rate,
         outcomes,
         reasons,
+        acceptance_passed,
         recommendation,
     }
 }
@@ -377,11 +555,19 @@ fn recommend(
     on_quality: Option<f64>,
     quality_delta: Option<f64>,
     failures: u64,
+    acceptance_passed: bool,
+    all_cases_have_explicit_acceptance: bool,
 ) -> Recommendation {
+    if failures > 0 || !acceptance_passed {
+        return Recommendation::Defer;
+    }
+    if all_cases_have_explicit_acceptance {
+        return Recommendation::Build;
+    }
     let (Some(on_quality), Some(quality_delta)) = (on_quality, quality_delta) else {
         return Recommendation::Defer;
     };
-    if failures > 0 || on_quality < 0.95 || quality_delta < -0.02 {
+    if on_quality < 0.95 || quality_delta < -0.02 {
         Recommendation::Defer
     } else if savings_ratio >= 0.20 && on_quality >= 0.98 {
         Recommendation::Build

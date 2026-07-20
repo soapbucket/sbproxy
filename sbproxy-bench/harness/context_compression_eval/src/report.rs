@@ -20,14 +20,7 @@ pub fn render_markdown(report: &EvalReport) -> String {
         "- Profile: `{}`\n",
         escape_inline(&report.profile)
     ));
-    output.push_str(&format!(
-        "- Input budget: `{}` tokens\n",
-        report.input_budget_tokens
-    ));
-    output.push_str(&format!(
-        "- Completion reserve: `{}` tokens\n",
-        report.completion_reserve_tokens
-    ));
+    output.push_str(&format!("- Report schema: `{}`\n", report.schema_version));
     output.push_str(&format!(
         "- Token counter: `{}`\n",
         escape_inline(&report.token_counter)
@@ -36,9 +29,19 @@ pub fn render_markdown(report: &EvalReport) -> String {
         "- Latency mode: `{}`\n\n",
         escape_inline(&report.latency_mode)
     ));
+    output.push_str("## Ordered pipeline\n\n");
+    for (index, lever) in report.pipeline.iter().enumerate() {
+        let config = serde_json::to_string(lever)
+            .unwrap_or_else(|_| "{\"type\":\"serialization_error\"}".to_string());
+        output.push_str(&format!("{}. `{}`\n", index + 1, escape_inline(&config)));
+    }
+    if report.pipeline.is_empty() {
+        output.push_str("No levers configured.\n");
+    }
+    output.push('\n');
     output.push_str("## Tokens versus quality and accuracy\n\n");
-    output.push_str("| Corpus | Cases | Input tokens | Output tokens | Saved | Savings | Off quality | On quality | Delta | Added latency (us) | Recommendation |\n");
-    output.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    output.push_str("| Corpus | Cases | Input tokens | Output tokens | Saved | Savings | Off quality | On quality | Delta | Acceptance | Added latency (us) | Recommendation |\n");
+    output.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|\n");
     push_aggregate_row(&mut output, "overall", &report.overall);
     for (corpus, aggregate) in &report.corpora {
         push_aggregate_row(&mut output, corpus, aggregate);
@@ -53,11 +56,11 @@ pub fn render_markdown(report: &EvalReport) -> String {
     }
 
     output.push_str("\n## Case results\n\n");
-    output.push_str("| Case | Corpus | Target model | Score | Saved | Savings | Off quality | On quality | Delta | Outcome | Reason |\n");
-    output.push_str("|---|---|---|---|---:|---:|---:|---:|---:|---|---|\n");
+    output.push_str("| Case | Corpus | Target model | Score | Saved | Savings | Off quality | On quality | Delta | Acceptance | Outcome | Reason |\n");
+    output.push_str("|---|---|---|---|---:|---:|---:|---:|---:|---|---|---|\n");
     for case in &report.cases {
         output.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             escape_cell(&case.id),
             escape_cell(&case.corpus),
             escape_cell(&case.target_model),
@@ -67,12 +70,35 @@ pub fn render_markdown(report: &EvalReport) -> String {
             score(case.off.quality_score),
             score(case.on.quality_score),
             signed_score(case.quality_delta),
+            passed(case.acceptance_passed),
             escape_cell(&case.outcome),
             case.reason
                 .as_deref()
                 .map(escape_cell)
                 .unwrap_or_else(|| "-".to_string()),
         ));
+    }
+    output.push_str("\n## Ordered lever results\n\n");
+    output.push_str("| Case | Order | Lever | Before | After | Saved | Outcome | Reason |\n");
+    output.push_str("|---|---:|---|---:|---:|---:|---|---|\n");
+    for case in &report.cases {
+        for (index, lever) in case.levers.iter().enumerate() {
+            output.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                escape_cell(&case.id),
+                index + 1,
+                escape_cell(&lever.lever),
+                lever.before_tokens,
+                lever.after_tokens,
+                lever.tokens_saved,
+                escape_cell(&lever.outcome),
+                lever
+                    .reason
+                    .as_deref()
+                    .map(escape_cell)
+                    .unwrap_or_else(|| "-".to_string()),
+            ));
+        }
     }
     output
 }
@@ -101,7 +127,7 @@ fn push_outcome_row(output: &mut String, name: &str, report: &AggregateReport) {
 
 fn push_aggregate_row(output: &mut String, name: &str, report: &AggregateReport) {
     output.push_str(&format!(
-        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
         escape_cell(name),
         report.case_count,
         report.input_tokens,
@@ -111,12 +137,21 @@ fn push_aggregate_row(output: &mut String, name: &str, report: &AggregateReport)
         score(report.off_quality_score),
         score(report.on_quality_score),
         signed_score(report.quality_delta),
+        passed(report.acceptance_passed),
         report
             .added_compression_latency_micros
             .map(|value| value.to_string())
             .unwrap_or_else(|| "not measured".to_string()),
         recommendation(report.recommendation),
     ));
+}
+
+fn passed(value: bool) -> &'static str {
+    if value {
+        "pass"
+    } else {
+        "fail"
+    }
 }
 
 fn recommendation(value: Recommendation) -> &'static str {

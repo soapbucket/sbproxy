@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "profile": "compact-serialization-smoke-v1",
+  "levers": [
+    {
+      "type": "compact_serialization",
+      "min_tokens": 1,
+      "tabular": {
+        "enabled": true,
+        "min_rows": 200
+      }
+    }
+  ]
+}
