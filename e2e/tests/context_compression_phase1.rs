@@ -8,6 +8,10 @@ const HOST: &str = "phase1.localhost";
 const QUERY: &str = "Which deployment fact explains the checkout outage?";
 const REQUIRED_EVIDENCE: &str =
     "Required evidence: checkout failed because catalog-v42 was missing in us-west-2.";
+const DISTRACTOR_A: &str = "Unrelated payroll archive from 2019. ";
+const DISTRACTOR_B: &str = "Unrelated office lunch menu and room booking notes.";
+const USEFUL_A: &str = "The catalog service reported ImagePullBackOff.";
+const USEFUL_B: &str = "The checkout deployment began at 12:01 UTC.";
 const UNMARKED_PREFIX: &str = "Caller note before retrieval.\n";
 const UNMARKED_SUFFIX: &str = "\nCaller note after retrieval.";
 
@@ -106,31 +110,11 @@ fn valid_body(rows: &Value) -> Value {
     let user_block = marked_block(
         QUERY,
         &[
-            marked_chunk(
-                "distractor-a",
-                "0.05",
-                "text",
-                "Unrelated payroll archive from 2019. ",
-            ),
-            marked_chunk(
-                "useful-b",
-                "0.60",
-                "text",
-                "The checkout deployment began at 12:01 UTC.",
-            ),
+            marked_chunk("distractor-a", "0.05", "text", DISTRACTOR_A),
+            marked_chunk("useful-b", "0.60", "text", USEFUL_B),
             marked_chunk("required", "0.99", "text", REQUIRED_EVIDENCE),
-            marked_chunk(
-                "distractor-b",
-                "0.10",
-                "text",
-                "Unrelated office lunch menu and room booking notes.",
-            ),
-            marked_chunk(
-                "useful-a",
-                "0.80",
-                "text",
-                "The catalog service reported ImagePullBackOff.",
-            ),
+            marked_chunk("distractor-b", "0.10", "text", DISTRACTOR_B),
+            marked_chunk("useful-a", "0.80", "text", USEFUL_A),
         ],
     );
     let pretty_rows = serde_json::to_string_pretty(rows).expect("serialize source rows");
@@ -243,8 +227,6 @@ fn phase1_pipeline_changes_only_valid_explicit_marked_context() {
     let compressed_user = compressed_messages[4]["content"]
         .as_str()
         .expect("compressed marked user content");
-    assert!(compressed_user.starts_with(UNMARKED_PREFIX));
-    assert!(compressed_user.ends_with(UNMARKED_SUFFIX));
     assert_ne!(compressed_messages[4], source_messages[4]);
     assert_ne!(compressed_messages[5], source_messages[5]);
 
@@ -272,12 +254,41 @@ fn phase1_pipeline_changes_only_valid_explicit_marked_context() {
         "required evidence must be placed at a retrieval edge"
     );
     assert!(
-        !compressed_user.contains("distractor-a") && !compressed_user.contains("distractor-b"),
-        "RAG selection must remove distractors"
+        !compressed_user.contains("distractor-a")
+            && !compressed_user.contains("distractor-b")
+            && !compressed_user.contains(DISTRACTOR_A)
+            && !compressed_user.contains(DISTRACTOR_B),
+        "RAG selection must remove distractor IDs and bodies"
+    );
+    let expected_user_block = marked_block(
+        QUERY,
+        &[
+            marked_chunk("required", "0.99", "text", REQUIRED_EVIDENCE),
+            marked_chunk("useful-b", "0.60", "text", USEFUL_B),
+            marked_chunk("useful-a", "0.80", "text", USEFUL_A),
+        ],
+    );
+    assert_eq!(
+        compressed_user,
+        format!("{UNMARKED_PREFIX}{expected_user_block}{UNMARKED_SUFFIX}"),
+        "the complete transformed user string must match exactly"
     );
     let compacted = &snapshot.blocks[1].chunks[0];
     assert_eq!(compacted.id, "tool-rows");
     assert_eq!(compacted.format, "sbproxy_table_v1");
+    let expected_tool = marked_block(
+        QUERY,
+        &[marked_chunk(
+            "tool-rows",
+            "1",
+            "sbproxy_table_v1",
+            &compacted.body,
+        )],
+    );
+    assert_eq!(
+        compressed_messages[5]["content"], expected_tool,
+        "the complete transformed tool string must match exactly"
+    );
     assert_eq!(
         decode_sbproxy_table_v1(&compacted.body).expect("decode public Table v1"),
         rows

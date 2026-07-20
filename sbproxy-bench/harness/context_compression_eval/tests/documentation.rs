@@ -2,6 +2,40 @@ use std::fs;
 use std::path::Path;
 
 #[test]
+fn operator_docs_qualify_retrieval_skip_reasons_and_json_fallbacks() {
+    let harness = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs = fs::read_to_string(
+        harness
+            .ancestors()
+            .nth(3)
+            .expect("repository root")
+            .join("docs/ai-context-compression.md"),
+    )
+    .expect("AI context compression docs");
+    let normalized = docs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for required in [
+        "Block- and chunk-local conditions become aggregate skip reasons only when no other block or chunk changes.",
+        "If any block or chunk changes, the lever returns the complete candidate with all unchanged local data copied byte-for-byte.",
+        "The runner records `applied` when that candidate satisfies the lever's commit rule; otherwise it records `skipped`, `no_savings`.",
+        "Invalid JSON in a marked JSON chunk | `skipped`, `unsafe_structured_shape` only when no other chunk changes",
+        "Valid nested, heterogeneous, or otherwise table-ineligible JSON | `applied`; `skipped`, `not_needed`; or runner `skipped`, `no_savings`",
+        "Still eligible for deterministic JSON minification; shape alone is not unsafe",
+    ] {
+        assert!(
+            normalized.contains(required),
+            "operator docs missing `{required}`"
+        );
+    }
+    assert!(
+        !normalized.contains(
+            "JSON is invalid, nested, heterogeneous, or otherwise unsafe for table encoding | `skipped`, `unsafe_structured_shape`"
+        ),
+        "valid table-ineligible JSON must not be described as unsafe structured input"
+    );
+}
+
+#[test]
 fn readme_and_workflow_cover_reproducibility_and_external_data_boundaries() {
     let harness = Path::new(env!("CARGO_MANIFEST_DIR"));
     let readme = fs::read_to_string(harness.join("README.md")).expect("harness README");
