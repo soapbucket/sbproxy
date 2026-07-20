@@ -8025,6 +8025,47 @@ mod compression_selection_tests {
     }
 
     #[test]
+    fn route_default_request_specific_compression_bypasses_cache_reads_and_writes_without_session()
+    {
+        let config = serde_json::json!({
+            "origins": {
+                "ai.example.com": {
+                    "action": {
+                        "type": "ai_proxy",
+                        "providers": [{"name": "openai", "api_key": "test-key"}],
+                        "compression": {
+                            "levers": [{
+                                "type": "rag_select",
+                                "min_tokens": 512,
+                                "max_chunks": 8
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        let compiled = sbproxy_config::compile_config(&config.to_string())
+            .expect("request-specific route default compiles");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("request-specific runtime compiles without Redis");
+        let runtime_set = pipeline
+            .compression_runtimes
+            .get_set(0)
+            .expect("compiled compression runtime set");
+        let selected = runtime_set.select_default();
+        let runtime = selected.runtime().expect("route-default runtime");
+        let has_captured_session = false;
+
+        let cache_bypass = compression_selection_bypasses_cache(Some(runtime_set.as_ref()), false)
+            || runtime.bypasses_semantic_cache(has_captured_session);
+        let semantic_cache_read_enabled = !cache_bypass;
+        let semantic_cache_write_enabled = !cache_bypass;
+
+        assert!(!semantic_cache_read_enabled);
+        assert!(!semantic_cache_write_enabled);
+    }
+
+    #[test]
     fn compression_disables_native_body_bypass() {
         assert!(native_bypass_is_safe(false, false));
         assert!(!native_bypass_is_safe(true, false));

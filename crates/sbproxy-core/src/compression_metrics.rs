@@ -656,10 +656,10 @@ pub(crate) fn record_compression_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_identity_with_sanitizers, record_compression_run, record_compression_selection,
-        record_compression_selection_event, record_compression_state_operation,
-        record_redis_compression_coordination, target_log, CompressionStateOperation,
-        CompressionStateOutcome, RedisCompressionCoordinationEvent,
+        bounded_identity_with_sanitizers, outcome_log, record_compression_run,
+        record_compression_selection, record_compression_selection_event,
+        record_compression_state_operation, record_redis_compression_coordination, target_log,
+        CompressionStateOperation, CompressionStateOutcome, RedisCompressionCoordinationEvent,
     };
     use sbproxy_ai::compression::{
         CompactSerializationConfig, CompressionBackend, CompressionLeverConfig, CompressionPolicy,
@@ -695,7 +695,7 @@ mod tests {
         }
     }
 
-    fn capture_summary(run: &CompressionRun) -> String {
+    fn capture_summary_with_policy(policy: &CompressionPolicy, run: &CompressionRun) -> String {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -705,7 +705,7 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             record_compression_run(
-                &policy(),
+                policy,
                 "compression-log-tenant",
                 Some("compression-log-key"),
                 true,
@@ -716,6 +716,10 @@ mod tests {
         });
         let bytes = captured.lock().expect("log capture").clone();
         String::from_utf8(bytes).expect("compression log is UTF-8")
+    }
+
+    fn capture_summary(run: &CompressionRun) -> String {
+        capture_summary_with_policy(&policy(), run)
     }
 
     fn capture_selection(reason: Option<&'static str>) -> String {
@@ -769,6 +773,33 @@ mod tests {
         }
     }
 
+    fn stateless_policy() -> CompressionPolicy {
+        CompressionPolicy {
+            state: None,
+            allow_admin_content_inspection: false,
+            levers: vec![
+                CompressionLeverConfig::RagSelect(RagSelectConfig {
+                    min_tokens: 512,
+                    ranking: RetrievalRanking::Auto,
+                    max_chunks: 8,
+                    min_relevance_percent: 15,
+                    drop_empty: true,
+                }),
+                CompressionLeverConfig::CompactSerialization(CompactSerializationConfig {
+                    min_tokens: 128,
+                    tabular: TabularSerializationConfig {
+                        enabled: true,
+                        min_rows: 8,
+                    },
+                }),
+                CompressionLeverConfig::PositionReorder(PositionReorderConfig {
+                    ranking: RetrievalRanking::Auto,
+                }),
+            ],
+            profiles: std::collections::BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn window_fit_target_omits_an_unconfigured_explicit_budget() {
         let configured = target_log(&policy());
@@ -797,33 +828,8 @@ mod tests {
 
     #[test]
     fn stateless_targets_are_content_free_and_stable() {
-        let policy = CompressionPolicy {
-            state: None,
-            allow_admin_content_inspection: false,
-            levers: vec![
-                CompressionLeverConfig::RagSelect(RagSelectConfig {
-                    min_tokens: 512,
-                    ranking: RetrievalRanking::Auto,
-                    max_chunks: 8,
-                    min_relevance_percent: 15,
-                    drop_empty: true,
-                }),
-                CompressionLeverConfig::CompactSerialization(CompactSerializationConfig {
-                    min_tokens: 128,
-                    tabular: TabularSerializationConfig {
-                        enabled: true,
-                        min_rows: 8,
-                    },
-                }),
-                CompressionLeverConfig::PositionReorder(PositionReorderConfig {
-                    ranking: RetrievalRanking::Auto,
-                }),
-            ],
-            profiles: std::collections::BTreeMap::new(),
-        };
-
         let targets: serde_json::Value =
-            serde_json::from_str(&target_log(&policy)).expect("valid target JSON");
+            serde_json::from_str(&target_log(&stateless_policy())).expect("valid target JSON");
         assert_eq!(
             targets,
             serde_json::json!([
@@ -847,6 +853,159 @@ mod tests {
                 }
             ])
         );
+    }
+
+    fn stateless_applied_run() -> CompressionRun {
+        CompressionRun {
+            messages: vec![serde_json::json!({
+                "role": "user",
+                "content": {
+                    "query": "private-query-sentinel",
+                    "chunk_id": "private-chunk-id-sentinel",
+                    "chunk_body": "private-chunk-body-sentinel",
+                    "score": "private-score-sentinel",
+                    "source_position": "private-source-position-sentinel",
+                    "parse_error": "private-parser-detail-sentinel",
+                    "credential": "private-credential-sentinel",
+                    "request_content": "private-request-content-sentinel",
+                    "free_form_error": "private-free-form-error-sentinel"
+                }
+            })],
+            initial_tokens: 100,
+            final_tokens: 70,
+            tokens_saved: 30,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
+            lever_results: vec![
+                LeverResult {
+                    lever: LeverKind::RagSelect,
+                    backend: None,
+                    outcome: LeverOutcome::Applied,
+                    before_tokens: 100,
+                    after_tokens: 80,
+                    tokens_saved: 20,
+                    duration: Duration::from_millis(4),
+                },
+                LeverResult {
+                    lever: LeverKind::CompactSerialization,
+                    backend: None,
+                    outcome: LeverOutcome::Applied,
+                    before_tokens: 80,
+                    after_tokens: 70,
+                    tokens_saved: 10,
+                    duration: Duration::from_millis(5),
+                },
+                LeverResult {
+                    lever: LeverKind::PositionReorder,
+                    backend: None,
+                    outcome: LeverOutcome::Applied,
+                    before_tokens: 70,
+                    after_tokens: 70,
+                    tokens_saved: 0,
+                    duration: Duration::from_millis(6),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn stateless_run_emits_one_content_free_summary_with_closed_accounting() {
+        let policy = stateless_policy();
+        let run = stateless_applied_run();
+        let log = capture_summary_with_policy(&policy, &run);
+
+        assert_eq!(log.matches("ai_compression_summary").count(), 1, "{log}");
+        assert!(log.contains(" INFO "), "{log}");
+        assert!(log.contains("levers_applied=3"), "{log}");
+        assert!(log.contains("targets="), "{log}");
+        assert!(log.contains("lever_outcomes="), "{log}");
+
+        let outcomes: serde_json::Value =
+            serde_json::from_str(&outcome_log(&run)).expect("valid outcome JSON");
+        assert_eq!(
+            outcomes,
+            serde_json::json!([
+                {
+                    "lever": "rag_select",
+                    "outcome": "applied",
+                    "reason": "",
+                    "backend": "none",
+                    "before_tokens": 100,
+                    "after_tokens": 80,
+                    "tokens_saved": 20,
+                    "duration_ms": 4
+                },
+                {
+                    "lever": "compact_serialization",
+                    "outcome": "applied",
+                    "reason": "",
+                    "backend": "none",
+                    "before_tokens": 80,
+                    "after_tokens": 70,
+                    "tokens_saved": 10,
+                    "duration_ms": 5
+                },
+                {
+                    "lever": "position_reorder",
+                    "outcome": "applied",
+                    "reason": "",
+                    "backend": "none",
+                    "before_tokens": 70,
+                    "after_tokens": 70,
+                    "tokens_saved": 0,
+                    "duration_ms": 6
+                }
+            ])
+        );
+
+        for forbidden in [
+            "private-query-sentinel",
+            "private-chunk-id-sentinel",
+            "private-chunk-body-sentinel",
+            "private-score-sentinel",
+            "private-source-position-sentinel",
+            "private-parser-detail-sentinel",
+            "private-credential-sentinel",
+            "private-request-content-sentinel",
+            "private-free-form-error-sentinel",
+        ] {
+            assert!(
+                !log.contains(forbidden),
+                "telemetry exposed {forbidden}: {log}"
+            );
+        }
+    }
+
+    #[test]
+    fn stateless_summary_levels_are_failure_first_and_skip_sensitive() {
+        let policy = stateless_policy();
+
+        let mut skipped = stateless_applied_run();
+        skipped.final_tokens = skipped.initial_tokens;
+        skipped.tokens_saved = 0;
+        for result in &mut skipped.lever_results {
+            result.outcome = LeverOutcome::Skipped {
+                reason: SkipReason::NotNeeded,
+            };
+            result.after_tokens = result.before_tokens;
+            result.tokens_saved = 0;
+        }
+        let skipped = capture_summary_with_policy(&policy, &skipped);
+        assert_eq!(skipped.matches("ai_compression_summary").count(), 1);
+        assert!(skipped.contains("DEBUG"), "{skipped}");
+
+        let mut failed = stateless_applied_run();
+        failed.lever_results[1].outcome = LeverOutcome::Failed {
+            reason: FailureReason::Internal,
+        };
+        failed.lever_results[1].after_tokens = failed.lever_results[1].before_tokens;
+        failed.lever_results[1].tokens_saved = 0;
+        failed.lever_results[2].before_tokens = failed.lever_results[1].before_tokens;
+        failed.lever_results[2].after_tokens = failed.lever_results[1].before_tokens;
+        failed.final_tokens = 80;
+        failed.tokens_saved = 20;
+        let failed = capture_summary_with_policy(&policy, &failed);
+        assert_eq!(failed.matches("ai_compression_summary").count(), 1);
+        assert!(failed.contains(" WARN "), "{failed}");
     }
 
     fn applied_run() -> CompressionRun {

@@ -44,6 +44,17 @@ fn ai_gateway_dashboard_covers_compression_value_and_health() {
         application["targets"][0]["expr"],
         "sbproxy:ai_compression_application_rate_5m"
     );
+    let application_description = application["description"]
+        .as_str()
+        .expect("compression application panel description");
+    assert!(
+        application_description.contains("committed a transformation"),
+        "application rate must describe committed transformations: {application_description}"
+    );
+    assert!(
+        !application_description.contains("strictly reducing"),
+        "zero-saving applied levers are valid: {application_description}"
+    );
     let request_rate = panels
         .iter()
         .find(|panel| panel["title"] == "AI Requests/sec by Provider")

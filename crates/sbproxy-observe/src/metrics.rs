@@ -1303,6 +1303,8 @@ fn record_compression_value_to(
     let lever = match lever {
         "summary_buffer" => "summary_buffer",
         "window_fit" => "window_fit",
+        "rag_select" => "rag_select",
+        "compact_serialization" => "compact_serialization",
         _ => return,
     };
     let token_count_precision = match token_count_precision {
@@ -3937,6 +3939,42 @@ mod tests {
                 tenant_id: "tenant-a",
                 origin: "origin-a",
                 model: "gpt-4o",
+                lever: "rag_select",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 30,
+                gross_cost_saved_micros: 300,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "compact_serialization",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 40,
+                gross_cost_saved_micros: 400,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "position_reorder",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 50,
+                gross_cost_saved_micros: 500,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
                 lever: "window_fit",
                 token_count_precision: "model_tokenizer",
                 tokens_saved: 120,
@@ -4023,6 +4061,19 @@ mod tests {
         assert!(scrape.contains(
             "sbproxy_ai_compression_value_cost_saved_micros_total{lever=\"window_fit\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 900"
         ));
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_tokens_saved_total{lever=\"rag_select\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 30"
+        ));
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_cost_saved_micros_total{lever=\"rag_select\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 300"
+        ));
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_tokens_saved_total{lever=\"compact_serialization\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 40"
+        ));
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_cost_saved_micros_total{lever=\"compact_serialization\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 400"
+        ));
+        assert!(!scrape.contains("lever=\"position_reorder\""));
         assert!(!scrape.contains("not-a-lever"));
         assert!(!scrape.contains("token_count_precision=\"exact\""));
     }

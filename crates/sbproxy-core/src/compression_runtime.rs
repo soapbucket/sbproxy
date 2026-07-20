@@ -7,13 +7,14 @@ use crate::compression_store::{
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use sbproxy_ai::compression::{
-    CommitError, CompressionBackend, CompressionConsistency, CompressionLever,
-    CompressionLeverConfig, CompressionPolicy, CompressionRecordId, CompressionRequest,
-    CompressionRequestControls, CompressionRun, CompressionRunner, CompressionSelector,
-    CompressionSessionRecord, CompressionSessionStore, CompressionStateBackend,
-    CompressionStateConfig, DeleteResult, InternalSummarizer, ListPage, ListRequest, PurgePage,
-    PurgeRequest, StoreError, SummarizationOutput, SummarizationRequest, SummarizerError,
-    SummaryBufferLever, UpdatePermit, WindowFitLever,
+    CommitError, CompactSerializationLever, CompressionBackend, CompressionConsistency,
+    CompressionLever, CompressionLeverConfig, CompressionPolicy, CompressionRecordId,
+    CompressionRequest, CompressionRequestControls, CompressionRun, CompressionRunner,
+    CompressionSelector, CompressionSessionRecord, CompressionSessionStore,
+    CompressionStateBackend, CompressionStateConfig, DeleteResult, InternalSummarizer, ListPage,
+    ListRequest, PositionReorderLever, PurgePage, PurgeRequest, RagSelectLever, StoreError,
+    SummarizationOutput, SummarizationRequest, SummarizerError, SummaryBufferLever, UpdatePermit,
+    WindowFitLever,
 };
 use sbproxy_ai::{AiClient, AiHandlerConfig, ProviderConfig};
 use sbproxy_platform::storage::{AsyncRedisConfig, AsyncRedisKVStore, KVStore};
@@ -226,7 +227,7 @@ pub struct CompressionRuntime {
 struct CompiledCompressionPipeline {
     runtime: Option<Arc<CompressionRuntime>>,
     behavior_fingerprint: Arc<str>,
-    uses_explicit_input_budget: bool,
+    requires_semantic_cache_bypass: bool,
 }
 
 /// Immutable default and named compression pipelines for one AI origin.
@@ -459,7 +460,7 @@ impl CompressionRuntimeSet {
     /// Whether new request-selectable or explicitly budgeted behavior must
     /// avoid semantic caches that cannot partition by compression behavior.
     pub fn requires_semantic_cache_bypass(&self) -> bool {
-        !self.profiles.is_empty() || self.default.uses_explicit_input_budget
+        !self.profiles.is_empty() || self.default.requires_semantic_cache_bypass
     }
 
     /// Iterate active runtimes for administrative state discovery.
@@ -478,11 +479,12 @@ fn compile_pipeline(
     dependencies: RuntimeDependencies,
 ) -> anyhow::Result<CompiledCompressionPipeline> {
     let behavior_fingerprint = Arc::<str>::from(policy_behavior_fingerprint(&policy)?);
-    let uses_explicit_input_budget = policy.levers.iter().any(|lever| {
-        matches!(
-            lever,
-            CompressionLeverConfig::WindowFit(config) if config.input_budget_tokens.is_some()
-        )
+    let requires_semantic_cache_bypass = policy.levers.iter().any(|lever| match lever {
+        CompressionLeverConfig::WindowFit(config) => config.input_budget_tokens.is_some(),
+        CompressionLeverConfig::RagSelect(_)
+        | CompressionLeverConfig::CompactSerialization(_)
+        | CompressionLeverConfig::PositionReorder(_) => true,
+        CompressionLeverConfig::SummaryBuffer(_) => false,
     });
     let runtime = if policy.levers.is_empty() {
         None
@@ -496,7 +498,7 @@ fn compile_pipeline(
     Ok(CompiledCompressionPipeline {
         runtime,
         behavior_fingerprint,
-        uses_explicit_input_budget,
+        requires_semantic_cache_bypass,
     })
 }
 
@@ -535,26 +537,15 @@ impl CompressionRuntime {
         handler: &AiHandlerConfig,
         dependencies: RuntimeDependencies,
     ) -> anyhow::Result<Self> {
-        if let Some(unwired) = policy.levers.iter().find_map(|lever| match lever {
-            CompressionLeverConfig::SummaryBuffer(_) | CompressionLeverConfig::WindowFit(_) => None,
-            CompressionLeverConfig::RagSelect(_) => Some("rag_select"),
-            CompressionLeverConfig::CompactSerialization(_) => Some("compact_serialization"),
-            CompressionLeverConfig::PositionReorder(_) => Some("position_reorder"),
-        }) {
-            bail!("compression lever {unwired} is not wired into this runtime");
-        }
-
         let summaries = policy
             .levers
             .iter()
             .filter_map(|lever| match lever {
                 CompressionLeverConfig::SummaryBuffer(summary) => Some(summary),
-                CompressionLeverConfig::WindowFit(_) => None,
-                CompressionLeverConfig::RagSelect(_)
+                CompressionLeverConfig::WindowFit(_)
+                | CompressionLeverConfig::RagSelect(_)
                 | CompressionLeverConfig::CompactSerialization(_)
-                | CompressionLeverConfig::PositionReorder(_) => {
-                    unreachable!("unwired levers are rejected before summary discovery")
-                }
+                | CompressionLeverConfig::PositionReorder(_) => None,
             })
             .collect::<Vec<_>>();
 
@@ -739,11 +730,14 @@ impl CompressionRuntime {
                         Arc::new(summarizer),
                     )));
                 }
-                CompressionLeverConfig::RagSelect(_)
-                | CompressionLeverConfig::CompactSerialization(_)
-                | CompressionLeverConfig::PositionReorder(_) => {
-                    // Construction rejects these variants until their runtime adapters are wired.
-                    unreachable!("CompressionRuntime contains an unwired compression lever")
+                CompressionLeverConfig::RagSelect(config) => {
+                    levers.push(Arc::new(RagSelectLever::new(config.clone())));
+                }
+                CompressionLeverConfig::CompactSerialization(config) => {
+                    levers.push(Arc::new(CompactSerializationLever::new(config.clone())));
+                }
+                CompressionLeverConfig::PositionReorder(config) => {
+                    levers.push(Arc::new(PositionReorderLever::new(config.clone())));
                 }
             }
         }
@@ -897,8 +891,8 @@ fn destination_allowed(value: &str, allowed: &[String], blocked: &[String]) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        policy_requires_redis, redis_dependency, CompressionExecution, CompressionRuntime,
-        CompressionRuntimeRegistry, CompressionRuntimeSet, MeshStateDependency,
+        policy_behavior_fingerprint, policy_requires_redis, redis_dependency, CompressionExecution,
+        CompressionRuntime, CompressionRuntimeRegistry, CompressionRuntimeSet, MeshStateDependency,
         RuntimeDependencies,
     };
     use async_trait::async_trait;
@@ -907,8 +901,8 @@ mod tests {
     use sbproxy_ai::compression::{
         CommitError, CompressionBackend, CompressionConsistency, CompressionRecordId,
         CompressionRequestControls, CompressionSessionRecord, CompressionSessionStore,
-        DeleteResult, FailureReason, LeverOutcome, ListPage, ListRequest, PurgePage, PurgeRequest,
-        SkipReason, StoreError, UpdatePermit,
+        DeleteResult, FailureReason, LeverKind, LeverOutcome, ListPage, ListRequest, PurgePage,
+        PurgeRequest, SkipReason, StoreError, UpdatePermit,
     };
     use sbproxy_ai::{AiHandlerConfig, BudgetConfig, OnExceedAction};
     use std::collections::HashMap;
@@ -1124,6 +1118,44 @@ mod tests {
             }
         }))
         .expect("handler fixture")
+    }
+
+    fn stateless_handler(levers: Vec<serde_json::Value>) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "test-key"}],
+            "compression": {"levers": levers}
+        }))
+        .expect("stateless handler fixture")
+    }
+
+    fn stateless_runtime(levers: Vec<serde_json::Value>) -> CompressionRuntime {
+        let handler = stateless_handler(levers);
+        let policy = handler
+            .effective_compression_policy()
+            .expect("explicit compression policy")
+            .into_owned();
+        CompressionRuntime::build(policy, &handler, RuntimeDependencies::empty_for_test())
+            .expect("stateless runtime builds without Redis")
+    }
+
+    fn marked_chunk(id: &str, score: f64, format: &str, body: &str) -> String {
+        format!(
+            "<sbproxy-chunk id=\"{id}\" score=\"{score}\" format=\"{format}\">\n{body}\n</sbproxy-chunk>"
+        )
+    }
+
+    fn marked_block(query: &str, chunks: &[String]) -> String {
+        format!(
+            "<sbproxy-retrieval>\n<sbproxy-query>\n{query}\n</sbproxy-query>\n{}\n</sbproxy-retrieval>",
+            chunks.join("\n")
+        )
+    }
+
+    fn marked_message(query: &str, chunks: &[String]) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
+            "role": "user",
+            "content": marked_block(query, chunks)
+        })]
     }
 
     struct GeneratedRedisIdentity {
@@ -1475,49 +1507,273 @@ origins:
         assert!(!runtime.has_stateful_summary());
     }
 
-    #[test]
-    fn unwired_stateless_levers_fail_closed_during_runtime_construction() {
+    #[tokio::test]
+    async fn stateless_levers_deserialize_execute_and_need_no_redis() {
+        let pretty_json = serde_json::to_string_pretty(&serde_json::json!({
+            "service": "catalog",
+            "regions": ["us-west-2", "us-east-1"],
+            "ready": true
+        }))
+        .unwrap();
+        let rag_messages = marked_message(
+            "which service is ready",
+            &[
+                marked_chunk("distractor", 0.1, "text", "unrelated material"),
+                marked_chunk("required", 0.9, "text", "catalog is ready"),
+            ],
+        );
+        let compact_messages = marked_message(
+            "compact this result",
+            &[marked_chunk("json", 1.0, "json", &pretty_json)],
+        );
+        let reorder_messages = marked_message(
+            "put useful evidence at the edges",
+            &[
+                marked_chunk("low", 0.1, "text", "low relevance"),
+                marked_chunk("high", 0.9, "text", "high relevance"),
+                marked_chunk("middle", 0.5, "text", "middle relevance"),
+            ],
+        );
         let cases = [
             (
                 serde_json::json!({
                     "type": "rag_select",
-                    "min_tokens": 512,
-                    "max_chunks": 8
+                    "min_tokens": 1,
+                    "ranking": "supplied",
+                    "max_chunks": 1,
+                    "min_relevance_percent": 0,
+                    "drop_empty": false
                 }),
-                "rag_select",
+                rag_messages,
+                LeverKind::RagSelect,
             ),
             (
                 serde_json::json!({
                     "type": "compact_serialization",
-                    "min_tokens": 128
+                    "min_tokens": 1,
+                    "tabular": {"enabled": false, "min_rows": 8}
                 }),
-                "compact_serialization",
+                compact_messages,
+                LeverKind::CompactSerialization,
             ),
             (
-                serde_json::json!({"type": "position_reorder"}),
-                "position_reorder",
+                serde_json::json!({
+                    "type": "position_reorder",
+                    "ranking": "supplied"
+                }),
+                reorder_messages,
+                LeverKind::PositionReorder,
             ),
         ];
 
-        for (lever, label) in cases {
-            let handler = AiHandlerConfig::from_config(serde_json::json!({
-                "providers": [{"name": "openai", "api_key": "test-key"}],
-                "compression": {"levers": [lever]}
-            }))
-            .unwrap_or_else(|error| panic!("{label} config must parse: {error}"));
+        for (lever, messages, expected_kind) in cases {
+            let runtime = stateless_runtime(vec![lever]);
+            assert!(runtime.store.is_none());
+
+            let run = runtime
+                .run(execution(None, &[], &[], None), &messages)
+                .await;
+
+            assert_eq!(run.lever_results.len(), 1);
+            assert_eq!(run.lever_results[0].lever, expected_kind);
+            assert_eq!(run.lever_results[0].backend, None);
+            assert_eq!(run.lever_results[0].outcome, LeverOutcome::Applied);
+        }
+    }
+
+    #[tokio::test]
+    async fn recommended_stateless_pipeline_executes_in_declared_order_without_redis() {
+        let chunks = [
+            marked_chunk(
+                "low",
+                0.3,
+                "json",
+                &serde_json::to_string_pretty(&serde_json::json!({"rank": 3, "ready": true}))
+                    .unwrap(),
+            ),
+            marked_chunk(
+                "highest",
+                0.9,
+                "json",
+                &serde_json::to_string_pretty(&serde_json::json!({"rank": 1, "ready": true}))
+                    .unwrap(),
+            ),
+            marked_chunk(
+                "discard",
+                0.1,
+                "json",
+                &serde_json::to_string_pretty(&serde_json::json!({"rank": 4, "ready": false}))
+                    .unwrap(),
+            ),
+            marked_chunk(
+                "middle",
+                0.6,
+                "json",
+                &serde_json::to_string_pretty(&serde_json::json!({"rank": 2, "ready": true}))
+                    .unwrap(),
+            ),
+        ];
+        let messages = marked_message("which entries are ready", &chunks);
+        let runtime = stateless_runtime(vec![
+            serde_json::json!({
+                "type": "rag_select",
+                "min_tokens": 1,
+                "ranking": "supplied",
+                "max_chunks": 3,
+                "min_relevance_percent": 0,
+                "drop_empty": false
+            }),
+            serde_json::json!({
+                "type": "compact_serialization",
+                "min_tokens": 1,
+                "tabular": {"enabled": false, "min_rows": 8}
+            }),
+            serde_json::json!({"type": "position_reorder", "ranking": "supplied"}),
+            serde_json::json!({"type": "window_fit"}),
+        ]);
+        assert!(runtime.store.is_none());
+
+        let run = runtime
+            .run(execution(None, &[], &[], None), &messages)
+            .await;
+
+        assert_eq!(
+            run.lever_results
+                .iter()
+                .map(|result| result.lever)
+                .collect::<Vec<_>>(),
+            [
+                LeverKind::RagSelect,
+                LeverKind::CompactSerialization,
+                LeverKind::PositionReorder,
+                LeverKind::WindowFit,
+            ]
+        );
+        assert_eq!(run.lever_results[0].outcome, LeverOutcome::Applied);
+        assert_eq!(run.lever_results[1].outcome, LeverOutcome::Applied);
+        assert_eq!(run.lever_results[2].outcome, LeverOutcome::Applied);
+        assert!(run
+            .lever_results
+            .iter()
+            .all(|result| result.backend.is_none()));
+    }
+
+    #[test]
+    fn summary_discovery_ignores_all_stateless_levers() {
+        let stateless = stateless_handler(vec![
+            serde_json::json!({
+                "type": "rag_select",
+                "min_tokens": 512,
+                "max_chunks": 8
+            }),
+            serde_json::json!({"type": "compact_serialization", "min_tokens": 128}),
+            serde_json::json!({"type": "position_reorder"}),
+            serde_json::json!({"type": "window_fit"}),
+        ]);
+        let stateless_policy = stateless
+            .effective_compression_policy()
+            .expect("stateless compression policy")
+            .into_owned();
+        assert!(!policy_requires_redis(&stateless_policy));
+
+        let summary = handler("redis");
+        let summary_policy = summary
+            .effective_compression_policy()
+            .expect("summary compression policy")
+            .into_owned();
+        assert!(policy_requires_redis(&summary_policy));
+    }
+
+    #[test]
+    fn every_new_config_field_changes_the_behavior_fingerprint_one_at_a_time() {
+        let base_levers = vec![
+            serde_json::json!({
+                "type": "rag_select",
+                "min_tokens": 512,
+                "ranking": "auto",
+                "max_chunks": 8,
+                "min_relevance_percent": 15,
+                "drop_empty": true
+            }),
+            serde_json::json!({
+                "type": "compact_serialization",
+                "min_tokens": 128,
+                "tabular": {"enabled": true, "min_rows": 8}
+            }),
+            serde_json::json!({"type": "position_reorder", "ranking": "auto"}),
+        ];
+        let fingerprint = |levers: Vec<serde_json::Value>| {
+            let handler = stateless_handler(levers);
             let policy = handler
                 .effective_compression_policy()
-                .expect("explicit policy")
+                .expect("compression policy")
                 .into_owned();
+            policy_behavior_fingerprint(&policy).expect("behavior fingerprint")
+        };
+        let baseline = fingerprint(base_levers.clone());
+        let mutations = [
+            (
+                "rag_select.min_tokens",
+                0,
+                "/min_tokens",
+                serde_json::json!(513),
+            ),
+            (
+                "rag_select.ranking",
+                0,
+                "/ranking",
+                serde_json::json!("lexical"),
+            ),
+            (
+                "rag_select.max_chunks",
+                0,
+                "/max_chunks",
+                serde_json::json!(7),
+            ),
+            (
+                "rag_select.min_relevance_percent",
+                0,
+                "/min_relevance_percent",
+                serde_json::json!(16),
+            ),
+            (
+                "rag_select.drop_empty",
+                0,
+                "/drop_empty",
+                serde_json::json!(false),
+            ),
+            (
+                "compact_serialization.min_tokens",
+                1,
+                "/min_tokens",
+                serde_json::json!(129),
+            ),
+            (
+                "compact_serialization.tabular.enabled",
+                1,
+                "/tabular/enabled",
+                serde_json::json!(false),
+            ),
+            (
+                "compact_serialization.tabular.min_rows",
+                1,
+                "/tabular/min_rows",
+                serde_json::json!(9),
+            ),
+            (
+                "position_reorder.ranking",
+                2,
+                "/ranking",
+                serde_json::json!("lexical"),
+            ),
+        ];
 
-            let error =
-                CompressionRuntime::build(policy, &handler, RuntimeDependencies::empty_for_test())
-                    .expect_err("unwired runtime lever must fail closed");
-
-            assert_eq!(
-                error.to_string(),
-                format!("compression lever {label} is not wired into this runtime")
-            );
+        for (field, lever_index, pointer, value) in mutations {
+            let mut changed = base_levers.clone();
+            *changed[lever_index]
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing fixture field {field}")) = value;
+            assert_ne!(baseline, fingerprint(changed), "field {field}");
         }
     }
 
@@ -1612,6 +1868,40 @@ origins:
         )
         .expect("legacy runtime set");
         assert!(!legacy_set.requires_semantic_cache_bypass());
+    }
+
+    #[test]
+    fn request_specific_default_levers_bypass_unpartitioned_semantic_caches() {
+        let cases = [
+            serde_json::json!({
+                "type": "rag_select",
+                "min_tokens": 512,
+                "max_chunks": 8
+            }),
+            serde_json::json!({"type": "compact_serialization", "min_tokens": 128}),
+            serde_json::json!({"type": "position_reorder"}),
+        ];
+
+        for lever in cases {
+            let handler = stateless_handler(vec![lever]);
+            let set = CompressionRuntimeSet::build(
+                handler
+                    .effective_compression_policy()
+                    .expect("compression policy")
+                    .into_owned(),
+                &handler,
+                RuntimeDependencies::empty_for_test(),
+            )
+            .expect("request-specific runtime set");
+
+            assert!(set.requires_semantic_cache_bypass());
+            assert!(set.select_default().runtime().is_some());
+            assert!(set
+                .select(&sbproxy_ai::compression::CompressionSelector::Off)
+                .expect("off selection")
+                .runtime()
+                .is_none());
+        }
     }
 
     #[test]
