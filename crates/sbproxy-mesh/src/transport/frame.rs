@@ -194,8 +194,11 @@ pub struct DigestPage {
 
 /// Write a framed payload to `w`. Frame layout is `[u32 BE length][payload]`.
 ///
-/// Returns the number of payload bytes written on success (matches
-/// `payload.len()`).
+/// The prefix and payload are coalesced into a single write. Writing them
+/// separately produces a write-write-read pattern on the socket, which
+/// stalls ~40ms per RPC when the peer's delayed ACK meets Nagle on either
+/// end (WOR-1949); it also keeps small frames to one TLS record when the
+/// stream is TLS-wrapped.
 pub async fn write_frame<W>(w: &mut W, payload: &[u8]) -> tokio::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -212,8 +215,10 @@ where
         ));
     }
     let len = payload.len() as u32;
-    w.write_u32(len).await?;
-    w.write_all(payload).await?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    w.write_all(&frame).await?;
     Ok(())
 }
 
@@ -512,6 +517,56 @@ mod tests {
             }
             other => panic!("expected DigestPage, got {:?}", other),
         }
+    }
+
+    /// Writer that counts discrete `poll_write` calls while collecting the
+    /// bytes, so tests can assert how many writes a helper issues.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl tokio::io::AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<tokio::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<tokio::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<tokio::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_frame_coalesces_prefix_and_body_into_one_write() {
+        // WOR-1949: a separate prefix write followed by a body write is the
+        // write-write-read pattern that stalls ~40ms per RPC against the
+        // peer's delayed ACK when Nagle is active on either socket. The
+        // frame must leave in a single write.
+        let mut w = CountingWriter::default();
+        write_frame(&mut w, b"hello").await.expect("write");
+        assert_eq!(
+            w.writes, 1,
+            "length prefix and body must be coalesced into one write"
+        );
+        assert_eq!(w.bytes[..4], 5u32.to_be_bytes());
+        assert_eq!(&w.bytes[4..], b"hello");
     }
 
     #[tokio::test]

@@ -117,6 +117,12 @@ impl TransportServer {
                         match accept {
                             Ok((stream, addr)) => {
                                 tracing::debug!(peer = %addr, "transport: accepted connection");
+                                // Mirror the client-side connect: the
+                                // response leg is a small write followed by
+                                // a read, so leaving Nagle on stalls it
+                                // against the client's delayed ACK
+                                // (WOR-1949).
+                                let _ = stream.set_nodelay(true);
                                 let cache = cache.clone();
                                 let cipher = cipher.clone();
                                 let tls = tls.clone();
