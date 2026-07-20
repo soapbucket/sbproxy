@@ -120,6 +120,10 @@ pub struct CompressionStateConfig {
 pub enum CompressionStateBackend {
     /// Strict Redis lease, fence, and compare-and-set storage.
     Redis,
+    /// Replicated mesh storage over the cluster replication substrate.
+    /// Requires `proxy.cluster.replication`; conditional writes converge
+    /// through causal last-writer-wins merging.
+    Mesh,
 }
 
 /// Backend identity exposed by store adapters and administrative metadata.
@@ -377,15 +381,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mesh_as_a_compression_state_backend() {
+    fn parses_mesh_as_a_compression_state_backend_without_changing_redis() {
         let mut value = valid_config();
         value["compression"]["state"]["backend"] = serde_json::json!("mesh");
 
-        let error = AiHandlerConfig::from_config(value).unwrap_err().to_string();
-        assert!(
-            error.contains("unknown variant `mesh`") && error.contains("`redis`"),
-            "mesh must not be accepted until the cluster substrate provides durable replicated state: {error}"
+        let config = AiHandlerConfig::from_config(value).expect("mesh backend parses");
+        let policy = config.compression.as_ref().expect("explicit policy");
+        assert_eq!(
+            policy.state.as_ref().expect("state config").backend,
+            CompressionStateBackend::Mesh
         );
+
+        // The additive variant leaves Redis deserialization untouched.
+        let redis = AiHandlerConfig::from_config(valid_config()).expect("redis still parses");
+        assert_eq!(
+            redis
+                .compression
+                .as_ref()
+                .and_then(|policy| policy.state.as_ref())
+                .expect("state config")
+                .backend,
+            CompressionStateBackend::Redis
+        );
+
+        // The backend enum stays closed: unknown names are still rejected.
+        let mut unknown = valid_config();
+        unknown["compression"]["state"]["backend"] = serde_json::json!("gossip");
+        let error = AiHandlerConfig::from_config(unknown)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown variant `gossip`"), "{error}");
     }
 
     #[test]

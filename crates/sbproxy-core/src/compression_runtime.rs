@@ -1,13 +1,19 @@
 //! Runtime binding for ordered AI context compression.
 
-use crate::compression_store::{RedisCompressionStore, RedisCompressionStoreConfig};
+use crate::compression_store::{
+    MeshCompressionStore, MeshCompressionStoreConfig, RedisCompressionStore,
+    RedisCompressionStoreConfig,
+};
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use sbproxy_ai::compression::{
-    CompressionLever, CompressionLeverConfig, CompressionPolicy, CompressionRequest,
+    CommitError, CompressionBackend, CompressionConsistency, CompressionLever,
+    CompressionLeverConfig, CompressionPolicy, CompressionRecordId, CompressionRequest,
     CompressionRequestControls, CompressionRun, CompressionRunner, CompressionSelector,
-    CompressionSessionStore, CompressionStateBackend, InternalSummarizer, SummarizationOutput,
-    SummarizationRequest, SummarizerError, SummaryBufferLever, WindowFitLever,
+    CompressionSessionRecord, CompressionSessionStore, CompressionStateBackend,
+    CompressionStateConfig, DeleteResult, InternalSummarizer, ListPage, ListRequest, PurgePage,
+    PurgeRequest, StoreError, SummarizationOutput, SummarizationRequest, SummarizerError,
+    SummaryBufferLever, UpdatePermit, WindowFitLever,
 };
 use sbproxy_ai::{AiClient, AiHandlerConfig, ProviderConfig};
 use sbproxy_platform::storage::{AsyncRedisConfig, AsyncRedisKVStore, KVStore};
@@ -17,9 +23,24 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How the mesh compression backend can bind to the replicated substrate.
+#[derive(Clone)]
+enum MeshStateDependency {
+    /// Cluster replication is not configured or not running; selecting
+    /// `backend: mesh` must fail loud.
+    Unavailable,
+    /// The live replicated substrate resolved from the process cluster
+    /// handle.
+    Live(Arc<sbproxy_mesh::state::replicated::ReplicatedStore>),
+    /// `proxy.cluster.replication` is configured, but this registry is a
+    /// discard-only validation build with no running cluster to bind.
+    ValidationOnly,
+}
+
 #[derive(Clone)]
 struct RuntimeDependencies {
     redis: Option<Arc<AsyncRedisKVStore>>,
+    mesh: MeshStateDependency,
     ai_client: Arc<AiClient>,
     writer_node: String,
 }
@@ -36,8 +57,14 @@ impl RuntimeDependencies {
             .as_ref()
             .map(|handle| handle.identity().node_id.clone())
             .unwrap_or_else(|| "standalone".to_string());
+        let mesh = cluster
+            .as_ref()
+            .and_then(|handle| handle.mesh_node())
+            .and_then(|node| node.replicated_store())
+            .map_or(MeshStateDependency::Unavailable, MeshStateDependency::Live);
         Ok(Self {
             redis,
+            mesh,
             ai_client: crate::server::ai_client(),
             writer_node,
         })
@@ -54,8 +81,18 @@ impl RuntimeDependencies {
             .as_ref()
             .map(|cluster| cluster.node_id.clone())
             .unwrap_or_else(|| "validation".to_string());
+        let mesh = if server
+            .cluster
+            .as_ref()
+            .is_some_and(|cluster| cluster.replication.is_some())
+        {
+            MeshStateDependency::ValidationOnly
+        } else {
+            MeshStateDependency::Unavailable
+        };
         Ok(Self {
             redis,
+            mesh,
             ai_client: Arc::new(AiClient::new()),
             writer_node,
         })
@@ -65,6 +102,7 @@ impl RuntimeDependencies {
     fn empty_for_test() -> Self {
         Self {
             redis: None,
+            mesh: MeshStateDependency::Unavailable,
             ai_client: Arc::new(AiClient::new()),
             writer_node: "test-node".to_string(),
         }
@@ -102,6 +140,77 @@ pub(crate) fn redis_admin_store(
     let redis = redis_dependency(server, l2_store, true).ok().flatten()?;
     let store = RedisCompressionStore::new(redis, RedisCompressionStoreConfig::default()).ok()?;
     Some(Arc::new(store))
+}
+
+/// Build the canonical mesh adapter for Admin lifecycle operations even when
+/// no active origin currently selects `backend: mesh`, so replicated session
+/// state written under an earlier configuration stays reachable for list,
+/// delete, and purge. `None` when the replicated substrate is not running.
+pub(crate) fn mesh_admin_store() -> Option<Arc<dyn CompressionSessionStore>> {
+    let replicated = crate::cluster::current_cluster_handle()?
+        .mesh_node()?
+        .replicated_store()?;
+    let store =
+        MeshCompressionStore::new(replicated, MeshCompressionStoreConfig::default()).ok()?;
+    Some(Arc::new(store))
+}
+
+/// Discard-only stand-in bound during configuration validation, where no
+/// live cluster substrate exists to attach. The validation registry never
+/// serves requests; if this store were ever reached, every operation fails
+/// closed as unavailable.
+struct ValidationOnlyMeshStore;
+
+#[async_trait]
+impl CompressionSessionStore for ValidationOnlyMeshStore {
+    fn backend(&self) -> CompressionBackend {
+        CompressionBackend::Mesh
+    }
+
+    fn consistency(&self) -> CompressionConsistency {
+        CompressionConsistency::EventualLww
+    }
+
+    async fn load(
+        &self,
+        _id: &CompressionRecordId,
+    ) -> Result<Option<CompressionSessionRecord>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn acquire_update(
+        &self,
+        _id: &CompressionRecordId,
+        _lease_ttl: Duration,
+    ) -> Result<Option<UpdatePermit>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn commit(
+        &self,
+        _permit: &UpdatePermit,
+        _expected_logical_version: Option<u64>,
+        _record: &CompressionSessionRecord,
+        _ttl: Duration,
+    ) -> Result<(), CommitError> {
+        Err(CommitError::Unavailable)
+    }
+
+    async fn release(&self, _permit: UpdatePermit) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn list(&self, _request: &ListRequest) -> Result<ListPage, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn delete(&self, _id: &CompressionRecordId) -> Result<DeleteResult, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn purge(&self, _request: &PurgeRequest) -> Result<PurgePage, StoreError> {
+        Err(StoreError::Unavailable)
+    }
 }
 
 /// Immutable per-origin compression dependencies held by a pipeline snapshot.
@@ -263,17 +372,26 @@ fn actions_require_redis(actions: &[sbproxy_modules::Action]) -> bool {
 }
 
 fn policy_requires_redis(policy: &CompressionPolicy) -> bool {
-    pipeline_requires_redis(&policy.levers)
+    pipeline_requires_redis(policy.state.as_ref(), &policy.levers)
         || policy
             .profiles
             .values()
-            .any(|profile| pipeline_requires_redis(&profile.levers))
+            .any(|profile| pipeline_requires_redis(profile.state.as_ref(), &profile.levers))
 }
 
-fn pipeline_requires_redis(levers: &[CompressionLeverConfig]) -> bool {
+/// Whether one pipeline binds the Redis compression state adapter. A
+/// mesh-backed pipeline must not force a Redis dependency, and a Redis
+/// pipeline stays on Redis regardless of any cluster replication being
+/// configured: the state backend is only ever the one selected in
+/// configuration.
+fn pipeline_requires_redis(
+    state: Option<&CompressionStateConfig>,
+    levers: &[CompressionLeverConfig],
+) -> bool {
     levers
         .iter()
         .any(|lever| matches!(lever, CompressionLeverConfig::SummaryBuffer(_)))
+        && state.is_some_and(|state| state.backend == CompressionStateBackend::Redis)
 }
 
 impl CompressionRuntimeSet {
@@ -479,6 +597,24 @@ impl CompressionRuntime {
                     })?;
                     Some(Arc::new(adapter))
                 }
+                CompressionStateBackend::Mesh => match &dependencies.mesh {
+                    MeshStateDependency::Live(replicated) => {
+                        let adapter = MeshCompressionStore::new(
+                            replicated.clone(),
+                            MeshCompressionStoreConfig::default(),
+                        )
+                        .map_err(|_| {
+                            anyhow::anyhow!("mesh compression state configuration is invalid")
+                        })?;
+                        Some(Arc::new(adapter) as Arc<dyn CompressionSessionStore>)
+                    }
+                    MeshStateDependency::ValidationOnly => Some(Arc::new(ValidationOnlyMeshStore)),
+                    MeshStateDependency::Unavailable => bail!(
+                        "mesh compression state requires proxy.cluster.replication: \
+                         configure cluster replication on every node, or select the \
+                         default backend: redis"
+                    ),
+                },
             }
         };
 
@@ -742,7 +878,8 @@ fn destination_allowed(value: &str, allowed: &[String], blocked: &[String]) -> b
 mod tests {
     use super::{
         policy_requires_redis, redis_dependency, CompressionExecution, CompressionRuntime,
-        CompressionRuntimeRegistry, CompressionRuntimeSet, RuntimeDependencies,
+        CompressionRuntimeRegistry, CompressionRuntimeSet, MeshStateDependency,
+        RuntimeDependencies,
     };
     use async_trait::async_trait;
     use rcgen::{CertificateParams, KeyPair};
@@ -1142,6 +1279,159 @@ origins:
             .to_string()
             .contains("Redis compression state requires"));
         assert!(!error.to_string().contains("redis://"));
+    }
+
+    /// Single-node replicated substrate for boot-matrix tests.
+    fn live_replicated_substrate() -> Arc<sbproxy_mesh::state::replicated::ReplicatedStore> {
+        use sbproxy_mesh::state::replicated::{
+            Consistency, MeshClock, ReplicaShard, ReplicatedStore, ReplicationSettings, ShardLimits,
+        };
+
+        let clock: MeshClock = Arc::new(|| 1_000_000);
+        let shard = Arc::new(ReplicaShard::in_memory(ShardLimits::default(), 0, clock));
+        let cache: Arc<sbproxy_mesh::state::distributed_cache::DistributedCache<bytes::Bytes>> =
+            Arc::new(sbproxy_mesh::state::distributed_cache::DistributedCache::new("node-a", 128));
+        Arc::new(ReplicatedStore::new(
+            shard,
+            cache,
+            Arc::new(sbproxy_mesh::transport::TransportClientPool::new()),
+            Arc::new(|_| None),
+            Arc::new(|| false),
+            ReplicationSettings {
+                replication_factor: 1,
+                write_consistency: Consistency::One,
+                read_consistency: Consistency::One,
+                anti_entropy_interval_secs: 3_600,
+                tombstone_gc_grace_secs: 0,
+            },
+        ))
+    }
+
+    fn dependencies_with_mesh(mesh: MeshStateDependency) -> RuntimeDependencies {
+        RuntimeDependencies {
+            redis: None,
+            mesh,
+            ai_client: Arc::new(sbproxy_ai::AiClient::new()),
+            writer_node: "node-a".to_string(),
+        }
+    }
+
+    // Boot matrix: backend x replication availability.
+    #[test]
+    fn mesh_backend_without_replication_fails_loud_at_build() {
+        let handler = handler("mesh");
+        let policy = handler
+            .effective_compression_policy()
+            .expect("explicit policy")
+            .into_owned();
+
+        let error = CompressionRuntime::build(
+            policy,
+            &handler,
+            dependencies_with_mesh(MeshStateDependency::Unavailable),
+        )
+        .expect_err("mesh without cluster replication must fail startup");
+
+        assert!(
+            error.to_string().contains("proxy.cluster.replication"),
+            "boot error must name the missing dependency: {error}"
+        );
+        assert!(error.to_string().contains("backend: redis"));
+    }
+
+    #[test]
+    fn mesh_backend_binds_the_replicated_substrate_when_live() {
+        let handler = handler("mesh");
+        let policy = handler
+            .effective_compression_policy()
+            .expect("explicit policy")
+            .into_owned();
+
+        let runtime = CompressionRuntime::build(
+            policy,
+            &handler,
+            dependencies_with_mesh(MeshStateDependency::Live(live_replicated_substrate())),
+        )
+        .expect("mesh backend boots against a live replicated substrate");
+
+        let store = runtime.admin_store().expect("mesh state store is bound");
+        assert_eq!(
+            store.backend(),
+            sbproxy_ai::compression::CompressionBackend::Mesh
+        );
+        assert_eq!(
+            store.consistency(),
+            sbproxy_ai::compression::CompressionConsistency::EventualLww
+        );
+    }
+
+    #[test]
+    fn mesh_backend_validates_when_replication_is_configured_without_a_live_cluster() {
+        let handler = handler("mesh");
+        let policy = handler
+            .effective_compression_policy()
+            .expect("explicit policy")
+            .into_owned();
+
+        let runtime = CompressionRuntime::build(
+            policy,
+            &handler,
+            dependencies_with_mesh(MeshStateDependency::ValidationOnly),
+        )
+        .expect("validation accepts mesh when replication is configured");
+        assert!(runtime.admin_store().is_some());
+    }
+
+    #[test]
+    fn cluster_replication_alone_never_switches_the_backend_off_redis() {
+        // backend: redis with a live replicated substrate available must
+        // still demand Redis; the mesh substrate is never substituted.
+        let handler = handler("redis");
+        let policy = handler
+            .effective_compression_policy()
+            .expect("explicit policy")
+            .into_owned();
+        let error = CompressionRuntime::build(
+            policy,
+            &handler,
+            dependencies_with_mesh(MeshStateDependency::Live(live_replicated_substrate())),
+        )
+        .expect_err("Redis backend must not silently bind mesh state");
+        assert!(error
+            .to_string()
+            .contains("Redis compression state requires"));
+
+        // A policy with no state block gains no state store either.
+        let stateless = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "test-key"}],
+            "compression": {"levers": [{"type": "window_fit"}]}
+        }))
+        .expect("stateless handler");
+        let runtime = CompressionRuntime::build(
+            stateless
+                .effective_compression_policy()
+                .expect("explicit policy")
+                .into_owned(),
+            &stateless,
+            dependencies_with_mesh(MeshStateDependency::Live(live_replicated_substrate())),
+        )
+        .expect("stateless pipeline builds");
+        assert!(runtime.admin_store().is_none());
+    }
+
+    #[test]
+    fn mesh_backed_policies_do_not_force_a_redis_dependency() {
+        let policy = handler("mesh")
+            .effective_compression_policy()
+            .expect("explicit policy")
+            .into_owned();
+        assert!(!policy_requires_redis(&policy));
+
+        let redis_policy = handler("redis")
+            .effective_compression_policy()
+            .expect("explicit policy")
+            .into_owned();
+        assert!(policy_requires_redis(&redis_policy));
     }
 
     #[test]

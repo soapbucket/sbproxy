@@ -178,6 +178,17 @@ static COMPRESSION_REDIS_COORDINATION_TOTAL: LazyLock<IntCounterVec> = LazyLock:
     .expect("AI compression Redis coordination counter registers")
 });
 
+static MESH_COMPRESSION_COORDINATION_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        Opts::new(
+            "mesh_compression_coordination_total",
+            "Mesh compression session coordination contention and rejected updates"
+        ),
+        &["event"]
+    )
+    .expect("AI compression mesh coordination counter registers")
+});
+
 /// Closed external state operation names emitted by both adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompressionStateOperation {
@@ -319,6 +330,40 @@ pub(crate) fn record_compression_state_operation(
 /// Record one closed Redis coordination event.
 pub(crate) fn record_redis_compression_coordination(event: RedisCompressionCoordinationEvent) {
     COMPRESSION_REDIS_COORDINATION_TOTAL
+        .with_label_values(&[event.as_str()])
+        .inc();
+}
+
+/// Closed mesh session coordination events, never raw substrate errors.
+/// The vocabulary mirrors [`RedisCompressionCoordinationEvent`] so
+/// dashboards compare the two backends event for event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeshCompressionCoordinationEvent {
+    /// A worker-local lease prevented a bounded update attempt.
+    Contention,
+    /// Worker-local lease ownership was gone at commit time.
+    LeaseExpiry,
+    /// The replicated logical version advanced before or during commit,
+    /// including a deterministic loss to an equal-version writer.
+    StaleVersion,
+    /// A worker-local delete fence rejected the commit.
+    FenceRejection,
+}
+
+impl MeshCompressionCoordinationEvent {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Contention => "contention",
+            Self::LeaseExpiry => "lease_expiry",
+            Self::StaleVersion => "stale_version",
+            Self::FenceRejection => "fence_rejection",
+        }
+    }
+}
+
+/// Record one closed mesh session coordination event.
+pub(crate) fn record_mesh_compression_coordination(event: MeshCompressionCoordinationEvent) {
+    MESH_COMPRESSION_COORDINATION_TOTAL
         .with_label_values(&[event.as_str()])
         .inc();
 }

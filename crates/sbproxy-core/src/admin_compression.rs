@@ -145,6 +145,21 @@ impl CompressionAdminRegistry {
                 });
             }
         }
+        // Mirror of the Redis fallback: replicated session state written
+        // under an earlier configuration stays manageable after every
+        // mesh-backed pipeline is removed, as long as the replicated
+        // substrate itself is still running.
+        if !stores
+            .iter()
+            .any(|entry| entry.backend == CompressionBackend::Mesh)
+        {
+            if let Some(store) = crate::compression_runtime::mesh_admin_store() {
+                stores.push(AdminStore {
+                    backend: CompressionBackend::Mesh,
+                    store,
+                });
+            }
+        }
         Self::finish(stores, origins)
     }
 
@@ -766,6 +781,7 @@ fn parse_limit(value: Option<&String>) -> Result<u16, AdminCompressionResponse> 
 fn parse_backend(value: &str) -> Result<CompressionBackend, AdminCompressionResponse> {
     match value {
         "redis" => Ok(CompressionBackend::Redis),
+        "mesh" => Ok(CompressionBackend::Mesh),
         _ => Err(bad_request("invalid backend")),
     }
 }
@@ -1176,6 +1192,8 @@ mod tests {
             100
         );
 
+        // The mesh backend is a valid filter; without a configured mesh
+        // store the page is honestly empty rather than an error.
         let mesh_filter = dispatch_with_registry(
             "GET",
             "/admin/compression/sessions?backend=mesh",
@@ -1187,7 +1205,22 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(mesh_filter.status, 400);
+        assert_eq!(mesh_filter.status, 200);
+        assert!(mesh_filter.body.contains("\"records\":[]"));
+
+        // The backend vocabulary stays closed.
+        let unknown_backend = dispatch_with_registry(
+            "GET",
+            "/admin/compression/sessions?backend=tape",
+            None,
+            Some(&readonly),
+            None,
+            &registry,
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unknown_backend.status, 400);
 
         let expired_filter = dispatch_with_registry(
             "GET",

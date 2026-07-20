@@ -101,6 +101,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "mesh_compression_coordination_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mesh_compression_coordination"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["event"],
+        description: "Mesh compression session coordination contention and rejected updates, by closed event (contention, lease_expiry, stale_version, fence_rejection).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "mesh_crypto_decrypt_failed_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("MESH_CRYPTO_DECRYPT_FAILED"),

@@ -1,12 +1,9 @@
 //! External state adapters for AI compression sessions.
 
-/// Experimental mesh adapter retained for hardening work; not public-config selectable.
+/// Replicated mesh adapter over the cluster replication substrate.
 pub mod mesh;
 /// Strict lease-serialized Redis adapter.
 pub mod redis;
 
-pub use mesh::{
-    MeshCompressionEvent, MeshCompressionEventSink, MeshCompressionStore,
-    MeshCompressionStoreConfig,
-};
+pub use mesh::{MeshCompressionStore, MeshCompressionStoreConfig};
 pub use redis::{RedisCompressionStore, RedisCompressionStoreConfig};
