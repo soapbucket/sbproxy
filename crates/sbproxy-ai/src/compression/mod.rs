@@ -1,5 +1,7 @@
 //! Ordered AI context-compression policies and execution.
 
+/// Deterministic compact serialization of marked JSON chunks.
+pub mod compact_serialization;
 /// Typed compression policy configuration.
 pub mod config;
 /// Opaque domain-separated session record identity.
@@ -22,6 +24,7 @@ mod summary_policy;
 /// Compatibility adapter for deterministic model-window fitting.
 pub mod window_fit;
 
+pub use compact_serialization::CompactSerializationLever;
 pub use config::{
     CompactSerializationConfig, CompressionBackend, CompressionLeverConfig, CompressionPolicy,
     CompressionProfile, CompressionSelector, CompressionStateBackend, CompressionStateConfig,
@@ -29,6 +32,7 @@ pub use config::{
     SummaryBufferConfig, TabularSerializationConfig, WindowFitConfig,
 };
 pub use identity::CompressionRecordId;
+pub use marked_context::table::{decode_sbproxy_table_v1, TableDecodeError};
 pub use marked_context::{
     inspect_marked_context, MarkedContextError, MarkedContextSnapshot, RetrievalBlockSnapshot,
     RetrievalChunkSnapshot,
