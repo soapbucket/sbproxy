@@ -134,24 +134,33 @@ fn status_retry_skip_reason(session: &mut Session) -> Option<&'static str> {
     None
 }
 
+/// Decide whether the upstream response status triggers a retry.
+///
+/// `Some(retryable error)` means the status matched the action's
+/// `retry.retry_on`, attempts remain under `max_attempts`, and the
+/// request can be replayed from Pingora's retry buffer; the caller
+/// (`upstream_response_decision`) returns it so Pingora discards the
+/// response before any bytes reach the downstream, drops the upstream
+/// connection, and re-runs `upstream_peer`. `None` lets the response
+/// flow through untouched; a skipped-but-matching status stamps
+/// `ctx.status_retry_skip_reason` so `response_filter` can surface
+/// `x-sbproxy-retry-skip-reason` on the passed-through response.
 async fn maybe_retry_upstream_status(
     session: &mut Session,
     upstream_response: &ResponseHeader,
     ctx: &mut RequestContext,
-) -> Result<()> {
+) -> Option<Box<Error>> {
     let status = upstream_response.status.as_u16();
     let pipeline = ctx.pipeline.clone();
-    let Some(action) = active_action(&pipeline, ctx) else {
-        return Ok(());
-    };
-    let Some(cfg) = retry_config_for_action(action) else {
-        return Ok(());
-    };
+    let action = active_action(&pipeline, ctx)?;
+    let cfg = retry_config_for_action(action)?;
     if !cfg.enabled() || !cfg.allows_status(status) {
-        return Ok(());
+        return None;
     }
 
-    if ctx.retry_count + 1 >= cfg.max_attempts {
+    // Status and connect-error retries share `ctx.retry_count`, so a
+    // mixed failure sequence stays under one `max_attempts` cap.
+    if !cfg.attempts_remaining(ctx.retry_count) {
         ctx.status_retry_skip_reason = Some("max_attempts_exhausted");
         debug!(
             hostname = %ctx.hostname,
@@ -159,7 +168,7 @@ async fn maybe_retry_upstream_status(
             attempts = %cfg.max_attempts,
             "upstream status matched retry_on but max attempts were exhausted"
         );
-        return Ok(());
+        return None;
     }
 
     if let Some(reason) = status_retry_skip_reason(session) {
@@ -170,7 +179,7 @@ async fn maybe_retry_upstream_status(
             reason = %reason,
             "upstream status matched retry_on but request is not replayable"
         );
-        return Ok(());
+        return None;
     }
 
     let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
@@ -183,6 +192,7 @@ async fn maybe_retry_upstream_status(
     ctx.status_retry_skip_reason = None;
     ctx.retry_count += 1;
     ctx.retry_backoff_ms = Some(backoff_ms);
+    sbproxy_observe::metrics::record_upstream_status_retry(ctx.hostname.as_str(), status);
     debug!(
         hostname = %ctx.hostname,
         upstream_status = %status,
@@ -197,7 +207,7 @@ async fn maybe_retry_upstream_status(
         "upstream status matched retry_on",
     );
     error.set_retry(true);
-    Err(error)
+    Some(error)
 }
 
 #[async_trait]
@@ -1208,17 +1218,22 @@ impl ProxyHttp for SbProxy {
         Ok(())
     }
 
-    /// Inspect upstream response headers before cache/downstream handling.
+    /// Decide whether to discard the upstream response and retry.
     ///
-    /// Status-code retries are decided here so a retryable upstream
-    /// response can be discarded before headers are written to the
-    /// downstream client.
-    async fn upstream_response_filter(
+    /// Runs once per upstream response, right after
+    /// `upstream_response_filter` and before any bytes reach the
+    /// downstream client. Status-code retries are decided here:
+    /// returning an error with `set_retry(true)` makes Pingora drop
+    /// the upstream connection and re-run `upstream_peer`, exactly
+    /// like a connect-time retry. Request-body replay is gated by
+    /// Pingora's retry buffer; a matching status the proxy cannot
+    /// safely replay passes through with `x-sbproxy-retry-skip-reason`.
+    async fn upstream_response_decision(
         &self,
         session: &mut Session,
-        upstream_response: &mut ResponseHeader,
+        upstream_response: &ResponseHeader,
         ctx: &mut Self::CTX,
-    ) -> Result<()>
+    ) -> Option<Box<Error>>
     where
         Self::CTX: Send + Sync,
     {
@@ -3759,12 +3774,10 @@ impl ProxyHttp for SbProxy {
         let Some(cfg) = retry_cfg else {
             return e;
         };
-        if !cfg.enabled() || !cfg.allows("connect_error") {
-            return e;
-        }
-        // ctx.retry_count == 0 on first attempt; max_attempts == 3
-        // means we allow attempts 0, 1, 2.
-        if ctx.retry_count + 1 >= cfg.max_attempts {
+        // `retry_count` is shared with status-code retries
+        // (`maybe_retry_upstream_status`), so `max_attempts` caps the
+        // combined total, never each source separately.
+        if !cfg.allows("connect_error") || !cfg.attempts_remaining(ctx.retry_count) {
             return e;
         }
         let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);

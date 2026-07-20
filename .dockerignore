@@ -3,6 +3,7 @@
 # build`, not regular cargo workflows.
 target/
 **/target/
+.worktrees/
 .git/
 .github/
 *.log

@@ -2534,6 +2534,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_upstream_status_retries_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_upstream_status_retry"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["origin", "status"],
+        description: "Upstream retries triggered by a configured response status, by origin and matched status.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_vault_resolution_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_vault_resolution"),
@@ -2751,7 +2762,7 @@ pub fn tenant_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-07-19*\n\n\
+         *Last modified: 2026-07-20*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\
