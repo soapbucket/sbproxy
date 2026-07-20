@@ -19,7 +19,10 @@ use serde::{Deserialize, Serialize};
 /// Desired state for a single sbproxy deployment.
 ///
 /// The operator owns a Deployment + Service + ConfigMap triple per `SBProxy`.
-/// Spec changes drive reconciliation; status is reserved for future use.
+/// When `spec.clustering.enabled` is true the Deployment is replaced by a
+/// StatefulSet plus a headless Service and a shared-key Secret, so replicas
+/// form a gossip mesh with stable per-pod DNS identities. Spec changes drive
+/// reconciliation; status is reserved for future use.
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[kube(
     group = "sbproxy.dev",
@@ -73,6 +76,58 @@ pub struct SBProxySpec {
     /// network.
     #[serde(default = "default_admin_port")]
     pub admin_port: i32,
+
+    /// Optional mesh clustering for multi-replica deployments.
+    ///
+    /// When present and `enabled: true`, the operator reconciles a
+    /// StatefulSet (stable per-pod identity) plus a headless Service
+    /// for gossip instead of a Deployment, generates a shared cluster
+    /// key Secret when none is referenced, and injects a rendered
+    /// `proxy.cluster` block into the mounted `sb.yml` so the replicas
+    /// form a mesh without hand-written peer configuration. Absent or
+    /// `enabled: false` keeps the plain-Deployment path unchanged.
+    #[serde(default)]
+    pub clustering: Option<ClusteringSpec>,
+}
+
+/// Mesh clustering knobs for an `SBProxy`.
+///
+/// The operator renders the full `proxy.cluster` block itself; these
+/// fields only override the ports and naming inputs of that rendering.
+/// Any user-supplied `proxy.cluster` block inside the referenced
+/// `SBProxyConfig` is replaced by the rendered one while clustering is
+/// enabled, so the mesh topology always matches the StatefulSet.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusteringSpec {
+    /// Turn mesh clustering on. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// UDP gossip listener port carried into `proxy.cluster.gossip_port`
+    /// and exposed on the headless Service. Defaults to 7946.
+    #[serde(default = "default_gossip_port")]
+    pub gossip_port: i32,
+
+    /// TCP typed-state transport port carried into
+    /// `proxy.cluster.transport_port` and exposed on the headless
+    /// Service. Defaults to 8946.
+    #[serde(default = "default_transport_port")]
+    pub transport_port: i32,
+
+    /// Optional name of an existing Secret in the same namespace whose
+    /// `cluster-key` entry holds the shared cluster key. When unset the
+    /// operator generates a `<sbproxy-name>-cluster-key` Secret once and
+    /// reuses it for the lifetime of the SBProxy, so rescheduled pods
+    /// always rejoin with the same key.
+    #[serde(default)]
+    pub cluster_secret_ref: Option<String>,
+
+    /// Cluster DNS domain used when rendering the stable per-pod seed
+    /// addresses (`<pod>.<headless-svc>.<ns>.svc.<domain>`). Defaults to
+    /// `cluster.local`; override only on clusters with a custom domain.
+    #[serde(default = "default_cluster_domain")]
+    pub cluster_domain: String,
 }
 
 /// Reference to a Kubernetes Secret holding admin credentials.
@@ -173,6 +228,18 @@ fn default_admin_auth_key() -> String {
     "authorization".to_string()
 }
 
+fn default_gossip_port() -> i32 {
+    7946
+}
+
+fn default_transport_port() -> i32 {
+    8946
+}
+
+fn default_cluster_domain() -> String {
+    "cluster.local".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +277,40 @@ configRef: my-config
         assert_eq!(spec.port, 8080);
         assert_eq!(spec.image, "ghcr.io/soapbucket/sbproxy:latest");
         assert_eq!(spec.config_ref, "my-config");
+        assert!(
+            spec.clustering.is_none(),
+            "clustering must default to absent so existing manifests are unchanged"
+        );
+    }
+
+    #[test]
+    fn clustering_spec_defaults_fill_in() {
+        let yaml = r#"
+image: ghcr.io/soapbucket/sbproxy:latest
+configRef: my-config
+replicas: 3
+clustering:
+  enabled: true
+"#;
+        let spec: SBProxySpec = serde_yaml::from_str(yaml).expect("parse spec");
+        let clustering = spec.clustering.expect("clustering parsed");
+        assert!(clustering.enabled);
+        assert_eq!(clustering.gossip_port, 7946);
+        assert_eq!(clustering.transport_port, 8946);
+        assert_eq!(clustering.cluster_secret_ref, None);
+        assert_eq!(clustering.cluster_domain, "cluster.local");
+    }
+
+    #[test]
+    fn clustering_spec_enabled_defaults_to_false() {
+        // A present-but-empty clustering block must not flip the
+        // workload to a StatefulSet.
+        let yaml = r#"
+image: ghcr.io/soapbucket/sbproxy:latest
+configRef: my-config
+clustering: {}
+"#;
+        let spec: SBProxySpec = serde_yaml::from_str(yaml).expect("parse spec");
+        assert!(!spec.clustering.expect("clustering parsed").enabled);
     }
 }

@@ -23,6 +23,12 @@
 //! Idempotent. Each reconcile renders a desired Deployment / Service / ConfigMap
 //! triple and applies it server-side. Config changes trigger a rollout-restart
 //! by stamping `sbproxy.dev/config-hash` on the Deployment's pod template.
+//!
+//! When `SBProxy.spec.clustering.enabled` is true the Deployment is replaced by
+//! a StatefulSet plus a headless Service and a shared-key Secret, and the
+//! mounted `sb.yml` gains an operator-rendered `proxy.cluster` block so the
+//! replicas form a gossip mesh with stable per-pod DNS identities. Flipping
+//! clustering on or off garbage-collects the other workload kind.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

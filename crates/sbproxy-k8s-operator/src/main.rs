@@ -2,7 +2,9 @@
 //!
 //! Watches `SBProxy` and `SBProxyConfig` resources and reconciles them into
 //! Deployment / Service / ConfigMap triples in the configured namespace (or
-//! cluster-wide when `--all-namespaces` is set).
+//! cluster-wide when `--all-namespaces` is set). When an `SBProxy` enables
+//! `spec.clustering`, the Deployment is swapped for a StatefulSet plus a
+//! headless Service and a shared-key Secret so the replicas form a mesh.
 //!
 //! See `docs/kubernetes.md` for end-user instructions.
 
@@ -15,9 +17,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
-use kube::api::{Api, ListParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::runtime::watcher::Config as WatcherConfig;
 use kube::runtime::Controller;
@@ -350,6 +352,10 @@ async fn run_controller(client: Client, cli: &Cli) -> Result<()> {
         Some(ns) => Api::namespaced(client.clone(), ns),
         None => Api::all(client.clone()),
     };
+    let statefulsets: Api<StatefulSet> = match &cli.namespace {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
     let services: Api<Service> = match &cli.namespace {
         Some(ns) => Api::namespaced(client.clone(), ns),
         None => Api::all(client.clone()),
@@ -366,6 +372,7 @@ async fn run_controller(client: Client, cli: &Cli) -> Result<()> {
 
     Controller::new(sbproxy_api, WatcherConfig::default())
         .owns(deployments, WatcherConfig::default())
+        .owns(statefulsets, WatcherConfig::default())
         .owns(services, WatcherConfig::default())
         .owns(configmaps, WatcherConfig::default())
         // Re-reconcile every SBProxy when any SBProxyConfig changes. Cheap to
@@ -393,12 +400,18 @@ async fn run_controller(client: Client, cli: &Cli) -> Result<()> {
 ///
 /// Steps:
 /// 1. Resolve the referenced `SBProxyConfig` in the same namespace.
-/// 2. Compute the `sb.yml` content hash.
+/// 2. Render the pod-facing `sb.yml` (verbatim, or with the injected
+///    `proxy.cluster` block when clustering is enabled) and compute its
+///    content hash.
 /// 3. Server-side-apply the desired ConfigMap and Service.
-/// 4. Decide between **hot-reload** and **rollout-restart**:
+/// 4. Reconcile the workload: a Deployment by default, or a StatefulSet
+///    plus headless Service plus shared-key Secret when
+///    `spec.clustering.enabled` is true. Flipping clustering deletes the
+///    other workload kind before applying the new one.
+/// 5. Decide between **hot-reload** and **rollout-restart**:
 ///    - Hot-reload (`POST /admin/reload`) when only `spec.config`
 ///      changed and `spec.adminAuthSecretRef` is set.
-///    - Rollout-restart (apply Deployment with bumped config-hash
+///    - Rollout-restart (apply the workload with a bumped config-hash
 ///      annotation) otherwise, or when hot-reload fails.
 ///
 /// Hot-reload preserves pod identity and connection state. The
@@ -449,8 +462,6 @@ async fn reconcile_one_inner(
             source: e,
         })?;
 
-    let hash = reconcile::config_hash(&cfg.spec.config);
-
     // --- Preview-validate the referenced config ---
     // A malformed config must not roll out to every replica. Validate it here;
     // on failure record the error in status and requeue without touching the
@@ -472,6 +483,39 @@ async fn reconcile_one_inner(
         .await;
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
+
+    // --- Render the pod-facing sb.yml body ---
+    // Non-clustered: the user document verbatim. Clustered: the user
+    // document with the operator-owned `proxy.cluster` block injected.
+    // The rollout hash covers the rendered body, so topology changes
+    // (replica count changing the seed list, port changes) roll pods
+    // even when the user document is untouched.
+    let clustered = reconcile::clustering_enabled(&sbproxy);
+    let body = if clustered {
+        match reconcile::render_clustered_config(&sbproxy, &cfg.spec.config) {
+            Ok(rendered) => rendered,
+            Err(msg) => {
+                tracing::warn!(
+                    name = %name,
+                    namespace = %ns,
+                    error = %msg,
+                    "failed to render clustered config; not rolling out"
+                );
+                patch_status(
+                    &ctx.client,
+                    &ns,
+                    &name,
+                    serde_json::json!({ "status": { "lastError": msg } }),
+                )
+                .await;
+                return Ok(Action::requeue(Duration::from_secs(60)));
+            }
+        }
+    } else {
+        cfg.spec.config.clone()
+    };
+    let hash = reconcile::config_hash(&body);
+
     // Config is valid: record the hash being rolled out and clear any prior
     // error so a fixed config no longer shows the stale failure.
     patch_status(
@@ -482,13 +526,10 @@ async fn reconcile_one_inner(
     )
     .await;
 
-    // --- Render desired state ---
-    let desired_cm = reconcile::desired_configmap(&sbproxy, &cfg);
-    let desired_svc = reconcile::desired_service(&sbproxy);
-    let desired_deploy = reconcile::desired_deployment(&sbproxy, &hash);
-
     // --- Apply ConfigMap + Service unconditionally ---
     let pp = PatchParams::apply(FIELD_MANAGER).force();
+    let desired_cm = reconcile::desired_configmap_with_body(&sbproxy, &body);
+    let desired_svc = reconcile::desired_service(&sbproxy);
 
     let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ns);
     cm_api
@@ -518,8 +559,60 @@ async fn reconcile_one_inner(
         .await
         .map_err(ReconcileError::Apply)?;
 
+    if clustered {
+        reconcile_clustered_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp).await
+    } else {
+        reconcile_deployment_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp).await
+    }
+}
+
+/// Non-clustered workload path: the original Deployment flow, plus
+/// garbage collection of clustered children left behind when a user
+/// flips `spec.clustering.enabled` off. The StatefulSet is deleted
+/// before the Deployment is applied so the two workloads never run
+/// pods side by side under the same labels.
+async fn reconcile_deployment_workload(
+    ctx: &Ctx,
+    sbproxy: &SBProxy,
+    ns: &str,
+    name: &str,
+    hash: &str,
+    pp: &PatchParams,
+) -> Result<Action, ReconcileError> {
+    // --- GC clustered children on the clustering-off transition ---
+    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
+    let sts_name = reconcile::statefulset_name(sbproxy);
+    if sts_api.get_opt(&sts_name).await.unwrap_or(None).is_some() {
+        tracing::info!(
+            name = %name,
+            namespace = %ns,
+            statefulset = %sts_name,
+            "clustering disabled; deleting StatefulSet before applying Deployment"
+        );
+        delete_ignoring_missing(sts_api.delete(&sts_name, &DeleteParams::default()).await)?;
+    }
+    let headless_api: Api<Service> = Api::namespaced(ctx.client.clone(), ns);
+    let headless_name = reconcile::headless_service_name(sbproxy);
+    if headless_api
+        .get_opt(&headless_name)
+        .await
+        .unwrap_or(None)
+        .is_some()
+    {
+        delete_ignoring_missing(
+            headless_api
+                .delete(&headless_name, &DeleteParams::default())
+                .await,
+        )?;
+    }
+    // The shared-key Secret is deliberately retained: re-enabling
+    // clustering later reuses the same key, and the owner reference
+    // still cascades it on SBProxy deletion.
+
+    let desired_deploy = reconcile::desired_deployment(sbproxy, hash);
+
     // --- Decide hot-reload vs rollout-restart ---
-    let deploy_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
+    let deploy_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), ns);
     let deploy_name = desired_deploy
         .metadata
         .name
@@ -531,11 +624,11 @@ async fn reconcile_one_inner(
         .and_then(reconcile::previous_config_hash);
 
     let hot_reload_eligible = reconcile::should_hot_reload(
-        &sbproxy,
+        sbproxy,
         existing_deploy.as_ref(),
         &desired_deploy,
         prev_hash.as_deref(),
-        &hash,
+        hash,
     );
 
     if hot_reload_eligible {
@@ -543,7 +636,7 @@ async fn reconcile_one_inner(
         // If any pod fails, we fall through to the rollout-restart
         // path so the cluster is never left in a half-reloaded
         // state.
-        match try_hot_reload(&ctx.client, &sbproxy, &ns).await {
+        match try_hot_reload(&ctx.client, sbproxy, ns).await {
             Ok(()) => {
                 tracing::info!(
                     name = %name,
@@ -571,12 +664,156 @@ async fn reconcile_one_inner(
 
     // --- Apply Deployment (rollout-restart on annotation change) ---
     deploy_api
-        .patch(deploy_name, &pp, &Patch::Apply(&desired_deploy))
+        .patch(deploy_name, pp, &Patch::Apply(&desired_deploy))
         .await
         .map_err(ReconcileError::Apply)?;
 
     // Requeue periodically as a belt-and-braces against missed watch events.
     Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Clustered workload path: shared-key Secret, headless Service, and
+/// StatefulSet, with garbage collection of the Deployment left behind
+/// when a user flips `spec.clustering.enabled` on. The Deployment is
+/// deleted before the StatefulSet is applied so the two workloads never
+/// run pods side by side under the same labels; the flip is therefore a
+/// full (brief) restart of the fleet, which a mesh-topology change
+/// requires anyway.
+async fn reconcile_clustered_workload(
+    ctx: &Ctx,
+    sbproxy: &SBProxy,
+    ns: &str,
+    name: &str,
+    hash: &str,
+    pp: &PatchParams,
+) -> Result<Action, ReconcileError> {
+    // --- Ensure the shared cluster key exists ---
+    // Create-if-absent, never overwrite: existing key material is what
+    // lets a rescheduled pod rejoin the mesh, so it must survive every
+    // reconcile. A user-referenced Secret is never created or touched.
+    let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), ns);
+    let secret_name = reconcile::cluster_secret_name(sbproxy);
+    let existing_secret = secrets_api
+        .get_opt(&secret_name)
+        .await
+        .map_err(ReconcileError::ClusterSecret)?;
+    if reconcile::needs_generated_cluster_secret(sbproxy, existing_secret.as_ref()) {
+        let secret = reconcile::desired_cluster_secret(sbproxy, &reconcile::generate_cluster_key());
+        match secrets_api.create(&PostParams::default(), &secret).await {
+            Ok(_) => {
+                tracing::info!(
+                    name = %name,
+                    namespace = %ns,
+                    secret = %secret_name,
+                    "generated shared cluster key Secret"
+                );
+            }
+            // Lost a create race with a concurrent reconcile: the
+            // winner's key is the cluster key; use it as-is.
+            Err(kube::Error::Api(e)) if e.code == 409 => {}
+            Err(e) => return Err(ReconcileError::ClusterSecret(e)),
+        }
+    }
+
+    // --- Apply the headless Service for stable per-pod DNS ---
+    let headless = reconcile::desired_headless_service(sbproxy);
+    let headless_api: Api<Service> = Api::namespaced(ctx.client.clone(), ns);
+    headless_api
+        .patch(
+            headless
+                .metadata
+                .name
+                .as_deref()
+                .ok_or(ReconcileError::MissingName)?,
+            pp,
+            &Patch::Apply(&headless),
+        )
+        .await
+        .map_err(ReconcileError::Apply)?;
+
+    // --- GC the Deployment on the clustering-on transition ---
+    let deploy_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), ns);
+    let deploy_name = reconcile::deployment_name(sbproxy);
+    if deploy_api
+        .get_opt(&deploy_name)
+        .await
+        .unwrap_or(None)
+        .is_some()
+    {
+        tracing::info!(
+            name = %name,
+            namespace = %ns,
+            deployment = %deploy_name,
+            "clustering enabled; deleting Deployment before applying StatefulSet"
+        );
+        delete_ignoring_missing(
+            deploy_api
+                .delete(&deploy_name, &DeleteParams::default())
+                .await,
+        )?;
+    }
+
+    // --- Decide hot-reload vs rollout-restart, then apply ---
+    let desired_sts = reconcile::desired_statefulset(sbproxy, hash);
+    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
+    let sts_name = desired_sts
+        .metadata
+        .name
+        .as_deref()
+        .ok_or(ReconcileError::MissingName)?;
+    let existing_sts = sts_api.get_opt(sts_name).await.unwrap_or(None);
+    let prev_hash = existing_sts
+        .as_ref()
+        .and_then(reconcile::previous_config_hash_statefulset);
+
+    let hot_reload_eligible = reconcile::should_hot_reload_statefulset(
+        sbproxy,
+        existing_sts.as_ref(),
+        &desired_sts,
+        prev_hash.as_deref(),
+        hash,
+    );
+
+    if hot_reload_eligible {
+        match try_hot_reload(&ctx.client, sbproxy, ns).await {
+            Ok(()) => {
+                tracing::info!(
+                    name = %name,
+                    namespace = %ns,
+                    config_revision = %hash,
+                    "hot-reloaded all clustered proxy pods via /admin/reload"
+                );
+                return Ok(Action::requeue(Duration::from_secs(300)));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    name = %name,
+                    namespace = %ns,
+                    "hot-reload failed; falling back to rollout-restart"
+                );
+            }
+        }
+    }
+
+    sts_api
+        .patch(sts_name, pp, &Patch::Apply(&desired_sts))
+        .await
+        .map_err(ReconcileError::Apply)?;
+
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Collapse a delete result so a concurrent deletion (404) is not an
+/// error: the object being gone is exactly the desired outcome. Generic
+/// over the success payload (`Either<K, Status>`) so no direct
+/// dependency on the `either` crate is needed.
+fn delete_ignoring_missing<T>(result: Result<T, kube::Error>) -> Result<(), ReconcileError> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(ReconcileError::Cleanup(e)),
+    }
 }
 
 /// Patch the `SBProxy` `status` subresource with a JSON merge patch.
@@ -717,6 +954,15 @@ enum ReconcileError {
     /// Server-side-apply patch failed.
     #[error("failed to apply child object: {0}")]
     Apply(#[source] kube::Error),
+
+    /// Reading or creating the shared cluster key Secret failed.
+    #[error("failed to ensure cluster key Secret: {0}")]
+    ClusterSecret(#[source] kube::Error),
+
+    /// Deleting a stale child object (Deployment or StatefulSet left
+    /// behind by a clustering on/off flip) failed.
+    #[error("failed to delete stale child object: {0}")]
+    Cleanup(#[source] kube::Error),
 }
 
 /// Errors specific to the hot-reload code path. These are

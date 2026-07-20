@@ -10,13 +10,21 @@ cluster-wide ClusterRole so the two paths can never drift (WOR-610).
 - apiGroups: ["sbproxy.dev"]
   resources: ["sbproxies/status"]
   verbs: ["get", "update", "patch"]
-# Manage the Deployment / Service / ConfigMap children we own.
+# Manage the Deployment / Service / ConfigMap children we own, plus the
+# StatefulSet used when SBProxy.spec.clustering is enabled.
 - apiGroups: ["apps"]
-  resources: ["deployments"]
+  resources: ["deployments", "statefulsets"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
   resources: ["services", "configmaps"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Secrets: read the admin auth Secret for hot-reload, and create the
+# generated shared cluster key Secret for clustered SBProxies. The
+# operator never lists or watches Secrets, and deletion cascades via
+# owner references, so neither verb is granted.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create"]
 # Emit events so kubectl describe surfaces reconcile diagnostics.
 - apiGroups: [""]
   resources: ["events"]
