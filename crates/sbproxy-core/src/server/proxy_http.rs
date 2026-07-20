@@ -210,6 +210,57 @@ async fn maybe_retry_upstream_status(
     Some(error)
 }
 
+/// Metric phase label for a timeout-classed Pingora error, or `None`
+/// when the error type is not honestly a timeout. `connect` covers
+/// deadlines hit while establishing the upstream connection (TCP
+/// connect, TLS handshake); `upstream` covers read and write
+/// deadlines on the established connection. This is the closed label
+/// set for `sbproxy_upstream_timeout_retries_total{phase}`.
+fn timeout_error_phase(etype: &ErrorType) -> Option<&'static str> {
+    match etype {
+        ErrorType::ConnectTimedout | ErrorType::TLSHandshakeTimedout => Some("connect"),
+        ErrorType::ReadTimedout | ErrorType::WriteTimedout => Some("upstream"),
+        _ => None,
+    }
+}
+
+/// Decide whether an error surfaced by `error_while_proxy` schedules
+/// a timeout retry.
+///
+/// Mirrors `maybe_retry_upstream_status` for the mid-proxy leg:
+/// `Some(phase)` means the error is a timeout class on the upstream
+/// side, the action's `retry.retry_on` lists `timeout`, attempts
+/// remain under the shared `max_attempts` cap, no response bytes have
+/// been written downstream, and the request is replayable; the caller
+/// then increments `ctx.retry_count` and marks the error retryable.
+/// `None` leaves the error exactly as Pingora produced it.
+///
+/// Both safety gates live here because Pingora's proxy loop retries
+/// blindly on `e.retry()`: `response_started` guards bytes that can
+/// never be recalled from the client, and `replay_skip` (from
+/// `status_retry_skip_reason`) guards requests whose method or body
+/// must not be replayed after they already reached the upstream.
+fn maybe_retry_upstream_timeout(
+    cfg: &sbproxy_modules::action::RetryConfig,
+    etype: &ErrorType,
+    esource: &pingora_error::ErrorSource,
+    retries_used: u32,
+    response_started: bool,
+    replay_skip: Option<&'static str>,
+) -> Option<&'static str> {
+    let phase = timeout_error_phase(etype)?;
+    if *esource != pingora_error::ErrorSource::Upstream {
+        return None;
+    }
+    if !cfg.allows("timeout") || !cfg.attempts_remaining(retries_used) {
+        return None;
+    }
+    if response_started || replay_skip.is_some() {
+        return None;
+    }
+    Some(phase)
+}
+
 #[async_trait]
 impl ProxyHttp for SbProxy {
     type CTX = RequestContext;
@@ -3745,11 +3796,11 @@ impl ProxyHttp for SbProxy {
 
     /// Pingora calls this when establishing the upstream TCP/TLS
     /// connection fails. If the action has a `retry` policy that
-    /// allows `connect_error` and we are still under `max_attempts`,
-    /// mark the error retryable so Pingora calls `upstream_peer`
-    /// again. For load_balancer actions, the failed target is
-    /// reported to the outlier detector so the next selection skips
-    /// it.
+    /// allows `connect_error` (or `timeout`, for the timeout-classed
+    /// connect failures) and we are still under `max_attempts`, mark
+    /// the error retryable so Pingora calls `upstream_peer` again.
+    /// For load_balancer actions, the failed target is reported to
+    /// the outlier detector so the next selection skips it.
     fn fail_to_connect(
         &self,
         _session: &mut Session,
@@ -3774,10 +3825,17 @@ impl ProxyHttp for SbProxy {
         let Some(cfg) = retry_cfg else {
             return e;
         };
-        // `retry_count` is shared with status-code retries
-        // (`maybe_retry_upstream_status`), so `max_attempts` caps the
-        // combined total, never each source separately.
-        if !cfg.allows("connect_error") || !cfg.attempts_remaining(ctx.retry_count) {
+        // A connect-phase timeout (TCP connect or TLS handshake
+        // deadline) is both a connect error and a timeout, so either
+        // `retry_on` token enables the retry.
+        let timeout_phase = timeout_error_phase(e.etype());
+        let allowed =
+            cfg.allows("connect_error") || (timeout_phase.is_some() && cfg.allows("timeout"));
+        // `retry_count` is shared with status-code and mid-proxy
+        // timeout retries (`maybe_retry_upstream_status`,
+        // `error_while_proxy`), so `max_attempts` caps the combined
+        // total, never each source separately.
+        if !allowed || !cfg.attempts_remaining(ctx.retry_count) {
             return e;
         }
         let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
@@ -3791,11 +3849,94 @@ impl ProxyHttp for SbProxy {
         }
         ctx.retry_count += 1;
         ctx.retry_backoff_ms = Some(backoff_ms);
+        // The timeout metric keys on the error class, not on which
+        // `retry_on` token enabled the retry: a ConnectTimedout
+        // retried under `connect_error` is still a timeout retry.
+        if let Some(phase) = timeout_phase {
+            sbproxy_observe::metrics::record_upstream_timeout_retry(ctx.hostname.as_str(), phase);
+        }
         debug!(
             attempt = %ctx.retry_count,
             max = %cfg.max_attempts,
             backoff_ms = %backoff_ms,
             "upstream connect error, retrying"
+        );
+        e.set_retry(true);
+        e
+    }
+
+    /// Pingora calls this when the request fails after the upstream
+    /// connection was established (or reused). Two retry sources meet
+    /// here, in order:
+    ///
+    /// 1. Pingora's reused-connection retry: an error marked
+    ///    `ReusedOnly` (a stale pooled connection dying on first use)
+    ///    becomes retryable when the connection was reused and the
+    ///    retry buffer was not truncated. That default is preserved
+    ///    verbatim and does not consume the configured attempt cap.
+    /// 2. The action's `retry.retry_on: [timeout]` policy: a read or
+    ///    write deadline on the upstream leg schedules a retry under
+    ///    the same shared `max_attempts` counter as connect-error and
+    ///    status-code retries. The proxy loop retries blindly on
+    ///    `e.retry()`, so this callback must hold the two safety
+    ///    gates itself: no response bytes written downstream, and a
+    ///    request that is safe to replay (idempotent method, fully
+    ///    buffered body).
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        session: &mut Session,
+        e: Box<Error>,
+        ctx: &mut Self::CTX,
+        client_reused: bool,
+    ) -> Box<Error> {
+        // Default fork behavior: peer context plus the
+        // reused-connection retry decision.
+        let mut e = e.more_context(format!("Peer: {peer}"));
+        e.retry
+            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+        if e.retry() {
+            return e;
+        }
+
+        let pipeline = ctx.pipeline.clone();
+        let Some(action) = active_action(&pipeline, ctx) else {
+            return e;
+        };
+        let Some(cfg) = retry_config_for_action(action) else {
+            return e;
+        };
+        let response_started = session.as_ref().response_written().is_some();
+        let replay_skip = status_retry_skip_reason(session);
+        let Some(phase) = maybe_retry_upstream_timeout(
+            cfg,
+            e.etype(),
+            e.esource(),
+            ctx.retry_count,
+            response_started,
+            replay_skip,
+        ) else {
+            return e;
+        };
+
+        let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
+        // A timed-out target is a failure for both the outlier
+        // detector and the per-target breaker, exactly like the
+        // connect-error and status-retry paths.
+        if let (Action::LoadBalancer(lb), Some(idx)) = (action, ctx.lb_target_idx) {
+            lb.record_target_failure(idx);
+            lb.record_breaker_failure(idx);
+            ctx.lb_target_idx = None;
+        }
+        ctx.retry_count += 1;
+        ctx.retry_backoff_ms = Some(backoff_ms);
+        sbproxy_observe::metrics::record_upstream_timeout_retry(ctx.hostname.as_str(), phase);
+        debug!(
+            attempt = %ctx.retry_count,
+            max = %cfg.max_attempts,
+            backoff_ms = %backoff_ms,
+            phase = %phase,
+            "upstream timeout, retrying"
         );
         e.set_retry(true);
         e
@@ -4357,6 +4498,7 @@ fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pingora_error::ErrorSource;
 
     fn pending_compression_value() -> sbproxy_ai::PendingCompressionValue {
         let run = sbproxy_ai::compression::CompressionRun {
@@ -4377,6 +4519,199 @@ mod tests {
         };
         sbproxy_ai::PendingCompressionValue::from_run("gpt-4o", &run)
             .expect("pending compression value")
+    }
+
+    fn timeout_retry_cfg(
+        retry_on: &[&str],
+        max_attempts: u32,
+    ) -> sbproxy_modules::action::RetryConfig {
+        sbproxy_modules::action::RetryConfig {
+            max_attempts,
+            retry_on: retry_on.iter().map(|s| s.to_string()).collect(),
+            backoff_ms: 0,
+        }
+    }
+
+    #[test]
+    fn timeout_retry_allows_upstream_timeouts_under_the_policy() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                0,
+                false,
+                None,
+            ),
+            Some("upstream")
+        );
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::WriteTimedout,
+                &ErrorSource::Upstream,
+                1,
+                false,
+                None,
+            ),
+            Some("upstream")
+        );
+    }
+
+    #[test]
+    fn timeout_retry_classifies_connect_phase_timeouts() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ConnectTimedout,
+                &ErrorSource::Upstream,
+                0,
+                false,
+                None,
+            ),
+            Some("connect")
+        );
+        assert_eq!(
+            timeout_error_phase(&ErrorType::TLSHandshakeTimedout),
+            Some("connect")
+        );
+    }
+
+    #[test]
+    fn timeout_retry_requires_the_timeout_token() {
+        for retry_on in [&["connect_error"][..], &["502", "503"][..]] {
+            let cfg = timeout_retry_cfg(retry_on, 3);
+            assert_eq!(
+                maybe_retry_upstream_timeout(
+                    &cfg,
+                    &ErrorType::ReadTimedout,
+                    &ErrorSource::Upstream,
+                    0,
+                    false,
+                    None,
+                ),
+                None,
+                "retry_on {retry_on:?} must not enable timeout retries"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_retry_enforces_the_shared_attempt_cap() {
+        // max_attempts: 2 permits exactly one retry: retries_used 0
+        // passes, 1 is the cap. 1 total attempt disables retries.
+        let cfg = timeout_retry_cfg(&["timeout"], 2);
+        assert!(maybe_retry_upstream_timeout(
+            &cfg,
+            &ErrorType::ReadTimedout,
+            &ErrorSource::Upstream,
+            0,
+            false,
+            None,
+        )
+        .is_some());
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                1,
+                false,
+                None,
+            ),
+            None
+        );
+        let disabled = timeout_retry_cfg(&["timeout"], 1);
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &disabled,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                0,
+                false,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn timeout_retry_leaves_non_timeout_errors_untouched() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+        for etype in [
+            ErrorType::ConnectionClosed,
+            ErrorType::ReadError,
+            ErrorType::WriteError,
+            ErrorType::ConnectRefused,
+            ErrorType::HTTPStatus(504),
+        ] {
+            assert_eq!(
+                maybe_retry_upstream_timeout(&cfg, &etype, &ErrorSource::Upstream, 0, false, None),
+                None,
+                "{etype:?} is not a timeout and must never schedule a timeout retry"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_retry_requires_the_upstream_leg() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+        for esource in [
+            ErrorSource::Downstream,
+            ErrorSource::Internal,
+            ErrorSource::Unset,
+        ] {
+            assert_eq!(
+                maybe_retry_upstream_timeout(
+                    &cfg,
+                    &ErrorType::ReadTimedout,
+                    &esource,
+                    0,
+                    false,
+                    None,
+                ),
+                None,
+                "{esource:?} timeouts are not upstream failures"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_retry_blocks_once_the_response_started_downstream() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                0,
+                true,
+                None,
+            ),
+            None,
+            "bytes already written downstream can never be recalled"
+        );
+    }
+
+    #[test]
+    fn timeout_retry_blocks_unreplayable_requests() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                0,
+                false,
+                Some("non_idempotent_method"),
+            ),
+            None,
+            "a request that already reached the upstream must pass the replay gate"
+        );
     }
 
     #[test]

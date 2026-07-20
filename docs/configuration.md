@@ -3516,7 +3516,7 @@ See [example 75](../examples/request-mirror/sb.yml).
 
 ## Upstream retries
 
-When an upstream connection fails (TCP refused, DNS failure, TLS handshake error, or connect timeout), or when an upstream response returns a configured status code, the proxy can retry the request automatically.
+When an upstream connection fails (TCP refused, DNS failure, TLS handshake error, or connect timeout), when an established upstream connection hits a read or write deadline, or when an upstream response returns a configured status code, the proxy can retry the request automatically.
 
 ```yaml
 origins:
@@ -3537,10 +3537,12 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_attempts` | int | `1` | Total request attempts including the original. `0` or `1` disables retries. Values above `16` are rejected at config load: the proxy loop never runs more tries than that. |
-| `retry_on` | array | `[connect_error, timeout]` | Retry conditions. Recognized values are `connect_error`, `timeout`, and numeric upstream status codes in `100..=599` such as `502` or `503`. Status codes may be written as YAML numbers or strings. Any other entry, and an explicitly empty list, is rejected at config load instead of silently never matching. |
+| `retry_on` | array | `[connect_error, timeout]` | Retry conditions. Recognized values are `connect_error` (any failure establishing the upstream connection), `timeout` (a connect-phase deadline, or a read/write deadline on the established connection), and numeric upstream status codes in `100..=599` such as `502` or `503`. Status codes may be written as YAML numbers or strings. Any other entry, and an explicitly empty list, is rejected at config load instead of silently never matching. |
 | `backoff_ms` | int | `100` | Base backoff before the next attempt. Doubles on each retry, capped at 5000ms. |
 
-`retry` is accepted on both `proxy` and `load_balancer` actions. Connect-error and status-code retries share one attempt counter, so a mixed failure sequence is capped at `max_attempts` total attempts. When every attempt is exhausted, the last upstream response (or connect error) is what the client sees, untouched.
+`retry` is accepted on both `proxy` and `load_balancer` actions. Connect-error, timeout, and status-code retries share one attempt counter, so a mixed failure sequence is capped at `max_attempts` total attempts. When every attempt is exhausted, the last upstream response (or transport error) is what the client sees, untouched.
+
+Timeout retries cover two phases. A connect-phase deadline (TCP connect or TLS handshake) retries when `retry_on` lists either `connect_error` or `timeout`: a connect timeout is both a connect error and a timeout, so either token enables it. A read or write deadline hit after the connection was established retries only under the `timeout` token, and only while the response has not started: once any response byte has been written toward the client, nothing can be recalled, so the timeout surfaces as an error instead. Because an established-connection timeout means the request already reached the upstream, these retries also apply the same replay rules as status-code retries below: safe or idempotent methods only, with a request body the retry buffer can replay in full. Connect-phase retries carry no such method gate, because the request was never sent.
 
 Status-code retries are decided after upstream response headers arrive and before any downstream response headers are written. The proxy only replays methods that are safe or idempotent by HTTP semantics: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`. A request with a body is replayed only after the downstream body has fully arrived and Pingora's retry buffer still contains the full body; the buffer is Pingora machinery, not something the proxy re-implements, and a body it cannot replay is never retried. Non-idempotent methods such as `POST` and `PATCH`, still-streaming bodies, and bodies larger than the retry buffer pass through unchanged. When a configured status retry is skipped, the response carries `x-sbproxy-retry-skip-reason` with one of `non_idempotent_method`, `streaming_body`, `body_too_large`, `body_unavailable`, or `max_attempts_exhausted`.
 
@@ -3555,7 +3557,7 @@ For `load_balancer` actions, whether a retry lands on a different target depends
 
 Independently of the algorithm, a failed attempt is reported to the outlier detector and the per-target circuit breaker when those are configured on the action. Once a target crosses the detector's ejection threshold (or its breaker opens), it drops out of the eligible list and every algorithm, including the hash-based ones, re-maps to a surviving target. Without outlier detection or circuit breakers configured, hash-based algorithms retry the same dead target; pair status retries with those features (or active health checks) if that matters for your topology.
 
-Each status-triggered retry increments `sbproxy_upstream_status_retries_total{origin, status}` at decision time. Skipped matches do not count; they surface through `x-sbproxy-retry-skip-reason` instead.
+Each status-triggered retry increments `sbproxy_upstream_status_retries_total{origin, status}` at decision time. Skipped matches do not count; they surface through `x-sbproxy-retry-skip-reason` instead. Each retry of a timed-out attempt increments `sbproxy_upstream_timeout_retries_total{origin, phase}`, where `phase` is `connect` for connection-establishment deadlines and `upstream` for read/write deadlines on the established connection; timeouts that are not retried do not count.
 
 See [example 76](../examples/upstream-retries/sb.yml) for the combined connect + status story, and [retry-on-status](../examples/retry-on-status/sb.yml) for status-code retries across a two-target load balancer.
 

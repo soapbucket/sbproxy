@@ -243,6 +243,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_transport_requests_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `protocol`, `result` | Transport-layer requests, by protocol and outcome. |
 | `sbproxy_unrouted_requests_total` | Counter | `stable` | `beta` | `reason` | Requests rejected before origin resolution, by reason. |
 | `sbproxy_upstream_status_retries_total` | Counter | `stable` | `beta` | `origin`, `status` | Upstream retries triggered by a configured response status, by origin and matched status. |
+| `sbproxy_upstream_timeout_retries_total` | Counter | `stable` | `beta` | `origin`, `phase` | Upstream retries triggered by a timeout-classed failure, by origin and phase (connect or upstream). |
 | `sbproxy_vault_resolution_duration_seconds` | Histogram | `stable` | `beta` | `backend`, `result` | Vault resolution duration, by backend and outcome. |
 | `sbproxy_vault_resolution_total` | Counter | `stable` | `beta` | `backend`, `result` | Vault resolution attempts, by backend and outcome. |
 | `sbproxy_waf_persistent_blocks_total` | Counter | `stable` | `beta` | `origin`, `tenant`, `event`, `key_kind` | WAF persistent (time-boxed) block actions, by lifecycle event and key kind. |

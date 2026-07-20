@@ -2545,6 +2545,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_upstream_timeout_retries_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_upstream_timeout_retry"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["origin", "phase"],
+        description: "Upstream retries triggered by a timeout-classed failure, by origin and phase (connect or upstream).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_vault_resolution_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_vault_resolution"),

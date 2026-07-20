@@ -249,8 +249,11 @@ pub struct RetryConfig {
     )]
     pub max_attempts: u32,
     /// Conditions under which to retry. Recognized values:
-    ///   * `"connect_error"`: TCP connect failure
-    ///   * `"timeout"`: connect or idle timeout
+    ///   * `"connect_error"`: failure establishing the upstream
+    ///     connection (TCP connect, DNS, TLS handshake)
+    ///   * `"timeout"`: a connect-phase deadline (TCP connect or TLS
+    ///     handshake, which `connect_error` also covers) or a read or
+    ///     write deadline on the established upstream connection
     ///
     /// Numeric status codes may be written as YAML numbers
     /// (`retry_on: [502]`) or strings (`retry_on: ["502"]`) and must

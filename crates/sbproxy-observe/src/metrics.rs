@@ -295,6 +295,15 @@ pub struct ProxyMetrics {
     /// statuses that are skipped (method not idempotent, body not
     /// replayable, cap reached) do not count.
     pub upstream_status_retries: IntCounterVec,
+    /// Counter `sbproxy_upstream_timeout_retries_total` of upstream
+    /// retries whose triggering error was a timeout, labelled by
+    /// origin and the phase the deadline was hit in: `connect` (TCP
+    /// connect or TLS handshake) or `upstream` (read or write on the
+    /// established connection). Keyed on the error class, not on
+    /// which `retry_on` token enabled the retry. Incremented once per
+    /// scheduled retry, at decision time; timeouts that are not
+    /// retried do not count.
+    pub upstream_timeout_retries: IntCounterVec,
 
     // --- Cache Reserve metrics ---
     /// Counter `sbproxy_cache_reserve_hits_total` of reserve hits served
@@ -604,6 +613,18 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let upstream_timeout_retries = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_upstream_timeout_retries_total",
+                "Upstream retries triggered by a timeout-classed failure",
+            ),
+            // phase is a closed two-value set: `connect` (TCP/TLS
+            // establishment deadline) or `upstream` (read/write
+            // deadline on the established connection).
+            &["origin", "phase"],
+        )
+        .unwrap();
+
         // --- Cache Reserve counters (W5-A) ---
 
         let cache_reserve_hits = IntCounterVec::new(
@@ -765,6 +786,9 @@ impl ProxyMetrics {
             .register(Box::new(upstream_status_retries.clone()))
             .unwrap();
         registry
+            .register(Box::new(upstream_timeout_retries.clone()))
+            .unwrap();
+        registry
             .register(Box::new(cache_reserve_hits.clone()))
             .unwrap();
         registry
@@ -816,6 +840,7 @@ impl ProxyMetrics {
             cache_results,
             circuit_breaker_transitions,
             upstream_status_retries,
+            upstream_timeout_retries,
             cache_reserve_hits,
             cache_reserve_misses,
             cache_reserve_writes,
@@ -2050,6 +2075,23 @@ pub fn record_upstream_status_retry(origin: &str, status: u16) {
     metrics()
         .upstream_status_retries
         .with_label_values(&[origin.as_str(), status.as_str()])
+        .inc();
+}
+
+/// Increment `sbproxy_upstream_timeout_retries_total{origin, phase}`.
+///
+/// Called once per timeout-triggered upstream retry, at the moment
+/// the retry is scheduled. `phase` is `connect` for TCP connect and
+/// TLS handshake deadlines, `upstream` for read and write deadlines
+/// on the established connection; no other value may be passed.
+/// Timeouts that are not retried (policy does not allow them, cap
+/// reached, response already started, body not replayable) are not
+/// counted.
+pub fn record_upstream_timeout_retry(origin: &str, phase: &str) {
+    let origin = sanitize_label("origin", origin);
+    metrics()
+        .upstream_timeout_retries
+        .with_label_values(&[origin.as_str(), phase])
         .inc();
 }
 
