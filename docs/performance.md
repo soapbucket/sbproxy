@@ -1,5 +1,5 @@
 # Performance
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-19*
 
 What SBproxy delivers on real hardware, with the methodology you'd need to reproduce it.
 
@@ -55,6 +55,63 @@ Be honest with yourself about coverage:
 - **The AI rows predate the current AI-gateway feature set.** The matrix-v7 run measured the AI proxy path before the usage ledger, the CEL policy engine, the guardrail mesh, outcome-aware routing, and predictive budgets landed, and before the model host could serve weights on a local GPU. Each of those adds work per request, so treat the AI rows as a ceiling for a fully configured gateway and re-run the recipe with your config. For AI router strategy comparisons (round-robin vs peak-EWMA vs prefix-affinity and friends), see [ai-lb-benchmark.md](ai-lb-benchmark.md). Requests answered by the [model host](model-host.md) are bound by the engine's token generation rate, like the streaming row, not by the proxy.
 
 If you need numbers for your scenario, run the benchmark recipe yourself. Don't take the table above on faith.
+
+## Clustered: a 3-node mesh, measured
+
+Everything above is single-node. This section is a 3-node gossip-mesh run
+(July 2026), because a proxy that markets clustering owes you multi-node
+numbers. Same zone and instance classes as the single-node matrix:
+c3-standard-8 per proxy node, a c3-standard-8 origin running the echo +
+mock-ai container, and a c3-standard-22 load generator, all in
+`us-central1-a`. The scenario is the AI proxy non-streaming recipe
+(OpenAI-compatible POST against the mocked upstream, 20 connections per
+stream, 30 s warmup, three 60 s replicates, median reported). Nodes were
+meshed with `proxy.cluster` in `shared_key` mode and per-minute governed-key
+limits in the approximate tier. Run these numbers against each other, not
+against the matrix-v7 table: the build and image tuning differ enough that
+cross-table comparisons mislead.
+
+| Measurement | Result |
+|---|---|
+| Single node, standalone (no cluster block) | 43,958 rps, 0.436 ms p50, 0.840 ms p99 |
+| Same node, mesh enabled, 3-node cluster formed | 43,129 rps, 0.445 ms p50, 0.851 ms p99 |
+| All 3 nodes loaded concurrently (aggregate) | 119,178 rps, ~0.45 ms p50, ~1.33 ms p99, zero errors |
+| Governed-key spend visible on a peer node | 15 to 20 s |
+| Node killed mid-run: surviving node's error rate | zero (throughput held) |
+| Killed node restarted: back in the 3-node directory | about 10 s |
+
+What the rows mean:
+
+- **The mesh stays off the request path.** Joining a 3-node cluster cost
+  the measured node 1.9 percent of throughput and about 10 microseconds of
+  p99, which is within run-to-run noise for this recipe. Gossip, membership,
+  and typed-state exchange are out-of-band of request serving.
+- **Aggregate scales like independent nodes, because on this path they
+  are.** Three loaded nodes delivered 2.71x one node. The missing 8 percent
+  per node is consistent with the shared origin and single load generator
+  approaching their own limits, so read 119k as this fleet's floor rather
+  than its ceiling.
+- **Approximate governance converges at the dissemination cadence.** Spend
+  recorded on one node appeared in a peer's admission view in 15 to 20 s
+  (the counter dissemination loop ticks every 15 s). Spend landing in the
+  final seconds of a fixed window can roll over before peers merge it, which
+  is the bounded-overshoot tradeoff
+  [key-management.md](key-management.md) documents for the approximate tier;
+  use the strict tier when a limit must be exact under concurrent traffic.
+- **A dying peer is a local event.** Killing one node mid-run left the
+  surviving nodes' success rate at 100 percent with throughput intact.
+  Clients of the dead node saw immediate connection-refused (fail-fast, no
+  hangs), which is what a fronting load balancer's health check needs to
+  eject it. After restart the node rejoined the mesh and served traffic
+  again in about 10 s.
+
+Reproduce it from the [sbproxy-bench](https://github.com/soapbucket/sbproxy-bench)
+`clustered` topology, or by hand: three nodes with a `proxy.cluster` block
+(`shared_key` security, symmetric seed lists), the A01 scenario config
+pointed at a shared mock origin, and `oha` streams per node. Watch
+`mesh_peer_count`, `mesh_owner_route_total`, and
+`GET /admin/cluster/status` to confirm the mesh formed before trusting a
+number.
 
 ## Hardware and methodology
 
