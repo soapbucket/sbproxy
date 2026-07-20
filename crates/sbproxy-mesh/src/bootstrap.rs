@@ -225,6 +225,26 @@ pub async fn bootstrap(
         .filter(|peer| Some(peer.as_str()) != config.gossip_advertise_addr.as_deref())
         .collect();
 
+    // Resolve DNS-name seeds and the advertised gossip address to `ip:port`
+    // form. The SWIM probe path sends UDP to a parsed `SocketAddr`, so a
+    // hostname seed (the shape the Kubernetes operator renders from a
+    // StatefulSet's stable DNS names) would otherwise never be probed and
+    // the mesh would never form. TCP transport addresses resolve at connect
+    // time and may stay symbolic; UDP gossip cannot. The self-filter above
+    // runs first on the literal strings, so a symmetric DNS seed list still
+    // drops this node's own entry before resolution.
+    let peers = resolve_gossip_addrs(peers).await;
+    let resolved_gossip_advertise = match config.gossip_advertise_addr.as_deref() {
+        Some(addr) => resolve_gossip_addr(addr).await.or_else(|| {
+            tracing::warn!(
+                addr = %addr,
+                "gossip advertise address did not resolve; advertising it unresolved"
+            );
+            Some(addr.to_string())
+        }),
+        None => None,
+    };
+
     // --- K3: derive the cluster cipher (if configured) ---
     //
     // A single `Cipher` is derived once here and shared by both the
@@ -308,13 +328,12 @@ pub async fn bootstrap(
     let gossip_cfg = GossipLoopConfig {
         node_id: node_id.clone(),
         gossip_port: config.gossip_port,
-        gossip_advertise_addr: config.gossip_advertise_addr.clone(),
+        gossip_advertise_addr: resolved_gossip_advertise.clone(),
         transport_advertise_addr: config
             .transport_advertise_addr
             .clone()
             .or_else(|| {
-                config
-                    .gossip_advertise_addr
+                resolved_gossip_advertise
                     .as_deref()
                     .and_then(|address| replace_port(address, config.transport_port))
             })
@@ -514,6 +533,56 @@ pub async fn bootstrap(
     Ok(node)
 }
 
+/// Resolve one `host:port` gossip address to `ip:port` form.
+///
+/// Addresses that already parse as socket addresses pass through untouched.
+/// Hostnames go through the system resolver, preferring IPv4 (the UDP gossip
+/// socket binds v4 by default). Returns `None` when resolution fails or
+/// yields no candidates.
+async fn resolve_gossip_addr(addr: &str) -> Option<String> {
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return Some(addr.to_string());
+    }
+    match tokio::net::lookup_host(addr).await {
+        Ok(mut candidates) => {
+            let mut fallback = None;
+            for candidate in candidates.by_ref() {
+                if candidate.is_ipv4() {
+                    return Some(candidate.to_string());
+                }
+                fallback.get_or_insert(candidate);
+            }
+            fallback.map(|candidate| candidate.to_string())
+        }
+        Err(error) => {
+            tracing::warn!(addr = %addr, %error, "gossip address failed to resolve");
+            None
+        }
+    }
+}
+
+/// Resolve every seed to `ip:port` form, dropping (with a warning) any that
+/// do not resolve. A dropped seed heals itself: the peer behind it resolves
+/// its own seed list when it boots and contacts this node, at which point
+/// membership gossip carries its live address.
+async fn resolve_gossip_addrs(peers: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(peers.len());
+    for peer in peers {
+        match resolve_gossip_addr(&peer).await {
+            Some(resolved) => {
+                if resolved != peer {
+                    tracing::info!(seed = %peer, resolved = %resolved, "resolved gossip seed");
+                }
+                out.push(resolved);
+            }
+            None => {
+                tracing::warn!(seed = %peer, "dropping unresolvable gossip seed");
+            }
+        }
+    }
+    out
+}
+
 fn replace_port(address: &str, port: u16) -> Option<String> {
     if port == 0 {
         return None;
@@ -711,5 +780,37 @@ mod tests {
         // None and that the local node id is preserved on the cache itself.
         assert_eq!(cache.local_node_id(), "local");
         assert!(cache.responsible_node("any-key").is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_gossip_addr_passes_socket_addrs_through() {
+        assert_eq!(
+            resolve_gossip_addr("10.0.0.1:7946").await.as_deref(),
+            Some("10.0.0.1:7946")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_gossip_addr_resolves_hostnames_preferring_ipv4() {
+        // `localhost` resolves everywhere; IPv4 preference makes the
+        // result deterministic on dual-stack hosts.
+        assert_eq!(
+            resolve_gossip_addr("localhost:7946").await.as_deref(),
+            Some("127.0.0.1:7946")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_gossip_addrs_drops_unresolvable_seeds() {
+        let resolved = resolve_gossip_addrs(vec![
+            "10.0.0.1:7946".to_string(),
+            "definitely-not-a-real-host.invalid:7946".to_string(),
+            "localhost:7947".to_string(),
+        ])
+        .await;
+        assert_eq!(
+            resolved,
+            vec!["10.0.0.1:7946".to_string(), "127.0.0.1:7947".to_string()]
+        );
     }
 }

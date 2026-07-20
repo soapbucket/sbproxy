@@ -87,6 +87,14 @@ struct Ctx {
 
 #[tokio::main]
 async fn main() {
+    // rustls 0.23 requires the process to select a CryptoProvider before any
+    // TLS machinery initialises, and the kube client speaks TLS to the API
+    // server. Install ring to match the rest of the workspace; without this
+    // the first reconcile panics and the operator manages nothing.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let cli = Cli::parse();
 
     // Init tracing once, regardless of subcommand.
