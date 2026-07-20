@@ -28,7 +28,7 @@
 
 In the config.rs test module, add strict deserialization and validation tests for all new variants. Pin defaults and unknown-field rejection with this public shape:
 
-~~~rust
+~~~rust,no_run
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalRanking {
@@ -110,7 +110,7 @@ Run the config tests again. Expected: PASS.
 
 Extend outcome.rs tests to pin these stable labels:
 
-~~~rust
+~~~rust,no_run
 LeverKind::RagSelect => "rag_select"
 LeverKind::CompactSerialization => "compact_serialization"
 LeverKind::PositionReorder => "position_reorder"
@@ -136,7 +136,7 @@ Expected: FAIL until the variants and as_str arms exist.
 
 Add this closed rule beside CompressionLever:
 
-~~~rust
+~~~rust,no_run
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompressionCommitRule {
     #[default]
@@ -163,7 +163,7 @@ Expected: FAIL because commit_rule is not implemented.
 
 Read lever.commit_rule() once per candidate. Commit according to:
 
-~~~rust
+~~~rust,no_run
 let changed = candidate != working;
 let applies = match lever.commit_rule() {
     CompressionCommitRule::StrictReduction => candidate_tokens < working_tokens,
@@ -181,7 +181,7 @@ Run the runner tests again. Expected: PASS.
 
 Add a crate-visible helper to token_estimate.rs:
 
-~~~rust
+~~~rust,no_run
 pub(crate) fn estimate_text_tokens(model: &str, text: &str) -> u64
 ~~~
 
@@ -238,7 +238,7 @@ Expected: FAIL because the module does not exist.
 
 Use these core interfaces in marked_context/mod.rs:
 
-~~~rust
+~~~rust,no_run
 pub(crate) const MAX_RETRIEVAL_BLOCKS: usize = 32;
 pub(crate) const MAX_CHUNKS_PER_BLOCK: usize = 1_024;
 pub(crate) const MAX_RETRIEVAL_CHUNKS: usize = 4_096;
@@ -291,7 +291,7 @@ Do not add an XML dependency. Parse complete lines with a bounded state machine 
 
 Expose owned, read-only snapshots without exposing parser internals:
 
-~~~rust
+~~~rust,no_run
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarkedContextSnapshot {
     pub blocks: Vec<RetrievalBlockSnapshot>,
@@ -344,7 +344,7 @@ Expected: PASS with no content-bearing Debug or Display output from parser error
 
 Pin the ranking interface:
 
-~~~rust
+~~~rust,no_run
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RankedChunk {
     pub index: usize,
@@ -455,7 +455,7 @@ Expected: PASS.
 
 Pin these interfaces:
 
-~~~rust
+~~~rust,no_run
 pub(crate) fn encode_table(value: &serde_json::Value, min_rows: usize) -> Option<String>;
 pub fn decode_sbproxy_table_v1(body: &str) -> Result<serde_json::Value, TableDecodeError>;
 ~~~
@@ -630,7 +630,7 @@ Expected: FAIL because runtime matches are non-exhaustive or do not construct th
 
 Import and instantiate:
 
-~~~rust
+~~~rust,no_run
 CompressionLeverConfig::RagSelect(config) =>
     Arc::new(RagSelectLever::new(config.clone()))
 CompressionLeverConfig::CompactSerialization(config) =>
@@ -762,7 +762,7 @@ Expected: PASS.
 
 Replace the hard-coded window fields in EvalConfig with:
 
-~~~rust
+~~~rust,no_run
 pub struct EvalConfig {
     pub profile: String,
     pub levers: Vec<CompressionLeverConfig>,
@@ -790,7 +790,7 @@ Expected: FAIL because EvalConfig still hard-codes WindowFit.
 
 Change CaseReport to include every ordered lever result:
 
-~~~rust
+~~~rust,no_run
 pub struct CaseLeverReport {
     pub lever: String,
     pub outcome: String,
@@ -809,7 +809,7 @@ Keep off and on inputs identical. Continue omitting wall-clock latency from comm
 
 Extend QualitySpec with:
 
-~~~rust
+~~~rust,no_run
 StructuredEquivalence { chunk_id: String }
 EdgePlacement { chunk_id: String }
 ~~~
@@ -820,7 +820,7 @@ EdgePlacement finds the selected chunk ordinal among all chunks in its block and
 
 Add this optional per-case gate:
 
-~~~rust
+~~~rust,no_run
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptanceSpec {
