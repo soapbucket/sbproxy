@@ -38,9 +38,10 @@ Chunk IDs select structural quality evidence. `score` is a finite supplied
 ranking value when a pipeline uses supplied ranking. Supported format labels
 are `text`, `json`, and `sbproxy_table_v1`. Text outside
 `<sbproxy-retrieval>` blocks remains literal and is never inferred to be
-retrieval context. Malformed or oversized markers leave the whole request
-unchanged under fail-open behavior and emit only a sanitized closed skip
-reason.
+retrieval context. On malformed or oversized marked context, the affected
+retrieval-aware lever leaves its input message list unchanged and exposes only
+a sanitized closed skip reason. Evaluation then continues through the ordered
+pipeline, so a later lever such as WindowFit may still trim the request.
 
 ## Typed stateless pipelines
 

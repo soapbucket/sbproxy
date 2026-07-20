@@ -39,6 +39,17 @@ fn readme_and_workflow_cover_reproducibility_and_external_data_boundaries() {
     ] {
         assert!(readme.contains(required), "README missing `{required}`");
     }
+    let normalized_readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized_readme.contains(
+            "On malformed or oversized marked context, the affected retrieval-aware lever leaves its input message list unchanged and exposes only a sanitized closed skip reason."
+        ),
+        "README must scope marked-context fail-open behavior to the affected retrieval-aware lever"
+    );
+    assert!(
+        !normalized_readme.contains("whole request"),
+        "README must not promise that the whole request remains unchanged"
+    );
     assert!(!readme.contains("--input-budget-tokens"));
     assert!(!readme.contains("--completion-reserve-tokens"));
     assert!(!readme.contains("WOR-1879"));
