@@ -1,34 +1,53 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # MCP (Model Context Protocol) gateway with federated upstreams.
 #
-# Aggregates two upstream MCP servers behind one virtual MCP endpoint
-# and exposes them at `mcp.example.com`. Each upstream gets a
-# namespace prefix, optional RBAC label, and optional per-server
-# timeout. A single `tool_allowlist` guardrail restricts which
-# (already-prefixed) tools the gateway will forward.
+# Aggregates two upstream servers behind one virtual MCP endpoint and
+# exposes them at `mcp.example.com`. `gh` is a real, runnable
+# federated server: `type: openapi` turns the tiny REST mock started
+# from `upstream.yml` into an MCP tool with no code, so `tools/list`
+# and `tools/call gh.search_repos` below are genuine round-trips, not
+# a story you have to take on faith. `db` is left pointed at
+# `postgres.example.com`, an RFC 2606 reserved placeholder, so you can
+# see the honest failure mode (silently absent from `tools/list`,
+# "unknown tool" on `tools/call`) next to the real one and swap it for
+# your own MCP or REST server the same way. `namespace: always` on
+# both servers guarantees the `gh.`/`db.` prefix regardless of name
+# collisions, matching the tool names used in `rbac_policies` and the
+# `tool_allowlist` guardrail below.
 #
-# Run:
-#   make run CONFIG=examples/mcp-federation/sb.yml
+# Run (two processes; see README for the full walkthrough):
+#   sbproxy serve -f examples/mcp-federation/upstream.yml &
+#   sbproxy serve -f examples/mcp-federation/sb.yml
 #
-# List the federated tool catalogue:
+# Initialize the MCP session (answered locally; no upstream needed):
+# Test:
 #   curl -s -X POST http://127.0.0.1:8080 \
 #     -H 'Host: mcp.example.com' \
 #     -H 'Content-Type: application/json' \
-#     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq .
+#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
 #
-# Initialize the MCP session (returns the configured server_info):
+# Initialize the MCP session (answered locally; no upstream needed):
 #   curl -s -X POST http://127.0.0.1:8080 \
 #     -H 'Host: mcp.example.com' \
 #     -H 'Content-Type: application/json' \
 #     -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | jq .
 #
-# Call a federated tool (routed to the upstream owning the namespace):
+# List the federated tool catalogue (real: only gh.search_repos shows
+# up, because the db upstream is the unreachable placeholder):
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq .
+#
+# Call the real federated tool (dispatches an actual REST request to
+# the mock upstream and returns its response as MCP tool-result
+# content):
 #   curl -s -X POST http://127.0.0.1:8080 \
 #     -H 'Host: mcp.example.com' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
 #       "jsonrpc":"2.0",
-#       "id":2,
+#       "id":3,
 #       "method":"tools/call",
 #       "params":{
 #         "name":"gh.search_repos",
@@ -38,7 +57,19 @@
 #
 # A `tools/call` for a tool not in the allowlist returns a JSON-RPC
 # error with code -32602 (`invalid params`) and a message naming the
-# blocked tool.
+# blocked tool, without ever reaching an upstream:
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "jsonrpc":"2.0",
+#       "id":4,
+#       "method":"tools/call",
+#       "params":{
+#         "name":"gh.delete_repo",
+#         "arguments":{"owner":"foo","repo":"bar"}
+#       }
+#     }' | jq .
 
 proxy:
   http_bind_port: 8080
@@ -78,18 +109,46 @@ origins:
             - principals: []
               allowed: ["db.query"]
       federated_servers:
-        # Bare hostnames are normalised to https://<host>/mcp.
-        # Use a full https://... URL for any other path. Per-server
+        # `type: openapi` derives MCP tools from an OpenAPI spec and
+        # dispatches `tools/call` as REST against `origin` instead of
+        # speaking MCP — see docs/mcp.md#openapi-backed-servers. The
+        # origin here is the mock started from `upstream.yml`, so
+        # this upstream is real: `tools/list` and `tools/call` both
+        # complete end-to-end with no external dependency. Per-server
         # `rbac:` (a label above) and `timeout:` (Go duration) are
-        # enforced: RBAC gates every tools/call against the caller's
-        # principal, and a call that outlasts the timeout fails rather
-        # than hanging the request.
-        - origin: github.example.com
+        # enforced the same way for `openapi` servers as for `mcp`
+        # ones: RBAC gates every tools/call against the caller's
+        # principal, and a call that outlasts the timeout fails
+        # rather than hanging the request.
+        - type: openapi
+          origin: http://127.0.0.1:8091
           prefix: gh
+          namespace: always
           rbac: read_only
           timeout: 10s
+          spec:
+            openapi: "3.0.0"
+            info:
+              title: Mock repository search
+              version: "1.0"
+            paths:
+              "/search/repositories":
+                get:
+                  operationId: search_repos
+                  summary: Search repositories by query.
+                  parameters:
+                    - name: q
+                      in: query
+                      required: true
+                      schema:
+                        type: string
+        # Bare hostnames are normalised to https://<host>/mcp for a
+        # plain `mcp` server (the default `type`). This one is left
+        # as the honest, unreachable placeholder: point it at your
+        # own MCP server to exercise it (see the README caveat).
         - origin: postgres.example.com
           prefix: db
+          namespace: always
           rbac: db_writer
           timeout: 5s
       guardrails:

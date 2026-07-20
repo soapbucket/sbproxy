@@ -2,15 +2,39 @@
 
 *Last modified: 2026-07-19*
 
-The embedded admin server publishes a small set of HTTP routes for
-operator tooling: liveness probes, request log, per-target health, managed
-model and cluster state, hot reload, drift detection, and the emitted OpenAPI
-document.
+The embedded admin server publishes the full control-plane HTTP surface for
+operator tooling: liveness probes, session login, key and credential
+lifecycle, the request log and its live stream, per-target health, spend and
+audit, config read/write and hot reload/drift, model-host catalog and
+deployment lifecycle, the response/semantic/key-policy caches, cluster
+status and the replicated-state substrate, prompts, the chat playground, and
+the emitted OpenAPI document.
 
-This page is the per-route reference. For the operator workflow
-(enabling the server, picking a port, IP allowlisting), see
-[manual.md section 9 - Hot reload](manual.md#9-hot-reload) and
-[manual.md section 5 - Metrics and observability](manual.md#5-metrics-and-observability).
+This page is the per-route reference: every path, its auth/role
+requirement, request and response shape, and status codes. For a
+task-oriented walkthrough (enabling the server, logging in, a curl
+cookbook), see [admin-api-guide.md](admin-api-guide.md). For the
+built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
+
+## Contents
+
+- [Enabling the admin server](#enabling-the-admin-server)
+- [Authentication](#authentication)
+- [Rate limiting](#rate-limiting)
+- [Error envelope](#error-envelope)
+- [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
+- [Session routes](#session-routes) - login, logout, whoami
+- [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
+- [Read routes](#read-routes-authenticated) - request log + stream, health, spend, audit, rate-limit budget, UI settings, OpenAPI
+- [AI compression session state](#ai-compression-session-state)
+- [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, log level
+- [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
+- [Cache admin](#cache-admin) - response cache and key-policy cache
+- [Cluster control plane](#cluster-control-plane) - status, deployments, enrollment, replicated state
+- [Admin UI](#admin-ui-get-adminui-get-) - static asset serving
+- [Prompt store admin](#prompt-store-admin-get-adminprompts-post-adminprompts) - prompt overlay
+- [Chat playground](#chat-playground)
+- [Curl recipes](#curl-recipes)
 
 ## Enabling the admin server
 
@@ -165,6 +189,241 @@ issuers.
 
 ---
 
+## Session routes
+
+`POST /admin/login`, `POST /admin/logout`, and `GET /admin/session` run
+before the general auth gate: they establish, revoke, or describe a
+browser session rather than exposing protected control-plane data. See
+[admin-api-guide.md](admin-api-guide.md#authenticating-basic-vs-session--csrf)
+for the full login/CSRF walkthrough.
+
+### `POST /admin/login`
+
+Verifies credentials — an `Authorization: Basic` header, or a JSON
+`{"username": "...", "password": "..."}` body — against the top-level
+admin or a configured `operators[]` entry.
+
+Success (`200`) sets `Set-Cookie: sb_admin_session=<token>; HttpOnly;
+SameSite=Strict; Path=/` (adds `; Secure` when TLS is on), good for 8
+hours, and returns:
+
+```json
+{"role": "admin", "csrf_token": "3f9c1a...", "username": "admin"}
+```
+
+`400` for a missing/unparseable body, `401` for invalid credentials
+(emits an `sbproxy::admin::audit` failure event).
+
+### `POST /admin/logout`
+
+Revokes the session and clears the cookie. Always `200`. Does not
+require an `X-CSRF-Token` header (it is one of the route-specific CSRF
+exceptions, alongside login and session discovery).
+
+### `GET /admin/session`
+
+Reports whether the request carries a valid session, without ever
+returning `401` — it distinguishes "please log in" from an error so
+the UI can render a login form on a fresh visit:
+
+```json
+{"authenticated": true, "username": "admin", "role": "admin", "via_session": true, "csrf_token": "3f9c1a..."}
+```
+
+or `{"authenticated": false}`. `via_session` is `false` for a request
+authenticated by HTTP Basic (a Basic caller is "authenticated" here
+too, so a Basic-authenticated browser session can still recover a
+usable CSRF token: the server mints and `Set-Cookie`s a session token
+automatically on a Basic-authenticated request that lacks one — the
+Basic-to-session upgrade — but the RBAC/CSRF gate still treats
+`via_session: false` requests as CSRF-exempt).
+
+---
+
+## API keys and credentials
+
+Full CRUD-plus-lifecycle over dynamic virtual keys and upstream
+provider credentials. Mounted on the shared admin listener; every
+mutation writes through the configured keystore and invalidates the
+policy cache so it takes effect on the next request without a reload.
+Responses never carry a secret hash or plaintext, except the one-time
+minted/rotated token. See [key-management.md](key-management.md) for
+the policy model these records drive.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/admin/keys` | List keys (no secrets). |
+| POST | `/admin/keys` | Mint a key; the plaintext token is returned once. |
+| GET | `/admin/keys/policy-schema` | The server-driven policy field contract the UI renders forms from. |
+| GET | `/admin/keys/{id}` | Fetch one key. |
+| PATCH | `/admin/keys/{id}` | Update policy/attribution fields (optimistic concurrency via `expected_revision`). |
+| DELETE | `/admin/keys/{id}` | Delete a key. |
+| GET | `/admin/keys/{id}/usage` | Governed usage snapshot (requests/tokens/budget counters) and backend health. |
+| POST | `/admin/keys/{id}/effective-policy/preview` | Evaluate the key's effective policy against a hypothetical request, without dispatching one. |
+| POST | `/admin/keys/{id}/revoke` | Mark revoked (terminal — no further mutation). |
+| POST | `/admin/keys/{id}/block` | Mark blocked (reversible). |
+| POST | `/admin/keys/{id}/unblock` | Mark active. |
+| POST | `/admin/keys/{id}/rotate` | Mint a new secret with a grace-window dual-key transition. |
+| GET | `/admin/credentials` | List upstream credentials (no secrets). |
+| POST | `/admin/credentials` | Create a credential (`vault_ref` or `secret`, envelope-sealed at rest). |
+| GET | `/admin/credentials/{id}` | Fetch one credential. |
+| PATCH | `/admin/credentials/{id}` | Update credential metadata, provider, or material. |
+| DELETE | `/admin/credentials/{id}` | Delete a credential. |
+| POST | `/admin/credentials/{id}/revoke`, `/block`, `/unblock` | Same lifecycle actions as keys. |
+
+All of these return `409 {"error":"key_management is not enabled"}`
+when the process has no dynamic key plane configured (no `keystore:`
+backend wired). List/get failures against the store are `500`; a
+missing key/credential id is `404`.
+
+### Key record shape (`KeyView`)
+
+`GET`/`POST`/`PATCH` responses wrap a `KeyView` under `"key"`:
+
+```json
+{
+  "key_id": "key_9f2c...",
+  "policy_revision": 3,
+  "policy_digest": "sha256:...",
+  "name": "checkout-service",
+  "status": "active",
+  "max_requests_per_minute": 600,
+  "max_tokens_per_minute": null,
+  "priority": null,
+  "budget": {"max_tokens": null, "max_cost_usd": 25.0},
+  "allowed_models": ["gpt-4o-mini", "claude-haiku-4-5"],
+  "blocked_models": [],
+  "allowed_providers": [],
+  "blocked_providers": [],
+  "allowed_tools": null,
+  "require_pii_redaction": [],
+  "principal_selectors": [],
+  "inject_tools": [],
+  "bypass_prompt_injection": false,
+  "project": null,
+  "user": null,
+  "tags": ["team:checkout"],
+  "metadata": {},
+  "tenant_id": null,
+  "expires_at": null,
+  "created_at": "2026-07-01T00:00:00Z",
+  "updated_at": "2026-07-01T00:00:00Z",
+  "source": "api",
+  "rotation_pending": false
+}
+```
+
+`status` is `active`, `blocked`, or `revoked`. `policy_digest` is only
+populated for records that own a tenant (`tenant_id` set); a tenantless
+record inherits the request's origin tenant, so it has no single
+runtime digest — get one per-origin from the effective-policy preview
+instead. `rotation_pending` is true while a prior secret is still
+valid inside its rotation grace window.
+
+`POST /admin/keys` accepts the same policy fields as `PATCH` (name,
+budgets, allow/block lists, `route_to_model`, `compression_profile`,
+`inject_tools`, `inject_mcp`, `principal_selectors`, `tags`, `metadata`,
+`tenant`, `expires_at`, ...) and returns `201` with
+`{"token": "<plaintext, shown once>", "key": <KeyView>}`.
+
+### Optimistic concurrency and terminal state
+
+`PATCH`, `revoke`, `block`, `unblock`, and `rotate` all read the
+record's current `policy_revision` and require the caller's
+`expected_revision` to match (omit it on `block`/`unblock`/`rotate` to
+default to the server-read value; `PATCH` requires it explicitly). A
+mismatch returns `409`:
+
+```json
+{"error": "key policy revision conflict", "key_id": "key_9f2c...", "expected_revision": 2, "current_revision": 3}
+```
+
+A `revoked` key is terminal: any further mutation returns
+`409 {"error": "revoked key is terminal", "key_id": "...", "current_revision": N}`.
+A keystore backend that cannot perform an atomic compare-and-swap
+returns `409 {"error": "configured key store does not support atomic key policy mutation"}`.
+
+### `POST /admin/keys/{id}/rotate`
+
+Body: `{"expected_revision": <optional>, "grace_secs": <optional, default 3600>}`.
+Mints a fresh secret, keeps the prior hash valid for `grace_secs`
+(both authenticate during the window), and returns:
+
+```json
+{"token": "sk-key_9f2c...-<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
+```
+
+### `GET /admin/keys/{id}/usage`
+
+Returns `{"usage": <GovernanceSnapshot>}` — the same request/token/
+budget counters the AI gateway's governance seam reserves against,
+read live rather than derived from the log. Returns
+`503 {"error":"governance backend unavailable"}` if the governance
+store (Redis, for a shared/cluster deployment) cannot be reached; the
+key record itself is not at fault in that case.
+
+### `POST /admin/keys/{id}/effective-policy/preview`
+
+Body is an optional sample request shape (`model`, `provider`, `tools`,
+`principal`, `origin_tenant_id`, `active_pii_rules`,
+`prompt_injection_detected`, `usage`, `at`) — every field optional; an
+empty body still returns the resolved policy. Response:
+
+```json
+{
+  "effective_policy": {"...": "the full secret-free effective policy"},
+  "policy_version": "...",
+  "decisions": {
+    "allowed": true,
+    "lifecycle": {"allowed": true, "reason_code": "active", "status": "active", "expires_at": null},
+    "tenant": {"allowed": true, "reason_code": "match", "origin_tenant_id": "...", "effective_tenant_id": "..."},
+    "model": {"allowed": true, "reason_code": "not_sampled", "requested": null, "effective": null, "routed": false},
+    "provider": {"...": "..."},
+    "tools": {"...": "..."},
+    "principal": {"...": "..."},
+    "rate_limits": {"...": "..."},
+    "budget": {"...": "..."},
+    "priority": {"...": "..."},
+    "guardrails": {"pii": {"...": "..."}, "prompt_injection": {"...": "..."}}
+  }
+}
+```
+
+Each decision block carries `allowed` plus a stable `reason_code`
+(`active`, `revoked`, `blocked`, `expired`, `not_sampled`, `blocked`,
+`not_allowed`, `allowed`, `match`, `mismatch`, `inherited`, ...) so the
+UI can render *why* a hypothetical request would be denied without
+needing a live upstream call. This never dispatches a request or
+reserves budget; it is pure evaluation against the stored record.
+
+### Credential record shape (`CredentialView`)
+
+```json
+{
+  "id": "cred_a1b2...",
+  "name": "openai-prod",
+  "provider": "openai",
+  "kind": "ai_provider",
+  "status": "active",
+  "tenant_id": null,
+  "storage": "vault_ref",
+  "vault_ref": "vault://secret/data/openai#key",
+  "created_at": "2026-07-01T00:00:00Z",
+  "updated_at": "2026-07-01T00:00:00Z",
+  "source": "api"
+}
+```
+
+`storage` is `vault_ref`, `encrypted` (envelope-sealed plaintext at
+rest), or `plaintext` (legacy records only). The actual secret is
+never present in any response; `vault_ref` only appears for
+vault-referenced credentials, since the reference itself is not a
+secret. `POST`/`PATCH` bodies accept `vault_ref` *or* `secret` (a
+plaintext value the server envelope-seals immediately); supplying
+neither is a `400`.
+
+---
+
 ## Read routes (authenticated)
 
 ### `GET /api/requests`
@@ -201,6 +460,25 @@ Response body: an array of `RequestLogEntry`:
 This is an in-memory ring buffer; entries are lost when the process
 exits. For durable request logs, enable the structured access log
 (see [access-log.md](access-log.md)).
+
+Supported query parameters: `status` (exact match), `method`
+(case-insensitive), `path` (substring), `guardrail_action`,
+`guardrail_category`, `offset`, `limit` (defaults to and is clamped at
+`max_log_entries`). No parameters returns the newest entries.
+
+### `GET /api/requests/stream`
+
+Server-Sent-Events tail of the same ring buffer: one `data: <json>`
+event per request as it completes, plus a leading `: connected`
+comment. `Content-Type: text/event-stream`; the connection stays open
+until the client disconnects. Handled directly by the async connection
+handler (not the blocking dispatcher) so it can own the socket for the
+stream's lifetime; requires authentication like every other route, but
+does not accept query filters — filter client-side.
+
+```bash
+curl -N -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/api/requests/stream"
+```
 
 ### `GET /api/health`
 
@@ -291,6 +569,85 @@ The shape and the per-origin mapping are documented in
 [openapi-emission.md](openapi-emission.md). The `.json` route
 returns `Content-Type: application/json`; the `.yaml` route returns
 `Content-Type: application/yaml`.
+
+### `GET /api/usage/spend`
+
+Token and USD spend totals from the AI cost/token metrics.
+
+With no query parameters, returns the legacy process-lifetime shape
+from the live counters:
+
+```json
+{"tokens": 1284213, "cost_usd": 41.27}
+```
+
+Passing any of `window` (`1h`, `24h`, `7d`, `30d`), `group_by`
+(`model`, `provider`, `key`, ...), `from`, or `to` (Unix seconds)
+switches to the windowed shape served from the durable usage rollups
+(these survive a restart, unlike the process-lifetime counters):
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/usage/spend?window=24h&group_by=model" | jq
+```
+
+An invalid `window` value is `400`; a valid windowed request when no
+rollup store is configured is `503` naming the config knob.
+
+### `GET /api/audit/recent`
+
+Recent rate-limit budget audit rows (suspend, throttle, resume
+transitions), newest first. `?limit=` bounds the count (default 50).
+Returns `[]` (not an error) when no `rate_limits:` block is
+configured — there is nothing to have audited.
+
+### `GET /api/rate_limits/budget`
+
+Per-workspace rate-limit budget state: tier (`normal`, `throttle`,
+`auto_suspend`) and any active suspend cool-down, from the
+`RateLimitBudgetRegistry` snapshot. `404 {"error":"no rate_limits: block configured"}`
+when the workspace-budget feature is off.
+
+### `POST /api/rate_limits/resume`
+
+Manually clears a workspace's escalation state back to `normal`.
+Body: `{"workspace": "<id>"}`. `400` for a missing/empty workspace,
+`404` when the workspace has not been tracked (no traffic seen) or no
+`rate_limits:` block is configured.
+
+### `GET /api/rate_limits/effective`
+
+Effective requests-per-second ceiling and tier for one workspace right
+now: `?workspace=<id>` (defaults to `default`).
+
+```json
+{"workspace": "default", "effective_rps": 1000, "tier": "normal"}
+```
+
+`404 {"error":"no rate_limits: block configured"}` when unconfigured.
+
+### `POST /api/rate_limits/clock/advance`
+
+**Test/dev-only.** Advances the rate limiter's clock by `?secs=N`
+seconds. This only does anything when `proxy.rate_limits.clock:
+manual` is set — a mode that exists so integration tests can assert
+token-bucket refill and suspend-cooldown behavior deterministically,
+without sleeping in wall time. Production configs use the default
+`system` clock, for which this route returns
+`400 {"error":"clock is not in manual mode"}`. There is no reason to
+call this against a real deployment.
+
+### `GET /api/ui-settings`
+
+Small settings block the admin UI reads once at load:
+
+```json
+{"trace_url_template": "https://jaeger.internal/trace/{trace_id}"}
+```
+
+`trace_url_template` is `proxy.admin.trace_url_template`; `null` when
+unset, in which case the UI renders trace IDs as plain text instead of
+a broken link.
 
 ---
 
@@ -578,7 +935,46 @@ curl -fsS -X POST -u "admin:${SB_ADMIN_PASSWORD}" \
 
 ---
 
-## Control routes (authenticated)
+## Config and control routes (authenticated)
+
+### `GET`, `PUT` `/admin/config`
+
+Reads and writes the raw on-disk config text.
+
+`GET` returns the current YAML plus the loaded revision:
+
+```json
+{"config": "proxy:\n  http_bind_port: 8080\n...", "revision": "abc123..."}
+```
+
+`PUT`/`POST` validates the submitted YAML, persists it, and hot-swaps
+the running pipeline — the same swap `POST /admin/reload` performs,
+just sourced from the request body instead of re-reading the file.
+Add `?if_match=<revision>` for optimistic concurrency (the write is
+rejected with `409` if the loaded revision has moved since the caller
+last read it). `400` for a YAML parse failure or a failed pipeline
+compile; the config path itself is scrubbed from any error message.
+Env-var interpolation (`${VAR}`) and secret-backend references are
+stored and echoed back exactly as written — a secret is never
+resolved into the saved config or exposed in this editor. See
+[secrets.md](secrets.md).
+
+### `GET`, `PUT` `/admin/log-level`
+
+Runtime tracing-filter control, no restart required.
+
+`GET` returns `{"level": "info"}` (or whatever directive is active,
+e.g. `sbproxy_ai=debug`). `PUT`/`POST` body `{"level": "debug"}` (or a
+per-target directive like `{"level": "sbproxy_ai=debug"}`) sets it
+immediately:
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" -X PUT "${SB_ADMIN_URL}/admin/log-level" \
+  -H 'content-type: application/json' -d '{"level":"debug"}'
+```
+
+`400` for a missing/empty `level` or a directive the tracing filter
+rejects.
 
 ### `POST /admin/reload`
 
@@ -655,6 +1051,170 @@ or alert pipeline. When `drift: true` is sustained for more than the
 expected reload window, page the operator: either the watcher is
 stuck, the deploy pipeline forgot to call `POST /admin/reload`, or
 someone hand-edited the file out of band.
+
+---
+
+## Model host admin
+
+Routes over the `proxy.model_host` runtime: what the local process can
+serve, what is desired, what is actually running, and lifecycle
+control. All authenticated, mounted on the shared admin listener. See
+[model-host.md](model-host.md#authenticated-catalog-and-local-deployment-api)
+for the config block these adapt and the authority model
+(`admin_managed` vs. `file_managed` vs. cluster) that governs which
+mutations are accepted.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/admin/model-host/catalog` | Bundled model + exact-variant evidence, with the rendered catalog revision. |
+| GET | `/admin/model-host/deployments` | Complete local desired-state document: authority, read-only flag, revision, digest, deployment map. |
+| PUT | `/admin/model-host/deployments` | Replace the desired-state map under `admin_managed` authority (compare-and-swap on `expected_revision`). |
+| GET | `/admin/model-host/status` | Per-deployment runtime state, lifecycle, engine, artifact, memory, device, port, queue, job. |
+| GET | `/admin/model-host/value` | Local-serving + compression value report (tokens/cost saved). |
+| GET | `/admin/model-host/files` | Verified artifact cache inventory: cache root, total bytes, per-artifact size/residency. |
+| POST | `/admin/model-host/gc` | On-demand protected LRU collection down to the configured cache budget. |
+| DELETE | `/admin/model-host/artifacts/{digest}` | Remove one exact cached artifact by its 64-hex-char digest. |
+| POST | `/admin/model-host/load` | Start (or confirm ready) one configured deployment. Body: `{"deployment": "<id>"}`. |
+| POST | `/admin/model-host/stop`, `/drain` | Drain and stop one deployment (aliases of the same operation). |
+| POST | `/admin/model-host/evict` | Compatibility alias for stop/drain. |
+| POST | `/admin/model-host/reset` | Clear retained crash-loop/failure state so a configured deployment can start again. |
+
+`load`, `stop`/`drain`/`evict`, and `reset` all accept `{"deployment":
+"<id>"}` (the legacy key `model` is still accepted as an alias) and
+operate only on a deployment ID that already exists in desired state —
+none of them create or delete a deployment; that is what the
+`deployments` PUT and `sb.yml` are for.
+
+### `GET`/`PUT /admin/model-host/deployments` errors
+
+`PUT` is only served on this process when a runtime manager is
+installed at all (`404` otherwise, from the model-host manager not
+being present). A stale `expected_revision` is `409 revision_conflict`;
+an invalid or secret-bearing body is `400 invalid_bundle`; a
+non-`admin_managed` authority (i.e. `file_managed` or a cluster
+verifier node) returns `403` explaining the deployment map is managed
+elsewhere. See [model-host.md](model-host.md#authenticated-catalog-and-local-deployment-api)
+for the full request schema and validation order.
+
+### `GET /admin/model-host/value`
+
+```json
+{
+  "models": [{"model": "gpt-4o-mini", "local_completions": 0, "cloud_completions": 42}],
+  "compression": [{"model": "gpt-4o-mini", "lever": "window_fit", "tokens_saved": 18432, "gross_cost_saved_micros": 2765, "token_count_precision": "model_tokenizer"}],
+  "compression_totals": {"window_fit": {"tokens_saved": 18432, "gross_cost_saved_micros": 2765}},
+  "total_compression_tokens_saved": 18432,
+  "total_compression_gross_cost_saved_micros": 2765
+}
+```
+
+Empty (all-zero) until a locally served or compressed request
+completes successfully. `compression` is sorted by model and lever;
+`compression_totals` aggregates by lever name. A known target-model
+tokenizer produces `model_tokenizer` precision; the UTF-8
+byte-length fallback produces `heuristic` — both are sbproxy estimates,
+not provider billing totals. The ledger is a bounded in-memory
+structure (at most 1,000 model lanes, with overflow folded into
+`__other__`) unless a qualifying `providers[].serve` block with
+`cache_dir` set has initialized a durable `value-ledger.redb` path, in
+which case it persists across restarts. See
+[ai-context-compression.md](ai-context-compression.md) for the
+data-plane policy that produces these savings.
+
+### `GET /admin/model-host/files`
+
+```json
+{
+  "schema_version": 1,
+  "cache_root": "/var/lib/sbproxy/models",
+  "total_bytes": 4831838208,
+  "artifacts": [
+    {"logical_model": "qwen2.5-0.5b-instruct", "variant_id": "q4_k_m", "artifact_digest": "9f2c...", "total_size_bytes": 402653184, "last_accessed_ms": 1784300000000, "resident": true}
+  ]
+}
+```
+
+`cache_root: null` and an empty `artifacts` array when no model host
+is configured — an honest empty inventory, not an error.
+
+### `POST /admin/model-host/gc`
+
+Runs the same protected LRU sweep the post-pull path runs
+automatically, on demand. Protects configured, resident, pinned,
+leased, and file-locked artifacts identically to the automatic sweep
+and to `DELETE .../artifacts/{digest}`. Returns the collection report
+(bytes reclaimed, artifacts removed). `409` when no cache budget is
+configured — there is no target to collect toward.
+
+### `DELETE /admin/model-host/artifacts/{digest}`
+
+`digest` must be 64 lowercase hex characters (a SHA-256); anything
+else is `400`. Removal shares the exact protection rules `sbproxy
+models remove` enforces, so the API and CLI can never disagree. `404`
+when the digest is not in the verified cache; `409` with a stable
+`reason` when removal is blocked (e.g. the artifact backs a ready
+replica); a manager-open or filesystem failure is `502`.
+
+---
+
+## Cache admin
+
+Two independent operator surfaces on the admin server (WOR-1754 /
+WOR-1755), unrelated to the model-host artifact cache above:
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/admin/cache` | Response-cache status: enabled, backend, whether prefix purge is supported. |
+| POST | `/admin/cache/purge` | Evict response-cache entries: by exact key, by prefix, or all. |
+| POST | `/admin/cache/key-policy/evict` | Drop one (or all) cached key policies so the next request re-reads the keystore. |
+| GET | `/admin/cache/semantic` | Recent semantic (embedding) cache lookup decisions per AI origin. |
+
+### `GET /admin/cache`
+
+```json
+{"enabled": true, "backend": "redis", "prefix_purge_supported": true}
+```
+
+`{"enabled": false}` when no origin turned on response caching.
+`prefix_purge_supported` is true only for `memory` and `redis`
+backends (`file` hashes keys into filenames and cannot scan by
+prefix; `memcached` has no scan primitive).
+
+### `POST /admin/cache/purge`
+
+Body selects the scope — `{"key": "..."}` deletes one entry,
+`{"prefix": "..."}` deletes a prefix, an empty body `{}` clears the
+whole cache:
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" -X POST "${SB_ADMIN_URL}/admin/cache/purge" \
+  -H 'content-type: application/json' -d '{"prefix":"gpt-4o-mini:"}'
+```
+
+`409 {"error":"response cache not enabled"}` when no origin enabled
+caching.
+
+### `POST /admin/cache/key-policy/evict`
+
+Body `{"id": "<key_id>"}` evicts one key's cached policy; an empty
+body `{}` evicts every cached policy. On the Redis key-plane tier this
+publishes the invalidation to every replica in the fleet, not just the
+node that received the request. `409 {"error":"dynamic key plane not enabled"}`
+when `key_management` has no keystore backend configured.
+
+### `GET /admin/cache/semantic`
+
+`?limit=N` (default 50, max 100) recent lookup decisions per AI origin
+that has a semantic (embedding) cache configured:
+
+```json
+{"caches": [{"origin": "ai.example.com", "recent": [{"reason": "hit", "score": 0.94, "threshold": 0.85}]}]}
+```
+
+`reason` is `hit`, `no_entry`, `expired`, `below_threshold`, or
+`cross_scope`. `caches: []` when no origin has an embedding cache
+configured. See [local-inference.md](local-inference.md) for the
+semantic-cache feature this debugs.
 
 ---
 
@@ -771,6 +1331,24 @@ authority-role escalation, malformed CSRs, and oversized requests fail closed.
 Use `sbproxy cluster enroll` instead of constructing this wire document by
 hand.
 
+### `GET /admin/cluster/metrics`
+
+Fleet-aggregated metrics (mesh tier). See [observability.md](observability.md)
+for the aggregation model; `404` when the mesh metrics tier is not
+configured.
+
+### `GET /admin/cluster/artifacts`
+
+Fleet-wide artifact-cache usage: total bytes and artifact count per
+node, and total bytes per model across the fleet. Aggregates each
+node's latest accepted snapshot from the model directory; a node with
+no accepted snapshot yet is omitted from `nodes` and flips the
+top-level `partial: true` flag rather than silently under-reporting.
+Outside a configured cluster (or when the directory has no other
+members), reports the local node's own artifact cache — the same
+inventory as `GET /admin/model-host/files`, reshaped for the fleet
+view. `405` for a method other than GET.
+
 ### `GET /admin/cluster/state`
 
 Fleet-complete listing of the replicated state substrate (see
@@ -857,24 +1435,24 @@ continue.
 
 ## Admin UI (`GET /admin/ui`, `GET /`)
 
-The admin server serves a browser dashboard at `/admin/ui` for
-configuration inspection, drift status, recent requests, and the
-runtime prompt-store overlay (see `/admin/prompts` below). `GET /`
+The admin server serves a full operator dashboard under `/admin/ui/`:
+keys and credentials, config editing and drift, the request log (with
+live tail), metrics, spend, AI performance, guardrails, prompts, a
+chat playground, the response/semantic cache, model host (catalog,
+desired-state editing, lifecycle actions), artifact storage, the audit
+and rate-limit view, and — despite older notes to the contrary — the
+full cluster roster, health rail, and unhealthy-node alerts, reading
+`GET /admin/cluster/status` and `GET /admin/cluster/metrics`. See
+[admin-ui.md](admin-ui.md) for the page-by-page reference. `GET /`
 does not redirect there; it returns a small static HTML landing page
 (`200 text/html`) that lists the main API endpoints. Both routes are
 authenticated like the rest of `/api/*` and `/admin/*`.
 
 The dashboard is only present when the binary was built with it
-embedded: build the UI assets first (`cd ui && pnpm install && pnpm
+embedded: build the UI assets first (`cd ui && npm ci && npm run
 build`), then compile the proxy with `--features embed-admin-ui`.
 Default builds skip the embed and `/admin/ui` returns a `404` whose
 body spells out those two steps.
-
-The current UI does not yet render the cluster roster or mutate model desired
-state. The operator-product PR will consume `GET /admin/cluster/status` for a
-cluster summary, complete node table, and prominent unhealthy-node callouts,
-then add mode-aware model selection and deployment management. The API and CLI
-contracts above are available before that UI lands.
 
 ---
 
@@ -952,9 +1530,13 @@ curl -s -u admin:secret \
 
 ## See also
 
+- [admin-api-guide.md](admin-api-guide.md) - task-oriented walkthrough: enabling the server, login/CSRF, a curl cookbook.
+- [admin-ui.md](admin-ui.md) - the built-in dashboard, page by page.
 - [manual.md](manual.md) - install, CLI, hot reload workflow.
 - [admin.md](admin.md) - admin listener, authentication, roles, TLS, and operator workflows.
 - [configuration.md](configuration.md) - the `proxy.admin:` block.
+- [key-management.md](key-management.md) - the virtual-key policy model `/admin/keys` and `/admin/credentials` drive.
+- [model-host.md](model-host.md) - the `proxy.model_host` config the model-host admin routes adapt.
 - [ai-context-compression.md](ai-context-compression.md) - compression policy, external state, and degradation behavior.
 - [openapi-emission.md](openapi-emission.md) - the emitted OpenAPI document's shape and per-origin mapping.
 - [access-log.md](access-log.md) - the durable structured request log.

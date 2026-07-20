@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-19*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -438,10 +438,14 @@ The full happy path lives at
 [`examples/mcp-federation/sb.yml`](../examples/mcp-federation/sb.yml).
 That fixture covers federated upstreams, prefix namespacing,
 `tool_allowlist`, and a curl recipe for `initialize`, `tools/list`,
-and `tools/call`.
+and `tools/call`. [use-case-mcp-federation.md](use-case-mcp-federation.md)
+walks through that same fixture end to end, including a real
+`type: openapi` upstream that runs with no external dependency.
 
 ## See also
 
+- [`use-case-mcp-federation.md`](use-case-mcp-federation.md): the
+  solution guide — problem, RBAC allowlist, and next steps.
 - [`migration-mcp-rbac.md`](migration-mcp-rbac.md): upgrade
   walk-through for the principal-aware ACL and default-deny
   flip.

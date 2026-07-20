@@ -6,14 +6,15 @@
 # only the versioned running-summary record shared by every worker.
 
 proxy:
-  http_bind_port: ${SB_HTTP_PORT:-8080}
+  http_bind_port: 8080
 
   admin:
     enabled: true
     bind: 127.0.0.1
-    port: ${SB_ADMIN_PORT:-9090}
+    port: 9090
     username: admin
-    password: ${ADMIN_PASSWORD}
+    # Demo password for local validate/run. Change before any non-loopback bind.
+    password: demo-change-me
 
   # compression.state.backend: redis binds to this process-wide Redis store.
   l2_cache_settings:

@@ -14,6 +14,8 @@ This guide owns the end-to-end picture: provider setup, wire compatibility, rout
 
 Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list. Callers of hosted providers should send an explicit `model`. A `default_model` can select among locally served models and appears in model metadata, but the hosted dynamic-routing path does not inject one into a request that omitted `model`:
 
+**Fragment** — this is one `origins` entry; it needs a sibling top-level `proxy:` block (at minimum `proxy.http_bind_port`) to be a runnable `sb.yml`. See [Full example](#full-example) below or [`examples/ai-gateway-quickstart/`](../examples/ai-gateway-quickstart/) for a complete file.
+
 ```yaml
 origins:
   "ai.example.com":
@@ -41,6 +43,8 @@ Any model a listed provider serves works without extra config. For a self-hosted
 
 Use `provider_type: managed_model` to route a public model name to a deployment
 owned by `proxy.model_host`:
+
+**Fragment** — nest under a top-level `proxy:` block that also configures `model_host`; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/) for a runnable pairing of both.
 
 ```yaml
 origins:
@@ -95,6 +99,8 @@ deployments must set `cold_start` explicitly.
 ## Model-based provider selection
 
 Before the routing strategy runs, the proxy narrows the candidate providers to those that declare the requested model in their `models` list. With one model per provider you get a single OpenAI-compatible endpoint where the `model` field picks the vendor:
+
+**Fragment** — same `origins` entry shape as [Provider setup](#provider-setup) above; nest under `proxy:` to run it. This exact shape (three providers, one model each) is the base config in [`use-case-own-openrouter.md`](use-case-own-openrouter.md) and [`examples/use-case-own-openrouter/sb.yml`](../examples/use-case-own-openrouter/sb.yml).
 
 ```yaml
 origins:
@@ -1220,8 +1226,10 @@ Both are sourced from the resolved principal, never from a request header, so a 
   used. For an admin-managed governed key, the immutable public `key_id` is
   used instead of its mutable display name.
 
+**Fragment** — an origin's `authentication:` block (alias `auth:`; this page uses the canonical name). Nest under an origin alongside `action:`; see [key-management.md](key-management.md) for the full key lifecycle.
+
 ```yaml
-auth:
+authentication:
   type: api_key
   api_keys:
     - secret: ${TEAM_A_KEY}

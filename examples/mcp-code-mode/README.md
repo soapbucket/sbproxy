@@ -1,5 +1,13 @@
 # MCP Code Mode TypeScript module
 
+> **Snippet, depends on a live upstream.** `federated_servers[].origin` here
+> is `github.example.com`, an RFC 2606 reserved placeholder, not a running
+> MCP server, so the federated catalogue this module is generated from is
+> empty as-shipped. Point the origin at your own MCP server to see typed
+> functions in the generated module. See
+> [`examples/mcp-federation`](../mcp-federation/) for the base federation
+> mechanics and the same caveat spelled out in full.
+
 Serves the federated tool catalogue as a typed TypeScript module for
 Cloudflare Code Mode agents.
 

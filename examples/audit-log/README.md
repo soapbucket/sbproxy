@@ -15,7 +15,7 @@ contract, and the structured-log sink notes.
 ## Run
 
 ```bash
-export ADMIN_PASSWORD=demo
+# password defaults to demo-change-me in sb.yml
 make run CONFIG=examples/audit-log/sb.yml
 ```
 

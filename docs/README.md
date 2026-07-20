@@ -18,7 +18,7 @@ Each walkthrough takes one problem end to end: a story doc, a runnable example d
 | A LiteLLM proxy you want off of | [Migrate off LiteLLM in an afternoon](migration-litellm.md) |
 | Shadow Ollama under someone's desk | [Guardrails on every prompt, local or hosted](use-case-guardrails-everywhere.md) |
 | AI crawlers eating your content for free | [Meter and monetize the AI that calls you](use-case-meter-crawlers.md) |
-| Internal MCP servers multiplying without an owner | [Federate your MCP tools behind one gateway](mcp.md) |
+| Internal MCP servers multiplying without an owner | [Federate your MCP tools behind one gateway](use-case-mcp-federation.md) |
 | It works on your laptop and on-call starts Monday | [Run it in production](use-case-production-ops.md) |
 
 Broader estate guides, same shape:
@@ -42,6 +42,8 @@ New here? Follow the [Getting Started guide](getting-started.md): install, run y
 - [json-schema.md](json-schema.md) - JSON Schema for editor autocomplete + validation of `sb.yml`.
 - [features.md](features.md) - tour of every feature with copy-paste configs.
 - [admin.md](admin.md) - the admin server: enable it, TLS, the built-in web UI, and the control-plane endpoints (keys, config, metrics, logs, prompts).
+- [admin-api-guide.md](admin-api-guide.md) - task-oriented admin API walkthrough: login/CSRF, roles, and a curl cookbook.
+- [admin-ui.md](admin-ui.md) - the built-in admin dashboard, page by page: what each view shows, mutates, and calls.
 - [troubleshooting.md](troubleshooting.md) - common failure modes and fixes.
 - [faq.md](faq.md) - quick answers to the questions operators hit most often.
 

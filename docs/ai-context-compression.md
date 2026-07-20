@@ -729,6 +729,10 @@ and begin with fresh external summary state.
 
 ## See also
 
+- [`examples/ai-context-compression-redis/`](../examples/ai-context-compression-redis/)
+  for a runnable copy of this pipeline: start Redis, then `curl` the chat
+  endpoint with a captured session ID to see the summary state persist across
+  turns.
 - [AI gateway guide](ai-gateway.md) for provider, policy, budget, cache, and
   routing behavior around the compression stage.
 - [LLM-aware resilience](ai-llm-aware-resilience.md) for typed upstream

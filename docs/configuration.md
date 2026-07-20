@@ -2,7 +2,7 @@
 
 *Last modified: 2026-07-19*
 
-The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
+The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial — a skeleton showing which keys nest where, or one field in isolation — so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
 For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, Lua, JavaScript, and WASM scripting, see [scripting.md](scripting.md). For the event system, see [events.md](events.md).
 
@@ -109,7 +109,7 @@ The CI gate `scripts/check-config-schema.sh` runs the generator and `diff`s agai
 
 ## Top-level structure
 
-Complete YAML skeleton with every top-level key:
+**Map, not a config** — every `{ ... }` and `[ ... ]` below is a placeholder for a real block documented in its own section, not literal YAML. This shows which keys nest where; it does not validate or run. For a complete file, see [`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml) for the smallest real one, or any [`examples/<name>/sb.yml`](../examples/) for a feature-specific full config.
 
 ```yaml
 # Server settings (ports, TLS, ACME, admin, secrets, shared state)

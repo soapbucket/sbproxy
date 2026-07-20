@@ -1,9 +1,15 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# Serve an open-weight model on a single cloud GPU (one NVIDIA L4)
-# behind the SBproxy gateway. The walkthrough for this config lives in
-# docs/use-case-serve-on-l4.md.
+# CPU / Apple Metal stand-in for the "serve an open-weight model on one
+# NVIDIA L4" story in docs/use-case-serve-on-l4.md. This config names
+# llama.cpp and a GGUF file, which is the CPU/Metal engine path, not
+# the NVIDIA GPU path. It exercises the config shape and the preflight
+# tooling (validate/plan/doctor), and answers a real completion on any
+# box that has llama-server available. It does NOT exercise or certify
+# the NVIDIA L4 engine path: that is vLLM/SGLang, still pending live
+# GCP evidence — see docs/model-host.md#managed-engines and
+# docs/model-host-certification.md.
 #
-# Run (on the L4 box):
+# Run (on any machine; a real completion needs llama-server available):
 #   sbproxy examples/use-case-serve-on-l4/sb.yml
 proxy:
   http_bind_port: 8080
@@ -24,18 +30,25 @@ origins:
             - qwen3-14b
           serve:
             models:
-              # A catalog id, resolved by the built-in model catalog.
               # Explicit weights source: repo, quant, file. This GGUF +
-              # llama-server path is the one certified on the L4 today;
-              # bare catalog ids (`model: qwen3-14b`) and the fit
-              # planner's automatic quant choice (FP8 on an Ada L4,
-              # Q4 GGUF on a T4) take over once catalog-driven serving
-              # lands. See docs/model-host.md for the phased status.
+              # llama-server path is the CPU/Metal stand-in used for
+              # preflight and config-shape validation on any box; it is
+              # not the NVIDIA engine path (that's vLLM/SGLang, pending
+              # live GCP certification). Bare catalog ids
+              # (`model: qwen3-14b`) and the fit planner's automatic
+              # quant choice (FP8 on an Ada-class NVIDIA GPU via vLLM,
+              # Q4 GGUF on CPU/Metal via llama.cpp) take over once
+              # catalog-driven serving lands. See docs/model-host.md
+              # for the phased status.
               - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
                 gguf_file: Qwen3-14B-Q4_K_M.gguf
                 name: qwen3-14b
-                # llama-server applies the GGUF's embedded chat template.
-                extra_args: ["--jinja"]
-                # Unload after 30 idle minutes so the card's VRAM is
-                # free for whatever you load next.
+                # Pinned explicitly (not "auto") so this is unambiguously
+                # the CPU/Metal engine, never the NVIDIA vLLM/SGLang path.
+                engine: llama_cpp
+                # No extra_args: llama.cpp's stable argument allowlist
+                # does not include --jinja today, so the chat template
+                # comes from llama-server's own default handling of the
+                # GGUF's embedded template, not an operator override.
+                # Unload after 30 idle minutes so memory comes back.
                 keep_alive: 30m

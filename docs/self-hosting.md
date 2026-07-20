@@ -129,17 +129,22 @@ runs against your hardware with a one-line change.
 
 ```yaml
 proxy:
+  http_bind_port: 8080
   model_host:
     deployments:
       local-coder:
         model: qwen2.5-0.5b-instruct
         variant: q4_k_m
 
-providers:
-  - name: local
-    provider_type: managed_model
-    deployment: local-coder
-    models: [claude-sonnet-4-5]
+origins:
+  "gateway.internal":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          provider_type: managed_model
+          deployment: local-coder
+          models: [claude-sonnet-4-5]
 ```
 
 Check the [model host boundary](model-host.md#current-boundary) before choosing
@@ -158,15 +163,34 @@ training-sensitive prompts with the provider-level
 providers with that flag. If no provider in the chain is marked, the
 request gets a 400 rather than landing somewhere you did not approve.
 
+Runnable copy of this shape: [`examples/self-hosting/sb.yml`](../examples/self-hosting/sb.yml)
+(compatibility `serve:` plus cloud spill). Canonical managed form:
+
 ```yaml
-providers:
-  - name: local
-    provider_type: managed_model
-    deployment: local-qwen
-    models: [qwen]
-  - name: openai
-    api_key: ${OPENAI_API_KEY}
-    default_model: gpt-4o-mini
+proxy:
+  http_bind_port: 8080
+  model_host:
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+
+origins:
+  "gateway.internal":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: fallback_chain
+      providers:
+        - name: local
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
+          no_prompt_training: true
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models: [gpt-4o-mini]
 ```
 
 ## Grown-up auth in front of local inference
@@ -176,15 +200,16 @@ front, with a ledger and a policy engine behind it: virtual keys,
 per-team quotas, hierarchical budgets, and the guardrail mesh all apply
 to the local model the same way they apply to a hosted one.
 
-It also tells you what the GPU is worth. Give a served model a
-`reference:` block naming the hosted model it displaces and that model's
-per-million-token price, and SBproxy prices every completion it serves
-locally at what the hosted API would have charged. A local completion
-costs nothing at the API, so the whole displaced price is the saving.
-The `reference:` lives on a served model inside a provider `serve:`
-block:
+It also tells you what the GPU is worth. On the compatibility `serve:`
+path, give a served model a `reference:` block naming the hosted model it
+displaces and that model's per-million-token price, and SBproxy prices
+every completion it serves locally at what the hosted API would have
+charged. A local completion costs nothing at the API, so the whole
+displaced price is the saving:
 
 ```yaml
+# Fragment — nest under origins."<host>".action (compatibility serve: path).
+# Full file: examples/self-hosting/sb.yml
 providers:
   - name: local
     serve:
@@ -262,6 +287,16 @@ your own GPUs.
 | Bring your own key | Provider keys plus a credential resolver (env, secret stores, vault) | Managed key rotation, mesh-distributed key cache |
 | 400-plus hosted-model marketplace | 66 hosted providers plus models on your GPUs | Same providers, fleet placement |
 
+## Runnable examples
+
+- [`examples/self-hosting/`](../examples/self-hosting/) — local model plus
+  cloud spill in one fallback array (the serve-only quickstart this page
+  describes).
+- [`examples/self-hosting-macos/`](../examples/self-hosting-macos/) — same
+  idea with the admin UI enabled on Apple Silicon / Metal.
+- [`examples/model-host-managed/`](../examples/model-host-managed/) —
+  canonical `proxy.model_host` + `provider_type: managed_model`.
+
 ## Related
 
 - [model-host.md](model-host.md) - the reference: catalog, fit planner,
@@ -270,3 +305,4 @@ your own GPUs.
   the hardware evidence ledger and final GCP procedure.
 - [ai-gateway.md](ai-gateway.md) - the routing, guardrail, budget, and
   ledger planes local models plug into.
+- [quickstart-serve.md](quickstart-serve.md) - `sbproxy run <model>` on-ramp.

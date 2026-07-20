@@ -1,6 +1,8 @@
 # Point your coding assistant at your own GPU
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-19*
+
+> **Compatibility form** — this walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
 ![The Anthropic wire answered by local Qwen3 weights behind the claude-sonnet-4-5 alias, the OpenAI wire answering the same, then the one-line base-URL change](assets/use-case-coding-assistant.gif)
 

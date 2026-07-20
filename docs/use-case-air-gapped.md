@@ -1,6 +1,8 @@
 # Air-gapped AI: weights, prompts, and verdicts that never leave your network
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-19*
+
+> **Compatibility form** — this walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
 ![Terminal recording: sbproxy doctor reports the host, the manifest shows a file: source with pinned sha256 digests, validate and plan pass with no network access, and a prompt injection attempt is blocked on the box](assets/use-case-air-gapped.gif)
 
