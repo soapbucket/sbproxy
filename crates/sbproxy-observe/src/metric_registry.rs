@@ -405,7 +405,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["op"],
-        description: "Successful cross-node cache RPC duration, by operation.",
+        description: "Successful cross-node cache RPC duration, by operation. Healthy same-zone means sit well under 5ms; a mean near 40ms is the delayed-ACK/Nagle transport stall signature and warrants an alert.",
         dead_reason: None,
     },
     MetricCapability {

@@ -58,7 +58,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `mesh_replication_read_repairs_total` | Counter | `stable` | `beta` | none | Stale replicas repaired in line by quorum reads. |
 | `mesh_replication_writes_total` | Counter | `stable` | `beta` | `outcome` | Replicated substrate writes, by coordinator outcome (acked or quorum_failed). |
 | `mesh_tombstone_gc_total` | Counter | `stable` | `beta` | `outcome` | Ack-aware tombstone garbage collection decisions (collected or deferred). |
-| `mesh_transport_rpc_duration_seconds` | Histogram | `stable` | `beta` | `op` | Successful cross-node cache RPC duration, by operation. |
+| `mesh_transport_rpc_duration_seconds` | Histogram | `stable` | `beta` | `op` | Successful cross-node cache RPC duration, by operation. Healthy same-zone means sit well under 5ms; a mean near 40ms is the delayed-ACK/Nagle transport stall signature and warrants an alert. |
 | `mesh_transport_rpc_errors_total` | Counter | `stable` | `beta` | `kind` | Cross-node cache RPC failures, by transport phase. |
 | `sbproxy_a2a_chain_depth` | Histogram | `stable` | `beta` | `route`, `spec` | Distribution of A2A chain depth observed at the proxy. |
 | `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labelled by route and reason. |

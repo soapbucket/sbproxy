@@ -713,6 +713,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_rpcs_avoid_delayed_ack_stalls() {
+        // WOR-1949 regression guard. A healthy loopback RPC costs well under
+        // a millisecond; the delayed-ACK/Nagle write-write-read stall costs
+        // ~40ms per RPC. The 20ms mean threshold sits far above any
+        // plausible loaded-runner jitter for a loopback roundtrip and far
+        // below the 40ms failure signature.
+        use std::time::{Duration, Instant};
+
+        let (server, cache, port) = spawn_server().await;
+        cache.put_local("hot", Bytes::from_static(b"value"));
+        let client = PeerClient::new(format!("127.0.0.1:{port}"));
+
+        // First call connects; keep it out of the timed window.
+        client.get("hot".to_string()).await.expect("warmup get");
+
+        const N: u32 = 30;
+        let started = Instant::now();
+        for _ in 0..N {
+            client.get("hot".to_string()).await.expect("get");
+        }
+        let mean = started.elapsed() / N;
+        assert!(
+            mean < Duration::from_millis(20),
+            "mean loopback RPC took {mean:?}; smells like the delayed-ACK/Nagle stall"
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
     async fn client_purge_prefix_returns_remote_count() {
         let (server, cache, port) = spawn_server().await;
         cache.put_local("p:1", Bytes::from_static(b"a"));
