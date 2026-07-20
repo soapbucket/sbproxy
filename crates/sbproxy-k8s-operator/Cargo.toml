@@ -15,6 +15,9 @@ name = "sbproxy-k8s-operator"
 path = "src/main.rs"
 
 [dependencies]
+# Process-level rustls CryptoProvider install; the kube client's TLS
+# session to the API server needs one selected before first use.
+rustls = { workspace = true }
 # Async runtime
 tokio = { workspace = true }
 futures = { workspace = true }
