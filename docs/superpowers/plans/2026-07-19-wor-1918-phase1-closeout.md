@@ -566,6 +566,7 @@ Add tests proving:
 - multiple blocks reorder independently;
 - missing supplied scores leave that block unchanged;
 - stable ties use original ordinals;
+- tied-score output is idempotent after reparsing resets source ordinals;
 - an already edge-ordered block skips as already_ordered;
 - a second run is idempotent;
 - parser failures preserve the full request; and
@@ -580,6 +581,8 @@ Expected: FAIL because the lever does not exist.
 ### Step 2: Implement edge placement
 
 Rank through the shared rank_chunks function. Construct the rendered order as all odd one-based ranks in ascending rank order followed by all even one-based ranks in descending rank order. Compare chunk IDs to the current order before marking a block changed.
+
+For tied scores, reparsing necessarily replaces the original source ordinals with the emitted order; no marker metadata preserves the prior tie order. Treat a current score sequence that already matches the edge-placed target score sequence as already ordered, even if recomputed tie-breaking would permute equal-score chunk IDs again. Otherwise retain stable original-ordinal tie-breaking and compare target chunk IDs before replacement. This score-equivalence check is required for second-run idempotence and must have a regression covering supplied-score ties.
 
 Return MissingRelevanceScore only when no block changes and at least one block cannot rank in supplied mode. Return AlreadyOrdered when every rankable block already has the target order.
 
