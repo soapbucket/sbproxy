@@ -46,7 +46,6 @@ origins:
           default_model: claude-haiku-4-5
           models:
             - claude-haiku-4-5
-            - claude-haiku-4-5
         - name: openrouter
           api_key: ${OPENROUTER_API_KEY}
           priority: 2

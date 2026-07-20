@@ -1,6 +1,6 @@
 # Single binary to self-host
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-19*
 
 The serve-only quickstart from [`docs/self-hosting.md`](../../docs/self-hosting.md):
 one local model running on this box as provider zero, with a cloud
@@ -23,7 +23,21 @@ The cloud spill provider in `sb.yml` reads `${OPENAI_API_KEY}`:
 
 ```bash
 export OPENAI_API_KEY=sk-...
+sbproxy validate examples/self-hosting/sb.yml
 make run CONFIG=examples/self-hosting/sb.yml
+```
+
+## Try it
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: gateway.internal' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3-14b","messages":[{"role":"user","content":"In one sentence, what is a reverse proxy?"}]}' \
+  | jq -r '.model, .choices[0].message.content'
+# 200. `model` names the local weights (proof the GPU/Metal lane answered)
+# on a certified box, or `gpt-4o-mini` if local is unavailable and the
+# request spilled to the cloud provider.
 ```
 
 ## What it shows

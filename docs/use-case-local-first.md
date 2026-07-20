@@ -1,6 +1,8 @@
 # You bought a GPU. Prove it pays for itself.
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-19*
+
+> **Compatibility form** — this walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
 ![A local Qwen3 answer from the GPU, a training-sensitive prompt pinned to the local lane, then the ledger split across both lanes and the dollars the GPU displaced](assets/use-case-local-first.gif)
 
@@ -167,8 +169,8 @@ The `0.15` and `0.60` are gpt-4o-mini's list prices per million prompt and compl
 
 ## You are done when
 
-- The plain request returns `200` with `model` reading `qwen3-14b`, confirming the local lane answered.
-- The flagged request also returns `qwen3-14b`, and it never spills: with the local engine down it fails (a 502, or a 400 with `"type": "no_compliant_provider"` when no provider is marked) instead of landing on the unmarked cloud lane.
+- The plain request returns `200` with `model` reading `Qwen3-14B-Q4_K_M.gguf` (the served weights file, trimmed by the `jq` split above), confirming the local lane answered.
+- The flagged request also returns `Qwen3-14B-Q4_K_M.gguf`, and it never spills: with the local engine down it fails (a 502, or a 400 with `"type": "no_compliant_provider"` when no provider is marked) instead of landing on the unmarked cloud lane.
 - `/tmp/sb-local-first-ledger.jsonl` holds entries whose `.event.provider` is `local`, `sbproxy ai ledger verify` prints `ledger verify: OK` and exits 0, and the displaced-cost query prints a number.
 
 ## Next steps

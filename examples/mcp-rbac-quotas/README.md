@@ -1,5 +1,13 @@
 # MCP RBAC and per-tool quotas
 
+> **Snippet, depends on a live upstream.** `federated_servers[].origin` here
+> is `github.example.com`, an RFC 2606 reserved placeholder, not a running
+> MCP server, so this config cannot be run end-to-end as-shipped: `tools/list`
+> against it hits a DNS error. Point the origin at your own MCP server to
+> exercise the RBAC and quota behavior below. See
+> [`examples/mcp-federation`](../mcp-federation/) for the base federation
+> mechanics and the same caveat spelled out in full.
+
 Default-deny tool access plus a sliding-window quota, both keyed on the
 caller's principal.
 

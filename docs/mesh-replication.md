@@ -11,12 +11,26 @@ replicated state substrate closes those gaps. It is configured under
 disk, with explicit consistency levels and a deletion protocol that
 keeps removed data removed.
 
-This substrate is infrastructure for cluster-internal state. No public
-feature selects it yet: in particular, `compression.state.backend: mesh`
+This substrate is infrastructure for cluster-internal state, not a
+feature you turn on to change what a request does. No public feature
+selects it yet: in particular, `compression.state.backend: mesh`
 remains rejected at config validation, and re-enabling it is a separate
 change gated on this substrate's guarantees. Configuring `replication`
 today provisions the substrate and its admin surface without changing
 any request-path behavior.
+
+The mesh it extends *is* on the request path today, just not through
+this replicated layer: [`examples/model-cluster-symmetric`](../examples/model-cluster-symmetric)
+and [`examples/model-cluster-split`](../examples/model-cluster-split)
+place managed-model requests using the same gossip cluster's typed-state
+cache, and approximate-tier key budgets disseminate per-node counters
+over it too (see [key-management.md](key-management.md)). Neither
+consumer uses the durable, quorum-checked `replication` block described
+below — they read the best-effort single-owner cache this substrate
+sits underneath. Read this page when you are standing up or operating
+the cluster substrate itself; read [model-cluster-symmetric](../examples/model-cluster-symmetric)
+or [model-cluster-split](../examples/model-cluster-split) for the
+user-facing feature that currently rides on the surrounding mesh.
 
 ## Configuration
 

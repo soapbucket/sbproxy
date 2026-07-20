@@ -153,411 +153,68 @@ origin can call the API cross-origin.
 Everything below is reachable at `http(s)://<bind>:<port>`. Probe and session
 establishment/discovery routes are unauthenticated; protected routes need auth
 (top-level Basic or a session), and protected mutations need the `admin` role.
-The separate enrollment exception is
-`POST /admin/cluster/enroll`, which authenticates an expiring one-time cluster
-token instead of an existing admin operator.
+The separate enrollment exception is `POST /admin/cluster/enroll`, which
+authenticates an expiring one-time cluster token instead of an existing admin
+operator. Full per-route schemas, request/response shapes, and status codes
+live in [admin-api-reference.md](admin-api-reference.md); a task-oriented
+walkthrough with a curl cookbook lives in
+[admin-api-guide.md](admin-api-guide.md). In short, the surface covers:
 
-**Health and readiness (unauthenticated).**
-
-| Method | Path | Returns |
-|---|---|---|
-| GET | `/healthz` | `{"status":"ok"}` |
-| GET | `/health` | Full report: version, build, uptime, per-component checks. |
-| GET | `/readyz`, `/livez` | Readiness / liveness, 200 or 503. |
-
-**Session.**
-
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/admin/login` | Verify credentials, set the session cookie, return a CSRF token. |
-| POST | `/admin/logout` | Revoke the session and clear the cookie. |
-| GET | `/admin/session` | Report whether the request carries a valid browser session and its role. |
-
-**Config and pipeline.**
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/api/openapi.json`, `/api/openapi.yaml` | OpenAPI of the live config. |
-| GET | `/admin/config` | Current on-disk YAML plus the loaded revision. |
-| PUT | `/admin/config` | Validate, persist, and hot-swap a new config (`?if_match=<rev>` for optimistic concurrency). |
-| GET | `/admin/drift` | On-disk config hash vs the loaded one. |
-| POST | `/admin/reload` | Re-read the config file and hot-swap the pipeline. |
-| GET | `/admin/log-level` | Current tracing filter directive. |
-| PUT | `/admin/log-level` | Change the log level at runtime, e.g. `{"level":"debug"}` or `{"level":"sbproxy_ai=debug"}`, no restart. |
-| GET | `/api/health/targets` | Per-target health, outlier, and breaker state. |
-| GET | `/admin/model-host/catalog` | Bundled model and exact-variant evidence, including the rendered catalog revision. |
-| GET | `/admin/model-host/deployments` | Complete local desired-state document with authority, read-only state, revision, digest, and deployment map. |
-| PUT | `/admin/model-host/deployments` | Replace the complete local deployment map under `admin_managed` authority with `expected_revision` compare-and-swap. |
-| GET | `/admin/model-host/status` | Managed deployment generation, lifecycle, engine, artifact, memory, device, port, queue, reason, and job state. |
-| GET | `/admin/model-host/value` | Local-serving value plus per-model, per-lever context-compression tokens and gross input cost saved. |
-| POST | `/admin/model-host/load` | Start one configured deployment and wait for ready, `{"deployment":"<id>"}`. |
-| POST | `/admin/model-host/stop` | Drain and stop one configured deployment, `{"deployment":"<id>"}`. |
-| POST | `/admin/model-host/drain` | Alias for the bounded drain and stop operation. |
-| POST | `/admin/model-host/evict` | Compatibility alias for the bounded drain and stop operation. |
-| POST | `/admin/model-host/reset` | Clear retained crash-loop state for a configured deployment. |
-| GET | `/admin/cluster/status` | Complete cluster roster, health and unhealthy-node alerts, model eligibility, placement, rollout, digest consistency, and authority state. |
-| GET | `/admin/cluster/deployments` | Locally active verified deployment bundle and signer identity. |
-| POST | `/admin/cluster/deployments` | Authority-only strict deployment draft publication. Non-authority nodes return `deployment_authority_read_only`. |
-| POST | `/admin/cluster/enroll` | Exchange a valid one-time enrollment token and locally generated CSR for installed cluster identity material. |
-| GET | `/admin/cluster/metrics` | Fleet-aggregated metrics (mesh tier; see [observability.md](observability.md)). |
-
-**AI compression session state.**
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/admin/compression/sessions` | List bounded, content-free session metadata with filters and cursor pagination. |
-| GET | `/admin/compression/sessions/{id}` | Read content-free metadata for one opaque record ID. |
-| GET | `/admin/compression/sessions/{id}/content` | Inspect one live, unexpired running summary when the caller is an Admin and that AI handler explicitly opts in. |
-| DELETE | `/admin/compression/sessions/{id}` | Delete one Redis summary record and advance its stale-writer fence. |
-| POST | `/admin/compression/sessions/purge` | Delete one explicitly scoped, bounded Redis page. |
-
-### Compression session operations
-
-Metadata reads allow either `read_only` or `admin`. They never return the
-running summary, raw session ID, raw messages, or message digests. Listing
-accepts `tenant`, `origin`, `backend=redis`, `conflict=true|false`, `cursor`,
-and `limit`. The default limit is 100 and the maximum is 500. Redis removes
-records at their TTL, so expired records are not retained for listing.
-
-Content inspection has a stricter contract. It requires the `admin` role and
-`allow_admin_content_inspection: true` on the current `ai_proxy` handler that
-owns the record. The default is denied. Every content-inspection attempt that
-reaches the compression route is emitted to the `sbproxy::admin::audit`
-tracing target before a response is returned, including disabled inspection,
-invalid IDs, missing or expired records, backend errors, and successful reads.
-The event is content-free. The built-in sink is tracing, so durable retention
-depends on the configured tracing collector. If an installed sink reports a
-failure, the endpoint returns `503` without the summary. A successful response
-carries `Cache-Control: no-store`, `Pragma: no-cache`, and
-`X-Content-Type-Options: nosniff`.
-
-`DELETE` and purge require the `admin` role. A browser session must also send
-its `X-CSRF-Token`; HTTP Basic requests remain CSRF-exempt. Deleting a missing
-record is idempotent and returns `200` with `"deleted": false`. Redis deletion
-advances a fence and invalidates an in-flight lease before it can recreate the
-record. A later eligible request with the same captured session can create a
-fresh summary; deletion removes summary state, not the caller's session.
-
-Purge always operates on a bounded page and returns a continuation cursor.
-At least one of `tenant` or `origin` is required. `conflict`, `backend`,
-`cursor`, and `limit` narrow a page but do not count as a destructive scope.
-This prevents the normal `conflict: false` value from acting as an all-record
-purge. An unfiltered purge must send both `"all": true` and the exact
-`"confirmation": "purge-compression-sessions"`. Backend, corrupt-record, and
-unsupported-schema failures during list or purge return a content-free `503`
-rather than a partial metadata response.
-
-Redis list and purge scan the shared Redis namespace using bounded pages and
-opaque cursors. Metadata, delete, and purge remain available from the global
-Redis L2 configuration after `summary_buffer` is disabled. Content inspection
-still requires an active origin policy with explicit opt-in.
-
-The following commands use the same HTTP Basic convention as the other admin
-examples. They assume at least one compression record exists:
-
-```bash
-export SB_ADMIN_URL=http://127.0.0.1:9090
-export SB_ADMIN_PASSWORD='replace-me'
-
-# Read a metadata page, then select one opaque ID from it.
-curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
-  "${SB_ADMIN_URL}/admin/compression/sessions?tenant=tenant-a&limit=100" \
-  | jq '{records,next_cursor}'
-SB_COMPRESSION_RECORD_ID="$(
-  curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
-    "${SB_ADMIN_URL}/admin/compression/sessions?tenant=tenant-a&limit=1" \
-    | jq -er '.records[0].id'
-)"
-
-# With the default handler setting, content inspection is denied with 403.
-curl -sS -i -u "admin:${SB_ADMIN_PASSWORD}" \
-  "${SB_ADMIN_URL}/admin/compression/sessions/${SB_COMPRESSION_RECORD_ID}/content"
-
-# Delete one record. Repeating this returns deleted=false.
-curl -fsS -X DELETE -u "admin:${SB_ADMIN_PASSWORD}" \
-  "${SB_ADMIN_URL}/admin/compression/sessions/${SB_COMPRESSION_RECORD_ID}" \
-  | jq
-
-# Purge at most 100 records for one tenant.
-curl -fsS -X POST -u "admin:${SB_ADMIN_PASSWORD}" \
-  -H 'Content-Type: application/json' \
-  --data '{"tenant":"tenant-a","limit":100}' \
-  "${SB_ADMIN_URL}/admin/compression/sessions/purge" \
-  | jq
-```
-
-See [Admin API reference](admin-api-reference.md#ai-compression-session-state)
-for the complete schemas and status codes, and
-[AI context compression](ai-context-compression.md) for the data-plane policy
-and state model.
-
-### Compression value report
-
-`GET /admin/model-host/value` returns local-serving and context-compression
-value in one JSON document while keeping the two dimensions separate.
-Compression rows are recorded only after a billable terminal provider request
-succeeds. They do not increment `local_completions` or `cloud_completions`.
-
-```bash
-curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
-  "${SB_ADMIN_URL}/admin/model-host/value" \
-  | jq '{compression,compression_totals,total_compression_tokens_saved,total_compression_gross_cost_saved_micros}'
-```
-
-A populated compression row has this shape:
-
-```json
-{
-  "model": "gpt-4o-mini",
-  "lever": "window_fit",
-  "tokens_saved": 18432,
-  "gross_cost_saved_micros": 2765,
-  "token_count_precision": "model_tokenizer"
-}
-```
-
-`compression` is sorted by model and lever. `compression_totals` aggregates by
-the closed lever name, and the two `total_compression_*` fields cover the whole
-report. A known target-model tokenizer produces `model_tokenizer`; the
-documented UTF-8 byte-length fallback produces `heuristic`. Both are SBproxy
-estimates rather than provider billing totals. Unknown model pricing records
-zero gross cost while retaining the saved-token count.
-
-Because both value dimensions share per-model lanes, a compression-only report's
-`models` array contains a zeroed local-serving row for each compression target;
-its local and cloud completion totals remain zero. The actual compression value
-stays in `compression` and `compression_totals`.
-
-The process-wide ledger stores no prompt or summary content. The current redb
-path requires one provider-level `providers[].serve` block that both contains
-at least one `models[].reference` and sets `cache_dir`; the file is
-`<cache_dir>/value-ledger.redb`. A qualifying block that initializes later
-promotes the same shared in-memory ledger in place and merges existing totals,
-so preexisting value sinks and Admin readers remain valid. The first successful
-durable path is canonical; a conflicting later path emits a bounded warning and
-keeps using it. `proxy.model_host.cache.directory` does not currently activate
-value-ledger persistence. Otherwise compression uses a bounded in-memory
-ledger.
-
-The ledger holds at most 1,000 model lanes total, including `__other__`. Once
-999 non-overflow model names have been admitted, additional names aggregate
-into `__other__` so an unbounded model string cannot grow Admin state.
-
-### Managed model operations
-
-These routes adapt the same process-wide runtime used by startup, reload, and
-request admission. Read the catalog before choosing a model or exact variant,
-and read the current deployment document before changing desired state:
-
-```bash
-curl -u "admin:${SB_ADMIN_PASSWORD}" \
-  "${SB_ADMIN_URL}/admin/model-host/catalog" \
-  | jq '{catalog_revision,models}'
-
-curl -u "admin:${SB_ADMIN_PASSWORD}" \
-  "${SB_ADMIN_URL}/admin/model-host/deployments" \
-  | jq '{authority,read_only,revision,content_digest,deployments}'
-```
-
-`PUT /admin/model-host/deployments` is available only under
-`admin_managed` authority. Its strict JSON body contains
-`expected_revision` and the complete replacement `deployments` map. Use
-`null` only when creating the first revision; use the unsigned revision from
-the latest read after that. A stale value returns `409 revision_conflict`.
-The API validates and prepares the complete candidate before the durable
-compare-and-swap. A race aborts the staged candidate. If final runtime
-activation fails after the store advances, SBproxy attempts to restore prior
-recreate generations. Rollback can fail, leaving the durable revision advanced
-and the runtime degraded. Read the deployment document, runtime status, and
-logs before recovery. Repair the reported dependency and send a corrected full
-map from the current revision, use Reset or Load when status directs it, or
-restart after confirming the persisted desired state is safe.
-
-Under `file_managed` authority, the deployment endpoint is read-only and
-changes continue through reviewed `sb.yml` plus `sbproxy apply -f <path>` or
-`POST /admin/reload`. Under cluster authority, only the authority node can
-publish a signed complete map through `POST /admin/cluster/deployments`;
-verifier nodes remain read-only. Neither deployment API rewrites `sb.yml` or
-provider routes under `origins[].action.providers`. Add a desired deployment
-before configuring its provider route, and remove or retarget the route before
-removing or renaming the deployment. See
-[Model host](model-host.md#authenticated-catalog-and-local-deployment-api) for
-the request schema, validation order, stable errors, and audit fields.
-
-The lifecycle actions below do not create arbitrary deployments. The
-deployment ID must already exist in active desired state.
-
-```bash
-export SB_ADMIN_URL=http://127.0.0.1:9090
-export SB_ADMIN_PASSWORD='replace-me'
-
-curl -u "admin:${SB_ADMIN_PASSWORD}" \
-  "${SB_ADMIN_URL}/admin/model-host/status"
-
-curl -u "admin:${SB_ADMIN_PASSWORD}" \
-  -H 'content-type: application/json' \
-  -d '{"deployment":"local-qwen"}' \
-  "${SB_ADMIN_URL}/admin/model-host/stop"
-
-curl -u "admin:${SB_ADMIN_PASSWORD}" \
-  -H 'content-type: application/json' \
-  -d '{"deployment":"local-qwen"}' \
-  "${SB_ADMIN_URL}/admin/model-host/reset"
-```
-
-The local CLI provides the same common operations with stable JSON envelopes:
-
-```bash
-export SB_ADMIN_USERNAME=admin
-sbproxy models ps --format json
-sbproxy models stop local-qwen --format json
-```
-
-Lifecycle errors include bounded `reason_code` values. A stop enters drain,
-rejects new requests, waits for active stream permits up to the configured
-deadline, and then stops the engine. Reset does not change `sb.yml`; it clears a
-retained failure so the configured generation can be started again. Detailed
-paths and transport diagnostics stay in server logs and are not returned to the
-browser.
-
-The Model host page renders catalog evidence and support state, exact variant
-availability, desired deployments, runtime status, and lifecycle actions.
-Stable and preview variants are selectable only when their engine and
-accelerator evidence is complete. Unsupported, config-only, and incomplete
-entries remain visible but disabled. Pickle variants also remain disabled unless
-the logical catalog model explicitly sets `allow_pickle`. Local admin-managed
-deployments are always one replica and omit cluster-only label, spread, and
-heterogeneous placement controls. The authority-node form adds those controls
-for signed cluster placement. Both forms cover pull and warm behavior,
-keepalive, concurrency, queueing, engine, and rollout. License acknowledgement
-is required when selecting a model that needs it.
-
-Admin-managed edits replace the complete map with compare-and-swap. A conflict
-keeps the submitted form and attempted map visible, reloads current state, and
-requires an explicit retry after the operator compares them. Removal is
-blocked while runtime evidence is stale or the deployment is ready,
-preparing, or draining. File-managed and cluster verifier views explain their
-read-only authority instead of offering a local save action.
-
-Any non-conflict mutation failure also reloads catalog, desired state, and
-runtime status because the durable authority may already have advanced. Signed
-cluster failures additionally reload the authority cursor and signed bundle.
-The operator draft remains open throughout recovery.
-
-### Cluster health and unhealthy-node callouts
-
-`GET /admin/cluster/status` is the backend contract for the admin cluster
-view. It never removes a failed node merely to make the fleet look healthy.
-The `nodes` array is the complete membership roster; each row includes
-membership state, acknowledgement age, local identity, roles, labels, reported
-health, stable unhealthy reasons, model endpoint, snapshot age and generation,
-engine/device/artifact counts, replicas, model eligibility, and exclusion
-reason.
-
-The separate `unhealthy_nodes` array is intentionally redundant. It gives the
-UI a direct alert feed while the same nodes remain visible in the full table.
-The directory retains bounded dead-node tombstones after SWIM routing GC, so a
-failed node does not disappear merely because it is no longer a routing owner.
-The summary includes total, healthy, degraded, and unhealthy nodes, eligible
-workers and replicas, deployment digest mismatch, rollout count, and unplaced
-replicas. Deployment rows include exact assignments, rejection reasons,
-retained and draining generations, readiness, timeout, and handoff deadline.
-
-```bash
-curl -u "admin:${SB_ADMIN_PASSWORD}" \
-  "${SB_ADMIN_URL}/admin/cluster/status" | jq '{summary,nodes,unhealthy_nodes}'
-
-sbproxy cluster status \
-  --admin-url "${SB_ADMIN_URL}" \
-  --username admin \
-  --format text
-```
-
-The Cluster page renders the local node first, then the complete roster, with a
-health rail and prominent unhealthy-node alerts. It keeps stale nodes visible,
-marks stale directory evidence, warns when a refresh fails, and shows rollout
-assignments, rejection reasons, generations, readiness, and handoff state.
-Fleet metrics come from the separate cluster metrics endpoint and do not hide
-roster or rollout evidence when metrics are unavailable.
-
-The authority node can publish the signed complete deployment map from the
-Model host page. The UI accepts a deployment bundle only when its active
-revision, digest, signer, key, and catalog revision form one coherent proof.
-A missing bundle is valid only for a fresh authority with no active revision;
-its first publication is revision 1. Stale or same-revision conflicting
-publication returns `409`. Verifier nodes display the proof and remain
-read-only.
-
-Config values support environment-variable interpolation (`${ENV_VAR}`)
-and secret backend references (HashiCorp Vault, AWS and GCP Secret
-Manager, Kubernetes Secrets, or a local secret file). The `/admin/config`
-editor reads and writes the raw config text, so those references are
-stored and shown exactly as written: a secret is never resolved into the
-saved config or exposed in the editor, and env vars resolve from the
-running process at load time. See [secrets.md](secrets.md) for the
-reference schemes.
-
-**API keys and upstream credentials.** Full lifecycle over HTTP: create
-(the plaintext token is returned once, on creation), list, get, edit
-policy and attribution, delete, revoke, block, unblock, and
-grace-window rotate.
-
-| Method | Path |
+| Family | Covers |
 |---|---|
-| POST, GET | `/admin/keys` |
-| GET, PATCH, DELETE | `/admin/keys/{id}` |
-| POST | `/admin/keys/{id}/revoke`, `/block`, `/unblock`, `/rotate` |
-| POST, GET | `/admin/credentials` |
-| GET, PATCH, DELETE | `/admin/credentials/{id}` |
+| Health and readiness | `/healthz`, `/health`, `/readyz`, `/livez` — unauthenticated probes. |
+| Session | `/admin/login`, `/admin/logout`, `/admin/session` — browser-session establishment and CSRF. |
+| Config and pipeline | `/admin/config`, `/admin/reload`, `/admin/drift`, `/admin/log-level`, `/api/health/targets`, the OpenAPI mirror. |
+| API keys and credentials | Full virtual-key and upstream-credential lifecycle: mint, list, edit policy, revoke, block, rotate, delete. |
+| Model host | Catalog, desired-state deployments, runtime status, lifecycle (load/stop/reset), the artifact cache, and the local-serving + compression value report. |
+| Cluster | Roster and health, signed deployment publication, one-time enrollment, fleet metrics, the replicated-state substrate. |
+| AI compression session state | Content-free session metadata, admin-gated content inspection, delete, and bounded purge — see [ai-context-compression.md](ai-context-compression.md). |
+| Cache | Response-cache status/purge, semantic-cache decisions, key-policy cache invalidation. |
+| Prompts | The runtime prompt-overlay snapshot, versioning, and pinning. |
+| Observability | `/metrics`, the request log and its live stream, spend, audit, and rate-limit budget state. |
+| Chat playground | Run a real chat completion against any configured AI endpoint from the dashboard. |
 
-Key policy covers allowed and blocked models and providers, budgets, PII
-rules, principal selectors, route-to-model, injected tools, tags,
-tenant, and expiry. Changes take effect without a reload. These keys are
-cluster-shared only when the keystore backend is Redis or the mesh tier;
-the default embedded and memory backends are per-node. See
-[key-management.md](key-management.md).
+Two things worth calling out here because they affect how you read the config
+reference below:
 
-**Prompts.**
+- **API keys and upstream credentials** are cluster-shared only when the
+  keystore backend is Redis or the mesh tier; the default embedded and memory
+  backends are per-node. Key policy takes effect without a reload. See
+  [key-management.md](key-management.md).
+- **`/admin/config`** reads and writes the raw config text, so
+  environment-variable interpolation (`${ENV_VAR}`) and secret-backend
+  references are stored and shown exactly as written — a secret is never
+  resolved into the saved config or exposed in the editor. See
+  [secrets.md](secrets.md).
+- **Model host and cluster deployment mutations** are authority-gated:
+  `PUT /admin/model-host/deployments` only works under `admin_managed`
+  authority (`file_managed` config stays read-only through this API; cluster
+  authority instead publishes through `POST /admin/cluster/deployments` on
+  the authority node, with verifier nodes read-only). See
+  [model-host.md](model-host.md#authenticated-catalog-and-local-deployment-api).
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/admin/prompts` | Runtime prompt-overlay snapshot. |
-| POST | `/admin/prompts/{host}/{name}/versions` | Add a prompt version. |
-| PUT | `/admin/prompts/{host}/{name}/pin` | Pin the default version. |
-
-**Observability.**
-
-| Method | Path | Returns |
-|---|---|---|
-| GET | `/metrics` | Prometheus / OpenMetrics text (also on the data-plane port). |
-| GET | `/api/requests` | Recent-request ring buffer. Filters: `status`, `method`, `path` (substring), `offset`, `limit`. |
-| GET | `/api/requests/stream` | Server-Sent-Events tail: a `data:` event per new request. |
-| GET | `/api/usage/spend` | Token and USD spend totals from the AI cost metrics. |
-| GET | `/api/audit/recent?limit=` | Recent rate-limit budget audit rows. |
-| GET | `/api/rate_limits/budget` | Per-workspace budget state: tier and suspend cool-down. |
-| POST | `/api/rate_limits/resume` | Manually clear a workspace's escalation, `{"workspace":"<id>"}`. |
-
-Metrics are per-instance: each process exposes only its own counters.
-For a cluster, an external Prometheus scrapes every instance and
-aggregates with PromQL; the Grafana dashboards in `dashboards/` already
-sum across instances. See [observability.md](observability.md).
+Metrics are per-instance: each process exposes only its own counters. For a
+cluster, an external Prometheus scrapes every instance and aggregates with
+PromQL; the Grafana dashboards in `dashboards/` already sum across instances.
+See [observability.md](observability.md).
 
 ## The built-in web UI
 
-A Vue single-page app drives the endpoints above (keys and credentials,
-config and drift, logs, metrics, prompts, model management, and cluster
-operations). It is off
-by default and lives behind a cargo feature so the lean binary carries
-no front-end assets.
+A Vue single-page app drives every endpoint above: keys and credentials,
+config and drift, logs (with live tail), metrics, spend, AI performance,
+guardrails, prompts, a chat playground, the response/semantic cache, model
+host management, artifact storage, audit, and the full cluster roster and
+health rail. It is off by default and lives behind a cargo feature so the
+lean binary carries no front-end assets.
 
 Build and enable it:
 
 ```bash
-cd ui && npm install && npm run build   # produces ui/dist/
+cd ui && npm ci && npm run build   # produces ui/dist/
 cargo build --release -p sbproxy --features embed-admin-ui
 ```
 
-Then open `http(s)://<bind>:<port>/admin/ui`. The UI logs in through
+Then open `http(s)://<bind>:<port>/admin/ui/`. The UI logs in through
 `POST /admin/login`, stores the returned CSRF token, and sends it on
 writes; the session cookie carries the rest. It inherits whatever auth,
 roles, and TLS the admin server is configured with, so put it behind TLS
@@ -565,19 +222,10 @@ before using it over anything but loopback.
 
 ![The admin sign-in form: username and password fields on a plain card](assets/admin-login.png)
 
-After sign-in, the Overview page shows live health with per-component checks, version, uptime, and the model host at a glance:
-
 ![The Overview page: health ok, per-component checks, a request-log count, and the model host section](assets/admin-overview.png)
 
-The Keys page lists every virtual key with its status, policy, budget, and expiry, and carries the mint, edit, rotate, block, revoke, and delete actions inline:
-
-![The Keys page: three active keys in a table with per-key Edit, Rotate, Block, Revoke, and Delete buttons](assets/admin-keys.png)
-
-Logs is the queryable view over the recent-request ring buffer, filterable by method, status, and path, with a control that retargets the tracing level at runtime:
-
-![The Logs page: recent requests with method, path, status, and duration, plus a tracing-level control](assets/admin-logs.png)
-
-The screenshots above were captured against a `--features embed-admin-ui` release build running a key-management example; to recapture after a UI change, boot `examples/use-case-own-openrouter/` and sign in.
+See [admin-ui.md](admin-ui.md) for a page-by-page reference: what each of
+the seventeen pages shows, what it can mutate, and which API paths back it.
 
 ## Security notes
 
@@ -598,3 +246,9 @@ config-write endpoints, and the embedded UI are all shipped. Remaining
 follow-ups are single-sign-on / external identity providers for
 operators, and per-route scopes finer than the `read_only` / `admin`
 split.
+
+## See also
+
+- [admin-api-guide.md](admin-api-guide.md) - task-oriented walkthrough: login/CSRF, roles, a curl cookbook.
+- [admin-api-reference.md](admin-api-reference.md) - every route, every field, every status code.
+- [admin-ui.md](admin-ui.md) - the built-in dashboard, page by page.
