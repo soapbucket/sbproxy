@@ -1,4 +1,4 @@
-//! Shipping contract for the Redis AI compression example.
+//! Shipping contract for the AI compression state-backend examples.
 
 use serde_yaml::Value;
 use std::path::{Path, PathBuf};
@@ -52,6 +52,35 @@ fn external_state_example_compiles_and_selects_redis() {
         .expect("ordered compression levers");
     assert_eq!(levers[0]["type"].as_str(), Some("summary_buffer"));
     assert_eq!(levers[1]["type"].as_str(), Some("window_fit"));
+}
+
+#[test]
+fn mesh_state_example_compiles_selects_mesh_and_configures_replication() {
+    std::env::set_var("OPENAI_API_KEY", "sk-test-compression-example");
+
+    let name = "ai-context-compression-mesh";
+    let (yaml, readme) = example(name);
+    sbproxy_config::compile_config(&yaml)
+        .unwrap_or_else(|error| panic!("{name}/sb.yml must compile: {error:#}"));
+    let compression = compression_action(&yaml);
+    assert_eq!(compression["state"]["backend"].as_str(), Some("mesh"));
+
+    // The mesh backend is only valid on top of cluster replication; the
+    // example must ship the replication block it depends on.
+    let parsed = serde_yaml::from_str::<Value>(&yaml).expect("example YAML parses");
+    assert!(
+        parsed["proxy"]["cluster"]["replication"].is_mapping(),
+        "{name}/sb.yml must configure proxy.cluster.replication"
+    );
+
+    // The runbook states the backend choice honestly: Redis stays the
+    // default recommendation and the contracts differ.
+    for required in ["redis", "mesh", "conflict_detected"] {
+        assert!(
+            readme.to_ascii_lowercase().contains(required),
+            "{name}/README.md must mention {required}"
+        );
+    }
 }
 
 #[test]

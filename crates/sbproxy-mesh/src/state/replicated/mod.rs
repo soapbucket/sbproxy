@@ -21,9 +21,11 @@
 //! the configured consistency level. Reads reconcile divergent replicas
 //! with the causal merge and repair stale ones in-line.
 //!
-//! This substrate is internal. Public configuration cannot select it as a
-//! compression-state backend until every WOR-1947 acceptance criterion is
-//! proven; re-enabling `backend: mesh` is an explicitly separate change.
+//! The AI compression session store selects this substrate through
+//! `compression.state.backend: mesh`; that adapter builds conditional
+//! writes from [`ReplicatedStore::get_versioned`] and
+//! [`ReplicatedStore::put_versioned`] and documents its consistency
+//! contract in `docs/ai-context-compression.md`.
 
 pub mod admin;
 pub mod maintenance;
@@ -154,6 +156,23 @@ pub struct ReadOutcome {
     pub repaired: usize,
 }
 
+/// Outcome of a replicated read that also surfaces the winning register's
+/// metadata (logical version, writer, tombstone and conflict flags).
+/// Adapters that build conditional writes on top of the causal merge need
+/// this to establish the version they are extending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionedReadOutcome {
+    /// The reconciled winning register; `None` when no replica holds the
+    /// key at all.
+    pub register: Option<VersionedLwwRegister>,
+    /// Decoded application value; `None` for missing or deleted keys.
+    pub value: Option<Bytes>,
+    /// Replicas that answered the read.
+    pub responses: usize,
+    /// Stale replicas repaired in-line by this read.
+    pub repaired: usize,
+}
+
 /// Callback resolving a node ID to its transport address.
 pub type PeerAddrFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// Callback reporting whether this node is currently isolated.
@@ -250,9 +269,53 @@ impl ReplicatedStore {
             .await
     }
 
+    /// Write `value` under `key` at an explicit logical version, extending
+    /// a version the caller has already observed through
+    /// [`Self::get_versioned`]. This is the conditional-write building
+    /// block for adapters that need compare-and-set semantics on top of
+    /// the causal merge: a replica already holding a higher version fences
+    /// the record out, and a concurrent writer claiming the same version
+    /// resolves through the deterministic LWW order, which the loser
+    /// detects by reading back. The fan-out itself acknowledges applies,
+    /// not victories, so callers verify the winner with a follow-up
+    /// [`Self::get_versioned`].
+    pub async fn put_versioned(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl_secs: u64,
+        logical_version: u64,
+        parent_logical_version: Option<u64>,
+    ) -> Result<WriteReceipt, StateError> {
+        if (self.is_isolated)() && self.settings.write_consistency != Consistency::One {
+            return Err(StateError::Isolated);
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+        let register = VersionedLwwRegister::live(
+            encoded,
+            &self.local_node_id,
+            (self.clock)(),
+            logical_version,
+            parent_logical_version,
+        );
+        self.fan_out(key, register, ttl_secs).await
+    }
+
     /// Read `key` at the configured read consistency, reconciling replica
     /// divergence with the causal merge and repairing stale replicas.
     pub async fn get(&self, key: &str) -> Result<ReadOutcome, StateError> {
+        let outcome = self.get_versioned(key).await?;
+        Ok(ReadOutcome {
+            value: outcome.value,
+            responses: outcome.responses,
+            repaired: outcome.repaired,
+        })
+    }
+
+    /// [`Self::get`] with the winning register's metadata attached, for
+    /// adapters that need the version and writer of the reconciled record
+    /// rather than just its value.
+    pub async fn get_versioned(&self, key: &str) -> Result<VersionedReadOutcome, StateError> {
         if (self.is_isolated)() && self.settings.read_consistency != Consistency::One {
             return Err(StateError::Isolated);
         }
@@ -320,7 +383,7 @@ impl ReplicatedStore {
             }
         }
 
-        let value = match winner {
+        let value = match winner.as_ref() {
             Some(w) if !w.is_tombstone() => {
                 let encoded = w.value().unwrap_or_default();
                 let decoded = base64::engine::general_purpose::STANDARD
@@ -330,7 +393,8 @@ impl ReplicatedStore {
             }
             _ => None,
         };
-        Ok(ReadOutcome {
+        Ok(VersionedReadOutcome {
+            register: winner,
             value,
             responses: responses.len(),
             repaired,

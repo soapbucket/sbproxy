@@ -75,6 +75,13 @@
           "enum": [
             "redis"
           ]
+        },
+        {
+          "description": "Replicated mesh storage over the cluster replication substrate. Requires `proxy.cluster.replication`; conditional writes converge through causal last-writer-wins merging.",
+          "type": "string",
+          "enum": [
+            "mesh"
+          ]
         }
       ]
     },

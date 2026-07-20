@@ -1,13 +1,14 @@
 # AI context compression
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-20*
 
 SBproxy can transform an AI chat request through an ordered, route-local
 compression pipeline before provider selection and dispatch. A route can keep
 one default pipeline and declare named profiles for different callers. Use
 `window_fit` for stateless, deterministic trimming. Add `summary_buffer` when
-conversations need a compact running summary stored in Redis so gateway
-workers can restart and successive turns can land on different replicas.
+conversations need a compact running summary stored in a shared state backend
+(Redis by default, or the replicated mesh substrate) so gateway workers can
+restart and successive turns can land on different replicas.
 
 This page is the canonical operator guide for compression configuration,
 runtime behavior, state, degradation, and telemetry.
@@ -353,27 +354,95 @@ compression runtime remains covered by
 `sbproxy_ai_compression_redis_coordination_total`; it does not double-count its
 async operations in the synchronous families.
 
-## Why mesh is not a supported state backend
+## Choosing a state backend: Redis or mesh
 
-`compression.state.backend` currently accepts only `redis`.
-`proxy.cluster.replication` provides a durable replicated mesh substrate with
-quorum consistency, restart recovery, ownership handoff, repair, and tombstone
-garbage collection. Compression's retained experimental mesh adapter still
-targets the legacy single-owner cache, however; it is not integrated with or
-validated against `ReplicatedStore` for session and Admin lifecycle semantics.
-SBproxy therefore rejects `backend: mesh` during configuration parsing.
-Enabling cluster replication does not change compression state behavior.
+`compression.state.backend` accepts `redis` and `mesh`. Redis is the default
+recommendation. It serializes every update with a distributed lease, a
+monotonic fence, and an atomic compare-and-set, so a cross-node update race is
+prevented before any write happens. Choose `mesh` for a Redis-free fleet that
+already runs `proxy.cluster.replication` and can accept eventually consistent
+session summaries.
+
+The two contracts are different; do not treat them as interchangeable:
+
+| Property | `redis` | `mesh` |
+|---|---|---|
+| External dependency | Redis service via `proxy.l2_cache_settings` | None beyond `proxy.cluster.replication` |
+| Update serialization | Distributed lease and fence across all workers | Worker-local lease only; cross-node writers race |
+| Compare-and-set | Atomic inside one Lua script | Conditional put with read-back verification |
+| Concurrent equal-version writers | Blocked by the lease or rejected before writing | Deterministic last-writer-wins merge; the loser fails with a stale-version error, the survivor is flagged `conflict_detected` |
+| Reported consistency | `serialized` | `eventual_lww` |
+| Durability | Redis persistence configuration | `factor` replicated copies, quorum acknowledgements, redb shards under `state_dir` |
+| Partition behavior | The unreachable side fails open per request | Divergence converges through the causal merge after the heal; deletes cannot resurrect |
+
+Enabling cluster replication by itself changes nothing here: compression stays
+on whatever backend the configuration selects, and a route without a `state`
+block keeps none. The backend switch is always the explicit
+`compression.state.backend` value.
+
+### Mesh state
+
+`backend: mesh` requires `proxy.cluster.replication` on every node. Selecting
+mesh without cluster replication fails at startup with a message naming the
+missing block; it never falls back to a weaker store. See
+[mesh-replication.md](mesh-replication.md) for the substrate's configuration
+and its consistency contract.
+
+Session records are replicated keys with the `compression:v1:` prefix on the
+cluster substrate. The write path behaves as follows:
+
+- `acquire_update` grants a worker-local permit. It short-circuits duplicate
+  summarizer work inside one process; it does not block writers on other
+  nodes. Serialization across nodes comes from the version check below, not
+  from the permit.
+- A commit reads the current replicated version at the configured read
+  consistency, rejects a stale expectation, writes the record at exactly the
+  next logical version, then reads the key back and requires that write to be
+  the reconciled winner. Two nodes that race the same parent version produce
+  exactly one surviving record cluster-wide: the loser's request degrades
+  safely with a stale-version failure (the request proceeds uncompressed for
+  that lever), and the surviving record carries `conflict_detected: true`.
+- A delete replicates a tombstone through the same quorum write path.
+  Tombstones fence stale live copies on every replica and are collected only
+  by acknowledgement-aware garbage collection, so a deleted summary does not
+  resurrect after a partition, restart, or rebalance. A writer that has read
+  the tombstone re-creates the session at the next version.
+
+With the default `quorum` read and write consistency, read and write replica
+sets overlap, so the commit verification observes any competing committed
+write. At `consistency: one`, a partition can accept equal-version updates on
+both sides; after the heal the causal merge settles one deterministic winner
+on every replica and flags the conflict. Summaries are derived state: the
+losing side's content is regenerated from the conversation on a later turn.
+
+The configured `state.ttl` bounds each live record's replicated lifetime.
+Tombstones ignore TTL and remain until every replica of the key acknowledges
+the deletion.
+
+Admin listing and purge enumerate mesh session state through the substrate's
+topology-safe fleet pagination: pages are bounded, a cursor keeps working
+while nodes join or leave mid-walk, and a record held by any current member is
+listed. A record replicated on several nodes can appear in more than one page,
+so collapse results by `id`. If a current member cannot be queried, the
+listing fails rather than returning a silently partial page.
+
+Mesh-backed state shares `sbproxy_ai_compression_state_operations_total` and
+`sbproxy_ai_compression_state_operation_duration_seconds` with
+`backend="mesh"`, and reports coordination pressure in
+`mesh_compression_coordination_total`. Replication health itself is covered by
+the substrate's `mesh_replication_*`, `mesh_anti_entropy_*`, `mesh_handoff_*`,
+and `mesh_tombstone_gc_*` families.
 
 ## Configuration reference
 
 | Field | Required | Constraint |
 |---|---|---|
-| `compression.state.backend` | For `summary_buffer` | `redis` |
+| `compression.state.backend` | For `summary_buffer` | `redis` (default recommendation) or `mesh` (requires `proxy.cluster.replication`) |
 | `compression.state.ttl` | For `summary_buffer` | Positive seconds or human duration |
 | `compression.allow_admin_content_inspection` | No | Default `false`; enables audited Admin-only content inspection for configured origins |
 | `compression.levers` | No | Ordered list; an explicit empty list disables compression |
 | `compression.profiles` | No | Route-local map of named pipelines selectable by a request, governed key, or CEL |
-| `compression.profiles.<name>.state` | For a profile with `summary_buffer` | `redis`; independent of the route default state |
+| `compression.profiles.<name>.state` | For a profile with `summary_buffer` | `redis` or `mesh`; independent of the route default state |
 | `compression.profiles.<name>.levers` | No | Ordered levers for this named profile; an empty list selects no runtime |
 | `summary_buffer.min_tokens` | Yes | Greater than zero |
 | `summary_buffer.retain_recent_messages` | Yes | Greater than zero |
@@ -393,8 +462,10 @@ single-record deletion, and bounded purge are documented in the
 `allow_admin_content_inspection: false` unless an audited operational workflow
 requires content access. Do not operate on backend keys directly.
 
-Metadata listing and purge scan the shared Redis namespace using bounded pages
-and opaque cursors.
+Metadata listing and purge use bounded pages and opaque cursors on both
+backends: a Redis-backed store scans its shared Redis namespace, and a
+mesh-backed store walks the replicated substrate's topology-safe fleet
+pagination.
 
 ## Semantic cache interaction
 
@@ -509,16 +580,20 @@ double-counted in the request distribution.
 | `sbproxy_ai_compression_state_operations_total` | Counter | `backend`, `operation`, `outcome` | External state operations |
 | `sbproxy_ai_compression_state_operation_duration_seconds` | Histogram | `backend`, `operation`, `outcome` | External state operation latency |
 | `sbproxy_ai_compression_redis_coordination_total` | Counter | `event` | Redis contention and rejected update events |
+| `mesh_compression_coordination_total` | Counter | `event` | Mesh contention and rejected update events |
 | `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Per-lever target-model input tokens avoided on terminal provider success |
 | `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross target-model input cost avoided on terminal provider success, in micro-USD |
 
-`lever` is `summary_buffer` or `window_fit`. `backend` is `redis` or `none`.
-Request `cache_bypass` is `true` or `false`. State `operation` is
+`lever` is `summary_buffer` or `window_fit`. `backend` is `redis`, `mesh`, or
+`none`. Request `cache_bypass` is `true` or `false`. State `operation` is
 `get`, `commit`, `delete`, `list`, or `purge`; its `outcome` is `ok`,
 `missing`, or `error`.
 
-Redis coordination `event` values are `contention`, `lease_expiry`,
-`stale_version`, and `fence_rejection`.
+Coordination `event` values are `contention`, `lease_expiry`,
+`stale_version`, and `fence_rejection` on both coordination counters. On the
+mesh counter, `contention` and the lease events describe worker-local permits,
+and `stale_version` includes a deterministic loss to a concurrent
+equal-version writer.
 
 Value `token_count_precision` is `model_tokenizer` or `heuristic`. Selection
 `source` is `header`, `governed_key`, `cel_policy`, or

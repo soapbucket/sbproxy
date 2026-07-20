@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-20*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -684,8 +684,8 @@ record endpoint places the same object in `record`.
 | Field | Type | Description |
 |---|---|---|
 | `id` | string | Opaque canonical record ID, 64 lowercase hexadecimal characters. |
-| `backend` | string | `redis`. |
-| `consistency` | string | `serialized`. |
+| `backend` | string | `redis` or `mesh`. |
+| `consistency` | string | `serialized` for Redis records, `eventual_lww` for mesh records. |
 | `schema_version` | int | External record serialization schema version. |
 | `tenant_id` | string | Tenant isolation and filtering boundary. |
 | `origin` | string | Normalized AI handler hostname. |
@@ -697,11 +697,11 @@ record endpoint places the same object in `record`.
 | `summarizer_provider` | string | Configured internal summarizer provider name. |
 | `summarizer_model` | string | Configured internal summarizer model name. |
 | `writer_node` | string | Configured cluster node ID, or the literal `standalone` outside cluster mode. It is not a credential or guaranteed unique process ID. |
-| `conflict_detected` | bool | Always `false` for the current serialized Redis backend. Retained for metadata compatibility. |
+| `conflict_detected` | bool | Always `false` for the serialized Redis backend. On the mesh backend, `true` when the record survived a deterministic merge of competing equal-version updates. |
 | `created_at_unix_ms` | int | Creation time in Unix milliseconds. |
 | `updated_at_unix_ms` | int | Last update time in Unix milliseconds. |
 | `expires_at_unix_ms` | int | Backend expiration time in Unix milliseconds. |
-| `kind` | string | `live` for Redis records returned by these endpoints. |
+| `kind` | string | `live` for Redis records returned by these endpoints. Mesh records can also report `tombstone` while a replicated deletion marker is retained; tombstone entries carry empty content metadata. |
 
 Metadata never contains `summary`, a raw session ID, raw messages, protected or
 covered message digests, or credential material. The opaque ID is derived from
@@ -747,7 +747,7 @@ Supported query parameters:
 |---|---|---|
 | `tenant` | non-empty string | Exact tenant filter. |
 | `origin` | non-empty hostname | Origin filter. Input is trimmed, lowercased, and has a trailing dot removed. |
-| `backend` | `redis` | Restrict the scan to Redis. Any other value returns `400`. |
+| `backend` | `redis`, `mesh` | Restrict the scan to one configured backend. Any other value returns `400`. |
 | `conflict` | `true`, `false` | Match `conflict_detected`. |
 | `cursor` | opaque string | Continue from `next_cursor` returned by the preceding list call. |
 | `limit` | positive integer | Page size. Defaults to 100; values above the maximum of 500 are clamped to 500. |
@@ -757,6 +757,12 @@ booleans or backends, a zero or non-integer limit, and an invalid cursor return
 `400`. Redis listing scans the shared Redis namespace through bounded pages and
 an opaque cursor. Redis expires records at their TTL, so expired records are
 not retained as a separate Admin-visible collection and cannot be filtered.
+Mesh listing walks the replicated substrate's topology-safe fleet pagination:
+a record held by any current cluster member is listed, a cursor keeps working
+while nodes join or leave, and a record replicated on several nodes can appear
+in more than one page, so collapse results by `id`. If a current member cannot
+be queried the mesh listing fails with `503` instead of returning a silently
+partial page.
 
 ### `GET /admin/compression/sessions/{id}`
 

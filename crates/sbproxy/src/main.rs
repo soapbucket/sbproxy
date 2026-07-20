@@ -7303,9 +7303,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_mesh_compression_until_cluster_state_is_durable_and_replicated() {
-        let path = temp_config(
-            r#"proxy:
+    fn validate_gates_mesh_compression_on_cluster_replication() {
+        fn mesh_compression_config(replication_block: &str) -> String {
+            format!(
+                r#"proxy:
   cluster:
     cluster_id: compression-test
     node_id: gateway-a
@@ -7316,7 +7317,7 @@ mod tests {
     advertise_addr: "127.0.0.1:17946"
     transport_advertise_addr: "127.0.0.1:18946"
     state_dir: ./state/compression-test
-    security:
+{replication_block}    security:
       mode: shared_key
       development: true
       shared_key: validation-only-secret
@@ -7332,7 +7333,7 @@ origins:
           api_key: test-key
           models: [gpt-4o-mini]
       compression:
-        state: { backend: mesh, ttl: 1h }
+        state: {{ backend: mesh, ttl: 1h }}
         levers:
           - type: summary_buffer
             min_tokens: 100
@@ -7342,15 +7343,33 @@ origins:
               provider: summarizer
               model: gpt-4o-mini
               timeout: 2s
-"#,
-        );
+"#
+            )
+        }
 
-        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        // A cluster without a replication block cannot host mesh
+        // compression state; boot and validation fail loud.
+        let rejected = temp_config(&mesh_compression_config(""));
+        assert!(handle_validate_subcommand(&validate_args(&rejected, false)).is_err());
         assert_eq!(
-            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            handle_validate_subcommand(&validate_args(&rejected, true)).unwrap(),
             2
         );
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rejected);
+
+        // With cluster replication configured, backend: mesh validates.
+        let accepted = temp_config(&mesh_compression_config(
+            "    replication:\n      factor: 2\n",
+        ));
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&accepted, false)).unwrap(),
+            0
+        );
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&accepted, true)).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_file(&accepted);
     }
 
     #[test]

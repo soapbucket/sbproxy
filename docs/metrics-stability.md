@@ -31,6 +31,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `mesh_anti_entropy_keys_total` | Counter | `stable` | `beta` | `direction` | Records reconciled by replicated-substrate anti-entropy, by push or pull direction. |
 | `mesh_anti_entropy_rounds_total` | Counter | `stable` | `beta` | none | Completed replicated-substrate maintenance rounds (handoff, anti-entropy, tombstone GC). |
 | `mesh_cold_start_snapshots_total` | Counter | `stable` | `beta` | `outcome` | Snapshots encountered during cold-start hydration, by outcome (merged, stale, corrupt). |
+| `mesh_compression_coordination_total` | Counter | `stable` | `beta` | `event` | Mesh compression session coordination contention and rejected updates, by closed event (contention, lease_expiry, stale_version, fence_rejection). |
 | `mesh_crypto_decrypt_failed_total` | Counter | `stable` | `beta` | `kind` | Mesh messages dropped because AEAD decryption failed, by crypto boundary (gossip or transport). |
 | `mesh_dead_peers_gc_total` | Counter | `stable` | `beta` | none | Dead peers removed from the peer table by the garbage collector. |
 | `mesh_dissemination_updates_applied_total` | Counter | `stable` | `beta` | `transition` | Inbound gossip peer updates that changed local peer state, by transition. |
