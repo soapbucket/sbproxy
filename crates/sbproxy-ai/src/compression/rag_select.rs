@@ -1,10 +1,12 @@
 //! Retrieval-aware selection for explicitly marked context.
 
 use crate::compression::marked_context::ranking::{rank_chunks, RankError};
-use crate::compression::marked_context::{parse_marked_messages, MarkedContextError};
+use crate::compression::marked_context::{
+    parse_marked_messages, MarkedContextError, RetrievalBlock,
+};
 use crate::compression::{
-    CompressionBackend, CompressionDecision, CompressionLever, CompressionRequest, LeverKind,
-    RagSelectConfig, SkipReason,
+    CompressionBackend, CompressionDecision, CompressionLever, CompressionRequest, FailureReason,
+    LeverKind, RagSelectConfig, SkipReason,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -15,10 +17,61 @@ pub struct RagSelectLever {
     config: RagSelectConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockOutcome {
+    MissingRelevanceScore,
+    NoSelectedChunks,
+    BelowThreshold,
+    NotNeeded,
+    InternalFailure,
+}
+
 impl RagSelectLever {
     /// Construct a retrieval selection lever from validated configuration.
     pub const fn new(config: RagSelectConfig) -> Self {
         Self { config }
+    }
+
+    fn stabilize_block(&self, model: &str, block: &mut RetrievalBlock) -> BlockOutcome {
+        let minimum_score = f64::from(self.config.min_relevance_percent) / 100.0;
+        // Every nonterminal iteration either removes at least one chunk or applies
+        // one deterministic same-set ordering that compares equal on the next pass.
+        let iteration_bound = block.chunks().len() + 2;
+
+        for _ in 0..iteration_bound {
+            if crate::token_estimate::estimate_text_tokens(model, &block.render())
+                < self.config.min_tokens
+            {
+                return BlockOutcome::BelowThreshold;
+            }
+
+            let ranked = match rank_chunks(block, self.config.ranking) {
+                Ok(ranked) => ranked,
+                Err(RankError::MissingSuppliedScore) => {
+                    return BlockOutcome::MissingRelevanceScore;
+                }
+            };
+            let selected = ranked
+                .into_iter()
+                .filter(|ranked| ranked.score >= minimum_score)
+                .take(self.config.max_chunks)
+                .map(|ranked| block.chunks()[ranked.index].clone())
+                .collect::<Vec<_>>();
+
+            if selected.is_empty() && !self.config.drop_empty {
+                return BlockOutcome::NoSelectedChunks;
+            }
+            if selected.as_slice() == block.chunks() {
+                return if selected.is_empty() {
+                    BlockOutcome::NoSelectedChunks
+                } else {
+                    BlockOutcome::NotNeeded
+                };
+            }
+            block.replace_chunks(selected);
+        }
+
+        BlockOutcome::InternalFailure
     }
 }
 
@@ -56,41 +109,22 @@ impl CompressionLever for RagSelectLever {
             }
         };
 
-        let minimum_score = f64::from(self.config.min_relevance_percent) / 100.0;
         let mut missing_relevance_score = false;
         let mut no_selected_chunks = false;
         let mut below_threshold = false;
 
         for block in marked.blocks_mut() {
-            if crate::token_estimate::estimate_text_tokens(request.model(), &block.render())
-                < self.config.min_tokens
-            {
-                below_threshold = true;
-                continue;
-            }
-
-            let ranked = match rank_chunks(block, self.config.ranking) {
-                Ok(ranked) => ranked,
-                Err(RankError::MissingSuppliedScore) => {
-                    missing_relevance_score = true;
-                    continue;
+            match self.stabilize_block(request.model(), block) {
+                BlockOutcome::MissingRelevanceScore => missing_relevance_score = true,
+                BlockOutcome::NoSelectedChunks => no_selected_chunks = true,
+                BlockOutcome::BelowThreshold => below_threshold = true,
+                BlockOutcome::NotNeeded => {}
+                BlockOutcome::InternalFailure => {
+                    return CompressionDecision::Failed {
+                        reason: FailureReason::Internal,
+                    };
                 }
-            };
-            let selected = ranked
-                .into_iter()
-                .filter(|ranked| ranked.score >= minimum_score)
-                .take(self.config.max_chunks)
-                .map(|ranked| block.chunks()[ranked.index].clone())
-                .collect::<Vec<_>>();
-
-            if selected.is_empty() {
-                no_selected_chunks = true;
-                if self.config.drop_empty {
-                    block.replace_chunks(Vec::new());
-                }
-                continue;
             }
-            block.replace_chunks(selected);
         }
 
         let candidate = marked.into_messages();
@@ -534,6 +568,54 @@ mod tests {
         assert_eq!(messages, original);
         assert_eq!(once, once_original);
         assert_skip(twice, SkipReason::NotNeeded);
+    }
+
+    #[tokio::test]
+    async fn lexical_selection_reaches_a_stable_fixed_point_before_emitting() {
+        let source = block(
+            "a b",
+            &[
+                chunk("unrelated", None, "c"),
+                chunk("first-b", None, "b"),
+                chunk("second-b", None, "b"),
+            ],
+        );
+        let messages = vec![message("user", source)];
+        let lever = RagSelectLever::new(config(1, RetrievalRanking::Lexical, 2, 44, true));
+        let request = CompressionRequest::new("unknown-model");
+
+        let once = candidate_messages(lever.compress(&request, &messages).await);
+        let twice = lever.compress(&request, &once).await;
+        let snapshot = inspect_marked_context(&once)
+            .expect("valid marked context")
+            .expect("one block");
+
+        assert_skip(twice, SkipReason::NoSelectedChunks);
+        assert!(snapshot.blocks[0].chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_score_auto_fallback_reaches_a_stable_fixed_point_before_emitting() {
+        let source = block(
+            "a",
+            &[
+                chunk("lexical-match", Some(0.1), "a"),
+                chunk("supplied-high", Some(0.9), "z"),
+                chunk("unscored", None, "z"),
+            ],
+        );
+        let messages = vec![message("tool", source)];
+        let lever = RagSelectLever::new(config(1, RetrievalRanking::Auto, 1, 20, true));
+        let request = CompressionRequest::new("unknown-model");
+
+        let once = candidate_messages(lever.compress(&request, &messages).await);
+        let twice = lever.compress(&request, &once).await;
+        let snapshot = inspect_marked_context(&once)
+            .expect("valid marked context")
+            .expect("one block");
+
+        assert_skip(twice, SkipReason::NoSelectedChunks);
+        assert!(snapshot.blocks[0].chunks.is_empty());
     }
 
     struct ConstantTokenCounter;
