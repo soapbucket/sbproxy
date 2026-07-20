@@ -219,7 +219,10 @@ target-model token estimate.
 `compact_serialization` examines only marked chunks with `format="json"` whose
 individual target-model estimate reaches `min_tokens`.
 
-The first candidate is canonical whitespace-free JSON. When tabular mode is
+The first candidate is canonical whitespace-free JSON. JSON containing
+duplicate object member names at any nesting depth is unsafe and remains
+byte-for-byte unchanged, because value parsing would otherwise discard one
+member. When tabular mode is
 enabled, the lever may instead encode a top-level JSON array as
 `sbproxy_table_v1` if all of these conditions hold:
 
@@ -324,7 +327,7 @@ The following conditions preserve the original working messages:
 - malformed, nested, or incomplete tags;
 - duplicate chunk identifiers within one block;
 - invalid or missing required scores;
-- invalid JSON;
+- invalid JSON or duplicate JSON object members;
 - unsafe tabular shape;
 - no material change;
 - no token reduction for a strict lever; or

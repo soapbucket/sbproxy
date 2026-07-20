@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 fn scratch_dir() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -55,12 +57,50 @@ fn generate_then_check_detects_report_drift() {
     );
     let json = fs::read_to_string(&json_report).expect("JSON report");
     assert!(json.contains("\"ruler_smoke\""));
-    assert!(json.contains("\"schema_version\": 3"));
+    let decoded: serde_json::Value = serde_json::from_str(&json).expect("valid JSON report");
+    assert_eq!(decoded["schema_version"], 4);
     assert!(json.contains("\"profile\": \"window-fit-smoke-v1\""));
     assert!(json.contains("\"type\": \"window_fit\""));
-    assert!(fs::read_to_string(&markdown_report)
-        .expect("Markdown report")
-        .contains("coding_agent_smoke"));
+    let manifest_bytes = fs::read("fixtures/provenance.json").expect("provenance manifest");
+    let manifest_sha256 = Sha256::digest(&manifest_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let verified = &decoded["verified_provenance"];
+    assert_eq!(verified["manifest_sha256"], manifest_sha256);
+    let artifacts = verified["artifacts"]
+        .as_array()
+        .expect("selected verified artifacts");
+    assert_eq!(artifacts.len(), 2);
+    assert_eq!(
+        artifacts
+            .iter()
+            .map(|artifact| artifact["path"].as_str().expect("artifact path"))
+            .collect::<Vec<_>>(),
+        vec![
+            "fixtures/coding-agent-smoke.jsonl",
+            "fixtures/ruler-smoke.jsonl"
+        ]
+    );
+    for artifact in artifacts {
+        assert_eq!(artifact["license"], "Apache-2.0");
+        assert_eq!(artifact["contains_customer_data"], false);
+        assert_eq!(artifact["official_benchmark_score"], false);
+        assert_eq!(
+            artifact["sha256"].as_str().expect("fixture digest").len(),
+            64
+        );
+        assert!(artifact["provenance"]
+            .as_str()
+            .expect("provenance kind")
+            .starts_with("independently_authored_"));
+    }
+    let markdown = fs::read_to_string(&markdown_report).expect("Markdown report");
+    assert!(markdown.contains("coding_agent_smoke"));
+    assert!(markdown.contains("## Verified provenance"));
+    assert!(markdown.contains(&manifest_sha256));
+    assert!(markdown.contains("fixtures/coding-agent-smoke.jsonl"));
+    assert!(markdown.contains("No customer data; no official benchmark scores."));
 
     let checked = command()
         .arg("check")

@@ -129,14 +129,17 @@ CI runs the matching `check` command for all five deterministic report pairs:
 `check` rejects byte drift and also rejects a regenerated overall
 recommendation other than `build`.
 
-Cases may declare explicit acceptance gates. `min_savings_ratio` and
+Cases may declare acceptance gates. `min_savings_ratio` and
 `min_on_quality_score` must be finite values from 0 through 1.
 `min_quality_delta` must be finite from -1 through 1. `require_non_expanding`
-requires treatment tokens to be no greater than control tokens. When every
-case declares acceptance, `build` requires every gate to pass and no lever to
-fail.
+requires treatment tokens to be no greater than control tokens. A complete
+acceptance gate contains at least one efficiency condition
+(`min_savings_ratio` or `require_non_expanding`) and at least one quality
+condition (`min_on_quality_score` or `min_quality_delta`). When every case has
+a complete gate, `build` requires every declared condition to pass and no
+lever to fail. A failed declared condition always produces `defer`.
 
-Cases without explicit acceptance preserve the earlier smoke fallback:
+Cases without a complete acceptance gate preserve the earlier smoke fallback:
 
 - `build`: at least 20% aggregate savings, treatment quality at least 0.98,
   quality delta no worse than -0.02, and no compression failures;
@@ -144,7 +147,11 @@ Cases without explicit acceptance preserve the earlier smoke fallback:
   delta or failure; and
 - `defer`: all other results, including missing quality.
 
-A case that saves tokens without both off and on quality results is invalid.
+Every case must produce both off and on quality results, even when it saves no
+tokens. Evidence-retention lists and exact-match reference lists must contain
+at least one nonblank value; structural scorer chunk IDs must be nonblank and
+must resolve in the control arm. Missing quality fails closed instead of
+producing a report.
 
 ## Structural quality scorers
 
@@ -183,7 +190,9 @@ Four lever-specific fixtures use independently authored sanitized shapes:
 `fixtures/provenance.json` pins each fixture's origin, Apache-2.0 license,
 privacy declarations, official-score declaration, corpus identity, and exact
 SHA-256 checksum. Generation fails if an input is not covered by the manifest.
-The committed fixture set contains no customer data. It does not claim official benchmark scores.
+Report schema 4 copies the exact manifest SHA-256 and the verified metadata for
+only the selected inputs into both detached JSON and Markdown reports. The
+committed fixture set contains no customer data and does not claim official benchmark scores.
 
 Evidence-retention and structural scores are deterministic. They need no
 provider credential, GPU, or network access. They are acceptance evidence for

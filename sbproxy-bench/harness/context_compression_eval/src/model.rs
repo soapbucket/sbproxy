@@ -63,6 +63,12 @@ impl AcceptanceSpec {
             || self.require_non_expanding
     }
 
+    /// Whether this case declares both an efficiency gate and a quality gate.
+    pub fn is_complete(&self) -> bool {
+        (self.min_savings_ratio.is_some() || self.require_non_expanding)
+            && (self.min_on_quality_score.is_some() || self.min_quality_delta.is_some())
+    }
+
     /// Evaluate the declared gates against one off/on result.
     pub fn passes(
         &self,
@@ -159,6 +165,26 @@ pub enum QualitySpec {
     },
 }
 
+impl QualitySpec {
+    pub(crate) fn validate(&self, case_id: &str) -> Result<()> {
+        match self {
+            Self::EvidenceRetention { required_evidence } => {
+                validate_nonblank_values(case_id, "required_evidence", required_evidence)
+            }
+            Self::ExactMatch {
+                reference_answers, ..
+            } => validate_nonblank_values(case_id, "reference_answers", reference_answers),
+            Self::StructuredEquivalence { chunk_id } | Self::EdgePlacement { chunk_id } => {
+                if chunk_id.trim().is_empty() {
+                    bail_quality(case_id, "chunk_id must not be blank")
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 /// Parse strict normalized JSONL input.
 pub fn parse_cases(reader: impl BufRead) -> Result<Vec<EvalCase>> {
     let cases: Vec<EvalCase> = reader
@@ -186,9 +212,27 @@ pub fn parse_cases(reader: impl BufRead) -> Result<Vec<EvalCase>> {
         if !ids.insert(case.id.as_str()) {
             return Err(anyhow!("duplicate case id `{}`", case.id));
         }
+        case.quality.validate(&case.id)?;
         case.acceptance.validate(&case.id)?;
     }
     Ok(cases)
+}
+
+fn validate_nonblank_values(case_id: &str, name: &str, values: &[String]) -> Result<()> {
+    if values.is_empty() {
+        return bail_quality(
+            case_id,
+            &format!("{name} must contain at least one nonblank value"),
+        );
+    }
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return bail_quality(case_id, &format!("{name} must not contain blank values"));
+    }
+    Ok(())
+}
+
+fn bail_quality<T>(case_id: &str, message: &str) -> Result<T> {
+    Err(anyhow!("case `{case_id}` quality {message}"))
 }
 
 fn validate_threshold(

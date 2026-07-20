@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "profile": "window-fit-smoke-v1",
   "pipeline": [
     {
@@ -10,6 +10,29 @@
   ],
   "token_counter": "sbproxy_target_model",
   "latency_mode": "omitted_for_deterministic_gate",
+  "verified_provenance": {
+    "manifest_sha256": "f96e77cd1248de3c5d0dc9d528e0a21e768a4d335a599caa5d2084f94afbb5b3",
+    "artifacts": [
+      {
+        "path": "fixtures/coding-agent-smoke.jsonl",
+        "corpus": "coding_agent_smoke",
+        "provenance": "independently_authored_sanitized_shape",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "92d9e081601a18de7f16b334672542cb879077514aba0ad936c180d7102da575"
+      },
+      {
+        "path": "fixtures/ruler-smoke.jsonl",
+        "corpus": "ruler_smoke",
+        "provenance": "independently_authored_synthetic",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "2df7a8acb71405294a99dffafdf8c08ad12fe471f09218f1be8cc68387504914"
+      }
+    ]
+  },
   "cases": [
     {
       "id": "coding_agent_diff",

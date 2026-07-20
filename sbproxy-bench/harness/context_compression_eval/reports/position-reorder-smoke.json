@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "profile": "position-reorder-smoke-v1",
   "pipeline": [
     {
@@ -9,6 +9,20 @@
   ],
   "token_counter": "sbproxy_target_model",
   "latency_mode": "omitted_for_deterministic_gate",
+  "verified_provenance": {
+    "manifest_sha256": "f96e77cd1248de3c5d0dc9d528e0a21e768a4d335a599caa5d2084f94afbb5b3",
+    "artifacts": [
+      {
+        "path": "fixtures/position-reorder-smoke.jsonl",
+        "corpus": "position_reorder_smoke",
+        "provenance": "independently_authored_sanitized_shape",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "4152dea5357521514de016917b9620df9ec1a8bc8f20961b054b2c7d0f55f591"
+      }
+    ]
+  },
   "cases": [
     {
       "id": "position_required_center_to_edge",

@@ -29,6 +29,40 @@ pub fn render_markdown(report: &EvalReport) -> String {
         "- Latency mode: `{}`\n\n",
         escape_inline(&report.latency_mode)
     ));
+    output.push_str("## Verified provenance\n\n");
+    if let Some(provenance) = &report.verified_provenance {
+        output.push_str(&format!(
+            "- Manifest SHA-256: `{}`\n",
+            escape_inline(&provenance.manifest_sha256)
+        ));
+        output.push_str(
+            "- Evidence boundary: only the selected, manifest-covered inputs listed below.\n",
+        );
+        if provenance
+            .artifacts
+            .iter()
+            .all(|artifact| !artifact.contains_customer_data && !artifact.official_benchmark_score)
+        {
+            output.push_str("- No customer data; no official benchmark scores.\n");
+        }
+        output.push_str("\n| Path | Corpus | Provenance | License | Customer data | Official score | SHA-256 |\n");
+        output.push_str("|---|---|---|---|---|---|---|\n");
+        for artifact in &provenance.artifacts {
+            output.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                escape_cell(&artifact.path),
+                escape_cell(&artifact.corpus),
+                escape_cell(&artifact.provenance),
+                escape_cell(&artifact.license),
+                yes_no(artifact.contains_customer_data),
+                yes_no(artifact.official_benchmark_score),
+                escape_cell(&artifact.sha256),
+            ));
+        }
+    } else {
+        output.push_str("No verified provenance is attached to this in-memory report.\n");
+    }
+    output.push('\n');
     output.push_str("## Ordered pipeline\n\n");
     for (index, lever) in report.pipeline.iter().enumerate() {
         let config = serde_json::to_string(lever)
@@ -151,6 +185,14 @@ fn passed(value: bool) -> &'static str {
         "pass"
     } else {
         "fail"
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
     }
 }
 

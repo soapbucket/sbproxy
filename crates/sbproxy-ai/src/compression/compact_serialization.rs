@@ -9,7 +9,9 @@ use crate::compression::{
     CompressionRequest, FailureReason, LeverKind, SkipReason,
 };
 use async_trait::async_trait;
-use serde_json::Value;
+use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value};
+use std::fmt;
 
 /// Stateless compact serialization of explicitly marked JSON chunks.
 #[derive(Debug, Clone)]
@@ -23,6 +25,119 @@ enum ChunkOutcome {
     BelowThreshold,
     NotNeeded,
     InternalFailure,
+}
+
+struct UniqueJsonSeed;
+
+impl<'de> DeserializeSeed<'de> for UniqueJsonSeed {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate object members")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_i128<E>(self, value: i128) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Number::from_i128(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("JSON integer is out of range"))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Number::from_u128(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("JSON integer is out of range"))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("JSON number must be finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Value::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or_default());
+        while let Some(value) = sequence.next_element_seed(UniqueJsonSeed)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(A::Error::custom(format!(
+                    "duplicate JSON object member {key:?}"
+                )));
+            }
+            let value = object.next_value_seed(UniqueJsonSeed)?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
+fn parse_unique_json(input: &str) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_str(input);
+    let value = UniqueJsonSeed.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
 }
 
 impl CompactSerializationLever {
@@ -41,7 +156,7 @@ impl CompactSerializationLever {
             return ChunkOutcome::BelowThreshold;
         }
 
-        let value = match serde_json::from_str::<Value>(chunk.body()) {
+        let value = match parse_unique_json(chunk.body()) {
             Ok(value) => value,
             Err(_) => return ChunkOutcome::UnsafeStructuredShape,
         };
@@ -573,6 +688,76 @@ mod tests {
                 .await,
             SkipReason::UnsafeStructuredShape,
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_json_members_are_unsafe_at_every_object_depth() {
+        let lever = CompactSerializationLever::new(config(1, true, 2));
+        for (id, body) in [
+            (
+                "top-level-duplicate",
+                r#"{
+  "answer": "first",
+  "answer": "second",
+  "padding": "duplicate keys must never be collapsed"
+}"#,
+            ),
+            (
+                "nested-duplicate",
+                r#"{
+  "outer": {
+    "answer": "first",
+    "answer": "second"
+  },
+  "padding": "nested duplicate keys must remain exact"
+}"#,
+            ),
+        ] {
+            let messages = vec![message(
+                "tool",
+                block("duplicate members", &[chunk(id, "json", body)]),
+            )];
+            let original = messages.clone();
+
+            assert_skip(
+                lever
+                    .compress(&CompressionRequest::new(HEURISTIC_MODEL), &messages)
+                    .await,
+                SkipReason::UnsafeStructuredShape,
+            );
+            assert_eq!(messages, original, "{id} input bytes must remain unchanged");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_json_stays_exact_when_another_chunk_changes() {
+        let duplicate = r#"{
+  "answer": "first",
+  "answer": "second",
+  "padding": "preserve this duplicate-bearing chunk exactly"
+}"#;
+        let valid = json!({"answer": "x".repeat(80), "ready": true});
+        let pretty = serde_json::to_string_pretty(&valid).unwrap();
+        let messages = vec![message(
+            "tool",
+            block(
+                "mixed duplicate and valid",
+                &[
+                    chunk("duplicate", "json", duplicate),
+                    chunk("valid", "json", &pretty),
+                ],
+            ),
+        )];
+        let lever = CompactSerializationLever::new(config(1, true, 2));
+
+        let output = candidate_messages(
+            lever
+                .compress(&CompressionRequest::new(HEURISTIC_MODEL), &messages)
+                .await,
+        );
+
+        assert_eq!(snapshot_chunk(&output, "duplicate").body, duplicate);
+        assert_eq!(snapshot_chunk(&output, "valid").body, valid.to_string());
     }
 
     #[tokio::test]

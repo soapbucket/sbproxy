@@ -2,9 +2,12 @@
 
 use crate::provider::ProviderConfig;
 use anyhow::bail;
-use schemars::JsonSchema;
+use schemars::schema::{
+    NumberValidation, ObjectValidation, Schema, SchemaObject, SubschemaValidation,
+};
+use schemars::{r#gen::SchemaGenerator, JsonSchema};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Default completion capacity reserved by the legacy window-fit behavior.
@@ -181,14 +184,17 @@ pub enum CompressionLeverConfig {
 #[serde(deny_unknown_fields)]
 pub struct RagSelectConfig {
     /// Minimum marked-context tokens before selection is eligible.
+    #[schemars(range(min = 1))]
     pub min_tokens: u64,
     /// Ranking source used to compare marked chunks.
     #[serde(default)]
     pub ranking: RetrievalRanking,
     /// Maximum number of marked chunks retained.
+    #[schemars(range(min = 1))]
     pub max_chunks: usize,
     /// Minimum accepted relevance percentage, from 0 through 100.
     #[serde(default)]
+    #[schemars(range(max = 100))]
     pub min_relevance_percent: u8,
     /// Drop marked chunks whose selected content is empty.
     #[serde(default)]
@@ -200,9 +206,11 @@ pub struct RagSelectConfig {
 #[serde(deny_unknown_fields)]
 pub struct CompactSerializationConfig {
     /// Minimum marked-context tokens before serialization is eligible.
+    #[schemars(range(min = 1))]
     pub min_tokens: u64,
     /// Optional tabular compaction rules.
     #[serde(default)]
+    #[schemars(schema_with = "conditional_tabular_serialization_schema")]
     pub tabular: TabularSerializationConfig,
 }
 
@@ -225,6 +233,50 @@ impl Default for TabularSerializationConfig {
             min_rows: 8,
         }
     }
+}
+
+fn conditional_tabular_serialization_schema(generator: &mut SchemaGenerator) -> Schema {
+    let enabled_is_true = SchemaObject {
+        const_value: Some(serde_json::Value::Bool(true)),
+        ..SchemaObject::default()
+    };
+    let mut enabled_object = ObjectValidation {
+        required: BTreeSet::from(["enabled".to_string()]),
+        ..ObjectValidation::default()
+    };
+    enabled_object
+        .properties
+        .insert("enabled".to_string(), enabled_is_true.into());
+    let enabled_condition = SchemaObject {
+        object: Some(Box::new(enabled_object)),
+        ..SchemaObject::default()
+    };
+    let minimum_rows = SchemaObject {
+        number: Some(Box::new(NumberValidation {
+            minimum: Some(2.0),
+            ..NumberValidation::default()
+        })),
+        ..SchemaObject::default()
+    };
+    let mut requirement_object = ObjectValidation::default();
+    requirement_object
+        .properties
+        .insert("min_rows".to_string(), minimum_rows.into());
+    let enabled_requirement = SchemaObject {
+        object: Some(Box::new(requirement_object)),
+        ..SchemaObject::default()
+    };
+
+    SchemaObject {
+        subschemas: Some(Box::new(SubschemaValidation {
+            all_of: Some(vec![generator.subschema_for::<TabularSerializationConfig>()]),
+            if_schema: Some(Box::new(enabled_condition.into())),
+            then_schema: Some(Box::new(enabled_requirement.into())),
+            ..SubschemaValidation::default()
+        })),
+        ..SchemaObject::default()
+    }
+    .into()
 }
 
 /// Configuration for marked-context position reordering.
@@ -427,9 +479,11 @@ enum DurationSchema {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompressionLeverConfig, CompressionSelector, CompressionStateBackend, RetrievalRanking,
+        CompressionLeverConfig, CompressionPolicy, CompressionSelector, CompressionStateBackend,
+        RetrievalRanking,
     };
     use crate::handler::AiHandlerConfig;
+    use jsonschema::JSONSchema;
 
     fn provider(name: &str) -> serde_json::Value {
         serde_json::json!({
@@ -473,6 +527,78 @@ mod tests {
             "providers": [provider("openai")],
             "compression": {"levers": levers}
         })
+    }
+
+    fn compression_schema() -> JSONSchema {
+        let schema = schemars::schema_for!(CompressionPolicy);
+        let value = serde_json::to_value(schema).expect("compression schema serializes");
+        JSONSchema::compile(&value).expect("compression schema compiles")
+    }
+
+    fn policy_with_lever(lever: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"levers": [lever]})
+    }
+
+    #[test]
+    fn generated_schema_rejects_runtime_invalid_stateless_bounds() {
+        let schema = compression_schema();
+        let invalid = [
+            serde_json::json!({"type": "rag_select", "min_tokens": 0, "max_chunks": 1}),
+            serde_json::json!({"type": "rag_select", "min_tokens": 1, "max_chunks": 0}),
+            serde_json::json!({
+                "type": "rag_select",
+                "min_tokens": 1,
+                "max_chunks": 1,
+                "min_relevance_percent": 101
+            }),
+            serde_json::json!({"type": "compact_serialization", "min_tokens": 0}),
+        ];
+
+        for lever in invalid {
+            let instance = policy_with_lever(lever.clone());
+            assert!(
+                !schema.is_valid(&instance),
+                "schema accepted runtime-invalid lever: {lever}"
+            );
+        }
+
+        let valid = policy_with_lever(serde_json::json!({
+            "type": "rag_select",
+            "min_tokens": 1,
+            "max_chunks": 1,
+            "min_relevance_percent": 100
+        }));
+        assert!(schema.is_valid(&valid));
+    }
+
+    #[test]
+    fn generated_schema_enforces_tabular_min_rows_only_when_enabled() {
+        let schema = compression_schema();
+        let enabled_too_small = policy_with_lever(serde_json::json!({
+            "type": "compact_serialization",
+            "min_tokens": 1,
+            "tabular": {"enabled": true, "min_rows": 1}
+        }));
+        let disabled_small = policy_with_lever(serde_json::json!({
+            "type": "compact_serialization",
+            "min_tokens": 1,
+            "tabular": {"enabled": false, "min_rows": 1}
+        }));
+        let disabled_zero = policy_with_lever(serde_json::json!({
+            "type": "compact_serialization",
+            "min_tokens": 1,
+            "tabular": {"enabled": false, "min_rows": 0}
+        }));
+        let enabled_boundary = policy_with_lever(serde_json::json!({
+            "type": "compact_serialization",
+            "min_tokens": 1,
+            "tabular": {"enabled": true, "min_rows": 2}
+        }));
+
+        assert!(!schema.is_valid(&enabled_too_small));
+        assert!(schema.is_valid(&disabled_small));
+        assert!(schema.is_valid(&disabled_zero));
+        assert!(schema.is_valid(&enabled_boundary));
     }
 
     #[test]

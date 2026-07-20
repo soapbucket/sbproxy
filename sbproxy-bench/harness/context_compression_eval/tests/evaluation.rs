@@ -73,6 +73,22 @@ fn all_stateless_configs() -> Vec<CompressionLeverConfig> {
 }
 
 #[tokio::test]
+async fn rejects_an_empty_case_suite() {
+    let error = evaluate_cases(
+        &[],
+        &EvalConfig {
+            profile: "empty-suite".to_string(),
+            levers: Vec::new(),
+            measure_latency: false,
+        },
+    )
+    .await
+    .expect_err("an empty suite must not produce acceptance evidence");
+
+    assert_eq!(error.to_string(), "evaluation requires at least one case");
+}
+
+#[tokio::test]
 async fn evaluates_identical_arms_through_real_window_fit() {
     let report = evaluate_cases(
         &[long_case()],
@@ -107,7 +123,8 @@ async fn evaluates_identical_arms_through_real_window_fit() {
     assert_eq!(case.levers[0].after_tokens, case.on.output_tokens);
     assert_eq!(case.levers[0].tokens_saved, case.tokens_saved);
     assert_eq!(case.added_compression_latency_micros, None);
-    assert_eq!(report.schema_version, 3);
+    assert_eq!(report.schema_version, 4);
+    assert_eq!(report.verified_provenance, None);
     assert_eq!(report.pipeline, window_fit_pipeline(192));
     assert_eq!(report.overall.applied_count, 1);
     assert_eq!(report.overall.skipped_count, 0);
@@ -184,7 +201,118 @@ async fn rejects_savings_without_quality_evidence() {
 
     assert!(error
         .to_string()
-        .contains("claims token savings without an off/on quality score"));
+        .contains("required_evidence must contain at least one nonblank value"));
+}
+
+#[tokio::test]
+async fn rejects_empty_or_blank_declared_quality_evidence_before_scoring() {
+    let invalid = [
+        (
+            QualitySpec::EvidenceRetention {
+                required_evidence: Vec::new(),
+            },
+            "required_evidence must contain at least one nonblank value",
+        ),
+        (
+            QualitySpec::EvidenceRetention {
+                required_evidence: vec!["  \n".to_string()],
+            },
+            "required_evidence must not contain blank values",
+        ),
+        (
+            QualitySpec::ExactMatch {
+                reference_answers: Vec::new(),
+                off_prediction: String::new(),
+                on_prediction: String::new(),
+            },
+            "reference_answers must contain at least one nonblank value",
+        ),
+        (
+            QualitySpec::ExactMatch {
+                reference_answers: vec![" \t".to_string()],
+                off_prediction: String::new(),
+                on_prediction: String::new(),
+            },
+            "reference_answers must not contain blank values",
+        ),
+        (
+            QualitySpec::StructuredEquivalence {
+                chunk_id: " \n".to_string(),
+            },
+            "chunk_id must not be blank",
+        ),
+        (
+            QualitySpec::EdgePlacement {
+                chunk_id: String::new(),
+            },
+            "chunk_id must not be blank",
+        ),
+    ];
+
+    for (quality, expected) in invalid {
+        let mut case = long_case();
+        case.id = "invalid-quality".to_string();
+        case.quality = quality;
+        let error = evaluate_cases(
+            &[case],
+            &EvalConfig {
+                profile: "quality-validation".to_string(),
+                levers: Vec::new(),
+                measure_latency: false,
+            },
+        )
+        .await
+        .expect_err("empty quality evidence must fail before scoring");
+        assert!(error.to_string().contains(expected), "{error:#}");
+    }
+}
+
+#[tokio::test]
+async fn rejects_missing_structural_quality_target_even_without_savings() {
+    let mut case = long_case();
+    case.id = "missing-structural-target".to_string();
+    case.quality = QualitySpec::StructuredEquivalence {
+        chunk_id: "does-not-exist".to_string(),
+    };
+
+    let error = evaluate_cases(
+        &[case],
+        &EvalConfig {
+            profile: "missing-structural-target".to_string(),
+            levers: Vec::new(),
+            measure_latency: false,
+        },
+    )
+    .await
+    .expect_err("every case needs complete off/on quality scores");
+
+    assert!(error
+        .to_string()
+        .contains("does not produce complete off/on quality scores"));
+}
+
+#[tokio::test]
+async fn non_expanding_only_acceptance_does_not_self_certify_build() {
+    let mut case = long_case();
+    case.id = "incomplete-acceptance".to_string();
+    case.acceptance = AcceptanceSpec {
+        require_non_expanding: true,
+        ..AcceptanceSpec::default()
+    };
+
+    let report = evaluate_cases(
+        &[case],
+        &EvalConfig {
+            profile: "incomplete-acceptance".to_string(),
+            levers: Vec::new(),
+            measure_latency: false,
+        },
+    )
+    .await
+    .expect("valid quality still produces a report");
+
+    assert!(report.cases[0].acceptance_passed);
+    assert_eq!(report.overall.recommendation, Recommendation::Defer);
 }
 
 #[tokio::test]

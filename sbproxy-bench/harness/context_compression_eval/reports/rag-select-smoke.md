@@ -3,9 +3,19 @@
 This is a first-party smoke evaluation, not an official third-party benchmark score.
 
 - Profile: `rag-select-smoke-v1`
-- Report schema: `3`
+- Report schema: `4`
 - Token counter: `sbproxy_target_model`
 - Latency mode: `omitted_for_deterministic_gate`
+
+## Verified provenance
+
+- Manifest SHA-256: `f96e77cd1248de3c5d0dc9d528e0a21e768a4d335a599caa5d2084f94afbb5b3`
+- Evidence boundary: only the selected, manifest-covered inputs listed below.
+- No customer data; no official benchmark scores.
+
+| Path | Corpus | Provenance | License | Customer data | Official score | SHA-256 |
+|---|---|---|---|---|---|---|
+| fixtures/rag-select-smoke.jsonl | rag_select_smoke | independently_authored_sanitized_shape | Apache-2.0 | no | no | 2f6dabbc2d7b8c91c4b9f957beafc2c86ae3cf04cd0b035f802b6dc57c032e80 |
 
 ## Ordered pipeline
 

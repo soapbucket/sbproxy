@@ -162,6 +162,9 @@ reduce the working message-list estimate before the runner commits it.
 
 `compact_serialization` considers only marked `format="json"` chunks whose
 estimate reaches `min_tokens`. Canonical whitespace-free JSON is one candidate.
+JSON containing duplicate object member names at any nesting depth is unsafe:
+the lever leaves that chunk byte-for-byte unchanged instead of parsing it into
+a value that would silently discard one member.
 When tabular mode is enabled, a top-level array may instead become
 `sbproxy_table_v1` when it has at least `min_rows` objects, every object has the
 same key set, and every cell is a string, number, boolean, or null. Nested
@@ -672,7 +675,8 @@ otherwise it records `skipped`, `no_savings`.
 | Malformed or oversized marked context | `skipped`, `malformed_marked_context` or `marked_context_too_large` | The current retrieval lever makes no partial rewrite; later levers may still act |
 | Supplied ranking lacks a score | `skipped`, `missing_relevance_score` when no other block changes | The affected retrieval block is unchanged; a change in another block yields a complete candidate |
 | Selection retains no chunks with `drop_empty: false` | `skipped`, `no_selected_chunks` when no other block changes | The affected retrieval block is unchanged; a change in another block yields a complete candidate |
-| Invalid JSON in a marked JSON chunk | `skipped`, `unsafe_structured_shape` only when no other chunk changes | The invalid chunk remains unchanged; a change in another chunk yields a candidate instead of the aggregate skip |
+| Invalid JSON in a marked JSON chunk | `skipped`, `unsafe_structured_shape` only when no other chunk changes | The invalid chunk remains byte-for-byte unchanged; a change in another chunk yields a candidate instead of the aggregate skip |
+| Duplicate object members in a marked JSON chunk | `skipped`, `unsafe_structured_shape` only when no other chunk changes | The duplicate-bearing chunk remains byte-for-byte unchanged at every nesting depth; a change in another chunk yields a candidate instead of the aggregate skip |
 | Valid nested, heterogeneous, or otherwise table-ineligible JSON | `applied`; `skipped`, `not_needed`; or runner `skipped`, `no_savings` | Still eligible for deterministic JSON minification; shape alone is not unsafe |
 | Chunks already have the edge order | `skipped`, `already_ordered` when no other block changes | Chunk bytes and order remain unchanged; a change in another block yields a complete candidate |
 | Below threshold, insufficient history, unknown window, or no need | `skipped` when the lever produces no candidate | Working messages and state remain unchanged |
@@ -979,6 +983,11 @@ cargo run --locked -- check \
 
 Those commands check all five committed JSON and Markdown report pairs. Each
 pipeline file deserializes through the production typed lever configuration.
+Report schema 4 embeds the exact verified provenance-manifest SHA-256 and the
+metadata for only the selected fixture inputs, including their fixture
+digests, origin, license, customer-data declaration, and official-score
+declaration. That keeps the evidence boundary attached when a report is copied
+away from the repository.
 The structural scorers verify marked evidence retention, exact decoded JSON
 values, and edge placement for named chunks. They do not run a provider, score
 a generated answer, or infer semantic correctness beyond the authored fixture

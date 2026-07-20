@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use context_compression_eval::{
     adapt_external_jsonl, build_stateless_levers, evaluate_cases, load_provenance, parse_cases,
     render_json, render_markdown, verify_fixture_set, EvalConfig, EvalPipelineFile, EvalReport,
-    ExternalSuite, Recommendation,
+    ExternalSuite, FixtureArtifact, Recommendation, VerifiedProvenanceSummary,
 };
 
 #[derive(Debug, Parser)]
@@ -120,7 +120,7 @@ async fn generate(
         .with_context(|| format!("read provenance {}", args.provenance.display()))?;
     let provenance = load_provenance(provenance_bytes.as_slice())?;
     verify_fixture_set(&args.harness_root, &provenance)?;
-    verify_inputs_covered(args, &provenance)?;
+    let selected_artifacts = verify_inputs_covered(args, &provenance)?;
 
     let mut cases = Vec::new();
     let mut ids = BTreeSet::new();
@@ -133,7 +133,7 @@ async fn generate(
             cases.push(case);
         }
     }
-    let report = evaluate_cases(
+    let mut report = evaluate_cases(
         &cases,
         &EvalConfig {
             profile: pipeline.profile,
@@ -142,6 +142,10 @@ async fn generate(
         },
     )
     .await?;
+    report.verified_provenance = Some(VerifiedProvenanceSummary::from_verified_inputs(
+        &provenance_bytes,
+        selected_artifacts,
+    ));
     let json = render_json(&report)?;
     let markdown = render_markdown(&report);
     Ok((report, json, markdown))
@@ -176,27 +180,31 @@ fn recommendation_label(recommendation: Recommendation) -> &'static str {
 fn verify_inputs_covered(
     args: &ReportArgs,
     manifest: &context_compression_eval::ProvenanceManifest,
-) -> Result<()> {
+) -> Result<Vec<FixtureArtifact>> {
     let covered = manifest
         .artifacts
         .iter()
         .map(|artifact| {
             let path = args.harness_root.join(&artifact.path);
-            fs::canonicalize(&path)
-                .with_context(|| format!("resolve covered input {}", path.display()))
+            let resolved = fs::canonicalize(&path)
+                .with_context(|| format!("resolve covered input {}", path.display()))?;
+            Ok((resolved, artifact))
         })
-        .collect::<Result<BTreeSet<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
+    let mut selected = Vec::with_capacity(args.input.len());
     for input in &args.input {
         let resolved = fs::canonicalize(input)
             .with_context(|| format!("resolve input {}", input.display()))?;
-        if !covered.contains(&resolved) {
+        let Some((_, artifact)) = covered.iter().find(|(path, _)| path == &resolved) else {
             bail!(
                 "input {} is not covered by the provenance manifest",
                 input.display()
             );
-        }
+        };
+        selected.push((*artifact).clone());
     }
-    Ok(())
+    selected.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(selected)
 }
 
 fn write_file(path: &Path, contents: &str) -> Result<()> {

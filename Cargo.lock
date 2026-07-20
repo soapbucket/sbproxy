@@ -8365,6 +8365,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
+ "jsonschema",
  "lru",
  "minijinja",
  "object_store",

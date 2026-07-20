@@ -3,9 +3,19 @@
 This is a first-party smoke evaluation, not an official third-party benchmark score.
 
 - Profile: `compact-serialization-smoke-v1`
-- Report schema: `3`
+- Report schema: `4`
 - Token counter: `sbproxy_target_model`
 - Latency mode: `omitted_for_deterministic_gate`
+
+## Verified provenance
+
+- Manifest SHA-256: `f96e77cd1248de3c5d0dc9d528e0a21e768a4d335a599caa5d2084f94afbb5b3`
+- Evidence boundary: only the selected, manifest-covered inputs listed below.
+- No customer data; no official benchmark scores.
+
+| Path | Corpus | Provenance | License | Customer data | Official score | SHA-256 |
+|---|---|---|---|---|---|---|
+| fixtures/compact-serialization-smoke.jsonl | compact_serialization_smoke | independently_authored_sanitized_shape | Apache-2.0 | no | no | 6486ae7ff0df33d1bd5152037b0bfbc5251f5b05858ba1167254490e49b18737 |
 
 ## Ordered pipeline
 

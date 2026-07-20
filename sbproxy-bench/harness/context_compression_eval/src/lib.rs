@@ -12,5 +12,8 @@ pub use evaluator::{
     CaseReport, EvalConfig, EvalReport, Recommendation,
 };
 pub use model::{parse_cases, AcceptanceSpec, EvalCase, EvalPipelineFile, QualitySpec};
-pub use provenance::{load_provenance, verify_fixture_set, FixtureArtifact, ProvenanceManifest};
+pub use provenance::{
+    load_provenance, verify_fixture_set, FixtureArtifact, ProvenanceManifest,
+    VerifiedProvenanceSummary,
+};
 pub use report::{render_json, render_markdown};

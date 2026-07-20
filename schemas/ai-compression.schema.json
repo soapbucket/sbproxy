@@ -197,7 +197,7 @@
               "description": "Minimum marked-context tokens before selection is eligible.",
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 1.0
             },
             "ranking": {
               "description": "Ranking source used to compare marked chunks.",
@@ -212,13 +212,14 @@
               "description": "Maximum number of marked chunks retained.",
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 1.0
             },
             "min_relevance_percent": {
               "description": "Minimum accepted relevance percentage, from 0 through 100.",
               "default": 0,
               "type": "integer",
               "format": "uint8",
+              "maximum": 100.0,
               "minimum": 0.0
             },
             "drop_empty": {
@@ -247,7 +248,7 @@
               "description": "Minimum marked-context tokens before serialization is eligible.",
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 1.0
             },
             "tabular": {
               "description": "Optional tabular compaction rules.",
@@ -259,7 +260,24 @@
                 {
                   "$ref": "#/definitions/TabularSerializationConfig"
                 }
-              ]
+              ],
+              "if": {
+                "required": [
+                  "enabled"
+                ],
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "min_rows": {
+                    "minimum": 2.0
+                  }
+                }
+              }
             }
           },
           "additionalProperties": false

@@ -10,6 +10,7 @@ use sbproxy_ai::compression::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::provenance::VerifiedProvenanceSummary;
 use crate::{AcceptanceSpec, EvalCase, QualitySpec};
 
 /// Immutable settings shared by every case in one evaluation.
@@ -201,6 +202,8 @@ pub struct EvalReport {
     pub token_counter: String,
     /// Whether latency values are observed or intentionally omitted.
     pub latency_mode: String,
+    /// Verified input provenance when attached by the detached-report CLI.
+    pub verified_provenance: Option<VerifiedProvenanceSummary>,
     /// Stable case rows sorted by corpus and identifier.
     pub cases: Vec<CaseReport>,
     /// Stable per-corpus summaries.
@@ -218,6 +221,7 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
         bail!("evaluation profile must not be empty");
     }
     for case in cases {
+        case.quality.validate(&case.id)?;
         case.acceptance.validate(&case.id)?;
     }
     let off_runner = CompressionRunner::with_model_counter(Vec::new());
@@ -258,19 +262,19 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
             None
         };
         let savings_ratio = ratio(on.tokens_saved, off.final_tokens);
-        let quality_delta = match (off_quality, on_quality) {
-            (Some(off), Some(on)) => Some(round_six(on - off)),
-            _ => None,
-        };
-        if on.tokens_saved > 0 && quality_delta.is_none() {
+        let (Some(off_quality), Some(on_quality)) = (off_quality, on_quality) else {
             bail!(
-                "case `{}` claims token savings without an off/on quality score",
+                "case `{}` does not produce complete off/on quality scores",
                 case.id
             );
-        }
-        let acceptance_passed =
-            case.acceptance
-                .passes(off.final_tokens, on.final_tokens, on_quality, quality_delta);
+        };
+        let quality_delta = Some(round_six(on_quality - off_quality));
+        let acceptance_passed = case.acceptance.passes(
+            off.final_tokens,
+            on.final_tokens,
+            Some(on_quality),
+            quality_delta,
+        );
         rows.push(CaseReport {
             id: case.id.clone(),
             corpus: case.corpus.clone(),
@@ -285,12 +289,12 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
             off: ArmReport {
                 input_tokens: off.initial_tokens,
                 output_tokens: off.final_tokens,
-                quality_score: off_quality,
+                quality_score: Some(off_quality),
             },
             on: ArmReport {
                 input_tokens: on.initial_tokens,
                 output_tokens: on.final_tokens,
-                quality_score: on_quality,
+                quality_score: Some(on_quality),
             },
             tokens_saved: on.tokens_saved,
             savings_ratio,
@@ -320,7 +324,7 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
     let overall = aggregate(&rows.iter().collect::<Vec<_>>());
 
     Ok(EvalReport {
-        schema_version: 3,
+        schema_version: 4,
         profile: config.profile.clone(),
         pipeline: config.levers.clone(),
         token_counter: "sbproxy_target_model".to_string(),
@@ -330,6 +334,7 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
             "omitted_for_deterministic_gate"
         }
         .to_string(),
+        verified_provenance: None,
         cases: rows,
         corpora,
         overall,
@@ -519,14 +524,14 @@ fn aggregate(rows: &[&CaseReport]) -> AggregateReport {
     let fallback_count = outcomes.get("failed").copied().unwrap_or_default();
     let skip_rate = ratio(skipped_count, rows.len() as u64);
     let acceptance_passed = rows.iter().all(|row| row.acceptance_passed);
-    let all_cases_have_explicit_acceptance = rows.iter().all(|row| row.acceptance.is_explicit());
+    let all_cases_have_complete_acceptance = rows.iter().all(|row| row.acceptance.is_complete());
     let recommendation = recommend(
         savings_ratio,
         on_quality_score,
         quality_delta,
         fallback_count,
         acceptance_passed,
-        all_cases_have_explicit_acceptance,
+        all_cases_have_complete_acceptance,
     );
 
     AggregateReport {
@@ -556,12 +561,12 @@ fn recommend(
     quality_delta: Option<f64>,
     failures: u64,
     acceptance_passed: bool,
-    all_cases_have_explicit_acceptance: bool,
+    all_cases_have_complete_acceptance: bool,
 ) -> Recommendation {
     if failures > 0 || !acceptance_passed {
         return Recommendation::Defer;
     }
-    if all_cases_have_explicit_acceptance {
+    if all_cases_have_complete_acceptance {
         return Recommendation::Build;
     }
     let (Some(on_quality), Some(quality_delta)) = (on_quality, quality_delta) else {

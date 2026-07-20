@@ -53,7 +53,8 @@ async fn json_and_markdown_are_byte_stable() {
     assert!(first_markdown.ends_with('\n'));
     assert!(first_markdown.contains("# Context Compression Evaluation"));
     assert!(first_markdown.contains("window_fit-smoke-v1"));
-    assert!(first_markdown.contains("Report schema: `3`"));
+    assert!(first_markdown.contains("Report schema: `4`"));
+    assert!(first_markdown.contains("No verified provenance is attached to this in-memory report."));
     assert!(first_markdown.contains("\"type\":\"window_fit\""));
     assert!(first_markdown.contains("## Ordered lever results"));
     assert!(first_markdown.contains("coding_agent_smoke"));
