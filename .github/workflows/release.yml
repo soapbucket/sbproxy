@@ -224,8 +224,8 @@ jobs:
           cargo test -p sbproxy-ai --test managed_replica_routing --locked
           cargo test -p sbproxy-core --test cluster_control_plane --locked
           cargo test -p sbproxy-core --test model_plane_envelope --test model_plane_transport --test managed_replica_dispatch --locked
-          SBPROXY_E2E_BIN=target/debug/sbproxy cargo test -p sbproxy-e2e --test model_cluster_control --locked -- --nocapture
-          SBPROXY_E2E_BIN=target/debug/sbproxy cargo test -p sbproxy-e2e --test model_cluster_dispatch --locked -- --nocapture
+          SBPROXY_E2E_BIN="${PWD}/target/debug/sbproxy" cargo test -p sbproxy-e2e --test model_cluster_control --locked -- --nocapture
+          SBPROXY_E2E_BIN="${PWD}/target/debug/sbproxy" cargo test -p sbproxy-e2e --test model_cluster_dispatch --locked -- --nocapture
 
   certify-model-host-apple-silicon:
     name: model-host certification / Apple Silicon (WOR-1858)
