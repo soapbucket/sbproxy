@@ -197,7 +197,10 @@ struct StrictModelDeployment {
     pull: sbproxy_model_host::PullPolicy,
     #[serde(default)]
     warm: bool,
-    #[serde(default)]
+    // Deliberately no default: admin-managed deployments must state
+    // cold_start explicitly (docs/ai-gateway.md, docs/configuration.md),
+    // because the safe omission behavior depends on the security profile
+    // and only the file_managed authority resolves that profile.
     cold_start: sbproxy_model_host::ColdStartPolicy,
     #[serde(default)]
     keep_alive_secs: Option<u64>,
@@ -2375,22 +2378,32 @@ models:
     }
 
     #[test]
-    fn minimal_deployment_body_deserializes_with_every_optional_field_defaulted() {
-        // The strict admin mirror of ModelDeployment must accept the same
-        // minimal body the canonical struct accepts. A field added here
-        // without #[serde(default)] breaks every existing admin client and
-        // only surfaces in the tag-time e2e, which is how a required
-        // cold_start slipped into a release candidate.
-        let body = r#"{
+    fn minimal_deployment_body_is_model_plus_explicit_cold_start() {
+        // Pins the documented admin PUT contract from both sides so drift
+        // surfaces at the PR gate rather than in the tag-time e2e:
+        // cold_start is the one field that must be explicit (the safe
+        // omission behavior depends on the security profile, which only
+        // the file_managed authority resolves), and every other field
+        // defaults.
+        let without_cold_start = r#"{
             "expected_revision": null,
             "deployments": { "m": { "model": "hf:org/model" } }
         }"#;
-        let request: DeploymentPutRequest =
-            serde_json::from_str(body).expect("minimal deployment body must deserialize");
-        let deployment = request.deployments.get("m").expect("deployment entry");
-        assert_eq!(
-            deployment.cold_start,
-            sbproxy_model_host::ColdStartPolicy::default()
+        let error = serde_json::from_str::<DeploymentPutRequest>(without_cold_start)
+            .expect_err("cold_start must be explicit for admin-managed deployments");
+        assert!(
+            error.to_string().contains("cold_start"),
+            "rejection must name the missing field: {error}"
         );
+
+        let minimal = r#"{
+            "expected_revision": null,
+            "deployments": { "m": { "model": "hf:org/model", "cold_start": "wait" } }
+        }"#;
+        let request: DeploymentPutRequest =
+            serde_json::from_str(minimal).expect("model plus cold_start must deserialize");
+        let deployment = request.deployments.get("m").expect("deployment entry");
+        assert_eq!(deployment.replicas, 1);
+        assert!(!deployment.warm);
     }
 }
