@@ -7,6 +7,8 @@ pub mod identity;
 mod marked_context;
 /// Closed compression outcomes and accounting records.
 pub mod outcome;
+/// Retrieval-aware selection for explicitly marked context.
+pub mod rag_select;
 /// Versioned external summary-state records and canonical message digests.
 pub mod record;
 /// Sequential asynchronous compression execution.
@@ -34,6 +36,7 @@ pub use marked_context::{
 pub use outcome::{
     FailureReason, LeverKind, LeverOutcome, LeverResult, RequestOutcome, SkipReason,
 };
+pub use rag_select::RagSelectLever;
 pub use record::{CompressionSessionRecord, MessageDigest, RecordKind, RECORD_SCHEMA_VERSION};
 pub use runner::{
     CompressionCommitRule, CompressionDecision, CompressionLever, CompressionRequest,
