@@ -445,6 +445,24 @@ fn target_log(policy: &CompressionPolicy) -> String {
                 }
                 target
             }
+            CompressionLeverConfig::RagSelect(config) => serde_json::json!({
+                "lever": "rag_select",
+                "min_tokens": config.min_tokens,
+                "ranking": config.ranking.as_str(),
+                "max_chunks": config.max_chunks,
+                "min_relevance_percent": config.min_relevance_percent,
+                "drop_empty": config.drop_empty,
+            }),
+            CompressionLeverConfig::CompactSerialization(config) => serde_json::json!({
+                "lever": "compact_serialization",
+                "min_tokens": config.min_tokens,
+                "tabular_enabled": config.tabular.enabled,
+                "tabular_min_rows": config.tabular.min_rows,
+            }),
+            CompressionLeverConfig::PositionReorder(config) => serde_json::json!({
+                "lever": "position_reorder",
+                "ranking": config.ranking.as_str(),
+            }),
         })
         .collect::<Vec<_>>();
     serde_json::Value::Array(targets).to_string()
@@ -644,9 +662,11 @@ mod tests {
         CompressionStateOutcome, RedisCompressionCoordinationEvent,
     };
     use sbproxy_ai::compression::{
-        CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionRun,
-        CompressionStateBackend, CompressionStateConfig, FailureReason, LeverKind, LeverOutcome,
-        LeverResult, SkipReason, SummarizerConfig, SummaryBufferConfig, WindowFitConfig,
+        CompactSerializationConfig, CompressionBackend, CompressionLeverConfig, CompressionPolicy,
+        CompressionRun, CompressionStateBackend, CompressionStateConfig, FailureReason, LeverKind,
+        LeverOutcome, LeverResult, PositionReorderConfig, RagSelectConfig, RetrievalRanking,
+        SkipReason, SummarizerConfig, SummaryBufferConfig, TabularSerializationConfig,
+        WindowFitConfig,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -760,7 +780,10 @@ mod tests {
             .iter_mut()
             .find_map(|lever| match lever {
                 CompressionLeverConfig::WindowFit(config) => Some(config),
-                CompressionLeverConfig::SummaryBuffer(_) => None,
+                CompressionLeverConfig::SummaryBuffer(_)
+                | CompressionLeverConfig::RagSelect(_)
+                | CompressionLeverConfig::CompactSerialization(_)
+                | CompressionLeverConfig::PositionReorder(_) => None,
             })
             .expect("test policy has window_fit");
         window_fit.input_budget_tokens = None;
@@ -769,6 +792,60 @@ mod tests {
         assert!(
             !unconfigured.contains("input_budget_tokens"),
             "{unconfigured}"
+        );
+    }
+
+    #[test]
+    fn stateless_targets_are_content_free_and_stable() {
+        let policy = CompressionPolicy {
+            state: None,
+            allow_admin_content_inspection: false,
+            levers: vec![
+                CompressionLeverConfig::RagSelect(RagSelectConfig {
+                    min_tokens: 512,
+                    ranking: RetrievalRanking::Auto,
+                    max_chunks: 8,
+                    min_relevance_percent: 15,
+                    drop_empty: true,
+                }),
+                CompressionLeverConfig::CompactSerialization(CompactSerializationConfig {
+                    min_tokens: 128,
+                    tabular: TabularSerializationConfig {
+                        enabled: true,
+                        min_rows: 8,
+                    },
+                }),
+                CompressionLeverConfig::PositionReorder(PositionReorderConfig {
+                    ranking: RetrievalRanking::Auto,
+                }),
+            ],
+            profiles: std::collections::BTreeMap::new(),
+        };
+
+        let targets: serde_json::Value =
+            serde_json::from_str(&target_log(&policy)).expect("valid target JSON");
+        assert_eq!(
+            targets,
+            serde_json::json!([
+                {
+                    "lever": "rag_select",
+                    "min_tokens": 512,
+                    "ranking": "auto",
+                    "max_chunks": 8,
+                    "min_relevance_percent": 15,
+                    "drop_empty": true
+                },
+                {
+                    "lever": "compact_serialization",
+                    "min_tokens": 128,
+                    "tabular_enabled": true,
+                    "tabular_min_rows": 8
+                },
+                {
+                    "lever": "position_reorder",
+                    "ranking": "auto"
+                }
+            ])
         );
     }
 

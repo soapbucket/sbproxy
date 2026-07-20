@@ -136,6 +136,30 @@ pub enum CompressionBackend {
     Mesh,
 }
 
+/// Ranking source used by retrieval-aware compression levers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalRanking {
+    /// Select supplied scores when complete, otherwise use lexical ranking.
+    #[default]
+    Auto,
+    /// Require caller-supplied relevance scores.
+    Supplied,
+    /// Rank marked context with deterministic lexical relevance.
+    Lexical,
+}
+
+impl RetrievalRanking {
+    /// Stable configuration, metric, and log label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Supplied => "supplied",
+            Self::Lexical => "lexical",
+        }
+    }
+}
+
 /// One configured compression lever.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -144,6 +168,72 @@ pub enum CompressionLeverConfig {
     SummaryBuffer(SummaryBufferConfig),
     /// Deterministic compatibility trimming to the target model window.
     WindowFit(WindowFitConfig),
+    /// Retrieval-aware selection of marked context chunks.
+    RagSelect(RagSelectConfig),
+    /// Deterministic compact serialization of supported structured content.
+    CompactSerialization(CompactSerializationConfig),
+    /// Reorder marked context to mitigate lost-in-the-middle effects.
+    PositionReorder(PositionReorderConfig),
+}
+
+/// Configuration for retrieval-aware marked-context selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RagSelectConfig {
+    /// Minimum marked-context tokens before selection is eligible.
+    pub min_tokens: u64,
+    /// Ranking source used to compare marked chunks.
+    #[serde(default)]
+    pub ranking: RetrievalRanking,
+    /// Maximum number of marked chunks retained.
+    pub max_chunks: usize,
+    /// Minimum accepted relevance percentage, from 0 through 100.
+    #[serde(default)]
+    pub min_relevance_percent: u8,
+    /// Drop marked chunks whose selected content is empty.
+    #[serde(default)]
+    pub drop_empty: bool,
+}
+
+/// Configuration for deterministic compact serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompactSerializationConfig {
+    /// Minimum marked-context tokens before serialization is eligible.
+    pub min_tokens: u64,
+    /// Optional tabular compaction rules.
+    #[serde(default)]
+    pub tabular: TabularSerializationConfig,
+}
+
+/// Tabular serialization eligibility controls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TabularSerializationConfig {
+    /// Enable tabular serialization of supported row collections.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum row count required when tabular serialization is enabled.
+    #[serde(default = "default_tabular_min_rows")]
+    pub min_rows: usize,
+}
+
+impl Default for TabularSerializationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_rows: 8,
+        }
+    }
+}
+
+/// Configuration for marked-context position reordering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PositionReorderConfig {
+    /// Ranking source used to order marked chunks.
+    #[serde(default)]
+    pub ranking: RetrievalRanking,
 }
 
 /// Configuration for the stateful running-summary lever.
@@ -291,6 +381,28 @@ fn validate_pipeline(
                     bail!("{path}.levers[{index}].input_budget_tokens must be greater than zero");
                 }
             }
+            CompressionLeverConfig::RagSelect(rag_select) => {
+                if rag_select.min_tokens == 0 {
+                    bail!("{path}.levers[{index}].min_tokens must be greater than zero");
+                }
+                if rag_select.max_chunks == 0 {
+                    bail!("{path}.levers[{index}].max_chunks must be greater than zero");
+                }
+                if rag_select.min_relevance_percent > 100 {
+                    bail!("{path}.levers[{index}].min_relevance_percent must not exceed 100");
+                }
+            }
+            CompressionLeverConfig::CompactSerialization(compact) => {
+                if compact.min_tokens == 0 {
+                    bail!("{path}.levers[{index}].min_tokens must be greater than zero");
+                }
+                if compact.tabular.enabled && compact.tabular.min_rows < 2 {
+                    bail!(
+                        "{path}.levers[{index}].tabular.min_rows must be at least 2 when tabular.enabled is true"
+                    );
+                }
+            }
+            CompressionLeverConfig::PositionReorder(_) => {}
         }
     }
     Ok(())
@@ -298,6 +410,10 @@ fn validate_pipeline(
 
 fn default_completion_reserve_tokens() -> u64 {
     DEFAULT_COMPLETION_RESERVE_TOKENS
+}
+
+fn default_tabular_min_rows() -> usize {
+    8
 }
 
 #[allow(dead_code)]
@@ -310,7 +426,9 @@ enum DurationSchema {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressionLeverConfig, CompressionSelector, CompressionStateBackend};
+    use super::{
+        CompressionLeverConfig, CompressionSelector, CompressionStateBackend, RetrievalRanking,
+    };
     use crate::handler::AiHandlerConfig;
 
     fn provider(name: &str) -> serde_json::Value {
@@ -348,6 +466,198 @@ mod tests {
                 ]
             }
         })
+    }
+
+    fn config_with_levers(levers: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "providers": [provider("openai")],
+            "compression": {"levers": levers}
+        })
+    }
+
+    #[test]
+    fn parses_stateless_lever_defaults_and_closed_rankings() {
+        let config = AiHandlerConfig::from_config(config_with_levers(serde_json::json!([
+            {
+                "type": "rag_select",
+                "min_tokens": 1_024,
+                "max_chunks": 12
+            },
+            {
+                "type": "compact_serialization",
+                "min_tokens": 2_048
+            },
+            {
+                "type": "position_reorder"
+            }
+        ])))
+        .expect("stateless levers parse");
+        let levers = &config.compression.expect("compression policy").levers;
+
+        let CompressionLeverConfig::RagSelect(rag_select) = &levers[0] else {
+            panic!("expected rag_select");
+        };
+        assert_eq!(rag_select.min_tokens, 1_024);
+        assert_eq!(rag_select.ranking, RetrievalRanking::Auto);
+        assert_eq!(rag_select.max_chunks, 12);
+        assert_eq!(rag_select.min_relevance_percent, 0);
+        assert!(!rag_select.drop_empty);
+
+        let CompressionLeverConfig::CompactSerialization(compact) = &levers[1] else {
+            panic!("expected compact_serialization");
+        };
+        assert_eq!(compact.min_tokens, 2_048);
+        assert!(!compact.tabular.enabled);
+        assert_eq!(compact.tabular.min_rows, 8);
+
+        let CompressionLeverConfig::PositionReorder(position_reorder) = &levers[2] else {
+            panic!("expected position_reorder");
+        };
+        assert_eq!(position_reorder.ranking, RetrievalRanking::Auto);
+
+        for (value, expected, label) in [
+            ("auto", RetrievalRanking::Auto, "auto"),
+            ("supplied", RetrievalRanking::Supplied, "supplied"),
+            ("lexical", RetrievalRanking::Lexical, "lexical"),
+        ] {
+            let ranking: RetrievalRanking =
+                serde_json::from_value(serde_json::json!(value)).expect("known ranking");
+            assert_eq!(ranking, expected);
+            assert_eq!(ranking.as_str(), label);
+        }
+        assert_eq!(RetrievalRanking::default(), RetrievalRanking::Auto);
+        assert!(serde_json::from_value::<RetrievalRanking>(serde_json::json!("semantic")).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_stateless_lever_limits() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "rag_select",
+                    "min_tokens": 0,
+                    "max_chunks": 12
+                }),
+                "min_tokens must be greater than zero",
+            ),
+            (
+                serde_json::json!({
+                    "type": "rag_select",
+                    "min_tokens": 1_024,
+                    "max_chunks": 0
+                }),
+                "max_chunks must be greater than zero",
+            ),
+            (
+                serde_json::json!({
+                    "type": "compact_serialization",
+                    "min_tokens": 0
+                }),
+                "min_tokens must be greater than zero",
+            ),
+        ];
+
+        for (lever, expected) in cases {
+            let error =
+                AiHandlerConfig::from_config(config_with_levers(serde_json::json!([lever])))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains(expected),
+                "unexpected validation error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_rag_relevance_percentage_bounds() {
+        for accepted in [0, 100] {
+            AiHandlerConfig::from_config(config_with_levers(serde_json::json!([{
+                "type": "rag_select",
+                "min_tokens": 1_024,
+                "max_chunks": 12,
+                "min_relevance_percent": accepted
+            }])))
+            .unwrap_or_else(|error| panic!("{accepted} must be accepted: {error}"));
+        }
+
+        let error = AiHandlerConfig::from_config(config_with_levers(serde_json::json!([{
+            "type": "rag_select",
+            "min_tokens": 1_024,
+            "max_chunks": 12,
+            "min_relevance_percent": 101
+        }])))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("min_relevance_percent must not exceed 100"),
+            "unexpected validation error: {error}"
+        );
+    }
+
+    #[test]
+    fn validates_tabular_min_rows_only_when_enabled() {
+        for min_rows in [0, 1] {
+            AiHandlerConfig::from_config(config_with_levers(serde_json::json!([{
+                "type": "compact_serialization",
+                "min_tokens": 1_024,
+                "tabular": {"enabled": false, "min_rows": min_rows}
+            }])))
+            .unwrap_or_else(|error| panic!("disabled min_rows={min_rows} must parse: {error}"));
+
+            let error = AiHandlerConfig::from_config(config_with_levers(serde_json::json!([{
+                "type": "compact_serialization",
+                "min_tokens": 1_024,
+                "tabular": {"enabled": true, "min_rows": min_rows}
+            }])))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("tabular.min_rows must be at least 2 when tabular.enabled is true"),
+                "unexpected validation error: {error}"
+            );
+        }
+
+        AiHandlerConfig::from_config(config_with_levers(serde_json::json!([{
+            "type": "compact_serialization",
+            "min_tokens": 1_024,
+            "tabular": {"enabled": true, "min_rows": 2}
+        }])))
+        .expect("enabled tabular serialization accepts two rows");
+    }
+
+    #[test]
+    fn rejects_unknown_fields_in_every_stateless_config() {
+        let cases = [
+            serde_json::json!({
+                "type": "rag_select",
+                "min_tokens": 1_024,
+                "max_chunks": 12,
+                "unknown": true
+            }),
+            serde_json::json!({
+                "type": "compact_serialization",
+                "min_tokens": 1_024,
+                "unknown": true
+            }),
+            serde_json::json!({
+                "type": "compact_serialization",
+                "min_tokens": 1_024,
+                "tabular": {"unknown": true}
+            }),
+            serde_json::json!({
+                "type": "position_reorder",
+                "unknown": true
+            }),
+        ];
+
+        for lever in cases {
+            let error =
+                AiHandlerConfig::from_config(config_with_levers(serde_json::json!([lever])))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("unknown field"), "unexpected error: {error}");
+        }
     }
 
     #[test]

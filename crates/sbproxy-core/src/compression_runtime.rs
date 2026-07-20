@@ -535,12 +535,26 @@ impl CompressionRuntime {
         handler: &AiHandlerConfig,
         dependencies: RuntimeDependencies,
     ) -> anyhow::Result<Self> {
+        if let Some(unwired) = policy.levers.iter().find_map(|lever| match lever {
+            CompressionLeverConfig::SummaryBuffer(_) | CompressionLeverConfig::WindowFit(_) => None,
+            CompressionLeverConfig::RagSelect(_) => Some("rag_select"),
+            CompressionLeverConfig::CompactSerialization(_) => Some("compact_serialization"),
+            CompressionLeverConfig::PositionReorder(_) => Some("position_reorder"),
+        }) {
+            bail!("compression lever {unwired} is not wired into this runtime");
+        }
+
         let summaries = policy
             .levers
             .iter()
             .filter_map(|lever| match lever {
                 CompressionLeverConfig::SummaryBuffer(summary) => Some(summary),
                 CompressionLeverConfig::WindowFit(_) => None,
+                CompressionLeverConfig::RagSelect(_)
+                | CompressionLeverConfig::CompactSerialization(_)
+                | CompressionLeverConfig::PositionReorder(_) => {
+                    unreachable!("unwired levers are rejected before summary discovery")
+                }
             })
             .collect::<Vec<_>>();
 
@@ -724,6 +738,12 @@ impl CompressionRuntime {
                         store,
                         Arc::new(summarizer),
                     )));
+                }
+                CompressionLeverConfig::RagSelect(_)
+                | CompressionLeverConfig::CompactSerialization(_)
+                | CompressionLeverConfig::PositionReorder(_) => {
+                    // Construction rejects these variants until their runtime adapters are wired.
+                    unreachable!("CompressionRuntime contains an unwired compression lever")
                 }
             }
         }
@@ -1453,6 +1473,52 @@ origins:
                 .expect("stateless runtime builds");
 
         assert!(!runtime.has_stateful_summary());
+    }
+
+    #[test]
+    fn unwired_stateless_levers_fail_closed_during_runtime_construction() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "rag_select",
+                    "min_tokens": 512,
+                    "max_chunks": 8
+                }),
+                "rag_select",
+            ),
+            (
+                serde_json::json!({
+                    "type": "compact_serialization",
+                    "min_tokens": 128
+                }),
+                "compact_serialization",
+            ),
+            (
+                serde_json::json!({"type": "position_reorder"}),
+                "position_reorder",
+            ),
+        ];
+
+        for (lever, label) in cases {
+            let handler = AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{"name": "openai", "api_key": "test-key"}],
+                "compression": {"levers": [lever]}
+            }))
+            .unwrap_or_else(|error| panic!("{label} config must parse: {error}"));
+            let policy = handler
+                .effective_compression_policy()
+                .expect("explicit policy")
+                .into_owned();
+
+            let error =
+                CompressionRuntime::build(policy, &handler, RuntimeDependencies::empty_for_test())
+                    .expect_err("unwired runtime lever must fail closed");
+
+            assert_eq!(
+                error.to_string(),
+                format!("compression lever {label} is not wired into this runtime")
+            );
+        }
     }
 
     #[test]

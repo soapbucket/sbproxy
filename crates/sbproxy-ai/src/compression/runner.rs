@@ -203,6 +203,16 @@ impl fmt::Debug for CompressionDecision {
     }
 }
 
+/// Token-accounting rule a lever's candidate must satisfy before commit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompressionCommitRule {
+    /// Commit only candidates with a smaller target-model token estimate.
+    #[default]
+    StrictReduction,
+    /// Commit changed candidates whose target-model estimate does not grow.
+    NonExpanding,
+}
+
 /// One asynchronous compression transformation.
 #[async_trait]
 pub trait CompressionLever: Send + Sync {
@@ -211,6 +221,11 @@ pub trait CompressionLever: Send + Sync {
 
     /// External state backend, if the lever is stateful.
     fn backend(&self) -> Option<CompressionBackend>;
+
+    /// Candidate commit rule used by the shared runner.
+    fn commit_rule(&self) -> CompressionCommitRule {
+        CompressionCommitRule::StrictReduction
+    }
 
     /// Produce a complete candidate, skip, or fail without mutating the input.
     async fn compress(
@@ -334,7 +349,7 @@ impl CompressionRunner {
         self.levers.is_empty()
     }
 
-    /// Run every lever in order and commit only strictly reducing candidates.
+    /// Run every lever in order and enforce each candidate's commit rule.
     pub async fn run(
         &self,
         request: &CompressionRequest<'_>,
@@ -354,19 +369,29 @@ impl CompressionRunner {
                     messages: candidate,
                 } => {
                     let candidate_tokens = self.token_counter.count(request.model(), &candidate);
-                    if candidate_tokens < working_tokens {
-                        let saved = working_tokens - candidate_tokens;
+                    let changed = candidate != working;
+                    let commit_rule = lever.commit_rule();
+                    let applies = match commit_rule {
+                        CompressionCommitRule::StrictReduction => candidate_tokens < working_tokens,
+                        CompressionCommitRule::NonExpanding => {
+                            changed && candidate_tokens <= working_tokens
+                        }
+                    };
+                    if applies {
+                        let saved = working_tokens.saturating_sub(candidate_tokens);
                         working = candidate;
                         working_tokens = candidate_tokens;
                         (LeverOutcome::Applied, candidate_tokens, saved)
                     } else {
-                        (
-                            LeverOutcome::Skipped {
-                                reason: SkipReason::NoSavings,
-                            },
-                            working_tokens,
-                            0,
-                        )
+                        let reason = if commit_rule == CompressionCommitRule::NonExpanding
+                            && !changed
+                            && candidate_tokens == working_tokens
+                        {
+                            SkipReason::NotNeeded
+                        } else {
+                            SkipReason::NoSavings
+                        };
+                        (LeverOutcome::Skipped { reason }, working_tokens, 0)
                     }
                 }
                 CompressionDecision::Skipped { reason } => {
@@ -404,8 +429,8 @@ impl CompressionRunner {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompressionDecision, CompressionLever, CompressionRequest, CompressionRequestControls,
-        CompressionRunner, TokenCounter,
+        CompressionCommitRule, CompressionDecision, CompressionLever, CompressionRequest,
+        CompressionRequestControls, CompressionRunner, TokenCounter,
     };
     use crate::compression::outcome::{
         FailureReason, LeverKind, LeverOutcome, RequestOutcome, SkipReason,
@@ -434,6 +459,7 @@ mod tests {
     struct ScriptedLever {
         kind: LeverKind,
         backend: Option<CompressionBackend>,
+        commit_rule: CompressionCommitRule,
         decision: CompressionDecision,
         seen_tokens: Arc<Mutex<Vec<u64>>>,
     }
@@ -445,11 +471,17 @@ mod tests {
                 Self {
                     kind,
                     backend: None,
+                    commit_rule: CompressionCommitRule::StrictReduction,
                     decision,
                     seen_tokens: seen_tokens.clone(),
                 },
                 seen_tokens,
             )
+        }
+
+        fn with_commit_rule(mut self, commit_rule: CompressionCommitRule) -> Self {
+            self.commit_rule = commit_rule;
+            self
         }
     }
 
@@ -461,6 +493,10 @@ mod tests {
 
         fn backend(&self) -> Option<CompressionBackend> {
             self.backend
+        }
+
+        fn commit_rule(&self) -> CompressionCommitRule {
+            self.commit_rule
         }
 
         async fn compress(
@@ -572,6 +608,10 @@ mod tests {
 
     #[tokio::test]
     async fn discards_equal_and_larger_candidates_as_no_savings() {
+        assert_eq!(
+            CompressionCommitRule::default(),
+            CompressionCommitRule::StrictReduction
+        );
         let (equal, _) = ScriptedLever::new(LeverKind::SummaryBuffer, candidate(100, "equal"));
         let (larger, seen) = ScriptedLever::new(LeverKind::WindowFit, candidate(120, "larger"));
         let runner = CompressionRunner::new(
@@ -602,6 +642,117 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn non_expanding_changed_equal_candidate_applies_with_zero_savings() {
+        let (lever, _) =
+            ScriptedLever::new(LeverKind::PositionReorder, candidate(100, "reordered"));
+        let runner = CompressionRunner::new(
+            vec![Arc::new(
+                lever.with_commit_rule(CompressionCommitRule::NonExpanding),
+            )],
+            Arc::new(FieldTokenCounter::default()),
+        );
+
+        let run = runner
+            .run(
+                &CompressionRequest::new("gpt-target"),
+                &messages(100, "original"),
+            )
+            .await;
+
+        assert_eq!(run.messages, messages(100, "reordered"));
+        assert_eq!(run.initial_tokens, 100);
+        assert_eq!(run.final_tokens, 100);
+        assert_eq!(run.tokens_saved, 0);
+        assert_eq!(run.lever_results[0].outcome, LeverOutcome::Applied);
+        assert_eq!(run.lever_results[0].tokens_saved, 0);
+        assert_eq!(run.outcome(), RequestOutcome::Applied);
+    }
+
+    #[tokio::test]
+    async fn non_expanding_unchanged_equal_candidate_skips_as_not_needed() {
+        let original = messages(100, "original");
+        let (lever, _) = ScriptedLever::new(
+            LeverKind::PositionReorder,
+            CompressionDecision::Candidate {
+                messages: original.clone(),
+            },
+        );
+        let runner = CompressionRunner::new(
+            vec![Arc::new(
+                lever.with_commit_rule(CompressionCommitRule::NonExpanding),
+            )],
+            Arc::new(FieldTokenCounter::default()),
+        );
+
+        let run = runner
+            .run(&CompressionRequest::new("gpt-target"), &original)
+            .await;
+
+        assert_eq!(run.messages, original);
+        assert_eq!(
+            run.lever_results[0].outcome,
+            LeverOutcome::Skipped {
+                reason: SkipReason::NotNeeded
+            }
+        );
+        assert_eq!(run.outcome(), RequestOutcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn non_expanding_larger_candidate_skips_as_no_savings() {
+        let (lever, _) = ScriptedLever::new(LeverKind::PositionReorder, candidate(120, "expanded"));
+        let runner = CompressionRunner::new(
+            vec![Arc::new(
+                lever.with_commit_rule(CompressionCommitRule::NonExpanding),
+            )],
+            Arc::new(FieldTokenCounter::default()),
+        );
+        let original = messages(100, "original");
+
+        let run = runner
+            .run(&CompressionRequest::new("gpt-target"), &original)
+            .await;
+
+        assert_eq!(run.messages, original);
+        assert_eq!(
+            run.lever_results[0].outcome,
+            LeverOutcome::Skipped {
+                reason: SkipReason::NoSavings
+            }
+        );
+        assert_eq!(run.outcome(), RequestOutcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn zero_saving_apply_preserves_request_savings_invariant() {
+        let (reordered, _) =
+            ScriptedLever::new(LeverKind::PositionReorder, candidate(100, "reordered"));
+        let (reduced, seen) = ScriptedLever::new(LeverKind::WindowFit, candidate(70, "reduced"));
+        let runner = CompressionRunner::new(
+            vec![
+                Arc::new(reordered.with_commit_rule(CompressionCommitRule::NonExpanding)),
+                Arc::new(reduced),
+            ],
+            Arc::new(FieldTokenCounter::default()),
+        );
+
+        let run = runner
+            .run(
+                &CompressionRequest::new("gpt-target"),
+                &messages(100, "original"),
+            )
+            .await;
+
+        assert_eq!(*seen.lock().unwrap(), vec![100]);
+        assert_eq!(run.lever_results[0].outcome, LeverOutcome::Applied);
+        assert_eq!(run.lever_results[0].tokens_saved, 0);
+        assert_eq!(run.lever_results[1].outcome, LeverOutcome::Applied);
+        assert_eq!(run.lever_results[1].tokens_saved, 30);
+        assert_eq!(run.tokens_saved, 30);
+        assert_eq!(run.applied_tokens_saved(), 30);
     }
 
     #[tokio::test]

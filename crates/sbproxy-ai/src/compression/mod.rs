@@ -20,9 +20,10 @@ mod summary_policy;
 pub mod window_fit;
 
 pub use config::{
-    CompressionBackend, CompressionLeverConfig, CompressionPolicy, CompressionProfile,
-    CompressionSelector, CompressionStateBackend, CompressionStateConfig, SummarizerConfig,
-    SummaryBufferConfig, WindowFitConfig,
+    CompactSerializationConfig, CompressionBackend, CompressionLeverConfig, CompressionPolicy,
+    CompressionProfile, CompressionSelector, CompressionStateBackend, CompressionStateConfig,
+    PositionReorderConfig, RagSelectConfig, RetrievalRanking, SummarizerConfig,
+    SummaryBufferConfig, TabularSerializationConfig, WindowFitConfig,
 };
 pub use identity::CompressionRecordId;
 pub use outcome::{
@@ -30,8 +31,8 @@ pub use outcome::{
 };
 pub use record::{CompressionSessionRecord, MessageDigest, RecordKind, RECORD_SCHEMA_VERSION};
 pub use runner::{
-    CompressionDecision, CompressionLever, CompressionRequest, CompressionRequestControls,
-    CompressionRun, CompressionRunner, ModelTokenCounter, TokenCounter,
+    CompressionCommitRule, CompressionDecision, CompressionLever, CompressionRequest,
+    CompressionRequestControls, CompressionRun, CompressionRunner, ModelTokenCounter, TokenCounter,
 };
 pub use store::{
     CommitError, CompressionConsistency, CompressionRecordMetadata, CompressionSessionStore,

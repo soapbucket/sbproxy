@@ -60,6 +60,15 @@ pub fn token_count_precision(model: &str) -> TokenCountPrecision {
     }
 }
 
+/// Estimate target-model tokens for plain text without chat-message framing.
+pub(crate) fn estimate_text_tokens(model: &str, text: &str) -> u64 {
+    if let Ok(bpe) = tiktoken_rs::bpe_for_model(model) {
+        bpe.encode_with_special_tokens(text).len() as u64
+    } else {
+        (text.len() as u64 / 4).max(1)
+    }
+}
+
 /// Estimate prompt tokens for a chat-completion request.
 ///
 /// `model` selects the BPE: GPT-4-class models use `cl100k_base`, GPT-4o
@@ -131,20 +140,11 @@ pub fn estimate_json_message_tokens(model: &str, messages: &[serde_json::Value])
         .collect::<Vec<_>>();
     let mut tokens = estimate_tokens(model, &projected);
 
-    if let Ok(bpe) = tiktoken_rs::bpe_for_model(model) {
-        for content in messages.iter().filter_map(structured_content_json) {
-            tokens += bpe.encode_with_special_tokens(&content).len() as u64;
-        }
-        for extra in messages.iter().filter_map(extra_message_fields_json) {
-            tokens += bpe.encode_with_special_tokens(&extra).len() as u64;
-        }
-    } else {
-        for content in messages.iter().filter_map(structured_content_json) {
-            tokens += (content.len() as u64 / 4).max(1);
-        }
-        for extra in messages.iter().filter_map(extra_message_fields_json) {
-            tokens += (extra.len() as u64 / 4).max(1);
-        }
+    for content in messages.iter().filter_map(structured_content_json) {
+        tokens += estimate_text_tokens(model, &content);
+    }
+    for extra in messages.iter().filter_map(extra_message_fields_json) {
+        tokens += estimate_text_tokens(model, &extra);
     }
     tokens
 }
@@ -467,5 +467,46 @@ mod tests {
             estimate_json_message_tokens("gpt-4", &missing),
             estimate_json_message_tokens("gpt-4", &explicit_null)
         );
+    }
+
+    #[test]
+    fn text_estimator_uses_the_known_model_bpe() {
+        let text = "Hello, target model!";
+        let expected = tiktoken_rs::bpe_for_model("gpt-4")
+            .expect("known model BPE")
+            .encode_with_special_tokens(text)
+            .len() as u64;
+
+        assert_eq!(estimate_text_tokens("gpt-4", text), expected);
+    }
+
+    #[test]
+    fn text_estimator_uses_bytes_divided_by_four_for_unknown_models() {
+        assert_eq!(
+            estimate_text_tokens("unknown-self-hosted-model", &"a".repeat(40)),
+            10
+        );
+    }
+
+    #[test]
+    fn text_estimator_empty_text_has_no_message_framing() {
+        assert_eq!(estimate_text_tokens("gpt-4", ""), 0);
+        assert_eq!(estimate_text_tokens("unknown-self-hosted-model", ""), 1);
+    }
+
+    #[test]
+    fn text_estimator_matches_plain_message_content_contribution() {
+        let text = "Count only this content contribution.";
+        let with_text = vec![json!({"role": "user", "content": text})];
+        let without_text = vec![json!({"role": "user", "content": null})];
+
+        for model in ["gpt-4", "unknown-self-hosted-model"] {
+            assert_eq!(
+                estimate_text_tokens(model, text),
+                estimate_json_message_tokens(model, &with_text)
+                    - estimate_json_message_tokens(model, &without_text),
+                "text estimate must equal the content-only contribution for {model}"
+            );
+        }
     }
 }
