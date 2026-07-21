@@ -12,6 +12,10 @@
 //! Linux binary. The pins keep the security posture (WOR-1663): no
 //! arbitrary binary or command line.
 //!
+//! The pinned-release catalog records a measured minimum macOS per
+//! entry, and a macOS host defaults to the newest entry its OS product
+//! version can load; see [`default_release_tag_for_platform`].
+//!
 //! The platform detection, asset-URL construction, and PATH lookup are
 //! pure and unit-tested. The actual download + extract is behind the
 //! `weights` feature (it reuses the reqwest fetch) and shells out to
@@ -79,10 +83,13 @@ impl Platform {
     }
 }
 
-/// The default pinned llama.cpp release tag used when
-/// `engines.llama_cpp.acquire.version` is unset (WOR-1801). The supported
-/// prebuilt assets for this tag have built-in digests. Operators using a
-/// different tag must provide `acquire.sha256` to verify its asset.
+/// The newest pinned llama.cpp release tag. It is used directly when
+/// `engines.llama_cpp.acquire.version` is unset on non-macOS platforms;
+/// macOS hosts resolve the default through
+/// [`default_release_tag_for_platform`], which may fall back to an older
+/// pin the host OS can actually load. The supported prebuilt assets for
+/// every pinned tag have built-in digests. Operators using a different
+/// tag must provide `acquire.sha256` to verify its asset.
 ///
 /// Pinned to a tag that ships the `ubuntu-vulkan-x64` asset (the Linux
 /// GPU path): the older `b4589` had only a CPU `ubuntu-x64` build, so a
@@ -99,7 +106,121 @@ const DEFAULT_LLAMA_LINUX_X64_SHA256: &str =
 const DEFAULT_LLAMA_LINUX_VULKAN_X64_SHA256: &str =
     "81492d7844bcb40c4c025b826dced6b3faa6e484863482d6bd255c84db53bd55";
 
-/// Built-in digest for one supported default release asset.
+const FALLBACK_LLAMA_MACOS_ARM64_SHA256: &str =
+    "edf417cd8dd148fd423ea758953caa43376df98d8f027b7748ea0399a9a8023f";
+const FALLBACK_LLAMA_MACOS_X64_SHA256: &str =
+    "7c07ab8bb59e249340ed15afe03d5f164521242942a406661d6c499efc186a84";
+
+/// A macOS product version (major.minor), ordered so newer versions
+/// compare greater. The patch component never affects whether the
+/// loader accepts a binary, so it is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MacOsVersion {
+    /// Major product version (the `26` in `26.5.2`).
+    pub major: u32,
+    /// Minor product version (the `5` in `26.5.2`).
+    pub minor: u32,
+}
+
+impl MacOsVersion {
+    /// Parse `26.5.2` / `14.7` / `15` into a version, ignoring anything
+    /// past the minor component. Returns `None` for non-numeric input.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = match parts.next() {
+            Some(minor) => minor.parse().ok()?,
+            None => 0,
+        };
+        Some(MacOsVersion { major, minor })
+    }
+}
+
+impl std::fmt::Display for MacOsVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}", self.major, self.minor)
+    }
+}
+
+/// One pinned llama.cpp release: its tag, the minimum macOS each Apple
+/// asset links against, and the checked-in SHA-256 digests of its
+/// release assets. The minimums are measured, not guessed: they are the
+/// `LC_BUILD_VERSION` `minos` of `llama-server` and the bundled ggml
+/// Metal dylib inside the published asset, read with `otool -l`. A
+/// binary whose `minos` exceeds the host macOS dies at dyld link time
+/// before `main` runs.
+struct PinnedLlamaRelease {
+    /// The ggml-org release tag.
+    tag: &'static str,
+    /// Measured `minos` of the `macos-arm64` asset.
+    min_macos_arm64: MacOsVersion,
+    /// Measured `minos` of the `macos-x64` asset.
+    min_macos_x64: MacOsVersion,
+    /// Digest of the `macos-arm64` asset.
+    macos_arm64_sha256: &'static str,
+    /// Digest of the `macos-x64` asset.
+    macos_x64_sha256: &'static str,
+    /// Digest of the `ubuntu-x64` asset. Only the newest pin carries
+    /// Linux digests; older pins exist purely as macOS fallbacks.
+    linux_x64_sha256: Option<&'static str>,
+    /// Digest of the `ubuntu-vulkan-x64` asset, when the pin ships one.
+    linux_vulkan_x64_sha256: Option<&'static str>,
+}
+
+impl PinnedLlamaRelease {
+    /// The minimum macOS this pin's asset for `platform` links against,
+    /// or `None` when the platform is not macOS.
+    fn min_macos(&self, platform: Platform) -> Option<MacOsVersion> {
+        match platform {
+            Platform::MacOsArm64 => Some(self.min_macos_arm64),
+            Platform::MacOsX64 => Some(self.min_macos_x64),
+            Platform::LinuxX64 => None,
+        }
+    }
+}
+
+/// Every pinned llama.cpp release, newest first. ggml-org builds recent
+/// `macos-arm64` assets on macOS 26 runners, so those binaries refuse to
+/// load on any older macOS (`Symbol not found ... built for macOS 26.0
+/// which is newer than running OS`). macOS hosts therefore pick the
+/// newest entry whose measured minimum is at or below the host product
+/// version; non-macOS platforms always use the newest entry. b9415 is
+/// the newest published build whose `macos-arm64` asset still links
+/// against macOS 14 (b9428, the next published build, jumps to 26).
+const PINNED_LLAMA_RELEASES: &[PinnedLlamaRelease] = &[
+    PinnedLlamaRelease {
+        tag: "b9905",
+        min_macos_arm64: MacOsVersion {
+            major: 26,
+            minor: 0,
+        },
+        min_macos_x64: MacOsVersion {
+            major: 13,
+            minor: 3,
+        },
+        macos_arm64_sha256: DEFAULT_LLAMA_MACOS_ARM64_SHA256,
+        macos_x64_sha256: DEFAULT_LLAMA_MACOS_X64_SHA256,
+        linux_x64_sha256: Some(DEFAULT_LLAMA_LINUX_X64_SHA256),
+        linux_vulkan_x64_sha256: Some(DEFAULT_LLAMA_LINUX_VULKAN_X64_SHA256),
+    },
+    PinnedLlamaRelease {
+        tag: "b9415",
+        min_macos_arm64: MacOsVersion {
+            major: 14,
+            minor: 0,
+        },
+        min_macos_x64: MacOsVersion {
+            major: 13,
+            minor: 3,
+        },
+        macos_arm64_sha256: FALLBACK_LLAMA_MACOS_ARM64_SHA256,
+        macos_x64_sha256: FALLBACK_LLAMA_MACOS_X64_SHA256,
+        linux_x64_sha256: None,
+        linux_vulkan_x64_sha256: None,
+    },
+];
+
+/// Built-in digest for one supported pinned release asset.
 pub(crate) fn default_release_sha256(
     tag: &str,
     platform: Platform,
@@ -107,15 +228,105 @@ pub(crate) fn default_release_sha256(
 ) -> Option<&'static str> {
     use crate::config::EngineAccel;
 
-    if tag != DEFAULT_LLAMA_RELEASE_TAG {
-        return None;
-    }
+    let pin = PINNED_LLAMA_RELEASES.iter().find(|pin| pin.tag == tag)?;
     match (platform, accel) {
-        (Platform::MacOsArm64, _) => Some(DEFAULT_LLAMA_MACOS_ARM64_SHA256),
-        (Platform::MacOsX64, _) => Some(DEFAULT_LLAMA_MACOS_X64_SHA256),
-        (Platform::LinuxX64, EngineAccel::Vulkan) => Some(DEFAULT_LLAMA_LINUX_VULKAN_X64_SHA256),
+        (Platform::MacOsArm64, _) => Some(pin.macos_arm64_sha256),
+        (Platform::MacOsX64, _) => Some(pin.macos_x64_sha256),
+        (Platform::LinuxX64, EngineAccel::Vulkan) => pin.linux_vulkan_x64_sha256,
         (Platform::LinuxX64, EngineAccel::Cuda) => None,
-        (Platform::LinuxX64, _) => Some(DEFAULT_LLAMA_LINUX_X64_SHA256),
+        (Platform::LinuxX64, _) => pin.linux_x64_sha256,
+    }
+}
+
+/// Select the newest pinned llama.cpp release whose asset for `platform`
+/// loads on macOS `host`. Pure so tests can inject host versions; the
+/// production caller feeds it [`host_macos_version`]. Fails when the
+/// host is older than every pin, naming the host version and the oldest
+/// supported minimum.
+fn select_macos_release_tag(
+    platform: Platform,
+    host: MacOsVersion,
+) -> Result<&'static str, String> {
+    let mut oldest: Option<(MacOsVersion, &'static str)> = None;
+    for pin in PINNED_LLAMA_RELEASES {
+        let Some(min) = pin.min_macos(platform) else {
+            continue;
+        };
+        if min <= host {
+            return Ok(pin.tag);
+        }
+        if oldest.is_none_or(|(oldest_min, _)| min < oldest_min) {
+            oldest = Some((min, pin.tag));
+        }
+    }
+    let requirement = match oldest {
+        Some((min, tag)) => format!("the oldest pinned build {tag} needs macOS {min} or newer"),
+        None => "no pinned build ships an asset for this platform".to_string(),
+    };
+    Err(format!(
+        "this host runs macOS {host}, which is older than every pinned llama.cpp \
+         release: {requirement}. Install llama.cpp on PATH (for example `brew \
+         install llama.cpp`), point engines.llama_cpp.acquire.path at a vetted \
+         binary, or pin engines.llama_cpp.acquire.version and acquire.sha256 to \
+         a build made for this macOS"
+    ))
+}
+
+/// The macOS product version of the running host, read from `sw_vers
+/// -productVersion` with a `sysctl -n kern.osproductversion` fallback.
+/// Only meaningful on macOS; other platforms report an error because
+/// neither probe exists there.
+pub fn host_macos_version() -> Result<MacOsVersion, String> {
+    let mut failures = Vec::new();
+    for (program, args) in [
+        ("sw_vers", &["-productVersion"][..]),
+        ("sysctl", &["-n", "kern.osproductversion"][..]),
+    ] {
+        match std::process::Command::new(program).args(args).output() {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                match MacOsVersion::parse(&text) {
+                    Some(version) => return Ok(version),
+                    None => failures.push(format!(
+                        "{program} reported unparseable version '{}'",
+                        text.trim()
+                    )),
+                }
+            }
+            Ok(output) => failures.push(format!("{program} exited with {}", output.status)),
+            Err(error) => failures.push(format!("{program}: {error}")),
+        }
+    }
+    Err(format!(
+        "could not determine the macOS product version ({})",
+        failures.join("; ")
+    ))
+}
+
+/// The default llama.cpp release tag for `platform` when
+/// `engines.llama_cpp.acquire.version` is unset. Non-macOS platforms use
+/// the newest pin unconditionally. macOS hosts pick the newest pin whose
+/// measured minimum macOS is at or below the host product version,
+/// because a newer asset dies at dyld link time on an older host. Fails
+/// with the host and minimum supported versions when the host is older
+/// than every pin.
+pub fn default_release_tag_for_platform(platform: Platform) -> Result<&'static str, String> {
+    match platform {
+        Platform::LinuxX64 => Ok(DEFAULT_LLAMA_RELEASE_TAG),
+        Platform::MacOsArm64 | Platform::MacOsX64 => {
+            select_macos_release_tag(platform, host_macos_version()?)
+        }
+    }
+}
+
+/// The default llama.cpp release tag for the running host: the newest
+/// pin the host can load (see [`default_release_tag_for_platform`]). A
+/// host with no prebuilt asset at all reports the newest pin, since the
+/// tag is then only informational and acquisition is blocked elsewhere.
+pub fn default_llama_release_tag_for_host() -> Result<&'static str, String> {
+    match Platform::detect() {
+        Some(platform) => default_release_tag_for_platform(platform),
+        None => Ok(DEFAULT_LLAMA_RELEASE_TAG),
     }
 }
 
@@ -478,6 +689,171 @@ mod tests {
                 .unwrap_err()
                 .contains("source build")
         );
+    }
+
+    #[test]
+    fn newest_pin_is_the_default_tag() {
+        assert_eq!(PINNED_LLAMA_RELEASES[0].tag, DEFAULT_LLAMA_RELEASE_TAG);
+    }
+
+    #[test]
+    fn macos_version_parse_takes_major_and_minor_only() {
+        assert_eq!(
+            MacOsVersion::parse("26.5.2"),
+            Some(MacOsVersion {
+                major: 26,
+                minor: 5,
+            })
+        );
+        assert_eq!(
+            MacOsVersion::parse("14.0"),
+            Some(MacOsVersion {
+                major: 14,
+                minor: 0,
+            })
+        );
+        // sw_vers output ends in a newline, and a bare major is valid.
+        assert_eq!(
+            MacOsVersion::parse("15\n"),
+            Some(MacOsVersion {
+                major: 15,
+                minor: 0,
+            })
+        );
+        assert_eq!(MacOsVersion::parse("Tahoe"), None);
+        assert_eq!(MacOsVersion::parse(""), None);
+    }
+
+    #[test]
+    fn macos_selection_prefers_the_newest_compatible_pin() {
+        // A current macOS loads the newest pin; boundary equality with
+        // the measured minimum counts as compatible.
+        for host in [
+            MacOsVersion {
+                major: 26,
+                minor: 5,
+            },
+            MacOsVersion {
+                major: 26,
+                minor: 0,
+            },
+            MacOsVersion {
+                major: 27,
+                minor: 1,
+            },
+        ] {
+            assert_eq!(
+                select_macos_release_tag(Platform::MacOsArm64, host),
+                Ok("b9905")
+            );
+        }
+    }
+
+    #[test]
+    fn macos_selection_falls_back_below_the_newest_pin_requirement() {
+        // macOS 14 and 15 hosts cannot load the b9905 macos-arm64 asset
+        // (its minos is 26.0), so they get the newest 14-compatible pin.
+        // 14.0 exercises boundary equality with the fallback's minimum.
+        for host in [
+            MacOsVersion {
+                major: 14,
+                minor: 0,
+            },
+            MacOsVersion {
+                major: 14,
+                minor: 7,
+            },
+            MacOsVersion {
+                major: 15,
+                minor: 6,
+            },
+        ] {
+            assert_eq!(
+                select_macos_release_tag(Platform::MacOsArm64, host),
+                Ok("b9415")
+            );
+        }
+    }
+
+    #[test]
+    fn macos_older_than_every_pin_fails_naming_both_versions() {
+        let error = select_macos_release_tag(
+            Platform::MacOsArm64,
+            MacOsVersion {
+                major: 13,
+                minor: 6,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("13.6"), "{error}");
+        assert!(error.contains("14.0"), "{error}");
+        assert!(error.contains("b9415"), "{error}");
+    }
+
+    #[test]
+    fn macos_x64_pins_share_a_lower_floor() {
+        // The Intel assets are built against macOS 13.3 even on the
+        // newest pin, so selection stays on the newest pin down to that
+        // floor and fails below it.
+        assert_eq!(
+            select_macos_release_tag(
+                Platform::MacOsX64,
+                MacOsVersion {
+                    major: 13,
+                    minor: 3,
+                },
+            ),
+            Ok("b9905")
+        );
+        let error = select_macos_release_tag(
+            Platform::MacOsX64,
+            MacOsVersion {
+                major: 13,
+                minor: 2,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("13.2"), "{error}");
+        assert!(error.contains("13.3"), "{error}");
+    }
+
+    #[test]
+    fn non_macos_platforms_keep_the_single_newest_pin() {
+        assert_eq!(
+            default_release_tag_for_platform(Platform::LinuxX64),
+            Ok(DEFAULT_LLAMA_RELEASE_TAG)
+        );
+    }
+
+    #[test]
+    fn fallback_release_assets_have_built_in_digests_for_macos_only() {
+        use crate::config::EngineAccel;
+
+        assert_eq!(
+            default_release_sha256("b9415", Platform::MacOsArm64, EngineAccel::Metal),
+            Some("edf417cd8dd148fd423ea758953caa43376df98d8f027b7748ea0399a9a8023f")
+        );
+        assert_eq!(
+            default_release_sha256("b9415", Platform::MacOsX64, EngineAccel::Auto),
+            Some("7c07ab8bb59e249340ed15afe03d5f164521242942a406661d6c499efc186a84")
+        );
+        // The fallback pin exists purely for macOS; Linux never selects
+        // it by default and carries no digest for it.
+        assert_eq!(
+            default_release_sha256("b9415", Platform::LinuxX64, EngineAccel::Cpu),
+            None
+        );
+        assert_eq!(
+            default_release_sha256("b9415", Platform::LinuxX64, EngineAccel::Vulkan),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_macos_version_reads_a_plausible_product_version() {
+        let version = host_macos_version().expect("macOS hosts report a product version");
+        assert!(version.major >= 11, "unexpectedly old macOS {version}");
     }
 
     #[test]

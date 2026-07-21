@@ -2283,11 +2283,21 @@ fn prepare_run(args: &RunArgs) -> anyhow::Result<PreparedRun> {
             "version": sbproxy_model_host::DEFAULT_SGLANG_VERSION,
             "acceleration": acceleration,
         }),
-        sbproxy_model_host::EngineKind::LlamaCpp => serde_json::json!({
-            "launch": "binary",
-            "version": sbproxy_model_host::DEFAULT_LLAMA_RELEASE_TAG,
-            "acceleration": acceleration,
-        }),
+        sbproxy_model_host::EngineKind::LlamaCpp => {
+            // The generated config pins the engine release explicitly, so
+            // the pin must be one this host's macOS can load: recent
+            // llama.cpp macos-arm64 assets link against macOS 26 and die
+            // at dyld link time on older hosts. The host-aware default
+            // picks the newest pinned build the OS supports, and fails
+            // here, loudly, when none fits.
+            let tag = sbproxy_model_host::default_llama_release_tag_for_host()
+                .map_err(|reason| anyhow::anyhow!("select llama.cpp release: {reason}"))?;
+            serde_json::json!({
+                "launch": "binary",
+                "version": tag,
+                "acceleration": acceleration,
+            })
+        }
         sbproxy_model_host::EngineKind::Embedded => {
             anyhow::bail!("catalog resolved the unsupported embedded managed engine")
         }
@@ -4724,7 +4734,13 @@ fn check_self_freshness() -> SelfFreshness {
 }
 
 fn check_engines_freshness() -> Vec<EngineFreshness> {
-    let pinned = sbproxy_model_host::DEFAULT_LLAMA_RELEASE_TAG.to_string();
+    // The effective default pin is host-aware on macOS: an older host
+    // reports the newest pinned build its OS can load. When even that
+    // fails (host older than every pin), report the newest pin so the
+    // freshness table still renders; acquisition surfaces the real error.
+    let pinned = sbproxy_model_host::default_llama_release_tag_for_host()
+        .unwrap_or(sbproxy_model_host::DEFAULT_LLAMA_RELEASE_TAG)
+        .to_string();
     let llama_latest = github_latest_release(LLAMA_RELEASE_REPO);
     let llama_update = llama_latest
         .as_deref()
