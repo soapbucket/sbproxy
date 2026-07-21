@@ -60,6 +60,14 @@ jobs:
   build:
     name: build / ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # Linux builds run inside a rust:bookworm container so the binaries
+    # link against glibc 2.36, the floor shared by the distroless
+    # cc-debian12 Docker base and Debian-12-era hosts. Building directly
+    # on the runner links against the runner's glibc (ubuntu-24.04 =
+    # 2.39), which produced Docker images that could not start at all:
+    # "version `GLIBC_2.39' not found". The `container` value is empty
+    # for macOS, which GitHub treats as "no container".
+    container: ${{ matrix.container }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -68,9 +76,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             platform: linux_amd64
+            container: rust:1.97-bookworm
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             platform: linux_arm64
+            container: rust:1.97-bookworm
           - target: aarch64-apple-darwin
             runner: macos-latest
             platform: darwin_arm64
@@ -84,7 +94,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Linux jobs take their toolchain from the pinned rust:bookworm
+      # container image; installing another one via rustup would only
+      # reintroduce drift. macOS still needs the action.
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.os == 'macOS'
         with:
           targets: ${{ matrix.target }}
 
@@ -104,8 +118,11 @@ jobs:
           set -euo pipefail
           case "${RUNNER_OS}" in
             Linux)
-              sudo apt-get update
-              sudo apt-get install -y protobuf-compiler libclang-dev clang
+              # Inside the rust:bookworm container we are root and sudo
+              # does not exist; on a bare runner we are not and it does.
+              SUDO="$(command -v sudo || true)"
+              ${SUDO} apt-get update
+              ${SUDO} apt-get install -y protobuf-compiler libclang-dev clang
               ;;
             macOS)
               brew install protobuf
@@ -129,6 +146,24 @@ jobs:
       - name: build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy --features embed-admin-ui
 
+      # Contract: linux binaries must not require a glibc newer than the
+      # distroless cc-debian12 runtime base (2.36), or the Docker image
+      # dies on startup and the tarball only runs on 2026-era distros.
+      - name: assert glibc baseline (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/sbproxy"
+          MAX_ALLOWED="2.36"
+          NEEDED="$(objdump -T "${BIN}" | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1 | cut -d_ -f2)"
+          echo "highest glibc symbol version required: ${NEEDED} (allowed: <= ${MAX_ALLOWED})"
+          HIGHEST="$(printf '%s\n%s\n' "${NEEDED}" "${MAX_ALLOWED}" | sort -V | tail -1)"
+          if [ "${HIGHEST}" != "${MAX_ALLOWED}" ]; then
+            echo "::error::binary requires GLIBC_${NEEDED} > ${MAX_ALLOWED}; it will not start on the distroless cc-debian12 image. Build inside the pinned rust:bookworm container."
+            exit 1
+          fi
+
       - name: package tarball
         shell: bash
         run: |
@@ -143,7 +178,13 @@ jobs:
           # at root. Matches the Go v0.1.x convention so install.sh and
           # the Homebrew formula find the binary at the expected path.
           tar -czf "dist/sbproxy_${{ matrix.platform }}.tar.gz" -C "${STAGE}" .
-          (cd dist && shasum -a 256 "sbproxy_${{ matrix.platform }}.tar.gz" > "sbproxy_${{ matrix.platform }}.tar.gz.sha256")
+          # sha256sum on Linux (present in the rust:bookworm container),
+          # shasum on macOS; both emit the same "HASH  filename" shape.
+          if command -v sha256sum >/dev/null; then
+            (cd dist && sha256sum "sbproxy_${{ matrix.platform }}.tar.gz" > "sbproxy_${{ matrix.platform }}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "sbproxy_${{ matrix.platform }}.tar.gz" > "sbproxy_${{ matrix.platform }}.tar.gz.sha256")
+          fi
 
       - name: upload artifact
         uses: actions/upload-artifact@v5
@@ -492,6 +533,16 @@ jobs:
             ${{ steps.meta.outputs.dockerhub_image }}:latest
           provenance: true
           sbom: false
+
+      # The one check that would have caught the glibc-mismatch images:
+      # actually start the container we just pushed. `--version` exits 0
+      # only if the dynamic linker resolves, i.e. the binary's glibc
+      # requirement fits the distroless base.
+      - name: smoke test pushed image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm "${{ steps.meta.outputs.dockerhub_image }}@${{ steps.push.outputs.digest }}" --version
 
       - uses: sigstore/cosign-installer@v3
 

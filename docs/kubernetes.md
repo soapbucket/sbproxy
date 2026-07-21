@@ -1,6 +1,6 @@
 # Running sbproxy on Kubernetes
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-20*
 
 The OSS Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`. With `spec.clustering.enabled: true` the Deployment is replaced by a StatefulSet plus a headless Service and a shared-key Secret, and the replicas form a gossip mesh; see "Clustered proxies" below. Everything else on this page applies to both shapes.
 
@@ -65,7 +65,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: soapbucket/sbproxy:1.5.0
+  image: soapbucket/sbproxy:1.6.1
   configRef: demo-config
   replicas: 2
   port: 8080
@@ -94,7 +94,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: soapbucket/sbproxy:1.5.0
+  image: soapbucket/sbproxy:1.6.1
   configRef: demo-config
   replicas: 2
   port: 8080
@@ -152,7 +152,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: soapbucket/sbproxy:1.5.0
+  image: soapbucket/sbproxy:1.6.1
   configRef: demo-config
   replicas: 3
   port: 8080

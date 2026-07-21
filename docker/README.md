@@ -1,9 +1,9 @@
 # Docker Compose Setup
-*Last modified: 2026-06-18*
+*Last modified: 2026-07-20*
 
 This directory contains a Docker Compose stack for running SBproxy locally with a full observability pipeline. The stack includes:
 
-- **sbproxy** - the proxy, built from the project Dockerfile (ports 8080, 8443)
+- **sbproxy** - the proxy, built from `Dockerfile.cloudbuild` at the repo root (ports 8080, 8443)
 - **redis** - distributed rate limiting counters and pub/sub config reload events (port 6379)
 - **pebble** - ACME test server for auto-TLS certificate issuance without hitting a public CA (ports 14000, 15000)
 - **prometheus** - scrapes SBproxy metrics every 15 seconds (port 9090)
@@ -38,7 +38,7 @@ Or from inside the `docker/` directory:
 
     docker compose up --build
 
-The `--build` flag rebuilds the SBproxy image from the project Dockerfile. Omit it on subsequent runs to reuse the cached image.
+The `--build` flag rebuilds the SBproxy image from `Dockerfile.cloudbuild`. Omit it on subsequent runs to reuse the cached image.
 
 SBproxy waits for Redis and Jaeger to be ready before starting, so all services come up in the correct order.
 
