@@ -1,6 +1,6 @@
 # SBproxy
 
-> The AI gateway built like a real proxy. One binary, built on Pingora. Open source under Apache 2.0.
+> SBproxy is a self-hosted AI gateway. It governs your AI traffic in both directions: which apps and agents can call which models, on whose keys, at what spend. Built like a real proxy: one binary on Pingora, open source under Apache 2.0.
 
 Most teams run nginx or Traefik for HTTP traffic, then route AI requests through a separate LiteLLM or Portkey instance. SBproxy handles both in a single binary. One config file covers everything.
 
