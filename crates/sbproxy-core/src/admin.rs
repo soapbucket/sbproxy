@@ -2366,17 +2366,27 @@ async fn serve_admin_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
             write_admin_response(sock, 403, "application/json", r#"{"error":"Forbidden"}"#).await;
         return;
     }
-    if !rate_limiter.check(&peer_ip) {
-        let _ = write_admin_response(
-            sock,
-            429,
-            "application/json",
-            r#"{"error":"Too Many Requests"}"#,
-        )
-        .await;
-        return;
-    }
-    handle_admin_connection(sock, state).await;
+    // The rate limit itself is enforced in `handle_admin_connection`,
+    // once the request path is known: static UI bundle assets are
+    // exempt (see `path_is_exempt_from_rate_limit`), everything else is
+    // not. IP filtering stays here, before any bytes are read, since it
+    // needs no path.
+    handle_admin_connection(sock, &peer_ip, &rate_limiter, state).await;
+}
+
+/// True for a request path that should never count against the admin
+/// rate limiter, even though the limiter itself cannot be disabled
+/// (see `proxy.admin.rate_limit_per_minute` validation). Currently just
+/// the static UI bundle: every session fetches the same hashed JS/CSS/
+/// font files, so counting them starves the limiter's actual purpose,
+/// which is bounding requests to authenticated, sensitive routes
+/// (login, keys, config, `/api/*`). A dashboard session can otherwise
+/// legitimately fire a dozen asset fetches navigating between a few
+/// views and trip a limit meant for credential-guessing / DDoS, with
+/// no indication to the operator beyond a silently broken page (a
+/// browser's dynamic `import()` rejects a 429 JSON body outright).
+fn path_is_exempt_from_rate_limit(path: &str) -> bool {
+    crate::admin_ui::is_static_asset(path)
 }
 
 /// Build a rustls `TlsAcceptor` for the admin server from PEM cert + key
@@ -2409,6 +2419,8 @@ fn build_admin_acceptor(tls: &AdminTls) -> Result<tokio_rustls::TlsAcceptor, Str
 
 async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     mut sock: S,
+    peer_ip: &str,
+    rate_limiter: &AdminRateLimiter,
     state: std::sync::Arc<AdminState>,
 ) {
     use tokio::io::AsyncReadExt;
@@ -2505,6 +2517,16 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("GET");
     let path = parts.next().unwrap_or("/");
+    if !path_is_exempt_from_rate_limit(path) && !rate_limiter.check(peer_ip) {
+        let _ = write_admin_response(
+            sock,
+            429,
+            "application/json",
+            r#"{"error":"Too Many Requests"}"#,
+        )
+        .await;
+        return;
+    }
     let mut auth_header: Option<String> = None;
     let mut origin: Option<String> = None;
     let mut cookie: Option<String> = None;
@@ -3174,10 +3196,15 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let handler = tokio::spawn(handle_admin_connection(
-            server,
-            std::sync::Arc::new(make_state()),
-        ));
+        let handler = tokio::spawn(async move {
+            handle_admin_connection(
+                server,
+                "10.0.0.1",
+                &AdminRateLimiter::new(1_000_000),
+                std::sync::Arc::new(make_state()),
+            )
+            .await
+        });
         let request = format!(
             "POST /admin/cluster/deployments HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
             512 * 1024 + 1
@@ -3198,10 +3225,15 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut client, server) = tokio::io::duplex(1024 * 1024);
-        let handler = tokio::spawn(handle_admin_connection(
-            server,
-            std::sync::Arc::new(make_state()),
-        ));
+        let handler = tokio::spawn(async move {
+            handle_admin_connection(
+                server,
+                "10.0.0.2",
+                &AdminRateLimiter::new(1_000_000),
+                std::sync::Arc::new(make_state()),
+            )
+            .await
+        });
         let body = vec![b'x'; 512 * 1024];
         let request = format!(
             "POST /unknown HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: {}\r\n\r\n",
@@ -3218,6 +3250,71 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
         assert!(!response.contains("request_body_too_large"));
+    }
+
+    // One simulated connection carrying a single bare GET for `path`,
+    // against a shared rate limiter. Mirrors production, where each
+    // admin request is its own TCP connection (`Connection: close`)
+    // and the limiter is an `Arc` cloned per accepted connection.
+    async fn get_through_rate_limiter(path: &str, limiter: &Arc<AdminRateLimiter>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let state = Arc::new(make_state());
+        let limiter = limiter.clone();
+        let path = path.to_string();
+        let handler =
+            tokio::spawn(
+                async move { handle_admin_connection(server, "peer", &limiter, state).await },
+            );
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_exempts_static_ui_assets_but_not_other_admin_paths() {
+        // WOR: dashboard navigation fires a JS+CSS fetch per view on top
+        // of whatever the view's own API calls need; a low per-IP cap
+        // meant to bound login/config/keys abuse should not also gate
+        // fetching the (identical, non-sensitive) bundle files every
+        // session needs. Regression for the 429 that silently broke
+        // `import()` of a route chunk mid-session.
+        let limiter = Arc::new(AdminRateLimiter::new(2));
+
+        // Exhaust the cap on a real admin route.
+        assert!(get_through_rate_limiter("/admin/config", &limiter)
+            .await
+            .starts_with("HTTP/1.1 401"));
+        assert!(get_through_rate_limiter("/admin/config", &limiter)
+            .await
+            .starts_with("HTTP/1.1 401"));
+        let blocked = get_through_rate_limiter("/admin/config", &limiter).await;
+        assert!(
+            blocked.starts_with("HTTP/1.1 429"),
+            "third non-asset request should be rate limited, got: {blocked}"
+        );
+
+        // The cap is already exhausted for this IP, yet asset fetches
+        // keep going through: the default build's own 404 (UI not
+        // embedded in a plain `cargo test`), never a 429.
+        for _ in 0..5 {
+            let resp = get_through_rate_limiter("/admin/ui/assets/index-abc123.js", &limiter).await;
+            assert!(
+                !resp.starts_with("HTTP/1.1 429"),
+                "static asset request must never be rate limited, got: {resp}"
+            );
+        }
+
+        // Once exhausted, the real admin routes are still blocked; the
+        // asset traffic above did not quietly refill the same bucket.
+        let still_blocked = get_through_rate_limiter("/admin/config", &limiter).await;
+        assert!(still_blocked.starts_with("HTTP/1.1 429"));
     }
 
     #[tokio::test]
@@ -3246,7 +3343,15 @@ mod tests {
             [7; 16],
         );
         let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let handler = tokio::spawn(handle_admin_connection(server, Arc::new(state)));
+        let handler = tokio::spawn(async move {
+            handle_admin_connection(
+                server,
+                "10.0.0.3",
+                &AdminRateLimiter::new(1_000_000),
+                Arc::new(state),
+            )
+            .await
+        });
         client
             .write_all(
                 format!("GET /admin/compression/sessions/{record_id}/content HTTP/1.1\r\n\r\n")

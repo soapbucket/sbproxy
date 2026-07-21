@@ -75,6 +75,20 @@ pub fn path_is_ours(path: &str) -> bool {
     path == UI_PREFIX || path.starts_with(&format!("{UI_PREFIX}/"))
 }
 
+/// Prefix for the Vite-built static bundle: hashed JS/CSS/font/image
+/// files, identical for every session and safe to exempt from the
+/// admin rate limiter (see [`crate::admin::path_is_exempt_from_rate_limit`]).
+const ASSETS_PREFIX: &str = "/admin/ui/assets/";
+
+/// True for a request under the static asset bundle
+/// (`/admin/ui/assets/index-XXXX.js`, `...css`, fonts, images). False
+/// for the SPA shell itself (`/admin/ui`, `/admin/ui/`) and for
+/// client-side route paths (`/admin/ui/keys`), which still go through
+/// the rate limiter like any other admin request.
+pub fn is_static_asset(path: &str) -> bool {
+    path.starts_with(ASSETS_PREFIX) && path.len() > ASSETS_PREFIX.len()
+}
+
 /// Byte-body variant of [`dispatch`], used by the admin server to serve
 /// a real Vite bundle including binary assets (fonts, images, wasm)
 /// that a `String` body would corrupt. Returns `None` when the path is
@@ -247,6 +261,25 @@ mod tests {
         // Sibling prefixes do not match.
         assert!(!path_is_ours("/admin/ui-other"));
         assert!(!path_is_ours("/admin"));
+    }
+
+    #[test]
+    fn is_static_asset_matches_only_the_assets_subpath() {
+        assert!(is_static_asset("/admin/ui/assets/index-CGvDHG5N.js"));
+        assert!(is_static_asset("/admin/ui/assets/index-f7jxlhHL.css"));
+        assert!(is_static_asset("/admin/ui/assets/favicon-abc123.woff2"));
+
+        // The SPA shell and client-side routes still count against the
+        // rate limiter; only the hashed bundle files under assets/ are
+        // exempt.
+        assert!(!is_static_asset("/admin/ui"));
+        assert!(!is_static_asset("/admin/ui/"));
+        assert!(!is_static_asset("/admin/ui/keys"));
+        assert!(!is_static_asset("/admin/ui/favicon.svg"));
+        assert!(!is_static_asset("/admin/ui/assets/"));
+        assert!(!is_static_asset("/admin/ui/assets"));
+        assert!(!is_static_asset("/admin/login"));
+        assert!(!is_static_asset("/api/health"));
     }
 
     #[test]
