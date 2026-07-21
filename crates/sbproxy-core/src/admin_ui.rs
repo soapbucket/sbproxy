@@ -77,7 +77,7 @@ pub fn path_is_ours(path: &str) -> bool {
 
 /// Prefix for the Vite-built static bundle: hashed JS/CSS/font/image
 /// files, identical for every session and safe to exempt from the
-/// admin rate limiter (see [`crate::admin::path_is_exempt_from_rate_limit`]).
+/// admin rate limiter (see `admin::path_is_exempt_from_rate_limit`).
 const ASSETS_PREFIX: &str = "/admin/ui/assets/";
 
 /// True for a request under the static asset bundle
