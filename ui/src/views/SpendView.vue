@@ -71,6 +71,12 @@ const spendByModel = computed(() => groupByLabel(costFamily.value, "model"));
 const spendByProvider = computed(() =>
   groupByLabel(costFamily.value, "provider"),
 );
+// Per-origin spend rides the origin label on the attributed cost
+// counter. Absent on scrapes from older binaries, so the section
+// hides rather than showing one "(none)" row.
+const spendByOrigin = computed(() =>
+  labeled(groupByLabel(costFamily.value, "origin")),
+);
 const spendByKey = computed(() =>
   labeled(groupByLabel(costFamily.value, "api_key_id")),
 );
@@ -111,6 +117,7 @@ const hasSpend = computed(() => totalSpend.value > 0);
 const hasTeams = computed(() => spendByTeam.value.length > 0);
 const hasProjects = computed(() => spendByProject.value.length > 0);
 const hasKeys = computed(() => spendByKey.value.length > 0);
+const hasOrigins = computed(() => spendByOrigin.value.length > 1);
 
 // --- Spend history from the durable rollups (WOR-1875) ---
 // Served by /api/usage/spend?window=&group_by=; survives restarts.
@@ -122,6 +129,7 @@ const HISTORY_GROUPS = [
   { value: "team", label: "Team" },
   { value: "project", label: "Project" },
   { value: "api_key", label: "API key" },
+  { value: "origin", label: "Origin" },
 ] as const;
 const historyWindow = ref<(typeof HISTORY_WINDOWS)[number]>("24h");
 const historyGroup = ref<string>("model");
@@ -324,6 +332,11 @@ const hasHistory = computed(() => historyRows.value.length > 0);
     <section class="panel">
       <h2>Spend by provider</h2>
       <MiniBars :items="spendByProvider" :format="formatUsd" />
+    </section>
+
+    <section class="panel" v-if="hasOrigins">
+      <h2>Spend by origin</h2>
+      <MiniBars :items="spendByOrigin" :format="formatUsd" />
     </section>
 
     <section class="panel" v-if="hasKeys">

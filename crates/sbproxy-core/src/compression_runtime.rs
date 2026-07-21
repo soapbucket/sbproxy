@@ -858,6 +858,7 @@ impl InternalSummarizer for RuntimeInternalSummarizer {
         let cost =
             sbproxy_ai::estimate_cost(request.model, output.input_tokens, output.output_tokens);
         sbproxy_ai::ai_metrics::record_ai_request_attributed(
+            "",
             request.provider,
             request.model,
             "compression_summary",
@@ -872,6 +873,7 @@ impl InternalSummarizer for RuntimeInternalSummarizer {
             cost,
         );
         sbproxy_ai::ai_metrics::record_ai_outcome_attributed(
+            "",
             request.provider,
             request.model,
             "compression_summary",

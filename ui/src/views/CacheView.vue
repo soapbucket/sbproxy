@@ -20,11 +20,37 @@ function refresh() {
 }
 onMounted(refresh);
 
+// Origin scope. The response-cache counter and the semantic-cache
+// debug report both key by origin, so one picker scopes the page;
+// "all origins" is the default aggregate.
+const selectedOrigin = ref("");
+const cacheResultsFamily = computed(() => {
+  const text = metricsReq.data.value;
+  if (!text) return undefined;
+  return findFamily(
+    parsePrometheus(text),
+    "sbproxy_cache_results_total",
+    "sbproxy_cache_hits_total",
+  );
+});
+const originOptions = computed(() => {
+  const fromMetrics =
+    cacheResultsFamily.value?.samples
+      .map((s) => s.labels.origin)
+      .filter((o): o is string => !!o) ?? [];
+  const fromSemantic = (semanticReq.data.value?.caches ?? []).map((c) => c.origin);
+  return [...new Set([...fromMetrics, ...fromSemantic])].sort();
+});
+
 // Semantic (embedding) cache decisions, flattened per origin. Only shown
 // when at least one AI origin has an embedding cache with recorded
 // lookups.
 const semanticCaches = computed(() =>
-  (semanticReq.data.value?.caches ?? []).filter((c) => c.recent.length > 0),
+  (semanticReq.data.value?.caches ?? []).filter(
+    (c) =>
+      c.recent.length > 0 &&
+      (!selectedOrigin.value || c.origin === selectedOrigin.value),
+  ),
 );
 function decisionTone(reason: string): string {
   return reason === "hit" ? "var(--sb-accent)" : "var(--sb-text-muted)";
@@ -39,16 +65,12 @@ const prefixSupported = computed(() => !!status.value?.prefix_purge_supported);
 // sbproxy_cache_results_total{origin, result}; the hits name is kept
 // as a fallback for older binaries.
 const cacheHits = computed(() => {
-  const text = metricsReq.data.value;
-  if (!text) return { hits: 0, misses: 0 };
-  const fam = findFamily(
-    parsePrometheus(text),
-    "sbproxy_cache_results_total",
-    "sbproxy_cache_hits_total",
-  );
+  const fam = cacheResultsFamily.value;
+  if (!fam) return { hits: 0, misses: 0 };
+  const scope = selectedOrigin.value ? { origin: selectedOrigin.value } : {};
   return {
-    hits: sumSamples(fam, { result: "hit" }),
-    misses: sumSamples(fam, { result: "miss" }),
+    hits: sumSamples(fam, { result: "hit", ...scope }),
+    misses: sumSamples(fam, { result: "miss", ...scope }),
   };
 });
 const hitRate = computed(() => {
@@ -120,6 +142,15 @@ const evictAllPolicies = () =>
     subtitle="Response-cache status and eviction, plus dynamic key-policy cache invalidation."
   >
     <template #actions>
+      <select
+        v-if="originOptions.length > 1"
+        class="sb-select origin-select"
+        v-model="selectedOrigin"
+        aria-label="Scope to origin"
+      >
+        <option value="">all origins</option>
+        <option v-for="o in originOptions" :key="o" :value="o">{{ o }}</option>
+      </select>
       <button class="sb-btn sb-btn--sm" @click="refresh">Refresh</button>
     </template>
   </PageHeader>
@@ -232,6 +263,12 @@ const evictAllPolicies = () =>
 </template>
 
 <style scoped>
+.origin-select {
+  width: auto;
+  min-width: 170px;
+  font-family: var(--sb-font-mono);
+  font-size: 0.78rem;
+}
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));

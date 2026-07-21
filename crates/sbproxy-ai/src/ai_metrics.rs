@@ -974,6 +974,10 @@ static AI_TOKENS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "AI tokens consumed, partitioned by attribution tag (WOR-1086)"
         ),
         &[
+            // Origin (config hostname) the request arrived on; bounded
+            // by the config, so it is cardinality-safe. Enables the
+            // admin UI's per-origin spend and token views.
+            "origin",
             "provider",
             "model",
             "surface", // classified AI surface (WOR-1095): chat_completions, embeddings, image_generation, audio_speech, realtime, ...
@@ -1006,6 +1010,8 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "AI cost in USD, partitioned by attribution tag (WOR-1086)"
         ),
         &[
+            // See AI_TOKENS_ATTRIBUTED: config-bounded origin hostname.
+            "origin",
             "provider",
             "model",
             "surface", // classified AI surface (WOR-1095)
@@ -1038,6 +1044,8 @@ static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "AI requests partitioned by attribution + outcome (WOR-1496)"
         ),
         &[
+            // See AI_TOKENS_ATTRIBUTED: config-bounded origin hostname.
+            "origin",
             "provider",
             "model",
             "surface",
@@ -1055,6 +1063,7 @@ static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 /// into that set before calling so the label cardinality stays bounded.
 #[allow(clippy::too_many_arguments)]
 pub fn record_ai_outcome_attributed(
+    origin: &str,
     provider: &str,
     model: &str,
     surface: &str,
@@ -1063,7 +1072,9 @@ pub fn record_ai_outcome_attributed(
     outcome: &str,
 ) {
     AI_OUTCOMES_ATTRIBUTED
-        .with_label_values(&[provider, model, surface, tenant_id, api_key_id, outcome])
+        .with_label_values(&[
+            origin, provider, model, surface, tenant_id, api_key_id, outcome,
+        ])
         .inc();
 }
 
@@ -1079,6 +1090,7 @@ pub fn record_ai_outcome_attributed(
 /// Allocate-layer join works off the span's trace_id.
 #[allow(clippy::too_many_arguments)]
 pub fn record_ai_request_attributed(
+    origin: &str,
     provider: &str,
     model: &str,
     surface: &str,
@@ -1104,6 +1116,7 @@ pub fn record_ai_request_attributed(
         }
         AI_TOKENS_ATTRIBUTED
             .with_label_values(&[
+                origin,
                 provider,
                 model,
                 surface,
@@ -1127,6 +1140,7 @@ pub fn record_ai_request_attributed(
     if cost > 0.0 {
         AI_COST_ATTRIBUTED
             .with_label_values(&[
+                origin,
                 provider,
                 model,
                 surface,
@@ -1392,6 +1406,7 @@ mod tests {
     #[test]
     fn test_record_ai_outcome_attributed() {
         record_ai_outcome_attributed(
+            "test.origin",
             "openai",
             "gpt-4o",
             "chat_completions",
@@ -1763,6 +1778,7 @@ mod tests {
             ..Default::default()
         };
         record_ai_request_attributed(
+            "test.origin",
             "openai",
             "gpt-4o",
             "chat_completions",
@@ -1867,6 +1883,7 @@ mod tests {
         let provider = "zero-kinds-test-provider";
         let model = "zero-kinds-test-model";
         record_ai_request_attributed(
+            "test.origin",
             provider,
             model,
             "chat_completions",

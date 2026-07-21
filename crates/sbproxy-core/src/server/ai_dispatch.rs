@@ -1558,6 +1558,7 @@ pub(super) async fn handle_ai_proxy(
         // OpenAI clients don't depend on it for routing decisions.
         let format = sbproxy_ai::client::provider_format(provider);
         emit_ai_billing_event(
+            hostname,
             surface_label,
             &provider.name,
             None,
@@ -1694,6 +1695,7 @@ pub(super) async fn handle_ai_proxy(
 
         let format = sbproxy_ai::client::provider_format(provider);
         emit_ai_billing_event(
+            hostname,
             surface_label,
             &provider.name,
             None,
@@ -2118,6 +2120,7 @@ pub(super) async fn handle_ai_proxy(
             };
             let cost = sbproxy_ai::budget::estimate_cost_for_usage("whisper-1", &usage);
             let cost_micros = emit_ai_billing_event(
+                hostname,
                 surface_label,
                 &provider.name,
                 model,
@@ -2144,6 +2147,7 @@ pub(super) async fn handle_ai_proxy(
         }
 
         emit_ai_billing_event(
+            hostname,
             surface_label,
             &provider.name,
             None,
@@ -4034,6 +4038,7 @@ pub(super) async fn handle_ai_proxy(
                         &o.body,
                     );
                     emit_ai_billing_event(
+                        hostname,
                         surface_label,
                         &o.provider_name,
                         Some(o.model.clone()),
@@ -4848,6 +4853,7 @@ pub(super) async fn handle_ai_proxy(
             // `usage` block (OpenAI) or a `message_delta` (Anthropic)
             // still charges the configured scopes after it closes.
             let stream_recorder = effective_budget.as_deref().map(|b| BudgetRecorderArgs {
+                origin: hostname.to_string(),
                 config: b,
                 keys: &budget_keys,
                 model: model.as_str(),
@@ -4941,6 +4947,7 @@ pub(super) async fn handle_ai_proxy(
             // the upstream response passes the status + size gates, we
             // dispatch `hook.store` best-effort (fail-open).
             let recorder = effective_budget.as_deref().map(|b| BudgetRecorderArgs {
+                origin: hostname.to_string(),
                 config: b,
                 keys: &budget_keys,
                 model: model.as_str(),
@@ -5771,6 +5778,7 @@ pub(super) async fn relay_ai_response_with_cache(
             let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
             let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
             let cost_micros = emit_ai_billing_event(
+                &args.origin,
                 args.surface_label,
                 args.provider_name,
                 Some(args.model.to_string()),
@@ -5831,6 +5839,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 let surface = ctx.ai_surface.clone().unwrap_or_default();
                 let model_for_event = (!model.is_empty()).then_some(model);
                 let cost_micros = emit_ai_billing_event(
+                    ctx.hostname.as_str(),
                     surface.as_str(),
                     provider.as_str(),
                     model_for_event,
@@ -6191,6 +6200,9 @@ impl StreamingReversibleRestore {
 /// body can be parsed for `usage` and recorded against every scope
 /// computed at pre-flight time.
 pub(super) struct BudgetRecorderArgs<'a> {
+    /// Origin hostname the request arrived on. Stamped onto the
+    /// attributed spend metrics so the admin UI can slice by origin.
+    origin: String,
     /// Reference to the AI handler's `BudgetConfig`. Used to look up
     /// each fired limit's scope label for the utilization gauge.
     config: &'a sbproxy_ai::BudgetConfig,
@@ -7217,6 +7229,7 @@ pub(super) async fn relay_ai_stream(
                 // settle its governance reservation with the same figure
                 // just recorded to the budget ledger.
                 let cost_micros = emit_ai_billing_event(
+                    &args.origin,
                     args.surface_label,
                     args.provider_name,
                     Some(args.model.to_string()),

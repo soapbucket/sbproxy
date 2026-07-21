@@ -3592,6 +3592,7 @@ mod tests {
             .fold(&[sbproxy_observe::usage_rollup::RollupEvent {
                 ts_secs: now - 60,
                 dims: sbproxy_observe::usage_rollup::RollupDims {
+                    origin: "test.origin".to_string(),
                     provider: "openai".to_string(),
                     model: "gpt-4o".to_string(),
                     tenant: "t".to_string(),
@@ -3846,6 +3847,7 @@ mod tests {
         let (before_tokens, _) = spend_totals_from_snapshot(&before);
 
         sbproxy_ai::ai_metrics::record_ai_request_attributed(
+            "test.origin",
             "anthropic",
             "claude-opus-4-8",
             "chat_completions",

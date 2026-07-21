@@ -198,6 +198,7 @@ mod tests {
             .unwrap_or(0.0);
 
         sbproxy_ai::ai_metrics::record_ai_request_attributed(
+            "test.origin",
             "openai",
             "gpt-4o",
             "chat_completions",
