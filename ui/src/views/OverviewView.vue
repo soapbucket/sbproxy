@@ -155,10 +155,18 @@ function optionalNumber(v: unknown): number | undefined {
         </thead>
         <tbody>
           <tr v-for="(m, i) in residentModels" :key="i">
-            <td class="sb-mono">{{ m.name ?? m.id ?? "unknown" }}</td>
+            <td class="sb-mono">{{ m.name ?? m.id ?? m.deployment ?? "unknown" }}</td>
             <td><StatusBadge :label="String(m.state ?? m.status ?? 'unknown')" /></td>
             <td class="sb-muted">{{ m.engine ?? "n/a" }}</td>
-            <td>{{ formatBytes(m.vram_bytes ?? optionalNumber(m.vram)) }}</td>
+            <td>
+              {{
+                formatBytes(
+                  m.vram_bytes ??
+                    optionalNumber(m.vram) ??
+                    optionalNumber((m.memory as Record<string, unknown> | undefined)?.total_bytes),
+                )
+              }}
+            </td>
           </tr>
         </tbody>
       </table>

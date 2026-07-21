@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { api, asList, ApiError, type Credential } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import { formatTime, shortId } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -43,6 +44,7 @@ async function submit() {
     await api.createCredential(body);
     showCreate.value = false;
     reset();
+    toast.success("Credential added");
     req.run();
   } catch (e) {
     createError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
@@ -53,18 +55,24 @@ async function submit() {
 
 // ---- actions ----
 const rowBusy = ref<string | null>(null);
-const actionError = ref<string | null>(null);
+
+const ACTION_DONE: Record<string, string> = {
+  revoke: "Credential revoked",
+  block: "Credential blocked",
+  unblock: "Credential unblocked",
+  rotate: "Credential rotated",
+};
 
 async function doAction(c: Credential, action: "revoke" | "block" | "unblock" | "rotate") {
   const id = credId(c);
   if (action === "revoke" && !confirm(`Revoke credential ${id}?`)) return;
   rowBusy.value = id + action;
-  actionError.value = null;
   try {
     await api.credentialAction(id, action);
+    toast.success(ACTION_DONE[action], shortId(id));
     req.run();
   } catch (e) {
-    actionError.value = e instanceof ApiError ? `${action}: ${e.hint}` : String(e);
+    toast.error(e, `${action[0].toUpperCase()}${action.slice(1)} credential`);
   } finally {
     rowBusy.value = null;
   }
@@ -74,12 +82,12 @@ async function doDelete(c: Credential) {
   const id = credId(c);
   if (!confirm(`Delete credential ${id}?`)) return;
   rowBusy.value = id + "delete";
-  actionError.value = null;
   try {
     await api.deleteCredential(id);
+    toast.success("Credential deleted", shortId(id));
     req.run();
   } catch (e) {
-    actionError.value = e instanceof ApiError ? `delete: ${e.hint}` : String(e);
+    toast.error(e, "Delete credential");
   } finally {
     rowBusy.value = null;
   }
@@ -100,8 +108,6 @@ function statusOf(c: Credential): string {
       <button class="sb-btn sb-btn--primary" @click="showCreate = true">Add credential</button>
     </template>
   </PageHeader>
-
-  <p class="notice" v-if="actionError">{{ actionError }}</p>
 
   <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
   <EmptyState v-else-if="!creds.length" message="No credentials configured.">

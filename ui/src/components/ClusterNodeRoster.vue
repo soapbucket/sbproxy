@@ -219,8 +219,8 @@ function labelEntries(labels: Record<string, string>): [string, string][] {
 }
 
 .local-marker {
-  color: var(--sb-on-navy);
-  background: var(--sb-navy);
+  color: var(--sb-on-ink);
+  background: var(--sb-ink);
 }
 
 .data-tag {

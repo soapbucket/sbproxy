@@ -76,9 +76,9 @@ function healthLabel(health: ClusterNode["health"]): string {
   margin-bottom: var(--sb-space-5);
   padding: var(--sb-space-5);
   overflow: hidden;
-  color: var(--sb-on-navy);
-  background: var(--sb-navy);
-  border: 1px solid var(--sb-navy-strong);
+  color: var(--sb-on-ink);
+  background: var(--sb-ink);
+  border: 1px solid var(--sb-ink-strong);
   border-radius: var(--sb-radius-lg);
 }
 
@@ -97,7 +97,7 @@ function healthLabel(health: ClusterNode["health"]): string {
 
 .health-rail h2 {
   font-size: 1.25rem;
-  color: var(--sb-on-navy);
+  color: var(--sb-on-ink);
 }
 
 .health-rail__summary {
@@ -112,7 +112,7 @@ function healthLabel(health: ClusterNode["health"]): string {
 }
 
 .health-rail__summary strong {
-  color: var(--sb-on-navy);
+  color: var(--sb-on-ink);
   font-family: var(--sb-font-mono);
   font-weight: 700;
 }
@@ -125,7 +125,7 @@ function healthLabel(health: ClusterNode["health"]): string {
 }
 
 .health-rail__scroller:focus-visible {
-  outline: 2px solid var(--sb-on-navy);
+  outline: 2px solid var(--sb-on-ink);
   outline-offset: 2px;
 }
 
@@ -144,7 +144,7 @@ function healthLabel(health: ClusterNode["health"]): string {
   left: 18px;
   height: 1px;
   content: "";
-  background: var(--sb-navy-soft);
+  background: var(--sb-ink-soft);
 }
 
 .health-rail__node {
@@ -156,16 +156,16 @@ function healthLabel(health: ClusterNode["health"]): string {
   align-items: center;
   min-width: 138px;
   padding: var(--sb-space-2);
-  color: var(--sb-on-navy);
-  background: var(--sb-navy);
-  border: 1px solid var(--sb-navy-soft);
+  color: var(--sb-on-ink);
+  background: var(--sb-ink);
+  border: 1px solid var(--sb-ink-soft);
   border-radius: var(--sb-radius-sm);
   text-decoration: none;
 }
 
 .health-rail__node:hover {
-  color: var(--sb-on-navy);
-  background: var(--sb-navy-strong);
+  color: var(--sb-on-ink);
+  background: var(--sb-ink-strong);
   border-color: var(--sb-accent-tint-strong);
   text-decoration: none;
 }
@@ -180,7 +180,7 @@ function healthLabel(health: ClusterNode["health"]): string {
   place-items: center;
   width: 26px;
   height: 26px;
-  color: var(--sb-navy-strong);
+  color: var(--sb-ink-strong);
   background: var(--sb-ok-bg);
   border: 2px solid var(--sb-ok);
   border-radius: 50%;
@@ -232,8 +232,8 @@ function healthLabel(health: ClusterNode["health"]): string {
   grid-column: 1 / -1;
   justify-self: start;
   padding: 1px 6px;
-  color: var(--sb-on-navy);
-  background: var(--sb-navy-soft);
+  color: var(--sb-on-ink);
+  background: var(--sb-ink-soft);
   border: 1px solid var(--sb-accent-tint-strong);
   border-radius: var(--sb-radius-pill);
   font-size: 0.62rem;

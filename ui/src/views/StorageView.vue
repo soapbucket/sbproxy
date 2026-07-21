@@ -8,6 +8,7 @@ import ModalDialog from "../components/ModalDialog.vue";
 import ModelFilesTable from "../components/ModelFilesTable.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import { formatBytes } from "../lib/format";
 import {
   deleteRefusalReason,
@@ -27,8 +28,6 @@ const files = computed(() => filesReq.data.value);
 const rows = computed(() => storageRows(files.value));
 const cacheConfigured = computed(() => Boolean(files.value?.cache_root));
 
-const banner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
-
 function failureText(error: unknown): string {
   if (error instanceof ApiError) return error.hint;
   return error instanceof Error ? error.message : "The operation failed.";
@@ -43,7 +42,6 @@ const pendingDelete = ref<StorageArtifactRow | null>(null);
 const deleteBusy = ref("");
 
 function requestDelete(row: StorageArtifactRow) {
-  banner.value = null;
   pendingDelete.value = row;
 }
 
@@ -56,22 +54,23 @@ async function confirmDelete() {
   const row = pendingDelete.value;
   if (!row || deleteBusy.value) return;
   deleteBusy.value = row.digest;
-  banner.value = null;
   const cleared = { ...refusals.value };
   delete cleared[row.digest];
   refusals.value = cleared;
   try {
     const report = await api.deleteModelHostArtifact(row.digest);
     pendingDelete.value = null;
-    banner.value = report.removed
-      ? {
-          tone: "ok",
-          text: `Deleted ${row.model} (${row.variant}) and reclaimed ${formatBytes(report.reclaimed_bytes)}.`,
-        }
-      : {
-          tone: "err",
-          text: `The server accepted the request but did not remove ${row.digestShort}.`,
-        };
+    if (report.removed) {
+      toast.success(
+        `Deleted ${row.model} (${row.variant})`,
+        `Reclaimed ${formatBytes(report.reclaimed_bytes)}.`,
+      );
+    } else {
+      toast.warn(
+        "Artifact not removed",
+        `The server accepted the request but did not remove ${row.digestShort}.`,
+      );
+    }
   } catch (error) {
     pendingDelete.value = null;
     if (error instanceof ApiError && error.status === 409) {
@@ -80,7 +79,7 @@ async function confirmDelete() {
         [row.digest]: deleteRefusalReason(error.body),
       };
     } else {
-      banner.value = { tone: "err", text: failureText(error) };
+      toast.error(error, "Delete artifact");
     }
   } finally {
     deleteBusy.value = "";
@@ -108,7 +107,6 @@ const gcSkipped = computed(() =>
 async function runGc() {
   if (gcBusy.value || gcDisabledReason.value) return;
   gcBusy.value = true;
-  banner.value = null;
   try {
     gcResult.value = await api.modelHostGc();
   } catch (error) {
@@ -118,10 +116,10 @@ async function runGc() {
       if (unavailable) {
         gcServerRefusal.value = unavailable;
       } else {
-        banner.value = { tone: "err", text: failureText(error) };
+        toast.error(error, "Run cache GC");
       }
     } else {
-      banner.value = { tone: "err", text: failureText(error) };
+      toast.error(error, "Run cache GC");
     }
   } finally {
     gcBusy.value = false;
@@ -130,7 +128,6 @@ async function runGc() {
 }
 
 function refresh() {
-  banner.value = null;
   void filesReq.run();
 }
 </script>
@@ -157,7 +154,6 @@ function refresh() {
 
   <ErrorState v-if="filesReq.error.value" :error="filesReq.error.value" @retry="refresh" />
   <template v-else>
-    <p v-if="banner" class="banner" :class="`banner--${banner.tone}`">{{ banner.text }}</p>
 
     <p v-if="files" class="storage-summary">
       <strong>{{ formatBytes(files.total_bytes) }}</strong>
@@ -231,20 +227,6 @@ function refresh() {
 </template>
 
 <style scoped>
-.banner {
-  padding: var(--sb-space-3) var(--sb-space-4);
-  border-radius: var(--sb-radius-sm);
-  margin-bottom: var(--sb-space-4);
-  font-size: 0.9rem;
-}
-.banner--ok {
-  background: var(--sb-accent-tint);
-  color: var(--sb-accent);
-}
-.banner--err {
-  background: var(--sb-err-bg);
-  color: var(--sb-err);
-}
 .storage-summary {
   margin-bottom: var(--sb-space-3);
   color: var(--sb-text-muted);

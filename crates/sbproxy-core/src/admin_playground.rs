@@ -144,6 +144,59 @@ pub async fn handle_chat(body: Option<&str>) -> (u16, &'static str, String) {
         }
     };
 
+    // A served / managed provider hosts its model on this box. The data
+    // plane resolves the engine's loopback endpoint (and takes a
+    // deployment admission permit) per request; without the same
+    // resolution the provider registry falls back to a localhost URL
+    // that points at the proxy itself and the chat 404s. Resolve here
+    // and call the engine directly; cloud providers keep the shared
+    // AiClient path below.
+    let requested_model = request.get("model").and_then(|v| v.as_str());
+    let managed_provider = ai
+        .config
+        .providers
+        .iter()
+        .find(|p| p.serve.is_some() || p.is_managed_model());
+    if let Some(provider) = managed_provider {
+        let origin_id = idx
+            .and_then(|i| pipeline.config.origins.get(i))
+            .map(|o| o.origin_id.to_string())
+            .unwrap_or_else(|| origin.clone());
+        match crate::server::model_host::managed_upstream(
+            &origin_id,
+            provider,
+            requested_model,
+            crate::server::model_host::lane_class_for(None),
+        )
+        .await
+        {
+            Ok(Some(upstream)) => {
+                return managed_chat(&origin, upstream, request, debug, &pipeline).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // A mixed origin may pair a local provider with cloud
+                // fallbacks; only fail hard when there is nothing to
+                // fall through to.
+                let has_cloud = ai
+                    .config
+                    .providers
+                    .iter()
+                    .any(|p| p.serve.is_none() && !p.is_managed_model());
+                if !has_cloud {
+                    return (
+                        502,
+                        "application/json",
+                        format!(
+                            r#"{{"error":"local engine unavailable: {}"}}"#,
+                            e.replace('"', "'")
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     let client = crate::server::ai_client();
     let router = ai.config.router();
     let started = std::time::Instant::now();
@@ -229,6 +282,122 @@ pub async fn handle_chat(body: Option<&str>) -> (u16, &'static str, String) {
         }
     }
 
+    (200, "application/json", out.to_string())
+}
+
+/// Run a playground chat against a locally served engine. The permit on
+/// `upstream` is held until the engine's response has been read, exactly
+/// like the data plane's request context, so deployment concurrency
+/// accounting sees the request. The engine speaks the OpenAI surface on
+/// loopback and needs no auth header.
+async fn managed_chat(
+    origin: &str,
+    upstream: crate::server::model_host::ManagedLocalUpstream,
+    mut request: serde_json::Value,
+    debug: bool,
+    pipeline: &crate::pipeline::CompiledPipeline,
+) -> (u16, &'static str, String) {
+    let public_model = upstream.public_model.clone();
+    if let Some(obj) = request.as_object_mut() {
+        obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(upstream.engine_model.clone()),
+        );
+    }
+    let url = format!(
+        "{}/chat/completions",
+        upstream.base_url.trim_end_matches('/')
+    );
+    let started = std::time::Instant::now();
+    let sent = reqwest::Client::new()
+        .post(&url)
+        .json(&request)
+        .send()
+        .await;
+    let resp = match sent {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                502,
+                "application/json",
+                format!(
+                    r#"{{"error":"local engine dispatch failed: {}"}}"#,
+                    e.to_string().replace('"', "'")
+                ),
+            )
+        }
+    };
+    let status = resp.status().as_u16();
+    let mut upstream_body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    // Hold the admission permit until the response is fully read.
+    drop(upstream.permit);
+    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    // The engine reports its internal model identifier; the public route
+    // name is what operators (and the price table) know.
+    if let Some(obj) = upstream_body.as_object_mut() {
+        if obj.contains_key("model") {
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(public_model.clone()),
+            );
+        }
+    }
+    let usage = upstream_body.get("usage");
+    let input = usage
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cost = sbproxy_ai::budget::estimate_cost_for_usage(
+        &public_model,
+        &sbproxy_ai::budget::AiUsage::Tokens {
+            input,
+            output,
+            cached_input: 0,
+            cache_creation: 0,
+        },
+    );
+
+    let mut out = json!({
+        "origin": origin,
+        "status": status,
+        "model": public_model,
+        "response": upstream_body,
+        "usage": { "input_tokens": input, "output_tokens": output },
+        "cost_usd": cost,
+        "latency_ms": latency_ms,
+    });
+    if debug {
+        let request_id = format!(
+            "pg-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        tracing::debug!(
+            target: "sbproxy::admin::playground",
+            request_id = %request_id,
+            origin = %origin,
+            model = %public_model,
+            status,
+            latency_ms,
+            "playground chat via managed engine (debug)"
+        );
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "debug".to_string(),
+                json!({
+                    "request_id": request_id,
+                    "config_revision": pipeline.config_revision.as_str(),
+                }),
+            );
+        }
+    }
     (200, "application/json", out.to_string())
 }
 

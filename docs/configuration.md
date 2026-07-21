@@ -299,7 +299,7 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `
 | `username` | string | "admin" | Top-level admin HTTP Basic username |
 | `password` | string | "changeme" | Top-level admin HTTP Basic password |
 | `max_log_entries` | int | 1000 | Recent-request log buffer size |
-| `rate_limit_per_minute` | int | 60 | Admin API requests allowed per client IP per minute; the global cap across all clients is ten times this value. Valid range 1 to 100000; 0 is rejected because the limiter cannot be turned off |
+| `rate_limit_per_minute` | int | 240 | Admin API requests allowed per client IP per minute; the global cap across all clients is ten times this value. Valid range 1 to 100000; 0 is rejected because the limiter cannot be turned off |
 | `bind` | string | "127.0.0.1" | Bind address; set to `0.0.0.0` or an interface for remote admin |
 | `allow_ips` | list | empty | IP / CIDR allowlist; empty keeps the loopback-only default |
 | `cors_origins` | list | empty | Allowed CORS origins for a separately hosted UI |
@@ -310,7 +310,7 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `
 When enabled, the admin server binds `bind:<port>` (loopback by
 default), authenticates every request (HTTP Basic or a browser session),
 enforces the operator's role on mutations, and applies a per-client-IP
-rate limit of `rate_limit_per_minute` requests per minute (default 60),
+rate limit of `rate_limit_per_minute` requests per minute (default 240),
 with a global cap across all clients of ten times that value. Full auth, RBAC, remote-access, and endpoint reference is in
 [admin.md](admin.md). Endpoints (abbreviated):
 

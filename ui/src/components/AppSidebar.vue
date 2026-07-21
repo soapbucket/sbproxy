@@ -1,33 +1,31 @@
 <script setup lang="ts">
 import { useAuth } from "../composables/useAuth";
-import BrandMark from "./BrandMark.vue";
 
 const { username, role, logout } = useAuth();
 
 const nav = [
-  { to: "/", label: "Overview" },
-  { to: "/keys", label: "Keys" },
-  { to: "/credentials", label: "Credentials" },
-  { to: "/config", label: "Config" },
-  { to: "/logs", label: "Logs" },
-  { to: "/metrics", label: "Metrics" },
-  { to: "/spend", label: "Spend" },
-  { to: "/ai-performance", label: "AI performance" },
-  { to: "/guardrails", label: "Guardrails" },
-  { to: "/prompts", label: "Prompts" },
-  { to: "/playground", label: "Playground" },
-  { to: "/cache", label: "Cache" },
-  { to: "/model-host", label: "Model host" },
-  { to: "/storage", label: "Storage" },
-  { to: "/audit", label: "Audit" },
-  { to: "/cluster", label: "Cluster" },
+  { to: "/", label: "overview" },
+  { to: "/keys", label: "keys" },
+  { to: "/credentials", label: "credentials" },
+  { to: "/config", label: "config" },
+  { to: "/logs", label: "logs" },
+  { to: "/metrics", label: "metrics" },
+  { to: "/spend", label: "spend" },
+  { to: "/ai-performance", label: "ai performance" },
+  { to: "/guardrails", label: "guardrails" },
+  { to: "/prompts", label: "prompts" },
+  { to: "/playground", label: "playground" },
+  { to: "/cache", label: "cache" },
+  { to: "/model-host", label: "model host" },
+  { to: "/storage", label: "storage" },
+  { to: "/audit", label: "audit" },
+  { to: "/cluster", label: "cluster" },
 ];
 </script>
 
 <template>
   <aside class="sidebar">
-    <BrandMark class="sidebar__brand" />
-    <nav class="nav">
+    <nav class="nav sb-mono">
       <RouterLink
         v-for="item in nav"
         :key="item.to"
@@ -40,9 +38,9 @@ const nav = [
       </RouterLink>
     </nav>
     <div class="sidebar__foot">
-      <div v-if="username" class="who">
+      <div v-if="username" class="who sb-mono">
         <span class="who__name">{{ username }}</span>
-        <span class="who__role" v-if="role">{{ role }}</span>
+        <span class="who__role">{{ role }}</span>
       </div>
       <button class="sb-btn sb-btn--sm logout" @click="logout">Sign out</button>
     </div>
@@ -54,45 +52,41 @@ const nav = [
   width: var(--sb-sidebar-w);
   flex: none;
   background: var(--sb-surface);
-  border-right: 1px solid var(--sb-border);
+  border-right: 1px solid var(--sb-border-ink);
   display: flex;
   flex-direction: column;
-  padding: var(--sb-space-5) var(--sb-space-4);
+  padding: var(--sb-space-4) 0;
   position: sticky;
   top: 0;
-  height: 100vh;
-}
-.sidebar__brand {
-  padding: 0 8px var(--sb-space-5);
+  align-self: flex-start;
+  min-height: 100%;
 }
 .nav {
   display: flex;
   flex-direction: column;
-  gap: 2px;
   flex: 1;
 }
 .nav__item {
-  padding: 8px 12px;
-  border-radius: var(--sb-radius-sm);
+  padding: 8px var(--sb-space-5);
   color: var(--sb-text-muted);
-  font-size: 0.9rem;
-  font-weight: 500;
+  font-size: 0.82rem;
   text-decoration: none;
-  border-left: 2px solid transparent;
+  letter-spacing: 0.01em;
 }
 .nav__item:hover {
   background: var(--sb-surface-hover);
   color: var(--sb-text);
   text-decoration: none;
 }
-.nav__item--active {
-  background: var(--sb-accent-tint);
-  color: var(--sb-accent);
-  border-left-color: var(--sb-accent);
+/* Active page reads as a solid ink block, the site's admin idiom. */
+.nav__item--active,
+.nav__item--active:hover {
+  background: var(--sb-ink);
+  color: var(--sb-on-ink);
 }
 .sidebar__foot {
   font-size: 0.72rem;
-  padding: var(--sb-space-4) 8px 0;
+  padding: var(--sb-space-4) var(--sb-space-5) 0;
   border-top: 1px solid var(--sb-border);
   line-height: 1.4;
   display: flex;
@@ -105,47 +99,38 @@ const nav = [
 }
 .who__name {
   font-weight: 600;
-  font-size: 0.82rem;
+  font-size: 0.78rem;
   color: var(--sb-text);
 }
 .who__role {
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   color: var(--sb-text-faint);
+  font-size: 0.64rem;
 }
 .logout {
   align-self: flex-start;
 }
 @media (max-width: 720px) {
-  /* Collapse the sidebar into a horizontal top bar. */
+  /* Collapse the sidebar into a horizontal top strip. */
   .sidebar {
     width: 100%;
-    height: auto;
     position: static;
+    min-height: 0;
     flex-direction: row;
     align-items: center;
     flex-wrap: wrap;
     gap: var(--sb-space-3);
-    padding: var(--sb-space-3) var(--sb-space-4);
+    padding: var(--sb-space-2) var(--sb-space-3);
     border-right: none;
-    border-bottom: 1px solid var(--sb-border);
-  }
-  .sidebar__brand {
-    padding: 0;
+    border-bottom: 1px solid var(--sb-border-ink);
   }
   .nav {
     flex-direction: row;
     flex-wrap: wrap;
-    gap: 2px;
   }
   .nav__item {
-    border-left: none;
-    border-bottom: 2px solid transparent;
-    padding: 6px 10px;
-  }
-  .nav__item--active {
-    border-left-color: transparent;
-    border-bottom-color: var(--sb-accent);
+    padding: 5px 10px;
   }
   .sidebar__foot {
     display: none;

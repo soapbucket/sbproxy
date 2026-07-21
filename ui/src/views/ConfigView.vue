@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { api, asList, ApiError, type TargetHealth } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import { formatMs } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -48,11 +49,14 @@ async function saveConfig() {
   saveBanner.value = null;
   try {
     await api.putConfig(editorText.value, editorRev.value || undefined);
-    saveBanner.value = { tone: "ok", text: "Config validated, saved, and hot-swapped." };
+    toast.success("Config saved", "Validated and hot-swapped into the live pipeline.");
+    saveBanner.value = null;
     await loadConfig(); // pick up the new revision
     drift.run();
     targetsReq.run();
   } catch (e) {
+    // Validation detail and revision conflicts render next to the
+    // editor, where the fix happens; anything else raises a toast.
     if (e instanceof ApiError && e.status === 409) {
       saveBanner.value = {
         tone: "err",
@@ -67,10 +71,7 @@ async function saveConfig() {
       }
       saveBanner.value = { tone: "err", text: detail || "Invalid config." };
     } else {
-      saveBanner.value = {
-        tone: "err",
-        text: e instanceof ApiError ? e.hint : String(e),
-      };
+      toast.error(e, "Save config");
     }
   } finally {
     saveBusy.value = false;
@@ -166,23 +167,19 @@ function targetHealthy(t: TargetHealth): string {
 
 // ---- reload ----
 const reloadBusy = ref(false);
-const reloadMsg = ref<string | null>(null);
-const reloadError = ref<ApiError | null>(null);
 
 async function reload() {
   if (!confirm("Reload configuration from disk? Active config will be replaced by the on-disk version.")) {
     return;
   }
   reloadBusy.value = true;
-  reloadMsg.value = null;
-  reloadError.value = null;
   try {
     await api.reload();
-    reloadMsg.value = "Reload requested. Refreshing drift and targets.";
+    toast.success("Config reloaded", "Refreshing drift and targets.");
     drift.run();
     targetsReq.run();
   } catch (e) {
-    reloadError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
+    toast.error(e, "Reload config");
   } finally {
     reloadBusy.value = false;
   }
@@ -202,8 +199,6 @@ async function reload() {
     </template>
   </PageHeader>
 
-  <p class="ok-line" v-if="reloadMsg">{{ reloadMsg }}</p>
-  <ErrorState v-if="reloadError" :error="reloadError" title="Reload failed" @retry="reload" />
 
   <!-- Live config editor -->
   <section class="section">
@@ -402,14 +397,6 @@ async function reload() {
   border-radius: var(--sb-radius-sm);
   background: var(--sb-accent-tint);
   color: var(--sb-accent);
-}
-.ok-line {
-  background: var(--sb-ok-bg);
-  border: 1px solid rgba(15, 158, 110, 0.3);
-  border-radius: var(--sb-radius-sm);
-  padding: 8px 12px;
-  color: var(--sb-ok);
-  font-size: 0.85rem;
 }
 .editor {
   width: 100%;

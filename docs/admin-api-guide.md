@@ -195,11 +195,12 @@ revision conflict on a key returns `expected_revision` and
 ## Rate limiting
 
 The admin server enforces its own in-process limiter, separate from
-any `rate_limits:` block on the data plane: 60 requests/minute per IP
-by default, and a global cap ten times that (600/minute). Exceeding
+any `rate_limits:` block on the data plane: 240 requests/minute per IP
+by default, and a global cap ten times that (2400/minute). Exceeding
 either returns `429` and does not count against the next window. This
-protects the admin port itself from a local flood; it is not
-configurable via `sb.yml` today.
+protects the admin port itself from a local flood. Tune it with
+`proxy.admin.rate_limit_per_minute` in `sb.yml` (range 1 to 100000;
+the limiter cannot be turned off).
 
 ## Curl cookbook
 

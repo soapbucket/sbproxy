@@ -91,8 +91,8 @@ the compression-content route does.
 ## Rate limiting
 
 The admin server enforces an in-process rate limit with both per-IP
-and global caps. The per-IP cap is 60 requests / minute by default;
-the global cap is 10x that (600 / minute). A request that exceeds
+and global caps. The per-IP cap is 240 requests / minute by default;
+the global cap is 10x that (2400 / minute). A request that exceeds
 either cap returns `429` and is not counted against future windows.
 The per-IP tracking map is capped at 10000 entries to prevent
 unique-IP floods from growing memory.

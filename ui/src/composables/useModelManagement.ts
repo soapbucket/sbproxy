@@ -9,6 +9,7 @@ import {
   type ModelHostAuthority,
 } from "../api";
 import { useAsync } from "./useAsync";
+import { toast } from "./useToasts";
 import {
   applyDeploymentChange,
   buildDeploymentMutation,
@@ -706,13 +707,12 @@ export function useModelManagement() {
       pendingConflictChange.value = null;
       pendingConflictMode.value = null;
       editor.value = null;
-      banner.value = {
-        tone: "ok",
-        text:
-          command.kind === "local_put"
-            ? "Desired deployment map saved."
-            : "Signed deployment revision published.",
-      };
+      const saved =
+        command.kind === "local_put"
+          ? "Desired deployment map saved."
+          : "Signed deployment revision published.";
+      banner.value = { tone: "ok", text: saved };
+      toast.success(saved);
       await Promise.all([
         deploymentsReq.run(),
         statusReq.run(),
@@ -923,18 +923,18 @@ export function useModelManagement() {
       if (action === "load") await api.modelHostLoad(deploymentId);
       if (action === "stop") await api.modelHostStop(deploymentId);
       if (action === "reset") await api.modelHostReset(deploymentId);
-      banner.value = {
-        tone: "ok",
-        text:
-          action === "load"
-            ? `Loading ${deploymentId}.`
-            : action === "stop"
-              ? `Draining and stopping ${deploymentId}.`
-              : `Reset ${deploymentId}.`,
-      };
+      const done =
+        action === "load"
+          ? `Loading ${deploymentId}.`
+          : action === "stop"
+            ? `Draining and stopping ${deploymentId}.`
+            : `Reset ${deploymentId}.`;
+      banner.value = { tone: "ok", text: done };
+      toast.success(done);
       await Promise.all([statusReq.run(), metricsReq.run()]);
     } catch (error) {
       banner.value = { tone: "err", text: errorText(error) };
+      toast.error(error, `${action[0].toUpperCase()}${action.slice(1)} ${deploymentId}`);
     } finally {
       lifecycleBusy.value = "";
     }

@@ -1342,8 +1342,8 @@
           "minimum": 0.0
         },
         "rate_limit_per_minute": {
-          "description": "Maximum admin API requests per client IP per minute. The global cap across all clients is ten times this value. Must be between 1 and 100000; the limiter cannot be turned off. Defaults to 60.",
-          "default": 60,
+          "description": "Maximum admin API requests per client IP per minute. The global cap across all clients is ten times this value. Must be between 1 and 100000; the limiter cannot be turned off. Defaults to 240.",
+          "default": 240,
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0

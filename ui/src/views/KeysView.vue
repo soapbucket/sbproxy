@@ -17,6 +17,7 @@ import {
   type KeyPolicyDraft,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import { formatNumber, formatUsd, formatTime, shortId } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -254,6 +255,7 @@ async function submitCreate() {
     if (token) {
       createdToken.value = token;
     }
+    toast.success("Key created");
     keysReq.run();
   } catch (e) {
     createError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
@@ -504,6 +506,7 @@ async function submitEdit() {
       return;
     }
     await api.patchKey(keyId(baseline), patch);
+    toast.success("Key policy saved");
     closeEdit();
     void keysReq.run();
   } catch (e) {
@@ -619,7 +622,13 @@ function closeUsage() {
 
 // ---- row actions ----
 const rowBusy = ref<string | null>(null);
-const actionError = ref<string | null>(null);
+
+const ACTION_DONE: Record<string, string> = {
+  revoke: "Key revoked",
+  block: "Key blocked",
+  unblock: "Key unblocked",
+  rotate: "Key rotated",
+};
 
 async function doAction(
   k: AdminKey,
@@ -628,12 +637,12 @@ async function doAction(
   const id = keyId(k);
   if (action === "revoke" && !confirm(`Revoke key ${id}? This cannot be undone.`)) return;
   rowBusy.value = id + action;
-  actionError.value = null;
   try {
     await api.keyAction(id, action);
+    toast.success(ACTION_DONE[action], shortId(id));
     keysReq.run();
   } catch (e) {
-    actionError.value = e instanceof ApiError ? `${action}: ${e.hint}` : String(e);
+    toast.error(e, `${action[0].toUpperCase()}${action.slice(1)} key`);
   } finally {
     rowBusy.value = null;
   }
@@ -643,12 +652,12 @@ async function doDelete(k: AdminKey) {
   const id = keyId(k);
   if (!confirm(`Delete key ${id}? This permanently removes it.`)) return;
   rowBusy.value = id + "delete";
-  actionError.value = null;
   try {
     await api.deleteKey(id);
+    toast.success("Key deleted", shortId(id));
     keysReq.run();
   } catch (e) {
-    actionError.value = e instanceof ApiError ? `delete: ${e.hint}` : String(e);
+    toast.error(e, "Delete key");
   } finally {
     rowBusy.value = null;
   }
@@ -679,7 +688,6 @@ function statusOf(k: AdminKey): string {
     </template>
   </PageHeader>
 
-  <p class="notice" v-if="actionError">{{ actionError }}</p>
   <ErrorState
     v-if="policySchemaReq.error.value"
     :error="policySchemaReq.error.value"

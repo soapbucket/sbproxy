@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { api, asList, ApiError, type PromptEntry } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
@@ -22,8 +23,6 @@ function versionsOf(p: PromptEntry): string[] {
 function pinnedOf(p: PromptEntry): string {
   return String(p.pinned ?? p.pinned_version ?? p.active ?? "");
 }
-
-const actionError = ref<string | null>(null);
 
 // ---- add version ----
 const showAdd = ref(false);
@@ -54,6 +53,7 @@ async function submitAdd() {
       body,
     );
     showAdd.value = false;
+    toast.success("Prompt version added");
     req.run();
   } catch (e) {
     addError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
@@ -87,6 +87,7 @@ async function submitPin() {
       { version: pinVersion.value },
     );
     showPin.value = false;
+    toast.success(`Pinned ${pinVersion.value}`);
     req.run();
   } catch (e) {
     pinError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
@@ -105,8 +106,6 @@ async function submitPin() {
       <button class="sb-btn sb-btn--primary" @click="req.run">Refresh</button>
     </template>
   </PageHeader>
-
-  <p class="notice" v-if="actionError">{{ actionError }}</p>
 
   <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
   <EmptyState v-else-if="!prompts.length" message="No prompt overlays configured." />
@@ -221,7 +220,6 @@ async function submitPin() {
 .tag {
   font-size: 0.76rem;
   padding: 2px 10px;
-  border-radius: var(--sb-radius-pill);
   background: var(--sb-surface-2);
   color: var(--sb-text-muted);
   border: 1px solid var(--sb-border);
@@ -235,13 +233,5 @@ async function submitPin() {
   display: flex;
   gap: var(--sb-space-3);
   margin-top: auto;
-}
-.notice {
-  background: var(--sb-err-bg);
-  border: 1px solid rgba(180, 34, 63, 0.3);
-  border-radius: var(--sb-radius-sm);
-  padding: 8px 12px;
-  color: var(--sb-err);
-  font-size: 0.85rem;
 }
 </style>

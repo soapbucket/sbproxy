@@ -2331,7 +2331,7 @@ pub struct AdminConfig {
     pub max_log_entries: usize,
     /// Maximum admin API requests per client IP per minute. The global
     /// cap across all clients is ten times this value. Must be between
-    /// 1 and 100000; the limiter cannot be turned off. Defaults to 60.
+    /// 1 and 100000; the limiter cannot be turned off. Defaults to 240.
     #[serde(default = "default_admin_rate_limit")]
     pub rate_limit_per_minute: u64,
     /// WOR-800 PR5: filesystem path to a redb file that persists the
@@ -2432,7 +2432,7 @@ fn default_max_log() -> usize {
 }
 
 fn default_admin_rate_limit() -> u64 {
-    60
+    240
 }
 
 fn default_http_port() -> u16 {

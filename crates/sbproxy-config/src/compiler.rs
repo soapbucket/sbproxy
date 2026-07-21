@@ -1733,7 +1733,7 @@ origins:
 "#;
         let compiled = compile_config(yaml).expect("should compile");
         let admin = compiled.server.admin.as_ref().expect("admin block");
-        assert_eq!(admin.rate_limit_per_minute, 60);
+        assert_eq!(admin.rate_limit_per_minute, 240);
     }
 
     #[test]
