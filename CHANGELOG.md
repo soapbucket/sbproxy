@@ -10,6 +10,28 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+## [1.6.2] - 2026-07-21
+
+### Added
+
+- **The local llama.cpp engine pin follows your macOS version.** Pinned
+  builds now carry their measured minimum macOS, and the host selects the
+  newest compatible one: macOS 26 gets the current build, macOS 14 and 15
+  get the newest build published against the older toolchain. Previously
+  the single pin targeted macOS 26 and died at dynamic-link time on
+  anything older. A host older than every pin fails before download with
+  the versions named; an explicit `version:` still wins.
+
+### Fixed
+
+- **Loading the admin UI no longer spends the admin rate budget.** Static
+  UI bundle assets are exempt from the per-IP admin rate limiter, so
+  opening the dashboard cannot starve API polling behind 429s.
+- **`sbproxy --version` reports the real product version** instead of a
+  stale crate stub.
+- **The installer reports the binary it just installed**, not whatever an
+  earlier install left on PATH.
+
 ## [1.6.1] - 2026-07-21
 
 A point release fixing operational defects found immediately after the
