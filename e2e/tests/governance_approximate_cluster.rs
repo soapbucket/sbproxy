@@ -374,6 +374,25 @@ fn approximate_cluster_bounds_admission_to_one_dissemination_intervals_slack() {
     let base_a = proxy_a.base_url();
     let base_b = proxy_b.base_url();
 
+    // Governance counters live in wall-clock-aligned 60s fixed windows. On a
+    // slow runner, boot plus mesh formation can consume most of the current
+    // window, and spend landing near its end legally resets before the 15s
+    // dissemination tick can deliver it to the peer, which reads as "never
+    // observed a merged contribution". Start the waves only when the window
+    // has enough runway for both waves, one dissemination tick, and the
+    // observation polling.
+    {
+        let secs_into_minute = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock")
+            .as_secs()
+            % 60;
+        let remaining = 60 - secs_into_minute;
+        if remaining < 40 {
+            std::thread::sleep(Duration::from_secs(remaining + 1));
+        }
+    }
+
     // Wave 1: exhaust the shared limit entirely on node A. Approximate
     // governance is exact within one process, so this must land exactly on
     // the limit with zero denials.
