@@ -14,3 +14,6 @@ fuzz/Cargo.lock
 examples/*/certs/
 
 .claude/
+
+# curl cookie jars from running the examples/docs commands; never commit
+cookies.txt
