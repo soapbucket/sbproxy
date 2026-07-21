@@ -1,6 +1,11 @@
 [package]
 name = "sbproxy-core"
-version = "0.1.0"
+# Tracks the real product/release version (the `sbproxy` binary's
+# `--version` also inherits it), not an independent library version:
+# `env!("CARGO_PKG_VERSION")` calls inside this crate feed the admin
+# `/health` endpoint (and the dashboard's VERSION tile), so a stale
+# pinned version here silently misreports the running release.
+version.workspace = true
 edition = "2021"
 license.workspace = true
 publish = false

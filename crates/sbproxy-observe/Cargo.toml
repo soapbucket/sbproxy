@@ -1,6 +1,12 @@
 [package]
 name = "sbproxy-observe"
-version = "0.1.0"
+# Tracks the real product/release version (the `sbproxy` binary's
+# `--version` also inherits it), not an independent library version:
+# `env!("CARGO_PKG_VERSION")` calls inside this crate stamp OTLP's
+# `service.version` resource attribute and the webhook notifier's
+# User-Agent, so a stale pinned version here silently defeats
+# version-based correlation across a rolling upgrade.
+version.workspace = true
 edition = "2021"
 license.workspace = true
 publish = false

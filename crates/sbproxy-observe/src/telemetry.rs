@@ -1535,4 +1535,23 @@ mod tests {
             Some("sbproxy-test".to_string())
         );
     }
+
+    /// Regression: sbproxy-observe used to pin its own Cargo.toml
+    /// version independently of the workspace, so every OTLP resource
+    /// stamped `service.version = "0.1.0"` no matter what release was
+    /// actually running, silently defeating version-based correlation
+    /// across a rolling upgrade. sbproxy-observe now inherits
+    /// `version.workspace = true`, so its own CARGO_PKG_VERSION is the
+    /// same string `sbproxy --version` prints; this assertion breaks
+    /// again if that inheritance is ever reverted.
+    #[test]
+    fn otlp_resource_service_version_matches_the_workspace_version() {
+        let resource = otlp_resource(&TelemetryConfig::default());
+        assert_eq!(
+            resource
+                .get(opentelemetry::Key::from_static_str("service.version"))
+                .map(|v| v.to_string()),
+            Some(env!("CARGO_PKG_VERSION").to_string())
+        );
+    }
 }

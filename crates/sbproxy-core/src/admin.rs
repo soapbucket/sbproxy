@@ -4563,7 +4563,20 @@ origins:
         assert_eq!(ps, 200, "/health rich endpoint ready status: {pb}");
         let rich: serde_json::Value = serde_json::from_str(&pb).unwrap();
         assert_eq!(rich["status"], "ok");
-        assert!(rich["version"].as_str().is_some(), "body: {pb}");
+        // Regression for a real product version mismatch: sbproxy-core
+        // used to pin its own Cargo.toml version independently of the
+        // workspace, so this endpoint (and the admin dashboard's
+        // VERSION tile, which reads it) reported a stale "0.1.0" no
+        // matter what release was actually running. sbproxy-core now
+        // inherits `version.workspace = true`, so its own
+        // CARGO_PKG_VERSION is the same string `sbproxy --version`
+        // prints; this assertion breaks again if that inheritance is
+        // ever reverted.
+        assert_eq!(
+            rich["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "body: {pb}"
+        );
         assert!(rich["build_hash"].as_str().is_some(), "body: {pb}");
         assert!(rich["timestamp"].as_str().is_some(), "body: {pb}");
         assert!(rich["uptime_seconds"].as_u64().is_some(), "body: {pb}");
