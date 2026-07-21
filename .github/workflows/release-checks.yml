@@ -4,9 +4,9 @@ name: release checks
 # on every PR. Single-threaded test isolation reruns the full workspace
 # tests one-thread-at-a-time, and the ACME integration test stands up
 # a Pebble service container and exercises real cert issuance. Both
-# are gated on tag pushes plus workflow_dispatch so day-to-day CI
-# stays cheap while we still catch ordering and CA regressions before
-# we ship.
+# run on tag pushes, nightly, and on workflow_dispatch so day-to-day
+# CI stays cheap while we still catch ordering and CA regressions
+# before we ship.
 #
 # macOS coverage is intentionally NOT in CI: macOS runners are billed
 # at 10x the Linux rate, sbproxy uses no platform-specific syscalls,
@@ -17,6 +17,13 @@ on:
   push:
     tags:
       - 'v*'
+  # Nightly run so this lane cannot rot silently between releases:
+  # tag-only triggers mean a breakage introduced mid-cycle only
+  # surfaces during the release itself. Failures do not page anyone;
+  # GitHub emails the scheduled run's actor on failure, which is the
+  # intended default.
+  schedule:
+    - cron: '30 9 * * *' # 09:30 UTC daily
   workflow_dispatch:
 
 # Default to read-only contents access for every job in this workflow.

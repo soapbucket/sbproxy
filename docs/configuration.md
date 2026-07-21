@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-20*
+*Last modified: 2026-07-21*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial — a skeleton showing which keys nest where, or one field in isolation — so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -299,6 +299,7 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `
 | `username` | string | "admin" | Top-level admin HTTP Basic username |
 | `password` | string | "changeme" | Top-level admin HTTP Basic password |
 | `max_log_entries` | int | 1000 | Recent-request log buffer size |
+| `rate_limit_per_minute` | int | 60 | Admin API requests allowed per client IP per minute; the global cap across all clients is ten times this value. Valid range 1 to 100000; 0 is rejected because the limiter cannot be turned off |
 | `bind` | string | "127.0.0.1" | Bind address; set to `0.0.0.0` or an interface for remote admin |
 | `allow_ips` | list | empty | IP / CIDR allowlist; empty keeps the loopback-only default |
 | `cors_origins` | list | empty | Allowed CORS origins for a separately hosted UI |
@@ -308,9 +309,9 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `
 
 When enabled, the admin server binds `bind:<port>` (loopback by
 default), authenticates every request (HTTP Basic or a browser session),
-enforces the operator's role on mutations, and applies a rate limit of
-60 requests per minute per client IP, with a global cap of 600 requests
-per minute across all clients. Full auth, RBAC, remote-access, and endpoint reference is in
+enforces the operator's role on mutations, and applies a per-client-IP
+rate limit of `rate_limit_per_minute` requests per minute (default 60),
+with a global cap across all clients of ten times that value. Full auth, RBAC, remote-access, and endpoint reference is in
 [admin.md](admin.md). Endpoints (abbreviated):
 
 | Path | Description |

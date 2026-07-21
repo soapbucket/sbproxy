@@ -1252,6 +1252,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 .as_ref()
                 .map(|a| a.max_log_entries)
                 .unwrap_or(1000),
+            rate_limit_per_minute: server_config
+                .admin
+                .as_ref()
+                .map(|a| a.rate_limit_per_minute)
+                .unwrap_or(60),
             // WOR-1717: carry the operator's admin TLS cert/key paths
             // through so the admin server serves HTTPS when configured.
             tls: server_config

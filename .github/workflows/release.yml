@@ -34,6 +34,15 @@
 
 name: release
 
+# No `schedule:` trigger here, deliberately. The `release` and `image`
+# publish jobs are guarded by `github.repository` and `!inputs.dry_run`
+# but NOT by a tag-ref condition, so a scheduled run (which executes on
+# the default branch with empty `inputs`) would attempt to sign and
+# publish from a branch ref. Until the publish jobs gain a
+# `startsWith(github.ref, 'refs/tags/')` guard, on-demand coverage of
+# the build and certification lanes comes from `workflow_dispatch`
+# with `dry_run: true`; the nightly rot check for tag-only lanes lives
+# in e2e.yml and release-checks.yml instead.
 on:
   push:
     tags:
@@ -285,7 +294,11 @@ jobs:
           MODEL: qwen2.5-0.5b-instruct
         run: |
           set -uo pipefail
-          CACHE_DIR="$(mktemp -d)"
+          # Fixed path (not mktemp) so the diagnostics step below can
+          # find the model-host's durable operation job records after
+          # a failure.
+          CACHE_DIR="/tmp/sbproxy-cert-cache"
+          mkdir -p "${CACHE_DIR}"
           ./target/release/sbproxy run "${MODEL}" \
             --variant q4_k_m \
             --cache-dir "${CACHE_DIR}" \
@@ -332,12 +345,37 @@ jobs:
           kill "${SB_PID}" 2>/dev/null || true
           exit "${CERT_STATUS}"
 
-      - name: upload boot log
+      # The engine's bounded stderr tail is what an engine_early_exit
+      # failure tells the operator to inspect. The model-host keeps
+      # that tail in memory only and the engine supervisor logs it into
+      # the proxy log on every failed launch attempt, so the boot log
+      # must ship in the artifact in full, alongside the durable
+      # operation job records (launch/load outcomes with reason and
+      # remediation) from the model-host cache dir.
+      - name: collect certification diagnostics
+        if: always()
+        run: |
+          set -uo pipefail
+          OUT="/tmp/sbproxy-cert-artifacts"
+          mkdir -p "${OUT}"
+          # Full proxy boot log, bounded only against pathological
+          # growth (engine stderr tails are <= 8 KiB each).
+          if [ -f /tmp/sbproxy-cert-boot.log ]; then
+            tail -c 8388608 /tmp/sbproxy-cert-boot.log > "${OUT}/sbproxy-cert-boot.log"
+          fi
+          # Durable model-host operation job records (<cache>/jobs/*.json).
+          find /tmp/sbproxy-cert-cache -type d -name jobs 2>/dev/null | while read -r dir; do
+            mkdir -p "${OUT}/jobs"
+            cp "${dir}"/*.json "${OUT}/jobs/" 2>/dev/null || true
+          done
+          ls -la "${OUT}" || true
+
+      - name: upload certification diagnostics
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: model-host-cert-apple-silicon-log
-          path: /tmp/sbproxy-cert-boot.log
+          path: /tmp/sbproxy-cert-artifacts/
           retention-days: 14
 
   release:

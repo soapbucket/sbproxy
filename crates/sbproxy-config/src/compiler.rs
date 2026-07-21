@@ -1079,6 +1079,17 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
                 }
             }
         }
+        // 0 is rejected rather than treated as "off": the admin rate
+        // limiter is a DDoS bound on an authenticated control surface
+        // and cannot be disabled through config.
+        if admin.rate_limit_per_minute == 0 || admin.rate_limit_per_minute > 100_000 {
+            anyhow::bail!(
+                "proxy.admin.rate_limit_per_minute is {}; it must be between 1 and \
+                 100000 requests per client IP per minute (the admin rate limiter \
+                 cannot be turned off)",
+                admin.rate_limit_per_minute
+            );
+        }
     }
 
     if let Some(log) = config_file
@@ -1703,6 +1714,77 @@ origins:
             msg.contains("proxy.admin.password"),
             "error must locate the tagged value: {msg}"
         );
+    }
+
+    #[test]
+    fn admin_rate_limit_defaults_to_60() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    username: admin
+    password: secret
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let admin = compiled.server.admin.as_ref().expect("admin block");
+        assert_eq!(admin.rate_limit_per_minute, 60);
+    }
+
+    #[test]
+    fn admin_rate_limit_out_of_range_is_rejected() {
+        for bad in ["0", "100001"] {
+            let yaml = format!(
+                r#"
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    username: admin
+    password: secret
+    rate_limit_per_minute: {bad}
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#
+            );
+            let err = compile_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("rate_limit_per_minute {bad} must fail compile"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("rate_limit_per_minute") && msg.contains("between 1 and"),
+                "error must name the field and its range: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_rate_limit_in_range_value_is_kept() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    username: admin
+    password: secret
+    rate_limit_per_minute: 500
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let admin = compiled.server.admin.as_ref().expect("admin block");
+        assert_eq!(admin.rate_limit_per_minute, 500);
     }
 
     // WOR-1140: unknown-config-key handling.
