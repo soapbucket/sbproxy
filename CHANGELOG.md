@@ -10,6 +10,32 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+## [1.6.1] - 2026-07-21
+
+A point release fixing operational defects found immediately after the
+1.6.0 cut.
+
+### Added
+
+- **Configurable admin rate limit.** `proxy.admin.rate_limit_per_minute`
+  (default 60, the previous hardcoded value; valid 1 to 100000). Automation
+  and dashboards that poll admin endpoints faster than once per second per
+  node can now raise the cap instead of silently reading 429s.
+
+### Fixed
+
+- **Docker images start again.** The published linux binaries are built
+  against glibc 2.36 so the container runtime image can execute them.
+- **Gateway-only clusters no longer report a standing pseudo-outage.**
+  Nodes without the worker role are not graded on the model plane, so a
+  cluster of pure gateways shows healthy nodes in `/admin/cluster/status`
+  and dashboards instead of a permanent degraded state. Worker health
+  semantics are unchanged.
+- **Model engine launch failures are diagnosable.** A failed engine start
+  logs its bounded, credential-redacted stderr tail instead of holding it
+  only in memory, and the release certification artifact carries the boot
+  log and durable job records.
+
 ## [1.6.0] - 2026-07-20
 
 The cluster release. The mesh gains durable replicated state, governed

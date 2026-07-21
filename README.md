@@ -4,7 +4,7 @@
 
 <h1 align="center">SBproxy</h1>
 
-*Last modified: 2026-07-20*
+*Last modified: 2026-07-21*
 
 <h3 align="center">Take control of your AI traffic.</h3>
 
