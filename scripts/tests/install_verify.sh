@@ -140,6 +140,38 @@ check "cosign-absent path installs the binary" \
 check "cosign-absent path states the gap rather than skipping silently" \
     "$(grep -q 'cosign is not installed' "${WORK}/out5.log" && echo 1 || echo 0)"
 
+# --- Case 6: an older sbproxy earlier on PATH must not make the success ---
+# --- banner report that older binary's version/location as the result. ---
+# Regression for the bug where `command -v sbproxy` (used for the banner)
+# picked up a stale shadowing binary instead of the one just verified and
+# installed to $INSTALL_DIR.
+RELEASE5="${WORK}/release_shadow"
+mkdir -p "$RELEASE5"
+tar czf "${RELEASE5}/${ARCHIVE}" -C "$WORK" sbproxy
+( cd "$RELEASE5" && sha256_of "$ARCHIVE" | awk -v f="$ARCHIVE" '{print $1"  "f}' \
+    > "${ARCHIVE}.sha256" )
+
+SHADOW_DIR="${WORK}/shadow_earlier"
+mkdir -p "$SHADOW_DIR"
+printf '#!/bin/sh\necho "sbproxy fake 1.0.0-stale"\n' > "${SHADOW_DIR}/sbproxy"
+chmod +x "${SHADOW_DIR}/sbproxy"
+
+DEST6="${WORK}/bin6"
+mkdir -p "$DEST6"
+if SBPROXY_VERSION="v9.9.9" SBPROXY_BASE_URL="file://${RELEASE5}" \
+   SBPROXY_INSTALL="$DEST6" SBPROXY_SKIP_COSIGN=1 \
+   PATH="${SHADOW_DIR}:${DEST6}:${PATH}" \
+   sh "$INSTALL_SH" >"${WORK}/out6.log" 2>&1; then rc=0; else rc=$?; fi
+check "shadowed install still exits 0" "$([ "$rc" = "0" ] && echo 1 || echo 0)"
+check "shadowed install writes the new binary to INSTALL_DIR" \
+    "$([ -x "${DEST6}/sbproxy" ] && echo 1 || echo 0)"
+check "banner reports the just-installed version, not the shadowing one" \
+    "$(grep -q 'Version:  sbproxy fake 9.9.9' "${WORK}/out6.log" && echo 1 || echo 0)"
+check "banner reports INSTALL_DIR as the location, not command -v" \
+    "$(grep -q "Location: ${DEST6}/sbproxy" "${WORK}/out6.log" && echo 1 || echo 0)"
+check "banner warns about the shadowing binary" \
+    "$(grep -q 'earlier on your PATH' "${WORK}/out6.log" && echo 1 || echo 0)"
+
 echo ""
 echo "install_verify: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" = "0" ]
