@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-20*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -68,26 +68,30 @@ sbproxy --version
 
 ### Docker
 
-The official image runs the statically-linked binary on a distroless base (`gcr.io/distroless/cc-debian12`); there is no shell or package manager in the runtime layer.
+The official image runs the release binary on a distroless base (`gcr.io/distroless/cc-debian12`); there is no shell or package manager in the runtime layer. The binary is built against glibc 2.36, so the same tarball also runs on Debian 12, Ubuntu 23.04, and anything newer.
+
+The image has no default config path, so every `docker run` must name the config explicitly, either as `serve -f <path>` or as a positional argument. Mount your config at `/etc/sbproxy` and point the command at it:
 
 ```bash
 # Pull the image
 docker pull soapbucket/sbproxy:latest
-
-# Run with a local config directory
-docker run --rm \
-  -p 8080:8080 \
-  -p 8443:8443 \
-  -p 8443:8443/udp \
-  -v /path/to/config:/etc/sbproxy \
-  soapbucket/sbproxy:latest
 
 # Run with a specific config file
 docker run --rm \
   -p 8080:8080 \
   -v /path/to/sb.yml:/etc/sbproxy/sb.yml:ro \
   soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
+
+# Run with a local config directory (certs, includes) mounted alongside
+docker run --rm \
+  -p 8080:8080 \
+  -p 8443:8443 \
+  -p 8443:8443/udp \
+  -v /path/to/config:/etc/sbproxy:ro \
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
+
+On Windows, quote the host path in the volume flag (PowerShell: `-v C:\Users\you\proxy:/etc/sbproxy:ro`).
 
 ### From source
 
