@@ -59,9 +59,19 @@ fi
 if [ -n "${ENGINE_PID:-}" ]; then
   echo "Killing engine pid $ENGINE_PID ..."
   kill -9 "$ENGINE_PID" 2>/dev/null || true
-  sleep 3
-  read -r code t3 < <(req 600)
-  [ "$code" = "200" ] && ok "recovers after kill -9 (${t3}s)" || bad "no recovery after kill -9 (http $code)"
+  # Recovery means the supervisor relaunches the engine and the model
+  # reloads; on cold caches that is tens of seconds, and the proxy
+  # correctly refuses requests while the relaunch is in flight. Poll
+  # with a deadline instead of demanding instant recovery.
+  recovery_deadline=$(( $(date +%s) + 180 ))
+  code=""
+  t3=""
+  while [ "$(date +%s)" -lt "$recovery_deadline" ]; do
+    read -r code t3 < <(req 60)
+    [ "$code" = "200" ] && break
+    sleep 3
+  done
+  [ "$code" = "200" ] && ok "recovers after kill -9 (${t3}s)" || bad "no recovery after kill -9 within 180s (last http $code)"
 else
   echo "SKIP: set ENGINE_PID to run the kill -9 recovery check"
 fi
