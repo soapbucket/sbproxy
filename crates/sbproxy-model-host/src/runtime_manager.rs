@@ -684,9 +684,22 @@ impl DeploymentSlot {
             match self.runtime.health(&running).await {
                 Ok(EngineHealth::Ready) => return Ok(Some(running)),
                 Ok(EngineHealth::Stopped) => {
+                    // A post-readiness exit is the one failure whose cause
+                    // lives only in the engine's stderr; without carrying the
+                    // bounded tail here, the operator-facing error names the
+                    // symptom and discards the diagnosis.
+                    let tail = running.process.stderr_tail();
+                    let tail = if tail.is_empty() {
+                        String::from("engine stderr was empty")
+                    } else {
+                        tail
+                    };
                     health_error = Some(RuntimeManagerError::Engine(EngineDriverError::new(
                         EngineFailureReason::EngineHealthFailed,
-                        format!("managed deployment {:?} engine process has exited", self.id),
+                        format!(
+                            "managed deployment {:?} engine process has exited; stderr tail: {tail}",
+                            self.id
+                        ),
                         "inspect the retained engine diagnostics, then reset the deployment",
                         true,
                     )));
