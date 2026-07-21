@@ -255,28 +255,40 @@ verify_install() {
         fi
     fi
 
-    if command -v sbproxy >/dev/null 2>&1; then
-        INSTALLED_VERSION=$(sbproxy --version 2>/dev/null || echo "unknown")
-        echo ""
-        echo "📦 sbproxy installed successfully!"
-        echo "   Version:  ${INSTALLED_VERSION}"
-        echo "   Location: $(command -v sbproxy)"
-        echo ""
-        echo "Get started:"
-        echo "  sbproxy serve -f sb.yml"
-        echo ""
-        echo "Docs: https://github.com/${REPO}"
-    else
-        echo ""
-        echo "📦 sbproxy installed to ${INSTALL_DIR}/sbproxy"
-        echo ""
-        if echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
-            echo "Run: sbproxy --version"
-        else
-            echo "Note: ${INSTALL_DIR} is not in your PATH."
-            echo "Add it with: export PATH=\"${INSTALL_DIR}:\$PATH\""
+    # Report on the file we just installed, not on whatever `sbproxy` happens
+    # to resolve to on PATH. An older sbproxy earlier on PATH (a stale
+    # Homebrew install is the common case) would otherwise make this banner
+    # print that older binary's version and path while claiming success,
+    # leaving the operator convinced they are on the new release when the
+    # shell still runs the old one.
+    INSTALLED_VERSION=$("${INSTALL_DIR}/sbproxy" --version 2>/dev/null || echo "unknown")
+    echo ""
+    echo "📦 sbproxy installed successfully!"
+    echo "   Version:  ${INSTALLED_VERSION}"
+    echo "   Location: ${INSTALL_DIR}/sbproxy"
+    echo ""
+
+    if echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+        _resolved=$(command -v sbproxy 2>/dev/null || true)
+        if [ -n "$_resolved" ] && [ "$_resolved" != "${INSTALL_DIR}/sbproxy" ]; then
+            echo "Warning: ${_resolved} is earlier on your PATH than ${INSTALL_DIR}."
+            echo "Running \`sbproxy\` will use that one, not the version just installed."
+            _other_version=$("$_resolved" --version 2>/dev/null || echo "unknown")
+            echo "  ${_resolved}: ${_other_version}"
+            echo "  ${INSTALL_DIR}/sbproxy: ${INSTALLED_VERSION}"
+            echo "Either remove/upgrade the other install, or run this one by full path."
+            echo ""
         fi
+    else
+        echo "Note: ${INSTALL_DIR} is not in your PATH."
+        echo "Add it with: export PATH=\"${INSTALL_DIR}:\$PATH\""
+        echo ""
     fi
+
+    echo "Get started:"
+    echo "  ${INSTALL_DIR}/sbproxy serve -f sb.yml"
+    echo ""
+    echo "Docs: https://github.com/${REPO}"
 }
 
 # Optionally provision a container runtime for GPU model serving.
