@@ -72,10 +72,13 @@ brew tap soapbucket/tap
 brew install sbproxy
 ```
 
-Docker:
+Docker (the image has no default config path, so name one explicitly):
 
 ```bash
 docker pull soapbucket/sbproxy:latest
+docker run --rm -p 8080:8080 \
+  -v ./sb.yml:/etc/sbproxy/sb.yml:ro \
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 From source (needs Rust 1.82+):
