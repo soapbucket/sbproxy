@@ -436,6 +436,21 @@ impl EngineSupervisor {
                 }
                 Err(error) => {
                     attempts = attempts.saturating_add(1);
+                    // Log the bounded, credential-redacted stderr tail
+                    // here: it is otherwise held only in memory (the
+                    // error diagnostic and crash-loop status), so a
+                    // process that exits after the failure, such as a
+                    // certification run whose only artifact is the boot
+                    // log, would lose the one diagnostic the error
+                    // message tells the operator to inspect.
+                    tracing::error!(
+                        deployment = %self.deployment,
+                        reason = %error.reason(),
+                        attempts,
+                        retryable = error.retryable(),
+                        stderr_tail = error.diagnostic_tail().unwrap_or(""),
+                        "managed engine launch attempt failed"
+                    );
                     let now_ms = self.clock.now_ms();
                     let first_failure_at_ms = retained
                         .as_ref()

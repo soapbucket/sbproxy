@@ -1341,6 +1341,13 @@
           "format": "uint",
           "minimum": 0.0
         },
+        "rate_limit_per_minute": {
+          "description": "Maximum admin API requests per client IP per minute. The global cap across all clients is ten times this value. Must be between 1 and 100000; the limiter cannot be turned off. Defaults to 60.",
+          "default": 60,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "prompt_persistence_path": {
           "description": "WOR-800 PR5: filesystem path to a redb file that persists the prompt-store runtime overlay. When set, every successful `POST /admin/prompts/.../versions` and `PUT /admin/prompts/.../pin` also writes through to the file, and the file's existing contents are hydrated into the in-memory overlay at boot. Absent means PR3-style ephemeral mutations.",
           "default": null,

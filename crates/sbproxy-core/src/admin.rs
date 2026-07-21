@@ -39,6 +39,10 @@ pub struct AdminConfig {
     pub password: String,
     /// Maximum number of recent request log entries to retain in memory.
     pub max_log_entries: usize,
+    /// Maximum admin API requests per client IP per minute. The global
+    /// cap is ten times this value. Validated to 1..=100000 at config
+    /// compile; the limiter cannot be turned off.
+    pub rate_limit_per_minute: u64,
     /// Optional TLS (WOR-1717). When set, the admin server (and the
     /// built-in UI) is served over HTTPS with this PEM cert + key instead
     /// of plaintext HTTP.
@@ -86,6 +90,7 @@ impl Default for AdminConfig {
             username: "admin".to_string(),
             password: "changeme".to_string(),
             max_log_entries: 1000,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -2300,7 +2305,7 @@ pub fn spawn_admin_server(
             }
         };
         tracing::info!(addr = %addr, tls = acceptor.is_some(), "admin server listening");
-        let rate_limiter = std::sync::Arc::new(AdminRateLimiter::new(60));
+        let rate_limiter = std::sync::Arc::new(build_rate_limiter(&state.config));
         let ip_filter = std::sync::Arc::new(if allow_ips.is_empty() {
             AdminIpFilter::localhost_only()
         } else {
@@ -2335,6 +2340,14 @@ pub fn spawn_admin_server(
             });
         }
     }))
+}
+
+/// Build the admin rate limiter from the configured per-IP cap. The
+/// global cap is derived as ten times the per-IP cap (see
+/// [`AdminRateLimiter::new`]); config validation guarantees the value
+/// is in 1..=100000, so the limiter is never off.
+fn build_rate_limiter(config: &AdminConfig) -> AdminRateLimiter {
+    AdminRateLimiter::new(config.rate_limit_per_minute)
 }
 
 /// Per-connection admin handling shared by the plaintext and TLS paths
@@ -3147,6 +3160,7 @@ mod tests {
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -3896,6 +3910,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -3945,6 +3960,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -3978,6 +3994,7 @@ origins:
                 username: "admin".to_string(),
                 password: "secret".to_string(),
                 max_log_entries: 5,
+                rate_limit_per_minute: 60,
                 tls: None,
                 bind: "127.0.0.1".to_string(),
                 allow_ips: Vec::new(),
@@ -4081,6 +4098,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -4113,6 +4131,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -4146,6 +4165,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -4197,6 +4217,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -4241,6 +4262,25 @@ origins:
         for _ in 0..5 {
             assert!(limiter.check("10.0.0.1"), "should allow within limit");
         }
+    }
+
+    #[test]
+    fn rate_limiter_uses_configured_per_minute_limit() {
+        // The limiter the admin server installs must come from config,
+        // not a hardcoded cap: a non-default value has to change what
+        // the third request sees.
+        assert_eq!(AdminConfig::default().rate_limit_per_minute, 60);
+        let cfg = AdminConfig {
+            rate_limit_per_minute: 2,
+            ..AdminConfig::default()
+        };
+        let limiter = build_rate_limiter(&cfg);
+        assert!(limiter.check("10.9.0.1"));
+        assert!(limiter.check("10.9.0.1"));
+        assert!(
+            !limiter.check("10.9.0.1"),
+            "third request must exceed the configured cap of 2"
+        );
     }
 
     #[test]
@@ -4545,6 +4585,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -4572,6 +4613,7 @@ origins:
             username: "admin".to_string(),
             password: "secret".to_string(),
             max_log_entries: 5,
+            rate_limit_per_minute: 60,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),

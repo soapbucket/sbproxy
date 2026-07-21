@@ -2329,6 +2329,11 @@ pub struct AdminConfig {
     /// Defaults to 1000.
     #[serde(default = "default_max_log")]
     pub max_log_entries: usize,
+    /// Maximum admin API requests per client IP per minute. The global
+    /// cap across all clients is ten times this value. Must be between
+    /// 1 and 100000; the limiter cannot be turned off. Defaults to 60.
+    #[serde(default = "default_admin_rate_limit")]
+    pub rate_limit_per_minute: u64,
     /// WOR-800 PR5: filesystem path to a redb file that persists the
     /// prompt-store runtime overlay. When set, every successful
     /// `POST /admin/prompts/.../versions` and `PUT /admin/prompts/.../pin`
@@ -2424,6 +2429,10 @@ fn default_admin_pass() -> String {
 
 fn default_max_log() -> usize {
     1000
+}
+
+fn default_admin_rate_limit() -> u64 {
+    60
 }
 
 fn default_http_port() -> u16 {

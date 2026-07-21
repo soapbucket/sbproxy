@@ -1,10 +1,11 @@
-# E2E tests for SBproxy. Runs ONLY on tag pushes and on manual
-# dispatch. The PR-required CI lane (`ci.yml`) excludes
+# E2E tests for SBproxy. Runs on tag pushes, on a nightly schedule,
+# and on manual dispatch. The PR-required CI lane (`ci.yml`) excludes
 # `sbproxy-e2e` because the harness spawns the proxy binary, listens
 # on real ports, and exercises the network stack; on shared GitHub
 # runners that pattern produces startup-timeout flakiness that does
-# not reflect a real regression. Gating e2e on tags keeps PR feedback
-# fast while still validating the full stack before a release ships.
+# not reflect a real regression. Gating e2e out of PRs keeps PR
+# feedback fast while still validating the full stack before a
+# release ships.
 
 name: e2e
 
@@ -13,6 +14,13 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  # Nightly run so this lane cannot rot silently between releases:
+  # tag-only triggers mean a breakage introduced mid-cycle only
+  # surfaces during the release itself. Failures do not page anyone;
+  # GitHub emails the scheduled run's actor on failure, which is the
+  # intended default.
+  schedule:
+    - cron: '30 9 * * *' # 09:30 UTC daily
   workflow_dispatch: {}
 
 permissions:

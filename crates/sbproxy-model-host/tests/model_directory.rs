@@ -330,6 +330,136 @@ fn directory_joins_every_member_and_calls_out_unhealthy_nodes() {
     assert_eq!(view.eligible_replicas["coder"].len(), 1);
 }
 
+/// A live gateway-only member: no worker role, no model plane, and
+/// therefore `model_plane: unavailable` in its published snapshot.
+fn gateway_snapshot_for(node_id: &str, generation: u64) -> NodeModelSnapshot {
+    let mut snapshot = snapshot_for(node_id, generation);
+    snapshot.node.roles = BTreeSet::from([NodeRole::Gateway]);
+    snapshot.node.model_endpoint = None;
+    snapshot.health.model_plane = ModelPlaneHealth::Unavailable;
+    snapshot.engines.clear();
+    snapshot.devices.clear();
+    snapshot.artifacts.clear();
+    snapshot.replicas.clear();
+    snapshot.placement_weight = 0;
+    snapshot.active_deployment_digest = None;
+    snapshot
+        .validate()
+        .expect("gateway directory snapshot fixture");
+    snapshot
+}
+
+#[test]
+fn gateway_only_nodes_are_not_graded_on_the_model_plane() {
+    let directory = ModelDirectory::new();
+    let gateway_a = gateway_snapshot_for("gateway-a", 5);
+    let gateway_b = gateway_snapshot_for("gateway-b", 6);
+    let view = directory
+        .refresh(
+            gateway_a.published_at_unix_ms + 1_000,
+            vec![
+                member("gateway-a", DirectoryMemberState::Alive),
+                member("gateway-b", DirectoryMemberState::Alive),
+            ],
+            BTreeMap::from([
+                ("gateway-a".to_string(), observed(&gateway_a)),
+                ("gateway-b".to_string(), observed(&gateway_b)),
+            ]),
+        )
+        .expect("directory refresh");
+
+    for node_id in ["gateway-a", "gateway-b"] {
+        let node = view.node(node_id).expect(node_id);
+        assert_eq!(node.health, ModelDirectoryHealth::Healthy, "{node_id}");
+        assert!(
+            node.unhealthy_reasons.is_empty(),
+            "{node_id} must not carry a model-plane reason: {:?}",
+            node.unhealthy_reasons
+        );
+        assert!(!node.model_eligible, "{node_id}");
+        assert_eq!(
+            node.exclusion_reason,
+            Some(ModelDirectoryExclusionReason::NotWorker),
+            "{node_id}"
+        );
+    }
+    assert_eq!(view.summary.total_nodes, 2);
+    assert_eq!(view.summary.healthy_nodes, 2);
+    assert_eq!(view.summary.degraded_nodes, 0);
+    assert_eq!(view.summary.unhealthy_nodes, 0);
+    assert_eq!(view.summary.eligible_workers, 0);
+}
+
+#[test]
+fn worker_with_model_plane_down_stays_degraded_with_its_reason() {
+    let directory = ModelDirectory::new();
+    let mut worker = snapshot_for("worker-a", 5);
+    worker.health.model_plane = ModelPlaneHealth::Unavailable;
+    let view = directory
+        .refresh(
+            worker.published_at_unix_ms + 1_000,
+            vec![member("worker-a", DirectoryMemberState::Alive)],
+            BTreeMap::from([("worker-a".to_string(), observed(&worker))]),
+        )
+        .expect("directory refresh");
+
+    let node = view.node("worker-a").expect("worker a");
+    assert_eq!(node.health, ModelDirectoryHealth::Degraded);
+    assert!(node
+        .unhealthy_reasons
+        .iter()
+        .any(|reason| reason == "model_plane_unavailable"));
+    assert!(node.model_eligible, "a degraded worker stays eligible");
+    assert_eq!(view.summary.healthy_nodes, 0);
+    assert_eq!(view.summary.degraded_nodes, 1);
+    assert_eq!(view.summary.unhealthy_nodes, 0);
+    assert_eq!(view.summary.eligible_workers, 1);
+}
+
+#[test]
+fn mixed_topology_grades_only_workers_on_the_model_plane() {
+    let directory = ModelDirectory::new();
+    let gateway = gateway_snapshot_for("gateway-a", 5);
+    let mut worker_down = snapshot_for("worker-b", 6);
+    worker_down.health.model_plane = ModelPlaneHealth::Unavailable;
+    let worker_up = snapshot_for("worker-c", 7);
+    let view = directory
+        .refresh(
+            gateway.published_at_unix_ms + 1_000,
+            vec![
+                member("gateway-a", DirectoryMemberState::Alive),
+                member("worker-b", DirectoryMemberState::Alive),
+                member("worker-c", DirectoryMemberState::Alive),
+            ],
+            BTreeMap::from([
+                ("gateway-a".to_string(), observed(&gateway)),
+                ("worker-b".to_string(), observed(&worker_down)),
+                ("worker-c".to_string(), observed(&worker_up)),
+            ]),
+        )
+        .expect("directory refresh");
+
+    let gateway_node = view.node("gateway-a").expect("gateway a");
+    assert_eq!(gateway_node.health, ModelDirectoryHealth::Healthy);
+    assert!(gateway_node.unhealthy_reasons.is_empty());
+
+    let down_node = view.node("worker-b").expect("worker b");
+    assert_eq!(down_node.health, ModelDirectoryHealth::Degraded);
+    assert!(down_node
+        .unhealthy_reasons
+        .iter()
+        .any(|reason| reason == "model_plane_unavailable"));
+
+    let up_node = view.node("worker-c").expect("worker c");
+    assert_eq!(up_node.health, ModelDirectoryHealth::Healthy);
+
+    assert_eq!(view.summary.total_nodes, 3);
+    assert_eq!(view.summary.healthy_nodes, 2);
+    assert_eq!(view.summary.degraded_nodes, 1);
+    assert_eq!(view.summary.unhealthy_nodes, 0);
+    assert_eq!(view.summary.eligible_workers, 2);
+}
+
 #[test]
 fn directory_keeps_current_generation_cold_candidates_and_device_utilization() {
     let directory = ModelDirectory::new();

@@ -89,6 +89,13 @@ proxy:
     port: {admin_port}
     username: admin
     password: secret
+    # Headroom over the 60/min default. This suite polls the admin
+    # surface from one client IP for membership, health, and usage
+    # merges; at the default cap those polls exhaust the per-IP budget
+    # mid-wait, and a 429-stalled poll loop outlives the governed
+    # key's one-minute fixed window, so usage reads decay to 0 before
+    # a merge can ever be observed.
+    rate_limit_per_minute: 600
   cluster:
     cluster_id: {CLUSTER_ID}
     node_id: {node_id}
@@ -200,11 +207,11 @@ fn wait_for_cluster_size(admin_port: u16, expected: u64, timeout: Duration) {
     loop {
         let status = admin_get(admin_port, "/admin/cluster/status");
         let total = status["summary"]["total_nodes"].as_u64().unwrap_or(0);
-        // Gateway-only nodes report health "degraded" with
-        // model_plane_unavailable in steady state, so counting
-        // summary.healthy_nodes would never converge for this topology.
-        // What this suite needs is gossip membership: every expected node
-        // present and alive.
+        // This helper waits on gossip membership only: every expected
+        // node present and alive. Aggregate health converges slightly
+        // later (snapshot collection lags membership by up to a publish
+        // interval) and is asserted separately by
+        // `wait_for_all_nodes_healthy` after this returns.
         let alive = status["nodes"]
             .as_array()
             .map(|nodes| {
@@ -221,6 +228,31 @@ fn wait_for_cluster_size(admin_port: u16, expected: u64, timeout: Duration) {
             panic!(
                 "admin port {admin_port} did not converge to {expected} alive cluster \
                  nodes within {timeout:?}; last status: {status}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Poll `/admin/cluster/status` until `summary.healthy_nodes` equals the
+/// full node count. This cluster is gateway-only: nodes without the
+/// worker role run no model plane, so an unavailable model plane must
+/// not grade them degraded. Every node in a converged gateway-only
+/// cluster therefore has to report healthy; anything less is the
+/// role-blind grading defect resurfacing.
+fn wait_for_all_nodes_healthy(admin_port: u16, expected: u64, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = admin_get(admin_port, "/admin/cluster/status");
+        let healthy = status["summary"]["healthy_nodes"].as_u64().unwrap_or(0);
+        if healthy == expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "admin port {admin_port} never reported summary.healthy_nodes == {expected} \
+                 for its gateway-only cluster within {timeout:?} (last saw {healthy}); \
+                 gateway-only nodes must not be graded on the model plane; last status: {status}"
             );
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -332,6 +364,12 @@ fn approximate_cluster_bounds_admission_to_one_dissemination_intervals_slack() {
     // cadence under test below.
     wait_for_cluster_size(admin_a, 2, Duration::from_secs(30));
     wait_for_cluster_size(admin_b, 2, Duration::from_secs(30));
+
+    // With membership converged, both gateway-only nodes must grade
+    // healthy: role-aware health means model_plane_unavailable neither
+    // degrades a non-worker nor appears in its unhealthy_reasons.
+    wait_for_all_nodes_healthy(admin_a, 2, Duration::from_secs(30));
+    wait_for_all_nodes_healthy(admin_b, 2, Duration::from_secs(30));
 
     let base_a = proxy_a.base_url();
     let base_b = proxy_b.base_url();
