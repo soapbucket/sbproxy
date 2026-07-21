@@ -169,8 +169,9 @@ pub use llama_driver::{
     LlamaBinarySource, LlamaCppDriver, LlamaDetection, LlamaProvisioned, SystemLlamaBinarySource,
 };
 pub use llama_release::{
-    asset_url as llama_asset_url, asset_url_accel as llama_asset_url_accel, is_executable_file,
-    resolve_on_path, Platform, DEFAULT_LLAMA_RELEASE_TAG,
+    asset_url as llama_asset_url, asset_url_accel as llama_asset_url_accel,
+    default_llama_release_tag_for_host, default_release_tag_for_platform, host_macos_version,
+    is_executable_file, resolve_on_path, MacOsVersion, Platform, DEFAULT_LLAMA_RELEASE_TAG,
 };
 #[cfg(feature = "weights")]
 pub use llama_release::{ensure_llama_server, ensure_llama_server_blocking};

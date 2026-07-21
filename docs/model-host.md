@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-21*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -936,11 +936,23 @@ The runtime reports one of four availability states before provisioning:
 
 llama.cpp consumes one verified GGUF path. The driver prefers an explicitly
 allowlisted path, then a compatible executable on `PATH`, then pinned
-acquisition. The built-in b9905 release assets have checked-in per-platform
+acquisition. The built-in pinned release assets have checked-in per-platform
 SHA-256 digests. Downloads use a release lock and publish under an
 asset-identity directory only after verification, so later starts reuse the
 same archive and executable. Apple Silicon uses Metal, and a CPU worker uses
 system RAM.
+
+Each pinned build also records the minimum macOS its Apple assets were built
+against. Recent llama.cpp macos-arm64 assets are built for macOS 26 and refuse
+to load on anything older, so when no `version:` is set, a macOS host reads
+its own product version and picks the newest pinned build it can run: macOS 26
+gets b9905, while macOS 14 and 15 fall back to b9415. Linux always uses the
+newest pin. A host older than every pinned build fails before any download,
+with a message naming the host version and the oldest supported minimum, and
+points at the alternatives: install llama.cpp on `PATH`, set a trusted
+`path:`, or pin `version:` and `sha256:` to a build made for that macOS. An
+explicit `version:` always wins over this selection, so only pin one on macOS
+if you know the build loads on the hosts you deploy to.
 
 llama.cpp is the engine for GGUF models on CPU and Apple Metal. NVIDIA GPU
 serving is handled by the vLLM and SGLang container engines, not llama.cpp, so

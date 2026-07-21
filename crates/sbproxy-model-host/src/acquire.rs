@@ -62,7 +62,8 @@ pub enum BinaryAcquirePlan {
 
 /// Decide how to obtain the binary for `engine`, given its optional
 /// provisioning and where (if anywhere) the binary already resolves on
-/// `PATH`. Pure: no fetch, no filesystem writes.
+/// `PATH`. No fetch, no filesystem writes; it only probes the host
+/// (CUDA prerequisites and, on macOS, the OS product version).
 ///
 /// Only binary engines (llama.cpp) are acquired here. vLLM is not a
 /// single-binary release (use a container or venv), and the embedded
@@ -82,7 +83,9 @@ pub fn plan_binary_acquire(
 /// This deterministic variant lets doctor and tests distinguish an acquirable
 /// CUDA source build from a blocked explicit CUDA request. `Auto` chooses the
 /// source build only when every prerequisite is ready; otherwise it keeps the
-/// ordinary release path.
+/// ordinary release path. On macOS the default llama.cpp tag additionally
+/// depends on the host macOS version: the newest pinned build the host can
+/// load is selected, and a host older than every pin yields a blocked plan.
 pub fn plan_binary_acquire_with_cuda(
     engine: EngineKind,
     prov: Option<&EngineProvisioning>,
@@ -119,17 +122,26 @@ pub fn plan_binary_acquire_with_cuda(
 
     match engine {
         EngineKind::LlamaCpp => {
-            if Platform::detect().is_none() {
+            let Some(platform) = Platform::detect() else {
                 return BinaryAcquirePlan::Blocked(format!(
                     "no prebuilt llama.cpp release for {}/{}; install llama.cpp on PATH \
                      or build from source",
                     std::env::consts::OS,
                     std::env::consts::ARCH
                 ));
-            }
-            let tag = acquire
-                .and_then(|a| a.version.clone())
-                .unwrap_or_else(|| DEFAULT_LLAMA_RELEASE_TAG.to_string());
+            };
+            // An explicit `acquire.version` is honoured as-is. The
+            // default is host-aware on macOS: recent macos-arm64 assets
+            // link against macOS 26 and die in dyld on older hosts, so
+            // the newest pin the host OS can load is selected instead. A
+            // host older than every pin blocks with the versions named.
+            let tag = match acquire.and_then(|a| a.version.clone()) {
+                Some(version) => version,
+                None => match crate::llama_release::default_release_tag_for_platform(platform) {
+                    Ok(tag) => tag.to_string(),
+                    Err(reason) => return BinaryAcquirePlan::Blocked(reason),
+                },
+            };
             let accel = acquire.map(|a| a.accel).unwrap_or_default();
             let configured_sha256 = acquire.and_then(|a| a.sha256.clone());
             let source_build_requested = acquire
@@ -165,10 +177,8 @@ pub fn plan_binary_acquire_with_cuda(
                 }
             }
             let sha256 = configured_sha256.or_else(|| {
-                Platform::detect().and_then(|platform| {
-                    crate::llama_release::default_release_sha256(&tag, platform, accel)
-                        .map(str::to_string)
-                })
+                crate::llama_release::default_release_sha256(&tag, platform, accel)
+                    .map(str::to_string)
             });
             BinaryAcquirePlan::FetchRelease { tag, accel, sha256 }
         }
@@ -267,19 +277,26 @@ mod tests {
 
     #[test]
     fn release_uses_default_tag_when_unset() {
-        // No engine on PATH, default provisioning: fetch the pinned
-        // default release and its built-in asset digest for this platform
-        // (the test host is a supported platform).
+        // No engine on PATH, default provisioning: fetch the host-selected
+        // pinned release and its built-in asset digest for this platform.
+        // On macOS the selected tag depends on the host OS version, so the
+        // expectation is computed through the same selector.
         let plan = plan_binary_acquire(EngineKind::LlamaCpp, None, None);
-        match plan {
-            BinaryAcquirePlan::FetchRelease { tag, sha256, .. } => {
-                assert_eq!(tag, DEFAULT_LLAMA_RELEASE_TAG);
+        let expected = Platform::detect()
+            .map(crate::llama_release::default_release_tag_for_platform)
+            .and_then(Result::ok);
+        match (plan, expected) {
+            (BinaryAcquirePlan::FetchRelease { tag, sha256, .. }, Some(selected)) => {
+                assert_eq!(tag, selected);
                 assert_eq!(sha256.as_deref().map(str::len), Some(64));
             }
-            // A platform with no prebuilt asset blocks instead; both are
-            // valid depending on the test host.
-            BinaryAcquirePlan::Blocked(r) => assert!(r.contains("no prebuilt")),
-            other => panic!("unexpected {other:?}"),
+            // A platform with no prebuilt asset, or a macOS older than
+            // every pin, blocks instead; both depend on the test host.
+            (BinaryAcquirePlan::Blocked(reason), _) => assert!(
+                reason.contains("no prebuilt") || reason.contains("older than every"),
+                "{reason}"
+            ),
+            (other, expected) => panic!("unexpected plan {other:?} (expected {expected:?})"),
         }
     }
 
