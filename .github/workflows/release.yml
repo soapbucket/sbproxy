@@ -131,7 +131,7 @@ jobs:
               # does not exist; on a bare runner we are not and it does.
               SUDO="$(command -v sudo || true)"
               ${SUDO} apt-get update
-              ${SUDO} apt-get install -y protobuf-compiler libclang-dev clang
+              ${SUDO} apt-get install -y protobuf-compiler libclang-dev clang cmake nasm
               ;;
             macOS)
               brew install protobuf
