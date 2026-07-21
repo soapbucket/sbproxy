@@ -29,7 +29,7 @@ h3,
 h4 {
   margin: 0;
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
   line-height: 1.25;
 }
 
@@ -73,7 +73,7 @@ button {
   color: var(--sb-text);
 }
 
-/* Scrollbars, softened to match the light ground. */
+/* Scrollbars, softened to match the paper ground. */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--sb-border-strong) transparent;
@@ -93,17 +93,19 @@ button {
 
 .sb-card {
   background: var(--sb-surface);
-  border: 1px solid var(--sb-border);
-  border-radius: var(--sb-radius);
+  border: 1px solid var(--sb-border-strong);
   padding: var(--sb-space-5);
 }
 
+/* Mono microcopy, the brand's labeling voice: small uppercase
+   JetBrains Mono for data labels and eyebrows (nav stays lowercase). */
 .sb-eyebrow {
-  font-size: 0.72rem;
+  font-family: var(--sb-font-mono);
+  font-size: 0.68rem;
   text-transform: uppercase;
   letter-spacing: 0.12em;
   color: var(--sb-text-faint);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .sb-muted {
@@ -113,17 +115,18 @@ button {
   color: var(--sb-text-faint);
 }
 
-/* Buttons */
+/* Buttons: square, mono, flush. Ink outline is the default; the
+   accent fill is the single primary action on a page. */
 .sb-btn {
   display: inline-flex;
   align-items: center;
   gap: var(--sb-space-2);
   padding: 7px 14px;
-  border-radius: var(--sb-radius-sm);
-  border: 1px solid var(--sb-border-strong);
-  background: var(--sb-surface-2);
+  border: 1px solid var(--sb-border-ink);
+  background: var(--sb-surface);
   color: var(--sb-text);
-  font-size: 0.86rem;
+  font-family: var(--sb-font-mono);
+  font-size: 0.8rem;
   font-weight: 500;
   cursor: pointer;
   transition: background 0.12s ease, border-color 0.12s ease,
@@ -131,34 +134,41 @@ button {
   white-space: nowrap;
 }
 .sb-btn:hover {
-  background: var(--sb-surface-hover);
-  border-color: var(--sb-border-accent);
+  background: var(--sb-accent-tint);
+  border-color: var(--sb-accent);
+  color: var(--sb-accent-strong);
 }
 .sb-btn:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
+.sb-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--sb-accent-ring);
+}
 .sb-btn--primary {
-  background: var(--sb-navy);
-  border-color: var(--sb-navy);
-  color: var(--sb-on-navy);
+  background: var(--sb-accent);
+  border-color: var(--sb-accent);
+  color: #ffffff;
   font-weight: 600;
 }
 .sb-btn--primary:hover {
-  background: var(--sb-navy-strong);
-  border-color: var(--sb-navy-strong);
+  background: var(--sb-accent-strong);
+  border-color: var(--sb-accent-strong);
+  color: #ffffff;
 }
 .sb-btn--danger {
   color: var(--sb-err);
-  border-color: rgba(180, 34, 63, 0.4);
+  border-color: var(--sb-err);
 }
 .sb-btn--danger:hover {
   background: var(--sb-err-bg);
   border-color: var(--sb-err);
+  color: var(--sb-err);
 }
 .sb-btn--sm {
   padding: 4px 10px;
-  font-size: 0.78rem;
+  font-size: 0.74rem;
 }
 
 /* Form fields */
@@ -169,8 +179,11 @@ button {
   margin-bottom: var(--sb-space-4);
 }
 .sb-label {
-  font-size: 0.78rem;
-  font-weight: 600;
+  font-family: var(--sb-font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
   color: var(--sb-text-muted);
 }
 .sb-input,
@@ -180,7 +193,6 @@ button {
   padding: 8px 10px;
   background: var(--sb-surface);
   border: 1px solid var(--sb-border-strong);
-  border-radius: var(--sb-radius-sm);
   color: var(--sb-text);
   font-family: inherit;
   font-size: 0.88rem;
@@ -203,7 +215,8 @@ button {
   resize: vertical;
 }
 
-/* Tables */
+/* Tables: white artifact panels ruled with hairlines under an ink
+   header rule. */
 .sb-table {
   width: 100%;
   border-collapse: collapse;
@@ -211,13 +224,14 @@ button {
 }
 .sb-table th {
   text-align: left;
-  font-weight: 600;
-  font-size: 0.74rem;
+  font-family: var(--sb-font-mono);
+  font-weight: 500;
+  font-size: 0.68rem;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.1em;
   color: var(--sb-text-faint);
   padding: 8px 12px;
-  border-bottom: 1px solid var(--sb-border-strong);
+  border-bottom: 1px solid var(--sb-border-ink);
   white-space: nowrap;
 }
 .sb-table td {
@@ -232,12 +246,11 @@ button {
   border-bottom: none;
 }
 
-/* Code / raw blocks */
+/* Code / raw blocks: the one deliberate dark panel. */
 .sb-code {
   background: var(--sb-code-bg);
   color: var(--sb-code-fg);
-  border: 1px solid var(--sb-border);
-  border-radius: var(--sb-radius);
+  border: 1px solid var(--sb-code-bg);
   padding: var(--sb-space-4);
   font-family: var(--sb-font-mono);
   font-size: 0.8rem;

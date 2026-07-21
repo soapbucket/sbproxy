@@ -131,10 +131,12 @@ const history = useAsync(() =>
 onMounted(history.run);
 watch([historyWindow, historyGroup], () => history.run());
 
-// Rollups disabled (503) reads as a hint, not a failure.
+// Rollups disabled (503) reads as a hint, not a failure. The detail
+// lives in the response body, not the error message.
 const historyDisabled = computed(() => {
   const e = history.error.value;
-  return e ? String(e).includes("not enabled") : false;
+  if (!e) return false;
+  return `${e.message} ${e.body}`.includes("not enabled");
 });
 
 function bucketLabel(tsSecs: number, bucketSecs: number): string {
@@ -396,7 +398,7 @@ const hasHistory = computed(() => historyRows.value.length > 0);
 .segmented {
   display: inline-flex;
   border: 1px solid var(--sb-border);
-  border-radius: 6px;
+  border-radius: 0;
   overflow: hidden;
 }
 .segmented button {
@@ -413,7 +415,7 @@ const hasHistory = computed(() => historyRows.value.length > 0);
   border-left: 1px solid var(--sb-border);
 }
 .segmented button.active {
-  background: var(--sb-bg-subtle, rgba(127, 127, 127, 0.12));
+  background: var(--sb-accent-tint);
   color: var(--sb-text);
 }
 .pickers select {
@@ -421,7 +423,7 @@ const hasHistory = computed(() => historyRows.value.length > 0);
   font-size: 12px;
   padding: 4px 8px;
   border: 1px solid var(--sb-border);
-  border-radius: 6px;
+  border-radius: 0;
   background: transparent;
   color: var(--sb-text);
 }

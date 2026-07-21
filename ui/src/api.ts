@@ -324,6 +324,9 @@ export interface ModelHostStatus {
 export interface ResidentModel {
   name?: string;
   id?: string;
+  /** Managed-runtime mirror rows key by deployment, not name. */
+  deployment?: string;
+  memory?: Record<string, unknown>;
   // EngineState serializes as a string or a small tagged object.
   state?: string | Record<string, unknown>;
   status?: string;

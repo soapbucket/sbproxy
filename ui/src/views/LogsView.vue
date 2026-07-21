@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import { api, asList, type RequestLog } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import { formatMs, formatTime, toDate } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -110,7 +111,6 @@ function traceUrl(r: RequestLog): string | null {
 const logLevel = ref("");
 const levelDraft = ref("");
 const levelBusy = ref(false);
-const levelMsg = ref("");
 async function loadLogLevel() {
   try {
     logLevel.value = (await api.logLevel()).level ?? "";
@@ -122,13 +122,12 @@ async function loadLogLevel() {
 async function applyLogLevel(value: string) {
   if (levelBusy.value || !value.trim()) return;
   levelBusy.value = true;
-  levelMsg.value = "";
   try {
     logLevel.value = (await api.setLogLevel(value)).level ?? value;
     levelDraft.value = logLevel.value;
-    levelMsg.value = `Log level set to ${logLevel.value}`;
+    toast.success(`Log level set to ${logLevel.value}`);
   } catch (e) {
-    levelMsg.value = e instanceof Error ? e.message : "Failed to set level";
+    toast.error(e, "Set log level");
   } finally {
     levelBusy.value = false;
   }
@@ -160,6 +159,15 @@ const methods = computed(() => {
   return [...set].sort();
 });
 
+// Origin filter for multi-tenant triage: options come from the rows in
+// the current window without forcing the operator to remember hostnames.
+const fOrigin = ref("");
+const origins = computed(() => {
+  const set = new Set<string>();
+  raw.value.forEach((r) => r.origin && set.add(String(r.origin)));
+  return [...set].sort();
+});
+
 const rows = computed<RequestLog[]>(() => {
   let list = [...raw.value];
   // Newest first, by parsed timestamp when available.
@@ -170,6 +178,9 @@ const rows = computed<RequestLog[]>(() => {
   });
   if (fMethod.value) {
     list = list.filter((r) => String(r.method ?? "").toUpperCase() === fMethod.value);
+  }
+  if (fOrigin.value) {
+    list = list.filter((r) => String(r.origin ?? "") === fOrigin.value);
   }
   if (fStatus.value) {
     // Accept exact code or a class like "2xx".
@@ -201,6 +212,7 @@ function statusTone(s: number | undefined): "ok" | "warn" | "err" | "info" | "ne
 
 function clearFilters() {
   fMethod.value = "";
+  fOrigin.value = "";
   fStatus.value = "";
   fPath.value = "";
   fGuardrail.value = "";
@@ -287,13 +299,21 @@ function detailFields(r: RequestLog): DetailField[] {
     >
       {{ p }}
     </button>
-    <span class="sb-faint msg" v-if="levelMsg">{{ levelMsg }}</span>
   </div>
 
   <div class="filters">
     <select class="sb-select" v-model="fMethod" aria-label="Filter by method">
       <option value="">All methods</option>
       <option v-for="m in methods" :key="m" :value="m">{{ m }}</option>
+    </select>
+    <select
+      class="sb-select"
+      v-model="fOrigin"
+      aria-label="Filter by origin"
+      v-if="origins.length > 1"
+    >
+      <option value="">All origins</option>
+      <option v-for="o in origins" :key="o" :value="o">{{ o }}</option>
     </select>
     <input class="sb-input" v-model="fStatus" placeholder="Status (e.g. 200 or 5xx)" aria-label="Filter by status" />
     <input class="sb-input" v-model="fPath" placeholder="Filter by path" aria-label="Filter by path" />

@@ -90,7 +90,7 @@ impl Default for AdminConfig {
             username: "admin".to_string(),
             password: "changeme".to_string(),
             max_log_entries: 1000,
-            rate_limit_per_minute: 60,
+            rate_limit_per_minute: 240,
             tls: None,
             bind: "127.0.0.1".to_string(),
             allow_ips: Vec::new(),
@@ -4374,7 +4374,7 @@ origins:
         // The limiter the admin server installs must come from config,
         // not a hardcoded cap: a non-default value has to change what
         // the third request sees.
-        assert_eq!(AdminConfig::default().rate_limit_per_minute, 60);
+        assert_eq!(AdminConfig::default().rate_limit_per_minute, 240);
         let cfg = AdminConfig {
             rate_limit_per_minute: 2,
             ..AdminConfig::default()

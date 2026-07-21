@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { api, ApiError, type CacheStatus } from "../api";
+import { api, type CacheStatus } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import { parsePrometheus, findFamily, sumSamples } from "../lib/metrics";
 import { formatNumber } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
@@ -34,11 +35,17 @@ const enabled = computed(() => !!status.value?.enabled);
 const backend = computed(() => status.value?.backend ?? "n/a");
 const prefixSupported = computed(() => !!status.value?.prefix_purge_supported);
 
-// Hit / miss from the Prometheus scrape (sbproxy_cache_hits_total{result}).
+// Hit / miss from the Prometheus scrape. The live family is
+// sbproxy_cache_results_total{origin, result}; the hits name is kept
+// as a fallback for older binaries.
 const cacheHits = computed(() => {
   const text = metricsReq.data.value;
   if (!text) return { hits: 0, misses: 0 };
-  const fam = findFamily(parsePrometheus(text), "sbproxy_cache_hits_total");
+  const fam = findFamily(
+    parsePrometheus(text),
+    "sbproxy_cache_results_total",
+    "sbproxy_cache_hits_total",
+  );
   return {
     hits: sumSamples(fam, { result: "hit" }),
     misses: sumSamples(fam, { result: "miss" }),
@@ -55,38 +62,56 @@ const purgeKey = ref("");
 const purgePrefix = ref("");
 const evictId = ref("");
 const busy = ref("");
-const banner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
 
-async function run(label: string, fn: () => Promise<unknown>, ok: string) {
+async function run(
+  label: string,
+  fn: () => Promise<unknown>,
+  action: string,
+  ok: string,
+) {
   if (busy.value) return;
   busy.value = label;
-  banner.value = null;
   try {
     await fn();
-    banner.value = { tone: "ok", text: ok };
+    toast.success(ok);
     refresh();
   } catch (e) {
-    const msg = e instanceof ApiError ? `${e.hint}` : e instanceof Error ? e.message : "Failed.";
-    banner.value = { tone: "err", text: msg };
+    toast.error(e, action);
   } finally {
     busy.value = "";
   }
 }
 
 const purgeAll = () =>
-  run("all", () => api.cachePurge({}), "Purged the entire response cache.");
+  run("all", () => api.cachePurge({}), "Purge cache", "Purged the entire response cache");
 const purgeByKey = () =>
-  run("key", () => api.cachePurge({ key: purgeKey.value }), `Purged key "${purgeKey.value}".`);
+  run(
+    "key",
+    () => api.cachePurge({ key: purgeKey.value }),
+    "Purge key",
+    `Purged key "${purgeKey.value}"`,
+  );
 const purgeByPrefix = () =>
   run(
     "prefix",
     () => api.cachePurge({ prefix: purgePrefix.value }),
-    `Purged entries under "${purgePrefix.value}".`,
+    "Purge prefix",
+    `Purged entries under "${purgePrefix.value}"`,
   );
 const evictKey = () =>
-  run("evict", () => api.evictKeyPolicy(evictId.value), `Evicted cached policy for "${evictId.value}".`);
+  run(
+    "evict",
+    () => api.evictKeyPolicy(evictId.value),
+    "Evict key policy",
+    `Evicted cached policy for "${evictId.value}"`,
+  );
 const evictAllPolicies = () =>
-  run("evict-all", () => api.evictKeyPolicy(), "Evicted all cached key policies.");
+  run(
+    "evict-all",
+    () => api.evictKeyPolicy(),
+    "Evict key policies",
+    "Evicted all cached key policies",
+  );
 </script>
 
 <template>
@@ -101,8 +126,6 @@ const evictAllPolicies = () =>
 
   <ErrorState v-if="statusReq.error.value" :error="statusReq.error.value" @retry="refresh" />
   <template v-else>
-    <p v-if="banner" class="banner" :class="`banner--${banner.tone}`">{{ banner.text }}</p>
-
     <div class="grid">
       <StatCard
         label="Response cache"
@@ -230,20 +253,6 @@ const evictAllPolicies = () =>
 }
 .action .sb-input {
   max-width: 320px;
-}
-.banner {
-  padding: var(--sb-space-3) var(--sb-space-4);
-  border-radius: var(--sb-radius-sm);
-  margin-bottom: var(--sb-space-4);
-  font-size: 0.9rem;
-}
-.banner--ok {
-  background: var(--sb-accent-tint);
-  color: var(--sb-accent);
-}
-.banner--err {
-  background: #fdecea;
-  color: #c0392b;
 }
 .semantic {
   margin-top: var(--sb-space-4);

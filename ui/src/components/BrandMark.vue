@@ -1,8 +1,7 @@
 <script setup lang="ts">
-// The SBproxy cube mark, same paths as the sbproxy.dev site header.
-// Navy is the brand tier (see tokens.css), so the mark reads navy on
-// the light chrome.
-withDefaults(defineProps<{ size?: number }>(), { size: 28 });
+// The SBproxy cube mark, same paths as the sbproxy.dev site header,
+// rendered in the accent green with the mono wordmark beside it.
+withDefaults(defineProps<{ size?: number }>(), { size: 20 });
 </script>
 
 <template>
@@ -35,10 +34,10 @@ withDefaults(defineProps<{ size?: number }>(), { size: 28 });
         stroke-linejoin="round"
       />
     </svg>
-    <div class="brand__text">
-      <span class="brand__name"><strong>SB</strong>proxy</span>
-      <span class="brand__role">Admin</span>
-    </div>
+    <span class="brand__text sb-mono">
+      <strong>sbproxy</strong>
+      <span class="brand__role">admin</span>
+    </span>
   </div>
 </template>
 
@@ -46,28 +45,25 @@ withDefaults(defineProps<{ size?: number }>(), { size: 28 });
 .brand {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 9px;
 }
 .brand__mark {
   flex: none;
-  color: var(--sb-navy);
+  color: var(--sb-accent);
 }
 .brand__text {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.15;
+  font-size: 0.86rem;
+  letter-spacing: 0.01em;
+  display: inline-flex;
+  gap: 7px;
+  align-items: baseline;
+  white-space: nowrap;
 }
-.brand__name {
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-.brand__name strong {
+.brand__text strong {
   font-weight: 700;
+  color: var(--sb-text);
 }
 .brand__role {
-  font-size: 0.72rem;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
   color: var(--sb-text-faint);
 }
 </style>

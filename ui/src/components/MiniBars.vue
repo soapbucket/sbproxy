@@ -2,10 +2,12 @@
 import { computed } from "vue";
 
 const props = defineProps<{
-  items: { key: string; value: number }[];
+  items: { key: string; value: number; color?: string }[];
   unit?: string;
   /** Custom value formatter; wins over the default fmt + unit pair. */
   format?: (v: number) => string;
+  /** Fill for bars without their own color. Defaults to series 1. */
+  color?: string;
 }>();
 
 const max = computed(() =>
@@ -29,7 +31,10 @@ function fmt(v: number): string {
       <div class="bar__track">
         <div
           class="bar__fill"
-          :style="{ width: `${Math.max(2, (item.value / max) * 100)}%` }"
+          :style="{
+            width: `${Math.max(1.5, (item.value / max) * 100)}%`,
+            background: item.color ?? color ?? 'var(--sb-chart-1)',
+          }"
         />
       </div>
     </div>
@@ -50,6 +55,7 @@ function fmt(v: number): string {
 }
 .bar__key {
   color: var(--sb-text-muted);
+  font-size: 0.74rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -60,18 +66,10 @@ function fmt(v: number): string {
   color: var(--sb-text);
 }
 .bar__track {
-  height: 8px;
+  height: 6px;
   background: var(--sb-bg-sunken);
-  border-radius: var(--sb-radius-pill);
-  overflow: hidden;
 }
 .bar__fill {
   height: 100%;
-  background: linear-gradient(
-    90deg,
-    var(--sb-navy-soft),
-    var(--sb-accent)
-  );
-  border-radius: var(--sb-radius-pill);
 }
 </style>

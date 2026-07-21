@@ -20,51 +20,34 @@ const resolvedTone = computed(() => {
 </script>
 
 <template>
-  <span class="badge" :class="`badge--${resolvedTone}`">
-    <span class="dot" />
+  <span class="badge sb-mono" :class="`badge--${resolvedTone}`">
     {{ label || "unknown" }}
   </span>
 </template>
 
 <style scoped>
+/* Status reads as a colored word, the site's instrument-panel idiom:
+   no pill, no dot, just ink that changes color. */
 .badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 9px;
-  border-radius: var(--sb-radius-pill);
-  font-size: 0.74rem;
+  font-size: 0.76rem;
   font-weight: 600;
-  line-height: 1.5;
-  border: 1px solid transparent;
+  letter-spacing: 0.01em;
+  text-transform: lowercase;
   white-space: nowrap;
-}
-.dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-  flex: none;
 }
 .badge--ok {
   color: var(--sb-ok);
-  background: var(--sb-ok-bg);
 }
 .badge--warn {
   color: var(--sb-warn);
-  background: var(--sb-warn-bg);
 }
 .badge--err {
   color: var(--sb-err);
-  background: var(--sb-err-bg);
 }
 .badge--info {
   color: var(--sb-info);
-  background: var(--sb-info-bg);
 }
 .badge--neutral {
   color: var(--sb-text-muted);
-  background: var(--sb-surface-2);
-  border-color: var(--sb-border);
 }
 </style>

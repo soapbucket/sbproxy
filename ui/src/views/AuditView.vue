@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { api, ApiError, type AuditRow, type WorkspaceStatus } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import { formatTime, toDate } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -27,21 +28,16 @@ const budgetConfigured = computed(
 );
 
 const busy = ref("");
-const banner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
 async function resume(ws: string) {
   if (busy.value) return;
   busy.value = ws;
-  banner.value = null;
   try {
     await api.resumeWorkspace(ws);
-    banner.value = { tone: "ok", text: `Resumed "${ws}".` };
+    toast.success(`Resumed "${ws}"`);
     budgetReq.run();
     req.run();
   } catch (e) {
-    banner.value = {
-      tone: "err",
-      text: e instanceof ApiError ? e.hint : e instanceof Error ? e.message : "Failed.",
-    };
+    toast.error(e, "Resume workspace");
   } finally {
     busy.value = "";
   }
@@ -81,7 +77,6 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
     </template>
   </PageHeader>
 
-  <p v-if="banner" class="banner" :class="`banner--${banner.tone}`">{{ banner.text }}</p>
 
   <!-- Workspace budgets + manual resume (WOR-1764) -->
   <section class="section" v-if="budgetConfigured">
@@ -158,20 +153,6 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
 }
 .section h2 {
   margin-bottom: var(--sb-space-4);
-}
-.banner {
-  padding: var(--sb-space-3) var(--sb-space-4);
-  border-radius: var(--sb-radius-sm);
-  margin-bottom: var(--sb-space-4);
-  font-size: 0.9rem;
-}
-.banner--ok {
-  background: var(--sb-accent-tint);
-  color: var(--sb-accent);
-}
-.banner--err {
-  background: #fdecea;
-  color: #c0392b;
 }
 .note {
   margin-top: var(--sb-space-4);

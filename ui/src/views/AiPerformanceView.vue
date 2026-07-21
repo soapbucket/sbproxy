@@ -305,13 +305,13 @@ function rateTone(rate: number): "ok" | "warn" | "err" {
 .rate-bar {
   flex: 1;
   height: 8px;
-  border-radius: 4px;
+  border-radius: 0;
   background: var(--sb-bg-subtle, rgba(127, 127, 127, 0.15));
   overflow: hidden;
 }
 .rate-fill {
   height: 100%;
-  border-radius: 4px;
+  border-radius: 0;
 }
 .rate--ok .rate-fill {
   background: var(--sb-ok, #157a5b);
