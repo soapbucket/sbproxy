@@ -4235,6 +4235,20 @@ impl ProxyHttp for SbProxy {
                 // expand usefully and the guardrail filters have data.
                 request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
                 trace_id: ctx.trace_ctx.as_ref().map(|t| t.trace_id.clone()),
+                session_id: ctx.session_id.map(|id| id.to_string()),
+                parent_session_id: ctx.parent_session_id.map(|id| id.to_string()),
+                properties: ctx.properties.clone(),
+                cache_status: if ctx.served_from_cache {
+                    "hit".to_string()
+                } else {
+                    "disabled".to_string()
+                },
+                retry_count: ctx.retry_count,
+                failover_engaged: ctx.fallback_triggered,
+                failover_from: None,
+                failover_to: None,
+                load_balancer_strategy: None,
+                load_balancer_target: None,
                 provider: ctx.ai_provider.clone(),
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,

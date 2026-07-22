@@ -12,7 +12,7 @@
 //! proxy.admin.username: admin
 //! proxy.admin.password: changeme
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -279,6 +279,34 @@ pub struct RequestLogEntry {
     /// it as an operator-configured deep link (WOR-1870).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// Caller-supplied or generated session identifier, when capture is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Parent session identifier supplied by the caller, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Bounded, normalized, and already-redacted custom properties.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, String>,
+    /// Gateway cache outcome: disabled, miss, hit, or semantic_hit.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cache_status: String,
+    /// Additional upstream attempts after the first attempt.
+    pub retry_count: u32,
+    /// Whether generic fallback or AI provider failover was engaged.
+    pub failover_engaged: bool,
+    /// First failed provider or target in a failover chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_from: Option<String>,
+    /// Last provider or target selected by failover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_to: Option<String>,
+    /// Closed load-balancing or AI routing strategy name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_balancer_strategy: Option<String>,
+    /// Selected bounded target, such as host:port or provider name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_balancer_target: Option<String>,
     /// AI provider that served the request, when the AI gateway did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -318,6 +346,14 @@ pub struct RequestLogFilter<'a> {
     pub guardrail_action: Option<&'a str>,
     /// Exact guardrail category match (WOR-1874).
     pub guardrail_category: Option<&'a str>,
+    /// Exact gateway cache-status match.
+    pub cache_status: Option<&'a str>,
+    /// Match rows that did or did not make an additional attempt.
+    pub retried: Option<bool>,
+    /// Exact normalized property key whose presence is required.
+    pub property_key: Option<&'a str>,
+    /// Exact redacted property value. Requires `property_key`.
+    pub property_value: Option<&'a str>,
 }
 
 // --- Admin State ---
@@ -614,6 +650,21 @@ impl AdminState {
                 filter
                     .guardrail_category
                     .is_none_or(|c| e.guardrail_category.as_deref() == Some(c))
+            })
+            .filter(|e| {
+                filter
+                    .cache_status
+                    .is_none_or(|status| e.cache_status == status)
+            })
+            .filter(|e| {
+                filter
+                    .retried
+                    .is_none_or(|retried| (e.retry_count > 0) == retried)
+            })
+            .filter(|e| match (filter.property_key, filter.property_value) {
+                (None, _) => true,
+                (Some(key), None) => e.properties.contains_key(key),
+                (Some(key), Some(value)) => e.properties.get(key).is_some_and(|v| v == value),
             })
             .skip(offset)
             .take(limit)
@@ -1577,6 +1628,15 @@ fn rl_query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// Decode one application/x-www-form-urlencoded query value. This is used for
+/// property values because custom dimensions commonly contain spaces and
+/// punctuation that browser clients percent-encode.
+fn decoded_query_param(path: &str, key: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    url::form_urlencoded::parse(query.as_bytes())
+        .find_map(|(candidate, value)| (candidate == key).then(|| value.into_owned()))
+}
+
 /// Handle an admin API request.
 ///
 /// Returns `(status, content_type, body)`. `method` is the HTTP
@@ -1888,6 +1948,40 @@ pub fn handle_admin_request(
         // WOR-1874: guardrail-column filters.
         let guardrail_action_f = rl_query_param(path, "guardrail_action");
         let guardrail_category_f = rl_query_param(path, "guardrail_category");
+        let cache_status_f = decoded_query_param(path, "cache_status");
+        if cache_status_f
+            .as_deref()
+            .is_some_and(|status| !matches!(status, "disabled" | "miss" | "hit" | "semantic_hit"))
+        {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"cache_status must be disabled, miss, hit, or semantic_hit"}"#
+                    .to_string(),
+            );
+        }
+        let retried_raw = decoded_query_param(path, "retried");
+        let retried_f = match retried_raw.as_deref() {
+            None => None,
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(_) => {
+                return (
+                    400,
+                    "application/json",
+                    r#"{"error":"retried must be true or false"}"#.to_string(),
+                );
+            }
+        };
+        let property_key_f = decoded_query_param(path, "property_key");
+        let property_value_f = decoded_query_param(path, "property_value");
+        if property_value_f.is_some() && property_key_f.as_deref().is_none_or(str::is_empty) {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"property_value requires property_key"}"#.to_string(),
+            );
+        }
         let offset = rl_query_param(path, "offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -1902,6 +1996,10 @@ pub fn handle_admin_request(
                 path_sub: path_f,
                 guardrail_action: guardrail_action_f,
                 guardrail_category: guardrail_category_f,
+                cache_status: cache_status_f.as_deref(),
+                retried: retried_f,
+                property_key: property_key_f.as_deref(),
+                property_value: property_value_f.as_deref(),
             },
             offset,
             limit,
@@ -3562,6 +3660,184 @@ mod tests {
         let page = state.query_requests(&RequestLogFilter::default(), 2, 3);
         assert_eq!(page.len(), 3);
         assert_eq!(page[0].path, "/api/thing/7");
+    }
+
+    #[test]
+    fn request_log_serializes_observability_fields() {
+        let entry = RequestLogEntry {
+            timestamp: "2026-07-21T12:00:00Z".to_string(),
+            origin: "api.test".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 200,
+            latency_ms: 42.5,
+            client_ip: "127.0.0.1".to_string(),
+            session_id: Some("01K0SESSION0000000000000000".to_string()),
+            parent_session_id: Some("01K0PARENT00000000000000000".to_string()),
+            properties: std::collections::BTreeMap::from([
+                ("feature".to_string(), "assistant".to_string()),
+                ("tier".to_string(), "gold tier".to_string()),
+            ]),
+            cache_status: "semantic_hit".to_string(),
+            retry_count: 2,
+            failover_engaged: true,
+            failover_from: Some("openai".to_string()),
+            failover_to: Some("anthropic".to_string()),
+            load_balancer_strategy: Some("lowest_latency".to_string()),
+            load_balancer_target: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(entry).expect("request log serializes");
+        assert_eq!(value["session_id"], "01K0SESSION0000000000000000");
+        assert_eq!(value["parent_session_id"], "01K0PARENT00000000000000000");
+        assert_eq!(value["properties"]["feature"], "assistant");
+        assert_eq!(value["cache_status"], "semantic_hit");
+        assert_eq!(value["retry_count"], 2);
+        assert_eq!(value["failover_engaged"], true);
+        assert_eq!(value["failover_from"], "openai");
+        assert_eq!(value["failover_to"], "anthropic");
+        assert_eq!(value["load_balancer_strategy"], "lowest_latency");
+        assert_eq!(value["load_balancer_target"], "anthropic");
+    }
+
+    #[test]
+    fn request_log_sse_uses_the_enriched_entry_contract() {
+        let state = make_state();
+        let mut events = state.log_events.subscribe();
+        state.log_request(RequestLogEntry {
+            timestamp: "2026-07-21T12:00:00Z".to_string(),
+            origin: "api.test".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 200,
+            latency_ms: 42.5,
+            client_ip: "127.0.0.1".to_string(),
+            session_id: Some("01K0SESSION0000000000000000".to_string()),
+            properties: std::collections::BTreeMap::from([(
+                "feature".to_string(),
+                "assistant".to_string(),
+            )]),
+            cache_status: "hit".to_string(),
+            retry_count: 1,
+            ..Default::default()
+        });
+
+        let event = events.try_recv().expect("subscriber receives event");
+        let value: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(value["session_id"], "01K0SESSION0000000000000000");
+        assert_eq!(value["properties"]["feature"], "assistant");
+        assert_eq!(value["cache_status"], "hit");
+        assert_eq!(value["retry_count"], 1);
+    }
+
+    #[test]
+    fn query_requests_filters_gateway_and_properties() {
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/cached".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            properties: std::collections::BTreeMap::from([
+                ("feature".to_string(), "assistant".to_string()),
+                ("tier".to_string(), "gold tier".to_string()),
+            ]),
+            cache_status: "hit".to_string(),
+            retry_count: 1,
+            ..Default::default()
+        });
+        state.log_request(RequestLogEntry {
+            timestamp: "t1".to_string(),
+            origin: "o".to_string(),
+            method: "GET".to_string(),
+            path: "/plain".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            cache_status: "disabled".to_string(),
+            ..Default::default()
+        });
+
+        let cached = state.query_requests(
+            &RequestLogFilter {
+                cache_status: Some("hit"),
+                retried: Some(true),
+                property_key: Some("feature"),
+                property_value: Some("assistant"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].path, "/cached");
+
+        let presence = state.query_requests(
+            &RequestLogFilter {
+                property_key: Some("tier"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(presence.len(), 1);
+
+        let not_retried = state.query_requests(
+            &RequestLogFilter {
+                retried: Some(false),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(not_retried.len(), 1);
+        assert_eq!(not_retried[0].path, "/plain");
+    }
+
+    #[test]
+    fn requests_endpoint_validates_observability_filters() {
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/cached".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            properties: std::collections::BTreeMap::from([(
+                "tier".to_string(),
+                "gold tier".to_string(),
+            )]),
+            cache_status: "hit".to_string(),
+            retry_count: 1,
+            ..Default::default()
+        });
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests?property_key=tier&property_value=gold%20tier&retried=true&cache_status=hit",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "valid filters must succeed: {body}");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rows.as_array().map(Vec::len), Some(1));
+
+        for path in [
+            "/api/requests?property_value=gold",
+            "/api/requests?retried=sometimes",
+            "/api/requests?cache_status=warm",
+        ] {
+            let (status, _, body) = handle_admin_request("GET", path, &state, Some(&auth), None);
+            assert_eq!(status, 400, "invalid filter must fail: {path}: {body}");
+        }
     }
 
     #[test]
