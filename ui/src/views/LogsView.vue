@@ -557,8 +557,10 @@ function detailFields(request: RequestLog): DetailField[] {
             <tr
               class="row"
               tabindex="0"
+              :aria-expanded="expandedKey === rowKey(request, index, group.key)"
               @click="toggleExpand(request, index, group.key)"
               @keydown.enter="toggleExpand(request, index, group.key)"
+              @keydown.space.prevent="toggleExpand(request, index, group.key)"
             >
               <td class="nowrap sb-muted">{{ formatTime(timestampOf(request)) }}</td>
               <td class="sb-mono">{{ request.method ?? "" }}</td>

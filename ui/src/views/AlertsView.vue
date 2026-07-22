@@ -119,7 +119,15 @@ const newestHistory = computed(() => [...(snapshot.value?.history ?? [])].revers
     </template>
   </PageHeader>
 
-  <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
+  <p
+    v-if="req.loading.value && !snapshot"
+    class="loading-state sb-mono sb-faint"
+    role="status"
+    aria-live="polite"
+  >
+    Loading alert runtime...
+  </p>
+  <ErrorState v-else-if="req.error.value" :error="req.error.value" @retry="req.run" />
   <template v-else-if="snapshot">
     <aside class="authority-note">
       <div>
@@ -227,6 +235,7 @@ const newestHistory = computed(() => [...(snapshot.value?.history ?? [])].revers
             <button
               class="sb-btn sb-btn--sm"
               :disabled="testingIndex !== null"
+              :aria-label="`Test ${channel.type} channel ${channel.index}`"
               @click="testChannel(channel)"
             >
               {{ testingIndex === channel.index ? "Testing..." : "Test channel" }}
@@ -285,6 +294,10 @@ const newestHistory = computed(() => [...(snapshot.value?.history ?? [])].revers
   padding: var(--sb-space-4);
   border: 1px solid var(--sb-border-ink);
   background: var(--sb-surface);
+}
+.loading-state {
+  padding: var(--sb-space-5) 0;
+  font-size: 0.78rem;
 }
 .authority-note__eyebrow {
   display: block;

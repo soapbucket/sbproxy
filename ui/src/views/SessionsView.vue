@@ -63,7 +63,15 @@ function statusTone(
     <span v-if="ungroupedCount">{{ ungroupedCount }} current requests have no session ID.</span>
   </aside>
 
-  <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
+  <p
+    v-if="req.loading.value && !req.data.value"
+    class="loading-state sb-mono sb-faint"
+    role="status"
+    aria-live="polite"
+  >
+    Loading recent sessions...
+  </p>
+  <ErrorState v-else-if="req.error.value" :error="req.error.value" @retry="req.run" />
   <template v-else-if="sessionRequests.length">
     <section class="session-totals" aria-label="Current ring session totals">
       <StatCard label="Requests" :value="formatNumber(totals.requestCount)" />
@@ -163,6 +171,10 @@ function statusTone(
   background: var(--sb-surface-2);
   color: var(--sb-text-muted);
   font-size: 0.84rem;
+}
+.loading-state {
+  padding: var(--sb-space-5) 0;
+  font-size: 0.78rem;
 }
 .retention-note strong {
   color: var(--sb-text);

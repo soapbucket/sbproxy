@@ -69,7 +69,15 @@ function statusTone(
     </template>
   </PageHeader>
 
-  <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
+  <p
+    v-if="req.loading.value && !req.data.value"
+    class="loading-state sb-mono sb-faint"
+    role="status"
+    aria-live="polite"
+  >
+    Loading session requests...
+  </p>
+  <ErrorState v-else-if="req.error.value" :error="req.error.value" @retry="req.run" />
   <template v-else-if="session">
     <section class="identity-panel">
       <span class="identity-panel__eyebrow sb-mono">session</span>
@@ -217,6 +225,10 @@ function statusTone(
   margin-bottom: var(--sb-space-4);
   color: var(--sb-text-faint);
   font-size: 0.74rem;
+}
+.loading-state {
+  padding: var(--sb-space-5) 0;
+  font-size: 0.78rem;
 }
 .identity-panel {
   margin-bottom: var(--sb-space-4);
