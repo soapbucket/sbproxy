@@ -7319,6 +7319,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_a_model_host_deployment_with_no_catalog_v2_variants() {
+        // WOR: qwen3-14b is a real builtin catalog id, but unlike
+        // qwen2.5-0.5b-instruct it has no `variants:` entries yet. Before
+        // this fix, a deployment referencing it (with no `variant:` pinned,
+        // the common case) passed validate and only failed at boot inside
+        // `Catalog::resolve_artifact`, crashing the whole process rather
+        // than just that deployment.
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  model_host:\n    deployments:\n      local-ai:\n        model: qwen3-14b\norigins:\n  x.local:\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: ok\n",
+        );
+        let error = handle_validate_subcommand(&validate_args(&path, false))
+            .expect_err("qwen3-14b has no complete catalog v2 artifact variant yet");
+        assert!(
+            error
+                .to_string()
+                .contains("no complete catalog v2 artifact variant"),
+            "{error:?}"
+        );
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn validate_gates_mesh_compression_on_cluster_replication() {
         fn mesh_compression_config(replication_block: &str) -> String {
             format!(

@@ -390,6 +390,11 @@ fn validate_catalog_deployment(
             deployment.model
         ))
     })?;
+    if entry.variants.is_empty() {
+        return Err(DesiredStateError::Catalog(incomplete_catalog_v2_message(
+            &deployment.model,
+        )));
+    }
     if let Some(variant) = deployment.variant.as_deref() {
         if !entry
             .variants
@@ -418,6 +423,11 @@ fn validate_legacy_catalog_entry(
     let catalog_entry = catalog.get(&entry.model).ok_or_else(|| {
         DesiredStateError::Catalog(format!("model {:?} is not in the catalog", entry.model))
     })?;
+    if catalog_entry.variants.is_empty() {
+        return Err(DesiredStateError::Catalog(incomplete_catalog_v2_message(
+            &entry.model,
+        )));
+    }
     if let Some(variant) = entry.variant.as_deref() {
         if !catalog_entry
             .variants
@@ -431,6 +441,21 @@ fn validate_legacy_catalog_entry(
         }
     }
     Ok(())
+}
+
+/// Shared message for a catalog id whose entry has not been migrated to
+/// catalog v2 (no `variants` at all), so `resolve_artifact` could never
+/// produce a runnable artifact for it. Surfacing this at config-validate
+/// time, with the same wording `resolve_artifact` uses at reconcile time,
+/// turns a boot-time `Fatal:` crash into an actionable validate error.
+fn incomplete_catalog_v2_message(model: &str) -> String {
+    format!(
+        "model {model:?} has no complete catalog v2 artifact variant (exact files, sizes, \
+         digests, source revision, and requirements are missing).\n\nTo fix: use a catalog \
+         model with complete artifact data (e.g. 'qwen2.5-0.5b-instruct'), or reference the \
+         model directly via a raw 'hf:Org/Repo[:QUANT]' source instead of a catalog id (e.g. \
+         'hf:Qwen/Qwen3-14B:Q4_K_M')."
+    )
 }
 
 pub(crate) fn validate_legacy_managed_compatibility(
@@ -739,7 +764,7 @@ fn identifier_fragment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::validate_legacy_managed_compatibility;
-    use crate::{EngineKind, ModelHostConfig, ServeEntry};
+    use crate::{Catalog, EngineKind, ModelHostConfig, ServeEntry};
 
     fn first_entry(yaml: &str) -> ServeEntry {
         serde_yaml::from_str::<ModelHostConfig>(yaml)
@@ -861,5 +886,44 @@ mod tests {
                 .expect_err(&format!("image {image} must be pinned"));
             assert!(error.to_string().contains("pinned"), "{error:?}");
         }
+    }
+
+    // WOR: qwen3-8b/qwen3-14b/etc. are "v1-shaped" builtin catalog entries
+    // (repo, quants, params only, no `variants:`) that cannot produce a
+    // runnable artifact. Before this fix, referencing one from a canonical
+    // deployment or a legacy `serve:` entry passed validation and only
+    // failed at boot, inside `Catalog::resolve_artifact`.
+    #[test]
+    fn canonical_deployment_rejects_a_model_with_no_catalog_v2_variants() {
+        let config = canonical("model: qwen3-14b\n");
+        let error = super::validate_catalog_deployment("local-ai", &config, &Catalog::builtin())
+            .expect_err("qwen3-14b has no variants: entries yet");
+        let message = error.to_string();
+        assert!(
+            message.contains("no complete catalog v2 artifact variant"),
+            "{message}"
+        );
+        assert!(message.contains("qwen2.5-0.5b-instruct"), "{message}");
+        assert!(message.contains("hf:"), "{message}");
+    }
+
+    #[test]
+    fn canonical_deployment_accepts_a_model_with_complete_variants() {
+        let config = canonical("model: qwen2.5-0.5b-instruct\nvariant: q4_k_m\n");
+        super::validate_catalog_deployment("local-ai", &config, &Catalog::builtin())
+            .expect("qwen2.5-0.5b-instruct is the one fully migrated builtin entry");
+    }
+
+    #[test]
+    fn legacy_catalog_entry_rejects_a_model_with_no_catalog_v2_variants() {
+        let entry = first_entry("models:\n  - model: qwen3-14b\n");
+        let error = super::validate_legacy_catalog_entry(&entry, &Catalog::builtin())
+            .expect_err("qwen3-14b has no variants: entries yet");
+        assert!(
+            error
+                .to_string()
+                .contains("no complete catalog v2 artifact variant"),
+            "{error}"
+        );
     }
 }

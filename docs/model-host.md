@@ -726,10 +726,15 @@ seven-day state lifetime expires.
 
 ## Deployment fields
 
-`model` must be a catalog v2 logical ID. `variant` pins one exact artifact.
-Omitting it lets the worker choose a compatible variant, but a deployment with
-more than one replica must pin a variant unless
-`heterogeneous_variants: true` is explicit.
+`model` is a catalog logical ID, but not every catalog id has migrated to
+catalog v2 yet (the exact files, digests, and requirements a worker needs to
+run it); a v1-shaped id has no variant to pin at all. `variant` pins one
+exact artifact on a v2 id. Omitting it lets the worker choose a compatible
+variant, but a deployment with more than one replica must pin a variant
+unless `heterogeneous_variants: true` is explicit. Run `sbproxy validate`
+against your config to confirm a referenced model id has a complete v2
+artifact before deploying; a raw `hf:Org/Repo[:QUANT]` reference bypasses
+catalog migration state entirely.
 
 Pull policy controls cache misses:
 
@@ -800,6 +805,15 @@ Each entry accepts these settings.
 | `swap_space_gib` | CPU KV-cache tier in GiB (vLLM `--swap-space`). |
 | `cpu_offload_gib` | GiB of weights kept in CPU RAM (vLLM `--cpu-offload-gb`). |
 | `reference` | Hosted model this local model displaces, used to price the dollars-saved value report. |
+
+Not every catalog id lists a runnable artifact yet. The catalog is migrating
+entry by entry from a v1 shape (repo, quant names, param count) to v2, which
+pins the exact files, digests, and requirements a worker needs; only a v1
+entry's migration to v2 makes it deployable. `sbproxy validate` rejects a
+deployment referencing a catalog id with no v2 artifact variant, so run it
+against your config before deploying rather than finding out at boot. A
+raw `hf:Org/Repo[:QUANT]` reference bypasses the catalog entirely and works
+regardless of migration state.
 
 Host-wide settings sit on the `serve:` block itself.
 

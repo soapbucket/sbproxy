@@ -124,13 +124,17 @@ fn desired_rejects_a_managed_provider_for_an_undeclared_deployment() {
 
 #[test]
 fn desired_legacy_ids_are_stable_and_equivalent_origins_deduplicate() {
+    // WOR: qwen3-8b/qwen3-14b are incomplete builtin catalog entries (no
+    // `variants:` yet) that config validation now rejects. This test isn't
+    // about catalog completeness, so it uses qwen2.5-0.5b-instruct (the one
+    // fully migrated builtin entry) as a stand-in instead.
     let first = compile_desired_state(
         input(
             None,
             Vec::new(),
             vec![
-                legacy("origin-a", "local", "qwen3-8b"),
-                legacy("origin-b", "local", "qwen3-8b"),
+                legacy("origin-a", "local", "qwen2.5-0.5b-instruct"),
+                legacy("origin-b", "local", "qwen2.5-0.5b-instruct"),
             ],
         ),
         &Catalog::builtin(),
@@ -140,7 +144,7 @@ fn desired_legacy_ids_are_stable_and_equivalent_origins_deduplicate() {
         input(
             None,
             Vec::new(),
-            vec![legacy("origin-a", "local", "qwen3-8b")],
+            vec![legacy("origin-a", "local", "qwen2.5-0.5b-instruct")],
         ),
         &Catalog::builtin(),
     )
@@ -155,13 +159,18 @@ fn desired_legacy_ids_are_stable_and_equivalent_origins_deduplicate() {
 
 #[test]
 fn desired_rejects_conflicting_legacy_routes_instead_of_picking_an_origin() {
+    // WOR: needs two distinct models. qwen2.5-0.5b-instruct is the one
+    // complete builtin entry; a raw hf: reference bypasses catalog
+    // completeness entirely (see docs/model-host.md), so pairing the two
+    // gives a second, genuinely different model without depending on any
+    // other builtin entry's migration state.
     let error = compile_desired_state(
         input(
             None,
             Vec::new(),
             vec![
-                legacy("origin-a", "local", "qwen3-8b"),
-                legacy("origin-b", "local", "qwen3-14b"),
+                legacy("origin-a", "local", "qwen2.5-0.5b-instruct"),
+                legacy("origin-b", "local", "hf:Qwen/Qwen3-14B"),
             ],
         ),
         &Catalog::builtin(),
@@ -176,9 +185,12 @@ fn desired_rejects_conflicting_legacy_routes_instead_of_picking_an_origin() {
 
 #[test]
 fn desired_rejects_conflicting_legacy_host_policies() {
-    let mut first = legacy("origin-a", "local-a", "qwen3-8b");
+    // WOR: see the comment above; qwen2.5-0.5b-instruct + a raw hf:
+    // reference are two distinct models that don't depend on any other
+    // builtin catalog entry being fully migrated.
+    let mut first = legacy("origin-a", "local-a", "qwen2.5-0.5b-instruct");
     first.config.cache_dir = Some("/cache/a".to_string());
-    let mut second = legacy("origin-b", "local-b", "qwen3-14b");
+    let mut second = legacy("origin-b", "local-b", "hf:Qwen/Qwen3-14B");
     second.config.cache_dir = Some("/cache/b".to_string());
 
     let error = compile_desired_state(
@@ -2425,13 +2437,18 @@ async fn manager_honors_legacy_never_eviction_policy() {
         BTreeMap::from([(0, 1)]),
     )
     .unwrap();
+    // WOR: qwen3-8b/qwen3-14b are incomplete builtin catalog entries;
+    // config validation now rejects them. This test is about eviction
+    // admission, not catalog completeness, so it uses the one complete
+    // builtin entry plus a raw hf: reference (which bypasses catalog
+    // completeness entirely) as two distinct stand-in models instead.
     let mut config: ModelHostConfig = serde_yaml::from_str(
         r#"
 eviction: never
 models:
-  - model: qwen3-8b
+  - model: qwen2.5-0.5b-instruct
     name: first
-  - model: qwen3-14b
+  - model: hf:Qwen/Qwen3-14B
     name: second
 "#,
     )
