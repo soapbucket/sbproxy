@@ -34,6 +34,7 @@
 //! timestamps, so retention and grouping are fully deterministic
 //! under test (no clock trait needed).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -46,6 +47,7 @@ const DAILY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("usage_rollups
 
 const HOUR_SECS: u64 = 3_600;
 const DAY_SECS: u64 = 86_400;
+const PROPERTY_TAIL_MAGIC: &[u8; 4] = b"SBP1";
 
 /// Attribution dimensions of one rollup bucket. Empty strings are the
 /// "unattributed" segment, mirroring the attributed metric labels.
@@ -67,6 +69,10 @@ pub struct RollupDims {
     pub api_key_id: String,
     /// Project from the credential's attribution tags.
     pub project: String,
+    /// Explicitly configured, redacted request properties promoted to
+    /// durable dimensions. The configured key set is bounded before
+    /// requests reach this type.
+    pub properties: BTreeMap<String, String>,
 }
 
 /// Closed outcome split for the rollup rows. Maps the wider
@@ -219,7 +225,7 @@ impl RollupAgg {
 }
 
 /// Dimension the query groups buckets by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupBy {
     /// One series per provider.
     Provider,
@@ -235,6 +241,8 @@ pub enum GroupBy {
     Project,
     /// One series per origin hostname.
     Origin,
+    /// One series per value of an explicitly promoted property.
+    Property(String),
     /// A single total series.
     Total,
 }
@@ -251,11 +259,17 @@ impl GroupBy {
             "project" => Self::Project,
             "origin" => Self::Origin,
             "total" | "" => Self::Total,
-            _ => return None,
+            _ => {
+                let key = s.strip_prefix("property:")?;
+                if !crate::capture::is_valid_property_key(key) {
+                    return None;
+                }
+                Self::Property(key.to_string())
+            }
         })
     }
 
-    fn key_of(self, dims: &RollupDims) -> String {
+    fn key_of(&self, dims: &RollupDims) -> String {
         match self {
             Self::Provider => dims.provider.clone(),
             Self::Model => dims.model.clone(),
@@ -264,6 +278,7 @@ impl GroupBy {
             Self::ApiKey => dims.api_key_id.clone(),
             Self::Project => dims.project.clone(),
             Self::Origin => dims.origin.clone(),
+            Self::Property(key) => dims.properties.get(key).cloned().unwrap_or_default(),
             Self::Total => String::new(),
         }
     }
@@ -302,6 +317,8 @@ pub struct RollupQueryResult {
     pub buckets: Vec<RollupBucket>,
     /// Totals across the window.
     pub totals: RollupTotals,
+    /// Promoted property keys present in rows in this window.
+    pub property_keys: Vec<String>,
 }
 
 /// Window totals for a query.
@@ -333,7 +350,13 @@ fn encode_key(bucket_start: u64, dims: &RollupDims) -> Vec<u8> {
             + dims.team.len()
             + dims.api_key_id.len()
             + dims.project.len()
-            + dims.origin.len(),
+            + dims.origin.len()
+            + dims
+                .properties
+                .iter()
+                .map(|(key, value)| 4 + key.len() + value.len())
+                .sum::<usize>()
+            + if dims.properties.is_empty() { 0 } else { 5 },
     );
     key.extend_from_slice(&bucket_start.to_be_bytes());
     // `origin` is encoded LAST so rows written before the dimension
@@ -351,6 +374,21 @@ fn encode_key(bucket_start: u64, dims: &RollupDims) -> Vec<u8> {
         let len = u16::try_from(part.len()).unwrap_or(u16::MAX);
         key.extend_from_slice(&len.to_be_bytes());
         key.extend_from_slice(&part.as_bytes()[..usize::from(len).min(part.len())]);
+    }
+    // Append promoted properties after every legacy dimension. Older
+    // binaries stop decoding after origin and safely ignore this tail.
+    // Empty property maps preserve the exact historical key encoding.
+    if !dims.properties.is_empty() {
+        key.extend_from_slice(PROPERTY_TAIL_MAGIC);
+        let count = u8::try_from(dims.properties.len()).unwrap_or(u8::MAX);
+        key.push(count);
+        for (property_key, value) in dims.properties.iter().take(usize::from(count)) {
+            for part in [property_key, value] {
+                let len = u16::try_from(part.len()).unwrap_or(u16::MAX);
+                key.extend_from_slice(&len.to_be_bytes());
+                key.extend_from_slice(&part.as_bytes()[..usize::from(len).min(part.len())]);
+            }
+        }
     }
     key
 }
@@ -390,6 +428,40 @@ fn decode_key(key: &[u8]) -> Option<(u64, RollupDims)> {
         cursor += 2;
         if key.len() >= cursor + len {
             dims.origin = String::from_utf8_lossy(&key[cursor..cursor + len]).into_owned();
+            cursor += len;
+        }
+    }
+    // A corrupt or partially written property tail must not hide the
+    // legacy dimensions. Decode into a temporary map and publish it
+    // only after the complete tail validates.
+    if key.get(cursor..cursor + PROPERTY_TAIL_MAGIC.len()) == Some(PROPERTY_TAIL_MAGIC) {
+        let mut property_cursor = cursor + PROPERTY_TAIL_MAGIC.len();
+        let parsed = (|| -> Option<BTreeMap<String, String>> {
+            let count = usize::from(*key.get(property_cursor)?);
+            property_cursor += 1;
+            let mut properties = BTreeMap::new();
+            for _ in 0..count {
+                let mut read_part = || -> Option<String> {
+                    let len_bytes = key.get(property_cursor..property_cursor + 2)?;
+                    let len = usize::from(u16::from_be_bytes([len_bytes[0], len_bytes[1]]));
+                    property_cursor += 2;
+                    let bytes = key.get(property_cursor..property_cursor + len)?;
+                    property_cursor += len;
+                    std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+                };
+                let property_key = read_part()?;
+                if !crate::capture::is_valid_property_key(&property_key) {
+                    return None;
+                }
+                let value = read_part()?;
+                if properties.insert(property_key, value).is_some() {
+                    return None;
+                }
+            }
+            (property_cursor == key.len()).then_some(properties)
+        })();
+        if let Some(properties) = parsed {
+            dims.properties = properties;
         }
     }
     Some((ts, dims))
@@ -464,8 +536,8 @@ impl RollupStore {
         let from_aligned = from_secs - (from_secs % bucket_secs);
         let lo = from_aligned.to_be_bytes().to_vec();
         let hi = to_secs.to_be_bytes().to_vec();
-        let mut grouped: std::collections::BTreeMap<(u64, String), RollupAgg> =
-            std::collections::BTreeMap::new();
+        let mut grouped: BTreeMap<(u64, String), RollupAgg> = BTreeMap::new();
+        let mut property_keys = BTreeSet::new();
         let mut totals = RollupAgg::default();
         for row in table.range(lo.as_slice()..hi.as_slice())? {
             let (k, v) = row?;
@@ -474,6 +546,7 @@ impl RollupStore {
             };
             let agg = RollupAgg::decode(v.value());
             totals.merge(&agg);
+            property_keys.extend(dims.properties.keys().cloned());
             grouped
                 .entry((ts, group_by.key_of(&dims)))
                 .or_default()
@@ -505,6 +578,7 @@ impl RollupStore {
                 blocked: totals.blocked,
                 error: totals.error,
             },
+            property_keys: property_keys.into_iter().collect(),
         })
     }
 
@@ -706,6 +780,7 @@ mod tests {
             team: team.to_string(),
             api_key_id: "sk_1".to_string(),
             project: "p1".to_string(),
+            properties: BTreeMap::new(),
         }
     }
 
@@ -738,6 +813,83 @@ mod tests {
         assert_eq!(GroupBy::parse("origin"), Some(GroupBy::Origin));
         let d = dims("openai", "gpt-4o", "growth");
         assert_eq!(GroupBy::Origin.key_of(&d), "ai.example");
+    }
+
+    #[test]
+    fn property_dimensions_round_trip_and_keep_the_legacy_key_prefix() {
+        let legacy = dims("openai", "gpt-4o", "growth");
+        let legacy_key = encode_key(3600, &legacy);
+        let mut promoted = legacy.clone();
+        promoted
+            .properties
+            .insert("feature".to_string(), "assistant".to_string());
+        promoted
+            .properties
+            .insert("tier".to_string(), "gold".to_string());
+
+        let key = encode_key(3600, &promoted);
+        assert!(key.starts_with(&legacy_key));
+        let (ts, decoded) = decode_key(&key).expect("property key decodes");
+        assert_eq!(ts, 3600);
+        assert_eq!(decoded, promoted);
+    }
+
+    #[test]
+    fn malformed_property_tail_does_not_hide_legacy_dimensions() {
+        let expected = dims("openai", "gpt-4o", "growth");
+        let mut key = encode_key(3600, &expected);
+        key.extend_from_slice(b"SBP1\x01\x00");
+
+        let (_, decoded) = decode_key(&key).expect("legacy dimensions still decode");
+        assert_eq!(decoded, expected);
+        assert!(decoded.properties.is_empty());
+    }
+
+    #[test]
+    fn group_by_property_parses_and_groups() {
+        let mut d = dims("openai", "gpt-4o", "growth");
+        d.properties
+            .insert("feature".to_string(), "assistant".to_string());
+        let group = GroupBy::parse("property:feature").expect("property group parses");
+        assert_eq!(group, GroupBy::Property("feature".to_string()));
+        assert_eq!(group.key_of(&d), "assistant");
+        assert!(GroupBy::parse("property:").is_none());
+        assert!(GroupBy::parse("property:bad.key").is_none());
+    }
+
+    #[test]
+    fn query_groups_by_property_and_reports_available_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RollupStore::open(&dir.path().join("r.redb")).unwrap();
+        let t0 = 1_700_000_400;
+        let mut assistant = dims("openai", "gpt-4o", "growth");
+        assistant
+            .properties
+            .insert("feature".to_string(), "assistant".to_string());
+        let mut search = dims("openai", "gpt-4o", "growth");
+        search
+            .properties
+            .insert("feature".to_string(), "search".to_string());
+        search
+            .properties
+            .insert("tier".to_string(), "gold".to_string());
+        store
+            .fold(&[usage(t0, assistant, 5, 2, 7), usage(t0, search, 3, 1, 4)])
+            .unwrap();
+
+        let result = store
+            .query(
+                t0 - 1,
+                t0 + HOUR_SECS,
+                GroupBy::Property("feature".to_string()),
+                t0,
+                90 * DAY_SECS,
+            )
+            .unwrap();
+        assert_eq!(result.property_keys, ["feature", "tier"]);
+        assert_eq!(result.buckets.len(), 2);
+        assert!(result.buckets.iter().any(|b| b.group == "assistant"));
+        assert!(result.buckets.iter().any(|b| b.group == "search"));
     }
 
     fn usage(ts: u64, d: RollupDims, tin: u64, tout: u64, cost: u64) -> RollupEvent {

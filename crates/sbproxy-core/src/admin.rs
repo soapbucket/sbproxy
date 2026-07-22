@@ -2241,8 +2241,7 @@ fn windowed_spend_response(
         return (
             400,
             "application/json",
-            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|total)"}"#
-                .to_string(),
+            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|origin|property:<key>|total)"}"#.to_string(),
         );
     };
     let window_secs = match window {
@@ -2295,6 +2294,7 @@ fn windowed_spend_response(
                 "bucket_secs": res.bucket_secs,
                 "buckets": res.buckets,
                 "totals": res.totals,
+                "property_keys": res.property_keys,
             })
             .to_string();
             (200, "application/json", body)
@@ -3875,6 +3875,10 @@ mod tests {
                     team: "growth".to_string(),
                     api_key_id: "sk1".to_string(),
                     project: "p".to_string(),
+                    properties: std::collections::BTreeMap::from([(
+                        "feature".to_string(),
+                        "assistant".to_string(),
+                    )]),
                 },
                 kind: sbproxy_observe::usage_rollup::RollupKind::Usage {
                     tokens_in: 5,
@@ -3897,6 +3901,14 @@ mod tests {
         assert_eq!(v["totals"]["cost_usd_micros"], 42);
         assert_eq!(v["totals"]["tokens_in"], 5);
         assert_eq!(v["buckets"][0]["group"], "gpt-4o");
+
+        let (code, _, body) =
+            windowed_spend_response(Some("24h"), Some("property:feature"), None, None);
+        assert_eq!(code, 200, "property-grouped spend must serve: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["group_by"], "property:feature");
+        assert_eq!(v["property_keys"], serde_json::json!(["feature"]));
+        assert_eq!(v["buckets"][0]["group"], "assistant");
     }
 
     #[test]

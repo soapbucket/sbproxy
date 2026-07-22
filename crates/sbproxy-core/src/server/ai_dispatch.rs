@@ -1571,6 +1571,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
+            &ctx.rollup_properties,
             &ai_span,
         );
         return relay_ai_response(
@@ -1711,6 +1712,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
+            &ctx.rollup_properties,
             &ai_span,
         );
         // WOR-1044 PR3: the GET-method-aware path runs before the
@@ -2141,6 +2143,7 @@ pub(super) async fn handle_ai_proxy(
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
+                &ctx.rollup_properties,
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -2168,6 +2171,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
+            &ctx.rollup_properties,
             &ai_span,
         );
         record_ai_provider_response_failure(
@@ -4075,6 +4079,7 @@ pub(super) async fn handle_ai_proxy(
                         &ctx.attribution_tags,
                         ctx.tenant_id.as_str(),
                         ctx.principal.api_key_id(),
+                        &ctx.rollup_properties,
                         &ai_span,
                     );
                     // Drop any idempotency capture: cascade does not
@@ -4894,6 +4899,7 @@ pub(super) async fn handle_ai_proxy(
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
                 api_key_id: ctx.principal.api_key_id().to_string(),
+                rollup_properties: ctx.rollup_properties.clone(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let stream_router_sink = RouterTokenSink {
@@ -4988,6 +4994,7 @@ pub(super) async fn handle_ai_proxy(
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
                 api_key_id: ctx.principal.api_key_id().to_string(),
+                rollup_properties: ctx.rollup_properties.clone(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let cache_router_sink = RouterTokenSink {
@@ -5817,6 +5824,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 &args.attribution_tags,
                 args.tenant_id.as_str(),
                 args.api_key_id.as_str(),
+                &args.rollup_properties,
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -5878,6 +5886,7 @@ pub(super) async fn relay_ai_response_with_cache(
                     &ctx.attribution_tags,
                     ctx.tenant_id.as_str(),
                     ctx.principal.api_key_id(),
+                    &ctx.rollup_properties,
                     &ai_span,
                 );
                 if cost_micros > 0 {
@@ -6280,6 +6289,9 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// metric without borrowing the request context. Empty string when
     /// the request was not credentialed.
     api_key_id: String,
+    /// Bounded, redacted custom properties explicitly promoted for
+    /// durable spend grouping by the matched origin.
+    rollup_properties: std::collections::BTreeMap<String, String>,
     /// WOR-1146: estimated prompt tokens for a chat_completions
     /// request, captured from the request body at dispatch. Used only
     /// as the prompt side of the fallback budget debit when a 2xx
@@ -7268,6 +7280,7 @@ pub(super) async fn relay_ai_stream(
                     &args.attribution_tags,
                     args.tenant_id.as_str(),
                     args.api_key_id.as_str(),
+                    &args.rollup_properties,
                     &ai_span,
                 );
                 // WOR-1835: governed-key settlement. `ai_admission` never

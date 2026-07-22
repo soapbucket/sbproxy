@@ -587,6 +587,9 @@ pub struct RequestContext {
     /// Caller-supplied custom properties from `X-Sb-Property-*`
     /// headers. Cardinality-capped, allowlist-checked, redaction-applied.
     pub properties: BTreeMap<String, String>,
+    /// Redacted subset of [`Self::properties`] explicitly promoted by
+    /// the origin's bounded `properties.rollup_keys` configuration.
+    pub rollup_properties: BTreeMap<String, String>,
     /// Session identifier (caller-supplied or auto-generated for
     /// anonymous traffic per `SessionsConfig::auto_generate`).
     pub session_id: Option<Ulid>,
@@ -1213,6 +1216,7 @@ impl RequestContext {
             classifier_intent: None,
             classifier_extensions: HashMap::new(),
             properties: BTreeMap::new(),
+            rollup_properties: BTreeMap::new(),
             session_id: None,
             parent_session_id: None,
             user_id: None,

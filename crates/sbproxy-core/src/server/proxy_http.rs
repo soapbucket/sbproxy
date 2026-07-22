@@ -4162,6 +4162,7 @@ impl ProxyHttp for SbProxy {
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
+                &ctx.rollup_properties,
                 &span,
             );
             info!(
@@ -4392,6 +4393,7 @@ impl ProxyHttp for SbProxy {
                         team: ctx.attribution_tags.team.clone().unwrap_or_default(),
                         api_key_id: ctx.principal.api_key_id().to_string(),
                         project: ctx.attribution_tags.project.clone().unwrap_or_default(),
+                        properties: ctx.rollup_properties.clone(),
                     },
                     kind: sbproxy_observe::usage_rollup::RollupKind::Outcome(
                         sbproxy_observe::usage_rollup::RollupOutcome::from_outcome_label(outcome),
