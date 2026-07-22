@@ -172,6 +172,7 @@ async fn cascade_below_threshold_falls_through_to_next_tier() {
     assert_eq!(out.tier_index, 1);
     assert_eq!(out.provider_name, "smart");
     assert_eq!(out.model, "smart-model");
+    assert_eq!(out.attempted_providers, ["cheap", "smart"]);
     let body: serde_json::Value = serde_json::from_slice(&out.body).expect("json");
     assert_eq!(
         body["choices"][0]["message"]["content"].as_str().unwrap(),
@@ -230,6 +231,7 @@ async fn cascade_above_threshold_short_circuits() {
     assert!(out.accepted);
     assert_eq!(out.tier_index, 0);
     assert_eq!(out.provider_name, "cheap");
+    assert_eq!(out.attempted_providers, ["cheap"]);
     let after = cascade_tier_outcome_value(0, "accepted");
     assert!(after > before, "tier 0 accepted counter should have ticked");
 }
