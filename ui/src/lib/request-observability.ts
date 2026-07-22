@@ -345,7 +345,7 @@ export function requestMatchesFilters(
   }
   if (filters.origin && request.origin !== filters.origin) return false;
   if (filters.sessionId && request.session_id !== filters.sessionId) return false;
-  if (filters.path && !pathOf(request).toLowerCase().includes(filters.path.toLowerCase())) {
+  if (filters.path && !pathOf(request).includes(filters.path)) {
     return false;
   }
   if (filters.status) {

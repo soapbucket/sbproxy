@@ -214,7 +214,7 @@ pub struct RequestContext {
     pub admin_last_ai_provider: Option<String>,
     /// Closed generic load-balancer or AI router strategy name.
     pub admin_load_balancer_strategy: Option<String>,
-    /// Selected generic host:port or initial AI provider.
+    /// Selected generic host:port or latest attempted AI provider.
     pub admin_load_balancer_target: Option<String>,
 
     // --- Concurrent limit guards ---
@@ -1104,6 +1104,7 @@ impl RequestContext {
                 self.admin_failover_to = Some(provider.to_string());
             }
         }
+        self.admin_load_balancer_target = Some(provider.to_string());
         self.admin_last_ai_provider = Some(provider.to_string());
         self.admin_ai_attempts = self.admin_ai_attempts.saturating_add(1);
     }
@@ -1397,6 +1398,7 @@ mod tests {
         assert!(ctx.admin_failover_engaged());
         assert_eq!(ctx.admin_failover_from.as_deref(), Some("openai"));
         assert_eq!(ctx.admin_failover_to.as_deref(), Some("bedrock"));
+        assert_eq!(ctx.admin_load_balancer_target.as_deref(), Some("bedrock"));
 
         ctx.retry_count = 4;
         assert_eq!(ctx.admin_retry_count(), 4);

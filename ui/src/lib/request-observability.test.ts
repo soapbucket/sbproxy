@@ -162,6 +162,7 @@ describe("requestMatchesFilters", () => {
       }),
     ).toBe(true);
     expect(requestMatchesFilters(request, { retried: false })).toBe(false);
+    expect(requestMatchesFilters(request, { path: "CHAT" })).toBe(false);
   });
 });
 

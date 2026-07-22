@@ -1628,9 +1628,8 @@ fn rl_query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-/// Decode one application/x-www-form-urlencoded query value. This is used for
-/// property values because custom dimensions commonly contain spaces and
-/// punctuation that browser clients percent-encode.
+/// Decode one application/x-www-form-urlencoded query value. Browser clients
+/// percent-encode path separators, spaces, and custom-dimension punctuation.
 fn decoded_query_param(path: &str, key: &str) -> Option<String> {
     let query = path.split_once('?')?.1;
     url::form_urlencoded::parse(query.as_bytes())
@@ -1943,11 +1942,11 @@ pub fn handle_admin_request(
     // `offset`, `limit`. No params returns the newest entries, unchanged.
     if path_only == "/api/requests" {
         let status = rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok());
-        let method_f = rl_query_param(path, "method");
-        let path_f = rl_query_param(path, "path");
+        let method_f = decoded_query_param(path, "method");
+        let path_f = decoded_query_param(path, "path");
         // WOR-1874: guardrail-column filters.
-        let guardrail_action_f = rl_query_param(path, "guardrail_action");
-        let guardrail_category_f = rl_query_param(path, "guardrail_category");
+        let guardrail_action_f = decoded_query_param(path, "guardrail_action");
+        let guardrail_category_f = decoded_query_param(path, "guardrail_category");
         let cache_status_f = decoded_query_param(path, "cache_status");
         if cache_status_f
             .as_deref()
@@ -1992,10 +1991,10 @@ pub fn handle_admin_request(
         let entries = state.query_requests(
             &RequestLogFilter {
                 status,
-                method: method_f,
-                path_sub: path_f,
-                guardrail_action: guardrail_action_f,
-                guardrail_category: guardrail_category_f,
+                method: method_f.as_deref(),
+                path_sub: path_f.as_deref(),
+                guardrail_action: guardrail_action_f.as_deref(),
+                guardrail_category: guardrail_category_f.as_deref(),
                 cache_status: cache_status_f.as_deref(),
                 retried: retried_f,
                 property_key: property_key_f.as_deref(),
@@ -3945,6 +3944,34 @@ mod tests {
             let (status, _, body) = handle_admin_request("GET", path, &state, Some(&auth), None);
             assert_eq!(status, 400, "invalid filter must fail: {path}: {body}");
         }
+    }
+
+    #[test]
+    fn requests_endpoint_decodes_path_filters_before_matching() {
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat?stream=true".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            ..Default::default()
+        });
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests?path=%2Fv1%2Fchat%3Fstream%3Dtrue",
+            &state,
+            Some(&auth),
+            None,
+        );
+
+        assert_eq!(status, 200, "encoded path filter must succeed: {body}");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rows.as_array().map(Vec::len), Some(1));
     }
 
     #[test]
