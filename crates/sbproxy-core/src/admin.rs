@@ -2050,11 +2050,16 @@ pub fn handle_admin_request(
     // legacy shape (process-lifetime counter totals) is unchanged.
     if path_only == "/api/usage/spend" {
         let window = rl_query_param(path, "window");
-        let group_by = rl_query_param(path, "group_by");
+        // `group_by` is the one spend parameter whose values carry
+        // punctuation: a promoted property reads `property:<key>`, and
+        // every standards-compliant client percent-encodes the colon.
+        // Decode before parsing so `property%3Afeature` and
+        // `property:feature` select the same dimension.
+        let group_by = decoded_query_param(path, "group_by");
         let from_p = rl_query_param(path, "from").and_then(|s| s.parse::<u64>().ok());
         let to_p = rl_query_param(path, "to").and_then(|s| s.parse::<u64>().ok());
         if window.is_some() || group_by.is_some() || from_p.is_some() || to_p.is_some() {
-            return windowed_spend_response(window, group_by, from_p, to_p);
+            return windowed_spend_response(window, group_by.as_deref(), from_p, to_p);
         }
         let snap = sbproxy_observe::metrics::metrics().snapshot_named(&[
             "sbproxy_tokens_attributed_total",
@@ -3972,6 +3977,27 @@ mod tests {
         assert_eq!(status, 200, "encoded path filter must succeed: {body}");
         let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn spend_group_by_accepts_a_percent_encoded_property_dimension() {
+        // A promoted property reads `property:<key>`, and every
+        // standards-compliant client percent-encodes the colon. Reading
+        // the raw query value made `property%3Afeature` a 400 while the
+        // admin UI's own dropdown emitted exactly that form.
+        let encoded = decoded_query_param(
+            "/api/usage/spend?window=24h&group_by=property%3Afeature",
+            "group_by",
+        );
+        assert_eq!(encoded.as_deref(), Some("property:feature"));
+        assert!(
+            sbproxy_observe::usage_rollup::GroupBy::parse(encoded.as_deref().unwrap()).is_some(),
+            "the decoded dimension must parse"
+        );
+
+        // The raw form keeps working for hand-written curl calls.
+        let raw = decoded_query_param("/api/usage/spend?group_by=property:feature", "group_by");
+        assert_eq!(raw.as_deref(), Some("property:feature"));
     }
 
     #[test]

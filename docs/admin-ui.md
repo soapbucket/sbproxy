@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-07-21*
+*Last modified: 2026-07-22*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -156,7 +156,7 @@ per-target health, and a raw config editor.
 
 ## Logs (`/logs`)
 
-![The Logs page: recent requests with method, path, status, and duration, plus a tracing-level control](assets/admin-logs.png)
+![The Logs page: requests with a Gateway decision column reading cache, routing, and guardrail outcomes, two custom-property columns, and the filter bar](assets/admin-logs.png)
 
 The queryable view over the recent-request ring buffer, with a live
 tail and a runtime log-level control.
@@ -210,6 +210,8 @@ restart at any step:
 
 ## Sessions (`/sessions`, `/sessions/:sessionId`)
 
+![The session index: rollup tiles over the ring, then one row per session with child sessions indented under their parent](assets/admin-sessions.png)
+
 Recent logical interactions reconstructed entirely from the request ring.
 
 - **Shows:** `GET /api/requests`, grouped by `session_id` and linked by
@@ -219,9 +221,34 @@ Recent logical interactions reconstructed entirely from the request ring.
   request and trace IDs, and links to a parent or child that remains in the
   ring.
 - **Mutations:** none. "Open in Logs" applies the exact session filter there.
+![A session detail page: child links, rollup tiles, and a numbered call chain where each call shows its gateway decision rail, IDs, AI route, tokens, and property chips](assets/admin-session-detail.png)
+
 - **Retention boundary:** this is not durable trace storage, a span waterfall,
   or replay. A restart or request-ring eviction can remove some or all of a
   session, and the UI labels parents that fall outside the current ring.
+
+### Attributing a spike to a customer
+
+The observability surfaces compose into one attribution loop. Send
+`X-Sb-Session-Id` (and `X-Sb-Parent-Session-Id` for a sub-agent) plus any
+`X-Sb-Property-*` headers your callers can supply, then:
+
+1. **Spend** shows the money. Group the window by a promoted property
+   (`Property: feature`) to see which product surface moved, or by origin
+   for which tenant.
+2. **Logs** shows the requests behind it. Filter by that exact property key
+   and value, and read the Gateway column: a run of `cache miss` where you
+   expected hits, or `fallback chain` engaging, explains a cost or latency
+   change without opening a single body.
+3. **Sessions** shows the shape of the work. One agent task is usually many
+   calls; the index ranks sessions by cost and duration, and a detail page
+   reads the call chain oldest first with each call's gateway decisions.
+4. **Alerts** shows whether anyone was told. Rule state and channel delivery
+   health answer "should this have paged us, and did it?"
+
+Only properties listed in the origin's `properties.rollup_keys` become
+durable spend dimensions; every captured property stays filterable in Logs
+for the life of the ring. Redacted keys show as `[redacted]` everywhere.
 
 ## Metrics (`/metrics`)
 
@@ -267,7 +294,7 @@ and remains the source of truth.
 
 ## Spend (`/spend`)
 
-![Spend: windowed history with group-by, live totals, and per-model breakdowns](assets/admin-spend.png)
+![Spend: the window grouped by a promoted custom property, with per-model, per-provider, and per-origin breakdowns below](assets/admin-spend.png)
 
 Estimated AI cost: live totals since process start, plus durable
 windowed history.
@@ -331,6 +358,8 @@ blocked, and what wasted spend the gateway flagged.
 
 ## Alerts (`/alerts`)
 
+![The Alerts page: rule evaluation state, one healthy and one failing channel with its delivery error, and the test-event history](assets/admin-alerts.png)
+
 Read-only alert operations over the runtime installed from `sb.yml`.
 
 - **Shows:** `GET /api/alerts`: built-in rules with thresholds, current
@@ -346,7 +375,10 @@ Read-only alert operations over the runtime installed from `sb.yml`.
   remains inactive below 10 attempts in an evaluation window.
 - **Empty/error notes:** no `proxy.alerting` block renders a disabled state;
   an enabled runtime with no channels keeps tests unavailable; no history is a
-  normal process-lifetime empty state.
+  normal process-lifetime empty state. A webhook channel pointed at a private
+  or loopback address reports `failing` with "target rejected by SSRF policy":
+  the delivery path enforces the same egress guard as the rest of the proxy, so
+  test a local receiver through a routable address.
 
 ## Prompts (`/prompts`)
 

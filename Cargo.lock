@@ -8306,7 +8306,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy"
-version = "1.6.2"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -8529,7 +8529,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-core"
-version = "1.6.2"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -8924,7 +8924,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-observe"
-version = "1.6.2"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
