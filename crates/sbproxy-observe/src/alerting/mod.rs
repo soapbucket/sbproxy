@@ -66,8 +66,7 @@ pub fn has_alerting_config() -> bool {
     RESOLVED_CHANNELS.get().is_some()
 }
 
-/// Whether any alert channel was installed at boot. Lets core skip building a
-/// dispatcher and spawning the loop when alerting is not configured.
+/// Whether at least one alert channel was installed at boot.
 pub fn has_configured_channels() -> bool {
     RESOLVED_CHANNELS.get().is_some_and(|c| !c.is_empty())
 }
