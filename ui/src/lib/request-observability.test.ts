@@ -5,7 +5,9 @@ import {
   buildSessionForest,
   discoverPropertyKeys,
   gatewayBadges,
+  logGroups,
   matchesProperty,
+  restorePropertyColumns,
   requestMatchesFilters,
   sessionCallChain,
   worstStatus,
@@ -191,6 +193,42 @@ describe("gatewayBadges", () => {
   it("marks legacy rows neutrally instead of inventing a gateway outcome", () => {
     expect(gatewayBadges(row())).toEqual([
       { kind: "legacy", label: "gateway data unavailable", tone: "neutral" },
+    ]);
+  });
+});
+
+describe("Logs presentation state", () => {
+  it("restores only available, unique property columns", () => {
+    expect(
+      restorePropertyColumns(
+        ["feature", "region", "tier"],
+        '["tier","missing","tier","feature"]',
+      ),
+    ).toEqual(["tier", "feature"]);
+    expect(restorePropertyColumns(["tier"], "not-json")).toEqual([]);
+  });
+
+  it("switches between one request ledger and session sections", () => {
+    const requests = [
+      row({ request_id: "child", session_id: "child", parent_session_id: "root" }),
+      row({ request_id: "root", session_id: "root" }),
+      row({ request_id: "none", session_id: undefined }),
+    ];
+
+    expect(logGroups(requests, false)).toMatchObject([
+      { key: "all", kind: "all", depth: 0, requests },
+    ]);
+    expect(
+      logGroups(requests, true).map((group) => [
+        group.kind,
+        group.key,
+        group.depth,
+        group.requests[0]?.request_id,
+      ]),
+    ).toEqual([
+      ["session", "root", 0, "root"],
+      ["session", "child", 1, "child"],
+      ["ungrouped", "ungrouped", 0, "none"],
     ]);
   });
 });

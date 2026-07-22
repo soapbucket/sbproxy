@@ -32,6 +32,14 @@ export interface SessionForest {
   byId: Map<string, SessionSummary>;
 }
 
+export interface LogGroup {
+  key: string;
+  kind: "all" | "session" | "orphan" | "ungrouped";
+  depth: number;
+  requests: RequestLog[];
+  session?: SessionSummary;
+}
+
 function finiteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
@@ -245,6 +253,58 @@ export function discoverPropertyKeys(requests: readonly RequestLog[]): string[] 
   return [...keys].sort();
 }
 
+export function restorePropertyColumns(
+  available: readonly string[],
+  persisted: string | null,
+): string[] {
+  if (!persisted) return [];
+  try {
+    const parsed: unknown = JSON.parse(persisted);
+    if (!Array.isArray(parsed)) return [];
+    const allowed = new Set(available);
+    const selected = new Set<string>();
+    for (const key of parsed) {
+      if (typeof key === "string" && allowed.has(key)) selected.add(key);
+    }
+    return [...selected];
+  } catch {
+    return [];
+  }
+}
+
+export function logGroups(
+  requests: readonly RequestLog[],
+  groupBySession: boolean,
+): LogGroup[] {
+  if (!groupBySession) {
+    return [{ key: "all", kind: "all", depth: 0, requests: [...requests] }];
+  }
+
+  const forest = buildSessionForest(requests);
+  const groups: LogGroup[] = [];
+  const append = (session: SessionSummary, depth: number, kind: "session" | "orphan") => {
+    groups.push({
+      key: session.sessionId,
+      kind,
+      depth,
+      requests: session.requests,
+      session,
+    });
+    session.children.forEach((child) => append(child, depth + 1, "session"));
+  };
+  forest.roots.forEach((session) => append(session, 0, "session"));
+  forest.orphans.forEach((session) => append(session, 0, "orphan"));
+  if (forest.ungrouped.length) {
+    groups.push({
+      key: "ungrouped",
+      kind: "ungrouped",
+      depth: 0,
+      requests: [...forest.ungrouped],
+    });
+  }
+  return groups;
+}
+
 export function matchesProperty(
   request: RequestLog,
   key: string,
@@ -268,6 +328,7 @@ export function requestMatchesFilters(
     return false;
   }
   if (filters.origin && request.origin !== filters.origin) return false;
+  if (filters.sessionId && request.session_id !== filters.sessionId) return false;
   if (filters.path && !pathOf(request).toLowerCase().includes(filters.path.toLowerCase())) {
     return false;
   }

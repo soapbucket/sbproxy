@@ -67,7 +67,9 @@ const prefixSupported = computed(() => !!status.value?.prefix_purge_supported);
 const cacheHits = computed(() => {
   const fam = cacheResultsFamily.value;
   if (!fam) return { hits: 0, misses: 0 };
-  const scope = selectedOrigin.value ? { origin: selectedOrigin.value } : {};
+  const scope: Record<string, string> = selectedOrigin.value
+    ? { origin: selectedOrigin.value }
+    : {};
   return {
     hits: sumSamples(fam, { result: "hit", ...scope }),
     misses: sumSamples(fam, { result: "miss", ...scope }),

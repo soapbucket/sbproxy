@@ -1635,6 +1635,7 @@ export interface RequestFilters {
   status?: string;
   path?: string;
   origin?: string;
+  sessionId?: string;
   guardrailAction?: string;
   guardrailCategory?: string;
   cacheStatus?: string;
