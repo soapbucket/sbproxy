@@ -526,7 +526,10 @@ function detailFields(request: RequestLog): DetailField[] {
                 <span class="session-rail" aria-hidden="true" />
                 <RouterLink
                   class="session-id sb-mono"
-                  :to="`/sessions/${encodeURIComponent(group.session.sessionId)}`"
+                  :to="{
+                    name: 'session-detail',
+                    params: { sessionId: group.session.sessionId },
+                  }"
                 >
                   {{ group.session.sessionId }}
                 </RouterLink>

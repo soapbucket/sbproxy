@@ -1,4 +1,4 @@
-import { createRouter, createWebHistory } from "vue-router";
+import { createMemoryHistory, createRouter, createWebHistory } from "vue-router";
 
 const routes = [
   {
@@ -30,6 +30,18 @@ const routes = [
     name: "logs",
     component: () => import("./views/LogsView.vue"),
     meta: { title: "Logs" },
+  },
+  {
+    path: "/sessions",
+    name: "sessions",
+    component: () => import("./views/SessionsView.vue"),
+    meta: { title: "Sessions" },
+  },
+  {
+    path: "/sessions/:sessionId",
+    name: "session-detail",
+    component: () => import("./views/SessionDetailView.vue"),
+    meta: { title: "Session detail" },
   },
   {
     path: "/metrics",
@@ -103,6 +115,9 @@ const routes = [
 // History mode with the `/admin/ui/` base. The admin server does SPA
 // fallback to index.html so refreshing a deep link resolves.
 export const router = createRouter({
-  history: createWebHistory("/admin/ui/"),
+  history:
+    import.meta.env.MODE === "test"
+      ? createMemoryHistory("/admin/ui/")
+      : createWebHistory("/admin/ui/"),
   routes,
 });

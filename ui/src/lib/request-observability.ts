@@ -8,6 +8,18 @@ export interface GatewayBadge {
   tone: BadgeTone;
 }
 
+export interface RequestRollup {
+  requestCount: number;
+  tokensIn: number;
+  tokensOut: number;
+  totalTokens: number;
+  costUsdMicros: number;
+  wallClockMs: number;
+  worstStatus?: number;
+  startedAt?: string;
+  endedAt?: string;
+}
+
 export interface SessionSummary {
   sessionId: string;
   parentSessionId?: string;
@@ -93,42 +105,46 @@ function safeCount(value: unknown): number {
   return number !== undefined && number > 0 ? number : 0;
 }
 
-function sessionSummary(sessionId: string, requests: RequestLog[]): SessionSummary {
+export function rollupRequests(requests: readonly RequestLog[]): RequestRollup {
   const timed = requests
     .map((request) => {
       const start = timestampMillis(request);
       if (start === undefined) return undefined;
-      return {
-        start,
-        end: start + (durationOf(request) ?? 0),
-        raw: String(timestampOf(request)),
-      };
+      return { start, end: start + (durationOf(request) ?? 0) };
     })
     .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
   const started = timed.length ? Math.min(...timed.map((entry) => entry.start)) : undefined;
   const ended = timed.length ? Math.max(...timed.map((entry) => entry.end)) : undefined;
+  const tokensIn = requests.reduce(
+    (total, request) => total + safeCount(request.tokens_in),
+    0,
+  );
+  const tokensOut = requests.reduce(
+    (total, request) => total + safeCount(request.tokens_out),
+    0,
+  );
 
   return {
-    sessionId,
-    requests: sessionCallChain(requests, sessionId),
     requestCount: requests.length,
-    tokensIn: requests.reduce((total, request) => total + safeCount(request.tokens_in), 0),
-    tokensOut: requests.reduce((total, request) => total + safeCount(request.tokens_out), 0),
-    totalTokens: requests.reduce(
-      (total, request) =>
-        total + safeCount(request.tokens_in) + safeCount(request.tokens_out),
-      0,
-    ),
+    tokensIn,
+    tokensOut,
+    totalTokens: tokensIn + tokensOut,
     costUsdMicros: requests.reduce(
       (total, request) => total + safeCount(request.cost_usd_micros),
       0,
     ),
     wallClockMs: started !== undefined && ended !== undefined ? ended - started : 0,
     worstStatus: worstStatus(requests),
-    ...(started !== undefined
-      ? { startedAt: new Date(started).toISOString() }
-      : {}),
+    ...(started !== undefined ? { startedAt: new Date(started).toISOString() } : {}),
     ...(ended !== undefined ? { endedAt: new Date(ended).toISOString() } : {}),
+  };
+}
+
+function sessionSummary(sessionId: string, requests: RequestLog[]): SessionSummary {
+  return {
+    sessionId,
+    requests: sessionCallChain(requests, sessionId),
+    ...rollupRequests(requests),
     orphaned: false,
     children: [],
   };
