@@ -1609,6 +1609,16 @@ export interface RequestLog {
   // WOR-1874 correlation + AI columns on the ring entry.
   request_id?: string;
   trace_id?: string;
+  session_id?: string;
+  parent_session_id?: string;
+  properties?: Record<string, string>;
+  cache_status?: "disabled" | "miss" | "hit" | "semantic_hit" | string;
+  retry_count?: number;
+  failover_engaged?: boolean;
+  failover_from?: string;
+  failover_to?: string;
+  load_balancer_strategy?: string;
+  load_balancer_target?: string;
   provider?: string;
   model?: string;
   tokens_in?: number;
@@ -1618,6 +1628,72 @@ export interface RequestLog {
   guardrail_action?: string;
   origin?: string;
   [k: string]: unknown;
+}
+
+export interface RequestFilters {
+  method?: string;
+  status?: string;
+  path?: string;
+  origin?: string;
+  guardrailAction?: string;
+  guardrailCategory?: string;
+  cacheStatus?: string;
+  retried?: boolean;
+  propertyKey?: string;
+  propertyValue?: string;
+}
+
+export type AlertRuleState = "inactive" | "ok" | "firing";
+export type AlertDeliveryStatus = "untested" | "healthy" | "failing";
+export type AlertHistoryEvent = "fired" | "resolved" | "test";
+
+export interface AlertRule {
+  rule: string;
+  description: string;
+  thresholds: number[];
+  minimum_samples?: number;
+  state: AlertRuleState;
+  reading?: number;
+  sample_count?: number;
+  last_evaluated_at?: string;
+}
+
+export interface AlertDeliveryHealth {
+  status: AlertDeliveryStatus;
+  last_attempt_at?: string;
+  error?: string;
+}
+
+export interface AlertChannel {
+  index: number;
+  type: "webhook" | "slack" | "pagerduty" | "log" | string;
+  target?: string;
+  routing_key_configured?: boolean;
+  health: AlertDeliveryHealth;
+}
+
+export interface AlertPayload {
+  rule: string;
+  severity: "warning" | "critical" | string;
+  message: string;
+  timestamp: string;
+  labels: Record<string, string>;
+  resolved: boolean;
+}
+
+export interface AlertHistoryEntry {
+  event: AlertHistoryEvent;
+  channel_index?: number;
+  alert: AlertPayload;
+}
+
+export interface AlertSnapshot {
+  enabled: boolean;
+  authority: "file";
+  read_only: boolean;
+  rules: AlertRule[];
+  channels: AlertChannel[];
+  history: AlertHistoryEntry[];
 }
 
 // WOR-1870: UI settings served by the admin API.
@@ -1745,6 +1821,34 @@ export interface SpendWindowResponse {
   bucket_secs: number;
   buckets: SpendWindowBucket[];
   totals: SpendWindowTotals;
+  property_keys?: string[];
+}
+
+function requestsPath(filters: RequestFilters = {}): string {
+  const params = new URLSearchParams();
+  if (filters.method) params.set("method", filters.method);
+  if (filters.status && /^\d{3}$/.test(filters.status)) {
+    params.set("status", filters.status);
+  }
+  if (filters.path) params.set("path", filters.path);
+  if (filters.guardrailAction) {
+    params.set("guardrail_action", filters.guardrailAction);
+  }
+  if (filters.guardrailCategory) {
+    params.set("guardrail_category", filters.guardrailCategory);
+  }
+  if (filters.cacheStatus) params.set("cache_status", filters.cacheStatus);
+  if (filters.retried !== undefined) {
+    params.set("retried", String(filters.retried));
+  }
+  if (filters.propertyKey) {
+    params.set("property_key", filters.propertyKey);
+    if (filters.propertyValue) {
+      params.set("property_value", filters.propertyValue);
+    }
+  }
+  const query = params.toString();
+  return query ? `/api/requests?${query}` : "/api/requests";
 }
 
 export const api = {
@@ -1865,12 +1969,19 @@ export const api = {
   targets: () => getJson<unknown>("/api/health/targets"),
 
   // Logs
-  requests: () => getJson<unknown>("/api/requests"),
+  requests: (filters: RequestFilters = {}) =>
+    getJson<RequestLog[]>(requestsPath(filters)),
   // WOR-1870: operator UI settings (trace deep-link template).
   uiSettings: () => getJson<UiSettings>("/api/ui-settings"),
   // WOR-1870: SSE live tail of the request ring. EventSource sends the
   // session cookie same-origin; the server enforces auth on connect.
   requestsStreamUrl: () => "/api/requests/stream",
+
+  // File-authoritative alert runtime state and targeted channel probes.
+  alerts: () => getJson<AlertSnapshot>("/api/alerts"),
+  testAlertChannel: async (channelIndex: number): Promise<void> => {
+    await sendJson("POST", "/api/alerts/test", { channel_index: channelIndex });
+  },
 
   // Metrics
   metrics: () => getText("/metrics"),

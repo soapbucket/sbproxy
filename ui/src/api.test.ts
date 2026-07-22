@@ -204,3 +204,38 @@ describe("model lifecycle request contracts", () => {
     ]);
   });
 });
+
+describe("request observability contracts", () => {
+  it("encodes bounded request-ring filters and omits client-only filters", async () => {
+    const fetchMock = stubFetch("[]");
+
+    await api.requests({
+      method: "POST",
+      status: "503",
+      path: "/v1/chat?stream=true",
+      origin: "public-api",
+      guardrailAction: "block",
+      guardrailCategory: "pii",
+      cacheStatus: "semantic_hit",
+      retried: true,
+      propertyKey: "customer.tier",
+      propertyValue: "gold & beta",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/requests?method=POST&status=503&path=%2Fv1%2Fchat%3Fstream%3Dtrue&guardrail_action=block&guardrail_category=pii&cache_status=semantic_hit&retried=true&property_key=customer.tier&property_value=gold+%26+beta",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("keeps HTTP-class filtering client-side", async () => {
+    const fetchMock = stubFetch("[]");
+
+    await api.requests({ status: "5xx" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/requests",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+});
