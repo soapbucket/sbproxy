@@ -909,6 +909,9 @@ pub struct CascadeOutcome {
     /// cascade returned the last tier's response after exhausting
     /// tiers without acceptance (cost cap, or no tier met the bar).
     pub accepted: bool,
+    /// Providers that received a request, in attempt order. Skipped or
+    /// ineligible tiers are omitted.
+    pub attempted_providers: Vec<String>,
 }
 
 impl AiClient {
@@ -987,6 +990,7 @@ impl AiClient {
 
         let mut last_outcome: Option<CascadeOutcome> = None;
         let mut total_cost_micros: u64 = 0;
+        let mut attempted_providers: Vec<String> = Vec::new();
 
         for (tier_idx, tier) in cascade.tiers.iter().enumerate() {
             // Cost cap gate. Both the cascade-level and per-tier
@@ -1048,6 +1052,7 @@ impl AiClient {
                 "cascade: dispatching tier"
             );
 
+            attempted_providers.push(provider.name.to_string());
             let resp = match self.forward_request(provider, path, &tier_body).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1134,6 +1139,7 @@ impl AiClient {
                     format,
                     tier_index: tier_idx,
                     accepted: false,
+                    attempted_providers: attempted_providers.clone(),
                 });
                 continue;
             }
@@ -1168,6 +1174,7 @@ impl AiClient {
                     format,
                     tier_index: tier_idx,
                     accepted: false,
+                    attempted_providers: attempted_providers.clone(),
                 });
                 continue;
             }
@@ -1197,6 +1204,7 @@ impl AiClient {
                     format,
                     tier_index: tier_idx,
                     accepted: false,
+                    attempted_providers: attempted_providers.clone(),
                 });
                 continue;
             }
@@ -1212,6 +1220,7 @@ impl AiClient {
                 format,
                 tier_index: tier_idx,
                 accepted: true,
+                attempted_providers,
             });
         }
 

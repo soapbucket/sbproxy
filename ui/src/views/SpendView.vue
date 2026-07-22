@@ -10,6 +10,7 @@ import {
   type MetricFamily,
 } from "../lib/metrics";
 import { formatNumber, formatUsd } from "../lib/format";
+import { spendGroupOptions } from "../lib/spend-grouping";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import MiniBars from "../components/MiniBars.vue";
@@ -122,15 +123,6 @@ const hasOrigins = computed(() => spendByOrigin.value.length > 1);
 // --- Spend history from the durable rollups (WOR-1875) ---
 // Served by /api/usage/spend?window=&group_by=; survives restarts.
 const HISTORY_WINDOWS = ["1h", "24h", "7d", "30d"] as const;
-const HISTORY_GROUPS = [
-  { value: "total", label: "Total" },
-  { value: "model", label: "Model" },
-  { value: "provider", label: "Provider" },
-  { value: "team", label: "Team" },
-  { value: "project", label: "Project" },
-  { value: "api_key", label: "API key" },
-  { value: "origin", label: "Origin" },
-] as const;
 const historyWindow = ref<(typeof HISTORY_WINDOWS)[number]>("24h");
 const historyGroup = ref<string>("model");
 const history = useAsync(() =>
@@ -138,6 +130,20 @@ const history = useAsync(() =>
 );
 onMounted(history.run);
 watch([historyWindow, historyGroup], () => history.run());
+const historyGroupOptions = computed(() => {
+  const keys = history.data.value?.property_keys ?? [];
+  const propertyQueryUnavailable =
+    history.error.value?.status === 400 && historyGroup.value.startsWith("property:");
+  return spendGroupOptions(
+    propertyQueryUnavailable
+      ? keys.filter((key) => `property:${key}` !== historyGroup.value)
+      : keys,
+    historyGroup.value,
+  );
+});
+const selectedGroupOption = computed(() =>
+  historyGroupOptions.value.find((option) => option.value === historyGroup.value),
+);
 
 // Rollups disabled (503) reads as a hint, not a failure. The detail
 // lives in the response body, not the error message.
@@ -228,12 +234,17 @@ const hasHistory = computed(() => historyRows.value.length > 0);
           </button>
         </div>
         <select v-model="historyGroup" aria-label="Group by">
-          <option v-for="g in HISTORY_GROUPS" :key="g.value" :value="g.value">
+          <option v-for="g in historyGroupOptions" :key="g.value" :value="g.value">
             {{ g.label }}
           </option>
         </select>
       </div>
     </div>
+
+    <p v-if="selectedGroupOption?.unavailable" class="hint property-unavailable">
+      This promoted property has no rollup data in the selected window. The selection
+      is preserved so the query remains explicit.
+    </p>
 
     <p v-if="historyDisabled" class="hint">
       Usage rollups are not enabled, so windowed history is unavailable.
@@ -267,7 +278,7 @@ const hasHistory = computed(() => historyRows.value.length > 0);
       <table class="detail">
         <thead>
           <tr>
-            <th>{{ HISTORY_GROUPS.find((g) => g.value === historyGroup)?.label ?? "Group" }}</th>
+            <th>{{ selectedGroupOption?.label ?? "Group" }}</th>
             <th>Cost</th>
             <th>Tokens in</th>
             <th>Tokens out</th>

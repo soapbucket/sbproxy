@@ -1303,6 +1303,12 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         .filter_map(|m| m.parse::<http::Method>().ok())
         .collect();
 
+    if let Some(properties) = config.properties.as_mut() {
+        properties
+            .validate_and_normalize_rollup_keys()
+            .map_err(|message| anyhow::anyhow!("origin {hostname}: {message}"))?;
+    }
+
     // Interpolate {{vars.X}} and {{env.X}} in all JSON value fields.
     // This resolves template patterns in action URLs, error pages, etc.
     // Header modifier values are also resolved at runtime by TemplateContext.
@@ -2064,6 +2070,55 @@ origins:
         assert_eq!(origin.allowed_methods.len(), 2);
         assert!(origin.allowed_methods.contains(&http::Method::GET));
         assert!(origin.allowed_methods.contains(&http::Method::POST));
+    }
+
+    #[test]
+    fn compile_origin_normalizes_promoted_property_keys() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    properties:
+      rollup_keys: [Feature, CUSTOMER-TIER]
+"#;
+        let compiled = compile_config(yaml).expect("property rollup keys should compile");
+        let properties = compiled
+            .resolve_origin("api.example.com")
+            .unwrap()
+            .properties
+            .as_ref()
+            .unwrap();
+        assert_eq!(properties.rollup_keys, ["feature", "customer-tier"]);
+    }
+
+    #[test]
+    fn compile_origin_rejects_invalid_promoted_property_keys() {
+        for rollup_keys in [
+            "[Feature, feature]",
+            "['bad.key']",
+            "[one, two, three, four, five, six]",
+        ] {
+            let yaml = format!(
+                r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    properties:
+      rollup_keys: {rollup_keys}
+"#
+            );
+            let error = compile_config(&yaml)
+                .err()
+                .expect("invalid property rollup keys must fail");
+            assert!(
+                error.to_string().contains("properties.rollup_keys"),
+                "unhelpful error: {error}"
+            );
+        }
     }
 
     /// WOR-1053 PR1: an origin with no `tenant_id:` resolves to the

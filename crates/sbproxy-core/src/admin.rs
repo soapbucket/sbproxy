@@ -12,7 +12,7 @@
 //! proxy.admin.username: admin
 //! proxy.admin.password: changeme
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -279,6 +279,34 @@ pub struct RequestLogEntry {
     /// it as an operator-configured deep link (WOR-1870).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// Caller-supplied or generated session identifier, when capture is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Parent session identifier supplied by the caller, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Bounded, normalized, and already-redacted custom properties.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, String>,
+    /// Gateway cache outcome: disabled, miss, hit, or semantic_hit.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cache_status: String,
+    /// Additional upstream attempts after the first attempt.
+    pub retry_count: u32,
+    /// Whether generic fallback or AI provider failover was engaged.
+    pub failover_engaged: bool,
+    /// First failed provider or target in a failover chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_from: Option<String>,
+    /// Last provider or target selected by failover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_to: Option<String>,
+    /// Closed load-balancing or AI routing strategy name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_balancer_strategy: Option<String>,
+    /// Selected bounded target, such as host:port or provider name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_balancer_target: Option<String>,
     /// AI provider that served the request, when the AI gateway did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -318,6 +346,14 @@ pub struct RequestLogFilter<'a> {
     pub guardrail_action: Option<&'a str>,
     /// Exact guardrail category match (WOR-1874).
     pub guardrail_category: Option<&'a str>,
+    /// Exact gateway cache-status match.
+    pub cache_status: Option<&'a str>,
+    /// Match rows that did or did not make an additional attempt.
+    pub retried: Option<bool>,
+    /// Exact normalized property key whose presence is required.
+    pub property_key: Option<&'a str>,
+    /// Exact redacted property value. Requires `property_key`.
+    pub property_value: Option<&'a str>,
 }
 
 // --- Admin State ---
@@ -614,6 +650,21 @@ impl AdminState {
                 filter
                     .guardrail_category
                     .is_none_or(|c| e.guardrail_category.as_deref() == Some(c))
+            })
+            .filter(|e| {
+                filter
+                    .cache_status
+                    .is_none_or(|status| e.cache_status == status)
+            })
+            .filter(|e| {
+                filter
+                    .retried
+                    .is_none_or(|retried| (e.retry_count > 0) == retried)
+            })
+            .filter(|e| match (filter.property_key, filter.property_value) {
+                (None, _) => true,
+                (Some(key), None) => e.properties.contains_key(key),
+                (Some(key), Some(value)) => e.properties.get(key).is_some_and(|v| v == value),
             })
             .skip(offset)
             .take(limit)
@@ -1577,6 +1628,14 @@ fn rl_query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// Decode one application/x-www-form-urlencoded query value. Browser clients
+/// percent-encode path separators, spaces, and custom-dimension punctuation.
+fn decoded_query_param(path: &str, key: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    url::form_urlencoded::parse(query.as_bytes())
+        .find_map(|(candidate, value)| (candidate == key).then(|| value.into_owned()))
+}
+
 /// Handle an admin API request.
 ///
 /// Returns `(status, content_type, body)`. `method` is the HTTP
@@ -1883,11 +1942,45 @@ pub fn handle_admin_request(
     // `offset`, `limit`. No params returns the newest entries, unchanged.
     if path_only == "/api/requests" {
         let status = rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok());
-        let method_f = rl_query_param(path, "method");
-        let path_f = rl_query_param(path, "path");
+        let method_f = decoded_query_param(path, "method");
+        let path_f = decoded_query_param(path, "path");
         // WOR-1874: guardrail-column filters.
-        let guardrail_action_f = rl_query_param(path, "guardrail_action");
-        let guardrail_category_f = rl_query_param(path, "guardrail_category");
+        let guardrail_action_f = decoded_query_param(path, "guardrail_action");
+        let guardrail_category_f = decoded_query_param(path, "guardrail_category");
+        let cache_status_f = decoded_query_param(path, "cache_status");
+        if cache_status_f
+            .as_deref()
+            .is_some_and(|status| !matches!(status, "disabled" | "miss" | "hit" | "semantic_hit"))
+        {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"cache_status must be disabled, miss, hit, or semantic_hit"}"#
+                    .to_string(),
+            );
+        }
+        let retried_raw = decoded_query_param(path, "retried");
+        let retried_f = match retried_raw.as_deref() {
+            None => None,
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(_) => {
+                return (
+                    400,
+                    "application/json",
+                    r#"{"error":"retried must be true or false"}"#.to_string(),
+                );
+            }
+        };
+        let property_key_f = decoded_query_param(path, "property_key");
+        let property_value_f = decoded_query_param(path, "property_value");
+        if property_value_f.is_some() && property_key_f.as_deref().is_none_or(str::is_empty) {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"property_value requires property_key"}"#.to_string(),
+            );
+        }
         let offset = rl_query_param(path, "offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -1898,10 +1991,14 @@ pub fn handle_admin_request(
         let entries = state.query_requests(
             &RequestLogFilter {
                 status,
-                method: method_f,
-                path_sub: path_f,
-                guardrail_action: guardrail_action_f,
-                guardrail_category: guardrail_category_f,
+                method: method_f.as_deref(),
+                path_sub: path_f.as_deref(),
+                guardrail_action: guardrail_action_f.as_deref(),
+                guardrail_category: guardrail_category_f.as_deref(),
+                cache_status: cache_status_f.as_deref(),
+                retried: retried_f,
+                property_key: property_key_f.as_deref(),
+                property_value: property_value_f.as_deref(),
             },
             offset,
             limit,
@@ -1923,6 +2020,29 @@ pub fn handle_admin_request(
         })
         .to_string();
         return (200, "application/json", body);
+    }
+    // WOR-1958: read-only alert runtime state plus an asynchronous targeted
+    // channel test. Configuration remains file-authoritative; the generic
+    // connection-level mutation gate handles RBAC and browser CSRF for POST.
+    if path_only == "/api/alerts" {
+        if method.eq_ignore_ascii_case("GET") {
+            return alerts_snapshot_response(crate::alerting::alert_snapshot());
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    if path_only == "/api/alerts/test" {
+        if method.eq_ignore_ascii_case("POST") {
+            return alert_channel_test_response(body, crate::alerting::queue_channel_test);
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
     }
     // WOR-1718: spend summary from the AI cost/token metrics.
     // WOR-1875: any of `window`, `group_by`, `from`, `to` selects the
@@ -2102,6 +2222,73 @@ pub fn handle_admin_request(
     }
 }
 
+fn alerts_snapshot_response(
+    snapshot: Option<sbproxy_observe::alerting::AlertRuntimeSnapshot>,
+) -> (u16, &'static str, String) {
+    let snapshot =
+        snapshot.unwrap_or_else(sbproxy_observe::alerting::AlertRuntimeSnapshot::disabled);
+    match serde_json::to_string(&snapshot) {
+        Ok(body) => (200, "application/json", body),
+        Err(error) => (
+            500,
+            "application/json",
+            serde_json::json!({"error": format!("alert snapshot serialization failed: {error}")})
+                .to_string(),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AlertChannelTestRequest {
+    channel_index: usize,
+}
+
+fn alert_channel_test_response<F>(body: Option<&str>, queue: F) -> (u16, &'static str, String)
+where
+    F: FnOnce(usize) -> Result<(), crate::alerting::AlertControlError>,
+{
+    let request =
+        match body.and_then(|body| serde_json::from_str::<AlertChannelTestRequest>(body).ok()) {
+            Some(request) => request,
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    r#"{"error":"body must be {\"channel_index\": <non-negative integer>}"}"#
+                        .to_string(),
+                );
+            }
+        };
+    match queue(request.channel_index) {
+        Ok(()) => (
+            202,
+            "application/json",
+            serde_json::json!({
+                "queued": true,
+                "channel_index": request.channel_index,
+            })
+            .to_string(),
+        ),
+        Err(crate::alerting::AlertControlError::UnknownChannel(index)) => (
+            404,
+            "application/json",
+            serde_json::json!({"error": format!("unknown alert channel index {index}")})
+                .to_string(),
+        ),
+        Err(crate::alerting::AlertControlError::Unavailable) => (
+            409,
+            "application/json",
+            r#"{"error":"alert runtime is unavailable"}"#.to_string(),
+        ),
+        Err(crate::alerting::AlertControlError::QueueFull) => (
+            503,
+            "application/json",
+            r#"{"error":"alert command queue is full"}"#.to_string(),
+        ),
+    }
+}
+
 fn snapshot_value(snap: &std::collections::HashMap<String, f64>, name: &str) -> f64 {
     snap.get(name).copied().unwrap_or(0.0)
 }
@@ -2143,9 +2330,12 @@ fn windowed_spend_response(
         return (
             400,
             "application/json",
-            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|total)"}"#
-                .to_string(),
+            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|origin|property:<key>|total)"}"#.to_string(),
         );
+    };
+    let requested_property_key = match &group {
+        sbproxy_observe::usage_rollup::GroupBy::Property(key) => Some(key.clone()),
+        _ => None,
     };
     let window_secs = match window {
         None => None,
@@ -2190,6 +2380,19 @@ fn windowed_spend_response(
         .query(from, to, group, now, writer.hourly_retention_secs())
     {
         Ok(res) => {
+            if let Some(key) = requested_property_key {
+                if !res.property_keys.iter().any(|candidate| candidate == &key) {
+                    return (
+                        400,
+                        "application/json",
+                        serde_json::json!({
+                            "error": format!("unknown property key {key:?}"),
+                            "property_keys": res.property_keys,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -2197,6 +2400,7 @@ fn windowed_spend_response(
                 "bucket_secs": res.bucket_secs,
                 "buckets": res.buckets,
                 "totals": res.totals,
+                "property_keys": res.property_keys,
             })
             .to_string();
             (200, "application/json", body)
@@ -3565,6 +3769,212 @@ mod tests {
     }
 
     #[test]
+    fn request_log_serializes_observability_fields() {
+        let entry = RequestLogEntry {
+            timestamp: "2026-07-21T12:00:00Z".to_string(),
+            origin: "api.test".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 200,
+            latency_ms: 42.5,
+            client_ip: "127.0.0.1".to_string(),
+            session_id: Some("01K0SESSION0000000000000000".to_string()),
+            parent_session_id: Some("01K0PARENT00000000000000000".to_string()),
+            properties: std::collections::BTreeMap::from([
+                ("feature".to_string(), "assistant".to_string()),
+                ("tier".to_string(), "gold tier".to_string()),
+            ]),
+            cache_status: "semantic_hit".to_string(),
+            retry_count: 2,
+            failover_engaged: true,
+            failover_from: Some("openai".to_string()),
+            failover_to: Some("anthropic".to_string()),
+            load_balancer_strategy: Some("lowest_latency".to_string()),
+            load_balancer_target: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(entry).expect("request log serializes");
+        assert_eq!(value["session_id"], "01K0SESSION0000000000000000");
+        assert_eq!(value["parent_session_id"], "01K0PARENT00000000000000000");
+        assert_eq!(value["properties"]["feature"], "assistant");
+        assert_eq!(value["cache_status"], "semantic_hit");
+        assert_eq!(value["retry_count"], 2);
+        assert_eq!(value["failover_engaged"], true);
+        assert_eq!(value["failover_from"], "openai");
+        assert_eq!(value["failover_to"], "anthropic");
+        assert_eq!(value["load_balancer_strategy"], "lowest_latency");
+        assert_eq!(value["load_balancer_target"], "anthropic");
+    }
+
+    #[test]
+    fn request_log_sse_uses_the_enriched_entry_contract() {
+        let state = make_state();
+        let mut events = state.log_events.subscribe();
+        state.log_request(RequestLogEntry {
+            timestamp: "2026-07-21T12:00:00Z".to_string(),
+            origin: "api.test".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 200,
+            latency_ms: 42.5,
+            client_ip: "127.0.0.1".to_string(),
+            session_id: Some("01K0SESSION0000000000000000".to_string()),
+            properties: std::collections::BTreeMap::from([(
+                "feature".to_string(),
+                "assistant".to_string(),
+            )]),
+            cache_status: "hit".to_string(),
+            retry_count: 1,
+            ..Default::default()
+        });
+
+        let event = events.try_recv().expect("subscriber receives event");
+        let value: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(value["session_id"], "01K0SESSION0000000000000000");
+        assert_eq!(value["properties"]["feature"], "assistant");
+        assert_eq!(value["cache_status"], "hit");
+        assert_eq!(value["retry_count"], 1);
+    }
+
+    #[test]
+    fn query_requests_filters_gateway_and_properties() {
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/cached".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            properties: std::collections::BTreeMap::from([
+                ("feature".to_string(), "assistant".to_string()),
+                ("tier".to_string(), "gold tier".to_string()),
+            ]),
+            cache_status: "hit".to_string(),
+            retry_count: 1,
+            ..Default::default()
+        });
+        state.log_request(RequestLogEntry {
+            timestamp: "t1".to_string(),
+            origin: "o".to_string(),
+            method: "GET".to_string(),
+            path: "/plain".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            cache_status: "disabled".to_string(),
+            ..Default::default()
+        });
+
+        let cached = state.query_requests(
+            &RequestLogFilter {
+                cache_status: Some("hit"),
+                retried: Some(true),
+                property_key: Some("feature"),
+                property_value: Some("assistant"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].path, "/cached");
+
+        let presence = state.query_requests(
+            &RequestLogFilter {
+                property_key: Some("tier"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(presence.len(), 1);
+
+        let not_retried = state.query_requests(
+            &RequestLogFilter {
+                retried: Some(false),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(not_retried.len(), 1);
+        assert_eq!(not_retried[0].path, "/plain");
+    }
+
+    #[test]
+    fn requests_endpoint_validates_observability_filters() {
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/cached".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            properties: std::collections::BTreeMap::from([(
+                "tier".to_string(),
+                "gold tier".to_string(),
+            )]),
+            cache_status: "hit".to_string(),
+            retry_count: 1,
+            ..Default::default()
+        });
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests?property_key=tier&property_value=gold%20tier&retried=true&cache_status=hit",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "valid filters must succeed: {body}");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rows.as_array().map(Vec::len), Some(1));
+
+        for path in [
+            "/api/requests?property_value=gold",
+            "/api/requests?retried=sometimes",
+            "/api/requests?cache_status=warm",
+        ] {
+            let (status, _, body) = handle_admin_request("GET", path, &state, Some(&auth), None);
+            assert_eq!(status, 400, "invalid filter must fail: {path}: {body}");
+        }
+    }
+
+    #[test]
+    fn requests_endpoint_decodes_path_filters_before_matching() {
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat?stream=true".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            ..Default::default()
+        });
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests?path=%2Fv1%2Fchat%3Fstream%3Dtrue",
+            &state,
+            Some(&auth),
+            None,
+        );
+
+        assert_eq!(status, 200, "encoded path filter must succeed: {body}");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
     fn windowed_spend_validates_params_and_serves_rollups() {
         // WOR-1875. The 400 paths are pure parameter validation and
         // run before any store lookup.
@@ -3599,6 +4009,10 @@ mod tests {
                     team: "growth".to_string(),
                     api_key_id: "sk1".to_string(),
                     project: "p".to_string(),
+                    properties: std::collections::BTreeMap::from([(
+                        "feature".to_string(),
+                        "assistant".to_string(),
+                    )]),
                 },
                 kind: sbproxy_observe::usage_rollup::RollupKind::Usage {
                     tokens_in: 5,
@@ -3621,6 +4035,168 @@ mod tests {
         assert_eq!(v["totals"]["cost_usd_micros"], 42);
         assert_eq!(v["totals"]["tokens_in"], 5);
         assert_eq!(v["buckets"][0]["group"], "gpt-4o");
+
+        let (code, _, body) =
+            windowed_spend_response(Some("24h"), Some("property:feature"), None, None);
+        assert_eq!(code, 200, "property-grouped spend must serve: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["group_by"], "property:feature");
+        assert_eq!(v["property_keys"], serde_json::json!(["feature"]));
+        assert_eq!(v["buckets"][0]["group"], "assistant");
+
+        let (code, _, body) =
+            windowed_spend_response(Some("24h"), Some("property:unknown"), None, None);
+        assert_eq!(code, 400);
+        assert!(
+            body.contains("unknown property key"),
+            "unhelpful error: {body}"
+        );
+    }
+
+    #[test]
+    fn alerts_snapshot_is_valid_when_disabled_and_never_exposes_channel_secrets() {
+        let (status, _, body) = alerts_snapshot_response(None);
+        assert_eq!(status, 200);
+        let disabled: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(disabled["enabled"], false);
+        assert_eq!(disabled["authority"], "file");
+        assert_eq!(disabled["read_only"], true);
+
+        let channels = vec![sbproxy_observe::alerting::AlertChannelConfig {
+            channel_type: "webhook".to_string(),
+            url: Some("https://user:password@hooks.example.com/private-token".to_string()),
+            headers: vec![("Authorization".to_string(), "Bearer secret".to_string())],
+            secret: Some("signing-secret".to_string()),
+            routing_key: None,
+        }];
+        let runtime = sbproxy_observe::alerting::AlertRuntime::new(
+            &sbproxy_observe::alerting::EngineConfig::default(),
+            &channels,
+        );
+        let (status, _, body) = alerts_snapshot_response(Some(runtime.snapshot()));
+        assert_eq!(status, 200);
+        assert!(body.contains("https://hooks.example.com"));
+        for secret in [
+            "password",
+            "private-token",
+            "Bearer secret",
+            "signing-secret",
+        ] {
+            assert!(!body.contains(secret), "alerts response leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn alerts_test_request_validates_body_and_maps_queue_outcomes() {
+        let (status, _, body) =
+            alert_channel_test_response(Some(r#"{"channel_index":1}"#), |channel_index| {
+                assert_eq!(channel_index, 1);
+                Ok(())
+            });
+        assert_eq!(status, 202);
+        assert!(body.contains("queued"));
+
+        for body in [None, Some("{}"), Some(r#"{"channel_index":"one"}"#)] {
+            let (status, _, _) = alert_channel_test_response(body, |_| {
+                panic!("malformed requests must not be queued")
+            });
+            assert_eq!(status, 400);
+        }
+
+        let (status, _, _) = alert_channel_test_response(Some(r#"{"channel_index":7}"#), |_| {
+            Err(crate::alerting::AlertControlError::UnknownChannel(7))
+        });
+        assert_eq!(status, 404);
+        let (status, _, _) = alert_channel_test_response(Some(r#"{"channel_index":0}"#), |_| {
+            Err(crate::alerting::AlertControlError::Unavailable)
+        });
+        assert_eq!(status, 409);
+    }
+
+    #[test]
+    fn alerts_routes_use_the_runtime_contract() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) =
+            handle_admin_request("GET", "/api/alerts", &state, Some(&auth), None);
+        assert_eq!(status, 200);
+        assert!(body.contains(r#""enabled":false"#));
+
+        let (status, _, _) = handle_admin_request(
+            "POST",
+            "/api/alerts/test",
+            &state,
+            Some(&auth),
+            Some(r#"{"channel_index":0}"#),
+        );
+        assert_eq!(status, 409);
+    }
+
+    async fn send_admin_request(state: AdminState, request: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let handler = tokio::spawn(async move {
+            handle_admin_connection(
+                server,
+                "alerts-test",
+                &AdminRateLimiter::new(1_000_000),
+                std::sync::Arc::new(state),
+            )
+            .await
+        });
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn alerts_test_route_keeps_read_only_and_browser_csrf_gates() {
+        let read_only_state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reader".to_string(),
+                password: "reader-secret".to_string(),
+                role: AdminRole::ReadOnly,
+            }],
+            ..AdminConfig::default()
+        });
+        let (read_only_token, read_only_csrf) =
+            read_only_state
+                .session_signer
+                .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+        let body = r#"{"channel_index":0}"#;
+        let request = format!(
+            "POST /api/alerts/test HTTP/1.1\r\nCookie: sb_admin_session={read_only_token}\r\nX-CSRF-Token: {read_only_csrf}\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_admin_request(read_only_state, request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+        assert!(response.contains("read-only operator"));
+
+        let state = make_state();
+        let (token, _) = state
+            .session_signer
+            .mint("admin", AdminRole::Admin, 3600, unix_now());
+        let request = format!(
+            "POST /api/alerts/test HTTP/1.1\r\nCookie: sb_admin_session={token}\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_admin_request(state, request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+        assert!(response.contains("CSRF token missing or invalid"));
     }
 
     #[test]

@@ -31,6 +31,8 @@ use super::rules::check_budget_exhaustion;
 /// every provider rather than one upstream origin, so it carries a fixed scope
 /// name instead of a hostname.
 pub const PROVIDER_ERROR_SCOPE: &str = "ai_providers";
+const BUDGET_FIRING_KEY: &str = "budget_exhaustion";
+const PROVIDER_ERROR_FIRING_KEY: &str = "error_rate_spike:origin=ai_providers";
 
 /// Live metric values the built-in rules evaluate against.
 ///
@@ -44,6 +46,10 @@ pub struct MetricReadings {
     /// `[0, 1]`. `None` when no attempts were made in the window, so a quiet
     /// gateway does not read as 0% and does not recover a real alert.
     pub provider_error_rate: Option<f64>,
+    /// Provider attempts observed in the same interval as
+    /// [`Self::provider_error_rate`]. Windows below the configured floor are
+    /// inactive and cannot fire or resolve the provider-error rule.
+    pub provider_attempts: u64,
 }
 
 /// Thresholds for the built-in rules.
@@ -54,6 +60,9 @@ pub struct EngineConfig {
     /// Provider error-burn threshold in `[0, 1]`. A window whose error
     /// fraction exceeds this fires; twice this is critical.
     pub provider_error_threshold: f64,
+    /// Minimum provider attempts required before an error-rate window is
+    /// active. This prevents sparse traffic from paging on noisy fractions.
+    pub provider_error_min_attempts: u64,
 }
 
 impl Default for EngineConfig {
@@ -61,8 +70,36 @@ impl Default for EngineConfig {
         Self {
             budget_thresholds: vec![0.80, 0.95],
             provider_error_threshold: 0.10,
+            provider_error_min_attempts: 10,
         }
     }
+}
+
+/// Current state of one rule's latest evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleEvaluationState {
+    /// No usable reading was available or the minimum sample floor was not met.
+    Inactive,
+    /// The rule evaluated against an active sample and did not breach.
+    Ok,
+    /// The rule evaluated against an active sample and is breaching.
+    Firing,
+}
+
+/// Latest evaluation details published for operator-facing runtime state.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RuleEvaluation {
+    /// Stable rule name.
+    pub rule: String,
+    /// Latest state.
+    pub state: RuleEvaluationState,
+    /// Latest metric reading, when one was available.
+    pub reading: Option<f64>,
+    /// Samples contributing to the reading, when the rule has a sample floor.
+    pub sample_count: Option<u64>,
+    /// RFC 3339 evaluation time.
+    pub evaluated_at: String,
 }
 
 /// Evaluates the built-in rules and tracks per-rule firing state so each
@@ -74,6 +111,7 @@ pub struct AlertEngine {
     /// alert exactly as first fired so the recovery notification carries the
     /// same labels (and therefore the same PagerDuty deduplication key).
     firing: HashMap<String, Alert>,
+    latest_evaluations: Vec<RuleEvaluation>,
 }
 
 impl AlertEngine {
@@ -82,6 +120,7 @@ impl AlertEngine {
         Self {
             config,
             firing: HashMap::new(),
+            latest_evaluations: Vec::new(),
         }
     }
 
@@ -94,51 +133,93 @@ impl AlertEngine {
     /// with the same breaching reading returns nothing, which is what holds a
     /// single incident open instead of reopening one every interval.
     pub fn evaluate(&mut self, readings: &MetricReadings) -> Vec<Alert> {
-        let mut active: HashMap<String, Alert> = HashMap::new();
-
-        if let Some(util) = readings.budget_utilization {
-            if let Some(alert) = check_budget_exhaustion(util, &self.config.budget_thresholds) {
-                active.insert(firing_key(&alert), alert);
-            }
-        }
-        if let Some(rate) = readings.provider_error_rate {
-            let rule = ErrorRateRule {
-                origin: PROVIDER_ERROR_SCOPE.to_string(),
-                threshold: self.config.provider_error_threshold,
-            };
-            if let Some(alert) = check_error_rate_spike(&rule, rate) {
-                active.insert(firing_key(&alert), alert);
-            }
-        }
-
         let mut to_fire = Vec::new();
+        let evaluated_at = chrono::Utc::now().to_rfc3339();
+        let mut evaluations = Vec::with_capacity(2);
 
-        // Fire only on the not-firing to firing edge.
-        for (key, alert) in &active {
-            if !self.firing.contains_key(key) {
-                to_fire.push(alert.clone());
+        match readings.budget_utilization {
+            Some(utilization) => {
+                let alert = check_budget_exhaustion(utilization, &self.config.budget_thresholds);
+                let state = if alert.is_some() {
+                    RuleEvaluationState::Firing
+                } else {
+                    RuleEvaluationState::Ok
+                };
+                self.apply_active_rule(BUDGET_FIRING_KEY, alert, &mut to_fire);
+                evaluations.push(RuleEvaluation {
+                    rule: "budget_exhaustion".to_string(),
+                    state,
+                    reading: Some(utilization),
+                    sample_count: None,
+                    evaluated_at: evaluated_at.clone(),
+                });
             }
+            None => evaluations.push(RuleEvaluation {
+                rule: "budget_exhaustion".to_string(),
+                state: RuleEvaluationState::Inactive,
+                reading: None,
+                sample_count: None,
+                evaluated_at: evaluated_at.clone(),
+            }),
         }
 
-        // Resolve rules that were firing last tick and no longer breach. Re-emit
-        // the alert as first fired, flipped to resolved, so the dispatcher's
-        // dedup key matches the trigger it is closing.
-        let cleared: Vec<String> = self
-            .firing
-            .keys()
-            .filter(|key| !active.contains_key(*key))
-            .cloned()
-            .collect();
-        for key in cleared {
-            if let Some(mut alert) = self.firing.remove(&key) {
-                alert.resolved = true;
-                alert.timestamp = chrono::Utc::now().to_rfc3339();
-                to_fire.push(alert);
+        let provider_active = readings.provider_attempts >= self.config.provider_error_min_attempts;
+        match (readings.provider_error_rate, provider_active) {
+            (Some(rate), true) => {
+                let rule = ErrorRateRule {
+                    origin: PROVIDER_ERROR_SCOPE.to_string(),
+                    threshold: self.config.provider_error_threshold,
+                };
+                let alert = check_error_rate_spike(&rule, rate);
+                let state = if alert.is_some() {
+                    RuleEvaluationState::Firing
+                } else {
+                    RuleEvaluationState::Ok
+                };
+                self.apply_active_rule(PROVIDER_ERROR_FIRING_KEY, alert, &mut to_fire);
+                evaluations.push(RuleEvaluation {
+                    rule: "error_rate_spike".to_string(),
+                    state,
+                    reading: Some(rate),
+                    sample_count: Some(readings.provider_attempts),
+                    evaluated_at,
+                });
             }
+            (reading, false) | (reading @ None, true) => evaluations.push(RuleEvaluation {
+                rule: "error_rate_spike".to_string(),
+                state: RuleEvaluationState::Inactive,
+                reading,
+                sample_count: Some(readings.provider_attempts),
+                evaluated_at,
+            }),
         }
 
-        self.firing = active;
+        self.latest_evaluations = evaluations;
         to_fire
+    }
+
+    fn apply_active_rule(&mut self, key: &str, alert: Option<Alert>, to_fire: &mut Vec<Alert>) {
+        match alert {
+            Some(alert) => {
+                debug_assert_eq!(firing_key(&alert), key);
+                if !self.firing.contains_key(key) {
+                    to_fire.push(alert.clone());
+                    self.firing.insert(key.to_string(), alert);
+                }
+            }
+            None => {
+                if let Some(mut alert) = self.firing.remove(key) {
+                    alert.resolved = true;
+                    alert.timestamp = chrono::Utc::now().to_rfc3339();
+                    to_fire.push(alert);
+                }
+            }
+        }
+    }
+
+    /// Latest state for each built-in rule, in stable display order.
+    pub fn latest_evaluations(&self) -> &[RuleEvaluation] {
+        &self.latest_evaluations
     }
 
     /// Number of rule instances currently held open. For tests and diagnostics.
@@ -229,6 +310,12 @@ pub fn error_burn(prev: ProviderCounters, now: ProviderCounters) -> Option<f64> 
     Some((errors / attempts).clamp(0.0, 1.0))
 }
 
+/// Number of provider attempts observed between two monotonic-counter
+/// snapshots. Counter resets clamp to zero.
+pub fn provider_attempt_delta(prev: ProviderCounters, now: ProviderCounters) -> u64 {
+    (now.attempts - prev.attempts).max(0.0) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +324,15 @@ mod tests {
         MetricReadings {
             budget_utilization: budget,
             provider_error_rate: errors,
+            provider_attempts: errors.map(|_| 10).unwrap_or(0),
+        }
+    }
+
+    fn provider_readings(rate: f64, attempts: u64) -> MetricReadings {
+        MetricReadings {
+            budget_utilization: None,
+            provider_error_rate: Some(rate),
+            provider_attempts: attempts,
         }
     }
 
@@ -297,6 +393,49 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_burn_is_inactive_below_the_minimum_attempts() {
+        let mut engine = AlertEngine::new(EngineConfig::default());
+
+        assert!(engine.evaluate(&provider_readings(1.0, 9)).is_empty());
+        let evaluation = engine
+            .latest_evaluations()
+            .iter()
+            .find(|evaluation| evaluation.rule == "error_rate_spike")
+            .unwrap();
+        assert_eq!(evaluation.state, RuleEvaluationState::Inactive);
+        assert_eq!(evaluation.reading, Some(1.0));
+        assert_eq!(evaluation.sample_count, Some(9));
+    }
+
+    #[test]
+    fn provider_error_burn_fires_at_the_minimum_attempts() {
+        let mut engine = AlertEngine::new(EngineConfig::default());
+
+        let fired = engine.evaluate(&provider_readings(0.50, 10));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].rule, "error_rate_spike");
+    }
+
+    #[test]
+    fn inactive_provider_sample_preserves_a_firing_alert() {
+        let mut engine = AlertEngine::new(EngineConfig::default());
+        assert_eq!(engine.evaluate(&provider_readings(0.50, 10)).len(), 1);
+
+        assert!(engine.evaluate(&provider_readings(0.0, 2)).is_empty());
+        assert_eq!(engine.firing_count(), 1);
+        let evaluation = engine
+            .latest_evaluations()
+            .iter()
+            .find(|evaluation| evaluation.rule == "error_rate_spike")
+            .unwrap();
+        assert_eq!(evaluation.state, RuleEvaluationState::Inactive);
+
+        let resolved = engine.evaluate(&provider_readings(0.0, 10));
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].resolved);
+    }
+
+    #[test]
     fn two_rules_breach_and_recover_on_their_own_schedules() {
         let mut engine = AlertEngine::new(EngineConfig::default());
 
@@ -327,8 +466,10 @@ mod tests {
             attempts: 120.0,
         };
         assert_eq!(error_burn(prev, now), Some(0.25));
+        assert_eq!(provider_attempt_delta(prev, now), 20);
 
         // No attempts in the window: no reading, so no alert and no recovery.
         assert_eq!(error_burn(now, now), None);
+        assert_eq!(provider_attempt_delta(now, now), 0);
     }
 }

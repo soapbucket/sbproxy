@@ -21,6 +21,21 @@ fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Op
     }
 }
 
+/// Stable admin-console label for the generic load balancer's closed
+/// algorithm set.
+fn load_balancer_algorithm_name(algorithm: &sbproxy_modules::action::Algorithm) -> &'static str {
+    use sbproxy_modules::action::Algorithm;
+    match algorithm {
+        Algorithm::RoundRobin => "round_robin",
+        Algorithm::WeightedRandom => "weighted_random",
+        Algorithm::LeastConnections => "least_connections",
+        Algorithm::IpHash => "ip_hash",
+        Algorithm::UriHash => "uri_hash",
+        Algorithm::HeaderHash { .. } => "header_hash",
+        Algorithm::CookieHash { .. } => "cookie_hash",
+    }
+}
+
 /// Scheme-agnostic host + path of an upstream URL (WOR-1698).
 struct ParsedUpstreamUrl {
     /// `Url::host_str()` of the upstream, or `None` when the URL has no
@@ -456,6 +471,9 @@ impl ProxyHttp for SbProxy {
 
                 lb.record_connect(target_idx);
                 ctx.lb_target_idx = Some(target_idx);
+                ctx.admin_load_balancer_strategy =
+                    Some(load_balancer_algorithm_name(&lb.algorithm).to_string());
+                ctx.admin_load_balancer_target = Some(format!("{host}:{port}"));
 
                 debug!(
                     hostname = %ctx.hostname,
@@ -4144,6 +4162,7 @@ impl ProxyHttp for SbProxy {
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
+                &ctx.rollup_properties,
                 &span,
             );
             info!(
@@ -4235,6 +4254,16 @@ impl ProxyHttp for SbProxy {
                 // expand usefully and the guardrail filters have data.
                 request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
                 trace_id: ctx.trace_ctx.as_ref().map(|t| t.trace_id.clone()),
+                session_id: ctx.session_id.map(|id| id.to_string()),
+                parent_session_id: ctx.parent_session_id.map(|id| id.to_string()),
+                properties: ctx.properties.clone(),
+                cache_status: ctx.admin_cache_status.as_str().to_string(),
+                retry_count: ctx.admin_retry_count(),
+                failover_engaged: ctx.admin_failover_engaged(),
+                failover_from: ctx.admin_failover_from.clone(),
+                failover_to: ctx.admin_failover_to.clone(),
+                load_balancer_strategy: ctx.admin_load_balancer_strategy.clone(),
+                load_balancer_target: ctx.admin_load_balancer_target.clone(),
                 provider: ctx.ai_provider.clone(),
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,
@@ -4364,6 +4393,7 @@ impl ProxyHttp for SbProxy {
                         team: ctx.attribution_tags.team.clone().unwrap_or_default(),
                         api_key_id: ctx.principal.api_key_id().to_string(),
                         project: ctx.attribution_tags.project.clone().unwrap_or_default(),
+                        properties: ctx.rollup_properties.clone(),
                     },
                     kind: sbproxy_observe::usage_rollup::RollupKind::Outcome(
                         sbproxy_observe::usage_rollup::RollupOutcome::from_outcome_label(outcome),
@@ -4533,6 +4563,35 @@ mod tests {
             max_attempts,
             retry_on: retry_on.iter().map(|s| s.to_string()).collect(),
             backoff_ms: 0,
+        }
+    }
+
+    #[test]
+    fn admin_load_balancer_algorithm_names_are_closed_and_stable() {
+        use sbproxy_modules::action::Algorithm;
+
+        let cases = [
+            (Algorithm::RoundRobin, "round_robin"),
+            (Algorithm::WeightedRandom, "weighted_random"),
+            (Algorithm::LeastConnections, "least_connections"),
+            (Algorithm::IpHash, "ip_hash"),
+            (Algorithm::UriHash, "uri_hash"),
+            (
+                Algorithm::HeaderHash {
+                    header: "x-tenant".to_string(),
+                },
+                "header_hash",
+            ),
+            (
+                Algorithm::CookieHash {
+                    cookie: "session".to_string(),
+                },
+                "cookie_hash",
+            ),
+        ];
+
+        for (algorithm, expected) in cases {
+            assert_eq!(load_balancer_algorithm_name(&algorithm), expected);
         }
     }
 

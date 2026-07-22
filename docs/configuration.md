@@ -508,6 +508,19 @@ for the engine, cache, admission, placement, and rollout contracts.
 | `max_cardinality_per_label` | int | 1000 | Default cap on unique label values per metric. New values are collapsed to `__other__`. |
 | `cardinality.hostname_cap` | int | 200 | Optional override for the `hostname` label budget. Useful for high-tenant-count deployments and deterministic overflow tests. |
 
+### Durable usage rollups
+
+`proxy.observability.usage_rollups` stores hourly and daily request, token,
+cost, and outcome aggregates in an embedded database. It is enabled by default
+and backs the windowed Spend API and UI.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Record durable rollups. If the path cannot be opened, the proxy logs a warning and continues with rollups unavailable. |
+| `path` | path | `/var/lib/sbproxy/usage-rollups.redb` | Embedded rollup database. |
+| `retention_hourly_days` | int | `90` | Days of hourly buckets retained before compaction. |
+| `retention_daily_days` | int | `395` | Days of daily buckets retained. |
+
 ### access_log
 
 Top-level block (sibling of `proxy:` and `origins:`) that turns on structured-JSON access logging. Off by default. When enabled, every completed request emits one JSON line at info level via the `access_log` tracing target after status, method, and sampling filters apply. Secrets are redacted before the line is written. See [Access log](access-log.md) for the full record shape.
@@ -539,17 +552,33 @@ proxy:
         url: https://hooks.example.com/sbproxy
         headers:
           X-Auth: ${ALERT_TOKEN}
+      - type: slack
+        url: ${SLACK_INCOMING_WEBHOOK}
+      - type: pagerduty
+        routing_key: ${PAGERDUTY_ROUTING_KEY}
       - type: log
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `channels` | list | `[]` | Notification channels. |
-| `channels[].type` | string | required | Channel type. Supported: `webhook`, `log`. |
-| `channels[].url` | string | | Webhook URL. Required when `type` is `webhook`. |
+| `channels[].type` | string | required | Channel type. Supported: `webhook`, `slack`, `pagerduty`, `log`. |
+| `channels[].url` | string | | Required for `webhook` and `slack`. Slack expects an incoming-webhook URL. |
 | `channels[].headers` | map | `{}` | Extra HTTP headers added to webhook deliveries. |
+| `channels[].routing_key` | secret reference | | Required for `pagerduty`; sent to Events API v2 and never exposed by the admin API. |
 
-An alert channel accepts exactly these three keys. A `secret:` key on a channel is rejected at config load as an unknown key; alert-webhook payload signing is not configurable yet. To sign webhook deliveries, use the `secret` field on per-origin `on_request` / `on_response` callbacks instead. See [Webhook envelope and signing](#webhook-envelope-and-signing).
+An alert channel accepts exactly `type`, `url`, `headers`, and `routing_key`.
+A `secret:` key on a channel is rejected at config load as an unknown key;
+alert-webhook payload signing is not configurable yet. To sign webhook
+deliveries, use the `secret` field on per-origin `on_request` / `on_response`
+callbacks instead. See [Webhook envelope and signing](#webhook-envelope-and-signing).
+
+The block in `sb.yml` is the configuration authority. The admin Alerts page
+and `GET /api/alerts` expose read-only rule state, sanitized channel targets,
+process-lifetime delivery health, and up to 200 recent events. The built-in
+provider error-rate rule requires at least 10 attempts in an evaluation window;
+smaller samples remain inactive. `POST /api/alerts/test` can test one channel
+without changing configuration.
 
 Alert webhook deliveries also include the standard `X-Sbproxy-*` identity headers (`Event`, `Instance`, `Rule`, `Severity`, `Timestamp`) and a `User-Agent: sbproxy/<version>`. The body is wrapped in an envelope:
 
@@ -740,6 +769,9 @@ origins:
 | `hsts` | object | | HSTS header injection. |
 | `compression` | object | | Response compression. |
 | `session` | object | | Session cookie settings. Alias: `session_config`. |
+| `properties` | object | | Custom request-property capture, redaction, response echo, and bounded durable-rollup promotion. |
+| `sessions` | object | | Observability session-ID capture and auto-generation. This is separate from the `session` cookie block. |
+| `user` | object | | Observability user-ID capture. |
 | `force_ssl` | bool | false | Redirect plain HTTP requests to HTTPS. |
 | `allowed_methods` | list | empty (allow all) | Whitelist of HTTP methods. |
 | `forward_rules` | list | | Path / header / IP rules that route to inline child origins. |
@@ -777,11 +809,64 @@ origins:
     response_cache: { ... }      # Optional
     variables: { ... }           # Optional
     session: { ... }             # Optional
+    properties: { ... }          # Optional request properties
+    sessions: { ... }            # Optional observability session IDs
+    user: { ... }                # Optional user identity capture
     cors: { ... }                # Optional
     compression: { ... }         # Optional
     hsts: { ... }                # Optional
     connection_pool: { ... }     # Optional
 ```
+
+### Request-envelope capture
+
+The `properties`, `sessions`, and `user` blocks capture bounded observability
+dimensions at request entry. Their defaults apply even when the blocks are
+omitted. The plural `sessions` block controls `X-Sb-Session-Id`; the singular
+`session` block above controls encrypted session cookies and is unrelated.
+
+```yaml
+origins:
+  "api.example.com":
+    action: {type: ai_proxy, providers: [{type: openai, api_key: "${OPENAI_API_KEY}"}]}
+    properties:
+      capture: true
+      echo: false
+      rollup_keys: [Feature, customer-tier]
+      redact:
+        keys: [customer-email]
+        value_regex: ['\b\d{3}-\d{2}-\d{4}\b']
+    sessions:
+      capture: true
+      auto_generate: anonymous
+      ttl_seconds: 86400
+    user:
+      capture: true
+      max_length: 256
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `properties.capture` | bool | `true` | Capture bounded `X-Sb-Property-*` headers. |
+| `properties.echo` | bool | `false` | Echo captured values as response headers. |
+| `properties.redact.keys` | list | `[]` | Lowercased property keys whose values become `[redacted]`. |
+| `properties.redact.value_regex` | list | `[]` | Regexes that replace a matching value with `[redacted]`. |
+| `properties.rollup_keys` | list | `[]` | Explicit property keys promoted into durable usage-rollup dimensions. At most five. |
+| `sessions.capture` | bool | `true` | Capture caller-supplied session and parent-session ULIDs. |
+| `sessions.auto_generate` | enum | `anonymous` | `never`, `anonymous`, or `always`. |
+| `sessions.ttl_seconds` | int | `86400` | Session-index retention hint used by downstream projections. The recent admin Sessions page is governed by the request-ring size instead. |
+| `sessions.budget` | object | unset | Optional per-workspace cap for automatically generated session IDs. Caller-supplied IDs are not gated. |
+| `user.capture` | bool | `true` | Capture the resolved user identifier. |
+| `user.max_length` | int | `256` | Maximum captured user-ID length. |
+
+`properties.rollup_keys` is intentionally explicit and bounded. Compilation
+lowercases every key, applies the same property-key syntax as request capture,
+rejects duplicates after normalization, and rejects more than five entries.
+Redaction runs before promotion, so a configured sensitive key contributes the
+literal `[redacted]` value rather than its original value. Each promoted key
+adds a durable grouping dimension and can increase rollup cardinality. These
+properties are not exported as arbitrary Prometheus labels. Query a promoted
+dimension through `GET /api/usage/spend?...&group_by=property:<key>`.
 
 ---
 

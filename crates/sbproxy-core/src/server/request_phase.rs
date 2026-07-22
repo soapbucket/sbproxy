@@ -2925,6 +2925,7 @@ pub(super) async fn request_filter(
             };
 
             if method_ok {
+                ctx.record_admin_cache_status(crate::context::AdminCacheStatus::Miss);
                 let key = build_response_cache_key(
                     "",
                     ctx.hostname.as_str(),
@@ -2991,6 +2992,7 @@ pub(super) async fn request_filter(
                                 )
                                 .await?;
                             ctx.served_from_cache = true;
+                            ctx.record_admin_cache_status(crate::context::AdminCacheStatus::Hit);
                             sbproxy_observe::metrics::record_cache(
                                 origin.origin_id.as_ref(),
                                 "hit",
@@ -3124,6 +3126,9 @@ pub(super) async fn request_filter(
                                             .await?;
                                         session.write_response_body(Some(body), true).await?;
                                         ctx.served_from_cache = true;
+                                        ctx.record_admin_cache_status(
+                                            crate::context::AdminCacheStatus::Hit,
+                                        );
                                         sbproxy_observe::metrics::record_cache(
                                             origin.origin_id.as_ref(),
                                             "hit",

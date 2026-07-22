@@ -89,6 +89,52 @@ pub struct RequestMetrics {
     pub stripped_bytes: u64,
 }
 
+/// Bounded cache outcome carried to the admin request ring.
+///
+/// The declaration order is the precedence order used when multiple cache
+/// layers participate in one request. A later, weaker observation cannot
+/// overwrite a stronger hit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdminCacheStatus {
+    /// No response or semantic cache lookup ran.
+    #[default]
+    Disabled,
+    /// At least one enabled cache lookup ran without serving the response.
+    Miss,
+    /// The response cache or reserve served the response.
+    Hit,
+    /// A semantic cache served the response.
+    SemanticHit,
+}
+
+impl AdminCacheStatus {
+    /// Stable admin API value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Miss => "miss",
+            Self::Hit => "hit",
+            Self::SemanticHit => "semantic_hit",
+        }
+    }
+
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::Disabled => 0,
+            Self::Miss => 1,
+            Self::Hit => 2,
+            Self::SemanticHit => 3,
+        }
+    }
+
+    /// Merge an observation into this status using cache precedence.
+    pub fn record(&mut self, status: Self) {
+        if status.precedence() > self.precedence() {
+            *self = status;
+        }
+    }
+}
+
 /// Per-request state threaded through all Pingora phases as CTX.
 pub struct RequestContext {
     // --- Identity ---
@@ -154,6 +200,22 @@ pub struct RequestContext {
     /// the final upstream response so operators can see why the proxy
     /// did not replay a matching failure status.
     pub status_retry_skip_reason: Option<&'static str>,
+
+    // --- Bounded admin gateway status ---
+    /// Strongest response-cache or semantic-cache outcome observed.
+    pub admin_cache_status: AdminCacheStatus,
+    /// Number of AI provider calls actually attempted.
+    pub admin_ai_attempts: u32,
+    /// First provider that handed off to another provider.
+    pub admin_failover_from: Option<String>,
+    /// Latest provider selected after a handoff.
+    pub admin_failover_to: Option<String>,
+    /// Most recently attempted AI provider, used to detect handoffs.
+    pub admin_last_ai_provider: Option<String>,
+    /// Closed generic load-balancer or AI router strategy name.
+    pub admin_load_balancer_strategy: Option<String>,
+    /// Selected generic host:port or latest attempted AI provider.
+    pub admin_load_balancer_target: Option<String>,
 
     // --- Concurrent limit guards ---
     /// Permits issued by `ConcurrentLimitPolicy` for this request. The
@@ -525,6 +587,9 @@ pub struct RequestContext {
     /// Caller-supplied custom properties from `X-Sb-Property-*`
     /// headers. Cardinality-capped, allowlist-checked, redaction-applied.
     pub properties: BTreeMap<String, String>,
+    /// Redacted subset of [`Self::properties`] explicitly promoted by
+    /// the origin's bounded `properties.rollup_keys` configuration.
+    pub rollup_properties: BTreeMap<String, String>,
     /// Session identifier (caller-supplied or auto-generated for
     /// anonymous traffic per `SessionsConfig::auto_generate`).
     pub session_id: Option<Ulid>,
@@ -1023,6 +1088,39 @@ pub enum HeadlessSignal {
 }
 
 impl RequestContext {
+    /// Record a cache outcome without allowing a weaker later observation to
+    /// hide a hit from another cache layer.
+    pub fn record_admin_cache_status(&mut self, status: AdminCacheStatus) {
+        self.admin_cache_status.record(status);
+    }
+
+    /// Record one actual AI provider attempt and derive bounded handoff state.
+    pub fn record_admin_ai_attempt(&mut self, provider: &str) {
+        if let Some(previous) = self.admin_last_ai_provider.as_deref() {
+            if previous != provider {
+                if self.admin_failover_from.is_none() {
+                    self.admin_failover_from = Some(previous.to_string());
+                }
+                self.admin_failover_to = Some(provider.to_string());
+            }
+        }
+        self.admin_load_balancer_target = Some(provider.to_string());
+        self.admin_last_ai_provider = Some(provider.to_string());
+        self.admin_ai_attempts = self.admin_ai_attempts.saturating_add(1);
+    }
+
+    /// Additional upstream attempts after the first, across generic and AI
+    /// retry mechanisms.
+    pub fn admin_retry_count(&self) -> u32 {
+        self.retry_count
+            .max(self.admin_ai_attempts.saturating_sub(1))
+    }
+
+    /// Whether a target or provider handoff occurred.
+    pub fn admin_failover_engaged(&self) -> bool {
+        self.fallback_triggered || self.admin_failover_to.is_some()
+    }
+
     /// Create a new, empty request context.
     pub fn new() -> Self {
         Self {
@@ -1036,6 +1134,13 @@ impl RequestContext {
             retry_count: 0,
             retry_backoff_ms: None,
             status_retry_skip_reason: None,
+            admin_cache_status: AdminCacheStatus::Disabled,
+            admin_ai_attempts: 0,
+            admin_failover_from: None,
+            admin_failover_to: None,
+            admin_last_ai_provider: None,
+            admin_load_balancer_strategy: None,
+            admin_load_balancer_target: None,
             concurrent_limit_guards: Vec::new(),
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
@@ -1112,6 +1217,7 @@ impl RequestContext {
             classifier_intent: None,
             classifier_extensions: HashMap::new(),
             properties: BTreeMap::new(),
+            rollup_properties: BTreeMap::new(),
             session_id: None,
             parent_session_id: None,
             user_id: None,
@@ -1259,6 +1365,51 @@ mod tests {
         assert_eq!(a.client_ip, b.client_ip);
         assert_eq!(a.hostname, b.hostname);
         assert_eq!(a.origin_idx, b.origin_idx);
+    }
+
+    #[test]
+    fn gateway_cache_status_uses_deterministic_precedence() {
+        let mut ctx = RequestContext::new();
+        assert_eq!(ctx.admin_cache_status, AdminCacheStatus::Disabled);
+        assert_eq!(ctx.admin_cache_status.as_str(), "disabled");
+
+        ctx.record_admin_cache_status(AdminCacheStatus::Miss);
+        ctx.record_admin_cache_status(AdminCacheStatus::Hit);
+        ctx.record_admin_cache_status(AdminCacheStatus::Miss);
+        assert_eq!(ctx.admin_cache_status, AdminCacheStatus::Hit);
+
+        ctx.record_admin_cache_status(AdminCacheStatus::SemanticHit);
+        ctx.record_admin_cache_status(AdminCacheStatus::Hit);
+        assert_eq!(ctx.admin_cache_status, AdminCacheStatus::SemanticHit);
+        assert_eq!(ctx.admin_cache_status.as_str(), "semantic_hit");
+    }
+
+    #[test]
+    fn gateway_attempts_capture_retry_and_failover_chain() {
+        let mut ctx = RequestContext::new();
+        ctx.record_admin_ai_attempt("openai");
+        assert_eq!(ctx.admin_retry_count(), 0);
+        assert!(!ctx.admin_failover_engaged());
+
+        ctx.record_admin_ai_attempt("anthropic");
+        ctx.record_admin_ai_attempt("bedrock");
+        assert_eq!(ctx.admin_ai_attempts, 3);
+        assert_eq!(ctx.admin_retry_count(), 2);
+        assert!(ctx.admin_failover_engaged());
+        assert_eq!(ctx.admin_failover_from.as_deref(), Some("openai"));
+        assert_eq!(ctx.admin_failover_to.as_deref(), Some("bedrock"));
+        assert_eq!(ctx.admin_load_balancer_target.as_deref(), Some("bedrock"));
+
+        ctx.retry_count = 4;
+        assert_eq!(ctx.admin_retry_count(), 4);
+    }
+
+    #[test]
+    fn generic_fallback_engages_gateway_failover_without_ai_attempts() {
+        let mut ctx = RequestContext::new();
+        ctx.fallback_triggered = true;
+        assert!(ctx.admin_failover_engaged());
+        assert_eq!(ctx.admin_retry_count(), 0);
     }
 
     #[test]

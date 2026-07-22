@@ -161,11 +161,18 @@ per-target health, and a raw config editor.
 The queryable view over the recent-request ring buffer, with a live
 tail and a runtime log-level control.
 
-- **Shows:** `GET /api/requests` as a client-filterable table (method,
-  status, path substring; a `guardrail_action` query param arrives
-  pre-filled when you follow the "Blocked requests" link from
-  Guardrails), `GET /api/ui-settings` (the trace-URL template used to
-  link a request's trace id out to your tracing backend).
+- **Shows:** `GET /api/requests` as a table filterable by method,
+  status, path, cache result, retry presence, guardrail action, exact
+  session ID, and exact custom property. A `guardrail_action` query
+  param arrives pre-filled when you follow the "Blocked requests"
+  link from Guardrails. `GET /api/ui-settings` supplies the trace-URL
+  template used to link a trace ID to the tracing backend.
+- **Columns and grouping:** a persisted property-column picker shows
+  only redacted values from the current ring. "Group by session"
+  renders roots, descendants, parents outside the ring, and ungrouped
+  requests with per-session summaries. The Gateway column reads cache,
+  retry, failover, load-balancer, and guardrail decisions as one causal
+  rail; expanding a row shows every bounded field.
 - **Mutations:** none directly on request data; `GET`/`PUT
   /admin/log-level` reads and sets the live tracing filter (e.g.
   `debug` or `sbproxy_ai=debug`) without a restart.
@@ -187,11 +194,11 @@ restart at any step:
    of the process stays at `info`. It applies immediately via
    `PUT /admin/log-level` and confirms with a toast.
 2. Turn on Live tail and reproduce the problem. New requests stream
-   in as they complete, with status, duration, provider, model,
-   token counts, and the guardrail outcome when one fired.
-3. Filter to the failure: by status (`5xx`), path substring, or
-   guardrail action. The "Blocked requests" link from Guardrails
-   arrives here pre-filtered.
+   in as they complete, with the same properties and gateway decisions
+   as snapshot rows. The active filter predicate is applied to both.
+3. Filter to the failure: by status (`5xx`), path substring, cache,
+   retry, guardrail action, session, or custom property. The "Blocked
+   requests" link from Guardrails arrives here pre-filtered.
 4. Correlate with the server log. Every row carries a `request_id`
    and, when tracing is exporting, a `trace_id` that deep-links to
    your tracing backend via the `trace_url_template` setting. The
@@ -200,6 +207,21 @@ restart at any step:
    places.
 5. Drop the level back to `info` when done; leaving `trace` on is a
    log-volume hazard, not a correctness one.
+
+## Sessions (`/sessions`, `/sessions/:sessionId`)
+
+Recent logical interactions reconstructed entirely from the request ring.
+
+- **Shows:** `GET /api/requests`, grouped by `session_id` and linked by
+  `parent_session_id`. The index rolls up request count, input and output
+  tokens, cost, wall-clock duration, and worst HTTP status. Detail pages show
+  one session's calls oldest first, their gateway decision rails, properties,
+  request and trace IDs, and links to a parent or child that remains in the
+  ring.
+- **Mutations:** none. "Open in Logs" applies the exact session filter there.
+- **Retention boundary:** this is not durable trace storage, a span waterfall,
+  or replay. A restart or request-ring eviction can remove some or all of a
+  session, and the UI labels parents that fall outside the current ring.
 
 ## Metrics (`/metrics`)
 
@@ -257,11 +279,15 @@ windowed history.
   durable rollup history chart, which survives a restart unlike the
   live counters. History groups by provider, model, tenant, team,
   API key, project, or origin; rollup rows recorded by builds that
-  predate the origin dimension fold into the unattributed segment.
+  predate the origin dimension fold into the unattributed segment. The
+  response also advertises promoted property keys, which appear as
+  `Property: <key>` groupings and query as `group_by=property:<key>`.
 - **Mutations:** none.
 - **Empty/error notes:** no AI traffic yet renders an empty state; a
   `window`/`group_by` combination with no matching rollup data renders
-  an empty chart, not an error.
+  an empty chart, not an error. If a selected property disappears in
+  another window, the selector preserves it with an unavailable hint
+  rather than changing the operator's query.
 
 ## AI performance (`/ai-performance`)
 
@@ -302,6 +328,25 @@ blocked, and what wasted spend the gateway flagged.
   empty state pointing at the AI gateway guardrails config, not an
   error; this is the expected state for a config with no guardrails
   declared.
+
+## Alerts (`/alerts`)
+
+Read-only alert operations over the runtime installed from `sb.yml`.
+
+- **Shows:** `GET /api/alerts`: built-in rules with thresholds, current
+  reading, sample floor, state, and latest evaluation; sanitized channels with
+  delivery health and bounded errors; and up to 200 process-lifetime fired,
+  resolved, and test events. Webhook and Slack targets include only scheme and
+  host. PagerDuty exposes only whether a routing key is configured.
+- **Mutations:** `POST /api/alerts/test` queues one targeted channel test. The
+  page polls briefly until that channel's `last_attempt_at` changes and then
+  reports the delivery result. It cannot edit rules or channels.
+- **Authority and retention:** `sb.yml` is authoritative. Rule state, channel
+  health, and history reset with the process. The provider error-rate rule
+  remains inactive below 10 attempts in an evaluation window.
+- **Empty/error notes:** no `proxy.alerting` block renders a disabled state;
+  an enabled runtime with no channels keeps tests unavailable; no history is a
+  normal process-lifetime empty state.
 
 ## Prompts (`/prompts`)
 

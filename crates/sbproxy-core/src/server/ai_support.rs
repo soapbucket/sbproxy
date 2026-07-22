@@ -1506,6 +1506,7 @@ pub(super) fn emit_ai_billing_event(
     tags: &sbproxy_ai::attribution::AttributionTags,
     tenant_id: &str,
     api_key_id: &str,
+    rollup_properties: &std::collections::BTreeMap<String, String>,
     ai_span: &tracing::Span,
 ) -> u64 {
     let cost_usd_micros = cost_usd_to_micros(cost_usd);
@@ -1594,6 +1595,7 @@ pub(super) fn emit_ai_billing_event(
                 team: tags.team.clone().unwrap_or_default(),
                 api_key_id: api_key_id.to_string(),
                 project: tags.project.clone().unwrap_or_default(),
+                properties: rollup_properties.clone(),
             },
             kind: sbproxy_observe::usage_rollup::RollupKind::Usage {
                 tokens_in: input_tokens,

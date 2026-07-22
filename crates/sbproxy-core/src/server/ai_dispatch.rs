@@ -1491,6 +1491,8 @@ pub(super) async fn handle_ai_proxy(
                 Error::new(ErrorType::HTTPStatus(502))
             })?;
         let provider = &config.providers[provider_idx];
+        ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+        ctx.admin_load_balancer_target = Some(provider.name.to_string());
 
         // WOR-1827: a served provider has no reachable upstream until its
         // engine is spawned, and `effective_base_url` would fall back to
@@ -1532,6 +1534,7 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
 
+        ctx.record_admin_ai_attempt(&provider.name);
         let resp = AI_CLIENT
             .load()
             .forward_get_request(provider, &path)
@@ -1568,6 +1571,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
+            &ctx.rollup_properties,
             &ai_span,
         );
         return relay_ai_response(
@@ -1601,6 +1605,8 @@ pub(super) async fn handle_ai_proxy(
                 Error::new(ErrorType::HTTPStatus(502))
             })?;
         let provider = &config.providers[provider_idx];
+        ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+        ctx.admin_load_balancer_target = Some(provider.name.to_string());
 
         // Read the body for methods that typically carry one. DELETE,
         // HEAD, OPTIONS go through without a body. For PUT / PATCH we
@@ -1667,6 +1673,7 @@ pub(super) async fn handle_ai_proxy(
                 ),
             };
 
+        ctx.record_admin_ai_attempt(&provider.name);
         let resp = AI_CLIENT
             .load()
             .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
@@ -1705,6 +1712,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
+            &ctx.rollup_properties,
             &ai_span,
         );
         // WOR-1044 PR3: the GET-method-aware path runs before the
@@ -1948,6 +1956,10 @@ pub(super) async fn handle_ai_proxy(
             let primary = provider_order.remove(position);
             provider_order.insert(0, primary);
         }
+        ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+        ctx.admin_load_balancer_target = provider_order
+            .first()
+            .map(|&index| config.providers[index].name.to_string());
 
         let mut selected = None;
         let mut last_error = None;
@@ -1956,6 +1968,7 @@ pub(super) async fn handle_ai_proxy(
                 break;
             }
             let provider = &config.providers[provider_idx];
+            ctx.record_admin_ai_attempt(&provider.name);
             let distributed_managed =
                 crate::server::model_host::distributed_managed_provider(provider);
             let response_result: anyhow::Result<reqwest::Response> = if distributed_managed {
@@ -2130,6 +2143,7 @@ pub(super) async fn handle_ai_proxy(
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
+                &ctx.rollup_properties,
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -2157,6 +2171,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
+            &ctx.rollup_properties,
             &ai_span,
         );
         record_ai_provider_response_failure(
@@ -3379,7 +3394,11 @@ pub(super) async fn handle_ai_proxy(
                     path: path.clone(),
                 };
                 let outcome = hook.lookup(&lookup_req).await;
+                ctx.admin_cache_status
+                    .record(crate::context::AdminCacheStatus::Miss);
                 if let Some(cached) = outcome.hit {
+                    ctx.admin_cache_status
+                        .record(crate::context::AdminCacheStatus::SemanticHit);
                     debug!(
                         origin = %hostname,
                         status = cached.status,
@@ -3551,7 +3570,11 @@ pub(super) async fn handle_ai_proxy(
                 };
                 match query_vec_result {
                     Ok(query_vec) => {
+                        ctx.admin_cache_status
+                            .record(crate::context::AdminCacheStatus::Miss);
                         if let Some(hit) = cache.lookup(&query_vec, &cache_scope) {
+                            ctx.admin_cache_status
+                                .record(crate::context::AdminCacheStatus::SemanticHit);
                             sbproxy_ai::ai_metrics::record_cache_result(
                                 cache.provider(),
                                 "semantic",
@@ -3946,6 +3969,10 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
+    ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+    ctx.admin_load_balancer_target = provider_order
+        .first()
+        .map(|&index| config.providers[index].name.to_string());
     // Cascade + streaming: cascade does not retry mid-stream, so
     // we dispatch to tier 1 only and let the streaming relay
     // handle the response unchanged. The model substitution is
@@ -4023,6 +4050,10 @@ pub(super) async fn handle_ai_proxy(
                 .await;
             match outcome {
                 Ok(o) => {
+                    ctx.admin_load_balancer_target = Some(o.provider_name.clone());
+                    for provider in &o.attempted_providers {
+                        ctx.record_admin_ai_attempt(provider);
+                    }
                     ctx.ai_provider = Some(o.provider_name.clone());
                     if !o.model.is_empty() {
                         ctx.ai_model = Some(o.model.clone());
@@ -4048,6 +4079,7 @@ pub(super) async fn handle_ai_proxy(
                         &ctx.attribution_tags,
                         ctx.tenant_id.as_str(),
                         ctx.principal.api_key_id(),
+                        &ctx.rollup_properties,
                         &ai_span,
                     );
                     // Drop any idempotency capture: cascade does not
@@ -4164,6 +4196,7 @@ pub(super) async fn handle_ai_proxy(
 
         if let Some((idx, resp)) = winner.or(fallback) {
             let provider = &config.providers[idx];
+            ctx.admin_load_balancer_target = Some(provider.name.to_string());
             let resolved_model = if model.is_empty() {
                 String::new()
             } else {
@@ -4453,6 +4486,7 @@ pub(super) async fn handle_ai_proxy(
             None => None,
         };
 
+        ctx.record_admin_ai_attempt(&provider.name);
         let attempt_start = std::time::Instant::now();
         // WOR-1103: wrap each upstream attempt in its own span so a
         // forced failover shows one child span per provider tried, with
@@ -4865,6 +4899,7 @@ pub(super) async fn handle_ai_proxy(
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
                 api_key_id: ctx.principal.api_key_id().to_string(),
+                rollup_properties: ctx.rollup_properties.clone(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let stream_router_sink = RouterTokenSink {
@@ -4959,6 +4994,7 @@ pub(super) async fn handle_ai_proxy(
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
                 api_key_id: ctx.principal.api_key_id().to_string(),
+                rollup_properties: ctx.rollup_properties.clone(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let cache_router_sink = RouterTokenSink {
@@ -5788,6 +5824,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 &args.attribution_tags,
                 args.tenant_id.as_str(),
                 args.api_key_id.as_str(),
+                &args.rollup_properties,
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -5849,6 +5886,7 @@ pub(super) async fn relay_ai_response_with_cache(
                     &ctx.attribution_tags,
                     ctx.tenant_id.as_str(),
                     ctx.principal.api_key_id(),
+                    &ctx.rollup_properties,
                     &ai_span,
                 );
                 if cost_micros > 0 {
@@ -6251,6 +6289,9 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// metric without borrowing the request context. Empty string when
     /// the request was not credentialed.
     api_key_id: String,
+    /// Bounded, redacted custom properties explicitly promoted for
+    /// durable spend grouping by the matched origin.
+    rollup_properties: std::collections::BTreeMap<String, String>,
     /// WOR-1146: estimated prompt tokens for a chat_completions
     /// request, captured from the request body at dispatch. Used only
     /// as the prompt side of the fallback budget debit when a 2xx
@@ -7239,6 +7280,7 @@ pub(super) async fn relay_ai_stream(
                     &args.attribution_tags,
                     args.tenant_id.as_str(),
                     args.api_key_id.as_str(),
+                    &args.rollup_properties,
                     &ai_span,
                 );
                 // WOR-1835: governed-key settlement. `ai_admission` never

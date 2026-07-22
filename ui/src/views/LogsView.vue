@@ -1,32 +1,73 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { api, asList, type RequestLog } from "../api";
+import { api, type RequestFilters, type RequestLog } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { toast } from "../composables/useToasts";
-import { formatMs, formatTime, toDate } from "../lib/format";
+import { formatMs, formatNumber, formatTime, formatUsd } from "../lib/format";
+import {
+  discoverPropertyKeys,
+  durationOf,
+  gatewayBadges,
+  logGroups,
+  pathOf,
+  requestMatchesFilters,
+  restorePropertyColumns,
+  statusOf,
+  timestampMillis,
+  timestampOf,
+} from "../lib/request-observability";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 
 const route = useRoute();
-const req = useAsync(() => api.requests());
+
+// Snapshot and live rows use the same predicate. The server receives every
+// bounded filter it supports; origin, status classes, and session stay local.
+const fMethod = ref("");
+const fOrigin = ref("");
+const fStatus = ref("");
+const fPath = ref("");
+const fGuardrail = ref("");
+const fCache = ref("");
+const fRetried = ref<"" | "true" | "false">("");
+const fPropertyKey = ref("");
+const fPropertyValue = ref("");
+const fSession = ref("");
+
+const filters = computed<RequestFilters>(() => ({
+  ...(fMethod.value ? { method: fMethod.value } : {}),
+  ...(fOrigin.value ? { origin: fOrigin.value } : {}),
+  ...(fStatus.value ? { status: fStatus.value } : {}),
+  ...(fPath.value ? { path: fPath.value } : {}),
+  ...(fGuardrail.value ? { guardrailAction: fGuardrail.value } : {}),
+  ...(fCache.value ? { cacheStatus: fCache.value } : {}),
+  ...(fRetried.value ? { retried: fRetried.value === "true" } : {}),
+  ...(fPropertyKey.value ? { propertyKey: fPropertyKey.value } : {}),
+  ...(fPropertyKey.value && fPropertyValue.value
+    ? { propertyValue: fPropertyValue.value }
+    : {}),
+  ...(fSession.value ? { sessionId: fSession.value } : {}),
+}));
+
+const req = useAsync(() => api.requests(filters.value));
+const snapshot = computed<RequestLog[]>(() => req.data.value ?? []);
+
 onMounted(() => {
+  const guardrail = route.query.guardrail_action;
+  if (typeof guardrail === "string") fGuardrail.value = guardrail;
+  const session = route.query.session_id;
+  if (typeof session === "string") fSession.value = session;
   req.run();
   loadLogLevel();
   loadUiSettings();
-  // WOR-1874: the Guardrails view deep-links here with a filter query.
-  const ga = route.query.guardrail_action;
-  if (typeof ga === "string" && ga) fGuardrail.value = ga;
+  loadPreferences();
 });
 onUnmounted(stopStream);
 
-const snapshot = computed<RequestLog[]>(() =>
-  asList<RequestLog>(req.data.value, "requests", "items", "entries", "data"),
-);
-
-// ---- live tail over the ring's SSE stream (WOR-1870) ----
+// Live tail over the request ring.
 const STREAM_ROW_CAP = 1000;
 const live = ref(false);
 const paused = ref(false);
@@ -37,32 +78,25 @@ let source: EventSource | null = null;
 
 function startStream() {
   stopStream();
-  // Seed with the snapshot so toggling live keeps history visible.
   streamRows.value = [...snapshot.value];
   pendingRows.value = [];
   paused.value = false;
   streamState.value = "reconnecting";
-  // EventSource sends the admin session cookie same-origin; the server
-  // enforces auth on connect and auto-reconnect re-runs the login
-  // gate after a proxy restart (sessions are per-process).
   source = new EventSource(api.requestsStreamUrl());
   source.onopen = () => {
     streamState.value = "open";
   };
   source.onerror = () => {
-    // EventSource retries on its own; surface the state instead of a
-    // silently dead view. A dead session keeps this in "reconnecting"
-    // until the operator logs in again.
     streamState.value = "reconnecting";
   };
-  source.onmessage = (ev) => {
+  source.onmessage = (event) => {
     try {
-      const row = JSON.parse(ev.data) as RequestLog;
+      const request = JSON.parse(event.data) as RequestLog;
       const target = paused.value ? pendingRows.value : streamRows.value;
-      target.unshift(row);
+      target.unshift(request);
       if (target.length > STREAM_ROW_CAP) target.length = STREAM_ROW_CAP;
     } catch {
-      // A malformed frame (heartbeat/comment) is not a row.
+      // Heartbeats and malformed frames are not request rows.
     }
   };
   live.value = true;
@@ -84,39 +118,44 @@ function toggleLive() {
 function togglePause() {
   if (!live.value) return;
   if (paused.value) {
-    // Flush what arrived while reading.
-    streamRows.value = [...pendingRows.value, ...streamRows.value].slice(0, STREAM_ROW_CAP);
+    streamRows.value = [...pendingRows.value, ...streamRows.value].slice(
+      0,
+      STREAM_ROW_CAP,
+    );
     pendingRows.value = [];
   }
   paused.value = !paused.value;
 }
 
-const raw = computed<RequestLog[]>(() => (live.value ? streamRows.value : snapshot.value));
+const raw = computed<RequestLog[]>(() =>
+  live.value ? streamRows.value : snapshot.value,
+);
 
-// ---- trace deep links (WOR-1870) ----
-const traceTemplate = ref<string>("");
+// Trace deep links.
+const traceTemplate = ref("");
 async function loadUiSettings() {
   try {
     traceTemplate.value = (await api.uiSettings()).trace_url_template ?? "";
   } catch {
-    // Older server: plain-text trace ids.
+    // Older servers render trace ids as plain text.
   }
 }
-function traceUrl(r: RequestLog): string | null {
-  if (!traceTemplate.value || !r.trace_id) return null;
-  return traceTemplate.value.replaceAll("{trace_id}", r.trace_id);
+function traceUrl(request: RequestLog): string | null {
+  if (!traceTemplate.value || !request.trace_id) return null;
+  return traceTemplate.value.replaceAll("{trace_id}", request.trace_id);
 }
 
-// ---- runtime log level (WOR-1759) ----
+// Runtime log level.
 const logLevel = ref("");
 const levelDraft = ref("");
 const levelBusy = ref(false);
+const LEVEL_PRESETS = ["info", "debug", "trace", "sbproxy_ai=debug"];
 async function loadLogLevel() {
   try {
     logLevel.value = (await api.logLevel()).level ?? "";
     levelDraft.value = logLevel.value;
   } catch {
-    // admin may be older; hide the control by leaving logLevel empty.
+    // Hide the control when an older server lacks the endpoint.
   }
 }
 async function applyLogLevel(value: string) {
@@ -126,129 +165,170 @@ async function applyLogLevel(value: string) {
     logLevel.value = (await api.setLogLevel(value)).level ?? value;
     levelDraft.value = logLevel.value;
     toast.success(`Log level set to ${logLevel.value}`);
-  } catch (e) {
-    toast.error(e, "Set log level");
+  } catch (error) {
+    toast.error(error, "Set log level");
   } finally {
     levelBusy.value = false;
   }
 }
-const LEVEL_PRESETS = ["info", "debug", "trace", "sbproxy_ai=debug"];
-
-// ---- filters ----
-const fMethod = ref("");
-const fStatus = ref("");
-const fPath = ref("");
-const fGuardrail = ref("");
-
-function statusOf(r: RequestLog): number | undefined {
-  return r.status ?? r.status_code;
-}
-function pathOf(r: RequestLog): string {
-  return String(r.path ?? r.uri ?? "");
-}
-function timeOf(r: RequestLog): unknown {
-  return r.time ?? r.timestamp ?? r.ts;
-}
-function durationOf(r: RequestLog): number | undefined {
-  return r.duration_ms ?? r.latency_ms;
-}
 
 const methods = computed(() => {
-  const set = new Set<string>();
-  raw.value.forEach((r) => r.method && set.add(String(r.method).toUpperCase()));
-  return [...set].sort();
-});
-
-// Origin filter for multi-tenant triage: options come from the rows in
-// the current window without forcing the operator to remember hostnames.
-const fOrigin = ref("");
-const origins = computed(() => {
-  const set = new Set<string>();
-  raw.value.forEach((r) => r.origin && set.add(String(r.origin)));
-  return [...set].sort();
-});
-
-const rows = computed<RequestLog[]>(() => {
-  let list = [...raw.value];
-  // Newest first, by parsed timestamp when available.
-  list.sort((a, b) => {
-    const da = toDate(timeOf(a))?.getTime() ?? 0;
-    const db = toDate(timeOf(b))?.getTime() ?? 0;
-    return db - da;
+  const values = new Set<string>();
+  raw.value.forEach((request) => {
+    if (request.method) values.add(request.method.toUpperCase());
   });
-  if (fMethod.value) {
-    list = list.filter((r) => String(r.method ?? "").toUpperCase() === fMethod.value);
-  }
-  if (fOrigin.value) {
-    list = list.filter((r) => String(r.origin ?? "") === fOrigin.value);
-  }
-  if (fStatus.value) {
-    // Accept exact code or a class like "2xx".
-    const q = fStatus.value.trim();
-    list = list.filter((r) => {
-      const s = statusOf(r);
-      if (s === undefined) return false;
-      if (/^\dxx$/i.test(q)) return String(s)[0] === q[0];
-      return String(s).startsWith(q);
-    });
-  }
-  if (fPath.value) {
-    const q = fPath.value.toLowerCase();
-    list = list.filter((r) => pathOf(r).toLowerCase().includes(q));
-  }
-  if (fGuardrail.value) {
-    list = list.filter((r) => r.guardrail_action === fGuardrail.value);
-  }
-  return list;
+  return [...values].sort();
 });
+const origins = computed(() => {
+  const values = new Set<string>();
+  raw.value.forEach((request) => {
+    if (request.origin) values.add(request.origin);
+  });
+  return [...values].sort();
+});
+const propertyKeys = computed(() => discoverPropertyKeys(raw.value));
 
-function statusTone(s: number | undefined): "ok" | "warn" | "err" | "info" | "neutral" {
-  if (s === undefined) return "neutral";
-  if (s < 300) return "ok";
-  if (s < 400) return "info";
-  if (s < 500) return "warn";
-  return "err";
+const rows = computed<RequestLog[]>(() =>
+  [...raw.value]
+    .sort(
+      (a, b) =>
+        (timestampMillis(b) ?? Number.NEGATIVE_INFINITY) -
+        (timestampMillis(a) ?? Number.NEGATIVE_INFINITY),
+    )
+    .filter((request) => requestMatchesFilters(request, filters.value)),
+);
+
+function applyFilters() {
+  if (!live.value) req.run();
 }
-
 function clearFilters() {
   fMethod.value = "";
   fOrigin.value = "";
   fStatus.value = "";
   fPath.value = "";
   fGuardrail.value = "";
+  fCache.value = "";
+  fRetried.value = "";
+  fPropertyKey.value = "";
+  fPropertyValue.value = "";
+  fSession.value = "";
+  if (!live.value) req.run();
 }
 
-// ---- row expansion (WOR-1870): the full ring record ----
-const expandedKey = ref<string | null>(null);
-function rowKey(r: RequestLog, i: number): string {
-  return r.request_id ?? `${String(timeOf(r))}-${i}`;
+// Operator presentation preferences.
+const PROPERTY_COLUMNS_KEY = "sbproxy.logs.property-columns.v1";
+const SESSION_GROUP_KEY = "sbproxy.logs.group-session.v1";
+const selectedPropertyKeys = ref<string[]>([]);
+const propertyColumnsStored = ref<string | null>(null);
+const propertyColumnsHydrated = ref(false);
+const groupBySession = ref(false);
+
+function loadPreferences() {
+  try {
+    propertyColumnsStored.value = window.localStorage.getItem(PROPERTY_COLUMNS_KEY);
+    groupBySession.value =
+      window.localStorage.getItem(SESSION_GROUP_KEY) === "true";
+  } catch {
+    // Storage can be unavailable in locked-down browsers.
+  }
 }
-function toggleExpand(r: RequestLog, i: number) {
-  const key = rowKey(r, i);
+
+watch(propertyKeys, (available) => {
+  if (propertyColumnsHydrated.value || !available.length) return;
+  selectedPropertyKeys.value = restorePropertyColumns(
+    available,
+    propertyColumnsStored.value,
+  );
+  propertyColumnsHydrated.value = true;
+});
+
+function togglePropertyColumn(key: string) {
+  const selected = new Set(selectedPropertyKeys.value);
+  if (selected.has(key)) selected.delete(key);
+  else selected.add(key);
+  selectedPropertyKeys.value = propertyKeys.value.filter((candidate) =>
+    selected.has(candidate),
+  );
+  try {
+    window.localStorage.setItem(
+      PROPERTY_COLUMNS_KEY,
+      JSON.stringify(selectedPropertyKeys.value),
+    );
+  } catch {
+    // The selection still applies for this page lifetime.
+  }
+}
+
+function toggleSessionGrouping() {
+  groupBySession.value = !groupBySession.value;
+  try {
+    window.localStorage.setItem(
+      SESSION_GROUP_KEY,
+      String(groupBySession.value),
+    );
+  } catch {
+    // The selection still applies for this page lifetime.
+  }
+}
+
+const displayGroups = computed(() => logGroups(rows.value, groupBySession.value));
+const tableColumnCount = computed(() => 8 + selectedPropertyKeys.value.length);
+
+function statusTone(
+  status: number | undefined,
+): "ok" | "warn" | "err" | "info" | "neutral" {
+  if (status === undefined) return "neutral";
+  if (status < 300) return "ok";
+  if (status < 400) return "info";
+  if (status < 500) return "warn";
+  return "err";
+}
+
+// Row expansion shows the complete bounded record.
+const expandedKey = ref<string | null>(null);
+function rowKey(request: RequestLog, index: number, group: string): string {
+  return request.request_id ?? `${String(timestampOf(request))}-${group}-${index}`;
+}
+function toggleExpand(request: RequestLog, index: number, group: string) {
+  const key = rowKey(request, index, group);
   expandedKey.value = expandedKey.value === key ? null : key;
 }
 interface DetailField {
   label: string;
   value: string;
 }
-function detailFields(r: RequestLog): DetailField[] {
+function detailFields(request: RequestLog): DetailField[] {
   const fields: DetailField[] = [];
-  const push = (label: string, v: unknown) => {
-    if (v !== undefined && v !== null && v !== "") fields.push({ label, value: String(v) });
+  const push = (label: string, value: unknown) => {
+    if (value !== undefined && value !== null && value !== "") {
+      fields.push({ label, value: String(value) });
+    }
   };
-  push("Request id", r.request_id);
-  push("Trace id", r.trace_id);
-  push("Origin", r.origin);
-  push("Client IP", r.client_ip ?? r.client);
-  push("Provider", r.provider);
-  push("Model", r.model);
-  push("Tokens in", r.tokens_in);
-  push("Tokens out", r.tokens_out);
-  if (r.cost_usd_micros !== undefined && r.cost_usd_micros !== null) {
-    push("Cost (USD)", (Number(r.cost_usd_micros) / 1_000_000).toFixed(6));
+  push("Request id", request.request_id);
+  push("Trace id", request.trace_id);
+  push("Session id", request.session_id);
+  push("Parent session", request.parent_session_id);
+  push("Origin", request.origin);
+  push("Client IP", request.client_ip ?? request.client);
+  push("Provider", request.provider);
+  push("Model", request.model);
+  push("Tokens in", request.tokens_in);
+  push("Tokens out", request.tokens_out);
+  if (request.cost_usd_micros !== undefined) {
+    push("Cost", formatUsd(request.cost_usd_micros / 1_000_000));
   }
-  push("Guardrail", r.guardrail_category);
-  push("Guardrail action", r.guardrail_action);
+  push("Cache", request.cache_status);
+  push("Retry count", request.retry_count);
+  push("Failover engaged", request.failover_engaged);
+  push("Failover from", request.failover_from);
+  push("Failover to", request.failover_to);
+  push("Load balancer", request.load_balancer_strategy);
+  push("Selected target", request.load_balancer_target);
+  push("Guardrail", request.guardrail_category);
+  push("Guardrail action", request.guardrail_action);
+  Object.entries(request.properties ?? {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .forEach(([key, value]) => push(`Property: ${key}`, value));
   return fields;
 }
 </script>
@@ -256,80 +336,169 @@ function detailFields(r: RequestLog): DetailField[] {
 <template>
   <PageHeader
     title="Logs"
-    subtitle="Recent requests from the in-memory ring buffer. Live tail streams new rows as they complete; expand a row for the full record."
+    subtitle="Recent requests from the in-memory ring. Filter the snapshot or tail it live, then expand any row to inspect the bounded request record."
   >
     <template #actions>
       <button
         class="sb-btn"
         :class="{ 'sb-btn--primary': live }"
-        @click="toggleLive"
         :aria-pressed="live"
+        @click="toggleLive"
       >
         {{ live ? "Live: on" : "Live: off" }}
       </button>
       <button v-if="live" class="sb-btn" @click="togglePause">
         {{ paused ? `Resume (${pendingRows.length} new)` : "Pause" }}
       </button>
-      <button v-if="!live" class="sb-btn sb-btn--primary" @click="req.run">Refresh</button>
+      <button v-else class="sb-btn sb-btn--primary" @click="req.run">
+        Refresh
+      </button>
     </template>
   </PageHeader>
 
-  <div class="sb-card stream-state" v-if="live && streamState === 'reconnecting'">
-    Stream disconnected; retrying. A proxy restart ends the admin session, so if this
-    persists, log in again.
+  <div v-if="live && streamState === 'reconnecting'" class="sb-card stream-state">
+    Stream disconnected; retrying. If this persists after a proxy restart, sign in
+    again.
   </div>
 
-  <div class="sb-card loglevel" v-if="logLevel">
+  <div v-if="logLevel" class="sb-card loglevel">
     <span class="lbl">Tracing level</span>
     <input
       v-model="levelDraft"
       class="sb-input lvl-input"
-      @keydown.enter="applyLogLevel(levelDraft)"
       aria-label="Tracing filter directive"
+      @keydown.enter="applyLogLevel(levelDraft)"
     />
-    <button class="sb-btn sb-btn--sm" :disabled="levelBusy" @click="applyLogLevel(levelDraft)">
+    <button
+      class="sb-btn sb-btn--sm"
+      :disabled="levelBusy"
+      @click="applyLogLevel(levelDraft)"
+    >
       Set
     </button>
     <button
-      v-for="p in LEVEL_PRESETS"
-      :key="p"
+      v-for="preset in LEVEL_PRESETS"
+      :key="preset"
       class="sb-btn sb-btn--sm preset"
       :disabled="levelBusy"
-      @click="applyLogLevel(p)"
+      @click="applyLogLevel(preset)"
     >
-      {{ p }}
+      {{ preset }}
     </button>
   </div>
 
-  <div class="filters">
-    <select class="sb-select" v-model="fMethod" aria-label="Filter by method">
-      <option value="">All methods</option>
-      <option v-for="m in methods" :key="m" :value="m">{{ m }}</option>
-    </select>
-    <select
-      class="sb-select"
-      v-model="fOrigin"
-      aria-label="Filter by origin"
-      v-if="origins.length > 1"
-    >
-      <option value="">All origins</option>
-      <option v-for="o in origins" :key="o" :value="o">{{ o }}</option>
-    </select>
-    <input class="sb-input" v-model="fStatus" placeholder="Status (e.g. 200 or 5xx)" aria-label="Filter by status" />
-    <input class="sb-input" v-model="fPath" placeholder="Filter by path" aria-label="Filter by path" />
-    <select class="sb-select" v-model="fGuardrail" aria-label="Filter by guardrail action">
-      <option value="">Any guardrail</option>
-      <option value="block">Blocked</option>
-    </select>
-    <button class="sb-btn" @click="clearFilters">Clear</button>
-    <span class="count sb-faint">{{ rows.length }} of {{ raw.length }}</span>
-  </div>
+  <section class="filter-panel" aria-label="Request filters">
+    <div class="filters">
+      <select v-model="fMethod" class="sb-select" aria-label="Filter by method">
+        <option value="">All methods</option>
+        <option v-for="method in methods" :key="method" :value="method">
+          {{ method }}
+        </option>
+      </select>
+      <select
+        v-if="origins.length > 1"
+        v-model="fOrigin"
+        class="sb-select"
+        aria-label="Filter by origin"
+      >
+        <option value="">All origins</option>
+        <option v-for="origin in origins" :key="origin" :value="origin">
+          {{ origin }}
+        </option>
+      </select>
+      <input
+        v-model="fStatus"
+        class="sb-input"
+        placeholder="Status: 200 or 5xx"
+        aria-label="Filter by status"
+      />
+      <input
+        v-model="fPath"
+        class="sb-input"
+        placeholder="Path contains"
+        aria-label="Filter by path"
+      />
+      <select v-model="fCache" class="sb-select" aria-label="Filter by cache status">
+        <option value="">Any cache</option>
+        <option value="disabled">Disabled</option>
+        <option value="miss">Miss</option>
+        <option value="hit">Hit</option>
+        <option value="semantic_hit">Semantic hit</option>
+      </select>
+      <select v-model="fRetried" class="sb-select" aria-label="Filter by retry">
+        <option value="">Any attempt count</option>
+        <option value="true">Retried</option>
+        <option value="false">Not retried</option>
+      </select>
+      <select
+        v-model="fGuardrail"
+        class="sb-select"
+        aria-label="Filter by guardrail action"
+      >
+        <option value="">Any guardrail</option>
+        <option value="block">Blocked</option>
+      </select>
+      <select
+        v-model="fPropertyKey"
+        class="sb-select"
+        aria-label="Filter by property key"
+      >
+        <option value="">Any property</option>
+        <option v-for="key in propertyKeys" :key="key" :value="key">{{ key }}</option>
+      </select>
+      <input
+        v-model="fPropertyValue"
+        class="sb-input"
+        :disabled="!fPropertyKey"
+        placeholder="Exact property value"
+        aria-label="Filter by property value"
+      />
+      <input
+        v-model="fSession"
+        class="sb-input session-filter"
+        placeholder="Exact session ID"
+        aria-label="Filter by session ID"
+      />
+    </div>
+    <div class="filter-actions">
+      <button class="sb-btn sb-btn--sm" :disabled="live" @click="applyFilters">
+        Apply to snapshot
+      </button>
+      <button class="sb-btn sb-btn--sm" @click="clearFilters">Clear all</button>
+      <button
+        class="sb-btn sb-btn--sm"
+        :class="{ 'sb-btn--primary': groupBySession }"
+        :aria-pressed="groupBySession"
+        @click="toggleSessionGrouping"
+      >
+        Group by session
+      </button>
+      <details class="column-picker">
+        <summary class="sb-btn sb-btn--sm">Property columns</summary>
+        <div class="column-picker__menu">
+          <p v-if="!propertyKeys.length" class="sb-faint">No properties in this ring.</p>
+          <label v-for="key in propertyKeys" :key="key" class="column-option">
+            <input
+              type="checkbox"
+              :checked="selectedPropertyKeys.includes(key)"
+              @change="togglePropertyColumn(key)"
+            />
+            <span class="sb-mono">{{ key }}</span>
+          </label>
+        </div>
+      </details>
+      <span class="count sb-faint">{{ rows.length }} of {{ raw.length }}</span>
+    </div>
+  </section>
 
   <ErrorState v-if="!live && req.error.value" :error="req.error.value" @retry="req.run" />
   <EmptyState v-else-if="!raw.length" message="No requests recorded yet." />
-  <EmptyState v-else-if="!rows.length" message="No requests match the current filters." />
-  <div class="table-wrap" v-else>
-    <table class="sb-table">
+  <EmptyState
+    v-else-if="!rows.length"
+    message="No requests match the current filters."
+  />
+  <div v-else class="table-wrap">
+    <table class="sb-table request-ledger">
       <thead>
         <tr>
           <th>Time</th>
@@ -337,50 +506,125 @@ function detailFields(r: RequestLog): DetailField[] {
           <th>Path</th>
           <th>Status</th>
           <th>Duration</th>
+          <th>Gateway</th>
+          <th v-for="key in selectedPropertyKeys" :key="key" class="property-head">
+            {{ key }}
+          </th>
           <th>Trace</th>
           <th>Upstream</th>
         </tr>
       </thead>
       <tbody>
-        <template v-for="(r, i) in rows" :key="rowKey(r, i)">
-          <tr class="row" @click="toggleExpand(r, i)">
-            <td class="nowrap sb-muted">{{ formatTime(timeOf(r)) }}</td>
-            <td class="sb-mono">{{ r.method ?? "" }}</td>
-            <td class="sb-mono path">
-              {{ pathOf(r) || "n/a" }}
-              <StatusBadge
-                v-if="r.guardrail_action"
-                :label="`guardrail: ${r.guardrail_category ?? r.guardrail_action}`"
-                tone="warn"
-              />
-            </td>
-            <td><StatusBadge :label="String(statusOf(r) ?? '?')" :tone="statusTone(statusOf(r))" /></td>
-            <td class="nowrap">{{ formatMs(durationOf(r)) }}</td>
-            <td class="sb-mono trace">
-              <a
-                v-if="traceUrl(r)"
-                :href="traceUrl(r)!"
-                target="_blank"
-                rel="noopener noreferrer"
-                @click.stop
-              >{{ r.trace_id!.slice(0, 8) }}…</a>
-              <span v-else-if="r.trace_id" class="sb-muted">{{ r.trace_id.slice(0, 8) }}…</span>
-            </td>
-            <td class="sb-mono sb-muted">{{ r.upstream ?? r.target ?? "" }}</td>
-          </tr>
-          <tr v-if="expandedKey === rowKey(r, i)" class="detail-row">
-            <td colspan="7">
-              <div class="detail-grid">
-                <div v-for="f in detailFields(r)" :key="f.label" class="detail-item">
-                  <span class="detail-label">{{ f.label }}</span>
-                  <span class="sb-mono detail-value">{{ f.value }}</span>
-                </div>
-                <p v-if="!detailFields(r).length" class="sb-faint no-detail">
-                  No additional fields on this row (older server or non-AI traffic).
-                </p>
+        <template v-for="group in displayGroups" :key="group.key">
+          <tr v-if="groupBySession" class="session-row">
+            <td :colspan="tableColumnCount">
+              <div
+                v-if="group.session"
+                class="session-summary"
+                :style="{ paddingLeft: `${group.depth * 18}px` }"
+              >
+                <span class="session-rail" aria-hidden="true" />
+                <RouterLink
+                  class="session-id sb-mono"
+                  :to="{
+                    name: 'session-detail',
+                    params: { sessionId: group.session.sessionId },
+                  }"
+                >
+                  {{ group.session.sessionId }}
+                </RouterLink>
+                <StatusBadge v-if="group.kind === 'orphan'" label="orphan" tone="warn" />
+                <span>{{ group.session.requestCount }} requests</span>
+                <span>{{ formatNumber(group.session.totalTokens) }} tokens</span>
+                <span>{{ formatUsd(group.session.costUsdMicros / 1_000_000) }}</span>
+                <span>{{ formatMs(group.session.wallClockMs) }}</span>
+                <StatusBadge
+                  :label="String(group.session.worstStatus ?? '?')"
+                  :tone="statusTone(group.session.worstStatus)"
+                />
+              </div>
+              <div v-else class="session-summary ungrouped-summary">
+                <span class="session-rail" aria-hidden="true" />
+                <strong>Ungrouped requests</strong>
+                <span>{{ group.requests.length }} requests</span>
               </div>
             </td>
           </tr>
+          <template
+            v-for="(request, index) in group.requests"
+            :key="rowKey(request, index, group.key)"
+          >
+            <tr
+              class="row"
+              tabindex="0"
+              :aria-expanded="expandedKey === rowKey(request, index, group.key)"
+              @click="toggleExpand(request, index, group.key)"
+              @keydown.enter="toggleExpand(request, index, group.key)"
+              @keydown.space.prevent="toggleExpand(request, index, group.key)"
+            >
+              <td class="nowrap sb-muted">{{ formatTime(timestampOf(request)) }}</td>
+              <td class="sb-mono">{{ request.method ?? "" }}</td>
+              <td class="sb-mono path">{{ pathOf(request) || "n/a" }}</td>
+              <td>
+                <StatusBadge
+                  :label="String(statusOf(request) ?? '?')"
+                  :tone="statusTone(statusOf(request))"
+                />
+              </td>
+              <td class="nowrap">{{ formatMs(durationOf(request)) }}</td>
+              <td>
+                <div class="signal-rail" aria-label="Gateway decisions">
+                  <template
+                    v-for="(badge, badgeIndex) in gatewayBadges(request)"
+                    :key="`${badge.kind}-${badge.label}`"
+                  >
+                    <span v-if="badgeIndex" class="signal-join" aria-hidden="true">›</span>
+                    <StatusBadge :label="badge.label" :tone="badge.tone" />
+                  </template>
+                </div>
+              </td>
+              <td
+                v-for="key in selectedPropertyKeys"
+                :key="key"
+                class="sb-mono property-value"
+              >
+                {{ request.properties?.[key] ?? "" }}
+              </td>
+              <td class="sb-mono trace">
+                <a
+                  v-if="traceUrl(request)"
+                  :href="traceUrl(request)!"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  @click.stop
+                >{{ request.trace_id!.slice(0, 8) }}…</a>
+                <span v-else-if="request.trace_id" class="sb-muted">
+                  {{ request.trace_id.slice(0, 8) }}…
+                </span>
+              </td>
+              <td class="sb-mono sb-muted">{{ request.upstream ?? request.target ?? "" }}</td>
+            </tr>
+            <tr
+              v-if="expandedKey === rowKey(request, index, group.key)"
+              class="detail-row"
+            >
+              <td :colspan="tableColumnCount">
+                <div class="detail-grid">
+                  <div
+                    v-for="field in detailFields(request)"
+                    :key="field.label"
+                    class="detail-item"
+                  >
+                    <span class="detail-label">{{ field.label }}</span>
+                    <span class="sb-mono detail-value">{{ field.value }}</span>
+                  </div>
+                  <p v-if="!detailFields(request).length" class="sb-faint no-detail">
+                    No additional fields on this legacy row.
+                  </p>
+                </div>
+              </td>
+            </tr>
+          </template>
         </template>
       </tbody>
     </table>
@@ -407,37 +651,77 @@ function detailFields(r: RequestLog): DetailField[] {
 .loglevel .preset {
   font-family: var(--sb-font-mono);
 }
-.loglevel .msg {
-  margin-left: auto;
-}
 .stream-state {
   margin-bottom: var(--sb-space-4);
   color: var(--sb-text-muted);
   font-size: 0.85rem;
 }
-.filters {
-  display: flex;
-  gap: var(--sb-space-3);
-  align-items: center;
+.filter-panel {
+  border-top: 1px solid var(--sb-border-ink);
+  border-bottom: 1px solid var(--sb-border);
+  padding: var(--sb-space-3) 0;
   margin-bottom: var(--sb-space-4);
+}
+.filters,
+.filter-actions {
+  display: flex;
+  gap: var(--sb-space-2);
+  align-items: center;
   flex-wrap: wrap;
 }
-.filters .sb-select {
-  width: auto;
+.filter-actions {
+  margin-top: var(--sb-space-2);
 }
+.filters .sb-select,
 .filters .sb-input {
   width: auto;
+  min-width: 135px;
   flex: 1;
-  min-width: 160px;
+}
+.filters .session-filter {
+  min-width: 210px;
 }
 .count {
   font-size: 0.8rem;
   margin-left: auto;
 }
+.column-picker {
+  position: relative;
+}
+.column-picker summary {
+  list-style: none;
+}
+.column-picker summary::-webkit-details-marker {
+  display: none;
+}
+.column-picker__menu {
+  position: absolute;
+  z-index: 4;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 220px;
+  max-height: 280px;
+  overflow: auto;
+  padding: var(--sb-space-3);
+  background: var(--sb-surface);
+  border: 1px solid var(--sb-border-ink);
+}
+.column-picker__menu p {
+  margin: 0;
+}
+.column-option {
+  display: flex;
+  align-items: center;
+  gap: var(--sb-space-2);
+  padding: 5px 0;
+  font-size: 0.8rem;
+}
 .table-wrap {
   border: 1px solid var(--sb-border);
-  border-radius: var(--sb-radius);
   overflow-x: auto;
+}
+.request-ledger {
+  min-width: 1040px;
 }
 .nowrap {
   white-space: nowrap;
@@ -445,17 +729,67 @@ function detailFields(r: RequestLog): DetailField[] {
 .row {
   cursor: pointer;
 }
+.row:focus-visible {
+  outline: 2px solid var(--sb-accent);
+  outline-offset: -2px;
+}
 .path {
-  max-width: 420px;
+  max-width: 330px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.trace a {
+.property-head {
+  color: var(--sb-accent-strong);
+}
+.property-value {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.signal-rail {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: max-content;
+}
+.signal-join {
+  color: var(--sb-border-strong);
+  font-family: var(--sb-font-mono);
+}
+.trace a,
+.session-id {
   text-decoration: underline;
 }
+.session-row td {
+  background: var(--sb-bg-sunken);
+  border-top: 1px solid var(--sb-border-ink);
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+.session-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sb-space-3);
+  color: var(--sb-text-muted);
+  font-size: 0.76rem;
+}
+.session-rail {
+  width: 18px;
+  height: 1px;
+  background: var(--sb-accent);
+  flex: none;
+}
+.session-id {
+  color: var(--sb-text);
+  font-weight: 600;
+}
+.ungrouped-summary {
+  color: var(--sb-text-faint);
+}
 .detail-row td {
-  background: var(--sb-bg-subtle, rgba(127, 127, 127, 0.06));
+  background: var(--sb-surface-2);
 }
 .detail-grid {
   display: grid;
@@ -480,5 +814,15 @@ function detailFields(r: RequestLog): DetailField[] {
 }
 .no-detail {
   margin: 4px 0;
+}
+@media (max-width: 720px) {
+  .column-picker__menu {
+    right: 0;
+    left: auto;
+  }
+  .count {
+    width: 100%;
+    margin-left: 0;
+  }
 }
 </style>
