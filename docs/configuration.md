@@ -567,6 +567,12 @@ proxy:
 | `channels[].headers` | map | `{}` | Extra HTTP headers added to webhook deliveries. |
 | `channels[].routing_key` | secret reference | | Required for `pagerduty`; sent to Events API v2 and never exposed by the admin API. |
 
+Webhook and Slack deliveries pass through the same SSRF guard as the rest of
+the proxy's outbound calls, so a channel pointed at a private or loopback
+address is rejected at delivery time and the admin Alerts page reports the
+channel as `failing` with "target rejected by SSRF policy". Point a local
+receiver at a routable address when testing.
+
 An alert channel accepts exactly `type`, `url`, `headers`, and `routing_key`.
 A `secret:` key on a channel is rejected at config load as an unknown key;
 alert-webhook payload signing is not configurable yet. To sign webhook

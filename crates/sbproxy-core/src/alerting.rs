@@ -233,7 +233,14 @@ mod tests {
     use sbproxy_observe::alerting::runtime::{AlertHistoryEvent, DeliveryStatus};
     use sbproxy_observe::alerting::AlertChannelConfig;
 
-    #[tokio::test]
+    // Paused time removes the wall clock from this test. A log-channel
+    // delivery is synchronous once the loop receives the command, so the
+    // only thing a real-time budget measured was how quickly a saturated
+    // machine scheduled the spawned task; the full workspace run starved
+    // it past ten seconds. With time paused the runtime auto-advances
+    // whenever every task is idle, so the poll below resolves as soon as
+    // the delivery lands, deterministically and under any load.
+    #[tokio::test(start_paused = true)]
     async fn channel_test_command_queues_and_runs_on_the_alert_runtime() {
         let channels = vec![AlertChannelConfig {
             channel_type: "log".to_string(),
@@ -248,7 +255,11 @@ mod tests {
         let loop_task = tokio::spawn(run(phase_rx, 3_600, channels, runtime.clone(), command_rx));
 
         control.queue_channel_test(0).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // Sleep between polls rather than spinning on `yield_now`: under
+        // paused time a sleep is what lets the clock auto-advance, and the
+        // budget is virtual, so it bounds a genuinely broken delivery
+        // without ever measuring machine load.
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let snapshot = runtime.snapshot();
                 if snapshot.history.len() == 1
@@ -256,7 +267,7 @@ mod tests {
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await

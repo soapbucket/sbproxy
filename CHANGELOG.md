@@ -10,6 +10,87 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+## [1.7.0] - 2026-07-22
+
+The admin release. The console is rebuilt around the editorial brand
+system, gains live sampled charts, and, most importantly, stops hiding
+data the proxy was already collecting: request sessions, custom
+properties, and the gateway's own decisions now reach the operator,
+and the alerting engine finally has a face. Per-origin scoping runs
+across the estate so a multi-tenant gateway reports per tenant.
+
+### Added
+
+- **Sessions.** Requests carrying `X-Sb-Session-Id` (and optionally
+  `X-Sb-Parent-Session-Id`) are reconstructed into logical
+  interactions. A session index ranks recent work by requests, tokens,
+  cost, wall-clock duration, and worst status, indenting child
+  sessions under their parent; a detail page reads one session's call
+  chain oldest first with each call's gateway decisions, identifiers,
+  AI route, tokens, cost, and properties. This is a view over the
+  in-memory request ring, not durable trace storage.
+- **Custom properties as first-class dimensions.** Bounded
+  `X-Sb-Property-*` headers are captured, redacted per configuration,
+  and carried on the request log, where they become filter and column
+  choices. Properties named in an origin's `properties.rollup_keys`
+  are promoted to durable spend dimensions, so the Spend page can
+  group a window by a business dimension the caller supplied.
+- **Gateway decisions on every request row.** The log now records what
+  the gateway actually did: cache result, retry count, whether
+  failover engaged and between which providers, the load-balancer
+  strategy and target, and the guardrail outcome. The console reads
+  them as one causal rail per row, answering whether the resilience
+  configuration fired without opening a body.
+- **Alerts page.** The alerting runtime is visible for the first time:
+  rule thresholds, current reading, sample floor, and evaluation
+  state; sanitized channel targets with delivery health and bounded
+  errors; and recent fired, resolved, and test events. A targeted
+  channel test exercises delivery without changing configuration.
+  `sb.yml` remains authoritative and the page is read-only.
+- **Live metrics.** The Metrics page samples the Prometheus endpoint
+  and charts what happened between samples: request rate, error rate,
+  latency percentiles from histogram bucket deltas, and AI token
+  throughput, with numeric tiles and trend sparklines.
+- **Per-origin scoping.** The attributed AI counters and the durable
+  usage rollups carry the origin the request arrived on, and Metrics,
+  Spend, Cache, and Logs can scope to one origin. Panels whose series
+  have no origin dimension say so rather than showing unscoped numbers
+  under a filter.
+- **Context-compression reporting.** The compression policies report
+  compressed requests, tokens and cost saved, per-lever savings,
+  outcomes, and average ratio per lever.
+
+### Changed
+
+- **The admin console follows the sbproxy.dev editorial system.**
+  Paper and ink surfaces, a persistent top bar carrying the admin
+  host, a live health dot, and the cluster node count, mono
+  microcopy, and square corners. Every mutation confirms or fails
+  through a toast; validation detail and revision conflicts stay
+  inline next to the form that caused them.
+- **The admin rate-limit default is 240 requests per minute per
+  client IP**, up from 60, with the global cap still ten times that.
+  A busy console no longer trips its own limiter.
+
+### Fixed
+
+- **Cache hit and miss counts are no longer always zero.** The Cache
+  page read a metric name the server never emitted.
+- **The playground reaches locally served models.** A chat against a
+  served or managed deployment returned 404 because the request
+  skipped the runtime's endpoint resolution and fell back to a
+  localhost URL pointing at the proxy itself.
+- **Spend groups by a promoted property.** The group-by parameter was
+  read without percent-decoding, so the console's own
+  `property:<key>` selection failed as an unknown dimension.
+- **Spend history reports a disabled rollup store as a hint**, not as
+  a failed view.
+- **The overview lists managed models by name** with their reserved
+  memory, instead of "unknown".
+- **An engine that dies after reaching readiness reports why.** The
+  health path now carries the bounded, redacted stderr tail into the
+  retained error rather than logging only that the process exited.
+
 ## [1.6.2] - 2026-07-21
 
 ### Added
