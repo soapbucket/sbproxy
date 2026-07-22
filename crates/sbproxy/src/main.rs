@@ -1558,10 +1558,6 @@ fn install_alerting_channels_for_cli(cli: &Cli) {
     let Some(alerting) = compiled.server.alerting.as_ref() else {
         return;
     };
-    if alerting.channels.is_empty() {
-        return;
-    }
-
     // Install the process resolver when any channel carries a provider-URI
     // secret reference; the same idempotent installer telemetry headers use.
     let has_reference = alerting.channels.iter().any(|c| {

@@ -59,6 +59,13 @@ pub fn configured_channels() -> Vec<AlertChannelConfig> {
     RESOLVED_CHANNELS.get().cloned().unwrap_or_default()
 }
 
+/// Whether a `proxy.alerting` block was installed at boot. Unlike
+/// [`has_configured_channels`], this remains true for an explicitly configured
+/// block with zero channels so the admin API can explain the active rule state.
+pub fn has_alerting_config() -> bool {
+    RESOLVED_CHANNELS.get().is_some()
+}
+
 /// Whether any alert channel was installed at boot. Lets core skip building a
 /// dispatcher and spawning the loop when alerting is not configured.
 pub fn has_configured_channels() -> bool {
