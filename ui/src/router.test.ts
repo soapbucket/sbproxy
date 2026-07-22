@@ -20,3 +20,12 @@ describe("session routes", () => {
     expect(route.params.sessionId).toBe("tenant/session 1");
   });
 });
+
+describe("alert route", () => {
+  it("resolves the alert operations page", () => {
+    const route = router.resolve("/alerts");
+
+    expect(route.name).toBe("alerts");
+    expect(route.meta.title).toBe("Alerts");
+  });
+});

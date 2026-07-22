@@ -68,6 +68,12 @@ const routes = [
     meta: { title: "Guardrails" },
   },
   {
+    path: "/alerts",
+    name: "alerts",
+    component: () => import("./views/AlertsView.vue"),
+    meta: { title: "Alerts" },
+  },
+  {
     path: "/prompts",
     name: "prompts",
     component: () => import("./views/PromptsView.vue"),

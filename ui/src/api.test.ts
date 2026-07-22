@@ -3,6 +3,7 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   api,
   ApiError,
+  setCsrfToken,
   type ClusterDeploymentBundleDraft,
   type DeploymentReplacementRequest,
   type ModelDeployment,
@@ -22,6 +23,7 @@ function stubFetch(rawBody: string, status = 200) {
 }
 
 afterEach(() => {
+  setCsrfToken(null);
   vi.unstubAllGlobals();
 });
 
@@ -268,6 +270,60 @@ describe("promoted property spend contracts", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/usage/spend?window=24h&group_by=property%3Acustomer.tier",
       expect.objectContaining({ method: "GET" }),
+    );
+  });
+});
+
+describe("alert operations contracts", () => {
+  it("decodes the secret-free runtime snapshot", async () => {
+    stubFetch(
+      JSON.stringify({
+        enabled: true,
+        authority: "file",
+        read_only: true,
+        rules: [
+          {
+            rule: "error_rate_spike",
+            description: "Provider error rate",
+            thresholds: [0.1, 0.2],
+            minimum_samples: 10,
+            state: "inactive",
+            sample_count: 4,
+          },
+        ],
+        channels: [
+          {
+            index: 0,
+            type: "slack",
+            target: "https://hooks.slack.com",
+            health: { status: "untested" },
+          },
+        ],
+        history: [],
+      }),
+    );
+
+    await expect(api.alerts()).resolves.toMatchObject({
+      authority: "file",
+      read_only: true,
+      rules: [{ minimum_samples: 10, state: "inactive" }],
+      channels: [{ target: "https://hooks.slack.com" }],
+    });
+  });
+
+  it("sends the browser CSRF token on targeted channel tests", async () => {
+    const fetchMock = stubFetch('{"status":"accepted"}', 202);
+    setCsrfToken("csrf-alert-test");
+
+    await api.testAlertChannel(3);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/alerts/test",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "X-CSRF-Token": "csrf-alert-test" }),
+        body: JSON.stringify({ channel_index: 3 }),
+      }),
     );
   });
 });
