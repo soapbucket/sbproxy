@@ -1822,7 +1822,7 @@ export interface SpendWindowResponse {
   bucket_secs: number;
   buckets: SpendWindowBucket[];
   totals: SpendWindowTotals;
-  property_keys?: string[];
+  property_keys: string[];
 }
 
 function requestsPath(filters: RequestFilters = {}): string {

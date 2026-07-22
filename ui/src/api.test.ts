@@ -239,3 +239,35 @@ describe("request observability contracts", () => {
     );
   });
 });
+
+describe("promoted property spend contracts", () => {
+  it("decodes available keys and encodes property grouping", async () => {
+    const fetchMock = stubFetch(
+      JSON.stringify({
+        from: 1,
+        to: 2,
+        group_by: "property:customer.tier",
+        bucket_secs: 3600,
+        buckets: [],
+        totals: {
+          requests: 0,
+          tokens_in: 0,
+          tokens_out: 0,
+          cost_usd_micros: 0,
+          ok: 0,
+          blocked: 0,
+          error: 0,
+        },
+        property_keys: ["customer.tier", "feature"],
+      }),
+    );
+
+    const result = await api.spendWindow("24h", "property:customer.tier");
+
+    expect(result.property_keys).toEqual(["customer.tier", "feature"]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/usage/spend?window=24h&group_by=property%3Acustomer.tier",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+});
