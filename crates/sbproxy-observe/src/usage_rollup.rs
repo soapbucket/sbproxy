@@ -11,7 +11,7 @@
 //! ## Shape
 //!
 //! Hour buckets are keyed by `{hour_start, provider, model, tenant,
-//! team, api_key_id, project}` and aggregate request counts, tokens by
+//! team, api_key_id, project, origin}` and aggregate request counts, tokens by
 //! direction, cost in micro-USD, and a closed outcome split
 //! (`ok` / `error` / `blocked`). A compaction pass folds hourly rows
 //! past the hourly retention into day buckets under the same
@@ -51,6 +51,10 @@ const DAY_SECS: u64 = 86_400;
 /// "unattributed" segment, mirroring the attributed metric labels.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RollupDims {
+    /// Origin hostname the request arrived on. Empty on rows written
+    /// by builds that predate the dimension; those decode as the
+    /// unattributed segment.
+    pub origin: String,
     /// Upstream provider name.
     pub provider: String,
     /// Model identifier.
@@ -229,6 +233,8 @@ pub enum GroupBy {
     ApiKey,
     /// One series per project.
     Project,
+    /// One series per origin hostname.
+    Origin,
     /// A single total series.
     Total,
 }
@@ -243,6 +249,7 @@ impl GroupBy {
             "team" => Self::Team,
             "api_key" => Self::ApiKey,
             "project" => Self::Project,
+            "origin" => Self::Origin,
             "total" | "" => Self::Total,
             _ => return None,
         })
@@ -256,6 +263,7 @@ impl GroupBy {
             Self::Team => dims.team.clone(),
             Self::ApiKey => dims.api_key_id.clone(),
             Self::Project => dims.project.clone(),
+            Self::Origin => dims.origin.clone(),
             Self::Total => String::new(),
         }
     }
@@ -318,15 +326,19 @@ pub struct RollupTotals {
 fn encode_key(bucket_start: u64, dims: &RollupDims) -> Vec<u8> {
     // Big-endian timestamp prefix so redb range scans by time work.
     let mut key = Vec::with_capacity(
-        8 + 12
+        8 + 14
             + dims.provider.len()
             + dims.model.len()
             + dims.tenant.len()
             + dims.team.len()
             + dims.api_key_id.len()
-            + dims.project.len(),
+            + dims.project.len()
+            + dims.origin.len(),
     );
     key.extend_from_slice(&bucket_start.to_be_bytes());
+    // `origin` is encoded LAST so rows written before the dimension
+    // existed still decode (the trailing slot is optional on read) and
+    // older binaries reading a newer file simply ignore the tail.
     for part in [
         &dims.provider,
         &dims.model,
@@ -334,6 +346,7 @@ fn encode_key(bucket_start: u64, dims: &RollupDims) -> Vec<u8> {
         &dims.team,
         &dims.api_key_id,
         &dims.project,
+        &dims.origin,
     ] {
         let len = u16::try_from(part.len()).unwrap_or(u16::MAX);
         key.extend_from_slice(&len.to_be_bytes());
@@ -369,6 +382,15 @@ fn decode_key(key: &[u8]) -> Option<(u64, RollupDims)> {
         }
         *slot = String::from_utf8_lossy(&key[cursor..cursor + len]).into_owned();
         cursor += len;
+    }
+    // Optional trailing origin slot: rows written before the dimension
+    // existed end here and decode as origin = "" (unattributed).
+    if key.len() >= cursor + 2 {
+        let len = usize::from(u16::from_be_bytes([key[cursor], key[cursor + 1]]));
+        cursor += 2;
+        if key.len() >= cursor + len {
+            dims.origin = String::from_utf8_lossy(&key[cursor..cursor + len]).into_owned();
+        }
     }
     Some((ts, dims))
 }
@@ -677,6 +699,7 @@ mod tests {
 
     fn dims(provider: &str, model: &str, team: &str) -> RollupDims {
         RollupDims {
+            origin: "ai.example".to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
             tenant: "t1".to_string(),
@@ -684,6 +707,37 @@ mod tests {
             api_key_id: "sk_1".to_string(),
             project: "p1".to_string(),
         }
+    }
+
+    #[test]
+    fn decode_tolerates_keys_without_the_origin_slot() {
+        // Rows written by builds that predate the origin dimension end
+        // after the project slot; they must decode as origin = "".
+        let with_origin = dims("openai", "gpt-4o", "growth");
+        let legacy = RollupDims {
+            origin: String::new(),
+            ..with_origin.clone()
+        };
+
+        // A legacy key is exactly the modern key minus the trailing
+        // origin slot.
+        let modern_key = encode_key(3600, &with_origin);
+        let legacy_key = modern_key[..modern_key.len() - 2 - with_origin.origin.len()].to_vec();
+
+        let (ts, decoded) = decode_key(&legacy_key).expect("legacy key must decode");
+        assert_eq!(ts, 3600);
+        assert_eq!(decoded, legacy);
+        assert_eq!(decoded.origin, "");
+
+        let (_, decoded_modern) = decode_key(&modern_key).expect("modern key must decode");
+        assert_eq!(decoded_modern, with_origin);
+    }
+
+    #[test]
+    fn group_by_origin_parses_and_groups() {
+        assert_eq!(GroupBy::parse("origin"), Some(GroupBy::Origin));
+        let d = dims("openai", "gpt-4o", "growth");
+        assert_eq!(GroupBy::Origin.key_of(&d), "ai.example");
     }
 
     fn usage(ts: u64, d: RollupDims, tin: u64, tout: u64, cost: u64) -> RollupEvent {

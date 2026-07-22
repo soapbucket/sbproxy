@@ -197,6 +197,25 @@ const scopedRequests = computed<MetricFamily | undefined>(() => {
   };
 });
 
+/**
+ * Scope any family to the selected origin via whichever of the given
+ * labels it carries. A family with none of them is returned unchanged
+ * (it stays an all-origins aggregate; the panel says so).
+ */
+function scopeByOrigin(
+  f: MetricFamily | undefined,
+  labels: string[] = ["origin", "hostname"],
+): MetricFamily | undefined {
+  const selected = selectedOrigin.value;
+  if (!f || !selected) return f;
+  const label = labels.find((l) => f.samples.some((s) => l in s.labels));
+  if (!label) return f;
+  return {
+    ...f,
+    samples: f.samples.filter((s) => s.labels[label] === selected),
+  };
+}
+
 const totalRequests = computed(() => sumSamples(scopedRequests.value));
 
 const requestsByStatus = computed(() => {
@@ -227,14 +246,16 @@ const requestsByMethod = computed(() => {
   if (!f || !f.samples.some((s) => "method" in s.labels)) return [];
   return groupByLabel(f, "method").slice(0, 8);
 });
-const errorsByType = computed(() =>
-  errorsFamily.value ? groupByLabel(errorsFamily.value, "error_type").slice(0, 8) : [],
-);
-const cacheResults = computed(() =>
-  cacheFamily.value ? groupByLabel(cacheFamily.value, "result").slice(0, 6) : [],
-);
+const errorsByType = computed(() => {
+  const f = scopeByOrigin(errorsFamily.value);
+  return f ? groupByLabel(f, "error_type").slice(0, 8) : [];
+});
+const cacheResults = computed(() => {
+  const f = scopeByOrigin(cacheFamily.value);
+  return f ? groupByLabel(f, "result").slice(0, 6) : [];
+});
 const authResults = computed(() => {
-  const f = authFamily.value;
+  const f = scopeByOrigin(authFamily.value);
   if (!f) return [];
   return groupByLabel(f, "result")
     .slice(0, 6)
@@ -247,9 +268,10 @@ const authResults = computed(() => {
           : undefined,
     }));
 });
-const bytesByDirection = computed(() =>
-  bytesFamily.value ? groupByLabel(bytesFamily.value, "direction").slice(0, 4) : [],
-);
+const bytesByDirection = computed(() => {
+  const f = scopeByOrigin(bytesFamily.value);
+  return f ? groupByLabel(f, "direction").slice(0, 4) : [];
+});
 
 const errorRate = computed(() => {
   const total = totalRequests.value;
@@ -260,16 +282,19 @@ const errorRate = computed(() => {
   return (errs / total) * 100;
 });
 
-const totalTokens = computed(() => (tokenFamily.value ? sumSamples(tokenFamily.value) : undefined));
+const totalTokens = computed(() => {
+  const f = scopeByOrigin(tokenFamily.value, ["origin"]);
+  return f ? sumSamples(f) : undefined;
+});
 const totalCost = computed(() => {
-  const f = costFamily.value;
+  const f = scopeByOrigin(costFamily.value, ["origin"]);
   if (!f) return undefined;
   const raw = sumSamples(f);
   return f.name.includes("micros") ? raw / 1e6 : raw;
 });
 
 const tokensByDirection = computed(() => {
-  const f = tokenFamily.value;
+  const f = scopeByOrigin(tokenFamily.value, ["origin"]);
   if (!f) return [];
   const label = ["direction", "kind", "type", "token_type"].find((l) =>
     f.samples.some((s) => l in s.labels),
@@ -277,7 +302,7 @@ const tokensByDirection = computed(() => {
   return label ? groupByLabel(f, label).slice(0, 8) : [];
 });
 const tokensByProvider = computed(() => {
-  const f = tokenFamily.value;
+  const f = scopeByOrigin(tokenFamily.value, ["origin"]);
   return f && f.samples.some((s) => "provider" in s.labels)
     ? groupByLabel(f, "provider").slice(0, 8)
     : [];
@@ -376,20 +401,32 @@ const p99Series = computed(() => latencySeries(0.99));
 const tokenRateSeries = computed(() => {
   const f = tokenFamily.value;
   if (!f) return [] as { name: string; points: SeriesPoint[] }[];
+  // The attributed counter carries an origin label, so the token
+  // charts honor the origin filter when one is selected.
+  const scope: Record<string, string> =
+    selectedOrigin.value && f.samples.some((s) => "origin" in s.labels)
+      ? { origin: selectedOrigin.value }
+      : {};
   const hasDirection = f.samples.some((s) => "direction" in s.labels);
   if (!hasDirection) {
     return [
-      { name: "tokens/s", points: rateSeries(snapshots.value, familyTotal([f.name])) },
+      { name: "tokens/s", points: rateSeries(snapshots.value, familyTotal([f.name], scope)) },
     ];
   }
   return [
     {
       name: "input",
-      points: rateSeries(snapshots.value, familyTotal([f.name], { direction: "input" })),
+      points: rateSeries(
+        snapshots.value,
+        familyTotal([f.name], { direction: "input", ...scope }),
+      ),
     },
     {
       name: "output",
-      points: rateSeries(snapshots.value, familyTotal([f.name], { direction: "output" })),
+      points: rateSeries(
+        snapshots.value,
+        familyTotal([f.name], { direction: "output", ...scope }),
+      ),
     },
   ];
 });
@@ -734,15 +771,15 @@ function formatPct(v: number): string {
           <MiniBars :items="tokensByDirection" />
         </div>
         <div class="sb-card" v-if="providerErrors.length">
-          <h3>Provider errors</h3>
+          <h3>Provider errors <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span></h3>
           <MiniBars :items="providerErrors" color="var(--sb-err)" />
         </div>
         <div class="sb-card" v-if="throughputByModel.length">
-          <h3>Token throughput (avg tok/s)</h3>
+          <h3>Token throughput (avg tok/s) <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span></h3>
           <MiniBars :items="throughputByModel" />
         </div>
         <div class="sb-card" v-if="modelHostGauges.length">
-          <h3>Model-host gauges</h3>
+          <h3>Model-host gauges <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span></h3>
           <MiniBars :items="modelHostGauges" />
         </div>
       </div>

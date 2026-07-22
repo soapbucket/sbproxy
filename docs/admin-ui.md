@@ -227,8 +227,13 @@ and remains the source of truth.
     configured origin, the first place to look when several tenants
     share one gateway.
 - **Filters:** with more than one configured origin, an origin picker
-  scopes the tiles, traffic charts, and latency percentiles to one
-  `Host`; "all origins" is the default.
+  scopes the page to one `Host`; "all origins" is the default. The
+  tiles, traffic charts, latency percentiles, and the status, method,
+  errors, cache, auth, bytes, and token panels all honor it (the AI
+  panels via the `origin` label on the attributed counters). A panel
+  whose series carry no origin dimension (provider errors, per-model
+  throughput, model-host gauges) stays an aggregate and says
+  "all origins" while a filter is active.
 - **Live control:** the Live toggle pauses and resumes sampling.
   Three consecutive failed scrapes pause it automatically and say so.
 - **Mutations:** none.
@@ -246,11 +251,13 @@ Estimated AI cost: live totals since process start, plus durable
 windowed history.
 
 - **Shows:** `GET /metrics` for live totals and breakdowns (by model,
-  provider, API key, team, project; attribution partitions are
-  omitted from a breakdown when the label is absent, not shown as a
-  zero row), `GET /api/usage/spend?window=...&group_by=...` for the
+  provider, origin, API key, team, project; attribution partitions
+  are omitted from a breakdown when the label is absent, not shown as
+  a zero row), `GET /api/usage/spend?window=...&group_by=...` for the
   durable rollup history chart, which survives a restart unlike the
-  live counters.
+  live counters. History groups by provider, model, tenant, team,
+  API key, project, or origin; rollup rows recorded by builds that
+  predate the origin dimension fold into the unattributed segment.
 - **Mutations:** none.
 - **Empty/error notes:** no AI traffic yet renders an empty state; a
   `window`/`group_by` combination with no matching rollup data renders
@@ -266,7 +273,10 @@ and provider health from the live counters.
 - **Shows:** `GET /metrics`, specifically the TTFT/TPOT/throughput
   histograms, per-provider request/error counts and error rate,
   failover reasons, cascade-tier outcomes, and router-strategy
-  decisions.
+  decisions. When context-compression policies are active, a
+  compression section reports compressed requests, tokens and cost
+  saved, per-lever savings, request outcomes, and the average
+  compression ratio per lever.
 - **Mutations:** none.
 - **Empty/error notes:** no AI traffic renders an empty state
   explaining that panels light up after the first request through an
@@ -338,7 +348,10 @@ invalidation and semantic-cache debugging.
 - **Shows:** `GET /admin/cache` (enabled, backend, whether prefix
   purge is supported), `GET /admin/cache/semantic` (recent embedding
   cache hit/miss decisions per AI origin), `GET /metrics` (cache-
-  related counters shown alongside).
+  related counters shown alongside). With more than one origin in
+  play, an origin picker scopes the hit/miss tiles and the semantic
+  decisions to one origin; purge controls always act on the whole
+  backend and stay global.
 - **Mutations:** `POST /admin/cache/purge` (all / by exact key / by
   prefix; prefix purge is disabled in the UI when the backend does
   not support it), `POST /admin/cache/key-policy/evict` (one key or
@@ -482,6 +495,8 @@ browser profiles or give each node its own loopback address
 (`127.0.0.2`, `127.0.0.3`).
 
 ![Cluster page with a three-node roster, health rail, and placement summary](assets/admin-cluster.png)
+
+![The same cluster after killing node-c: the health rail marks it unhealthy and an alert reports membership as dead](assets/admin-cluster-degraded.png)
 
 ## See also
 

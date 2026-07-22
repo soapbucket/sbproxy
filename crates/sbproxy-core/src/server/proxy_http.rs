@@ -4134,6 +4134,7 @@ impl ProxyHttp for SbProxy {
             // event without a fabricated dollar figure.
             let span = tracing::Span::current();
             emit_ai_billing_event(
+                ctx.hostname.as_str(),
                 rd.surface_label,
                 &rd.provider_name,
                 Some("gpt-4o-realtime-preview".to_string()),
@@ -4337,6 +4338,7 @@ impl ProxyHttp for SbProxy {
             let outcome =
                 crate::server::access_log::ai_outcome_label(status_u16, ctx.ai_outcome.as_deref());
             sbproxy_ai::ai_metrics::record_ai_outcome_attributed(
+                ctx.hostname.as_str(),
                 ctx.ai_provider.as_deref().unwrap_or(""),
                 ctx.ai_model.as_deref().unwrap_or(""),
                 ctx.ai_surface.as_deref().unwrap_or(""),
@@ -4355,6 +4357,7 @@ impl ProxyHttp for SbProxy {
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
                     dims: sbproxy_observe::usage_rollup::RollupDims {
+                        origin: ctx.hostname.to_string(),
                         provider: ctx.ai_provider.clone().unwrap_or_default(),
                         model: ctx.ai_model.clone().unwrap_or_default(),
                         tenant: ctx.tenant_id.to_string(),
@@ -4394,6 +4397,7 @@ impl ProxyHttp for SbProxy {
                 if let Some(est) = ctx.ai_prompt_tokens_est {
                     if est > 0 {
                         sbproxy_ai::ai_metrics::record_ai_request_attributed(
+                            ctx.hostname.as_str(),
                             ctx.ai_provider.as_deref().unwrap_or(""),
                             ctx.ai_model.as_deref().unwrap_or(""),
                             ctx.ai_surface.as_deref().unwrap_or(""),

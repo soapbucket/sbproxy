@@ -13,7 +13,7 @@ import {
   histogramQuantileByLabels,
   type MetricFamily,
 } from "../lib/metrics";
-import { formatNumber } from "../lib/format";
+import { formatNumber, formatUsd } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import MiniBars from "../components/MiniBars.vue";
@@ -121,6 +121,32 @@ function rateTone(rate: number): "ok" | "warn" | "err" {
   if (rate >= 0.05) return "warn";
   return "ok";
 }
+
+// --- Context compression ---
+// The compression policies report lever activity and savings; the
+// section renders only after at least one compression request ran.
+const compressionRequests = computed(() =>
+  fam("sbproxy_ai_compression_requests_total"),
+);
+const compressionTotalRequests = computed(() => sumSamples(compressionRequests.value));
+const compressionTokensSaved = computed(() =>
+  sumSamples(fam("sbproxy_ai_compression_tokens_saved_total")),
+);
+const compressionCostSaved = computed(
+  () => sumSamples(fam("sbproxy_ai_compression_value_cost_saved_micros_total")) / 1e6,
+);
+const compressionByOutcome = computed(() =>
+  groupByLabel(compressionRequests.value, "outcome").slice(0, 6),
+);
+const compressionSavedByLever = computed(() =>
+  groupByLabel(fam("sbproxy_ai_compression_tokens_saved_total"), "lever").slice(0, 8),
+);
+const compressionRatioByLever = computed(() =>
+  histogramAvgByLabel(fam("sbproxy_ai_compression_ratio"), "lever")
+    .map((r) => ({ key: r.key, value: Math.round(r.value * 100) / 100 }))
+    .slice(0, 8),
+);
+const hasCompression = computed(() => compressionTotalRequests.value > 0);
 </script>
 
 <template>
@@ -246,6 +272,37 @@ function rateTone(rate: number): "ok" | "warn" | "err" {
       <h2>Request latency p95 by surface</h2>
       <MiniBars :items="latencyBySurface" :format="formatSecs" />
     </section>
+
+    <section class="panel" v-if="hasCompression">
+      <h2>Context compression</h2>
+      <div class="tiles">
+        <StatCard
+          label="compressed requests"
+          :value="formatNumber(compressionTotalRequests)"
+          tone="accent"
+        />
+        <StatCard label="tokens saved" :value="formatNumber(compressionTokensSaved)" />
+        <StatCard
+          v-if="compressionCostSaved > 0"
+          label="cost saved"
+          :value="formatUsd(compressionCostSaved)"
+        />
+      </div>
+      <div class="cols">
+        <div v-if="compressionSavedByLever.length">
+          <h3>Tokens saved by lever</h3>
+          <MiniBars :items="compressionSavedByLever" />
+        </div>
+        <div v-if="compressionByOutcome.length">
+          <h3>Requests by outcome</h3>
+          <MiniBars :items="compressionByOutcome" />
+        </div>
+        <div v-if="compressionRatioByLever.length">
+          <h3>Avg compression ratio by lever</h3>
+          <MiniBars :items="compressionRatioByLever" />
+        </div>
+      </div>
+    </section>
   </template>
 </template>
 
@@ -255,6 +312,15 @@ function rateTone(rate: number): "ok" | "warn" | "err" {
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
   margin-bottom: 20px;
+}
+.cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--sb-space-5);
+}
+.cols h3 {
+  font-size: 0.85rem;
+  margin-bottom: var(--sb-space-3);
 }
 .panel {
   margin-bottom: 24px;

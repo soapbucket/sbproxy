@@ -1496,6 +1496,7 @@ pub(super) fn cached_message_signature_verifier(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_ai_billing_event(
+    origin: &str,
     surface_label: &str,
     provider_name: &str,
     model: Option<String>,
@@ -1534,6 +1535,7 @@ pub(super) fn emit_ai_billing_event(
         sbproxy_ai::tracing_spans::record_token_usage(ai_span, input_tokens, output_tokens);
     }
     sbproxy_ai::ai_metrics::record_ai_request_attributed(
+        origin,
         provider_name,
         model_label,
         surface_label,
@@ -1585,6 +1587,7 @@ pub(super) fn emit_ai_billing_event(
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             dims: sbproxy_observe::usage_rollup::RollupDims {
+                origin: origin.to_string(),
                 provider: provider_name.to_string(),
                 model: model_label.to_string(),
                 tenant: tenant_id.to_string(),
@@ -1842,6 +1845,7 @@ pub(super) fn record_cache_hit_savings(
         .and_then(serde_json::Value::as_str)
         .unwrap_or(fallback_model);
     sbproxy_ai::ai_metrics::record_ai_request_attributed(
+        origin,
         provider,
         model,
         surface,
