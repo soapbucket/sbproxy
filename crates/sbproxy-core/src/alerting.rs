@@ -77,6 +77,7 @@ async fn run(mut phase_rx: broadcast::Receiver<ExecutionPhase>, interval_secs: u
                 let readings = MetricReadings {
                     budget_utilization: budget,
                     provider_error_rate: alerting::error_burn(prev, now),
+                    provider_attempts: alerting::provider_attempt_delta(prev, now),
                 };
                 prev = now;
                 for alert in engine.evaluate(&readings) {

@@ -24,12 +24,15 @@ pub mod engine;
 pub mod error_rate;
 pub mod rate_limit;
 pub mod rules;
+pub mod runtime;
 pub mod slo;
 
 pub use channels::{Alert, AlertChannelConfig, AlertDispatcher};
 pub use engine::{
-    error_burn, sample_registry, AlertEngine, EngineConfig, MetricReadings, ProviderCounters,
+    error_burn, provider_attempt_delta, sample_registry, AlertEngine, EngineConfig, MetricReadings,
+    ProviderCounters, RuleEvaluation, RuleEvaluationState,
 };
+pub use runtime::{AlertRuntime, AlertRuntimeSnapshot};
 
 use std::sync::OnceLock;
 
