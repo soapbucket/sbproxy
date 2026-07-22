@@ -6059,6 +6059,14 @@
               "$ref": "#/definitions/RedactConfig"
             }
           ]
+        },
+        "rollup_keys": {
+          "description": "Explicit property keys copied into durable usage-rollup dimensions. Bounded to [`MAX_ROLLUP_PROPERTY_KEYS`] during config compilation.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
