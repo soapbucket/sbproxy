@@ -1,5 +1,5 @@
 # Headers reference
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-21*
 
 Every header SBproxy reads or stamps, with the config that triggers it.
 This is the single source of truth; `docs/manual.md` and the marketing
@@ -19,10 +19,10 @@ also forwarded or stripped depending on trust.
 | Header | Description | Source |
 |---|---|---|
 | `X-Request-Id` | Correlation ID. If present (and `proxy.correlation_id.enabled`, the default), its value is adopted as the request's correlation ID; otherwise the proxy mints a UUID v4. The header name is configurable via `proxy.correlation_id.header`. | `crates/sbproxy-core/src/server/request_phase.rs` |
-| `x-sb-session-id` | Caller-supplied session ULID. Captured when it parses; invalid values are dropped and counted. | `crates/sbproxy-observe/src/capture.rs` |
-| `x-sb-parent-session-id` | Caller-supplied parent session ULID for chaining agent sessions. Never auto-generated. | `crates/sbproxy-observe/src/capture.rs` |
+| `x-sb-session-id` | Caller-supplied session ULID. Captured when it parses; invalid values are dropped and counted. The admin Sessions page reconstructs only the requests still present in the in-memory ring. | `crates/sbproxy-observe/src/capture.rs` |
+| `x-sb-parent-session-id` | Caller-supplied parent session ULID for chaining agent sessions. Never auto-generated. When both sessions remain in the request ring, the admin console links their hierarchy. | `crates/sbproxy-observe/src/capture.rs` |
 | `x-sb-user-id` | Caller-supplied user identifier. First in the user-ID resolution order, ahead of the JWT `sub` claim and forward-auth headers. | `crates/sbproxy-observe/src/capture.rs` |
-| `x-sb-property-*` | Per-request session properties captured onto the request event. Length-capped, allowlist-checked, and redacted per `properties.redact`. | `crates/sbproxy-observe/src/capture.rs` |
+| `x-sb-property-*` | Per-request properties captured onto the request event and admin request ring. Length-capped, allowlist-checked, and redacted per `properties.redact`. Keys explicitly named in `properties.rollup_keys` are promoted into durable usage rollups only after redaction; arbitrary properties never become Prometheus labels. | `crates/sbproxy-observe/src/capture.rs` |
 | `x-sb-flags` | Per-request feature flags. `x-sb-flags: debug` turns on the debug response headers listed below and a DEBUG-level log line. Kill switch: `--disable-sb-flags` / `SB_DISABLE_SB_FLAGS=1`. | `crates/sbproxy-core/src/sb_flags.rs` |
 | `x-sbproxy-tag` | Caller-supplied attribution tag read by the AI dispatch path. | `crates/sbproxy-core/src/server/ai_dispatch.rs` |
 | `traceparent` / `tracestate` / `b3` / `x-b3-*` | W3C Trace Context or B3 propagation. Parsed when present; a random trace context is generated otherwise. | `crates/sbproxy-core/src/server/request_phase.rs` |

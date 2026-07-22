@@ -1,11 +1,11 @@
 # Admin API reference
 
-*Last modified: 2026-07-20*
+*Last modified: 2026-07-21*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
-lifecycle, the request log and its live stream, per-target health, spend and
-audit, config read/write and hot reload/drift, model-host catalog and
+lifecycle, the request log and its live stream, recent sessions, alert
+operations, per-target health, spend and audit, config read/write and hot reload/drift, model-host catalog and
 deployment lifecycle, the response/semantic/key-policy caches, cluster
 status and the replicated-state substrate, prompts, the chat playground, and
 the emitted OpenAPI document.
@@ -25,7 +25,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
 - [Session routes](#session-routes) - login, logout, whoami
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
-- [Read routes](#read-routes-authenticated) - request log + stream, health, spend, audit, rate-limit budget, UI settings, OpenAPI
+- [Read routes](#read-routes-authenticated) - request log + stream, alerts, health, spend, audit, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, log level
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
@@ -438,11 +438,30 @@ Response body: an array of `RequestLogEntry`:
   {
     "timestamp": "2026-05-12T10:15:32.456Z",
     "origin": "api.example.com",
-    "method": "GET",
-    "path": "/v1/orders?limit=10",
+    "method": "POST",
+    "path": "/v1/chat/completions",
     "status": 200,
     "latency_ms": 42.7,
-    "client_ip": "10.0.0.5"
+    "client_ip": "10.0.0.5",
+    "request_id": "08ad73be-...",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "session_id": "01K0SESSION0000000000000000",
+    "parent_session_id": "01K0PARENT00000000000000000",
+    "properties": {"feature": "assistant", "tier": "gold"},
+    "cache_status": "miss",
+    "retry_count": 1,
+    "failover_engaged": true,
+    "failover_from": "openai",
+    "failover_to": "anthropic",
+    "load_balancer_strategy": "lowest_latency",
+    "load_balancer_target": "anthropic",
+    "provider": "anthropic",
+    "model": "claude-sonnet-4",
+    "tokens_in": 315,
+    "tokens_out": 82,
+    "cost_usd_micros": 1840,
+    "guardrail_category": "pii",
+    "guardrail_action": "block"
   }
 ]
 ```
@@ -456,6 +475,18 @@ Response body: an array of `RequestLogEntry`:
 | `status` | int | Response status code. |
 | `latency_ms` | float | End-to-end latency in milliseconds. |
 | `client_ip` | string | Client IP as observed by the proxy. |
+| `request_id`, `trace_id` | string | Correlation identifiers when available. |
+| `session_id`, `parent_session_id` | string | Captured session ULIDs. Optional when session capture produced no value. |
+| `properties` | object | Bounded, normalized custom properties after redaction. Empty maps are omitted. |
+| `cache_status` | string | Gateway cache decision: `disabled`, `miss`, `hit`, or `semantic_hit`. |
+| `retry_count` | int | Additional upstream attempts after the first. Zero means no retry. |
+| `failover_engaged` | bool | Whether fallback or AI provider failover ran. |
+| `failover_from`, `failover_to` | string | First failed and final selected provider or target, when known. |
+| `load_balancer_strategy`, `load_balancer_target` | string | Bounded routing strategy and selected target. |
+| `provider`, `model` | string | AI provider and model when the AI gateway handled the request. |
+| `tokens_in`, `tokens_out` | int | Parsed prompt and completion tokens. |
+| `cost_usd_micros` | int | Estimated AI cost in millionths of a US dollar. |
+| `guardrail_category`, `guardrail_action` | string | Bounded guardrail outcome when a guardrail intervened. |
 
 This is an in-memory ring buffer; entries are lost when the process
 exits. For durable request logs, enable the structured access log
@@ -463,8 +494,16 @@ exits. For durable request logs, enable the structured access log
 
 Supported query parameters: `status` (exact match), `method`
 (case-insensitive), `path` (substring), `guardrail_action`,
-`guardrail_category`, `offset`, `limit` (defaults to and is clamped at
-`max_log_entries`). No parameters returns the newest entries.
+`guardrail_category`, `cache_status`, `retried`, `property_key`,
+`property_value`, `offset`, and `limit` (defaults to and is clamped at
+`max_log_entries`). `cache_status` accepts the four values listed above.
+`retried` accepts only `true` or `false`. Property matching is exact after
+URL decoding; `property_value` requires `property_key`. No parameters returns
+the newest entries.
+
+The admin UI derives its Sessions list and detail pages from this ring. Those
+pages are a recent operational view, not durable trace storage, a timing
+waterfall, or a request replay facility.
 
 ### `GET /api/requests/stream`
 
@@ -474,7 +513,8 @@ comment. `Content-Type: text/event-stream`; the connection stays open
 until the client disconnects. Handled directly by the async connection
 handler (not the blocking dispatcher) so it can own the socket for the
 stream's lifetime; requires authentication like every other route, but
-does not accept query filters — filter client-side.
+does not accept query filters. Each event has the same enriched
+`RequestLogEntry` shape as the snapshot; filter the stream client-side.
 
 ```bash
 curl -N -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/api/requests/stream"
@@ -582,7 +622,8 @@ from the live counters:
 ```
 
 Passing any of `window` (`1h`, `24h`, `7d`, `30d`), `group_by`
-(`model`, `provider`, `key`, ...), `from`, or `to` (Unix seconds)
+(`total`, `model`, `provider`, `tenant`, `team`, `api_key`, `project`,
+`origin`, or `property:<key>`), `from`, or `to` (Unix seconds)
 switches to the windowed shape served from the durable usage rollups
 (these survive a restart, unlike the process-lifetime counters):
 
@@ -591,8 +632,75 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/api/usage/spend?window=24h&group_by=model" | jq
 ```
 
+The windowed response contains `from`, `to`, `group_by`, `bucket_secs`,
+`buckets`, `totals`, and `property_keys`. `property_keys` lists the promoted
+property dimensions available in that window. A syntactically invalid or
+unavailable `property:<key>` is `400`; keys must first be configured through
+the origin's bounded `properties.rollup_keys` list.
+
 An invalid `window` value is `400`; a valid windowed request when no
 rollup store is configured is `503` naming the config knob.
+
+### `GET /api/alerts`
+
+Returns the latest secret-free alert runtime snapshot. Both `read_only` and
+`admin` operators may read it. The response is valid even when alerting is not
+configured:
+
+```json
+{
+  "enabled": true,
+  "authority": "file",
+  "read_only": true,
+  "rules": [
+    {
+      "rule": "error_rate_spike",
+      "description": "Provider error rate over the latest evaluation window",
+      "thresholds": [0.1, 0.2],
+      "minimum_samples": 10,
+      "state": "inactive",
+      "sample_count": 4
+    }
+  ],
+  "channels": [
+    {
+      "index": 0,
+      "type": "slack",
+      "target": "https://hooks.slack.com",
+      "health": {"status": "untested"}
+    }
+  ],
+  "history": []
+}
+```
+
+Rules report `inactive`, `ok`, or `firing`, their thresholds, latest reading,
+sample count, and evaluation timestamp. Provider error-rate evaluation stays
+inactive until at least 10 provider attempts contribute to the interval.
+Channels report only their type, stable index, sanitized scheme and host, or
+whether a PagerDuty routing key is configured. URLs, paths, credentials,
+headers, and routing keys are never returned. Delivery health is `untested`,
+`healthy`, or `failing`, with a bounded error summary and latest-attempt time.
+
+History retains at most 200 fired, resolved, and channel-test events for the
+life of the process. It is not durable. `authority: "file"` and
+`read_only: true` mean that `sb.yml` remains the only configuration authority.
+
+### `POST /api/alerts/test`
+
+Queues one asynchronous test delivery to a configured channel. This route
+requires the `admin` role. Browser-session callers must include their current
+`X-CSRF-Token`; HTTP Basic callers remain CSRF-exempt.
+
+```json
+{"channel_index": 0}
+```
+
+Success is `202 {"queued":true,"channel_index":0}`. A malformed body is
+`400`, an unknown index is `404`, an unavailable runtime is `409`, and a full
+bounded command queue is `503`. Poll `GET /api/alerts` until that channel's
+`health.last_attempt_at` changes to observe the delivery result. This endpoint
+tests delivery only and cannot create, edit, or delete rules or channels.
 
 ### `GET /api/audit/recent`
 

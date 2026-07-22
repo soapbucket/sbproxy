@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-21*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -1556,6 +1556,21 @@ SBproxy emits structured JSON logs to stderr. Verbosity is controlled (in preced
 
 Each access log line carries: `timestamp`, `level`, `msg`, `origin`, `method`, `path`, `status`, `latency_ms`, `client_ip`, `request_id`, `trace_id`, `cache_result`, plus three phase-timing fields (`auth_ms`, `upstream_ttfb_ms`, `response_filter_ms`) that split `latency_ms` into the parts of the pipeline that produced it. The canonical access-log schema (with optional fields and stability rules) is [access-log.md](./access-log.md); the same phase observations appear as `sbproxy_phase_duration_seconds` in [metrics-stability.md](./metrics-stability.md).
 
+### Alert operations
+
+SBproxy evaluates built-in budget-exhaustion and provider-error rules and can
+deliver state changes through webhook, Slack, PagerDuty, or process-log
+channels. Provider error rate needs at least 10 attempts in its evaluation
+window; smaller samples stay inactive instead of paging on noisy fractions.
+
+The admin Alerts page shows current rule readings, sanitized channel delivery
+health, and up to 200 fired, resolved, and test events retained for the life of
+the process. Operators can test one configured channel, but the console is not
+a rule editor: `sb.yml` remains authoritative. Channel URLs are reduced to
+scheme and host, and routing keys, headers, credentials, and URL paths never
+appear in the API or UI. See [configuration.md](configuration.md#alerting-fields)
+and [admin-api-reference.md](admin-api-reference.md#get-apialerts).
+
 ### Request envelope: properties, sessions, users
 
 SBproxy stamps every request with a typed observability envelope so downstream tools (in-process subscribers today; the enterprise ingest pipeline and portal next) can slice traffic without re-deriving fields.
@@ -1587,6 +1602,7 @@ Over-cap entries are dropped silently and counted; the request still serves a 20
 ```yaml
 properties:
   capture: true
+  rollup_keys: [environment, feature-flag]
   redact:
     keys: ["customer-email", "ssn"]
     value_regex:
@@ -1594,7 +1610,12 @@ properties:
       - '\b\d{3}-\d{2}-\d{4}\b'
 ```
 
-Captured properties feed structured logs, the in-memory event bus, and (with the enterprise ingest pipeline wired) ClickHouse. They are NOT exported as Prometheus labels: that would unbound metric cardinality.
+Captured properties feed structured logs, the in-memory request ring, and the
+event bus. Up to five explicitly configured `rollup_keys` also become durable
+usage-rollup dimensions after redaction, so Spend can group by
+`property:<key>`. Keys are lowercased and validated at config load. Promotion
+can increase rollup cardinality, which is why it is explicit and bounded.
+Properties are not exported as arbitrary Prometheus labels.
 
 #### Sessions
 
@@ -1614,6 +1635,13 @@ Format: ULID (26 chars, Crockford base32). Caller-supplied IDs survive intact; a
 | `always` | Auto-generate whenever the caller did not supply one |
 
 The proxy echoes the captured or auto-generated ID back as `X-Sb-Session-Id` on the response so stateless SDK callers can adopt it.
+
+The admin Sessions page groups the requests still present in the in-memory
+request ring, rolls up request count, tokens, cost, wall-clock duration, and
+worst status, and orders each session's calls oldest first. Parent session IDs
+form a navigable hierarchy when both sessions remain in the ring. This is a
+recent operational view, not durable trace storage, a span waterfall, or a
+request replay mechanism; restart and ring eviction remove its source rows.
 
 #### Users
 
