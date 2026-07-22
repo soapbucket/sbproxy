@@ -2244,6 +2244,10 @@ fn windowed_spend_response(
             r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|origin|property:<key>|total)"}"#.to_string(),
         );
     };
+    let requested_property_key = match &group {
+        sbproxy_observe::usage_rollup::GroupBy::Property(key) => Some(key.clone()),
+        _ => None,
+    };
     let window_secs = match window {
         None => None,
         Some(w) => match parse_spend_window(w) {
@@ -2287,6 +2291,19 @@ fn windowed_spend_response(
         .query(from, to, group, now, writer.hourly_retention_secs())
     {
         Ok(res) => {
+            if let Some(key) = requested_property_key {
+                if !res.property_keys.iter().any(|candidate| candidate == &key) {
+                    return (
+                        400,
+                        "application/json",
+                        serde_json::json!({
+                            "error": format!("unknown property key {key:?}"),
+                            "property_keys": res.property_keys,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -3909,6 +3926,14 @@ mod tests {
         assert_eq!(v["group_by"], "property:feature");
         assert_eq!(v["property_keys"], serde_json::json!(["feature"]));
         assert_eq!(v["buckets"][0]["group"], "assistant");
+
+        let (code, _, body) =
+            windowed_spend_response(Some("24h"), Some("property:unknown"), None, None);
+        assert_eq!(code, 400);
+        assert!(
+            body.contains("unknown property key"),
+            "unhelpful error: {body}"
+        );
     }
 
     #[test]
