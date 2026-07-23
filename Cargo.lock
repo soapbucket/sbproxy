@@ -8416,6 +8416,7 @@ dependencies = [
  "redis",
  "sbproxy-platform",
  "sbproxy-plugin",
+ "sbproxy-security",
  "serde",
  "serde_json",
  "sha2 0.11.0",

@@ -8,6 +8,9 @@ publish = false
 [dependencies]
 sbproxy-plugin.workspace = true
 sbproxy-platform.workspace = true
+# AES-256-GCM and HKDF for at-rest encryption of cached payloads.
+# Already in the graph; this adds no external crate.
+sbproxy-security.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

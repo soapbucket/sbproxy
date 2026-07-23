@@ -1,10 +1,12 @@
 //! Cache storage trait and backends.
 
+mod encrypted;
 mod file;
 mod memcached;
 mod memory;
 mod redis;
 
+pub use encrypted::{CacheKeyMaterial, EncryptedCacheStore};
 pub use file::{FileCacheConfig, FileCacheStore};
 pub use memcached::{MemcachedConfig, MemcachedStore};
 pub use memory::MemoryCacheStore;
