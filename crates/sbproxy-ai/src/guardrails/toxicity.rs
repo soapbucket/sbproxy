@@ -23,6 +23,9 @@ impl ToxicityGuardrail {
         for keyword in &self.keywords {
             let keyword_lower = keyword.to_lowercase();
             if lower.contains(&keyword_lower) {
+                crate::ai_metrics::record_safety_guardrail_verdict(
+                    "toxicity", "toxic", "keyword", "block",
+                );
                 return Some(GuardrailBlock {
                     name: "toxicity".to_string(),
                     reason: format!("Toxic content detected: matched keyword \"{keyword}\""),
@@ -30,6 +33,7 @@ impl ToxicityGuardrail {
             }
         }
 
+        crate::ai_metrics::record_safety_guardrail_verdict("toxicity", "none", "keyword", "allow");
         None
     }
 

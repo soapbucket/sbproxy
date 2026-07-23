@@ -1505,6 +1505,41 @@ per_surface_rate_limits:
 
 Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`, `classifier`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
 
+##### Safety guardrail modes
+
+`toxicity`, `jailbreak`, and `content_safety` default to `mode: keyword`.
+That mode preserves the existing case-insensitive substring matchers and
+requires no model. It catches only configured or built-in literal terms; it
+does not provide semantic or ML detection.
+
+Set `mode: classifier` to make one of those guardrails enforce the local
+embedding classifier. This is an explicit, fail-closed configuration choice:
+the proxy rejects an unavailable backend, an incomplete class taxonomy, or
+keyword-only fields that would otherwise be ignored. It never substitutes the
+keyword backend after classifier mode was requested.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | `keyword` or `classifier` | `keyword` | Selects the literal matcher or local classifier. |
+| `classifier` | object | required in classifier mode | Uses the same `backend`, threshold, class-example, `scope`, and `max_chars` fields as the classifier input guardrail below. Rejected in keyword mode. |
+| `blocked_categories` | list | type-specific | In classifier mode, valid only for `content_safety`, must be nonempty, and may contain `violence`, `self_harm`, `sexual`, `hate_speech`, or `illegal`. |
+| `stream_policy` | `chunk`, `close`, or `off` | mode-specific | Output classifier mode defaults to `close`, accepts `close` or `off`, and rejects `chunk`. Keyword mode retains the normal streaming default. |
+
+Classifier class maps must be exact:
+
+- `toxicity`: `toxic`, `safe`
+- `jailbreak`: `jailbreak`, `safe`
+- `content_safety`: `violence`, `self_harm`, `sexual`, `hate_speech`,
+  `illegal`, `safe`
+
+Input classifier mode defaults to `scope: last_user_message`; `full_text` is
+also available. Output classifier mode always evaluates the complete response:
+omit `scope` or set it to `full_text`. An explicit `last_user_message` output
+scope is rejected.
+
+See [Safety guardrail modes](ai-gateway.md#safety-guardrail-modes) and the
+[ai-safety-classifiers](../examples/ai-safety-classifiers/) example.
+
 ##### Classifier input guardrail
 
 `type: classifier` is input-only. It maps prompt text onto operator-defined

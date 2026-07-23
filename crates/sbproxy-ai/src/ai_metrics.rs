@@ -226,6 +226,17 @@ static AI_GUARDRAIL_BLOCKS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+static AI_SAFETY_GUARDRAIL_VERDICTS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_safety_guardrail_verdicts_total",
+            "Built-in safety guardrail evaluations by class, backend, and verdict"
+        ),
+        &["guardrail", "class", "backend", "verdict"]
+    )
+    .unwrap()
+});
+
 static AI_CACHE_RESULTS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -703,6 +714,46 @@ pub fn record_provider_error(provider: &str, error_kind: &str) {
 /// Record a guardrail block.
 pub fn record_guardrail_block(category: &str) {
     AI_GUARDRAIL_BLOCKS.with_label_values(&[category]).inc();
+}
+
+/// Record one built-in safety guardrail evaluation.
+///
+/// Every label is normalized to a closed vocabulary before it reaches
+/// Prometheus. Classifier implementations and configuration can therefore
+/// never turn model-produced labels into unbounded metric cardinality.
+pub fn record_safety_guardrail_verdict(guardrail: &str, class: &str, backend: &str, verdict: &str) {
+    let guardrail = match guardrail {
+        "toxicity" | "jailbreak" | "content_safety" => guardrail,
+        _ => "unknown",
+    };
+    let class = match class {
+        "toxic" | "jailbreak" | "violence" | "self_harm" | "sexual" | "hate_speech" | "illegal"
+        | "safe" | "none" | "unknown" => class,
+        _ => "unknown",
+    };
+    let backend = match backend {
+        "keyword" | "classifier" => backend,
+        _ => "unknown",
+    };
+    let verdict = match verdict {
+        "allow" | "block" => verdict,
+        _ => "unknown",
+    };
+    AI_SAFETY_GUARDRAIL_VERDICTS
+        .with_label_values(&[guardrail, class, backend, verdict])
+        .inc();
+}
+
+#[cfg(test)]
+pub(crate) fn safety_guardrail_verdict_value(
+    guardrail: &str,
+    class: &str,
+    backend: &str,
+    verdict: &str,
+) -> f64 {
+    AI_SAFETY_GUARDRAIL_VERDICTS
+        .with_label_values(&[guardrail, class, backend, verdict])
+        .get()
 }
 
 // --- Context-poisoning guardrail metrics ---
@@ -1652,6 +1703,14 @@ mod tests {
             .iter()
             .find(|f| f.name() == "sbproxy_ai_guardrail_blocks_total");
         assert!(blocks.is_some());
+    }
+
+    #[test]
+    fn safety_guardrail_verdict_labels_are_closed() {
+        let before = safety_guardrail_verdict_value("jailbreak", "unknown", "unknown", "unknown");
+        record_safety_guardrail_verdict("jailbreak", "operator-value", "remote", "deny");
+        let after = safety_guardrail_verdict_value("jailbreak", "unknown", "unknown", "unknown");
+        assert_eq!(after, before + 1.0);
     }
 
     #[test]

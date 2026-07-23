@@ -11,6 +11,10 @@
 #   - schema: the response must contain a top-level JSON object with
 #     a "summary" string and a "tags" array.
 #
+# Keyword mode is the zero-dependency default. It is literal substring
+# matching, not ML classification; see examples/ai-safety-classifiers for
+# the explicit local-classifier mode.
+#
 # Each guardrail returns a block result on a hit, which the gateway
 # converts into a 4xx response and increments
 # sbproxy_ai_guardrail_blocks_total{category=...}.

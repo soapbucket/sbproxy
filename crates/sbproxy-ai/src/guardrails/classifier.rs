@@ -138,7 +138,7 @@ impl ClassifierConfig {
             .map_or(text, |(end, _)| &text[..end])
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let ClassifierBackendConfig::Embedding(backend) = &self.backend;
         if backend.model_path.trim().is_empty() {
             return Err(anyhow!(

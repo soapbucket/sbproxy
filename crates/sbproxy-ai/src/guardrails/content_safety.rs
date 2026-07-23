@@ -66,6 +66,12 @@ impl ContentSafetyGuardrail {
             if let Some(keywords) = CATEGORY_KEYWORDS.get(category.as_str()) {
                 for keyword in keywords {
                     if lower.contains(keyword) {
+                        crate::ai_metrics::record_safety_guardrail_verdict(
+                            "content_safety",
+                            category,
+                            "keyword",
+                            "block",
+                        );
                         return Some(GuardrailBlock {
                             name: "content_safety".to_string(),
                             reason: format!("Content safety violation: category \"{category}\""),
@@ -75,6 +81,12 @@ impl ContentSafetyGuardrail {
             }
         }
 
+        crate::ai_metrics::record_safety_guardrail_verdict(
+            "content_safety",
+            "none",
+            "keyword",
+            "allow",
+        );
         None
     }
 

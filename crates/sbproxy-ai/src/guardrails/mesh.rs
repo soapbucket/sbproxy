@@ -113,7 +113,8 @@ fn cost_rank(g: &Guardrail) -> u8 {
         | Guardrail::ContentSafety(_)
         | Guardrail::Injection(_)
         | Guardrail::AgentAlignment(_)
-        | Guardrail::Classifier(_) => 1,
+        | Guardrail::Classifier(_)
+        | Guardrail::SafetyClassifier(_) => 1,
     }
 }
 

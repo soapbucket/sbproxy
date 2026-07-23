@@ -144,6 +144,11 @@ impl StreamGuardSession {
                         tail_keep = tail_keep.max(g.max_pattern_len());
                         window.push(i);
                     }
+                    // A full-text classifier is never safe to evaluate on
+                    // partial deltas. Config compilation maps an omitted
+                    // policy to Close and rejects an explicit Chunk; this
+                    // fallback also keeps hand-built test pipelines safe.
+                    Guardrail::SafetyClassifier(_) => at_close.push(i),
                     Guardrail::AgentAlignment(_) => tool_call.push(i),
                     // regex / pii / schema / context_poisoning: per
                     // decoded delta, as the per-chunk path always did.

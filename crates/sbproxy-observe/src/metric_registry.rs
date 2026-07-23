@@ -817,6 +817,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_safety_guardrail_verdicts_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_safety_guardrail_verdict"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["guardrail", "class", "backend", "verdict"],
+        description: "Built-in safety guardrail evaluations by class, backend, and verdict.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_inter_token_latency_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_inter_token_latency"),

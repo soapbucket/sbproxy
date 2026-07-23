@@ -210,7 +210,7 @@ Per-request provider, model, token counts, and estimated USD cost land on the `s
 
 ### Guardrails, policy, and resilience
 
-The AI path composes with input/output guardrails (nine detector types plus an opt-in [guardrail mesh](ai-guardrail-mesh.md) that fuses verdicts under a quorum rule), a one-expression [AI policy plane](ai-policy-cel.md) over the pipeline's own signals, and [LLM-aware resilience](ai-llm-aware-resilience.md) that classifies upstream failures into typed causes and retries per class. Each link is the owning reference; [ai-gateway.md](ai-gateway.md) carries the end-to-end picture.
+The AI path composes with input/output guardrails (ten detector types plus an opt-in [guardrail mesh](ai-guardrail-mesh.md) that fuses verdicts under a quorum rule), a one-expression [AI policy plane](ai-policy-cel.md) over the pipeline's own signals, and [LLM-aware resilience](ai-llm-aware-resilience.md) that classifies upstream failures into typed causes and retries per class. Toxicity, jailbreak, and content-safety detection default to zero-dependency keyword matching and offer an explicit local-classifier mode; the [safety mode contract](ai-gateway.md#safety-guardrail-modes) states the limits of each. Each link is the owning reference; [ai-gateway.md](ai-gateway.md) carries the end-to-end picture.
 
 ---
 

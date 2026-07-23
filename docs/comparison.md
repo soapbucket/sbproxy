@@ -114,7 +114,7 @@ SBproxy reaches 200+ models through 66 native providers behind one OpenAI-compat
 | Scripting | CEL + Lua + WASM + JS | No |
 | Rate limiting | Built-in (node-local; cluster-wide needs a shared backend) | Built-in |
 | Response caching | Built-in (memory, file, memcached, redis) | 7 backends |
-| Guardrails | 9 built-in types (PII, injection, ...) | External integrations |
+| Guardrails | 10 built-in types (PII, injection, ...) | External integrations |
 | P99 proxy overhead | < 1 ms | 240-1200 ms |
 
 Choose LiteLLM if you only need an AI gateway and want the broadest provider coverage out

@@ -233,6 +233,31 @@ is required to prevent them from blocking. The complete configuration and
 model download commands are in
 [ai-classifier-routing](../examples/ai-classifier-routing/).
 
+## Enable classifier-backed safety enforcement
+
+The `toxicity`, `jailbreak`, and `content_safety` guardrails can use the same
+in-process embedding backend for enforcing verdicts. Set
+`mode: classifier` and nest the classifier configuration under
+`classifier:`. Unlike the routing-only `type: classifier` entry, these modes
+block when their configured unsafe class wins.
+
+Classifier mode is never an automatic upgrade. Keyword mode remains the
+zero-dependency default, and it is a literal substring matcher. When
+classifier mode is explicit, the model and tokenizer must be usable while the
+candidate AI action is compiled; otherwise publication fails instead of
+quietly weakening the guardrail.
+
+The three guardrails use separate closed class taxonomies but share the
+process-level model cache. Multiple entries that point at the same resolved
+model and tokenizer therefore load one embedder while maintaining independent
+centroids, thresholds, and verdicts. `content_safety` also requires a
+nonempty `blocked_categories` subset.
+
+For a configuration covering input scope, output streaming behavior,
+taxonomies, and metrics, see
+[ai-safety-classifiers](../examples/ai-safety-classifiers/). The normative
+field table is [Safety guardrail modes](configuration.md#safety-guardrail-modes).
+
 ## Metrics and usage tracking
 
 Local inference and the semantic cache emit `sbproxy_*` metrics, attributed per
@@ -243,6 +268,7 @@ tenant where relevant (see [metrics-stability.md](./metrics-stability.md)):
 | `sbproxy_semantic_cache_results_total{tenant,origin,source,result}` | Cache hit / miss / error rate by embedding source |
 | `sbproxy_inference_requests_total{kind,backend,model,result}` | Embed and classify call counts |
 | `sbproxy_inference_duration_seconds{kind,backend,model}` | Embed and classify latency |
+| `sbproxy_ai_safety_guardrail_verdicts_total{guardrail,class,backend,verdict}` | Safety verdicts and whether they came from the keyword or classifier path |
 | `sbproxy_ai_tokens_saved_total{tenant,origin,model,kind}` | Tokens a cache hit avoided |
 | `sbproxy_ai_cost_saved_micros_total{tenant,origin,model}` | Micro-USD a cache hit avoided |
 

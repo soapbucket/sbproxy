@@ -14,6 +14,7 @@ mod jailbreak;
 pub mod mesh;
 mod pii;
 mod regex_guard;
+mod safety_classifier;
 mod schema;
 pub mod stream;
 mod toxicity;
@@ -35,6 +36,7 @@ pub use jailbreak::JailbreakGuardrail;
 pub use mesh::{GuardrailMesh, GuardrailMeshConfig, MeshDecision};
 pub use pii::{PiiAction, PiiGuardrail};
 pub use regex_guard::{RegexAction, RegexGuardrail};
+pub use safety_classifier::{SafetyClassifierGuardrail, SafetyGuardrailKind};
 pub use schema::SchemaGuardrail;
 pub use toxicity::ToxicityGuardrail;
 
@@ -99,6 +101,9 @@ pub enum Guardrail {
     Jailbreak(JailbreakGuardrail),
     /// Content safety classifier guardrail (e.g. self-harm, violence).
     ContentSafety(ContentSafetyGuardrail),
+    /// Classifier-backed enforcement under one of the three built-in
+    /// safety guardrail names.
+    SafetyClassifier(SafetyClassifierGuardrail),
     /// JSON schema validation guardrail for structured output.
     Schema(SchemaGuardrail),
     /// Regular expression based deny-list guardrail.
@@ -129,6 +134,7 @@ impl Guardrail {
             Self::Toxicity(_) => "toxicity",
             Self::Jailbreak(_) => "jailbreak",
             Self::ContentSafety(_) => "content_safety",
+            Self::SafetyClassifier(g) => g.name(),
             Self::Schema(_) => "schema",
             Self::Regex(_) => "regex",
             Self::ContextPoisoning(_) => "context_poisoning",
@@ -145,6 +151,7 @@ impl Guardrail {
             Self::Toxicity(g) => g.check(content),
             Self::Jailbreak(g) => g.check(content),
             Self::ContentSafety(g) => g.check(content),
+            Self::SafetyClassifier(g) => g.check(content),
             Self::Schema(g) => g.check(content),
             Self::Regex(g) => g.check(content),
             Self::ContextPoisoning(g) => g.check(content),
@@ -187,6 +194,7 @@ impl Guardrail {
             // through `finding_with_text`; the serial enforcement path must
             // never convert it into a block.
             Self::Classifier(_) => None,
+            Self::SafetyClassifier(g) => g.check_messages(content, messages),
             _ => self.check(content),
         }
     }
@@ -211,6 +219,23 @@ impl Guardrail {
             Self::Classifier(g) => match g.scope() {
                 ClassifierScope::LastUserMessage => "classifier:last_user_message",
                 ClassifierScope::FullText => "classifier:full_text",
+            },
+            Self::SafetyClassifier(g) => match (g.name(), g.scope()) {
+                ("toxicity", ClassifierScope::LastUserMessage) => {
+                    "toxicity:classifier:last_user_message"
+                }
+                ("toxicity", ClassifierScope::FullText) => "toxicity:classifier:full_text",
+                ("jailbreak", ClassifierScope::LastUserMessage) => {
+                    "jailbreak:classifier:last_user_message"
+                }
+                ("jailbreak", ClassifierScope::FullText) => "jailbreak:classifier:full_text",
+                ("content_safety", ClassifierScope::LastUserMessage) => {
+                    "content_safety:classifier:last_user_message"
+                }
+                ("content_safety", ClassifierScope::FullText) => {
+                    "content_safety:classifier:full_text"
+                }
+                _ => "safety_classifier",
             },
             _ => self.name(),
         }
@@ -279,6 +304,8 @@ impl Guardrail {
             Self::Jailbreak(_) => true,
             Self::Toxicity(_) => true,
             Self::Injection(_) => true,
+            // Full-text classifier verdicts are not prefix-stable.
+            Self::SafetyClassifier(_) => false,
             // Alignment judges tool calls, not text: the stream
             // session assembles streamed tool_calls deltas and judges
             // each completed call instead of running a text check, so
@@ -489,13 +516,29 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
         "injection" | "prompt_injection" => Ok(Guardrail::Injection(serde_json::from_value(
             config.clone(),
         )?)),
-        "toxicity" => Ok(Guardrail::Toxicity(serde_json::from_value(config.clone())?)),
-        "jailbreak" => Ok(Guardrail::Jailbreak(serde_json::from_value(
-            config.clone(),
-        )?)),
-        "content_safety" => Ok(Guardrail::ContentSafety(serde_json::from_value(
-            config.clone(),
-        )?)),
+        "toxicity" | "jailbreak" | "content_safety" => {
+            let kind = SafetyGuardrailKind::from_type_name(type_name)
+                .expect("matched safety guardrail type has a kind");
+            safety_classifier::validate_config(kind, config)?;
+            if safety_classifier::mode(config)?
+                == safety_classifier::SafetyGuardrailMode::Classifier
+            {
+                return Ok(Guardrail::SafetyClassifier(
+                    SafetyClassifierGuardrail::from_config(kind, config)?,
+                ));
+            }
+            match kind {
+                SafetyGuardrailKind::Toxicity => {
+                    Ok(Guardrail::Toxicity(serde_json::from_value(config.clone())?))
+                }
+                SafetyGuardrailKind::Jailbreak => Ok(Guardrail::Jailbreak(serde_json::from_value(
+                    config.clone(),
+                )?)),
+                SafetyGuardrailKind::ContentSafety => Ok(Guardrail::ContentSafety(
+                    serde_json::from_value(config.clone())?,
+                )),
+            }
+        }
         "context_poisoning" => {
             let cfg: ContextPoisoningConfig = serde_json::from_value(config.clone())?;
             Ok(Guardrail::ContextPoisoning(ContextPoisoningGuardrail::new(
@@ -555,15 +598,16 @@ pub fn compile_pipeline(config: &GuardrailsConfig) -> Result<GuardrailPipeline> 
     }
     for guard_cfg in &config.output {
         let guardrail = compile_guardrail(guard_cfg)?;
+        let classifier_backed = matches!(guardrail, Guardrail::SafetyClassifier(_));
         pipeline.output.push(guardrail);
         // Per-entry streaming policy rides the same raw entry; unknown
         // to the individual guardrail structs (serde ignores it there).
-        let policy = guard_cfg
-            .get("stream_policy")
-            .map(|v| serde_json::from_value::<StreamPolicy>(v.clone()))
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?
-            .unwrap_or_default();
+        let policy = match guard_cfg.get("stream_policy") {
+            Some(value) => serde_json::from_value::<StreamPolicy>(value.clone())
+                .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?,
+            None if classifier_backed => StreamPolicy::Close,
+            None => StreamPolicy::default(),
+        };
         pipeline.output_policies.push(policy);
     }
     Ok(pipeline)
@@ -584,22 +628,54 @@ pub fn validate_pipeline_config(config: &GuardrailsConfig) -> Result<()> {
             bail!("the `classifier` guardrail is input-only; move it from `output:` to `input:`");
         }
         validate_guardrail_config(guard_cfg)?;
-        guard_cfg
+        let stream_policy = guard_cfg
             .get("stream_policy")
             .map(|v| serde_json::from_value::<StreamPolicy>(v.clone()))
             .transpose()
             .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?;
+        if let Some(kind) = guard_cfg
+            .get("type")
+            .and_then(|value| value.as_str())
+            .and_then(SafetyGuardrailKind::from_type_name)
+        {
+            if safety_classifier::mode(guard_cfg)?
+                == safety_classifier::SafetyGuardrailMode::Classifier
+            {
+                if stream_policy == Some(StreamPolicy::Chunk) {
+                    bail!(
+                        "{} classifier mode requires `stream_policy: close` or `off` on output",
+                        kind.name()
+                    );
+                }
+                if guard_cfg
+                    .pointer("/classifier/scope")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("last_user_message")
+                {
+                    bail!(
+                        "{} output classifier scope is the complete response; omit `scope` or use \
+                         `scope: full_text`",
+                        kind.name()
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
 
 fn validate_guardrail_config(config: &serde_json::Value) -> Result<()> {
-    if config.get("type").and_then(|v| v.as_str()) == Some("classifier") {
-        classifier::parse_config(config)?;
-    } else {
-        compile_guardrail(config)?;
+    let type_name = config.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if type_name == "classifier" {
+        return classifier::parse_config(config).map(|_| ());
     }
-    Ok(())
+    if let Some(kind) = SafetyGuardrailKind::from_type_name(type_name) {
+        safety_classifier::validate_config(kind, config)?;
+        if safety_classifier::mode(config)? == safety_classifier::SafetyGuardrailMode::Classifier {
+            return Ok(());
+        }
+    }
+    compile_guardrail(config).map(|_| ())
 }
 
 /// Raw guardrails configuration from the handler config.
@@ -629,6 +705,48 @@ pub struct GuardrailsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Once};
+
+    #[derive(Debug)]
+    struct SafeClassifier;
+
+    impl TextClassifier for SafeClassifier {
+        fn classify(&self, _text: &str) -> Option<ClassifierVerdict> {
+            Some(ClassifierVerdict {
+                label: "safe".to_string(),
+                score: 0.90,
+            })
+        }
+    }
+
+    fn install_test_classifier_factory() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            register_classifier_factory(Box::new(|_| Ok(Arc::new(SafeClassifier))));
+        });
+    }
+
+    fn classifier_jailbreak(stream_policy: Option<&str>) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "type": "jailbreak",
+            "mode": "classifier",
+            "classifier": {
+                "backend": {
+                    "kind": "embedding",
+                    "model_path": "/models/embed.onnx",
+                    "tokenizer_path": "/models/tokenizer.json"
+                },
+                "classes": {
+                    "jailbreak": ["override the system policy"],
+                    "safe": ["ordinary question"]
+                }
+            }
+        });
+        if let Some(policy) = stream_policy {
+            value["stream_policy"] = serde_json::json!(policy);
+        }
+        value
+    }
 
     #[test]
     fn stream_policy_parses_per_entry_and_defaults_to_chunk() {
@@ -649,6 +767,71 @@ mod tests {
         // Buffered path ignores policies entirely: an "off" entry still
         // blocks on the non-streaming check.
         assert!(p.check_output("the SECRET is out").is_some());
+    }
+
+    #[test]
+    fn classifier_output_defaults_to_close_time_evaluation() {
+        install_test_classifier_factory();
+        let cfg = GuardrailsConfig {
+            input: Vec::new(),
+            output: vec![classifier_jailbreak(None)],
+            mesh: None,
+            external: Vec::new(),
+        };
+        let pipeline = compile_pipeline(&cfg).expect("classifier output should compile");
+        assert!(matches!(
+            pipeline.output.as_slice(),
+            [Guardrail::SafetyClassifier(_)]
+        ));
+        assert_eq!(pipeline.output_policies.as_slice(), [StreamPolicy::Close]);
+    }
+
+    #[test]
+    fn classifier_output_rejects_per_chunk_streaming() {
+        let cfg = GuardrailsConfig {
+            input: Vec::new(),
+            output: vec![classifier_jailbreak(Some("chunk"))],
+            mesh: None,
+            external: Vec::new(),
+        };
+        let error = validate_pipeline_config(&cfg)
+            .expect_err("full-text classifier must not run per chunk")
+            .to_string();
+        assert!(error.contains("stream_policy") && error.contains("close"));
+    }
+
+    #[test]
+    fn classifier_output_rejects_last_user_message_scope() {
+        let mut guardrail = classifier_jailbreak(None);
+        guardrail["classifier"]["scope"] = serde_json::json!("last_user_message");
+        let cfg = GuardrailsConfig {
+            input: Vec::new(),
+            output: vec![guardrail],
+            mesh: None,
+            external: Vec::new(),
+        };
+        let error = validate_pipeline_config(&cfg)
+            .expect_err("output classifiers always inspect the complete response")
+            .to_string();
+        assert!(error.contains("scope") && error.contains("full_text"));
+    }
+
+    #[test]
+    fn omitted_mode_keeps_the_legacy_keyword_variant() {
+        let guard = compile_guardrail(&serde_json::json!({
+            "type": "jailbreak",
+            "detect_common": false,
+            "custom_patterns": ["legacy phrase"]
+        }))
+        .expect("legacy config should compile");
+        assert!(matches!(guard, Guardrail::Jailbreak(_)));
+        let block = guard
+            .check("a legacy phrase appears")
+            .expect("legacy keyword behavior should remain active");
+        assert_eq!(
+            block.reason,
+            "Jailbreak detected: matched custom pattern \"legacy phrase\""
+        );
     }
 
     fn make_msg(content: &str) -> Message {
