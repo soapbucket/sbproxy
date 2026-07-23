@@ -1197,6 +1197,19 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
+    if config_file
+        .proxy
+        .http3
+        .as_ref()
+        .is_some_and(|http3| http3.enabled)
+    {
+        anyhow::bail!(
+            "config compile: proxy.http3.enabled=true is not supported because HTTP/3 is not \
+             served by this build. Set `enabled: false` or remove the `http3` block. Native \
+             HTTP/3 support is tracked in WOR-1969."
+        );
+    }
+
     // WOR-1818: report interpolation leftovers. An unset `${VAR}` stays
     // literal, which for most fields degrades into a confusing runtime
     // failure. Warn once, listing every remaining reference with its
@@ -2085,6 +2098,70 @@ origins:
                 "{reachable} reaches beyond loopback"
             );
         }
+    }
+
+    #[test]
+    fn http3_enabled_is_rejected_because_it_is_not_served() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  http3:
+    enabled: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+
+        let error = compile_config(yaml)
+            .err()
+            .expect("proxy.http3.enabled=true must fail config compilation");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("proxy.http3.enabled")
+                && message.contains("not served")
+                && message.contains("WOR-1969"),
+            "error must name the unsupported setting, explain that it is not served, and point \
+             to the implementation ticket: {message}"
+        );
+    }
+
+    #[test]
+    fn http3_explicitly_disabled_remains_valid() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  http3:
+    enabled: false
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+
+        let compiled = compile_config(yaml).expect("disabled HTTP/3 config remains valid");
+        assert_eq!(
+            compiled.server.http3.as_ref().map(|config| config.enabled),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn http3_omitted_remains_valid() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+
+        let compiled = compile_config(yaml).expect("omitted HTTP/3 config remains valid");
+        assert!(compiled.server.http3.is_none());
     }
 
     // WOR-1140: unknown-config-key handling.

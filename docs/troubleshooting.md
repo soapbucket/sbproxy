@@ -1,5 +1,5 @@
 # Troubleshooting
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-22*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -287,10 +287,10 @@ Check:
 
 ## HTTP/3 requests fall back to HTTP/2
 
-Cause: HTTP/3 is currently disabled until native QUIC support lands in Pingora. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
+Cause: HTTP/3 is not served by this build. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
 
 Check:
-- The `proxy.http3` block still parses, but it is inert. Setting `enabled: true` only logs a warning and starts no listener, so the absence of an `Alt-Svc: h3` header on responses is expected.
+- Config compilation rejects `proxy.http3.enabled: true` and references WOR-1969. Remove the block or set `enabled: false`.
 - If you need a UDP/QUIC path today, terminate HTTP/3 at an upstream edge or CDN and forward HTTP/2 to SBproxy.
 
 ## A local model will not serve

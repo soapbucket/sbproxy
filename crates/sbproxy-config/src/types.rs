@@ -536,12 +536,11 @@ pub struct ProxyServerConfig {
     /// overrides the manual `tls_cert_file` / `tls_key_file` pair.
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
-    /// Optional HTTP/3 (QUIC) listener configuration.
+    /// Reserved HTTP/3 (QUIC) listener configuration.
     ///
-    /// Temporarily inert: HTTP/3 is disabled until native QUIC support lands
-    /// in the underlying proxy engine. The field still parses so existing
-    /// configs keep loading, but enabling it only logs a warning and does not
-    /// start a listener.
+    /// The block remains in the schema for forward compatibility. Omission or
+    /// `enabled: false` compiles, but `enabled: true` is rejected because this
+    /// build does not serve HTTP/3. Native support is tracked in WOR-1969.
     #[serde(default)]
     pub http3: Option<Http3Config>,
     /// Metrics collection settings, including cardinality limiting.
@@ -3870,15 +3869,15 @@ pub struct AlertChannelConfig {
 
 /// HTTP/3 (QUIC) configuration.
 ///
-/// Temporarily inert: HTTP/3 is disabled until native QUIC support lands in
-/// the underlying proxy engine. These fields still parse, but the listener is
-/// not started; enabling it logs a warning instead.
+/// The shape is reserved for forward compatibility. The config compiler
+/// accepts an omitted or disabled block, but rejects `enabled: true` because
+/// this build does not serve HTTP/3. Native support is tracked in WOR-1969.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Http3Config {
     /// Whether to enable the HTTP/3 (QUIC) listener.
     ///
-    /// Currently ignored: HTTP/3 is temporarily disabled (see the struct
-    /// docs). Setting this to `true` logs a warning and starts no listener.
+    /// Must remain `false` in this build. Setting it to `true` fails config
+    /// compilation because HTTP/3 is not served.
     #[serde(default)]
     pub enabled: bool,
     /// Maximum number of concurrent QUIC streams per connection.

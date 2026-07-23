@@ -240,7 +240,7 @@ proxy:
 | `tls_cert_file` | string | | Path to PEM-encoded TLS certificate. Ignored when `acme` is configured. |
 | `tls_key_file` | string | | Path to PEM-encoded TLS private key. |
 | `acme` | object | | ACME (auto-TLS) block. Overrides manual cert/key when set. See [ACME / auto TLS](#acme--auto-tls). |
-| `http3` | object | | HTTP/3 (QUIC) listener config. Currently inert; see [HTTP/3 fields](#http3-fields). |
+| `http3` | object | | Reserved HTTP/3 (QUIC) listener config. Enabling it is rejected; see [HTTP/3 fields](#http3-fields). |
 | `metrics` | object | | Metrics tuning, including label cardinality limits. |
 | `alerting` | object | | Alert notification channels. |
 | `admin` | object | | Embedded read-only admin / stats API server. |
@@ -283,13 +283,13 @@ proxy:
 
 ### HTTP/3 fields
 
-HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `http3` block still parses, but no QUIC listener starts and setting `enabled: true` only logs a warning. The fields below are documented for forward compatibility; they have no runtime effect today.
+HTTP/3 is not served by this build. The `http3` shape is retained for forward compatibility: omitting the block or setting `enabled: false` compiles, while `enabled: true` fails config compilation with an actionable error referencing WOR-1969. The remaining fields are reserved and have no runtime effect while the block is disabled.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | Enable the HTTP/3 (QUIC) listener. Currently inert; no listener starts. |
-| `max_streams` | int | 100 | Maximum concurrent QUIC streams per connection. Currently inert. |
-| `idle_timeout_secs` | int | 30 | Idle timeout for QUIC connections. Currently inert. |
+| `enabled` | bool | false | Reserved activation flag. Must remain false in this build. |
+| `max_streams` | int | 100 | Reserved maximum concurrent QUIC streams per connection. |
+| `idle_timeout_secs` | int | 30 | Reserved idle timeout for QUIC connections. |
 
 ### Admin fields
 

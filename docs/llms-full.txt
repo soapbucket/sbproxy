@@ -12791,7 +12791,7 @@ Next: the [manual](manual.md), [architecture](architecture.md), [performance](pe
 
 ## Config stability tiers
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-22*
 
 Stability guarantees for every field in `sb.yml`. Check a field's tier before relying on it in production.
 
@@ -12825,11 +12825,11 @@ An `alpha` field is experimental.
 
 ### `disabled`
 
-A `disabled` field still parses but has no runtime effect today.
+A `disabled` field is retained in the schema but cannot activate runtime behavior today.
 
-- The field is accepted by the config loader so existing configs keep loading.
-- No code path acts on the value; setting it does nothing beyond an optional warning log.
-- Currently applies to the `http3` block: HTTP/3 is temporarily disabled until native QUIC support lands in Pingora.
+- An omitted block or its disabled value remains valid for config compatibility.
+- Attempting to enable unavailable behavior fails config compilation instead of being ignored.
+- Currently applies to the `http3` block. Native HTTP/3 support is tracked in WOR-1969.
 
 ---
 
@@ -12859,7 +12859,7 @@ A `disabled` field still parses but has no runtime effect today.
 | `tls_cert_file` | string | - | **stable** | Path to PEM cert for manual TLS. |
 | `tls_key_file` | string | - | **stable** | Path to PEM key for manual TLS. |
 | `acme` | object | - | **beta** | Automatic TLS via ACME. |
-| `http3` | object | - | **disabled** | HTTP/3 (QUIC) listener. Currently inert. |
+| `http3` | object | - | **disabled** | Reserved HTTP/3 (QUIC) listener shape. `enabled: true` is rejected. |
 
 ### `proxy.acme` - AcmeConfig
 
@@ -12875,13 +12875,13 @@ A `disabled` field still parses but has no runtime effect today.
 
 ### `proxy.http3` - Http3Config
 
-HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. These fields still parse, but no QUIC listener starts and setting `enabled: true` only logs a warning.
+HTTP/3 is not served by this build. The block is retained for forward compatibility: omission or `enabled: false` compiles, while `enabled: true` fails config compilation with a reference to WOR-1969.
 
 | Field | Type | Default | Stability | Notes |
 |---|---|---|---|---|
-| `enabled` | boolean | false | **disabled** | Enable QUIC listener. Currently inert; no listener starts. |
-| `max_streams` | integer | 100 | **disabled** | Max concurrent QUIC streams per connection. Currently inert. |
-| `idle_timeout_secs` | integer | 30 | **disabled** | QUIC idle timeout in seconds. Currently inert. |
+| `enabled` | boolean | false | **disabled** | Must remain false until HTTP/3 is served. |
+| `max_streams` | integer | 100 | **disabled** | Reserved max concurrent QUIC streams per connection. |
+| `idle_timeout_secs` | integer | 30 | **disabled** | Reserved QUIC idle timeout in seconds. |
 
 ### Origin Config (each entry under `origins:`)
 
@@ -13265,7 +13265,7 @@ proxy:
 | `tls_cert_file` | string | | Path to PEM-encoded TLS certificate. Ignored when `acme` is configured. |
 | `tls_key_file` | string | | Path to PEM-encoded TLS private key. |
 | `acme` | object | | ACME (auto-TLS) block. Overrides manual cert/key when set. See [ACME / auto TLS](#acme--auto-tls). |
-| `http3` | object | | HTTP/3 (QUIC) listener config. Currently inert; see [HTTP/3 fields](#http3-fields). |
+| `http3` | object | | Reserved HTTP/3 (QUIC) listener config. Enabling it is rejected; see [HTTP/3 fields](#http3-fields). |
 | `metrics` | object | | Metrics tuning, including label cardinality limits. |
 | `alerting` | object | | Alert notification channels. |
 | `admin` | object | | Embedded read-only admin / stats API server. |
@@ -13308,13 +13308,13 @@ proxy:
 
 ### HTTP/3 fields
 
-HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `http3` block still parses, but no QUIC listener starts and setting `enabled: true` only logs a warning. The fields below are documented for forward compatibility; they have no runtime effect today.
+HTTP/3 is not served by this build. The `http3` shape is retained for forward compatibility: omitting the block or setting `enabled: false` compiles, while `enabled: true` fails config compilation with an actionable error referencing WOR-1969. The remaining fields are reserved and have no runtime effect while the block is disabled.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | Enable the HTTP/3 (QUIC) listener. Currently inert; no listener starts. |
-| `max_streams` | int | 100 | Maximum concurrent QUIC streams per connection. Currently inert. |
-| `idle_timeout_secs` | int | 30 | Idle timeout for QUIC connections. Currently inert. |
+| `enabled` | bool | false | Reserved activation flag. Must remain false in this build. |
+| `max_streams` | int | 100 | Reserved maximum concurrent QUIC streams per connection. |
+| `idle_timeout_secs` | int | 30 | Reserved idle timeout for QUIC connections. |
 
 ### Admin fields
 
@@ -19106,7 +19106,7 @@ The store does not currently emit metrics. Wire a metric of your choice around t
 
 ## SBproxy features manual
 
-*Last modified: 2026-07-21*
+*Last modified: 2026-07-22*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -21433,7 +21433,7 @@ This flag only affects the plain `http_bind_port` listener. TLS-fronted HTTP/2 o
 
 ### HTTP/3 limitations
 
-HTTP/3 is currently disabled entirely until native QUIC support lands in Pingora. No QUIC listener is started; the `http3` config block still parses but is ignored, and setting `enabled: true` only logs a warning. Because there is no H3 dispatch path today, the per-action and per-auth limitations that previously applied over HTTP/3 do not apply: all traffic is served over HTTP/1.1 and HTTP/2, where every action and auth module is supported. These notes will be revisited when HTTP/3 returns.
+HTTP/3 is not served by this build. No QUIC listener is started, and config compilation rejects `proxy.http3.enabled: true` instead of accepting an inert setting. Omission and `enabled: false` remain valid for forward compatibility. Because there is no H3 dispatch path today, the per-action and per-auth limitations that previously applied over HTTP/3 do not apply: all traffic is served over HTTP/1.1 and HTTP/2, where every action and auth module is supported. Native support is tracked in WOR-1969.
 
 ================================================================
 # docs/getting-started-agent-identity.md
@@ -25330,8 +25330,8 @@ plane, enterprise hooks) log and degrade instead of blocking.
     `SB_WORKER_THREADS` or auto-detection), binds the plain HTTP
     listener on `http_bind_port`, and adds the HTTPS listener (manual
     certs or the ACME dynamic-certificate resolver, with optional
-    mTLS). No QUIC port is bound even when `proxy.http3` is
-    configured; an enabled `http3` block only logs a warning.
+    mTLS). No QUIC port is bound. Config compilation rejects
+    `proxy.http3.enabled: true` because HTTP/3 is not served.
 11. **Admin server**: when `proxy.admin.enabled: true`, spawns the
     embedded admin listener (default `127.0.0.1:9090`) and registers
     the component health probes that `/readyz` and `/health` report.
@@ -25840,26 +25840,25 @@ handshake timeouts follow Pingora's defaults.
 
 ### HTTP/3 (QUIC)
 
-HTTP/3 is temporarily disabled until native QUIC support lands in
-Pingora. The `proxy.http3` block still parses, but it is ignored: no
-QUIC listener is started, no `Alt-Svc` header is advertised, and
-setting `enabled: true` only logs a warning at startup. HTTP/2 is the
-highest version served. The fields are documented for when HTTP/3
-returns:
+HTTP/3 is not served by this build. No QUIC listener is started and no
+`Alt-Svc` header is advertised. The `proxy.http3` shape is retained for
+forward compatibility, but config compilation rejects `enabled: true`
+with a reference to WOR-1969. HTTP/2 is the highest version served. The
+reserved shape is:
 
 ```yaml
 proxy:
   http3:
-    enabled: true          # currently ignored; logs a warning
+    enabled: false         # true is rejected during config compilation
     idle_timeout_secs: 30
     max_streams: 100
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `enabled` | `false` | Whether to start the HTTP/3 (QUIC) listener. Currently inert |
-| `idle_timeout_secs` | `30` | Idle timeout for QUIC connections |
-| `max_streams` | `100` | Maximum concurrent QUIC streams per connection |
+| `enabled` | `false` | Reserved activation flag. Must remain false in this build |
+| `idle_timeout_secs` | `30` | Reserved idle timeout for QUIC connections |
+| `max_streams` | `100` | Reserved maximum concurrent QUIC streams per connection |
 
 ---
 
@@ -36771,7 +36770,7 @@ The oracle engine, the `sb.yml` gate, and the runtime enforcement ship today.
 ================================================================
 
 ## Troubleshooting
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-22*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -37059,10 +37058,10 @@ Check:
 
 ## HTTP/3 requests fall back to HTTP/2
 
-Cause: HTTP/3 is currently disabled until native QUIC support lands in Pingora. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
+Cause: HTTP/3 is not served by this build. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
 
 Check:
-- The `proxy.http3` block still parses, but it is inert. Setting `enabled: true` only logs a warning and starts no listener, so the absence of an `Alt-Svc: h3` header on responses is expected.
+- Config compilation rejects `proxy.http3.enabled: true` and references WOR-1969. Remove the block or set `enabled: false`.
 - If you need a UDP/QUIC path today, terminate HTTP/3 at an upstream edge or CDN and forward HTTP/2 to SBproxy.
 
 ## A local model will not serve
@@ -37274,7 +37273,7 @@ The fields below are the ones most useful when triage-grepping the JSON access l
 ================================================================
 
 ## Upgrade Guide
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-22*
 
 ## Upgrading between versions
 
@@ -37290,7 +37289,7 @@ The fields below are the ones most useful when triage-grepping the JSON access l
 
 - JavaScript engine (QuickJS) for transforms and WAF rules via `js_script` fields in request/response modifiers.
 - ACME auto-cert (Let's Encrypt) via `proxy.acme` config block.
-- HTTP/3 (QUIC) support via `proxy.http3` config block (temporarily disabled pending native Pingora HTTP/3 support).
+- Reserved HTTP/3 (QUIC) config shape via `proxy.http3`. `enabled: true` is rejected until native HTTP/3 support lands.
 - Per-origin metrics with 21 metric families and configurable cardinality limiting.
 - W3C and B3 distributed tracing header propagation.
 - Webhook alerting with configurable channels via `proxy.alerting`.
@@ -37304,7 +37303,7 @@ The following top-level `proxy:` sub-keys are new in v1.0:
 | Key | Description |
 |-----|-------------|
 | `proxy.acme` | ACME auto-cert configuration (Let's Encrypt). |
-| `proxy.http3` | HTTP/3 QUIC configuration (temporarily disabled pending native Pingora HTTP/3 support). |
+| `proxy.http3` | Reserved HTTP/3 QUIC configuration. `enabled: true` fails config compilation. |
 | `proxy.metrics` | Metrics cardinality limits. |
 | `proxy.alerting` | Alert notification channels (webhook, log). |
 | `proxy.admin` | Embedded stats/logs SPA. |

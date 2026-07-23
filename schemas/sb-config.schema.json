@@ -303,7 +303,7 @@
           ]
         },
         "http3": {
-          "description": "Optional HTTP/3 (QUIC) listener configuration.\n\nTemporarily inert: HTTP/3 is disabled until native QUIC support lands in the underlying proxy engine. The field still parses so existing configs keep loading, but enabling it only logs a warning and does not start a listener.",
+          "description": "Reserved HTTP/3 (QUIC) listener configuration.\n\nThe block remains in the schema for forward compatibility. Omission or `enabled: false` compiles, but `enabled: true` is rejected because this build does not serve HTTP/3. Native support is tracked in WOR-1969.",
           "default": null,
           "anyOf": [
             {
@@ -655,11 +655,11 @@
       }
     },
     "Http3Config": {
-      "description": "HTTP/3 (QUIC) configuration.\n\nTemporarily inert: HTTP/3 is disabled until native QUIC support lands in the underlying proxy engine. These fields still parse, but the listener is not started; enabling it logs a warning instead.",
+      "description": "HTTP/3 (QUIC) configuration.\n\nThe shape is reserved for forward compatibility. The config compiler accepts an omitted or disabled block, but rejects `enabled: true` because this build does not serve HTTP/3. Native support is tracked in WOR-1969.",
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Whether to enable the HTTP/3 (QUIC) listener.\n\nCurrently ignored: HTTP/3 is temporarily disabled (see the struct docs). Setting this to `true` logs a warning and starts no listener.",
+          "description": "Whether to enable the HTTP/3 (QUIC) listener.\n\nMust remain `false` in this build. Setting it to `true` fails config compilation because HTTP/3 is not served.",
           "default": false,
           "type": "boolean"
         },

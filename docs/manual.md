@@ -716,8 +716,8 @@ plane, enterprise hooks) log and degrade instead of blocking.
     `SB_WORKER_THREADS` or auto-detection), binds the plain HTTP
     listener on `http_bind_port`, and adds the HTTPS listener (manual
     certs or the ACME dynamic-certificate resolver, with optional
-    mTLS). No QUIC port is bound even when `proxy.http3` is
-    configured; an enabled `http3` block only logs a warning.
+    mTLS). No QUIC port is bound. Config compilation rejects
+    `proxy.http3.enabled: true` because HTTP/3 is not served.
 11. **Admin server**: when `proxy.admin.enabled: true`, spawns the
     embedded admin listener (default `127.0.0.1:9090`) and registers
     the component health probes that `/readyz` and `/health` report.
@@ -1226,26 +1226,25 @@ handshake timeouts follow Pingora's defaults.
 
 ### HTTP/3 (QUIC)
 
-HTTP/3 is temporarily disabled until native QUIC support lands in
-Pingora. The `proxy.http3` block still parses, but it is ignored: no
-QUIC listener is started, no `Alt-Svc` header is advertised, and
-setting `enabled: true` only logs a warning at startup. HTTP/2 is the
-highest version served. The fields are documented for when HTTP/3
-returns:
+HTTP/3 is not served by this build. No QUIC listener is started and no
+`Alt-Svc` header is advertised. The `proxy.http3` shape is retained for
+forward compatibility, but config compilation rejects `enabled: true`
+with a reference to WOR-1969. HTTP/2 is the highest version served. The
+reserved shape is:
 
 ```yaml
 proxy:
   http3:
-    enabled: true          # currently ignored; logs a warning
+    enabled: false         # true is rejected during config compilation
     idle_timeout_secs: 30
     max_streams: 100
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `enabled` | `false` | Whether to start the HTTP/3 (QUIC) listener. Currently inert |
-| `idle_timeout_secs` | `30` | Idle timeout for QUIC connections |
-| `max_streams` | `100` | Maximum concurrent QUIC streams per connection |
+| `enabled` | `false` | Reserved activation flag. Must remain false in this build |
+| `idle_timeout_secs` | `30` | Reserved idle timeout for QUIC connections |
+| `max_streams` | `100` | Reserved maximum concurrent QUIC streams per connection |
 
 ---
 

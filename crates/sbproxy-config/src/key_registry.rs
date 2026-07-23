@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Which top-level `proxy:` config keys are inert, and how boot says so.
+//! Which top-level `proxy:` config keys are retained without live behavior.
 //!
 //! `proxy.alerting` accepted a PagerDuty routing key, validated it, and had no
 //! consumer anywhere in the boot path. An operator who configured it believed
@@ -9,25 +9,25 @@
 //! the pattern the capability registry exists to close: a surface that parses
 //! input and does nothing while presenting as complete.
 //!
-//! Only inert keys are listed here. A stable key is the default and needs no
-//! entry; the coverage test asserts that every key named here is genuinely a
-//! real config key (so a rename cannot leave a stale classification), and the
-//! boot path warns for each one an operator has actually set.
+//! Only config-only keys are listed here. A stable key is the default and needs
+//! no entry; the coverage test asserts that every key named here is genuinely
+//! a real config key so a rename cannot leave a stale classification. Each
+//! entry also explains how the compiler treats attempts to activate it.
 
 use sbproxy_capability::{ConfigKeyCapability, SupportLevel};
 
-/// The top-level `proxy:` keys that parse but do not yet do what they imply.
+/// The top-level `proxy:` keys retained in the schema without live behavior.
 ///
-/// Kept deliberately short. An entry is a promise that the key is inert *and*
-/// that boot warns when it is set; the moment a key's consumer lands, its entry
-/// is deleted and the warning stops.
+/// Kept deliberately short. The moment a key's consumer lands, its entry is
+/// deleted.
 pub const INERT_CONFIG_KEYS: &[ConfigKeyCapability] = &[ConfigKeyCapability {
     path: "proxy.http3",
     support: SupportLevel::ConfigOnly,
     consumer: None,
     note: Some(
-        "Parsed and ignored: HTTP/3 is disabled until native QUIC support lands \
-             in the proxy engine. Enabling it starts no listener.",
+        "Reserved for forward compatibility. This build does not serve HTTP/3, \
+             so proxy.http3.enabled=true fails config compilation. Native HTTP/3 \
+             support is tracked in WOR-1969.",
     ),
 }];
 
@@ -76,7 +76,7 @@ mod tests {
         for key in INERT_CONFIG_KEYS {
             let note = key.note.unwrap_or("");
             assert!(
-                note.contains("WOR-") || note.contains("engine"),
+                note.contains("WOR-"),
                 "inert key {} must explain itself and point at the work that fixes \
                  it: '{note}'",
                 key.path

@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-22*
 
 Stability guarantees for every field in `sb.yml`. Check a field's tier before relying on it in production.
 
@@ -34,11 +34,11 @@ An `alpha` field is experimental.
 
 ### `disabled`
 
-A `disabled` field still parses but has no runtime effect today.
+A `disabled` field is retained in the schema but cannot activate runtime behavior today.
 
-- The field is accepted by the config loader so existing configs keep loading.
-- No code path acts on the value; setting it does nothing beyond an optional warning log.
-- Currently applies to the `http3` block: HTTP/3 is temporarily disabled until native QUIC support lands in Pingora.
+- An omitted block or its disabled value remains valid for config compatibility.
+- Attempting to enable unavailable behavior fails config compilation instead of being ignored.
+- Currently applies to the `http3` block. Native HTTP/3 support is tracked in WOR-1969.
 
 ---
 
@@ -68,7 +68,7 @@ A `disabled` field still parses but has no runtime effect today.
 | `tls_cert_file` | string | - | **stable** | Path to PEM cert for manual TLS. |
 | `tls_key_file` | string | - | **stable** | Path to PEM key for manual TLS. |
 | `acme` | object | - | **beta** | Automatic TLS via ACME. |
-| `http3` | object | - | **disabled** | HTTP/3 (QUIC) listener. Currently inert. |
+| `http3` | object | - | **disabled** | Reserved HTTP/3 (QUIC) listener shape. `enabled: true` is rejected. |
 
 ### `proxy.acme` - AcmeConfig
 
@@ -84,13 +84,13 @@ A `disabled` field still parses but has no runtime effect today.
 
 ### `proxy.http3` - Http3Config
 
-HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. These fields still parse, but no QUIC listener starts and setting `enabled: true` only logs a warning.
+HTTP/3 is not served by this build. The block is retained for forward compatibility: omission or `enabled: false` compiles, while `enabled: true` fails config compilation with a reference to WOR-1969.
 
 | Field | Type | Default | Stability | Notes |
 |---|---|---|---|---|
-| `enabled` | boolean | false | **disabled** | Enable QUIC listener. Currently inert; no listener starts. |
-| `max_streams` | integer | 100 | **disabled** | Max concurrent QUIC streams per connection. Currently inert. |
-| `idle_timeout_secs` | integer | 30 | **disabled** | QUIC idle timeout in seconds. Currently inert. |
+| `enabled` | boolean | false | **disabled** | Must remain false until HTTP/3 is served. |
+| `max_streams` | integer | 100 | **disabled** | Reserved max concurrent QUIC streams per connection. |
+| `idle_timeout_secs` | integer | 30 | **disabled** | Reserved QUIC idle timeout in seconds. |
 
 ### Origin Config (each entry under `origins:`)
 
