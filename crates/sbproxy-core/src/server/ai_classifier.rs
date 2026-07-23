@@ -46,7 +46,8 @@ pub(super) fn build_centroid(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
         return None;
     }
     let norm = dot(&sum, &sum).sqrt();
-    if norm <= f32::EPSILON {
+    // NaN compares false against everything, so it needs an explicit check.
+    if norm.is_nan() || norm <= f32::EPSILON {
         return None;
     }
     for s in sum.iter_mut() {
@@ -80,11 +81,13 @@ pub(super) fn nearest_centroid(
     }
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     let (best, label) = (scored[0].0, scored[0].1);
-    if best < min_score {
+    // NaN compares false against everything, so it needs an explicit check.
+    if best.is_nan() || best < min_score {
         return None;
     }
     if let Some((second, _)) = scored.get(1) {
-        if best - second < min_margin {
+        // NaN compares false against everything, so it needs an explicit check.
+        if (best - second).is_nan() || best - second < min_margin {
             return None;
         }
     }
@@ -133,6 +136,13 @@ mod tests {
     }
 
     #[test]
+    fn centroid_rejects_nan_input() {
+        // A NaN-poisoned norm must not slip past the EPSILON guard, since
+        // every comparison against NaN is false.
+        assert!(build_centroid(&[vec![f32::NAN, 0.0]]).is_none());
+    }
+
+    #[test]
     fn nearest_centroid_picks_the_closest_class() {
         let centroids = vec![
             (label("documentation"), vec![1.0, 0.0]),
@@ -170,6 +180,25 @@ mod tests {
         let centroids = vec![(label("documentation"), vec![1.0, 0.0])];
         let v = nearest_centroid(&[1.0, 0.0], &centroids, 0.30, 0.05).expect("verdict");
         assert_eq!(v.label, "documentation");
+    }
+
+    #[test]
+    fn nearest_centroid_still_applies_the_floor_to_a_single_class() {
+        let centroids = vec![(label("documentation"), vec![1.0, 0.0])];
+        // Only one configured class, so the margin check is skipped, but
+        // the score floor still applies. 0.2 is below the 0.30 floor.
+        assert!(nearest_centroid(&[0.2, 0.0], &centroids, 0.30, 0.05).is_none());
+    }
+
+    #[test]
+    fn nearest_centroid_rejects_a_nan_embedding() {
+        let centroids = vec![
+            (label("documentation"), vec![1.0, 0.0]),
+            (label("coding"), vec![0.0, 1.0]),
+        ];
+        // A NaN-poisoned query must not be able to defeat the score or
+        // margin guards, since every comparison against NaN is false.
+        assert!(nearest_centroid(&[f32::NAN, 0.0], &centroids, 0.30, 0.05).is_none());
     }
 
     #[test]
