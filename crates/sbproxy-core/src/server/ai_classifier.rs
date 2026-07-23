@@ -97,6 +97,173 @@ pub(super) fn nearest_centroid(
     })
 }
 
+/// Nearest-centroid classifier over the in-process MiniLM embedder.
+#[cfg(feature = "inprocess-classify")]
+struct CentroidClassifier {
+    /// Loaded ONNX model + tokenizer, shared with any other classifier
+    /// configured against the same model and tokenizer path pair.
+    embedder: std::sync::Arc<sbproxy_classifiers::OnnxEmbedder>,
+    /// Per-class unit centroids, in configuration order.
+    centroids: Vec<(String, Vec<f32>)>,
+    /// Minimum cosine similarity the winning class must reach.
+    min_score: f32,
+    /// Minimum gap between the best and second-best class.
+    min_margin: f32,
+    /// Human-readable model identifier used in inference metrics.
+    model_label: String,
+}
+
+// Hand-written because neither the tract model nor the tokenizer inside
+// `OnnxEmbedder` implements `Debug`, and the `Guardrail` enum requires it.
+#[cfg(feature = "inprocess-classify")]
+impl std::fmt::Debug for CentroidClassifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CentroidClassifier")
+            .field("classes", &self.centroids.len())
+            .field("min_score", &self.min_score)
+            .field("min_margin", &self.min_margin)
+            .finish()
+    }
+}
+
+#[cfg(feature = "inprocess-classify")]
+impl sbproxy_ai::guardrails::TextClassifier for CentroidClassifier {
+    fn classify(&self, text: &str) -> Option<ClassifierVerdict> {
+        let started = std::time::Instant::now();
+        let embedded = self.embedder.embed(text);
+        let result = if embedded.is_ok() { "ok" } else { "error" };
+        sbproxy_observe::metrics::record_inference(
+            "classify",
+            "inprocess",
+            &self.model_label,
+            result,
+            started.elapsed().as_secs_f64(),
+        );
+        let out = match embedded {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %e, "classifier embedding failed; no label emitted");
+                return None;
+            }
+        };
+        nearest_centroid(
+            &out.values,
+            &self.centroids,
+            self.min_score,
+            self.min_margin,
+        )
+    }
+}
+
+/// Load the embedder for `cfg`, reusing an already-loaded one when the
+/// same model and tokenizer pair has been seen before.
+///
+/// Loading parses the ONNX graph and can take hundreds of milliseconds,
+/// so two origins that point at the same model share one instance.
+#[cfg(feature = "inprocess-classify")]
+fn shared_embedder(
+    cfg: &sbproxy_ai::guardrails::EmbeddingBackendConfig,
+) -> anyhow::Result<std::sync::Arc<sbproxy_classifiers::OnnxEmbedder>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// Already-loaded embedders keyed by their (model_path, tokenizer_path)
+    /// pair, so two classifier origins pointed at the same files share one
+    /// loaded model instead of parsing the ONNX graph twice.
+    type EmbedderCache = HashMap<(String, String), Arc<sbproxy_classifiers::OnnxEmbedder>>;
+
+    static CACHE: OnceLock<Mutex<EmbedderCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (cfg.model_path.clone(), cfg.tokenizer_path.clone());
+    if let Ok(map) = cache.lock() {
+        if let Some(e) = map.get(&key) {
+            return Ok(Arc::clone(e));
+        }
+    }
+    let mut options = sbproxy_classifiers::LoadOptions::default();
+    if let Some(bytes) = cfg.max_model_bytes {
+        options = options.with_max_model_bytes(bytes);
+    }
+    let embedder = Arc::new(sbproxy_classifiers::OnnxEmbedder::load_with_options(
+        std::path::Path::new(&cfg.model_path),
+        std::path::Path::new(&cfg.tokenizer_path),
+        &options,
+    )?);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, Arc::clone(&embedder));
+    }
+    Ok(embedder)
+}
+
+/// Build a classifier backend for `cfg`.
+///
+/// Embeds every example prompt once and folds each class into a unit
+/// centroid. A class whose examples all fail to embed is dropped with a
+/// warning rather than failing the whole load, so one bad example does
+/// not cost the operator the other classes.
+#[cfg(feature = "inprocess-classify")]
+fn build_backend(
+    cfg: &sbproxy_ai::guardrails::ClassifierConfig,
+) -> anyhow::Result<std::sync::Arc<dyn sbproxy_ai::guardrails::TextClassifier>> {
+    // Only one backend variant exists today, so this destructure is
+    // irrefutable.
+    let sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(backend) = &cfg.backend;
+    let embedder = shared_embedder(backend)?;
+    let mut centroids: Vec<(String, Vec<f32>)> = Vec::new();
+    for (label, examples) in &cfg.classes {
+        let vectors: Vec<Vec<f32>> = examples
+            .iter()
+            .filter_map(|e| match embedder.embed(e) {
+                Ok(o) => Some(o.values),
+                Err(err) => {
+                    tracing::warn!(error = %err, class = %label, "skipping unembeddable example");
+                    None
+                }
+            })
+            .collect();
+        match build_centroid(&vectors) {
+            Some(c) => centroids.push((label.clone(), c)),
+            None => tracing::warn!(class = %label, "class has no usable examples; dropping it"),
+        }
+    }
+    if centroids.is_empty() {
+        anyhow::bail!("classifier has no usable class centroids");
+    }
+    let model_label = std::path::Path::new(&backend.model_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "inprocess".to_string());
+    tracing::info!(
+        classes = centroids.len(),
+        model = %model_label,
+        "classifier guardrail backend ready"
+    );
+    Ok(std::sync::Arc::new(CentroidClassifier {
+        embedder,
+        centroids,
+        min_score: backend.min_score,
+        min_margin: backend.min_margin,
+        model_label,
+    }))
+}
+
+/// Stand-in used when the binary is built without `inprocess-classify`.
+#[cfg(not(feature = "inprocess-classify"))]
+fn build_backend(
+    _cfg: &sbproxy_ai::guardrails::ClassifierConfig,
+) -> anyhow::Result<std::sync::Arc<dyn sbproxy_ai::guardrails::TextClassifier>> {
+    anyhow::bail!("this binary was built without the `inprocess-classify` feature")
+}
+
+/// Register the classifier backend for the process.
+///
+/// Registered unconditionally so that a binary built without the feature
+/// reports a precise reason instead of the generic "no backend
+/// registered" message.
+pub(crate) fn install_classifier_factory() {
+    sbproxy_ai::guardrails::register_classifier_factory(Box::new(build_backend));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +382,29 @@ mod tests {
         ];
         let v = nearest_centroid(&[1.0, 0.0], &centroids, 0.30, 0.05).expect("verdict");
         assert_eq!(v.label, "good");
+    }
+
+    #[test]
+    fn factory_rejects_a_config_whose_model_is_missing() {
+        // The factory must return an error rather than panicking, because
+        // the guardrail turns that error into an inert guardrail.
+        let cfg = sbproxy_ai::guardrails::ClassifierConfig {
+            backend: sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(
+                sbproxy_ai::guardrails::EmbeddingBackendConfig {
+                    model_path: "/nonexistent/model.onnx".to_string(),
+                    tokenizer_path: "/nonexistent/tokenizer.json".to_string(),
+                    min_score: 0.30,
+                    min_margin: 0.05,
+                    max_model_bytes: None,
+                },
+            ),
+            classes: std::collections::BTreeMap::from([(
+                "documentation".to_string(),
+                vec!["write the readme".to_string()],
+            )]),
+            scope: sbproxy_ai::guardrails::ClassifierScope::LastUserMessage,
+            max_chars: 2000,
+        };
+        assert!(build_backend(&cfg).is_err());
     }
 }

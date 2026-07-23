@@ -73,18 +73,27 @@ fn default_max_chars() -> usize {
     2000
 }
 
-/// Declarative config for a `type: classifier` guardrail entry.
+/// Which inference backend decides the class.
+///
+/// A second backend (an OpenAI-compatible LLM endpoint) is coming; this
+/// tagged shape lets a `classifier` entry name its backend explicitly
+/// instead of the config format assuming the embedding one.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ClassifierConfig {
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClassifierBackendConfig {
+    /// Local sentence-embedding model with one centroid per class.
+    Embedding(EmbeddingBackendConfig),
+}
+
+/// Config specific to the local sentence-embedding backend: an ONNX
+/// model paired with a tokenizer, plus the cosine-similarity thresholds
+/// that decide whether a class wins.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingBackendConfig {
     /// Filesystem path to the ONNX embedding model.
     pub model_path: String,
     /// Filesystem path to the matching Hugging Face `tokenizer.json`.
     pub tokenizer_path: String,
-    /// Class label to example prompts. Each class centroid is the
-    /// L2-normalized mean of its examples' embeddings, so three to ten
-    /// short, representative examples per class is the useful range.
-    #[serde(default)]
-    pub classes: BTreeMap<String, Vec<String>>,
     /// Minimum cosine similarity the winning class must reach.
     #[serde(default = "default_min_score")]
     pub min_score: f32,
@@ -92,6 +101,21 @@ pub struct ClassifierConfig {
     /// against labeling a prompt that sits between two centroids.
     #[serde(default = "default_min_margin")]
     pub min_margin: f32,
+    /// Optional override for the ONNX file size budget, in bytes.
+    #[serde(default)]
+    pub max_model_bytes: Option<u64>,
+}
+
+/// Declarative config for a `type: classifier` guardrail entry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassifierConfig {
+    /// Which inference backend decides the class.
+    pub backend: ClassifierBackendConfig,
+    /// Class label to example prompts, shared across whichever backend
+    /// is configured. For the embedding backend, three to ten short,
+    /// representative examples per class is the useful range.
+    #[serde(default)]
+    pub classes: BTreeMap<String, Vec<String>>,
     /// Which slice of the prompt to classify.
     #[serde(default)]
     pub scope: ClassifierScope,
@@ -100,9 +124,6 @@ pub struct ClassifierConfig {
     /// would build an oversized tensor.
     #[serde(default = "default_max_chars")]
     pub max_chars: usize,
-    /// Optional override for the ONNX file size budget, in bytes.
-    #[serde(default)]
-    pub max_model_bytes: Option<u64>,
 }
 
 /// Builds a backend for one [`ClassifierConfig`].
@@ -169,9 +190,12 @@ impl ClassifierGuardrail {
         let backend = match build_classifier(&cfg) {
             Ok(b) => Some(b),
             Err(e) => {
+                // Only one backend variant exists today, so this
+                // destructure is irrefutable.
+                let ClassifierBackendConfig::Embedding(embedding) = &cfg.backend;
                 warn!(
                     error = %e,
-                    model_path = %cfg.model_path,
+                    model_path = %embedding.model_path,
                     "classifier guardrail backend unavailable; guardrail is inert \
                      and prompts keep their original routing"
                 );
@@ -246,14 +270,16 @@ mod tests {
 
     fn cfg(scope: ClassifierScope) -> ClassifierConfig {
         ClassifierConfig {
-            model_path: "/unused/model.onnx".to_string(),
-            tokenizer_path: "/unused/tokenizer.json".to_string(),
+            backend: ClassifierBackendConfig::Embedding(EmbeddingBackendConfig {
+                model_path: "/unused/model.onnx".to_string(),
+                tokenizer_path: "/unused/tokenizer.json".to_string(),
+                min_score: 0.30,
+                min_margin: 0.05,
+                max_model_bytes: None,
+            }),
             classes: std::collections::BTreeMap::new(),
-            min_score: 0.30,
-            min_margin: 0.05,
             scope,
             max_chars: 2000,
-            max_model_bytes: None,
         }
     }
 

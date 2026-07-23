@@ -20,8 +20,9 @@ mod toxicity;
 
 pub use agent_alignment::{AgentAlignmentConfig, AgentAlignmentGuardrail, AgentAlignmentMode};
 pub use classifier::{
-    build_classifier, register_classifier_factory, ClassifierConfig, ClassifierFactory,
-    ClassifierGuardrail, ClassifierScope, ClassifierVerdict, TextClassifier,
+    build_classifier, register_classifier_factory, ClassifierBackendConfig, ClassifierConfig,
+    ClassifierFactory, ClassifierGuardrail, ClassifierScope, ClassifierVerdict,
+    EmbeddingBackendConfig, TextClassifier,
 };
 pub use content_safety::ContentSafetyGuardrail;
 pub use context_poisoning::{
@@ -902,8 +903,11 @@ mod tests {
         // no-op, and silently accepting it hides an operator mistake.
         let err = compile_guardrail(&serde_json::json!({
             "type": "classifier",
-            "model_path": "/unused/model.onnx",
-            "tokenizer_path": "/unused/tokenizer.json",
+            "backend": {
+                "kind": "embedding",
+                "model_path": "/unused/model.onnx",
+                "tokenizer_path": "/unused/tokenizer.json"
+            },
             "classes": {}
         }))
         .expect_err("empty classes must be rejected");
@@ -921,8 +925,11 @@ mod tests {
         // and taking the rest of the pipeline down with it.
         let g = compile_guardrail(&serde_json::json!({
             "type": "classifier",
-            "model_path": "/unused/model.onnx",
-            "tokenizer_path": "/unused/tokenizer.json",
+            "backend": {
+                "kind": "embedding",
+                "model_path": "/unused/model.onnx",
+                "tokenizer_path": "/unused/tokenizer.json"
+            },
             "classes": { "documentation": ["write the readme"] }
         }))
         .expect("classifier should compile without a backend");
@@ -941,8 +948,11 @@ mod tests {
             "input": [
                 {
                     "type": "classifier",
-                    "model_path": "/unused/model.onnx",
-                    "tokenizer_path": "/unused/tokenizer.json",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/unused/model.onnx",
+                        "tokenizer_path": "/unused/tokenizer.json"
+                    },
                     "classes": { "documentation": ["write the readme"] }
                 },
                 {"type": "regex", "patterns": ["SECRET"]}
@@ -965,8 +975,11 @@ mod tests {
         // #[serde(default)], so build it through serde.
         let classifier_entry = serde_json::json!({
             "type": "classifier",
-            "model_path": "/unused/model.onnx",
-            "tokenizer_path": "/unused/tokenizer.json",
+            "backend": {
+                "kind": "embedding",
+                "model_path": "/unused/model.onnx",
+                "tokenizer_path": "/unused/tokenizer.json"
+            },
             "classes": { "documentation": ["write the readme"] }
         });
 

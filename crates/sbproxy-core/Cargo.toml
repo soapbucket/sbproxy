@@ -69,6 +69,10 @@ embed-admin-ui = ["dep:include_dir"]
 # this on by default; library consumers leave it off (the `source: inprocess`
 # config then returns a clear error and the cache treats it as a miss).
 inprocess-embed = ["dep:sbproxy-classifiers"]
+# In-process MiniLM classifier backing the `type: classifier` AI
+# guardrail. Shares the ONNX runtime already pulled in by
+# `inprocess-embed`, so enabling it adds no new dependency.
+inprocess-classify = ["dep:sbproxy-classifiers"]
 
 [dependencies]
 sbproxy-plugin.workspace = true
