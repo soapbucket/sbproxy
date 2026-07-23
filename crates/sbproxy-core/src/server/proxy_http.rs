@@ -1302,9 +1302,17 @@ impl ProxyHttp for SbProxy {
                     forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
                 match effective_action {
                     Some(Action::GraphQL(graphql)) => match upstream_request.method {
-                        http::Method::GET => {
-                            graphql.validate_get_query(upstream_request.uri.query())
-                        }
+                        http::Method::GET => match ctx
+                            .replacement_request_body
+                            .as_deref()
+                            .or(ctx.graphql_request_body.as_deref())
+                        {
+                            Some(body) if !body.is_empty() => {
+                                Err("validated GraphQL GET requests must not contain a body"
+                                    .to_string())
+                            }
+                            _ => graphql.validate_get_query(upstream_request.uri.query()),
+                        },
                         http::Method::POST => {
                             let content_type = upstream_request
                                 .headers

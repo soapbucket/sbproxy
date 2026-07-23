@@ -474,7 +474,7 @@ pub struct RequestContext {
     /// Whether the resolved GraphQL action requires validation of the final
     /// outbound request after request modifiers have run.
     pub graphql_validation_pending: bool,
-    /// Original POST bytes captured into Pingora's replay buffer. The final
+    /// Original request bytes captured into Pingora's replay buffer. The final
     /// validator uses these unless a body modifier supplies replacement bytes.
     pub graphql_request_body: Option<bytes::Bytes>,
 

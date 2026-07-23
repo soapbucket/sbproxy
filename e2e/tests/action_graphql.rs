@@ -8,6 +8,25 @@
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
 
+fn get_with_body(
+    proxy: &ProxyHarness,
+    path: &str,
+    host: &str,
+    body: Vec<u8>,
+) -> anyhow::Result<u16> {
+    Ok(reqwest::blocking::Client::new()
+        .request(
+            reqwest::Method::GET,
+            format!("{}{}", proxy.base_url(), path),
+        )
+        .header("host", host)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()?
+        .status()
+        .as_u16())
+}
+
 #[test]
 fn graphql_query_round_trips_via_proxy() {
     let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
@@ -169,6 +188,111 @@ origins:
         upstream.captured().len(),
         1,
         "only the valid GraphQL GET request may reach the upstream"
+    );
+}
+
+#[test]
+fn graphql_validated_get_rejects_nonempty_inbound_body() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      validate_queries: true
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let status = get_with_body(
+        &proxy,
+        "/graphql?query=%7Bhello%7D",
+        "gql.localhost",
+        br#"{"query":"{ __schema { queryType { name } } }"}"#.to_vec(),
+    )
+    .expect("send GraphQL GET with a body");
+
+    assert_eq!(status, 400);
+    assert!(
+        upstream.captured().is_empty(),
+        "validated GraphQL GET bodies must not reach the upstream"
+    );
+}
+
+#[test]
+fn graphql_validated_get_rejects_body_replacement_modifier() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      validate_queries: true
+    request_modifiers:
+      - body:
+          replace_json:
+            query: "{{ __schema {{ queryType {{ name }} }} }}"
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let response = proxy
+        .get("/graphql?query=%7Bhello%7D", "gql.localhost")
+        .expect("send bodyless GraphQL GET");
+
+    assert_eq!(response.status, 400);
+    assert!(
+        upstream.captured().is_empty(),
+        "a body modifier must not add a body to a validated GraphQL GET"
+    );
+}
+
+#[test]
+fn graphql_validated_get_rejects_body_retained_by_post_to_get_modifier() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      validate_queries: true
+    request_modifiers:
+      - method: GET
+        query:
+          set:
+            query: "{{ hello }}"
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let response = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!({"query": "{ __schema { queryType { name } } }"}),
+            &[("content-type", "application/json")],
+        )
+        .expect("send GraphQL POST rewritten to GET");
+
+    assert_eq!(response.status, 400);
+    assert!(
+        upstream.captured().is_empty(),
+        "a POST body retained by a GET method modifier must not reach the upstream"
     );
 }
 

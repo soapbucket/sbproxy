@@ -28,12 +28,12 @@ pub(super) async fn handle_action(
 
             // The request's final method, URI, headers, and replacement body
             // do not exist until `upstream_request_filter` applies request
-            // modifiers. Mark it for validation there. POST bodies still
-            // need to be captured now so both validation and forwarding see
-            // the same bytes.
+            // modifiers. Mark it for validation there. Any inbound body still
+            // needs to be drained and captured now so both validation and
+            // forwarding see the same bytes, including when a modifier
+            // changes the request method.
             ctx.graphql_validation_pending = true;
-            let method = session.req_header().method.clone();
-            if method == http::Method::POST {
+            if !session.as_mut().is_body_empty() {
                 // Pingora copies bodies consumed from request_filter into its
                 // replay buffer. The fixed 64 KiB buffer is therefore also
                 // the maximum body that can be validated and then forwarded
@@ -52,8 +52,8 @@ pub(super) async fn handle_action(
                     }
                 }
                 if replay_buffer_truncated {
-                    let detail =
-                        "validated GraphQL POST body exceeds the 64 KiB replay limit".to_string();
+                    let detail = "validated GraphQL request body exceeds the 64 KiB replay limit"
+                        .to_string();
                     debug!(detail = %detail, "GraphQL request validation failed");
                     send_error(session, 413, &detail).await?;
                     return Ok(true);

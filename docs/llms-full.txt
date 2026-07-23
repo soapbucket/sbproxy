@@ -14610,15 +14610,17 @@ setting `max_depth` above zero, or setting `allow_introspection: false`
 enables fail-closed parsing. Validated requests support a percent-encoded
 `query` parameter on `GET`, plus an `application/json` object or batched
 array on `POST`. Every entry in a batch must contain a string `query`
-field and the complete batch is rejected when any entry fails.
+field and the complete batch is rejected when any entry fails. Validated
+`GET` requests are query-parameter-only: a non-empty inbound body, or a
+body added by a request modifier, is rejected with `400`.
 
 Validation failures return `400` before an HTTP request is sent upstream.
-Validated POST bodies are limited to 64 KiB so the accepted body can be
-replayed unchanged after the pre-upstream check; larger bodies return
-`413`. Multipart uploads and persisted-query-only envelopes are not
-validated transports and therefore return `400` when any validation
-control is enabled. They continue to pass through unchanged under the
-default transparent configuration.
+Inbound bodies on validated requests are limited to 64 KiB so an accepted
+POST body can be replayed unchanged after the pre-upstream check; larger
+bodies return `413`. Multipart uploads and persisted-query-only envelopes
+are not validated transports and therefore return `400` when any validation
+control is enabled. They continue to pass through unchanged under the default
+transparent configuration.
 
 ### storage
 
