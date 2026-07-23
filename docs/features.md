@@ -2080,9 +2080,9 @@ base64_decode, url_encode, and url_decode are the other modes ([config](../examp
 | `bot_detection` | Bot scoring and challenge configuration (opaque, see configuration.md) |
 | `threat_protection` | IP reputation and dynamic blocklist hooks |
 | `fallback_origin` | Origin used when the primary upstream fails |
-| `traffic_capture` | Mirror or capture request/response traffic |
+| `traffic_capture` | Config-only compatibility field; use `mirror` for live request mirroring |
 | `message_signatures` | RFC 9421 HTTP message signatures |
-| `connection_pool` | Per-origin pool tuning (size, idle timeout) |
+| `connection_pool` | Config-only compatibility field; Pingora's built-in pool settings apply |
 
 ![the primary upstream answering 503 while the client receives the fallback's 200 degraded body with an X-Fallback header](assets/fallback-origin.gif)
 

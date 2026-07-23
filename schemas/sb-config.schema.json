@@ -335,7 +335,7 @@
           ]
         },
         "observability": {
-          "description": "Top-level observability block: groups `log` (tracing-subscriber filter / format / sampling) and `telemetry` (OTLP exporter) under one block so an operator configures the whole surface from YAML instead of CLI flags + env vars.\n\nWhen absent, CLI / env precedence still applies; the YAML fields are a third source of truth that wins over the existing `RUST_LOG` default but loses to `--log-level` / `SB_LOG_LEVEL`.",
+          "description": "Top-level observability block: live log sinks, redaction and custom fields plus the OTLP exporter and durable usage rollups. The parent log level, format, and sampling fields are compatibility-only; process tracing uses CLI/environment selection and built-in sampling defaults.",
           "default": null,
           "anyOf": [
             {
@@ -727,11 +727,11 @@
       }
     },
     "ObservabilityConfig": {
-      "description": "Top-level observability block: groups the `log` and `telemetry` sub-blocks so an operator can configure both from YAML rather than CLI flags + env vars. Re-uses the existing `LoggingConfig` and `TelemetryConfig` shapes from `sbproxy-observe`.",
+      "description": "Top-level observability block grouping live log extensions, telemetry, and durable usage rollups. The legacy process-logger fields under `log` remain parseable but are not installed into the tracing subscriber.",
       "type": "object",
       "properties": {
         "log": {
-          "description": "`tracing-subscriber` configuration: level, format, per-level sampling. CLI / env still wins where applicable; this block is the YAML source-of-truth for everything else.",
+          "description": "Log sinks, redaction, and custom fields, plus compatibility-only parent level, format, and per-level sampling values.",
           "default": null,
           "anyOf": [
             {
@@ -773,7 +773,7 @@
       "type": "object",
       "properties": {
         "level": {
-          "description": "Log level filter. `debug | info | warn | error`. Default `info`.",
+          "description": "Compatibility-only process log level. Use CLI/environment controls; this YAML value is not installed into the tracing subscriber.",
           "default": null,
           "type": [
             "string",
@@ -781,7 +781,7 @@
           ]
         },
         "format": {
-          "description": "Output format. `compact | pretty | json`. Default `compact`.",
+          "description": "Compatibility-only process output format. Sink-local `format` remains live, while the process subscriber uses CLI/environment controls.",
           "default": null,
           "type": [
             "string",
@@ -789,7 +789,7 @@
           ]
         },
         "sampling": {
-          "description": "Per-level emission sampling rates. Default 1.0 / 0.1 / 0.01.",
+          "description": "Compatibility-only per-level sampling rates. The process logger uses its built-in sampling defaults.",
           "default": null,
           "anyOf": [
             {
@@ -2633,16 +2633,16 @@
       ]
     },
     "SecretsConfig": {
-      "description": "Top-level secrets management configuration.\n\nControls which vault backend is used to resolve `secret:` references in config values and how secret rotation is handled.",
+      "description": "Top-level secrets management configuration.\n\nThe live surface is [`SecretsConfig::backends`], selected by provider URI references. The legacy single-backend and rotation fields remain parseable for compatibility but are not consumed by the OSS runtime.",
       "type": "object",
       "properties": {
         "backend": {
-          "description": "Backend to use for resolving secrets.\n\nSupported values: `\"env\"` (default), `\"local\"`, `\"hashicorp\"`.",
+          "description": "Legacy single-backend selector. Use [`SecretsConfig::backends`].",
           "default": "env",
           "type": "string"
         },
         "hashicorp": {
-          "description": "HashiCorp Vault connection settings. Required when `backend = \"hashicorp\"`.",
+          "description": "Legacy HashiCorp block. Declare a named `hashicorp` backend instead.",
           "default": null,
           "anyOf": [
             {
@@ -2662,7 +2662,7 @@
           }
         },
         "rotation": {
-          "description": "Secret rotation settings.",
+          "description": "Reserved rotation shape; no OSS scheduler consumes it.",
           "default": null,
           "anyOf": [
             {
@@ -2674,7 +2674,7 @@
           ]
         },
         "fallback": {
-          "description": "Fallback strategy when the vault backend is unavailable.\n\nSupported values: `\"cache\"` (default), `\"reject\"`, `\"env\"`.",
+          "description": "Legacy fallback selector; provider URI resolution fails loudly and does not consult this value.",
           "default": "cache",
           "type": "string"
         },
@@ -2689,7 +2689,7 @@
       }
     },
     "HashiCorpSecretsConfig": {
-      "description": "HashiCorp Vault connection settings.",
+      "description": "Legacy HashiCorp Vault connection settings.\n\nThe OSS resolver consumes the `hashicorp` variant in [`SecretsConfig::backends`], not this compatibility block.",
       "type": "object",
       "required": [
         "addr"
@@ -2715,7 +2715,7 @@
       }
     },
     "RotationConfig": {
-      "description": "Secret rotation configuration.",
+      "description": "Reserved secret-rotation configuration.\n\nNo OSS scheduler consumes this compatibility block.",
       "type": "object",
       "properties": {
         "grace_period_secs": {
@@ -3505,7 +3505,7 @@
           ]
         },
         "redis_source_of_truth": {
-          "description": "Treat Redis as the source of truth rather than a coherence tier (backend `redis`).",
+          "description": "Legacy compatibility switch. Selecting `backend: redis` already makes Redis the key store; this value does not change runtime behavior.",
           "default": false,
           "type": "boolean"
         },
@@ -3882,7 +3882,7 @@
           ]
         },
         "key_introspection": {
-          "description": "Expose the authenticated caller-only `GET /api/v1/key` endpoint.",
+          "description": "Reserved caller-introspection switch. The OSS runtime does not install `GET /api/v1/key`; retained for config compatibility.",
           "default": false,
           "type": "boolean"
         },
@@ -4759,7 +4759,7 @@
       }
     },
     "ScriptingConfig": {
-      "description": "Per-engine scripting sandbox limits, exposed under the `proxy.scripting:` block of sb.yml.\n\nToday this block carries sub-blocks for the Lua engine and the JavaScript engine. The CEL and WebAssembly engines manage their own budgets separately. Operators who omit the block get the documented defaults from each sub-block.",
+      "description": "Per-engine scripting sandbox limits, exposed under the `proxy.scripting:` block of sb.yml.\n\nThe Lua sub-block is installed into the live engine. The JavaScript sub-block remains parseable for compatibility but `JsEngine::new` uses its built-in defaults; CEL and WebAssembly manage their own budgets separately.",
       "type": "object",
       "properties": {
         "lua": {
@@ -4778,7 +4778,7 @@
           ]
         },
         "javascript": {
-          "description": "JavaScript engine sandbox knobs. Covers the QuickJS-backed `JsEngine` used by transforms, request matchers, and WAF custom rules.",
+          "description": "Reserved JavaScript sandbox shape. It is not installed into the QuickJS-backed `JsEngine` by the OSS boot path.",
           "default": {
             "sandbox": {
               "budget_ms": 100,
@@ -4839,7 +4839,7 @@
       }
     },
     "JsScriptingConfig": {
-      "description": "JavaScript engine config block (`proxy.scripting.javascript:`).\n\nWraps the sandbox limits the engine enforces every time it runs a script. Adding fresh knobs here (module loader settings, host bindings, ...) should keep `sandbox:` as its own sub-block so existing configs keep parsing.",
+      "description": "JavaScript engine config block (`proxy.scripting.javascript:`).\n\nRetained so existing configs keep parsing. Programmatic callers may pass this sandbox to `JsEngine::with_sandbox`, but the YAML boot path does not.",
       "type": "object",
       "properties": {
         "sandbox": {
@@ -5638,7 +5638,7 @@
           "default": null
         },
         "rate_limit_headers": {
-          "description": "Configuration for rate-limit response headers (`X-RateLimit-*`, `Retry-After`).",
+          "description": "Compatibility-only origin-level rate-limit header shape. Configure the live rate-limit policy's `headers` block instead.",
           "default": null
         },
         "error_pages": {
@@ -5677,7 +5677,7 @@
           ]
         },
         "traffic_capture": {
-          "description": "Traffic capture / mirroring configuration.",
+          "description": "Compatibility-only traffic-capture shape. The OSS runtime has no consumer; use [`MirrorConfig`] for live request mirroring.",
           "default": null
         },
         "mirror": {
@@ -5741,7 +5741,7 @@
           ]
         },
         "connection_pool": {
-          "description": "Per-origin connection pool tuning.  Falls back to proxy-wide defaults when not specified.",
+          "description": "Compatibility-only per-origin connection-pool shape. Pingora's built-in pool settings apply regardless of these values.",
           "default": null,
           "anyOf": [
             {
@@ -6406,7 +6406,7 @@
           ]
         },
         "ttl_seconds": {
-          "description": "Sessions index TTL in seconds. The proxy itself does not enforce TTL; this knob feeds the ClickHouse projections (T2.4) which key storage on `(workspace_id, session_id)`.",
+          "description": "Reserved sessions-index TTL hint. The OSS runtime does not expire the in-process request ring or a downstream projection from this value.",
           "default": 86400,
           "type": "integer",
           "format": "uint64",
@@ -7373,25 +7373,25 @@
       ]
     },
     "ConnectionPoolConfig": {
-      "description": "Per-origin connection pool tuning parameters.\n\nControls how many concurrent connections are maintained to an upstream, how long idle connections are kept alive, and the maximum lifetime of any individual connection.",
+      "description": "Legacy per-origin connection-pool shape.\n\nThe OSS runtime does not install these values into Pingora. They remain in the schema so existing configuration files continue to parse.",
       "type": "object",
       "properties": {
         "max_connections": {
-          "description": "Maximum number of concurrent connections to the upstream.\n\nAdditional requests will queue until a connection is available. Default: 128.",
+          "description": "Maximum number of concurrent connections to the upstream.\n\nConfig-only compatibility value. Default: 128.",
           "default": 128,
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
         },
         "idle_timeout_secs": {
-          "description": "Maximum idle time before a connection is closed, in seconds.\n\nConnections that have been unused for longer than this will be dropped from the pool.  Default: 90 s.",
+          "description": "Maximum idle time before a connection is closed, in seconds.\n\nConfig-only compatibility value. Default: 90 s.",
           "default": 90,
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
         },
         "max_lifetime_secs": {
-          "description": "Maximum total lifetime of a connection, in seconds.\n\nConnections older than this will be closed and replaced even if they are still healthy.  Default: 300 s.",
+          "description": "Maximum total lifetime of a connection, in seconds.\n\nConfig-only compatibility value. Default: 300 s.",
           "default": 300,
           "type": "integer",
           "format": "uint32",

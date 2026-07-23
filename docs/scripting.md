@@ -638,19 +638,15 @@ transforms:
 
 The `ctx` argument carries `ctx.request.aipref.train`, `ctx.request.aipref.search`, and `ctx.request.aipref.ai_input`, each defaulting to `true` when the request has no valid `aipref` header.
 
-Sandbox limits live under `proxy.scripting.javascript.sandbox`:
+QuickJS always runs with a sandbox: a 100 ms CPU budget, 16 MiB heap cap, and
+1 MiB native-stack cap. A script that exceeds the CPU budget is aborted by a
+watchdog with an uncatchable exception; the modifier or transform is skipped
+and the error is logged.
 
-```yaml
-proxy:
-  scripting:
-    javascript:
-      sandbox:
-        budget_ms: 100    # CPU time budget per invocation
-        memory_mb: 16     # QuickJS heap cap
-        stack_kb: 1024    # native stack cap
-```
-
-A script that exceeds `budget_ms` is aborted by a watchdog with an uncatchable exception; the modifier or transform is skipped and the error is logged.
+The `proxy.scripting.javascript.sandbox` YAML subtree remains parseable for
+compatibility but is not installed into `JsEngine::new` today, so changing
+those YAML values does not tune the live engine. Rust integrations that
+construct `JsEngine::with_sandbox` directly can supply different limits.
 
 ---
 

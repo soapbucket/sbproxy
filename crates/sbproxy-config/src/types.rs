@@ -601,14 +601,10 @@ pub struct ProxyServerConfig {
     /// Metrics collection settings, including cardinality limiting.
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
-    /// Top-level observability block: groups `log` (tracing-subscriber
-    /// filter / format / sampling) and `telemetry` (OTLP exporter)
-    /// under one block so an operator configures the whole surface
-    /// from YAML instead of CLI flags + env vars.
-    ///
-    /// When absent, CLI / env precedence still applies; the YAML
-    /// fields are a third source of truth that wins over the existing
-    /// `RUST_LOG` default but loses to `--log-level` / `SB_LOG_LEVEL`.
+    /// Top-level observability block: live log sinks, redaction and custom
+    /// fields plus the OTLP exporter and durable usage rollups. The parent log
+    /// level, format, and sampling fields are compatibility-only; process
+    /// tracing uses CLI/environment selection and built-in sampling defaults.
     #[serde(default)]
     pub observability: Option<ObservabilityConfig>,
     /// Alert notification channel configuration.
@@ -1325,7 +1321,8 @@ pub struct KeyGovernanceConfig {
     /// be pre-gated must not be silently treated as unlimited.
     #[serde(default)]
     pub missing_rate: GovernanceMissingRatePolicy,
-    /// Expose the authenticated caller-only `GET /api/v1/key` endpoint.
+    /// Reserved caller-introspection switch. The OSS runtime does not install
+    /// `GET /api/v1/key`; retained for config compatibility.
     pub key_introspection: bool,
     /// Require AI requests to resolve to a governed key instead of accepting
     /// origin credentials or anonymous access.
@@ -1548,8 +1545,8 @@ pub struct KeyStoreConfig {
     /// Redis connection URL (backend `redis`).
     #[serde(default)]
     pub url: Option<String>,
-    /// Treat Redis as the source of truth rather than a coherence tier
-    /// (backend `redis`).
+    /// Legacy compatibility switch. Selecting `backend: redis` already makes
+    /// Redis the key store; this value does not change runtime behavior.
     #[serde(default)]
     pub redis_source_of_truth: bool,
     /// Secret-reference namespace prefix (backend `secrets_manager`).
@@ -1935,10 +1932,9 @@ pub struct SeedCredentialConfig {
 /// Per-engine scripting sandbox limits, exposed under the
 /// `proxy.scripting:` block of sb.yml.
 ///
-/// Today this block carries sub-blocks for the Lua engine
-/// and the JavaScript engine. The CEL and WebAssembly
-/// engines manage their own budgets separately. Operators who omit
-/// the block get the documented defaults from each sub-block.
+/// The Lua sub-block is installed into the live engine. The JavaScript
+/// sub-block remains parseable for compatibility but `JsEngine::new` uses its
+/// built-in defaults; CEL and WebAssembly manage their own budgets separately.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ScriptingConfig {
     /// Lua sandbox limits. Always populated, even when the operator
@@ -1946,19 +1942,16 @@ pub struct ScriptingConfig {
     /// `None`.
     #[serde(default)]
     pub lua: LuaScriptingConfig,
-    /// JavaScript engine sandbox knobs. Covers the QuickJS-backed
-    /// `JsEngine` used by transforms, request matchers, and WAF
-    /// custom rules.
+    /// Reserved JavaScript sandbox shape. It is not installed into the
+    /// QuickJS-backed `JsEngine` by the OSS boot path.
     #[serde(default)]
     pub javascript: JsScriptingConfig,
 }
 
 /// JavaScript engine config block (`proxy.scripting.javascript:`).
 ///
-/// Wraps the sandbox limits the engine enforces every time it runs a
-/// script. Adding fresh knobs here (module loader settings, host
-/// bindings, ...) should keep `sandbox:` as its own sub-block so
-/// existing configs keep parsing.
+/// Retained so existing configs keep parsing. Programmatic callers may pass
+/// this sandbox to `JsEngine::with_sandbox`, but the YAML boot path does not.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct JsScriptingConfig {
     /// Sandbox limits: CPU time budget, heap memory cap, and native
@@ -3516,15 +3509,13 @@ pub struct AlertingConfig {
     pub channels: Vec<AlertChannelConfig>,
 }
 
-/// Top-level observability block: groups the `log` and `telemetry`
-/// sub-blocks so an operator can configure both from YAML rather than
-/// CLI flags + env vars. Re-uses the existing `LoggingConfig` and
-/// `TelemetryConfig` shapes from `sbproxy-observe`.
+/// Top-level observability block grouping live log extensions, telemetry, and
+/// durable usage rollups. The legacy process-logger fields under `log` remain
+/// parseable but are not installed into the tracing subscriber.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityConfig {
-    /// `tracing-subscriber` configuration: level, format, per-level
-    /// sampling. CLI / env still wins where applicable; this block is
-    /// the YAML source-of-truth for everything else.
+    /// Log sinks, redaction, and custom fields, plus compatibility-only parent
+    /// level, format, and per-level sampling values.
     #[serde(default)]
     pub log: Option<ObservabilityLogConfig>,
     /// OTLP exporter configuration. When `enabled = true`, the
@@ -3589,13 +3580,16 @@ fn default_rollup_daily_days() -> u32 {
 /// observe crate.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityLogConfig {
-    /// Log level filter. `debug | info | warn | error`. Default `info`.
+    /// Compatibility-only process log level. Use CLI/environment controls;
+    /// this YAML value is not installed into the tracing subscriber.
     #[serde(default)]
     pub level: Option<String>,
-    /// Output format. `compact | pretty | json`. Default `compact`.
+    /// Compatibility-only process output format. Sink-local `format` remains
+    /// live, while the process subscriber uses CLI/environment controls.
     #[serde(default)]
     pub format: Option<String>,
-    /// Per-level emission sampling rates. Default 1.0 / 0.1 / 0.01.
+    /// Compatibility-only per-level sampling rates. The process logger uses
+    /// its built-in sampling defaults.
     #[serde(default)]
     pub sampling: Option<ObservabilitySamplingConfig>,
     /// Operator-extensible redaction block. `fields` extends the
@@ -3955,31 +3949,27 @@ fn default_idle_timeout() -> u32 {
 
 // --- ConnectionPoolConfig ---
 
-/// Per-origin connection pool tuning parameters.
+/// Legacy per-origin connection-pool shape.
 ///
-/// Controls how many concurrent connections are maintained to an upstream,
-/// how long idle connections are kept alive, and the maximum lifetime of
-/// any individual connection.
+/// The OSS runtime does not install these values into Pingora. They remain in
+/// the schema so existing configuration files continue to parse.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ConnectionPoolConfig {
     /// Maximum number of concurrent connections to the upstream.
     ///
-    /// Additional requests will queue until a connection is available.
-    /// Default: 128.
+    /// Config-only compatibility value. Default: 128.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
 
     /// Maximum idle time before a connection is closed, in seconds.
     ///
-    /// Connections that have been unused for longer than this will be
-    /// dropped from the pool.  Default: 90 s.
+    /// Config-only compatibility value. Default: 90 s.
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u32,
 
     /// Maximum total lifetime of a connection, in seconds.
     ///
-    /// Connections older than this will be closed and replaced even if they
-    /// are still healthy.  Default: 300 s.
+    /// Config-only compatibility value. Default: 300 s.
     #[serde(default = "default_max_lifetime_secs")]
     pub max_lifetime_secs: u32,
 }
@@ -4427,7 +4417,8 @@ pub struct RawOriginConfig {
     /// Threat protection (IP reputation, blocklist) configuration.
     #[serde(default)]
     pub threat_protection: Option<serde_json::Value>,
-    /// Configuration for rate-limit response headers (`X-RateLimit-*`, `Retry-After`).
+    /// Compatibility-only origin-level rate-limit header shape. Configure the
+    /// live rate-limit policy's `headers` block instead.
     #[serde(default)]
     pub rate_limit_headers: Option<serde_json::Value>,
     /// Per-status custom error response bodies. Each entry covers one
@@ -4452,7 +4443,8 @@ pub struct RawOriginConfig {
     /// wide branding (e.g. `acme-edge`).
     #[serde(default)]
     pub proxy_status: Option<ProxyStatusConfig>,
-    /// Traffic capture / mirroring configuration.
+    /// Compatibility-only traffic-capture shape. The OSS runtime has no
+    /// consumer; use [`MirrorConfig`] for live request mirroring.
     #[serde(default)]
     pub traffic_capture: Option<serde_json::Value>,
     /// Shadow traffic mirror, fire-and-forget copy of each request to
@@ -4484,8 +4476,8 @@ pub struct RawOriginConfig {
     /// header. See [`IdempotencyConfig`].
     #[serde(default)]
     pub idempotency: Option<IdempotencyConfig>,
-    /// Per-origin connection pool tuning.  Falls back to proxy-wide defaults
-    /// when not specified.
+    /// Compatibility-only per-origin connection-pool shape. Pingora's built-in
+    /// pool settings apply regardless of these values.
     #[serde(default)]
     pub connection_pool: Option<ConnectionPoolConfig>,
     /// Opaque per-origin extensions for out-of-tree config blocks.
@@ -5185,16 +5177,15 @@ pub struct HeaderModifiers {
 
 /// Top-level secrets management configuration.
 ///
-/// Controls which vault backend is used to resolve `secret:` references in
-/// config values and how secret rotation is handled.
+/// The live surface is [`SecretsConfig::backends`], selected by provider URI
+/// references. The legacy single-backend and rotation fields remain parseable
+/// for compatibility but are not consumed by the OSS runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SecretsConfig {
-    /// Backend to use for resolving secrets.
-    ///
-    /// Supported values: `"env"` (default), `"local"`, `"hashicorp"`.
+    /// Legacy single-backend selector. Use [`SecretsConfig::backends`].
     #[serde(default = "default_secrets_backend")]
     pub backend: String,
-    /// HashiCorp Vault connection settings. Required when `backend = "hashicorp"`.
+    /// Legacy HashiCorp block. Declare a named `hashicorp` backend instead.
     #[serde(default)]
     pub hashicorp: Option<HashiCorpSecretsConfig>,
     /// Logical name to vault path mapping. INERT since the removal of
@@ -5203,12 +5194,11 @@ pub struct SecretsConfig {
     /// Use `secret://<backend>/<name>` references instead.
     #[serde(default)]
     pub map: HashMap<String, String>,
-    /// Secret rotation settings.
+    /// Reserved rotation shape; no OSS scheduler consumes it.
     #[serde(default)]
     pub rotation: Option<RotationConfig>,
-    /// Fallback strategy when the vault backend is unavailable.
-    ///
-    /// Supported values: `"cache"` (default), `"reject"`, `"env"`.
+    /// Legacy fallback selector; provider URI resolution fails loudly and does
+    /// not consult this value.
     #[serde(default = "default_fallback")]
     pub fallback: String,
     /// Named secret backends that provider-URI references resolve against
@@ -5441,7 +5431,10 @@ pub enum K8sBackendAuth {
     },
 }
 
-/// HashiCorp Vault connection settings.
+/// Legacy HashiCorp Vault connection settings.
+///
+/// The OSS resolver consumes the `hashicorp` variant in
+/// [`SecretsConfig::backends`], not this compatibility block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HashiCorpSecretsConfig {
     /// Vault server address (e.g. `"https://vault.example.com:8200"`).
@@ -5454,7 +5447,9 @@ pub struct HashiCorpSecretsConfig {
     pub mount: String,
 }
 
-/// Secret rotation configuration.
+/// Reserved secret-rotation configuration.
+///
+/// No OSS scheduler consumes this compatibility block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RotationConfig {
     /// Seconds the previous secret value remains valid after rotation.

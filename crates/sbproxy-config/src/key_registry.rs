@@ -1,83 +1,306 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Which top-level `proxy:` config keys are retained without live behavior.
+//! Reviewed exceptions to the build-time configuration-reader scan.
 //!
-//! `proxy.alerting` accepted a PagerDuty routing key, validated it, and had no
-//! consumer anywhere in the boot path. An operator who configured it believed
-//! they were paged, and nothing disagreed. That is the config-key instance of
-//! the pattern the capability registry exists to close: a surface that parses
-//! input and does nothing while presenting as complete.
+//! Most schema keys need no entry: the reader guard finds their non-test Rust
+//! field access. An entry exists only when the serialized name differs from the
+//! Rust field or serde consumes it indirectly, or when the key is deliberately
+//! retained without live behavior.
 //!
-//! Only config-only keys are listed here. A stable key is the default and needs
-//! no entry; the coverage test asserts that every key named here is genuinely
-//! a real config key so a rename cannot leave a stale classification. Each
-//! entry also explains how the compiler treats attempts to activate it.
+//! Keep this list reviewed and small. Every stable exception names the concrete
+//! consumer the scanner cannot infer. Every `ConfigOnly` exception tells an
+//! operator exactly what does not happen and names the tracking issue.
 
 use sbproxy_capability::{ConfigKeyCapability, SupportLevel};
 
-/// The top-level `proxy:` keys retained in the schema without live behavior.
-///
-/// Kept deliberately short. The moment a key's consumer lands, its entry is
-/// deleted.
-pub const INERT_CONFIG_KEYS: &[ConfigKeyCapability] = &[ConfigKeyCapability {
-    path: "proxy.http3",
-    support: SupportLevel::ConfigOnly,
-    consumer: None,
-    note: Some(
-        "Reserved for forward compatibility. This build does not serve HTTP/3, \
-             so proxy.http3.enabled=true fails config compilation. Native HTTP/3 \
-             support is tracked in WOR-1969.",
-    ),
-}];
-
-/// Every top-level `proxy:` key the schema actually declares.
-///
-/// Reflected from the `ProxyServerConfig` JSON schema rather than hand-listed,
-/// so it cannot drift from the struct. This is the set the coverage check
-/// validates the registry against.
-pub fn declared_top_level_keys() -> Vec<String> {
-    let schema = schemars::schema_for!(crate::types::ProxyServerConfig);
-    let mut out = Vec::new();
-    if let Some(object) = schema.schema.object {
-        for property in object.properties.keys() {
-            out.push(format!("proxy.{property}"));
-        }
+const fn stable(path: &'static str, consumer: &'static str) -> ConfigKeyCapability {
+    ConfigKeyCapability {
+        path,
+        support: SupportLevel::Stable,
+        consumer: Some(consumer),
+        note: None,
     }
-    out.sort();
-    out
+}
+
+const fn config_only(path: &'static str, note: &'static str) -> ConfigKeyCapability {
+    ConfigKeyCapability {
+        path,
+        support: SupportLevel::ConfigOnly,
+        consumer: None,
+        note: Some(note),
+    }
+}
+
+/// Keys whose reader is indirect, plus deliberately inert compatibility keys.
+///
+/// An override covers its complete schema subtree. Prefer the narrowest path
+/// that describes the indirect consumer or inert surface.
+pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
+    stable(
+        "access_log.output.type",
+        "sbproxy_core::server::access_log::emit_access_log",
+    ),
+    config_only(
+        "agent_classes.hosted_feed",
+        "The OSS resolver does not fetch hosted agent-class feeds; builtin and inline catalogs \
+         remain live. Retained for compatibility and tracked by WOR-1976.",
+    ),
+    config_only(
+        "origins.*.agent_skills[].max_clock_skew_secs",
+        "Agent Skills responses do not yet carry the signed freshness headers this limit would \
+         verify. Reserved under WOR-1976.",
+    ),
+    stable(
+        "origins.*.agent_skills[].type",
+        "sbproxy_config::compiler::compile_origin",
+    ),
+    config_only(
+        "origins.*.connection_pool",
+        "Pingora owns upstream connection pooling; these per-origin limits are not applied by \
+         the OSS runtime. Classified under WOR-1976.",
+    ),
+    config_only(
+        "origins.*.compression.level",
+        "The OSS compressors use their library defaults; this compatibility value is not \
+         applied. Classified under WOR-1976.",
+    ),
+    config_only(
+        "origins.*.cors.enable",
+        "The presence of the cors block enables CORS; the legacy enable/enabled value itself is \
+         ignored, including false. Classified under WOR-1976.",
+    ),
+    stable(
+        "origins.*.credentials[].policies[].type",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
+    ),
+    stable(
+        "origins.*.credentials[].type",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
+    ),
+    stable(
+        "origins.*.forward_rules[].parameters[].in",
+        "sbproxy_openapi::build",
+    ),
+    stable(
+        "origins.*.observability.log.sinks[].output.type",
+        "sbproxy_core::server::lifecycle::compile_one_sink",
+    ),
+    config_only(
+        "origins.*.rate_limit_headers",
+        "The OSS runtime does not consume the origin-level block; configure headers on the live \
+         rate-limit policy instead. Classified under WOR-1976.",
+    ),
+    config_only(
+        "origins.*.sessions.ttl_seconds",
+        "Session capture does not expire its in-process request-ring entries from this value; it \
+         is a reserved retention hint under WOR-1976.",
+    ),
+    config_only(
+        "origins.*.traffic_capture",
+        "The OSS runtime has no traffic-capture consumer; use the live mirror block or an \
+         out-of-tree extension. Classified under WOR-1976.",
+    ),
+    stable(
+        "proxy.alerting.channels[].type",
+        "sbproxy::map_alert_channel",
+    ),
+    stable(
+        "proxy.cache_reserve.backend.type",
+        "sbproxy_core::pipeline::build_cache_reserve",
+    ),
+    stable(
+        "proxy.credentials[].policies[].type",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
+    ),
+    stable(
+        "proxy.credentials[].type",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
+    ),
+    config_only(
+        "proxy.device_parser_file",
+        "The current pure-Rust device parser does not load an operator regex catalog. Reserved \
+         for the parser swap tracked under WOR-1976.",
+    ),
+    config_only(
+        "proxy.http3",
+        "This build does not serve HTTP/3; enabled=true fails config compilation. Native HTTP/3 \
+         support is tracked in WOR-1969.",
+    ),
+    stable(
+        "proxy.key_management.governance.backend.type",
+        "sbproxy_core::key_plane::build_governance_store",
+    ),
+    config_only(
+        "proxy.key_management.governance.key_introspection",
+        "The caller-only key-introspection route is not installed by the OSS runtime. Retained \
+         for compatibility and classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.key_management.store.redis_source_of_truth",
+        "Selecting the Redis store already makes Redis authoritative; this legacy boolean does \
+         not alter runtime behavior. Classified under WOR-1976.",
+    ),
+    stable(
+        "proxy.l2_cache_settings",
+        "sbproxy_config::compiler::build_l2_store",
+    ),
+    config_only(
+        "proxy.observability.log.level",
+        "The active tracing filter is selected by CLI/environment precedence, not this YAML \
+         value. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.observability.log.format",
+        "The active tracing format is selected by CLI/environment precedence, not this YAML \
+         value. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.observability.log.sampling",
+        "The process logger currently uses its fixed sampling defaults; these YAML rates are not \
+         installed. Classified under WOR-1976.",
+    ),
+    stable(
+        "proxy.observability.log.sinks[].output.type",
+        "sbproxy_core::server::lifecycle::compile_one_sink",
+    ),
+    config_only(
+        "proxy.scripting.javascript",
+        "QuickJS engines currently use their built-in sandbox defaults; this YAML block is not \
+         installed into JsEngine::new. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.secrets.backend",
+        "The legacy single-backend selector is not consulted; declare named entries under \
+         proxy.secrets.backends. Classified under WOR-1976.",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.external_account_file",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.jwt_path",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.role_id",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.service_account_key_file",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.service_account_key_json",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.session_name",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.type",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].type",
+        "sbproxy::install_secret_resolver",
+    ),
+    config_only(
+        "proxy.secrets.fallback",
+        "The named-backend resolver fails unresolved provider URIs loudly and does not consult \
+         this legacy fallback selector. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.secrets.hashicorp",
+        "The legacy HashiCorp block is not installed; configure a hashicorp entry under \
+         proxy.secrets.backends. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.secrets.map",
+        "The secret:<name> form was removed; use secret://<backend>/<name>. Retained for \
+         compatibility and tracked by WOR-1976.",
+    ),
+    config_only(
+        "proxy.secrets.rotation",
+        "The OSS process resolver does not schedule re-resolution or a dual-value grace window \
+         from this block. Classified under WOR-1976.",
+    ),
+    stable(
+        "proxy.tenants[].credentials[].policies[].type",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
+    ),
+    stable(
+        "proxy.tenants[].credentials[].type",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
+    ),
+    stable(
+        "proxy.tenants[].observability.log.sinks[].output.type",
+        "sbproxy_core::server::lifecycle::compile_one_sink",
+    ),
+    stable("source.overlays", "sbproxy_config::source::load_with_depth"),
+];
+
+/// Return the config-only registry entries explicitly present in raw YAML.
+///
+/// This walks the operator-authored value rather than a deserialized
+/// [`crate::types::ConfigFile`], so serde defaults do not produce warnings for
+/// omitted keys. Registry `*` segments match map values and `[]` segments match
+/// array elements.
+pub(crate) fn configured_config_only_keys(
+    yaml: &serde_yaml::Value,
+) -> Vec<&'static ConfigKeyCapability> {
+    CONFIG_KEY_OVERRIDES
+        .iter()
+        .filter(|entry| entry.support == SupportLevel::ConfigOnly)
+        .filter(|entry| {
+            let segments: Vec<&str> = entry.path.split('.').collect();
+            yaml_path_exists(yaml, &segments)
+        })
+        .collect()
+}
+
+fn yaml_path_exists(value: &serde_yaml::Value, segments: &[&str]) -> bool {
+    let Some((segment, rest)) = segments.split_first() else {
+        return true;
+    };
+
+    if *segment == "*" {
+        return value
+            .as_mapping()
+            .is_some_and(|map| map.values().any(|child| yaml_path_exists(child, rest)));
+    }
+
+    if let Some(name) = segment.strip_suffix("[]") {
+        return value
+            .get(name)
+            .and_then(serde_yaml::Value::as_sequence)
+            .is_some_and(|items| items.iter().any(|child| yaml_path_exists(child, rest)));
+    }
+
+    value
+        .get(*segment)
+        .is_some_and(|child| yaml_path_exists(child, rest))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
-    use sbproxy_capability::validate_config_key_coverage;
+    use sbproxy_capability::config_scan::{schema_key_paths, verify_config_readers};
+    use sbproxy_capability::scan::rust_sources;
 
     #[test]
-    fn the_inert_key_registry_is_consistent_with_the_schema() {
-        let declared = declared_top_level_keys();
-        let declared_refs: Vec<&str> = declared.iter().map(String::as_str).collect();
-
-        let errors = validate_config_key_coverage(INERT_CONFIG_KEYS, &declared_refs);
-
-        assert!(
-            errors.is_empty(),
-            "config-key registry is inconsistent:\n{}",
-            errors
-                .iter()
-                .map(|e| format!("  - {e}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    #[test]
-    fn every_inert_key_names_the_ticket_that_activates_it() {
-        for key in INERT_CONFIG_KEYS {
+    fn every_config_only_key_names_its_tracking_issue() {
+        for key in CONFIG_KEY_OVERRIDES
+            .iter()
+            .filter(|key| key.support == SupportLevel::ConfigOnly)
+        {
             let note = key.note.unwrap_or("");
             assert!(
                 note.contains("WOR-"),
-                "inert key {} must explain itself and point at the work that fixes \
+                "config-only key {} must explain itself and point at the work that tracks \
                  it: '{note}'",
                 key.path
             );
@@ -86,10 +309,67 @@ mod tests {
 
     #[test]
     fn alerting_is_wired_and_no_longer_classified_inert() {
-        // WOR-1884 wired the dispatcher: proxy.alerting is a real schema key
-        // and is now stable, so it must NOT appear in the inert registry (a
-        // stable key needs no entry) and the boot warning for it is gone.
-        assert!(declared_top_level_keys().contains(&"proxy.alerting".to_string()));
-        assert!(!INERT_CONFIG_KEYS.iter().any(|k| k.path == "proxy.alerting"));
+        assert!(!CONFIG_KEY_OVERRIDES
+            .iter()
+            .any(|key| key.path == "proxy.alerting"));
+    }
+
+    #[test]
+    fn configured_config_only_keys_follow_maps_and_arrays_without_defaults() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+proxy:
+  observability:
+    log:
+      sampling: { info: 0.5 }
+origins:
+  api.example:
+    agent_skills:
+      - type: skill-md
+        name: deploy
+        description: deploy
+        url: /deploy.md
+        max_clock_skew_secs: 30
+    action: { type: static, status_code: 200 }
+"#,
+        )
+        .expect("fixture parses");
+
+        let configured = configured_config_only_keys(&yaml);
+        let paths: Vec<&str> = configured.iter().map(|key| key.path).collect();
+
+        assert_eq!(
+            paths,
+            [
+                "origins.*.agent_skills[].max_clock_skew_secs",
+                "proxy.observability.log.sampling",
+            ]
+        );
+        assert!(!paths.contains(&"origins.*.agent_skills[].type"));
+        assert!(!paths.contains(&"proxy.http3"));
+    }
+
+    #[test]
+    fn every_schema_key_has_a_production_reader_or_reviewed_override() {
+        let schema = serde_json::to_value(schemars::schema_for!(crate::types::ConfigFile))
+            .expect("config schema serializes");
+        let keys = schema_key_paths(&schema);
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("sbproxy-config crate lives under crates/");
+        let sources = rust_sources(repo_root);
+
+        let errors = verify_config_readers(&keys, CONFIG_KEY_OVERRIDES, &sources);
+
+        assert!(
+            errors.is_empty(),
+            "configuration keys without production readers:\n{}",
+            errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 }

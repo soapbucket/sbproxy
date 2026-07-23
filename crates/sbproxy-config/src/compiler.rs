@@ -652,12 +652,18 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
             .map(|cred| {
                 // Convert the per-credential attrs to the legacy
                 // ai_project / ai_user / tags / metadata shape.
-                let metadata: serde_json::Map<String, serde_json::Value> = cred
+                let mut metadata: serde_json::Map<String, serde_json::Value> = cred
                     .attrs
                     .metadata
                     .iter()
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
+                if let Some(cost_center) = &cred.attrs.cost_center {
+                    metadata.insert(
+                        "cost_center".to_string(),
+                        serde_json::Value::String(cost_center.clone()),
+                    );
+                }
                 let key = cred.key.clone().unwrap_or_default();
                 let key_id = format!(
                     "cfg:{}:{}:{}:{}:{}",
@@ -1135,6 +1141,20 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // single source of truth. Returns an error when the legacy and
     // new shapes coexist (operator must pick one).
     let yaml = migrate_features_to_extensions(&yaml)?;
+
+    // WOR-1976: make every explicitly configured compatibility-only key
+    // visible at boot. Inspect the raw YAML so omitted serde-defaulted fields
+    // stay quiet; the same registry is enforced against the generated schema
+    // by the build-time reader guard.
+    if let Ok(raw_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&yaml) {
+        for key in crate::key_registry::configured_config_only_keys(&raw_yaml) {
+            tracing::warn!(
+                config_key = key.path,
+                reason = key.note.unwrap_or("no live OSS consumer"),
+                "config-only key is set and does not activate runtime behavior"
+            );
+        }
+    }
 
     // Reject the legacy `virtual_keys:` YAML key with a pointer to
     // the migration guide. The credentials epic replaces it with the
@@ -2698,6 +2718,7 @@ proxy:
       key: ${OPENAI_API_KEY}
       attrs:
         project: shared
+        cost_center: research
         tags: [tier-shared]
 origins:
   ai.local:
@@ -2723,6 +2744,10 @@ origins:
         assert_eq!(vks[0]["project"], "shared");
         assert_eq!(vks[0]["allowed_providers"][0], "openai");
         assert_eq!(vks[0]["tags"][0], "tier-shared");
+        assert_eq!(
+            vks[0]["metadata"]["cost_center"], "research",
+            "cost_center must be lifted into the runtime metadata map"
+        );
     }
 
     /// `route_to_model` and `inject_tools` set on a credentials-block

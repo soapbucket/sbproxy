@@ -20,7 +20,8 @@
 - W3C and B3 distributed tracing header propagation.
 - Webhook alerting with configurable channels via `proxy.alerting`.
 - Admin stats SPA via `proxy.admin`.
-- Per-origin connection pool tuning via `connection_pool`.
+- The legacy per-origin `connection_pool` shape remains parseable but is
+  config-only; Pingora's built-in pool settings apply.
 
 #### Config additions
 
@@ -38,13 +39,13 @@ The following per-origin keys are new in v1.0:
 
 | Key | Description |
 |-----|-------------|
-| `connection_pool` | Per-origin connection pool tuning. |
+| `connection_pool` | Config-only compatibility shape; does not tune Pingora. |
 | `on_request` | Event hook plugins (alpha). |
 | `on_response` | Event hook plugins (alpha). |
 | `bot_detection` | Bot traffic detection (alpha). |
 | `threat_protection` | Dynamic blocklist integration (alpha). |
-| `rate_limit_headers` | Rate limit response header control. |
-| `traffic_capture` | Request mirroring (alpha). |
+| `rate_limit_headers` | Config-only compatibility shape; configure response headers on the live rate-limit policy. |
+| `traffic_capture` | Config-only compatibility shape; use `mirror` for live request mirroring. |
 | `message_signatures` | HTTP message signature verification (alpha). |
 
 #### Migration steps

@@ -39,7 +39,6 @@ proxy:
       # Redis is the system of record so every replica reads the same keys.
       backend: redis
       url: redis://redis:6379
-      redis_source_of_truth: true
     cache:
       ttl_secs: 30
       # The mesh distributed cache sits in front of the store. Reads and writes

@@ -61,6 +61,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "cargo doc"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
+step "config schema and reader coverage"
+bash "$ROOT/scripts/check-config-schema.sh"
+bash "$ROOT/scripts/check-config-readers.sh"
+
 step "generated docs are current"
 bash "$ROOT/scripts/check-metrics-stability.sh"
 bash "$ROOT/scripts/check-model-host-capabilities.sh"

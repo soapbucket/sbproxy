@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-07-22*
+*Last modified: 2026-07-23*
 
 Stability guarantees for every field in `sb.yml`. Check a field's tier before relying on it in production.
 
@@ -40,6 +40,19 @@ A `disabled` field is retained in the schema but cannot activate runtime behavio
 - Attempting to enable unavailable behavior fails config compilation instead of being ignored.
 - Currently applies to the `http3` block. Native HTTP/3 support is tracked in WOR-1969.
 
+### `config-only`
+
+A `config-only` field remains parseable for compatibility but has no live
+consumer in the open-source runtime.
+
+- Do not use it to satisfy an operational requirement.
+- An explicitly authored config-only key emits a boot/config-validation warning
+  naming the complete schema path and the reason it has no effect.
+- The build-time config-reader guard requires an explicit registry entry and
+  an operator-facing reason for every such field.
+- The field is removed from examples that purport to demonstrate working
+  behavior. Its reference entry states the live alternative, when one exists.
+
 ---
 
 ## Stabilization rules
@@ -47,6 +60,41 @@ A `disabled` field is retained in the schema but cannot activate runtime behavio
 1. A field moves from `alpha` to `beta` once its interface is reviewed, it has integration tests, and it has been in at least one release.
 2. A field moves from `beta` to `stable` once it has been in production use by at least one internal deployment for one full release cycle without interface changes.
 3. Stable fields are never silently removed. The process is: deprecate (the config compiler logs a structured deprecation warning at load time naming the legacy and canonical field), then remove in the next major version. A schema-level `x-deprecated` annotation is planned but not shipped.
+
+## Build-time reader coverage
+
+CI walks the generated `ConfigFile` JSON Schema and requires every key to have
+either a non-test Rust field read or a reviewed entry in
+`CONFIG_KEY_OVERRIDES`. Indirect serde consumers name their concrete runtime
+consumer. Deliberately inert fields are marked `config-only` with a reason.
+Run the same lane locally with:
+
+```bash
+scripts/check-config-readers.sh
+```
+
+Adding a key to `types.rs` without wiring it now fails with the complete dotted
+schema path. Adding a reviewed `ConfigOnly` entry makes the exception explicit
+and stale entries fail when their schema path is removed or renamed.
+
+### Current config-only compatibility fields
+
+| Field or subtree | What happens today |
+|---|---|
+| `agent_classes.hosted_feed` | The OSS resolver uses builtin or inline catalogs; it does not fetch a hosted feed. |
+| `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
+| `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
+| `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |
+| `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |
+| `origins.*.rate_limit_headers` | Use the live rate-limit policy's `headers` block instead. |
+| `origins.*.sessions.ttl_seconds` | Reserved retention hint; the in-process request ring does not expire entries from it. |
+| `origins.*.traffic_capture` | No OSS capture consumer; use `mirror` for live fire-and-forget request mirroring. |
+| `proxy.device_parser_file` | The current pure-Rust device parser does not load this catalog override. |
+| `proxy.key_management.governance.key_introspection` | The caller-only introspection route is not installed. |
+| `proxy.key_management.store.redis_source_of_truth` | Redis is authoritative whenever `store.backend: redis`; this legacy boolean changes nothing. |
+| `proxy.observability.log.level`, `.format`, `.sampling` | Process logging uses CLI/environment selection and fixed sampling defaults. Sink-local `format` remains live. |
+| `proxy.scripting.javascript` | QuickJS engines use built-in sandbox defaults; this YAML subtree is not installed. |
+| `proxy.secrets.backend`, `.hashicorp`, `.map`, `.rotation`, `.fallback` | Legacy single-backend surface. Use named `proxy.secrets.backends` and provider URI references. |
 
 ---
 
@@ -116,9 +164,10 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `on_response` | - | array | `[]` | **alpha** | Response event hook plugins. |
 | `bot_detection` | - | object | - | **alpha** | Bot detection config. |
 | `threat_protection` | - | object | - | **alpha** | Dynamic threat blocklist config. |
-| `rate_limit_headers` | - | object | - | **beta** | Rate limit response header config. |
+| `rate_limit_headers` | - | object | - | **config-only** | Use the live rate-limit policy's `headers` block. |
 | `error_pages` | - | object | - | **beta** | Custom error page config. |
-| `traffic_capture` | - | object | - | **alpha** | Request mirroring config. |
+| `traffic_capture` | - | object | - | **config-only** | No OSS consumer; use `mirror` for request mirroring. |
+| `connection_pool` | - | object | - | **config-only** | Retained for compatibility; Pingora's built-in pool settings apply. |
 | `message_signatures` | - | object | - | **alpha** | HTTP message signing config. |
 
 ### CORS Config (`cors:`)
@@ -131,7 +180,7 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `expose_headers` | - | array | `[]` | **stable** |
 | `max_age` | - | integer | - | **stable** |
 | `allow_credentials` | - | boolean | false | **stable** |
-| `enable` | `enabled` | boolean | - | **stable** |
+| `enable` | `enabled` | boolean | - | **config-only** |
 
 ### HSTS Config (`hsts:`)
 

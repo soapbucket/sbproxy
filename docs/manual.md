@@ -1190,39 +1190,19 @@ testing:
 
 ## 8. Connection tuning
 
-Upstream connection behavior is tuned per origin with a single
-`connection_pool` block, placed at the origin level alongside the
-`action` block.
-
-![ten concurrent requests completing over a bounded upstream pool, per-request timing shown](assets/connection-pool.gif)
-
-A 32-connection pool with idle and lifetime caps absorbs the burst ([config](../examples/connection-pool/)).
-
-### Per-origin connection pool
+Pingora owns the OSS runtime's upstream connection pool. The legacy
+per-origin `connection_pool` shape remains parseable for config compatibility,
+but none of its values are installed into Pingora today.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_connections` | `128` | Maximum concurrent connections to the upstream. Additional requests queue until a connection frees up |
-| `idle_timeout_secs` | `90` | Idle keep-alive connections unused for longer than this are dropped from the pool |
-| `max_lifetime_secs` | `300` | Hard ceiling on any single connection's lifetime; older connections are replaced even when healthy |
+| `max_connections` | `128` | Config-only compatibility value; does not cap live connections |
+| `idle_timeout_secs` | `90` | Config-only compatibility value; does not change live idle reaping |
+| `max_lifetime_secs` | `300` | Config-only compatibility value; does not change live connection lifetime |
 
-```yaml
-origins:
-  "api.example.com":
-    connection_pool:
-      max_connections: 32
-      idle_timeout_secs: 60
-      max_lifetime_secs: 300
-    action:
-      type: proxy
-      url: https://backend.internal
-```
-
-Tune these when an upstream is sensitive to concurrent connection
-count, or when a load balancer aggressively terminates long-lived TCP
-sessions. Origins without a `connection_pool` block get the defaults
-above. There are no other per-origin transport knobs; buffer sizes and
-handshake timeouts follow Pingora's defaults.
+Do not use this block to satisfy an upstream concurrency or lifetime
+requirement. Buffer sizes, pooling, and handshake timeouts currently follow
+Pingora's runtime defaults.
 
 ### HTTP/3 (QUIC)
 

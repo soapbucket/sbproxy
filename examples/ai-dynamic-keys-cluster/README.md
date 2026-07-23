@@ -14,8 +14,8 @@ which runs the same feature on a single local binary.
 Resolution order is L1 in-memory cache, then the mesh distributed cache, then
 the store. Two pieces in `sb.yml` make the key plane coherent across replicas:
 
-- `store.backend: redis` with `redis_source_of_truth: true` - Redis is the
-  durable system of record, so every replica reads and writes the same keys. A
+- `store.backend: redis` - selecting Redis makes it the durable system of
+  record, so every replica reads and writes the same keys. A
   key minted on one replica is visible on the others as soon as it is written.
 - `cache.tier: mesh` - the policy cache is backed by the mesh distributed cache:
   a SWIM gossip cluster with a consistent-hash ring. Reads and writes route to

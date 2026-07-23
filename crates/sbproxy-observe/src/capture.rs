@@ -292,9 +292,8 @@ pub struct SessionsConfig {
     /// supply one.
     #[serde(default)]
     pub auto_generate: AutoGenerate,
-    /// Sessions index TTL in seconds. The proxy itself does not
-    /// enforce TTL; this knob feeds the ClickHouse projections (T2.4)
-    /// which key storage on `(workspace_id, session_id)`.
+    /// Reserved sessions-index TTL hint. The OSS runtime does not expire the
+    /// in-process request ring or a downstream projection from this value.
     #[serde(default = "default_session_ttl")]
     pub ttl_seconds: u64,
     /// Cap on auto-generated session IDs per workspace per window.

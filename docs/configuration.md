@@ -166,7 +166,6 @@ origins:
     cors: { ... }
     compression: { ... }
     hsts: { ... }
-    connection_pool: { ... }
     extensions: { ... }
 ```
 
@@ -799,13 +798,13 @@ origins:
 | `mirror` | object | | Shadow traffic configuration. See [Request mirror](#request-mirror). |
 | `bot_detection` | object | | Bot detection config. |
 | `threat_protection` | object | | IP reputation / blocklist config. |
-| `rate_limit_headers` | object | | `X-RateLimit-*` and `Retry-After` header configuration. |
+| `rate_limit_headers` | object | | Compatibility-only; ignored by the OSS runtime. Configure headers on the live rate-limit policy. |
 | `error_pages` | list | | Custom error pages keyed by status code or class. |
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
-| `traffic_capture` | object | | Traffic capture / mirroring. |
+| `traffic_capture` | object | | Compatibility-only; no OSS consumer. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
 | `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
-| `connection_pool` | object | | Per-origin connection pool tuning. |
+| `connection_pool` | object | | Compatibility-only; Pingora's built-in upstream pool settings apply. |
 | `extensions` | object | | Opaque map for enterprise / third-party origin-level blocks. |
 
 ### Origin architecture
@@ -831,7 +830,6 @@ origins:
     cors: { ... }                # Optional
     compression: { ... }         # Optional
     hsts: { ... }                # Optional
-    connection_pool: { ... }     # Optional
 ```
 
 ### Request-envelope capture
@@ -870,7 +868,7 @@ origins:
 | `properties.rollup_keys` | list | `[]` | Explicit property keys promoted into durable usage-rollup dimensions. At most five. |
 | `sessions.capture` | bool | `true` | Capture caller-supplied session and parent-session ULIDs. |
 | `sessions.auto_generate` | enum | `anonymous` | `never`, `anonymous`, or `always`. |
-| `sessions.ttl_seconds` | int | `86400` | Session-index retention hint used by downstream projections. The recent admin Sessions page is governed by the request-ring size instead. |
+| `sessions.ttl_seconds` | int | `86400` | Reserved compatibility hint. No OSS consumer expires the request ring from this value. |
 | `sessions.budget` | object | unset | Optional per-workspace cap for automatically generated session IDs. Caller-supplied IDs are not gated. |
 | `user.capture` | bool | `true` | Capture the resolved user identifier. |
 | `user.max_length` | int | `256` | Maximum captured user-ID length. |
@@ -3195,24 +3193,10 @@ origins:
 
 ### Secret references
 
-Secrets are resolved through the top-level `proxy.secrets` block (see [Secrets](#secrets)). Once resolved, secrets are available in templates as `{{ secrets.name }}`.
-
-```yaml
-proxy:
-  secrets:
-    backend: hashicorp
-    hashicorp:
-      addr: https://vault.example.com:8200
-    map:
-      database_url: secret/data/prod/db_url
-      stripe_key: secret/data/prod/stripe_key
-
-origins:
-  "api.example.com":
-    action:
-      type: proxy
-      url: "{{ secrets.database_url }}"
-```
+Declare named backends under `proxy.secrets.backends` and place a provider URI
+directly in a secret-bearing field. The legacy `backend`, `hashicorp`, `map`,
+`rotation`, and `fallback` fields remain parseable but are config-only. See
+[Secrets](#secrets) and [the secrets guide](secrets.md).
 
 ### Template scopes
 
@@ -3304,22 +3288,10 @@ origins:
 
 ## Connection pool
 
-Per-origin connection pool tuning. When unset, falls back to proxy-wide defaults.
-
-```yaml
-origins:
-  "api.example.com":
-    connection_pool:
-      max_connections: 128
-      idle_timeout_secs: 90
-      max_lifetime_secs: 300
-```
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_connections` | int | 128 | Maximum concurrent connections to the upstream |
-| `idle_timeout_secs` | int | 90 | Maximum idle time before a connection is closed |
-| `max_lifetime_secs` | int | 300 | Maximum total lifetime of a connection |
+`origins.*.connection_pool` is retained for config compatibility but is not
+applied by the OSS runtime. Pingora's built-in upstream connection-pool
+behavior remains in effect regardless of the three parsed values. Do not use
+this block to enforce a connection cap, idle timeout, or maximum lifetime.
 
 ---
 
@@ -4049,35 +4021,36 @@ Alert webhook channels (`proxy.alerting.channels[]`) do not accept a `secret` fi
 
 ## Secrets
 
-The top-level `proxy.secrets` block configures how `secret:` references are resolved at config-load time and how rotation is handled.
+The live surface is the named-backend list under
+`proxy.secrets.backends`. Provider URI references select a backend by name and
+fail startup if they cannot be resolved:
 
 ```yaml
 proxy:
   secrets:
-    backend: hashicorp
-    hashicorp:
-      addr: https://vault.example.com:8200
-      token: ${VAULT_TOKEN}
-      mount: secret
-    map:
-      openai_key: secret/data/prod/openai_key
-      db_password: secret/data/prod/db_password
-    rotation:
-      grace_period_secs: 300
-      re_resolve_interval_secs: 60
-    fallback: cache
+    backends:
+      - type: hashicorp
+        name: primary
+        addr: https://vault.example.com
+        mount: secret
+        auth:
+          type: token
+          token: ${VAULT_TOKEN}
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: vault://primary/apps/openai?key=api_key
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `backend` | string | `env` | Backend used to resolve secrets. Supported: `env`, `local`, `hashicorp`. |
-| `hashicorp.addr` | string | | Vault server address (required when `backend = hashicorp`) |
-| `hashicorp.token` | string | from `VAULT_TOKEN` env var | Vault token |
-| `hashicorp.mount` | string | `secret` | KV secrets engine mount path |
-| `map` | map | | Logical-name to vault-path mapping |
-| `rotation.grace_period_secs` | int | 300 | Seconds the previous secret value remains valid after rotation |
-| `rotation.re_resolve_interval_secs` | int | 60 | How often to re-fetch secrets from the backend |
-| `fallback` | string | `cache` | Strategy when the backend is unavailable. Supported: `cache`, `reject`, `env`. |
+The legacy `proxy.secrets.backend`, `hashicorp`, `map`, `rotation`, and
+`fallback` keys are config-only compatibility fields. They do not select a
+backend, schedule re-resolution, provide a dual-value grace window, or change
+failure behavior. Use [the named-backend guide](secrets.md) for every supported
+backend and URI shape.
 
 The `extensions` map at both the proxy and the origin level holds opaque blocks consumed by enterprise / third-party crates. OSS does not parse them.
 
@@ -4418,7 +4391,6 @@ origins:
     cors: { ... }
     compression: { ... }
     hsts: { ... }
-    connection_pool: { ... }
     mirror: { ... }                # shadow traffic; sibling of action
     on_request: [ ... ]            # webhook callbacks
     on_response: [ ... ]

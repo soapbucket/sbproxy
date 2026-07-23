@@ -41,6 +41,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod config_scan;
 pub mod scan;
 
 /// Schema version of the capability registry.

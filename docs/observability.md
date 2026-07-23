@@ -19,18 +19,21 @@ The correlation_id policy threads one identifier through logs, webhooks, and the
 
 ## Configuration
 
-The currently shipped schema lives under `proxy.observability:` and groups the `log` (tracing-subscriber filter + format + sampling) and `telemetry` (OTLP exporter) blocks. When the block is absent, CLI flags and env vars are the only source of truth.
+The currently shipped schema lives under `proxy.observability:` and groups the
+live log sinks/redaction/custom-field surfaces with the `telemetry` (OTLP
+exporter) block. The parent `log.level`, `log.format`, and `log.sampling`
+values remain parseable for compatibility but are not installed into the
+process logger. Select the process filter and format with `--log-level`,
+`SB_LOG_LEVEL`/`RUST_LOG`, and `--log-format`/`SB_LOG_FORMAT`; process sampling
+uses the built-in defaults.
 
 ```yaml
 proxy:
   observability:
     log:
-      level: info                  # debug | info | warn | error
-      format: compact              # compact | pretty | json
-      sampling:
-        info: 1.0                  # fraction of info lines kept
-        debug: 0.1
-        trace: 0.01
+      # Live log configuration belongs under sinks/redact/custom_fields.
+      # Each sink may select its own format.
+      sinks: []
     telemetry:
       enabled: true
       endpoint: "http://otel-collector:4317"
@@ -93,7 +96,7 @@ Field schema:
 
 * `name` is unique within the declaring scope. Duplicates within a scope are warn-logged today and reserved for a hard reject in a follow-up patch.
 * `target` selects the internal channel: `access_log | error_log | audit_log | trace_exporter | external_log`. A sink only sees records emitted on the channel it subscribes to.
-* `format` overrides the parent `proxy.observability.log.format` for this sink. Today every variant emits one JSON object per line; `pretty` re-renders with indentation.
+* `format` selects this sink's wire format. When omitted it defaults to `json`; `pretty` re-renders with indentation. The legacy parent `proxy.observability.log.format` field is config-only and does not supply this value.
 * `output` is the where: see the four output types below.
 * `profile` is the redaction shape: `internal` keeps JA3/JA4 fingerprints and raw query strings; `external` strips them. Proxy-scope sinks default to `internal`; tenant- and origin-scope sinks default to `external` because the downstream backend is usually outside the operator's trust boundary.
 

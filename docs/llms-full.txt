@@ -571,6 +571,15 @@ the next version cut.
   `proxy.admin.**` as a reload: `AdminConfig` is read once at startup, so
   a rotated admin password or a swapped certificate needs a restart, and
   the plan now says so. See [`docs/admin.md`](docs/admin.md).
+- **Accepted configuration now has an accountable runtime owner.** GraphQL
+  depth, introspection, and syntax controls are enforced before upstream
+  dispatch; configured CEL feature flags publish atomically across reloads;
+  concurrent limits can be keyed by client, API key, header, or route; and AI
+  shadow requests run through a bounded, drop-on-saturation lane that cannot
+  delay the primary response. Enabling the reserved HTTP/3 listener now fails
+  configuration compilation instead of logging and continuing without QUIC.
+  A build-time schema audit rejects future keys that have neither a production
+  reader nor an exact reviewed `ConfigOnly` justification.
 - **Workspace rate-budget behavior now has one owner.** The
   `rate_limit_budget` policy module owns the soft, throttle, and auto-suspend
   state machine and its tests. The previously ignored `per_route_rps` field is
@@ -6384,7 +6393,7 @@ Each cap is configurable per entry:
 | `max_decompression_ratio` | 100 | Compressed:expanded ratio cap. |
 | `max_entries` | 1000 | Max entries per archive. |
 | `max_expanded_bytes` | 10485760 | Max expanded archive bytes. |
-| `max_clock_skew_secs` | 60 | Tolerance for time-sensitive headers. |
+| `max_clock_skew_secs` | 60 | Reserved config-only value for future signed freshness headers; no v0.2 response consumes it. |
 
 ## Integrity contract
 
@@ -12804,7 +12813,7 @@ Next: the [manual](manual.md), [architecture](architecture.md), [performance](pe
 
 ## Config stability tiers
 
-*Last modified: 2026-07-22*
+*Last modified: 2026-07-23*
 
 Stability guarantees for every field in `sb.yml`. Check a field's tier before relying on it in production.
 
@@ -12844,6 +12853,19 @@ A `disabled` field is retained in the schema but cannot activate runtime behavio
 - Attempting to enable unavailable behavior fails config compilation instead of being ignored.
 - Currently applies to the `http3` block. Native HTTP/3 support is tracked in WOR-1969.
 
+### `config-only`
+
+A `config-only` field remains parseable for compatibility but has no live
+consumer in the open-source runtime.
+
+- Do not use it to satisfy an operational requirement.
+- An explicitly authored config-only key emits a boot/config-validation warning
+  naming the complete schema path and the reason it has no effect.
+- The build-time config-reader guard requires an explicit registry entry and
+  an operator-facing reason for every such field.
+- The field is removed from examples that purport to demonstrate working
+  behavior. Its reference entry states the live alternative, when one exists.
+
 ---
 
 ## Stabilization rules
@@ -12851,6 +12873,41 @@ A `disabled` field is retained in the schema but cannot activate runtime behavio
 1. A field moves from `alpha` to `beta` once its interface is reviewed, it has integration tests, and it has been in at least one release.
 2. A field moves from `beta` to `stable` once it has been in production use by at least one internal deployment for one full release cycle without interface changes.
 3. Stable fields are never silently removed. The process is: deprecate (the config compiler logs a structured deprecation warning at load time naming the legacy and canonical field), then remove in the next major version. A schema-level `x-deprecated` annotation is planned but not shipped.
+
+## Build-time reader coverage
+
+CI walks the generated `ConfigFile` JSON Schema and requires every key to have
+either a non-test Rust field read or a reviewed entry in
+`CONFIG_KEY_OVERRIDES`. Indirect serde consumers name their concrete runtime
+consumer. Deliberately inert fields are marked `config-only` with a reason.
+Run the same lane locally with:
+
+```bash
+scripts/check-config-readers.sh
+```
+
+Adding a key to `types.rs` without wiring it now fails with the complete dotted
+schema path. Adding a reviewed `ConfigOnly` entry makes the exception explicit
+and stale entries fail when their schema path is removed or renamed.
+
+### Current config-only compatibility fields
+
+| Field or subtree | What happens today |
+|---|---|
+| `agent_classes.hosted_feed` | The OSS resolver uses builtin or inline catalogs; it does not fetch a hosted feed. |
+| `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
+| `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
+| `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |
+| `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |
+| `origins.*.rate_limit_headers` | Use the live rate-limit policy's `headers` block instead. |
+| `origins.*.sessions.ttl_seconds` | Reserved retention hint; the in-process request ring does not expire entries from it. |
+| `origins.*.traffic_capture` | No OSS capture consumer; use `mirror` for live fire-and-forget request mirroring. |
+| `proxy.device_parser_file` | The current pure-Rust device parser does not load this catalog override. |
+| `proxy.key_management.governance.key_introspection` | The caller-only introspection route is not installed. |
+| `proxy.key_management.store.redis_source_of_truth` | Redis is authoritative whenever `store.backend: redis`; this legacy boolean changes nothing. |
+| `proxy.observability.log.level`, `.format`, `.sampling` | Process logging uses CLI/environment selection and fixed sampling defaults. Sink-local `format` remains live. |
+| `proxy.scripting.javascript` | QuickJS engines use built-in sandbox defaults; this YAML subtree is not installed. |
+| `proxy.secrets.backend`, `.hashicorp`, `.map`, `.rotation`, `.fallback` | Legacy single-backend surface. Use named `proxy.secrets.backends` and provider URI references. |
 
 ---
 
@@ -12920,9 +12977,10 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `on_response` | - | array | `[]` | **alpha** | Response event hook plugins. |
 | `bot_detection` | - | object | - | **alpha** | Bot detection config. |
 | `threat_protection` | - | object | - | **alpha** | Dynamic threat blocklist config. |
-| `rate_limit_headers` | - | object | - | **beta** | Rate limit response header config. |
+| `rate_limit_headers` | - | object | - | **config-only** | Use the live rate-limit policy's `headers` block. |
 | `error_pages` | - | object | - | **beta** | Custom error page config. |
-| `traffic_capture` | - | object | - | **alpha** | Request mirroring config. |
+| `traffic_capture` | - | object | - | **config-only** | No OSS consumer; use `mirror` for request mirroring. |
+| `connection_pool` | - | object | - | **config-only** | Retained for compatibility; Pingora's built-in pool settings apply. |
 | `message_signatures` | - | object | - | **alpha** | HTTP message signing config. |
 
 ### CORS Config (`cors:`)
@@ -12935,7 +12993,7 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `expose_headers` | - | array | `[]` | **stable** |
 | `max_age` | - | integer | - | **stable** |
 | `allow_credentials` | - | boolean | false | **stable** |
-| `enable` | `enabled` | boolean | - | **stable** |
+| `enable` | `enabled` | boolean | - | **config-only** |
 
 ### HSTS Config (`hsts:`)
 
@@ -13204,7 +13262,6 @@ origins:
     cors: { ... }
     compression: { ... }
     hsts: { ... }
-    connection_pool: { ... }
     extensions: { ... }
 ```
 
@@ -13837,13 +13894,13 @@ origins:
 | `mirror` | object | | Shadow traffic configuration. See [Request mirror](#request-mirror). |
 | `bot_detection` | object | | Bot detection config. |
 | `threat_protection` | object | | IP reputation / blocklist config. |
-| `rate_limit_headers` | object | | `X-RateLimit-*` and `Retry-After` header configuration. |
+| `rate_limit_headers` | object | | Compatibility-only; ignored by the OSS runtime. Configure headers on the live rate-limit policy. |
 | `error_pages` | list | | Custom error pages keyed by status code or class. |
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
-| `traffic_capture` | object | | Traffic capture / mirroring. |
+| `traffic_capture` | object | | Compatibility-only; no OSS consumer. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
 | `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
-| `connection_pool` | object | | Per-origin connection pool tuning. |
+| `connection_pool` | object | | Compatibility-only; Pingora's built-in upstream pool settings apply. |
 | `extensions` | object | | Opaque map for enterprise / third-party origin-level blocks. |
 
 ### Origin architecture
@@ -13869,7 +13926,6 @@ origins:
     cors: { ... }                # Optional
     compression: { ... }         # Optional
     hsts: { ... }                # Optional
-    connection_pool: { ... }     # Optional
 ```
 
 ### Request-envelope capture
@@ -13908,7 +13964,7 @@ origins:
 | `properties.rollup_keys` | list | `[]` | Explicit property keys promoted into durable usage-rollup dimensions. At most five. |
 | `sessions.capture` | bool | `true` | Capture caller-supplied session and parent-session ULIDs. |
 | `sessions.auto_generate` | enum | `anonymous` | `never`, `anonymous`, or `always`. |
-| `sessions.ttl_seconds` | int | `86400` | Session-index retention hint used by downstream projections. The recent admin Sessions page is governed by the request-ring size instead. |
+| `sessions.ttl_seconds` | int | `86400` | Reserved compatibility hint. No OSS consumer expires the request ring from this value. |
 | `sessions.budget` | object | unset | Optional per-workspace cap for automatically generated session IDs. Caller-supplied IDs are not gated. |
 | `user.capture` | bool | `true` | Capture the resolved user identifier. |
 | `user.max_length` | int | `256` | Maximum captured user-ID length. |
@@ -16233,24 +16289,10 @@ origins:
 
 ### Secret references
 
-Secrets are resolved through the top-level `proxy.secrets` block (see [Secrets](#secrets)). Once resolved, secrets are available in templates as `{{ secrets.name }}`.
-
-```yaml
-proxy:
-  secrets:
-    backend: hashicorp
-    hashicorp:
-      addr: https://vault.example.com:8200
-    map:
-      database_url: secret/data/prod/db_url
-      stripe_key: secret/data/prod/stripe_key
-
-origins:
-  "api.example.com":
-    action:
-      type: proxy
-      url: "{{ secrets.database_url }}"
-```
+Declare named backends under `proxy.secrets.backends` and place a provider URI
+directly in a secret-bearing field. The legacy `backend`, `hashicorp`, `map`,
+`rotation`, and `fallback` fields remain parseable but are config-only. See
+[Secrets](#secrets) and [the secrets guide](secrets.md).
 
 ### Template scopes
 
@@ -16342,22 +16384,10 @@ origins:
 
 ## Connection pool
 
-Per-origin connection pool tuning. When unset, falls back to proxy-wide defaults.
-
-```yaml
-origins:
-  "api.example.com":
-    connection_pool:
-      max_connections: 128
-      idle_timeout_secs: 90
-      max_lifetime_secs: 300
-```
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_connections` | int | 128 | Maximum concurrent connections to the upstream |
-| `idle_timeout_secs` | int | 90 | Maximum idle time before a connection is closed |
-| `max_lifetime_secs` | int | 300 | Maximum total lifetime of a connection |
+`origins.*.connection_pool` is retained for config compatibility but is not
+applied by the OSS runtime. Pingora's built-in upstream connection-pool
+behavior remains in effect regardless of the three parsed values. Do not use
+this block to enforce a connection cap, idle timeout, or maximum lifetime.
 
 ---
 
@@ -17087,35 +17117,36 @@ Alert webhook channels (`proxy.alerting.channels[]`) do not accept a `secret` fi
 
 ## Secrets
 
-The top-level `proxy.secrets` block configures how `secret:` references are resolved at config-load time and how rotation is handled.
+The live surface is the named-backend list under
+`proxy.secrets.backends`. Provider URI references select a backend by name and
+fail startup if they cannot be resolved:
 
 ```yaml
 proxy:
   secrets:
-    backend: hashicorp
-    hashicorp:
-      addr: https://vault.example.com:8200
-      token: ${VAULT_TOKEN}
-      mount: secret
-    map:
-      openai_key: secret/data/prod/openai_key
-      db_password: secret/data/prod/db_password
-    rotation:
-      grace_period_secs: 300
-      re_resolve_interval_secs: 60
-    fallback: cache
+    backends:
+      - type: hashicorp
+        name: primary
+        addr: https://vault.example.com
+        mount: secret
+        auth:
+          type: token
+          token: ${VAULT_TOKEN}
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: vault://primary/apps/openai?key=api_key
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `backend` | string | `env` | Backend used to resolve secrets. Supported: `env`, `local`, `hashicorp`. |
-| `hashicorp.addr` | string | | Vault server address (required when `backend = hashicorp`) |
-| `hashicorp.token` | string | from `VAULT_TOKEN` env var | Vault token |
-| `hashicorp.mount` | string | `secret` | KV secrets engine mount path |
-| `map` | map | | Logical-name to vault-path mapping |
-| `rotation.grace_period_secs` | int | 300 | Seconds the previous secret value remains valid after rotation |
-| `rotation.re_resolve_interval_secs` | int | 60 | How often to re-fetch secrets from the backend |
-| `fallback` | string | `cache` | Strategy when the backend is unavailable. Supported: `cache`, `reject`, `env`. |
+The legacy `proxy.secrets.backend`, `hashicorp`, `map`, `rotation`, and
+`fallback` keys are config-only compatibility fields. They do not select a
+backend, schedule re-resolution, provide a dual-value grace window, or change
+failure behavior. Use [the named-backend guide](secrets.md) for every supported
+backend and URI shape.
 
 The `extensions` map at both the proxy and the origin level holds opaque blocks consumed by enterprise / third-party crates. OSS does not parse them.
 
@@ -17456,7 +17487,6 @@ origins:
     cors: { ... }
     compression: { ... }
     hsts: { ... }
-    connection_pool: { ... }
     mirror: { ... }                # shadow traffic; sibling of action
     on_request: [ ... ]            # webhook callbacks
     on_response: [ ... ]
@@ -18250,7 +18280,7 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 | Governed-key budget backend (`key_management.governance.backend`, strict tier only) | Connection / command failure | Only affects keys governed under `consistency: strict`. The default `approximate` tier does not depend on this backend at all; its per-node counters keep disseminating over the cluster mesh. For a strict key, a reserve call that cannot reach the backend denies the request (`503`) by default (`failure_mode: closed`); `failure_mode: allow_unreserved` admits it instead without a reservation. A settle call on an already-admitted request is unaffected by `failure_mode` and stays best-effort. | Auto-reconnect; enforcement resumes on the next successful call | `sbproxy_governance_fail_open_total{key_id}` on `allow_unreserved`; also logged at WARN (fail-open/fail-closed) or DEBUG (other reserve/settle errors) |
 | ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
 | Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None dedicated; resolver failures are logged at WARN |
-| Vault / secrets backend (`proxy.secrets`) | Fetch fails | Secrets resolved at config-load are cached and reused. New rotation calls fail loudly. | Auto-reconnect, re-fetch on recover | `sbproxy_vault_resolution_total{backend,result}` |
+| Vault / secrets backend (`proxy.secrets.backends`) | Fetch fails | Unresolved provider URI references fail startup; backend-local caches retain already resolved values where supported. | Backend reconnect/re-fetch behavior | `sbproxy_vault_resolution_total{backend,result}` |
 | Webhook receivers (`on_request` / `on_response` / alerting) | Send fails | Webhook delivery is fire-and-forget by design. A failed POST is logged at WARN; the request itself is not affected. | None needed; next event tries again | `sbproxy_outbound_webhook_attempts_total{result}` |
 
 ## Detailed reference
@@ -21207,9 +21237,9 @@ base64_decode, url_encode, and url_decode are the other modes ([config](../examp
 | `bot_detection` | Bot scoring and challenge configuration (opaque, see configuration.md) |
 | `threat_protection` | IP reputation and dynamic blocklist hooks |
 | `fallback_origin` | Origin used when the primary upstream fails |
-| `traffic_capture` | Mirror or capture request/response traffic |
+| `traffic_capture` | Config-only compatibility field; use `mirror` for live request mirroring |
 | `message_signatures` | RFC 9421 HTTP message signatures |
-| `connection_pool` | Per-origin pool tuning (size, idle timeout) |
+| `connection_pool` | Config-only compatibility field; Pingora's built-in pool settings apply |
 
 ![the primary upstream answering 503 while the client receives the fallback's 200 degraded body with an X-Fallback header](assets/fallback-origin.gif)
 
@@ -25825,39 +25855,19 @@ testing:
 
 ## 8. Connection tuning
 
-Upstream connection behavior is tuned per origin with a single
-`connection_pool` block, placed at the origin level alongside the
-`action` block.
-
-![ten concurrent requests completing over a bounded upstream pool, per-request timing shown](assets/connection-pool.gif)
-
-A 32-connection pool with idle and lifetime caps absorbs the burst ([config](../examples/connection-pool/)).
-
-### Per-origin connection pool
+Pingora owns the OSS runtime's upstream connection pool. The legacy
+per-origin `connection_pool` shape remains parseable for config compatibility,
+but none of its values are installed into Pingora today.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_connections` | `128` | Maximum concurrent connections to the upstream. Additional requests queue until a connection frees up |
-| `idle_timeout_secs` | `90` | Idle keep-alive connections unused for longer than this are dropped from the pool |
-| `max_lifetime_secs` | `300` | Hard ceiling on any single connection's lifetime; older connections are replaced even when healthy |
+| `max_connections` | `128` | Config-only compatibility value; does not cap live connections |
+| `idle_timeout_secs` | `90` | Config-only compatibility value; does not change live idle reaping |
+| `max_lifetime_secs` | `300` | Config-only compatibility value; does not change live connection lifetime |
 
-```yaml
-origins:
-  "api.example.com":
-    connection_pool:
-      max_connections: 32
-      idle_timeout_secs: 60
-      max_lifetime_secs: 300
-    action:
-      type: proxy
-      url: https://backend.internal
-```
-
-Tune these when an upstream is sensitive to concurrent connection
-count, or when a load balancer aggressively terminates long-lived TCP
-sessions. Origins without a `connection_pool` block get the defaults
-above. There are no other per-origin transport knobs; buffer sizes and
-handshake timeouts follow Pingora's defaults.
+Do not use this block to satisfy an upstream concurrency or lifetime
+requirement. Buffer sizes, pooling, and handshake timeouts currently follow
+Pingora's runtime defaults.
 
 ### HTTP/3 (QUIC)
 
@@ -30455,18 +30465,21 @@ The correlation_id policy threads one identifier through logs, webhooks, and the
 
 ## Configuration
 
-The currently shipped schema lives under `proxy.observability:` and groups the `log` (tracing-subscriber filter + format + sampling) and `telemetry` (OTLP exporter) blocks. When the block is absent, CLI flags and env vars are the only source of truth.
+The currently shipped schema lives under `proxy.observability:` and groups the
+live log sinks/redaction/custom-field surfaces with the `telemetry` (OTLP
+exporter) block. The parent `log.level`, `log.format`, and `log.sampling`
+values remain parseable for compatibility but are not installed into the
+process logger. Select the process filter and format with `--log-level`,
+`SB_LOG_LEVEL`/`RUST_LOG`, and `--log-format`/`SB_LOG_FORMAT`; process sampling
+uses the built-in defaults.
 
 ```yaml
 proxy:
   observability:
     log:
-      level: info                  # debug | info | warn | error
-      format: compact              # compact | pretty | json
-      sampling:
-        info: 1.0                  # fraction of info lines kept
-        debug: 0.1
-        trace: 0.01
+      # Live log configuration belongs under sinks/redact/custom_fields.
+      # Each sink may select its own format.
+      sinks: []
     telemetry:
       enabled: true
       endpoint: "http://otel-collector:4317"
@@ -30529,7 +30542,7 @@ Field schema:
 
 * `name` is unique within the declaring scope. Duplicates within a scope are warn-logged today and reserved for a hard reject in a follow-up patch.
 * `target` selects the internal channel: `access_log | error_log | audit_log | trace_exporter | external_log`. A sink only sees records emitted on the channel it subscribes to.
-* `format` overrides the parent `proxy.observability.log.format` for this sink. Today every variant emits one JSON object per line; `pretty` re-renders with indentation.
+* `format` selects this sink's wire format. When omitted it defaults to `json`; `pretty` re-renders with indentation. The legacy parent `proxy.observability.log.format` field is config-only and does not supply this value.
 * `output` is the where: see the four output types below.
 * `profile` is the redaction shape: `internal` keeps JA3/JA4 fingerprints and raw query strings; `external` strips them. Proxy-scope sinks default to `internal`; tenant- and origin-scope sinks default to `external` because the downstream backend is usually outside the operator's trust boundary.
 
@@ -34615,19 +34628,15 @@ transforms:
 
 The `ctx` argument carries `ctx.request.aipref.train`, `ctx.request.aipref.search`, and `ctx.request.aipref.ai_input`, each defaulting to `true` when the request has no valid `aipref` header.
 
-Sandbox limits live under `proxy.scripting.javascript.sandbox`:
+QuickJS always runs with a sandbox: a 100 ms CPU budget, 16 MiB heap cap, and
+1 MiB native-stack cap. A script that exceeds the CPU budget is aborted by a
+watchdog with an uncatchable exception; the modifier or transform is skipped
+and the error is logged.
 
-```yaml
-proxy:
-  scripting:
-    javascript:
-      sandbox:
-        budget_ms: 100    # CPU time budget per invocation
-        memory_mb: 16     # QuickJS heap cap
-        stack_kb: 1024    # native stack cap
-```
-
-A script that exceeds `budget_ms` is aborted by a watchdog with an uncatchable exception; the modifier or transform is skipped and the error is logged.
+The `proxy.scripting.javascript.sandbox` YAML subtree remains parseable for
+compatibility but is not installed into `JsEngine::new` today, so changing
+those YAML values does not tune the live engine. Rust integrations that
+construct `JsEngine::with_sandbox` directly can supply different limits.
 
 ---
 
@@ -36956,7 +36965,7 @@ SBproxy adds well under 1 ms of overhead under normal load. If you see more, the
 1. Check `upstream_ttfb_ms` in the structured log. If it's high, the upstream is slow, not SBproxy.
 2. If `upstream_ttfb_ms` is low but total latency is high, suspect DNS. Resolved addresses are cached and refreshed in the background by a refreshing resolver, so a request that lands right after a hostname goes stale pays the resolver round trip.
 3. Turn on OpenTelemetry tracing (`telemetry` block) to get a per-span breakdown across the phase pipeline.
-4. If you have Lua or JavaScript configured, cap runaway scripts with the per-engine sandbox budgets: `proxy.scripting.lua.sandbox.max_execution_ms` and `proxy.scripting.javascript.sandbox.budget_ms`.
+4. If you have Lua configured, cap runaway scripts with `proxy.scripting.lua.sandbox.max_execution_ms`. JavaScript uses its built-in 100 ms budget; the parsed `proxy.scripting.javascript` tuning block is not installed yet.
 5. The `sbproxy_phase_duration_seconds{phase}` histogram (and the matching `auth_ms` / `upstream_ttfb_ms` / `response_filter_ms` access-log fields) splits end-to-end latency into auth, upstream wait, and response transforms, so you can see which phase grew without tracing.
 
 ## No access-log lines appear
@@ -37359,7 +37368,8 @@ The fields below are the ones most useful when triage-grepping the JSON access l
 - W3C and B3 distributed tracing header propagation.
 - Webhook alerting with configurable channels via `proxy.alerting`.
 - Admin stats SPA via `proxy.admin`.
-- Per-origin connection pool tuning via `connection_pool`.
+- The legacy per-origin `connection_pool` shape remains parseable but is
+  config-only; Pingora's built-in pool settings apply.
 
 #### Config additions
 
@@ -37377,13 +37387,13 @@ The following per-origin keys are new in v1.0:
 
 | Key | Description |
 |-----|-------------|
-| `connection_pool` | Per-origin connection pool tuning. |
+| `connection_pool` | Config-only compatibility shape; does not tune Pingora. |
 | `on_request` | Event hook plugins (alpha). |
 | `on_response` | Event hook plugins (alpha). |
 | `bot_detection` | Bot traffic detection (alpha). |
 | `threat_protection` | Dynamic blocklist integration (alpha). |
-| `rate_limit_headers` | Rate limit response header control. |
-| `traffic_capture` | Request mirroring (alpha). |
+| `rate_limit_headers` | Config-only compatibility shape; configure response headers on the live rate-limit policy. |
+| `traffic_capture` | Config-only compatibility shape; use `mirror` for live request mirroring. |
 | `message_signatures` | HTTP message signature verification (alpha). |
 
 #### Migration steps
