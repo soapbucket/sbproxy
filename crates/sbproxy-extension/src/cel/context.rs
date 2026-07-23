@@ -190,6 +190,29 @@ pub fn populate_agent_class_namespace(ctx: &mut CelContext, view: &AgentClassVie
     ctx.set("agent", CelValue::Map(agent));
 }
 
+/// Stamp the request's closed trust-tier label under
+/// `request.trust_tier`.
+///
+/// The core runtime owns the typed enum. This dependency-neutral CEL
+/// layer accepts its stable string form and defensively maps anything
+/// outside the closed set to `anonymous`.
+pub fn populate_trust_tier_namespace(ctx: &mut CelContext, tier: &str) {
+    let tier = match tier {
+        "suspicious" | "strong" | "named" | "anonymous" => tier,
+        _ => "anonymous",
+    };
+    let request_var = ctx
+        .variables
+        .remove("request")
+        .unwrap_or_else(|| CelValue::Map(HashMap::new()));
+    let mut request_map = match request_var {
+        CelValue::Map(map) => map,
+        _ => HashMap::new(),
+    };
+    request_map.insert("trust_tier".to_string(), CelValue::String(tier.to_string()));
+    ctx.set("request", CelValue::Map(request_map));
+}
+
 /// Headless-browser detector fields exposed to CEL.
 ///
 /// Empty / absent detector output renders as zero values so response-time
@@ -1186,6 +1209,18 @@ mod tests {
         let engine = CelEngine::new();
         assert!(engine
             .eval_bool_source(r#"origin.name == "backend-a" && origin.weight > 50"#, &ctx)
+            .unwrap());
+    }
+
+    #[test]
+    fn trust_tier_is_a_first_class_request_field() {
+        let mut ctx =
+            build_request_context("GET", "/", &HeaderMap::new(), None, None, "example.com");
+        populate_trust_tier_namespace(&mut ctx, "strong");
+
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"request.trust_tier == "strong""#, &ctx)
             .unwrap());
     }
 

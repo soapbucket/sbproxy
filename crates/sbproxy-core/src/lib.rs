@@ -140,6 +140,7 @@ pub mod server;
 /// fires an in-process request through the compiled handler chain
 /// and feeds the verdict into the `/readyz` synthetic probe cache.
 pub mod synthetic;
+mod trust_tier;
 
 // Re-export the main entry point for convenience.
 pub use server::{run, GraceConfig};

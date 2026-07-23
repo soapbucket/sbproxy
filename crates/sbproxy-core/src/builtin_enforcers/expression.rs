@@ -141,6 +141,7 @@ impl PolicyEnforcer for ExpressionEnforcer {
             kya: kya_view,
             tls: tls_view,
             agent_class: agent_class_view,
+            trust_tier: Some(ctx.trust_tier.as_str()),
             ml: ml_view,
             features: Some(features_view),
             agent_detect: agent_detect_view,

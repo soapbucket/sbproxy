@@ -169,6 +169,10 @@ pub struct RequestContext {
     // --- Auth state ---
     /// Authentication result, populated by the auth phase.
     pub auth_result: Option<AuthDecision>,
+    /// Conservative trust tier derived once after identity enrichment and
+    /// authentication. Downstream policies and scripting read this field
+    /// instead of independently combining signature, agent, and deny signals.
+    pub trust_tier: sbproxy_modules::auth::TrustTier,
 
     // --- Flags ---
     /// Whether the force-SSL redirect check has already been performed.
@@ -1192,6 +1196,7 @@ impl RequestContext {
             response_body_bytes: 0,
             mirror_pending: None,
             auth_result: None,
+            trust_tier: sbproxy_modules::auth::TrustTier::Anonymous,
             force_ssl_checked: false,
             short_circuit_status: None,
             short_circuit_body: None,
@@ -1380,6 +1385,11 @@ mod tests {
         assert!(ctx.upstream_content_type.is_none());
         assert!(ctx.forward_rule_idx.is_none());
         assert!(!ctx.fallback_triggered);
+        assert_eq!(
+            ctx.trust_tier,
+            sbproxy_modules::auth::TrustTier::Anonymous,
+            "missing evidence must default to the least-privileged tier"
+        );
     }
 
     #[test]

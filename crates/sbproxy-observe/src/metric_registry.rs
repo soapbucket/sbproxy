@@ -2593,6 +2593,17 @@ pub const METRICS: &[MetricCapability] = &[
         ),
     },
     MetricCapability {
+        name: "sbproxy_trust_tier_requests_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_trust_tier"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tier"],
+        description: "Requests partitioned by the conservative trust-tier decision.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_unrouted_requests_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_unrouted_request"),

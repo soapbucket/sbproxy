@@ -77,6 +77,7 @@ The CEL context is built per request. Every namespace below is available to `exp
 | `request.agent_purpose` | string | Operator-stated purpose (`training`, `search`, `assistant`, ...) |
 | `request.agent_id_source` | string | Which resolver signal matched (`bot_auth`, `rdns`, `user_agent`, `anonymous_bot_auth`, `fallback`) |
 | `request.agent_rdns_hostname` | string | Forward-confirmed reverse-DNS hostname when the rDNS path matched |
+| `request.trust_tier` | string | Conservative identity tier: `suspicious`, `strong`, `named`, or `anonymous` |
 | `request.aipref.train` | bool | Parsed `aipref:` header, training axis (default `true`) |
 | `request.aipref.search` | bool | Search axis (default `true`) |
 | `request.aipref.ai_input` | bool | Inference-input axis (default `true`) |
@@ -89,6 +90,16 @@ The CEL context is built per request. Every namespace below is available to `exp
 > Header normalization: header keys are lowercased only; hyphens are preserved. Always use bracket notation: `request.headers["content-type"]`, not `request.headers["Content-Type"]` or `request.headers.content_type`.
 
 Enterprise builds additionally populate `request.kya.*` (Know-Your-Agent verifier verdict) and `request.ml_classification.*` (ML agent classifier verdict) when those subsystems run.
+
+The trust tier is computed once after identity enrichment and authentication.
+An observed denial wins over positive evidence; verified Web Bot Auth, CAP,
+KYA, or another signed agent verdict is `strong`; a sufficiently confident
+unsigned rule-pack identity is `named`; and missing evidence is `anonymous`.
+For example:
+
+```cel
+request.trust_tier == "strong" || request.trust_tier == "named"
+```
 
 #### `connection` - peer information
 

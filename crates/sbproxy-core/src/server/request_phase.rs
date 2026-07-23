@@ -2189,6 +2189,7 @@ pub(super) async fn request_filter(
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
                 }
                 Err((status, msg)) => {
+                    crate::trust_tier::finalize(ctx, true);
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);
                     emit_auth_audit(
                         "forward_auth_denied",
@@ -2295,6 +2296,9 @@ pub(super) async fn request_filter(
                     ctx.validate_request_body = true;
                 }
             }
+            if !auth_succeeded {
+                crate::trust_tier::finalize(ctx, true);
+            }
             match auth_result {
                 AuthResult::Allow { sub, source } => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::Allow { sub, source });
@@ -2383,6 +2387,11 @@ pub(super) async fn request_filter(
             }
         }
     }
+
+    // All identity enrichers and the configured authentication provider
+    // have now run. Compute once so every downstream policy sees the same
+    // conservative tier and the distribution metric has a live writer.
+    crate::trust_tier::finalize(ctx, false);
 
     // --- P0 edge capture ---
     //

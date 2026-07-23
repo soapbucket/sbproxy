@@ -248,6 +248,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_tokens_attributed_total` | Counter | `stable` | `beta` | `project`, `user`, `tag`, `direction` | AI token usage attributed to a credential's project / user / tag. |
 | `sbproxy_transport_duration_seconds` | Histogram | `config_only` (nothing emits this yet) | `alpha` | `protocol`, `result` | Transport-layer request duration, by protocol and outcome. |
 | `sbproxy_transport_requests_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `protocol`, `result` | Transport-layer requests, by protocol and outcome. |
+| `sbproxy_trust_tier_requests_total` | Counter | `stable` | `beta` | `tier` | Requests partitioned by the conservative trust-tier decision. |
 | `sbproxy_unrouted_requests_total` | Counter | `stable` | `beta` | `reason` | Requests rejected before origin resolution, by reason. |
 | `sbproxy_upstream_status_retries_total` | Counter | `stable` | `beta` | `origin`, `status` | Upstream retries triggered by a configured response status, by origin and matched status. |
 | `sbproxy_upstream_timeout_retries_total` | Counter | `stable` | `beta` | `origin`, `phase` | Upstream retries triggered by a timeout-classed failure, by origin and phase (connect or upstream). |

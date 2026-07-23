@@ -270,6 +270,9 @@ pub struct ProxyMetrics {
     /// Histogram `sbproxy_agent_detect_inference_seconds` of scorer
     /// latency in seconds.
     pub agent_detect_inference_seconds: Histogram,
+    /// Counter `sbproxy_trust_tier_requests_total` of requests partitioned
+    /// by the closed trust-tier decision.
+    pub trust_tier_requests: IntCounterVec,
 
     // --- Per-origin metrics (Sprint 1A) ---
     /// Total HTTP requests with origin, method, and status labels.
@@ -529,6 +532,15 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let trust_tier_requests = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_trust_tier_requests_total",
+                "Requests partitioned by the derived trust tier",
+            ),
+            &["tier"],
+        )
+        .unwrap();
+
         // --- Per-origin metrics (Sprint 1A) ---
 
         let per_origin_requests_total = CounterVec::new(
@@ -765,6 +777,9 @@ impl ProxyMetrics {
             .register(Box::new(agent_detect_inference_seconds.clone()))
             .unwrap();
         registry
+            .register(Box::new(trust_tier_requests.clone()))
+            .unwrap();
+        registry
             .register(Box::new(per_origin_requests_total.clone()))
             .unwrap();
         registry
@@ -831,6 +846,7 @@ impl ProxyMetrics {
             agent_detect_total,
             agent_detect_score,
             agent_detect_inference_seconds,
+            trust_tier_requests,
             per_origin_requests_total,
             per_origin_request_duration,
             per_origin_active_connections,
@@ -1225,6 +1241,22 @@ pub fn record_agent_detect(
     if duration_secs > 0.0 {
         m.agent_detect_inference_seconds.observe(duration_secs);
     }
+}
+
+/// Record one derived request trust tier.
+///
+/// The label is closed to the four trust-tier values. Unknown input is
+/// conservatively attributed to
+/// `anonymous` instead of creating attacker-controlled cardinality.
+pub fn record_trust_tier(tier: &str) {
+    let tier = match tier {
+        "suspicious" | "strong" | "named" | "anonymous" => tier,
+        _ => "anonymous",
+    };
+    metrics()
+        .trust_tier_requests
+        .with_label_values(&[tier])
+        .inc();
 }
 
 /// Attribute the tokens and cost a semantic-cache hit avoided (WOR-1225):
@@ -4676,6 +4708,20 @@ mod tests {
         let out = metrics().render();
         assert!(out.contains("sbproxy_agent_detect_score_bucket"));
         assert!(out.contains("sbproxy_agent_detect_inference_seconds_bucket"));
+    }
+
+    #[test]
+    fn record_trust_tier_stamps_the_closed_tier_label() {
+        let before = metrics()
+            .trust_tier_requests
+            .with_label_values(&["strong"])
+            .get();
+        record_trust_tier("strong");
+        let after = metrics()
+            .trust_tier_requests
+            .with_label_values(&["strong"])
+            .get();
+        assert_eq!(after, before + 1);
     }
 
     #[test]

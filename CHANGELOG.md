@@ -12,6 +12,11 @@ the next version cut.
 
 ### Added
 
+- **Trust tier is now live policy input.** The request path combines
+  authentication and agent-detection evidence into `suspicious`, `strong`,
+  `named`, or `anonymous`; CEL expression and assertion policies can read
+  `request.trust_tier`, and `sbproxy_trust_tier_requests_total` reports the
+  closed-set distribution. Verified Web Bot Auth resolves to `strong`.
 - **Subscribe to signed configuration from an upstream authority.** A new
   `proxy.config_authority.upstream` block points a node at an authority
   that publishes signed configuration bundles. The node polls, verifies

@@ -2299,7 +2299,7 @@ impl ProxyHttp for SbProxy {
                         let resp_headers = upstream_response.headers.clone();
                         for policy in policies {
                             if let Policy::Assertion(a) = policy {
-                                let passed = a.evaluate(
+                                let passed = a.evaluate_with_trust_tier(
                                     &method,
                                     &path,
                                     &req_headers,
@@ -2309,6 +2309,7 @@ impl ProxyHttp for SbProxy {
                                     resp_status,
                                     &resp_headers,
                                     None,
+                                    Some(ctx.trust_tier.as_str()),
                                 );
                                 if passed {
                                     tracing::info!(

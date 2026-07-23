@@ -156,6 +156,9 @@ impl ExpressionPolicy {
         if let Some(agent_class) = views.agent_class {
             sbproxy_extension::cel::context::populate_agent_class_namespace(&mut ctx, &agent_class);
         }
+        if let Some(trust_tier) = views.trust_tier {
+            sbproxy_extension::cel::context::populate_trust_tier_namespace(&mut ctx, trust_tier);
+        }
 
         // Wave 5 / A5.2: stamp the ML classifier verdict whenever
         // inference produced one.
@@ -219,6 +222,9 @@ pub struct ExpressionViews<'a> {
     /// `populate_agent_class_namespace` runs and policy expressions can
     /// branch on `request.agent_class` / `request.agent_id_source`.
     pub agent_class: Option<sbproxy_extension::cel::context::AgentClassView<'a>>,
+    /// Conservative request trust tier. When present, policy expressions can
+    /// branch on `request.trust_tier`.
+    pub trust_tier: Option<&'a str>,
     /// ML agent classifier verdict view.
     pub ml: Option<sbproxy_extension::cel::context::MlClassificationView<'a>>,
     /// Phase 2 per-request feature flags view. When `Some`,
@@ -471,5 +477,27 @@ mod tests {
             result,
             "untrustworthy TLS fingerprints must be available as false, not missing/fail-closed"
         );
+    }
+
+    #[test]
+    fn expression_policy_can_branch_on_trust_tier() {
+        let p = ExpressionPolicy {
+            expression: r#"request.trust_tier == "strong""#.to_string(),
+            deny_status: 403,
+            deny_message: "x".to_string(),
+        };
+
+        assert!(p.evaluate_with_views(
+            "GET",
+            "/",
+            &http::HeaderMap::new(),
+            None,
+            None,
+            "h.com",
+            ExpressionViews {
+                trust_tier: Some("strong"),
+                ..Default::default()
+            },
+        ));
     }
 }
