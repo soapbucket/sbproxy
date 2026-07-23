@@ -15,13 +15,26 @@
 //!    because a CEL rule turns a label into a `route_to:<model>` and a
 //!    hallucinated label would either dead-end the rule or, worse, match
 //!    a rule the operator wrote for a different purpose.
-//! 2. **It never blocks a request.** A classifier is a routing hint, not
-//!    a security control. Every failure mode (timeout, transport error,
-//!    non-2xx, unparseable body, unrecognized class) yields no label and
-//!    the request keeps its original routing. `fail_open` only changes
-//!    the log level, never the outcome. Do not "fix" this into a
-//!    blocking guard: use a `type: injection` or `type: regex` guardrail
-//!    if you want something that can reject a request.
+//! 2. **No failure mode blocks a request.** A classifier is a routing
+//!    hint, not a security control. Every failure mode (timeout,
+//!    transport error, non-2xx, unparseable body, unrecognized class)
+//!    yields no label and the request keeps its original routing.
+//!    `fail_open` only changes the log level, never the outcome. Do not
+//!    "fix" this into a blocking guard: use a `type: injection` or
+//!    `type: regex` guardrail if you want something that can reject a
+//!    request.
+//!
+//!    A *successful* label is a different matter, and it is the one
+//!    thing an operator has to configure for. The mesh counts every
+//!    guardrail that produced a label toward `flagged_count`, and
+//!    [`super::mesh::GuardrailMeshConfig::block_threshold`] defaults to
+//!    `1`, so under a default `mesh:` block a classified prompt is
+//!    blocked with a 400 `guardrail_violation`. Label-only use, which is
+//!    what routing wants, needs `block_threshold: 0` (optionally with
+//!    `redact_on_flag: false`). This is the same rule the embedding
+//!    backend has always been under; it is stated here because a
+//!    classifier is the guardrail most likely to label a perfectly
+//!    ordinary request.
 //!
 //! The HTTP call sits behind [`ChatCompletionsTransport`] so the
 //! classification logic can be tested without a network.
@@ -87,7 +100,7 @@ fn default_fail_open() -> bool {
 ///   cache_capacity: 1024
 ///   fail_open: true
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct LlmBackendConfig {
     /// Full URL of the OpenAI-compatible chat-completions endpoint.
     /// This is the complete path, not a prefix: point it at
@@ -96,9 +109,12 @@ pub struct LlmBackendConfig {
     /// Model identifier sent as the `model` field of the request body.
     pub model: String,
     /// Bearer token for a hosted provider. Omit entirely for a local
-    /// runtime that needs none. When present it must resolve to a real
-    /// value at config load; an unresolved `${VAR}` is a hard error
-    /// rather than a silent unauthenticated call.
+    /// runtime that needs none. An empty value is a hard error, since it
+    /// is wrong on every host. An unresolved `${VAR}`, which means the
+    /// named variable was unset on *this* host, degrades this backend to
+    /// inert and logs at `error!`: the classifier emits no label and
+    /// every other guardrail on the origin keeps running. It is never
+    /// sent as a literal bearer token.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Per-call wall-clock timeout in milliseconds.
@@ -109,10 +125,34 @@ pub struct LlmBackendConfig {
     pub cache_capacity: usize,
     /// Log level for a failed classification: `true` (the default)
     /// warns, `false` logs at error. Both outcomes are the same: no
-    /// label, and the request keeps its original routing. This backend
-    /// never blocks.
+    /// label, and the request keeps its original routing. No failure
+    /// mode of this backend blocks. A successful label is separate and
+    /// does count toward the mesh quorum; see the module docs.
     #[serde(default = "default_fail_open")]
     pub fail_open: bool,
+}
+
+/// Stand-in printed wherever a secret would otherwise reach a log.
+const REDACTED: &str = "[redacted]";
+
+/// Hand-written so the resolved bearer token cannot reach a log.
+///
+/// `ChatCompletionsTransport` requires `Debug`, and the chain from
+/// [`LlmClassifier`] up through [`super::GuardrailPipeline`] is `Debug`
+/// throughout, so a single `debug!(?pipeline)` anywhere in the dispatch
+/// path would otherwise print the key. Every other field stays visible,
+/// since diagnosis is the whole point of `Debug` here.
+impl std::fmt::Debug for LlmBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmBackendConfig")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| REDACTED))
+            .field("timeout_ms", &self.timeout_ms)
+            .field("cache_capacity", &self.cache_capacity)
+            .field("fail_open", &self.fail_open)
+            .finish()
+    }
 }
 
 /// Why one classification call did not produce a usable body.
@@ -143,11 +183,23 @@ pub trait ChatCompletionsTransport: Send + Sync + std::fmt::Debug {
 
 /// The real transport: a `reqwest` client with the configured timeout
 /// baked in and an optional bearer token.
-#[derive(Debug)]
 pub struct ReqwestChatTransport {
     http: reqwest::Client,
     url: String,
     api_key: Option<String>,
+}
+
+/// Hand-written for the same reason as [`LlmBackendConfig`]'s: this type
+/// holds the resolved bearer token, and `Debug` on it is reachable from
+/// any `Debug` of the compiled guardrail pipeline.
+impl std::fmt::Debug for ReqwestChatTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReqwestChatTransport")
+            .field("http", &self.http)
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| REDACTED))
+            .finish()
+    }
 }
 
 impl ReqwestChatTransport {
@@ -220,14 +272,24 @@ pub struct LlmClassifier {
 impl LlmClassifier {
     /// Build from config, over a real HTTP transport.
     ///
-    /// Every failure here is operator config that has to be fixed, so
-    /// this returns an error rather than degrading to an inert
-    /// guardrail: unlike the embedding backend there is no model file
-    /// that might legitimately be absent on one host.
+    /// Returns `Err` for config that is wrong on every host: a malformed
+    /// `base_url`, an empty `model`, an empty `classes` map, a class
+    /// named `none`, an empty `api_key`. Those an operator has to fix,
+    /// and they fail the same way everywhere.
+    ///
+    /// Returns `Ok(None)` for the one failure that is host-specific: an
+    /// `api_key` still holding the literal `${VAR}`, which means the
+    /// named variable was unset when this config loaded. The caller must
+    /// degrade the guardrail to inert in that case, exactly as the
+    /// embedding backend degrades when its model file is missing. An
+    /// `Err` there would abort `compile_pipeline` and take the PII,
+    /// injection, and regex guardrails configured alongside this one
+    /// down with it, turning one unset variable into an origin with no
+    /// guardrails at all. A routing hint must never be able to do that.
     pub fn from_config(
         cfg: &LlmBackendConfig,
         classes: &BTreeMap<String, Vec<String>>,
-    ) -> Result<Self> {
+    ) -> Result<Option<Self>> {
         let url = url::Url::parse(cfg.base_url.trim()).map_err(|e| {
             anyhow!(
                 "classifier `llm` backend has an invalid base_url {:?}: {e}",
@@ -239,13 +301,33 @@ impl LlmClassifier {
                 "classifier `llm` backend needs a non-empty `model`"
             ));
         }
-        let api_key = resolve_api_key(cfg.api_key.as_deref())?;
+        // Ahead of the key, so a config that is also shape-wrong still
+        // fails loud rather than being masked by the inert path.
+        validate_classes(classes)?;
+        let api_key = match resolve_api_key(cfg.api_key.as_deref())? {
+            ApiKey::Resolved(key) => key,
+            ApiKey::Unresolved(var) => {
+                // error!, not warn!: unlike a model file that may
+                // legitimately be absent on a given host, an unset key
+                // variable is nearly always a deployment mistake.
+                error!(
+                    endpoint = %endpoint_label_of(&cfg.base_url),
+                    model = %cfg.model.trim(),
+                    variable = %var,
+                    "classifier `llm` backend api_key is still an unresolved reference, \
+                     so the named environment variable was unset at config load; this \
+                     classifier is inert and emits no label, while every other guardrail \
+                     on this origin keeps running. Set the variable or remove `api_key`"
+                );
+                return Ok(None);
+            }
+        };
         let transport = ReqwestChatTransport::new(
             url.to_string(),
             api_key,
             Duration::from_millis(cfg.timeout_ms),
         )?;
-        Self::with_transport(cfg, classes, Arc::new(transport))
+        Self::with_transport(cfg, classes, Arc::new(transport)).map(Some)
     }
 
     /// Build over a caller-supplied transport. Used by the tests, and
@@ -255,21 +337,11 @@ impl LlmClassifier {
         classes: &BTreeMap<String, Vec<String>>,
         transport: Arc<dyn ChatCompletionsTransport>,
     ) -> Result<Self> {
-        if classes.is_empty() {
-            return Err(anyhow!(
-                "classifier `llm` backend needs at least one entry under `classes`"
-            ));
-        }
-        if let Some(bad) = classes
-            .keys()
-            .find(|k| normalize_reply(k.as_str()) == NONE_TOKEN)
-        {
-            return Err(anyhow!(
-                "classifier class name {bad:?} collides with the reserved `none` answer \
-                 token that means no class fits; rename the class"
-            ));
-        }
-        let capacity = NonZeroUsize::new(cfg.cache_capacity.max(1)).unwrap_or(NonZeroUsize::MIN);
+        validate_classes(classes)?;
+        // A configured 0 means "no cache"; the smallest legal LRU is the
+        // closest honest reading of that, and every larger value is
+        // already non-zero.
+        let capacity = NonZeroUsize::new(cfg.cache_capacity).unwrap_or(NonZeroUsize::MIN);
         Ok(Self {
             transport,
             model: cfg.model.trim().to_string(),
@@ -384,15 +456,52 @@ fn prompt_key(text: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Resolve the configured API key, refusing to proceed unauthenticated.
+/// Reject a class map that is wrong on every host.
+///
+/// Split out of [`LlmClassifier::with_transport`] so
+/// [`LlmClassifier::from_config`] can run it before the API key is
+/// resolved: a config that is both shape-wrong and key-unresolved has to
+/// report the shape error rather than quietly taking the inert path.
+fn validate_classes(classes: &BTreeMap<String, Vec<String>>) -> Result<()> {
+    if classes.is_empty() {
+        return Err(anyhow!(
+            "classifier `llm` backend needs at least one entry under `classes`"
+        ));
+    }
+    if let Some(bad) = classes
+        .keys()
+        .find(|k| normalize_reply(k.as_str()) == NONE_TOKEN)
+    {
+        return Err(anyhow!(
+            "classifier class name {bad:?} collides with the reserved `none` answer \
+             token that means no class fits; rename the class"
+        ));
+    }
+    Ok(())
+}
+
+/// What resolving the configured `api_key` produced.
+#[derive(Debug)]
+enum ApiKey {
+    /// Nothing was configured, or the configured value is a real key.
+    Resolved(Option<String>),
+    /// The value is still the literal `${VAR}`. Carries the variable
+    /// name, which is the only useful thing to put in the log.
+    Unresolved(String),
+}
+
+/// Resolve the configured API key, never sending an unresolved
+/// reference as a bearer token.
 ///
 /// The config loader interpolates `${VAR}` at load time and leaves the
 /// literal `${VAR}` in place when the variable is unset. Passing that
-/// through as a bearer token would produce a confusing 401 per request
-/// at runtime, so it fails at construction instead.
-fn resolve_api_key(raw: Option<&str>) -> Result<Option<String>> {
+/// through as a bearer token would produce a confusing 401 per request,
+/// so it is reported to the caller as [`ApiKey::Unresolved`], which
+/// degrades the backend to inert. An empty key is a different case: no
+/// host can make that right, so it stays a hard error.
+fn resolve_api_key(raw: Option<&str>) -> Result<ApiKey> {
     let Some(raw) = raw else {
-        return Ok(None);
+        return Ok(ApiKey::Resolved(None));
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -403,13 +512,9 @@ fn resolve_api_key(raw: Option<&str>) -> Result<Option<String>> {
     }
     if trimmed.starts_with("${") && trimmed.ends_with('}') {
         let name = &trimmed[2..trimmed.len() - 1];
-        return Err(anyhow!(
-            "classifier `llm` backend `api_key` is still the literal {trimmed:?}, which \
-             means the environment variable {name:?} was unset at config load; set it or \
-             remove `api_key`"
-        ));
+        return Ok(ApiKey::Unresolved(name.to_string()));
     }
-    Ok(Some(trimmed.to_string()))
+    Ok(ApiKey::Resolved(Some(trimmed.to_string())))
 }
 
 /// Host of the configured endpoint, for logs.
@@ -526,31 +631,51 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// What the fake transport does when it is called.
+    ///
+    /// [`ClassifierTransportError`] is not `Clone`, so the outcome is
+    /// stored as a description and the error is built per call.
+    #[derive(Debug)]
+    enum FakeOutcome {
+        Body(String),
+        Timeout,
+        Status(u16),
+        Transport(String),
+    }
+
     /// Transport that answers with a canned body (or a canned failure)
     /// and records what it was asked, so tests can assert both the
     /// request shape and the call count without a socket.
     #[derive(Debug)]
     struct FakeTransport {
-        reply: Option<String>,
+        outcome: FakeOutcome,
         calls: AtomicUsize,
         bodies: Mutex<Vec<Json>>,
     }
 
     impl FakeTransport {
-        fn answering(body: String) -> Self {
+        fn with_outcome(outcome: FakeOutcome) -> Self {
             Self {
-                reply: Some(body),
+                outcome,
                 calls: AtomicUsize::new(0),
                 bodies: Mutex::new(Vec::new()),
             }
         }
 
+        fn answering(body: String) -> Self {
+            Self::with_outcome(FakeOutcome::Body(body))
+        }
+
         fn failing() -> Self {
-            Self {
-                reply: None,
-                calls: AtomicUsize::new(0),
-                bodies: Mutex::new(Vec::new()),
-            }
+            Self::with_outcome(FakeOutcome::Timeout)
+        }
+
+        fn returning_status(code: u16) -> Self {
+            Self::with_outcome(FakeOutcome::Status(code))
+        }
+
+        fn failing_transport(detail: &str) -> Self {
+            Self::with_outcome(FakeOutcome::Transport(detail.to_string()))
         }
 
         fn calls(&self) -> usize {
@@ -563,9 +688,13 @@ mod tests {
         async fn post_chat(&self, body: Json) -> Result<String, ClassifierTransportError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.bodies.lock().push(body);
-            match &self.reply {
-                Some(r) => Ok(r.clone()),
-                None => Err(ClassifierTransportError::Timeout),
+            match &self.outcome {
+                FakeOutcome::Body(r) => Ok(r.clone()),
+                FakeOutcome::Timeout => Err(ClassifierTransportError::Timeout),
+                FakeOutcome::Status(code) => Err(ClassifierTransportError::Status(*code)),
+                FakeOutcome::Transport(detail) => {
+                    Err(ClassifierTransportError::Transport(detail.clone()))
+                }
             }
         }
     }
@@ -652,10 +781,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_non_2xx_status_produces_no_label_and_is_not_cached() {
+        // A 503 from an overloaded endpoint is transient in exactly the
+        // way a timeout is, so it must not poison the cache either.
+        let t = Arc::new(FakeTransport::returning_status(503));
+        let c = classifier(t.clone());
+        assert!(c.classify("write the readme").await.is_none());
+        assert!(c.classify("write the readme").await.is_none());
+        assert_eq!(t.calls(), 2, "a non-2xx must not populate the cache");
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_produces_no_label_and_is_not_cached() {
+        let t = Arc::new(FakeTransport::failing_transport("connection refused"));
+        let c = classifier(t.clone());
+        assert!(c.classify("write the readme").await.is_none());
+        assert!(c.classify("write the readme").await.is_none());
+        assert_eq!(
+            t.calls(),
+            2,
+            "a transport error must not populate the cache"
+        );
+    }
+
+    #[test]
+    fn every_transport_error_names_itself_in_its_message() {
+        assert!(ClassifierTransportError::Timeout
+            .to_string()
+            .contains("timed out"));
+        assert!(ClassifierTransportError::Status(503)
+            .to_string()
+            .contains("503"));
+        assert!(
+            ClassifierTransportError::Transport("connection refused".to_string())
+                .to_string()
+                .contains("connection refused")
+        );
+    }
+
+    #[tokio::test]
     async fn unparseable_body_produces_no_label() {
         let t = Arc::new(FakeTransport::answering("this is not JSON".to_string()));
         let c = classifier(t);
         assert!(c.classify("write the readme").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_choices_array_produces_no_label() {
+        // Well-formed JSON with nothing to read: the pointer lookup has
+        // to miss rather than panic or invent a label.
+        let t = Arc::new(FakeTransport::answering(json!({"choices": []}).to_string()));
+        let c = classifier(t.clone());
+        assert!(c.classify("write the readme").await.is_none());
+        assert_eq!(t.calls(), 1);
     }
 
     #[tokio::test]
@@ -679,12 +857,24 @@ mod tests {
 
     #[tokio::test]
     async fn label_uses_the_configured_spelling_not_the_model_echo() {
+        // The class is configured with a capital D and the model echoes
+        // it lowercased and punctuated. The two spellings have to differ
+        // for this assertion to discriminate: with a class already
+        // spelled "documentation" it would pass whether the code
+        // returned the config string or the normalized echo, and the
+        // property is that the operator's spelling wins. It matters
+        // because the label is what a CEL rule matches on to pick a
+        // route.
+        let configured = BTreeMap::from([(
+            "Documentation".to_string(),
+            vec!["write the readme".to_string()],
+        )]);
         let t = Arc::new(FakeTransport::answering(chat_reply(
-            "  \"Documentation.\" ",
+            "  \"documentation.\" ",
         )));
-        let c = classifier(t);
+        let c = LlmClassifier::with_transport(&cfg(), &configured, t).expect("builds");
         let v = c.classify("write the readme").await.expect("verdict");
-        assert_eq!(v.label, "documentation", "config spelling wins");
+        assert_eq!(v.label, "Documentation", "config spelling wins");
     }
 
     #[tokio::test]
@@ -719,21 +909,36 @@ mod tests {
     }
 
     #[test]
-    fn missing_api_key_is_a_hard_config_error() {
+    fn unresolved_api_key_degrades_the_backend_to_inert() {
         // An unset `${VAR}` survives config interpolation verbatim.
-        // Sending it as a bearer token would 401 on every request.
+        // Sending it as a bearer token would 401 on every request, but
+        // erroring here would abort `compile_pipeline` and disable every
+        // other guardrail on the origin, so the backend goes inert
+        // instead. `mod.rs` pins the pipeline-level half of this.
         let mut c = cfg();
         c.api_key = Some("${SBPROXY_TEST_CLASSIFIER_KEY_UNSET}".to_string());
-        let err = LlmClassifier::from_config(&c, &classes()).expect_err("must fail loud");
+        let built = LlmClassifier::from_config(&c, &classes())
+            .expect("an unset key is not a hard config error");
         assert!(
-            err.to_string()
-                .contains("SBPROXY_TEST_CLASSIFIER_KEY_UNSET"),
-            "error should name the variable: {err}"
+            built.is_none(),
+            "an unresolved key must yield no backend, not an authenticated one"
         );
     }
 
     #[test]
+    fn a_shape_error_still_wins_over_an_unresolved_api_key() {
+        // Both wrong at once: the class map is wrong on every host, so
+        // that has to be the reported outcome rather than a quiet
+        // degrade to inert.
+        let mut c = cfg();
+        c.api_key = Some("${SBPROXY_TEST_CLASSIFIER_KEY_UNSET}".to_string());
+        assert!(LlmClassifier::from_config(&c, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
     fn empty_api_key_is_a_hard_config_error() {
+        // Unlike an unresolved reference, an empty key is wrong on every
+        // host, so it stays loud.
         let mut c = cfg();
         c.api_key = Some("   ".to_string());
         assert!(LlmClassifier::from_config(&c, &classes()).is_err());
@@ -743,7 +948,40 @@ mod tests {
     // reaches the real `reqwest::Client` builder.
     #[tokio::test]
     async fn absent_api_key_is_fine_for_a_local_runtime() {
-        assert!(LlmClassifier::from_config(&cfg(), &classes()).is_ok());
+        let built = LlmClassifier::from_config(&cfg(), &classes()).expect("builds");
+        assert!(built.is_some());
+    }
+
+    #[tokio::test]
+    async fn debug_never_prints_the_api_key() {
+        // Nothing logs the pipeline today, but the whole chain from this
+        // transport up to `GuardrailPipeline` is `Debug`, so one
+        // `debug!(?pipeline)` would otherwise print a bearer token.
+        const SECRET: &str = "sk-do-not-log-me-0123456789";
+        let mut c = cfg();
+        c.api_key = Some(SECRET.to_string());
+        let rendered = format!("{c:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "config Debug leaked: {rendered}"
+        );
+        assert!(rendered.contains(REDACTED), "config Debug: {rendered}");
+        // The other fields stay visible; Debug exists to diagnose.
+        assert!(rendered.contains("qwen3-coder:30b"), "{rendered}");
+
+        let transport = ReqwestChatTransport::new(
+            c.base_url.clone(),
+            Some(SECRET.to_string()),
+            Duration::from_millis(c.timeout_ms),
+        )
+        .expect("transport builds");
+        let rendered = format!("{transport:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "transport Debug leaked: {rendered}"
+        );
+        assert!(rendered.contains(REDACTED), "transport Debug: {rendered}");
+        assert!(rendered.contains("localhost"), "{rendered}");
     }
 
     #[test]
@@ -759,6 +997,7 @@ mod tests {
         let t: Arc<dyn ChatCompletionsTransport> =
             Arc::new(FakeTransport::answering(chat_reply("none")));
         assert!(LlmClassifier::with_transport(&cfg(), &reserved, t).is_err());
+        assert!(LlmClassifier::from_config(&cfg(), &reserved).is_err());
     }
 
     #[test]
@@ -766,14 +1005,27 @@ mod tests {
         let t: Arc<dyn ChatCompletionsTransport> =
             Arc::new(FakeTransport::answering(chat_reply("none")));
         assert!(LlmClassifier::with_transport(&cfg(), &BTreeMap::new(), t).is_err());
+        assert!(LlmClassifier::from_config(&cfg(), &BTreeMap::new()).is_err());
     }
 
     #[test]
     fn match_class_only_returns_configured_names() {
-        let names = vec!["coding".to_string(), "documentation".to_string()];
-        assert_eq!(match_class("coding", &names).as_deref(), Some("coding"));
-        assert_eq!(match_class("CODING", &names).as_deref(), Some("coding"));
-        assert_eq!(match_class("`coding`", &names).as_deref(), Some("coding"));
+        // Configured with capitals so every positive assertion tells the
+        // operator's spelling apart from the model's echo: a normalized
+        // echo would return "coding", not "Coding".
+        let names = vec!["Coding".to_string(), "Documentation".to_string()];
+        assert_eq!(match_class("Coding", &names).as_deref(), Some("Coding"));
+        assert_eq!(match_class("coding", &names).as_deref(), Some("Coding"));
+        assert_eq!(match_class("CODING", &names).as_deref(), Some("Coding"));
+        assert_eq!(match_class("`coding`", &names).as_deref(), Some("Coding"));
+        assert_eq!(
+            match_class("documentation.", &names).as_deref(),
+            Some("Documentation")
+        );
+        assert_eq!(
+            match_class("Thinking it over.\ndocumentation", &names).as_deref(),
+            Some("Documentation")
+        );
         assert!(match_class("none", &names).is_none());
         assert!(match_class("NONE", &names).is_none());
         assert!(match_class("", &names).is_none());

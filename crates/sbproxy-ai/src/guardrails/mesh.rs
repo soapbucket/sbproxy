@@ -55,9 +55,11 @@ pub struct GuardrailMeshConfig {
     /// untouched.
     #[serde(default)]
     pub redact_on_flag: bool,
-    /// Wall-clock budget for running the detectors. Once exceeded, the
-    /// cascade stops launching further (expensive) detectors. `None` runs
-    /// them all.
+    /// Wall-clock budget for running the detectors. Once exceeded, no
+    /// further detector is launched. `None` runs them all. This gates
+    /// launching only: a detector already running, in particular an
+    /// in-flight LLM classifier call, is not cancelled and runs to its
+    /// own `timeout_ms`.
     #[serde(default)]
     pub latency_budget_ms: Option<u64>,
     /// Cache verdicts by content + guardrail-set hash so a repeated prompt
@@ -278,10 +280,18 @@ impl GuardrailMesh {
     ///
     /// Only the classifier guardrail has an async backend today, and
     /// only when it is configured with `kind: llm`; every other
-    /// guardrail was already decided by the cascade. `started` is the
-    /// cascade's own start instant so the configured latency budget
-    /// covers both passes: an LLM call is the most expensive detector in
-    /// the mesh, so it is the first thing a spent budget should skip.
+    /// guardrail was already decided by the cascade.
+    ///
+    /// `started` is the cascade's own start instant, so the budget is
+    /// measured across both passes rather than restarting here: an LLM
+    /// call is the most expensive detector in the mesh, so it is the
+    /// first thing a spent budget should skip. The budget gates
+    /// *launching* a call and nothing more. A call already in flight
+    /// when the budget runs out is not cancelled; it runs to the
+    /// backend's own `timeout_ms`, which is the only bound on it. An
+    /// operator who needs a hard ceiling on the whole evaluation has to
+    /// set `timeout_ms` accordingly, since `latency_budget_ms` alone
+    /// cannot deliver one.
     async fn collect_async(
         &self,
         pipeline: &GuardrailPipeline,

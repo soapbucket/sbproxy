@@ -1,10 +1,19 @@
 //! Text classifier guardrail.
 //!
-//! Labels a prompt with a predicted class instead of blocking it. The
-//! mesh reads labels from [`GuardrailBlock::name`], so the class name
-//! lands directly in `ai.guardrails.labels` and the CEL policy plane can
-//! branch on it with `route_to:<model>`. That makes this guardrail a
+//! Labels a prompt with a predicted class instead of blocking it on its
+//! own. The mesh reads labels from [`GuardrailBlock::name`], so the class
+//! name lands directly in `ai.guardrails.labels` and the CEL policy plane
+//! can branch on it with `route_to:<model>`. That makes this guardrail a
 //! routing signal rather than a security control.
+//!
+//! One thing an operator has to configure for: a label is a flag as far
+//! as the mesh is concerned. It counts toward `flagged_count`, and
+//! [`super::mesh::GuardrailMeshConfig::block_threshold`] defaults to `1`,
+//! so under a default `mesh:` block a successfully classified prompt is
+//! rejected with a 400. Label-only use, which is what routing wants,
+//! needs `block_threshold: 0`. No failure mode here ever blocks: a
+//! backend that will not load, a call that times out, and an answer
+//! outside the configured class set all produce no label at all.
 //!
 //! Two backends exist, and they sit on two different seams because they
 //! have two different costs:
@@ -36,9 +45,15 @@
 //! deliberate. `compile_pipeline` aborts the whole pipeline on any
 //! guardrail error, so returning an error for a missing model file would
 //! silently disable the PII and injection guards configured alongside
-//! this one. Config that cannot be right on any host (a malformed URL, a
-//! missing API key) is still a hard error, because there is no artifact
-//! that might legitimately be absent.
+//! this one.
+//!
+//! The line is what the config would do on a different host, not which
+//! backend is in play. Anything host-specific degrades to inert: a model
+//! file that is absent here, an `api_key` whose `${VAR}` was unset here.
+//! Anything wrong on every host is a hard error: a malformed `base_url`,
+//! an empty class map, a class named `none`, an empty `api_key`. An
+//! unresolved key logs at `error!` rather than `warn!`, because unlike a
+//! missing model file it is nearly always a deployment mistake.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -252,12 +267,14 @@ impl ClassifierGuardrail {
 
     /// Build from a raw config value.
     ///
-    /// A malformed config is an error. An embedding backend that will
-    /// not load is warned about and degrades to an inert guardrail,
-    /// because the model file may legitimately be absent on one host
-    /// and failing here would abort the whole pipeline. An LLM backend
-    /// has no such artifact: everything that can go wrong at
-    /// construction is config the operator has to fix, so it fails loud.
+    /// Config that is wrong on every host is an error. Config that only
+    /// fails on this one degrades to an inert guardrail, because failing
+    /// here would abort the whole pipeline and take the security
+    /// guardrails configured alongside this one down with it. That
+    /// covers an embedding backend whose model file is absent (logged at
+    /// `warn!`, since it may legitimately be missing) and an LLM backend
+    /// whose `api_key` reference did not resolve (logged at `error!`,
+    /// since that is nearly always a deployment mistake).
     pub fn from_config(config: &serde_json::Value) -> Result<Self> {
         let cfg: ClassifierConfig = serde_json::from_value(config.clone())?;
         if cfg.classes.is_empty() {
@@ -283,8 +300,16 @@ impl ClassifierGuardrail {
                     ClassifierBackend::Inert
                 }
             },
+            // `Ok(None)` means the `api_key` reference did not resolve
+            // on this host. `LlmClassifier::from_config` has already
+            // logged it at error with the variable name; going inert
+            // here is what keeps one unset variable from disabling the
+            // PII, injection, and regex guardrails on this origin.
             ClassifierBackendConfig::Llm(llm) => {
-                ClassifierBackend::Async(Arc::new(LlmClassifier::from_config(llm, &cfg.classes)?))
+                match LlmClassifier::from_config(llm, &cfg.classes)? {
+                    Some(backend) => ClassifierBackend::Async(Arc::new(backend)),
+                    None => ClassifierBackend::Inert,
+                }
             }
         };
         Ok(Self { cfg, backend })
@@ -555,8 +580,9 @@ mod tests {
 
     #[tokio::test]
     async fn async_backend_honors_scope_and_max_chars() {
-        // Same subject-selection rules as the sync path: "readme" sits
-        // only in the earlier turn, so last_user_message scope hides it.
+        // Same subject-selection rules as the sync path, both halves.
+        // Scope: "readme" sits only in the earlier turn, so
+        // last_user_message hides it.
         let g = async_guardrail(ClassifierScope::LastUserMessage);
         let messages = vec![
             msg("user", "update the readme"),
@@ -565,6 +591,40 @@ mod tests {
         ];
         let joined = "update the readme done now refactor the parser";
         assert!(g.check_messages_async(joined, &messages).await.is_none());
+
+        // max_chars: the same needle, now present in the last user turn
+        // but sitting past the cap, must still not reach the backend.
+        let mut capped = cfg(ClassifierScope::LastUserMessage);
+        capped.max_chars = 10;
+        let g = ClassifierGuardrail::with_async_backend(
+            capped,
+            Arc::new(FakeAsync {
+                needle: "readme",
+                label: "documentation",
+            }),
+        );
+        let long = format!("{}readme", "x".repeat(50));
+        let messages = vec![msg("user", &long)];
+        assert!(g.check_messages_async(&long, &messages).await.is_none());
+
+        // ... and within the cap it does, so the assertion above is
+        // about truncation rather than about the needle never matching.
+        let mut uncapped = cfg(ClassifierScope::LastUserMessage);
+        uncapped.max_chars = 2000;
+        let g = ClassifierGuardrail::with_async_backend(
+            uncapped,
+            Arc::new(FakeAsync {
+                needle: "readme",
+                label: "documentation",
+            }),
+        );
+        assert_eq!(
+            g.check_messages_async(&long, &messages)
+                .await
+                .expect("should classify")
+                .name,
+            "documentation"
+        );
     }
 
     #[tokio::test]
@@ -602,8 +662,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_backend_with_an_unresolved_api_key_fails_to_compile() {
-        // A hard config error, not a silent unauthenticated call.
+    async fn llm_backend_with_an_unresolved_api_key_goes_inert() {
+        // Never an unauthenticated call, and never a hard error either:
+        // an error would abort `compile_pipeline` and disable every
+        // other guardrail on the origin over one unset variable.
         let entry = serde_json::json!({
             "type": "classifier",
             "backend": {
@@ -614,6 +676,51 @@ mod tests {
             },
             "classes": {"coding": ["refactor the parser"]},
         });
-        assert!(ClassifierGuardrail::from_config(&entry).is_err());
+        let g = ClassifierGuardrail::from_config(&entry).expect("degrades rather than failing");
+        assert!(!g.is_async(), "an inert guardrail has no async pass to run");
+        assert!(g.check_messages("refactor the parser", &[]).is_none());
+        assert!(g
+            .check_messages_async("refactor the parser", &[])
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn llm_backend_config_shape_errors_stay_hard() {
+        // The other side of the line: config that is wrong on every host
+        // must not be swallowed by the inert path.
+        let empty_classes = serde_json::json!({
+            "type": "classifier",
+            "backend": {
+                "kind": "llm",
+                "base_url": "http://localhost:11434/v1/chat/completions",
+                "model": "qwen3-coder:30b",
+                "api_key": "${SBPROXY_TEST_CLASSIFIER_ABSENT_KEY}",
+            },
+            "classes": {},
+        });
+        assert!(ClassifierGuardrail::from_config(&empty_classes).is_err());
+
+        let bad_url = serde_json::json!({
+            "type": "classifier",
+            "backend": {
+                "kind": "llm",
+                "base_url": "not a url",
+                "model": "qwen3-coder:30b",
+            },
+            "classes": {"coding": ["refactor the parser"]},
+        });
+        assert!(ClassifierGuardrail::from_config(&bad_url).is_err());
+
+        let reserved_class = serde_json::json!({
+            "type": "classifier",
+            "backend": {
+                "kind": "llm",
+                "base_url": "http://localhost:11434/v1/chat/completions",
+                "model": "qwen3-coder:30b",
+            },
+            "classes": {"None": ["anything"]},
+        });
+        assert!(ClassifierGuardrail::from_config(&reserved_class).is_err());
     }
 }

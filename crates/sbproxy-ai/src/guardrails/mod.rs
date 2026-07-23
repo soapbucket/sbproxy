@@ -495,11 +495,37 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
     }
 }
 
+/// Guards the one-time warning below. A guardrail pipeline recompiles
+/// whenever the memoization in `sbproxy-core` misses, which can be per
+/// request, so the log line has to be emitted at most once per process.
+static ASYNC_CLASSIFIER_WITHOUT_MESH: std::sync::Once = std::sync::Once::new();
+
 /// Compile a full guardrail pipeline from a GuardrailsConfig.
 pub fn compile_pipeline(config: &GuardrailsConfig) -> Result<GuardrailPipeline> {
     let mut pipeline = GuardrailPipeline::default();
     for guard_cfg in &config.input {
         pipeline.input.push(compile_guardrail(guard_cfg)?);
+    }
+    // A `kind: llm` classifier only ever runs on the mesh's async pass.
+    // With no `mesh:` block the dispatch path takes the serial
+    // `check_input` route, which cannot await, so the guardrail is
+    // silently inert forever. Say so rather than failing: a later reload
+    // may add the mesh block, and a routing hint must never be able to
+    // take an origin's real guards down with it.
+    if config.mesh.is_none()
+        && pipeline
+            .input
+            .iter()
+            .any(|g| matches!(g, Guardrail::Classifier(c) if c.is_async()))
+    {
+        ASYNC_CLASSIFIER_WITHOUT_MESH.call_once(|| {
+            tracing::warn!(
+                "a `type: classifier` guardrail with `backend.kind: llm` is configured \
+                 without a `guardrails.mesh` block; it needs one to run at all, because \
+                 the serial input path cannot await it, so it emits no label today. Add \
+                 a `mesh:` block, with `block_threshold: 0` for label-only routing use"
+            );
+        });
     }
     for guard_cfg in &config.output {
         let guardrail = compile_guardrail(guard_cfg)?;
@@ -976,6 +1002,53 @@ mod tests {
         let pipeline = compile_pipeline(&cfg).expect("mixed pipeline should compile");
         assert_eq!(pipeline.input.len(), 2);
         assert!(pipeline.input[1].check("this is SECRET").is_some());
+    }
+
+    #[test]
+    fn an_unresolvable_api_key_does_not_break_a_mixed_pipeline() {
+        // The failure this guards is the worst one available: an LLM
+        // classifier whose `${VAR}` was unset on this host used to error
+        // out of `compile_pipeline`, and the caller in `sbproxy-core`
+        // turns a compile failure into "run with no guardrails at all".
+        // One unset variable would then disable PII, injection, and
+        // regex on the origin, and re-log the warning per request
+        // because the failure is not negatively cached.
+        //
+        // The classifier itself is expected to go quiet. Its sibling is
+        // not. GuardrailsConfig does not derive Default, and every field
+        // carries #[serde(default)], so build it through serde.
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "input": [
+                {
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "llm",
+                        "base_url": "http://localhost:11434/v1/chat/completions",
+                        "model": "qwen3-coder:30b",
+                        "api_key": "${SBPROXY_TEST_PIPELINE_KEY_UNSET}"
+                    },
+                    "classes": { "documentation": ["write the readme"] }
+                },
+                {"type": "regex", "patterns": ["SECRET"]}
+            ]
+        }))
+        .expect("config should deserialize");
+        let pipeline = compile_pipeline(&cfg).expect("an unset key must not fail the pipeline");
+        assert_eq!(pipeline.input.len(), 2);
+        assert!(
+            pipeline.input[1].check("this is SECRET").is_some(),
+            "the sibling guardrail must still run"
+        );
+        let Guardrail::Classifier(classifier) = &pipeline.input[0] else {
+            panic!("first entry should be the classifier");
+        };
+        assert!(
+            !classifier.is_async(),
+            "the classifier degraded to inert; a live LLM backend would report async"
+        );
+        assert!(pipeline.input[0]
+            .check_with_text("write the readme", &[])
+            .is_none());
     }
 
     #[test]
