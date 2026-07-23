@@ -1,6 +1,6 @@
 # AI policy plane (CEL)
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-23*
 
 The AI policy plane is one sandboxed CEL expression that expresses
 cross-cutting rules over the AI decision pipeline. Instead of spreading a
@@ -106,6 +106,11 @@ the documented UTF-8 byte-length heuristic. This makes an expression such as
 `ai.tokens.input_est > 12000 ? "compression:compact" : "compression:off"`
 depend on the caller's original context rather than a stale or post-compression
 accounting field.
+
+`ai.guardrails.labels` carries the name of every guardrail that flagged. A
+[`classifier` guardrail](ai-classifier-routing.md) contributes its predicted
+class instead, so an expression can read that label and emit a matching
+`route_to:`.
 
 The guardrail-verdict and budget-fraction dimensions are richest when the
 [guardrail mesh](ai-guardrail-mesh.md) and

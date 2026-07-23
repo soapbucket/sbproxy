@@ -10,6 +10,27 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+### Added
+
+- **Classifier-based routing.** A `type: classifier` input guardrail
+  labels a prompt with one of the classes you declare, the label lands
+  in `ai.guardrails.labels`, and a CEL expression turns it into a
+  `route_to:<model>`. The gateway can therefore route on what a request
+  is asking for rather than on a header, a path, or a separate API key.
+  Two backends fill in the same class map. `kind: embedding` runs a
+  local ONNX sentence-embedding model with one averaged vector per
+  class, so the decision costs no network call and the prompt never
+  leaves the process; `min_score` and `min_margin` decide whether a
+  class wins. `kind: llm` asks any OpenAI-compatible
+  `/chat/completions` endpoint, hosted or local, to name the class, and
+  caches the answer per prompt. The guardrail never rejects a request.
+  A model that will not load, a call that times out, and an answer
+  outside the configured class set all emit no label, and the request
+  stays on the route it arrived with. Label-only routing needs the mesh's
+  `block_threshold: 0`, since a label otherwise counts toward the block
+  quorum. See [`docs/ai-classifier-routing.md`](docs/ai-classifier-routing.md)
+  and the runnable [`examples/ai-classifier-routing/`](examples/ai-classifier-routing/).
+
 ## [1.7.0] - 2026-07-22
 
 The admin release. The console is rebuilt around the editorial brand
