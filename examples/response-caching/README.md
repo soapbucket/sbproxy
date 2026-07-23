@@ -50,7 +50,7 @@ A request with a different query string is treated as a separate cache key and h
 ## What this exercises
 
 - `response_cache` action sibling - per-origin cache configuration
-- `ttl_seconds` - hard upper bound on cache entry age
+- `ttl_secs` - hard upper bound on cache entry age
 - `cache_control: true` - upstream `Cache-Control` headers can shorten the TTL
 - `x-sbproxy-cache` response header - `HIT`, `STALE`, or `HIT-RESERVE` marks a cached serve; the header is absent on a miss, and no `Age` header is set
 
