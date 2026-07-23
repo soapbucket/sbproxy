@@ -15,35 +15,45 @@ use crate::compression::{SummarizationOutput, SummarizerError};
 use crate::handler::AiHandlerConfig;
 use crate::provider::ProviderConfig;
 use crate::providers::{get_provider_info, ProviderFormat};
-use crate::routing::Router;
+use crate::routing::{provider_allowed_by_policy, Router};
 use crate::translators;
+use crate::usage_sink::{LlmUsageEvent, UsageSink};
 
 /// Default upper bound on shadow requests in flight per `AiClient`.
-/// Sized so a 1024-deep queue holding ~32 KB of request state per
-/// task fits comfortably in well under 64 MB of resident memory,
-/// while still absorbing burst traffic to a slow shadow provider.
-pub const DEFAULT_SHADOW_MAX_INFLIGHT: usize = 1024;
+pub const DEFAULT_SHADOW_MAX_INFLIGHT: usize = 16;
+/// Process-wide shadow memory reservation budget per `AiClient`.
+///
+/// Admission reserves twice the serialized request size plus twice the
+/// response metadata cap for each task. This covers the request clone and
+/// transient response translation without allowing task count and per-task
+/// buffers to multiply into an unbounded resident-memory claim.
+pub const DEFAULT_SHADOW_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Minimum interval between rate-limited shadow-overflow WARN log
 /// lines. Bursts above this rate are coalesced into a single line.
 const SHADOW_OVERFLOW_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// Maximum response bytes retained for shadow usage metadata parsing.
+/// The response is still drained so the connection can be reused.
+const MAX_SHADOW_RESPONSE_METADATA_BYTES: usize = 1024 * 1024;
 const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const PROVIDER_RETRY_JITTER_PCT: u64 = 25;
 
 /// Supervisor for shadow / side-by-side eval tasks.
 ///
-/// Owns a bounded in-flight queue (`Semaphore`) so a slow or hung
-/// shadow provider can never accumulate unbounded background tasks.
-/// Each spawned task wraps `run_shadow_request` in
-/// `tokio::time::timeout`; when the timeout elapses the future is
-/// dropped (which aborts the in-flight reqwest connection) and the
-/// `sbproxy_ai_shadow_timeout_total` counter ticks. When `try_acquire`
-/// fails the supervisor logs at WARN at most once per minute and ticks
-/// `sbproxy_ai_shadow_dropped_total`.
+/// Owns bounded task and memory semaphores so a slow or hung shadow provider
+/// can never accumulate unbounded background work or retained response
+/// buffers. Each spawned task wraps `run_shadow_request` in
+/// `tokio::time::timeout`; when the timeout elapses the future is dropped
+/// (which aborts the in-flight reqwest connection) and the
+/// `sbproxy_ai_shadow_timeout_total` counter ticks. When either admission
+/// resource is exhausted the supervisor logs at WARN at most once per minute
+/// and ticks `sbproxy_ai_shadow_dropped_total`.
 pub struct ShadowSupervisor {
     semaphore: Arc<Semaphore>,
+    memory: Arc<Semaphore>,
     max_inflight: usize,
+    max_memory_bytes: usize,
     /// Unix-epoch nanoseconds of the last overflow WARN log. `0`
     /// means "never logged"; `AtomicI64` because `Instant` is not
     /// portable to atomics and a wall-clock skew of a few seconds is
@@ -54,10 +64,16 @@ pub struct ShadowSupervisor {
 impl ShadowSupervisor {
     /// Build a supervisor with the given in-flight bound.
     pub fn new(max_inflight: usize) -> Self {
+        Self::with_memory_budget(max_inflight, DEFAULT_SHADOW_MEMORY_BUDGET_BYTES)
+    }
+
+    fn with_memory_budget(max_inflight: usize, max_memory_bytes: usize) -> Self {
         let bound = max_inflight.max(1);
         Self {
             semaphore: Arc::new(Semaphore::new(bound)),
+            memory: Arc::new(Semaphore::new(max_memory_bytes)),
             max_inflight: bound,
+            max_memory_bytes,
             last_warn_unix_nanos: AtomicI64::new(0),
         }
     }
@@ -75,17 +91,58 @@ impl ShadowSupervisor {
     /// Try to admit one shadow task. Returns the owned permit on
     /// success; on overflow, ticks `sbproxy_ai_shadow_dropped_total`,
     /// emits a rate-limited WARN, and returns `None`.
-    fn try_admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        match self.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                ai_metrics::record_shadow_dropped();
-                self.maybe_warn_overflow();
-                None
-            }
-        }
+    #[cfg(test)]
+    fn try_admit(&self) -> Option<ShadowPermit> {
+        self.try_admit_request(0)
     }
 
+    fn try_admit_request(&self, request_bytes: usize) -> Option<ShadowPermit> {
+        let slot = match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return self.reject_admission(),
+        };
+        let memory_bytes = shadow_memory_reservation(request_bytes);
+        if memory_bytes > self.max_memory_bytes {
+            return self.reject_admission();
+        }
+        let memory_permits = match u32::try_from(memory_bytes) {
+            Ok(permits) => permits,
+            Err(_) => return self.reject_admission(),
+        };
+        let memory = match self.memory.clone().try_acquire_many_owned(memory_permits) {
+            Ok(permit) => permit,
+            Err(_) => return self.reject_admission(),
+        };
+        Some(ShadowPermit {
+            _slot: slot,
+            _memory: memory,
+        })
+    }
+
+    fn reject_admission<T>(&self) -> Option<T> {
+        ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::Saturated);
+        self.maybe_warn_overflow();
+        None
+    }
+
+    #[cfg(test)]
+    fn available_memory_bytes(&self) -> usize {
+        self.memory.available_permits()
+    }
+}
+
+struct ShadowPermit {
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    _memory: tokio::sync::OwnedSemaphorePermit,
+}
+
+fn shadow_memory_reservation(request_bytes: usize) -> usize {
+    request_bytes
+        .saturating_mul(2)
+        .saturating_add(MAX_SHADOW_RESPONSE_METADATA_BYTES.saturating_mul(2))
+}
+
+impl ShadowSupervisor {
     /// Emit at most one overflow WARN per
     /// `SHADOW_OVERFLOW_WARN_INTERVAL`. Concurrent overflows are
     /// coalesced via a CAS on `last_warn_unix_nanos`.
@@ -106,7 +163,8 @@ impl ShadowSupervisor {
                 warn!(
                     target: "sbproxy_ai_shadow",
                     max_inflight = self.max_inflight,
-                    "shadow supervisor queue full; dropping shadow request (rate-limited)"
+                    max_memory_bytes = self.max_memory_bytes,
+                    "shadow supervisor capacity exhausted; dropping shadow request (rate-limited)"
                 );
                 return;
             }
@@ -134,6 +192,109 @@ impl Drop for ShadowInflightGuard {
     fn drop(&mut self) {
         ai_metrics::dec_shadow_inflight();
     }
+}
+
+/// Result of trying to enqueue one configured shadow request.
+///
+/// This vocabulary is deliberately closed so callers can make
+/// deterministic assertions without parsing logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowDispatchOutcome {
+    /// The handler has no shadow block.
+    NotConfigured,
+    /// The request surface is outside the v1 chat-evaluation allowlist.
+    UnsupportedSurface,
+    /// Streaming shadowing is intentionally unsupported.
+    StreamingSkipped,
+    /// The configured probabilistic sampler did not select this request.
+    SampledOut,
+    /// The named shadow provider was absent from the handler provider list.
+    ProviderNotFound,
+    /// Credential-scoped provider policy disallowed the shadow provider.
+    ProviderNotAllowed,
+    /// Prompt-training opt-out disallowed the configured shadow provider.
+    PromptTrainingDisallowed,
+    /// Purpose-scoped egress is active and shadow transport cannot honor it.
+    EgressDenied,
+    /// The bounded shadow supervisor had no free slot.
+    Saturated,
+    /// The shadow task was admitted and spawned.
+    Spawned,
+}
+
+/// Request-scoped usage attribution copied into a completed shadow event.
+///
+/// The event and sinks are owned by the background task, keeping
+/// shadow accounting separate from the primary budget and governance
+/// path. Recording is implemented alongside the usage-sink wiring.
+#[derive(Debug, Clone)]
+pub struct ShadowUsageRecord {
+    event: LlmUsageEvent,
+    sinks: Vec<Arc<dyn UsageSink>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShadowAttribution {
+    Shadow,
+}
+
+impl ShadowAttribution {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+        }
+    }
+}
+
+impl ShadowUsageRecord {
+    /// Build shadow accounting from the request's governed identity.
+    pub fn new(mut event: LlmUsageEvent, sinks: Vec<Arc<dyn UsageSink>>) -> Self {
+        event.provider.clear();
+        event.model.clear();
+        event.prompt_tokens = 0;
+        event.completion_tokens = 0;
+        event.total_tokens = 0;
+        event.cost_usd = 0.0;
+        event.latency_ms = 0;
+        event.status = 0;
+        // Never derive the ledger dedup key from a caller-controlled
+        // correlation header. A different primary request could otherwise
+        // deliberately choose that derived value and suppress this event.
+        event.request_id = Some(format!("{:032x}:shadow", rand::random::<u128>()));
+        event.tag = Some(ShadowAttribution::Shadow.as_str().to_string());
+        event.engine_version = None;
+        Self { event, sinks }
+    }
+
+    fn record(mut self, provider: String, model: String, result: ShadowCallResult) {
+        let usage = crate::budget::AiUsage::Tokens {
+            input: result.prompt_tokens,
+            output: result.completion_tokens,
+            cached_input: 0,
+            cache_creation: 0,
+        };
+        self.event.provider = provider;
+        self.event.model = model;
+        self.event.prompt_tokens = result.prompt_tokens;
+        self.event.completion_tokens = result.completion_tokens;
+        self.event.total_tokens = result
+            .prompt_tokens
+            .saturating_add(result.completion_tokens);
+        self.event.cost_usd = crate::budget::estimate_cost_for_usage(&self.event.model, &usage);
+        self.event.latency_ms = result.latency_ms;
+        self.event.status = result.status;
+        for sink in &self.sinks {
+            sink.record(&self.event);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShadowCallResult {
+    status: u16,
+    latency_ms: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 /// HTTP client that forwards AI requests to upstream providers.
@@ -204,6 +365,174 @@ impl AiClient {
     /// Borrow the shadow supervisor (test + diagnostic accessor).
     pub fn shadow_supervisor(&self) -> &Arc<ShadowSupervisor> {
         &self.shadow_supervisor
+    }
+
+    /// Best-effort, non-blocking admission for one non-streaming
+    /// shadow copy. All policy and capacity failures suppress only the
+    /// shadow copy; they never reject or await the primary request.
+    // Keep policy and accounting inputs explicit at this one dispatch boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_spawn_shadow(
+        &self,
+        config: &AiHandlerConfig,
+        path: &str,
+        body: &serde_json::Value,
+        is_stream: bool,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+    ) -> ShadowDispatchOutcome {
+        let Some(shadow_cfg) = config.shadow.as_ref() else {
+            return ShadowDispatchOutcome::NotConfigured;
+        };
+        if !crate::handler::classify_surface("POST", path).supports_shadow_eval() {
+            return ShadowDispatchOutcome::UnsupportedSurface;
+        }
+        if is_stream {
+            ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::Streaming);
+            return ShadowDispatchOutcome::StreamingSkipped;
+        }
+
+        let sampled = if shadow_cfg.sample_rate >= 1.0 {
+            true
+        } else if shadow_cfg.sample_rate <= 0.0 {
+            false
+        } else {
+            rand::random::<f32>() < shadow_cfg.sample_rate
+        };
+        if !sampled {
+            return ShadowDispatchOutcome::SampledOut;
+        }
+
+        let Some(shadow_provider) = config
+            .providers
+            .iter()
+            .find(|provider| provider.name == shadow_cfg.provider)
+            .cloned()
+        else {
+            ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::ProviderNotFound);
+            warn!(
+                provider = %shadow_cfg.provider,
+                "shadow target not found in providers list"
+            );
+            return ShadowDispatchOutcome::ProviderNotFound;
+        };
+
+        if !provider_allowed_by_policy(
+            shadow_provider.name.as_str(),
+            allowed_providers,
+            blocked_providers,
+        ) {
+            ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::ProviderNotAllowed);
+            debug!(
+                provider = %shadow_provider.name,
+                "credential provider policy suppressed shadow request"
+            );
+            return ShadowDispatchOutcome::ProviderNotAllowed;
+        }
+
+        if disallow_prompt_training && !shadow_provider.no_prompt_training {
+            ai_metrics::record_shadow_dropped(
+                ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
+            );
+            debug!(
+                provider = %shadow_provider.name,
+                "prompt-training opt-out suppressed shadow request"
+            );
+            return ShadowDispatchOutcome::PromptTrainingDisallowed;
+        }
+
+        // The shadow transport uses reqwest directly and cannot yet consume
+        // the egress authorizer's DNS pins or re-authorize redirect targets.
+        // Fail closed whenever purpose-scoped egress is active instead of
+        // pretending that an initial URL check secures the whole call.
+        if self.egress.is_some() {
+            ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::EgressDenied);
+            warn!(
+                provider = %shadow_provider.name,
+                "egress-authorized shadow transport is unavailable; suppressing shadow request"
+            );
+            return ShadowDispatchOutcome::EgressDenied;
+        }
+
+        let request_bytes = serialized_json_len(body);
+        let Some(permit) = self.shadow_supervisor.try_admit_request(request_bytes) else {
+            return ShadowDispatchOutcome::Saturated;
+        };
+        let http = self.http.clone();
+        let path_owned = path.to_string();
+        let mut body_owned = if let Some(model) = shadow_cfg.model.as_ref() {
+            let mut body = body.clone();
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(model.clone()),
+                );
+            }
+            body
+        } else {
+            body.clone()
+        };
+        if let Some(model) = body_owned
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        {
+            if let Some(object) = body_owned.as_object_mut() {
+                object.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(shadow_provider.map_model(&model)),
+                );
+            }
+        }
+        let http_timeout_ms = shadow_cfg.timeout_ms;
+        let task_timeout_ms = shadow_cfg.task_timeout_ms;
+        let http_timeout = Duration::from_millis(http_timeout_ms);
+        let task_timeout = Duration::from_millis(task_timeout_ms);
+        let usage_provider = shadow_provider.name.as_str().to_string();
+        let usage_model = body_owned
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _gauge = ShadowInflightGuard::enter();
+            match tokio::time::timeout(
+                task_timeout,
+                run_shadow_request(http, shadow_provider, path_owned, body_owned, http_timeout),
+            )
+            .await
+            {
+                Ok(result) => {
+                    if let Some(usage) = usage {
+                        usage.record(usage_provider, usage_model, result);
+                    }
+                }
+                Err(_) => {
+                    ai_metrics::record_shadow_timeout();
+                    if let Some(usage) = usage {
+                        usage.record(
+                            usage_provider,
+                            usage_model,
+                            ShadowCallResult {
+                                status: 504,
+                                latency_ms: task_timeout_ms,
+                                prompt_tokens: 0,
+                                completion_tokens: 0,
+                            },
+                        );
+                    }
+                    warn!(
+                        target: "sbproxy_ai_shadow",
+                        timeout_ms = task_timeout_ms,
+                        "shadow request exceeded supervisor timeout; dropping"
+                    );
+                }
+            }
+        });
+        ShadowDispatchOutcome::Spawned
     }
 
     /// Execute one bounded chat-completion call against exactly one provider.
@@ -279,85 +608,11 @@ impl AiClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response> {
-        // Shadow / side-by-side eval: fire a copy of the request at
-        // the configured shadow provider concurrently with the
-        // primary. The shadow response is logged + drained; the
-        // primary response is what the client sees.
-        if let Some(shadow_cfg) = config.shadow.as_ref() {
-            let sampled = if shadow_cfg.sample_rate >= 1.0 {
-                true
-            } else if shadow_cfg.sample_rate <= 0.0 {
-                false
-            } else {
-                rand::random::<f32>() < shadow_cfg.sample_rate
-            };
-            if sampled {
-                if let Some(shadow_provider) = config
-                    .providers
-                    .iter()
-                    .find(|p| p.name == shadow_cfg.provider)
-                    .cloned()
-                {
-                    let http = self.http.clone();
-                    let path_owned = path.to_string();
-                    let body_owned = if let Some(model) = shadow_cfg.model.as_ref() {
-                        let mut b = body.clone();
-                        if let Some(obj) = b.as_object_mut() {
-                            obj.insert(
-                                "model".to_string(),
-                                serde_json::Value::String(model.clone()),
-                            );
-                        }
-                        b
-                    } else {
-                        body.clone()
-                    };
-                    let http_timeout_ms = shadow_cfg.timeout_ms;
-                    let task_timeout_ms = shadow_cfg.task_timeout_ms;
-                    let http_timeout = Duration::from_millis(http_timeout_ms);
-                    let task_timeout = Duration::from_millis(task_timeout_ms);
-                    // Bounded supervisor: try_admit returns None when
-                    // the in-flight queue is full. On admit, we hold
-                    // the OwnedSemaphorePermit + an inflight gauge
-                    // guard inside the spawned task so both clean up
-                    // automatically whether the future completes,
-                    // times out, or is cancelled.
-                    if let Some(permit) = self.shadow_supervisor.try_admit() {
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let _gauge = ShadowInflightGuard::enter();
-                            match tokio::time::timeout(
-                                task_timeout,
-                                run_shadow_request(
-                                    http,
-                                    shadow_provider,
-                                    path_owned,
-                                    body_owned,
-                                    http_timeout,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(()) => {}
-                                Err(_) => {
-                                    ai_metrics::record_shadow_timeout();
-                                    warn!(
-                                        target: "sbproxy_ai_shadow",
-                                        timeout_ms = task_timeout_ms,
-                                        "shadow request exceeded supervisor timeout; dropping"
-                                    );
-                                }
-                            }
-                        });
-                    }
-                } else {
-                    warn!(
-                        provider = %shadow_cfg.provider,
-                        "shadow target not found in providers list"
-                    );
-                }
-            }
-        }
+        let is_stream = body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let _ = self.try_spawn_shadow(config, path, body, is_stream, &[], &[], false, None);
 
         // Race strategy: fan out to every eligible provider in
         // parallel, return the first 2xx, cancel the losers. The
@@ -1337,7 +1592,7 @@ async fn run_shadow_request(
     path: String,
     body: serde_json::Value,
     timeout: std::time::Duration,
-) {
+) -> ShadowCallResult {
     let format = provider_format(&provider);
     let (translated_body, translated_path) = translators::translate_request(format, &path, &body);
     let send_body = translated_body.as_ref().unwrap_or(&body);
@@ -1356,12 +1611,17 @@ async fn run_shadow_request(
     if matches!(format, ProviderFormat::Anthropic) {
         req = req.header("anthropic-version", "2023-06-01");
     }
-    let resp = match req.send().await {
+    let mut resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             warn!(provider = %provider.name, error = %e, "shadow request transport error");
             ai_metrics::record_provider_error(&provider.name, "transport");
-            return;
+            return ShadowCallResult {
+                status: 0,
+                latency_ms: started.elapsed().as_millis() as u64,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            };
         }
     };
     let status = resp.status();
@@ -1375,14 +1635,30 @@ async fn run_shadow_request(
         };
         ai_metrics::record_provider_error(&provider.name, kind);
     }
-    let raw_bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(provider = %provider.name, error = %e, "shadow body drain failed");
-            ai_metrics::record_provider_error(&provider.name, "transport");
-            return;
+    let mut raw_bytes = Vec::new();
+    let mut total_response_bytes = 0_u64;
+    let mut metadata_truncated = false;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                total_response_bytes =
+                    total_response_bytes.saturating_add(chunk.len().try_into().unwrap_or(u64::MAX));
+                metadata_truncated |=
+                    append_shadow_response_metadata(&mut raw_bytes, chunk.as_ref());
+            }
+            Ok(None) => break,
+            Err(e) => {
+                warn!(provider = %provider.name, error = %e, "shadow body drain failed");
+                ai_metrics::record_provider_error(&provider.name, "transport");
+                return ShadowCallResult {
+                    status: status.as_u16(),
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                };
+            }
         }
-    };
+    }
     // Translate non-OpenAI shadow responses into OpenAI shape so the
     // metadata parsing below works uniformly across providers.
     let bytes_vec = translators::translate_response_bytes(format, &raw_bytes);
@@ -1394,12 +1670,50 @@ async fn run_shadow_request(
         provider = %provider.name,
         status = %status,
         latency_ms = elapsed.as_millis() as u64,
-        bytes = bytes.len(),
+        bytes = total_response_bytes,
+        metadata_truncated,
         prompt_tokens = ?prompt_tokens,
         completion_tokens = ?completion_tokens,
         finish_reason = ?finish_reason,
         "shadow response"
     );
+    ShadowCallResult {
+        status: status.as_u16(),
+        latency_ms: elapsed.as_millis() as u64,
+        prompt_tokens: prompt_tokens.unwrap_or(0),
+        completion_tokens: completion_tokens.unwrap_or(0),
+    }
+}
+
+fn append_shadow_response_metadata(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let available = MAX_SHADOW_RESPONSE_METADATA_BYTES.saturating_sub(buffer.len());
+    let retained = available.min(chunk.len());
+    buffer.extend_from_slice(&chunk[..retained]);
+    retained < chunk.len()
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len(value: &serde_json::Value) -> usize {
+    let mut writer = CountingWriter::default();
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => writer.bytes,
+        Err(_) => usize::MAX,
+    }
 }
 
 /// Best-effort extraction of token counts and finish_reason from an
@@ -1493,6 +1807,27 @@ pub(crate) fn build_url(base_url: &str, path: &str) -> String {
 mod tests {
     use super::*;
 
+    static SHADOW_METRIC_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[derive(Debug, Default)]
+    struct CapturingUsageSink {
+        events: std::sync::Mutex<Vec<LlmUsageEvent>>,
+    }
+
+    impl UsageSink for CapturingUsageSink {
+        fn record(&self, event: &LlmUsageEvent) {
+            self.events
+                .lock()
+                .expect("capturing usage sink lock")
+                .push(event.clone());
+        }
+
+        fn name(&self) -> &str {
+            "capturing"
+        }
+    }
+
     async fn serve_one_json_response(
         response_body: &'static str,
     ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
@@ -1541,6 +1876,18 @@ mod tests {
                 .await
                 .expect("write test response");
             request
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    async fn serve_one_hanging_response() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging test provider");
+        let address = listener.local_addr().expect("hanging provider address");
+        let task = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept shadow request");
+            std::future::pending::<()>().await;
         });
         (format!("http://{address}/v1"), task)
     }
@@ -1699,6 +2046,468 @@ mod tests {
 
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+    fn shadow_handler_config(sample_rate: f32) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "primary",
+                    "api_key": "primary-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "shadow",
+                    "api_key": "shadow-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                }
+            ],
+            "shadow": {
+                "provider": "shadow",
+                "model": "shadow-model",
+                "sample_rate": sample_rate,
+                "timeout_ms": 50,
+                "task_timeout_ms": 50
+            }
+        }))
+        .expect("valid shadow handler fixture")
+    }
+
+    fn shadow_usage_event(request_id: &str) -> LlmUsageEvent {
+        LlmUsageEvent {
+            provider: "primary".to_string(),
+            model: "primary-model".to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cost_usd: 1.0,
+            latency_ms: 1,
+            status: 200,
+            key_id: None,
+            tenant_id: None,
+            project: None,
+            user: None,
+            team: None,
+            tags: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            request_id: Some(request_id.to_string()),
+            tag: None,
+            priority: None,
+            engine_version: None,
+        }
+    }
+
+    #[test]
+    fn shadow_usage_id_is_server_generated_and_cannot_collide_with_primary_id() {
+        let usage = ShadowUsageRecord::new(shadow_usage_event("caller-id"), Vec::new());
+        let request_id = usage.event.request_id.expect("shadow request id");
+
+        assert_ne!(request_id, "caller-id:shadow");
+        assert!(request_id.ends_with(":shadow"));
+        assert_eq!(request_id.len(), 39);
+        assert!(request_id[..32]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn shadow_response_metadata_buffer_is_bounded() {
+        let mut buffer = vec![b'a'; MAX_SHADOW_RESPONSE_METADATA_BYTES - 2];
+
+        let truncated = append_shadow_response_metadata(&mut buffer, b"bcdef");
+
+        assert!(truncated);
+        assert_eq!(buffer.len(), MAX_SHADOW_RESPONSE_METADATA_BYTES);
+        assert!(buffer.ends_with(b"bc"));
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_applies_the_shadow_providers_model_map() {
+        let (base_url, captured) =
+            serve_one_json_response(r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#).await;
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "primary",
+                    "api_key": "primary-test-key"
+                },
+                {
+                    "name": "shadow",
+                    "api_key": "shadow-test-key",
+                    "base_url": base_url,
+                    "allow_private_base_url": true,
+                    "model_map": {"shadow-model": "upstream-shadow-model"}
+                }
+            ],
+            "shadow": {
+                "provider": "shadow",
+                "model": "shadow-model",
+                "sample_rate": 1.0,
+                "timeout_ms": 500,
+                "task_timeout_ms": 500
+            }
+        }))
+        .expect("valid mapped shadow fixture");
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+
+        let outcome = client.try_spawn_shadow(
+            &config,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        let request = captured.await.expect("test provider task");
+        let request_text = String::from_utf8(request).expect("HTTP request is UTF-8");
+        let body = request_text.split_once("\r\n\r\n").expect("HTTP body").1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON request body");
+        assert_eq!(body["model"], "upstream-shadow-model");
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_boundary_rejects_non_chat_paths() {
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/assistants",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::UnsupportedSurface);
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_skips_streaming_without_admission() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model", "stream": true}),
+            true,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::StreamingSkipped);
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_sampling_out_is_not_a_failed_admission() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(0.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::SampledOut);
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_honors_credential_provider_policy() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &["primary".to_string()],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::ProviderNotAllowed);
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_honors_prompt_training_opt_out() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+        let dropped_before = ai_metrics::shadow_dropped_value(
+            ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
+        );
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            true,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::PromptTrainingDisallowed);
+        assert!(
+            ai_metrics::shadow_dropped_value(
+                ai_metrics::ShadowDropReason::PromptTrainingDisallowed
+            ) - dropped_before
+                >= 1.0
+        );
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn prompt_training_opt_out_allows_a_compliant_shadow_provider() {
+        let mut config = shadow_handler_config(1.0);
+        config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.name == "shadow")
+            .expect("shadow provider")
+            .no_prompt_training = true;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+
+        let outcome = client.try_spawn_shadow(
+            &config,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            true,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_records_each_closed_drop_reason_exactly_once() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let reasons = [
+            ai_metrics::ShadowDropReason::Streaming,
+            ai_metrics::ShadowDropReason::ProviderNotFound,
+            ai_metrics::ShadowDropReason::ProviderNotAllowed,
+            ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
+            ai_metrics::ShadowDropReason::EgressDenied,
+            ai_metrics::ShadowDropReason::Saturated,
+        ];
+        let snapshot = || reasons.map(ai_metrics::shadow_dropped_value);
+
+        let before_sampling = snapshot();
+        assert_eq!(
+            AiClient::new().try_spawn_shadow(
+                &shadow_handler_config(0.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::SampledOut
+        );
+        assert_eq!(snapshot(), before_sampling, "sampling is not a drop");
+
+        let assert_one_increment = |before: [f64; 6], reason: ai_metrics::ShadowDropReason| {
+            let after = snapshot();
+            for (index, candidate) in reasons.iter().enumerate() {
+                let expected = if *candidate == reason { 1.0 } else { 0.0 };
+                assert_eq!(
+                    after[index] - before[index],
+                    expected,
+                    "unexpected increment for {} while exercising {}",
+                    candidate.as_str(),
+                    reason.as_str()
+                );
+            }
+        };
+
+        let client = AiClient::new();
+        let before = snapshot();
+        assert_eq!(
+            client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model", "stream": true}),
+                true,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::StreamingSkipped
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::Streaming);
+
+        let mut missing = shadow_handler_config(1.0);
+        missing.shadow.as_mut().expect("shadow config").provider = "missing".to_string();
+        let before = snapshot();
+        assert_eq!(
+            client.try_spawn_shadow(
+                &missing,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::ProviderNotFound
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::ProviderNotFound);
+
+        let before = snapshot();
+        assert_eq!(
+            client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &["primary".to_string()],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::ProviderNotAllowed
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::ProviderNotAllowed);
+
+        let before = snapshot();
+        assert_eq!(
+            client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                true,
+                None,
+            ),
+            ShadowDispatchOutcome::PromptTrainingDisallowed
+        );
+        assert_one_increment(
+            before,
+            ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
+        );
+
+        let egress_client = AiClient::new().with_egress(enforce_ai_provider(&["api.openai.com"]));
+        let before = snapshot();
+        assert_eq!(
+            egress_client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::EgressDenied
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::EgressDenied);
+
+        let supervisor = Arc::new(ShadowSupervisor::new(1));
+        let saturated_client = AiClient::with_shadow_supervisor(supervisor.clone());
+        let held = supervisor.try_admit().expect("reserve the only slot");
+        let before = snapshot();
+        assert_eq!(
+            saturated_client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::Saturated
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::Saturated);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_drops_when_bounded_admission_is_saturated() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let supervisor = Arc::new(ShadowSupervisor::new(1));
+        let client = AiClient::with_shadow_supervisor(supervisor.clone());
+        let held = supervisor.try_admit().expect("reserve the only slot");
+        let dropped_before =
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated);
+
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::Saturated);
+        assert!(
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated)
+                - dropped_before
+                >= 1.0
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn shadow_admission_reserves_a_process_wide_memory_budget() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let one_task_bytes = MAX_SHADOW_RESPONSE_METADATA_BYTES * 2 + 16;
+        let supervisor = ShadowSupervisor::with_memory_budget(8, one_task_bytes);
+        let first = supervisor
+            .try_admit_request(8)
+            .expect("first request fits the byte budget");
+        assert_eq!(supervisor.available_memory_bytes(), 0);
+        let dropped_before =
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated);
+
+        assert!(
+            supervisor.try_admit_request(8).is_none(),
+            "a free task slot must not bypass the byte budget"
+        );
+        assert_eq!(
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated)
+                - dropped_before,
+            1.0
+        );
+
+        drop(first);
+        assert_eq!(supervisor.available_memory_bytes(), one_task_bytes);
+        assert!(
+            supervisor.try_admit_request(8).is_some(),
+            "dropping the task must return both admission resources"
+        );
+    }
+
     #[tokio::test]
     async fn shadow_supervisor_succeeds_within_timeout() {
         // Note: the shadow_dropped_total and shadow_timeout_total
@@ -1730,6 +2539,7 @@ mod tests {
 
     #[tokio::test]
     async fn shadow_supervisor_records_timeout_when_future_hangs() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
         let supervisor = ShadowSupervisor::new(4);
         let timeout_before = ai_metrics::shadow_timeout_value();
 
@@ -1760,8 +2570,10 @@ mod tests {
 
     #[tokio::test]
     async fn shadow_supervisor_drops_request_when_queue_full() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
         let supervisor = ShadowSupervisor::new(2);
-        let dropped_before = ai_metrics::shadow_dropped_value();
+        let dropped_before =
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated);
 
         // Fill every slot. Hold the permits across the test so the
         // semaphore stays at zero.
@@ -1773,7 +2585,9 @@ mod tests {
         let denied = supervisor.try_admit();
         assert!(denied.is_none(), "queue must reject when full");
         assert!(
-            ai_metrics::shadow_dropped_value() - dropped_before >= 1.0,
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated)
+                - dropped_before
+                >= 1.0,
             "shadow_dropped_total should have ticked"
         );
 
@@ -1783,6 +2597,80 @@ mod tests {
         drop(p2);
         drop(p3);
         assert_eq!(supervisor.available(), 2);
+    }
+
+    #[tokio::test]
+    async fn production_shadow_timeout_emits_a_failed_usage_event() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let (base_url, hanging_provider) = serve_one_hanging_response().await;
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "primary-test-key"},
+                {
+                    "name": "shadow",
+                    "api_key": "shadow-test-key",
+                    "base_url": base_url,
+                    "allow_private_base_url": true
+                }
+            ],
+            "shadow": {
+                "provider": "shadow",
+                "model": "gpt-4o",
+                "sample_rate": 1.0,
+                "timeout_ms": 5000,
+                "task_timeout_ms": 25
+            }
+        }))
+        .expect("valid timeout fixture");
+        let sink = Arc::new(CapturingUsageSink::default());
+        let usage = ShadowUsageRecord::new(
+            shadow_usage_event("caller-controlled"),
+            vec![sink.clone() as Arc<dyn UsageSink>],
+        );
+        let timeout_before = ai_metrics::shadow_timeout_value();
+
+        assert_eq!(
+            AiClient::new().try_spawn_shadow(
+                &config,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "gpt-4o"}),
+                false,
+                &[],
+                &[],
+                false,
+                Some(usage),
+            ),
+            ShadowDispatchOutcome::Spawned
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = sink
+                    .events
+                    .lock()
+                    .expect("capturing usage sink lock")
+                    .first()
+                    .cloned()
+                {
+                    break event;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("shadow timeout usage event");
+        hanging_provider.abort();
+
+        assert_eq!(ai_metrics::shadow_timeout_value() - timeout_before, 1.0);
+        assert_eq!(event.provider, "shadow");
+        assert_eq!(event.model, "gpt-4o");
+        assert_eq!(event.status, 504);
+        assert_eq!(event.total_tokens, 0);
+        assert_eq!(event.tag.as_deref(), Some("shadow"));
+        assert_ne!(
+            event.request_id.as_deref(),
+            Some("caller-controlled:shadow")
+        );
     }
 
     fn enforce_ai_provider(hosts: &[&str]) -> EgressAuthorizer {

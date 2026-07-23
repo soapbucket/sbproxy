@@ -381,10 +381,13 @@ static AI_SHADOW_INFLIGHT: LazyLock<Gauge> = LazyLock::new(|| {
     .unwrap()
 });
 
-static AI_SHADOW_DROPPED: LazyLock<Counter> = LazyLock::new(|| {
-    register_counter!(
-        "sbproxy_ai_shadow_dropped_total",
-        "Shadow requests dropped because the supervisor queue was full"
+static AI_SHADOW_DROPPED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_shadow_dropped_total",
+            "Shadow requests skipped or dropped before dispatch"
+        ),
+        &["reason"]
     )
     .unwrap()
 });
@@ -409,10 +412,44 @@ pub fn dec_shadow_inflight() {
     AI_SHADOW_INFLIGHT.dec();
 }
 
-/// Record one shadow request that the supervisor refused to spawn
-/// because the in-flight queue was at capacity.
-pub fn record_shadow_dropped() {
-    AI_SHADOW_DROPPED.inc();
+/// Closed, low-cardinality reasons why a configured shadow request
+/// did not reach the shadow provider. Deliberate sampling is excluded:
+/// sampling out is expected behavior, not a failed dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowDropReason {
+    /// Streaming requests are intentionally unsupported by shadow dispatch.
+    Streaming,
+    /// The configured shadow provider was absent from the handler provider list.
+    ProviderNotFound,
+    /// Credential-scoped provider policy disallowed the shadow provider.
+    ProviderNotAllowed,
+    /// The request opted out of prompt training and the shadow provider did not.
+    PromptTrainingDisallowed,
+    /// Purpose-scoped egress is active and shadow transport cannot honor it.
+    EgressDenied,
+    /// The bounded shadow supervisor had no free admission slots.
+    Saturated,
+}
+
+impl ShadowDropReason {
+    /// Stable Prometheus label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Streaming => "streaming",
+            Self::ProviderNotFound => "provider_not_found",
+            Self::ProviderNotAllowed => "provider_not_allowed",
+            Self::PromptTrainingDisallowed => "prompt_training_disallowed",
+            Self::EgressDenied => "egress_denied",
+            Self::Saturated => "saturated",
+        }
+    }
+}
+
+/// Record one configured shadow request that could not be dispatched.
+pub fn record_shadow_dropped(reason: ShadowDropReason) {
+    AI_SHADOW_DROPPED
+        .with_label_values(&[reason.as_str()])
+        .inc();
 }
 
 /// Record one shadow task that exceeded its wall-clock supervisor
@@ -465,10 +502,12 @@ pub fn shadow_inflight_value() -> f64 {
     AI_SHADOW_INFLIGHT.get()
 }
 
-/// Read the cumulative shadow-dropped counter value. Tests use this
-/// to assert that an overflow tick happened.
-pub fn shadow_dropped_value() -> f64 {
-    AI_SHADOW_DROPPED.get()
+/// Read the cumulative shadow-dropped counter value for one closed
+/// reason. Tests use this to assert that the expected path ticked.
+pub fn shadow_dropped_value(reason: ShadowDropReason) -> f64 {
+    AI_SHADOW_DROPPED
+        .with_label_values(&[reason.as_str()])
+        .get()
 }
 
 /// Read the cumulative shadow-timeout counter value. Tests use this

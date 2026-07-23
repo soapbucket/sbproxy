@@ -1703,6 +1703,17 @@ fn usage_event_from_context(
     }
 }
 
+/// Copy request identity into a shadow-only usage record without touching the
+/// primary billing path. The background shadow task fills provider, model,
+/// tokens, cost, latency, and status before emitting to these same sinks.
+pub(super) fn shadow_usage_record_from_context(
+    ctx: &crate::context::RequestContext,
+) -> Option<sbproxy_ai::client::ShadowUsageRecord> {
+    let sinks = ctx.ai_usage_sinks.as_ref()?.clone();
+    let event = usage_event_from_context(ctx, String::new());
+    Some(sbproxy_ai::client::ShadowUsageRecord::new(event, sinks))
+}
+
 /// WOR-1541: fold this request's realized outcome into the global routing
 /// feedback store, so the `outcome_aware` strategy scores providers by
 /// realized cost-per-success. No-op unless the origin opted in (the
@@ -2719,7 +2730,18 @@ mod ai_response_span_metadata_tests {
 
 #[cfg(test)]
 mod governed_usage_attribution_tests {
-    use super::usage_event_from_context;
+    use super::{shadow_usage_record_from_context, usage_event_from_context};
+
+    #[derive(Debug)]
+    struct NoopUsageSink;
+
+    impl sbproxy_ai::usage_sink::UsageSink for NoopUsageSink {
+        fn record(&self, _event: &sbproxy_ai::usage_sink::LlmUsageEvent) {}
+
+        fn name(&self) -> &str {
+            "noop"
+        }
+    }
 
     #[test]
     fn usage_event_uses_immutable_key_identity_and_safe_policy_attribution() {
@@ -2764,6 +2786,21 @@ mod governed_usage_attribution_tests {
             Some("cc-42")
         );
         assert_ne!(event.key_id.as_deref(), Some("mutable display name"));
+    }
+
+    #[test]
+    fn shadow_usage_record_reuses_configured_sinks_only() {
+        let mut ctx = crate::context::RequestContext::new();
+        assert!(
+            shadow_usage_record_from_context(&ctx).is_none(),
+            "an origin without usage sinks must not create shadow accounting work"
+        );
+
+        ctx.ai_usage_sinks = Some(vec![std::sync::Arc::new(NoopUsageSink)]);
+        assert!(
+            shadow_usage_record_from_context(&ctx).is_some(),
+            "shadow accounting must fan out through the origin's existing sinks"
+        );
     }
 }
 

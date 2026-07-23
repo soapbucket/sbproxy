@@ -92,10 +92,10 @@ pub struct AiHandlerConfig {
     /// setting is adapted by [`Self::effective_compression_policy`].
     #[serde(default)]
     pub compression: Option<CompressionPolicy>,
-    /// Optional shadow / side-by-side eval. The primary response is
-    /// served unchanged; a copy of every request goes to the shadow
-    /// provider concurrently and metrics (TTFT, tokens, cost,
-    /// finish_reason) are logged.
+    /// Optional shadow / side-by-side eval for sampled non-streaming
+    /// requests. The primary response is served unchanged; an admitted
+    /// copy goes to the shadow provider in a bounded background task.
+    /// Streaming requests are intentionally skipped.
     #[serde(default)]
     pub shadow: Option<AiShadowConfig>,
     /// Optional pattern-aware PII redaction applied at the request
@@ -582,17 +582,18 @@ fn default_health_healthy() -> u32 {
     2
 }
 
-/// Shadow / side-by-side eval: send the same request to a second
-/// provider concurrently and log metadata. The shadow response is
-/// drained and discarded; the primary's response goes to the client
-/// unchanged.
+/// Shadow / side-by-side eval: send the same request to a second provider
+/// concurrently and log metadata. V1 is restricted to non-streaming chat
+/// evaluation surfaces (`chat/completions`, normalized `messages`, and
+/// normalized `responses`). The shadow response is drained and discarded;
+/// the primary's response goes to the client unchanged.
 ///
-/// Shadow tasks are supervised by a bounded queue. When the in-flight
-/// queue fills up the new request is dropped (a counter ticks) instead
-/// of being silently spawned, and each task has a hard wall-clock
-/// timeout that, when exceeded, drops the future and ticks a separate
-/// timeout counter. See `sbproxy_ai::client::AiClient` for the
-/// supervisor implementation.
+/// Shadow tasks are supervised by bounded task and memory admission. When
+/// either capacity fills up the new request is dropped (a counter ticks)
+/// instead of being silently spawned, and each task has a hard wall-clock
+/// timeout that, when exceeded, drops the future and ticks a separate timeout
+/// counter. See `sbproxy_ai::client::AiClient` for the supervisor
+/// implementation.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AiShadowConfig {
     /// Provider name to shadow against. Must also appear in the
@@ -1033,6 +1034,17 @@ impl AiSurface {
             AiSurface::Responses => "responses",
             AiSurface::Unknown => "unknown",
         }
+    }
+
+    /// Whether v1 shadow evaluation may replay this request surface.
+    ///
+    /// Only chat evaluation surfaces are safe to copy. Mutating and non-chat
+    /// APIs must never enter the shadow transport.
+    pub fn supports_shadow_eval(&self) -> bool {
+        matches!(
+            self,
+            AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
+        )
     }
 }
 

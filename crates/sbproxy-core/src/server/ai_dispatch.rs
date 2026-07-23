@@ -3891,6 +3891,29 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     }
+
+    // WOR-1973: mirror the final, policy-approved request body only after
+    // guardrails, model rewrites, compression, credential provider policy,
+    // and prompt-training opt-out enforcement have finished. V1 is restricted
+    // to canonical chat evaluation surfaces so mutating APIs such as
+    // Assistants, Batches, and FineTuning are never replayed. Admission is
+    // synchronous and bounded; the upstream work itself is detached, so a
+    // slow, failed, or saturated shadow target cannot delay or reject primary
+    // dispatch. Streaming requests are intentionally skipped.
+    if shadow_surface_is_eligible(&surface) {
+        let shadow_usage = super::ai_support::shadow_usage_record_from_context(ctx);
+        let _shadow_outcome = AI_CLIENT.load().try_spawn_shadow(
+            config,
+            &path,
+            &body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_training,
+            shadow_usage,
+        );
+    }
+
     // WOR-1534: model-based provider routing. When the requested model is
     // declared in one or more providers' `models` lists, restrict the routing
     // set to those providers so the model name selects the vendor (a provider
@@ -7581,6 +7604,41 @@ fn model_eligible_providers(
         })
         .collect();
     (!eligible.is_empty() && eligible.len() < order.len()).then_some(eligible)
+}
+
+fn shadow_surface_is_eligible(surface: &sbproxy_ai::handler::AiSurface) -> bool {
+    surface.supports_shadow_eval()
+}
+
+#[cfg(test)]
+mod shadow_surface_tests {
+    use super::shadow_surface_is_eligible;
+    use sbproxy_ai::handler::AiSurface;
+
+    #[test]
+    fn v1_shadow_eval_excludes_mutating_and_non_chat_surfaces() {
+        for surface in [
+            AiSurface::ChatCompletions,
+            AiSurface::Messages,
+            AiSurface::Responses,
+        ] {
+            assert!(shadow_surface_is_eligible(&surface), "{surface:?}");
+        }
+
+        for surface in [
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Files,
+            AiSurface::Embeddings,
+            AiSurface::ImageGeneration,
+            AiSurface::Moderations,
+            AiSurface::Reranking,
+        ] {
+            assert!(!shadow_surface_is_eligible(&surface), "{surface:?}");
+        }
+    }
 }
 
 #[cfg(test)]
