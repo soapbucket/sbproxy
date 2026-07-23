@@ -98,6 +98,10 @@ pub enum Guardrail {
     /// body so it can read the structured tool-call shape, which
     /// `Message` would otherwise strip.
     AgentAlignment(AgentAlignmentGuardrail),
+    /// Embedding-backed class labeler. Emits the predicted class as the
+    /// guardrail label so the CEL policy plane can route on it. Never
+    /// blocks on its own.
+    Classifier(classifier::ClassifierGuardrail),
 }
 
 impl Guardrail {
@@ -113,6 +117,7 @@ impl Guardrail {
             Self::Regex(_) => "regex",
             Self::ContextPoisoning(_) => "context_poisoning",
             Self::AgentAlignment(_) => "agent_alignment",
+            Self::Classifier(_) => "classifier",
         }
     }
 
@@ -132,6 +137,9 @@ impl Guardrail {
             // text-only check is inert here. See
             // [`Guardrail::check_body`] for the actual entry point.
             Self::AgentAlignment(_) => None,
+            // Scope resolution needs the message list, which this
+            // text-only entry point does not carry. See `check_with_text`.
+            Self::Classifier(_) => None,
         }
     }
 
@@ -158,6 +166,7 @@ impl Guardrail {
             // text-fallback path so alignment does not flag on
             // every benign user message.
             Self::AgentAlignment(_) => None,
+            Self::Classifier(g) => g.check_messages(content, messages),
             _ => self.check(content),
         }
     }
@@ -230,6 +239,10 @@ impl Guardrail {
             // each completed call instead of running a text check, so
             // the per-chunk TEXT classification stays false.
             Self::AgentAlignment(_) => false,
+            // A centroid score is meaningful only over the full text.
+            // Scoring an accumulating prefix is not prefix-stable: the
+            // winning class can flip mid-stream.
+            Self::Classifier(_) => false,
         }
     }
 }
@@ -438,6 +451,9 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
         "regex" => Ok(Guardrail::Regex(regex_guard::RegexGuardrail::from_config(
             config,
         )?)),
+        "classifier" => Ok(Guardrail::Classifier(
+            classifier::ClassifierGuardrail::from_config(config)?,
+        )),
         "regex_guard" => {
             // Go format: type: "regex_guard", config: { deny: [...] }
             // Map to Rust regex guard with deny patterns.
@@ -867,5 +883,63 @@ mod tests {
         // existing `check_input` path is unaffected.
         let messages = vec![make_msg("any user text")];
         assert!(pipeline.check_input(&messages).is_none());
+    }
+
+    #[test]
+    fn classifier_type_requires_at_least_one_class() {
+        // A config with no classes is a hard error: it can only ever be a
+        // no-op, and silently accepting it hides an operator mistake.
+        let err = compile_guardrail(&serde_json::json!({
+            "type": "classifier",
+            "model_path": "/unused/model.onnx",
+            "tokenizer_path": "/unused/tokenizer.json",
+            "classes": {}
+        }))
+        .expect_err("empty classes must be rejected");
+        assert!(
+            err.to_string()
+                .contains("at least one entry under `classes`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn classifier_type_compiles_and_is_inert_without_a_backend() {
+        // No factory is registered in this unit-test process, so the
+        // guardrail must compile and return no label rather than failing
+        // and taking the rest of the pipeline down with it.
+        let g = compile_guardrail(&serde_json::json!({
+            "type": "classifier",
+            "model_path": "/unused/model.onnx",
+            "tokenizer_path": "/unused/tokenizer.json",
+            "classes": { "documentation": ["write the readme"] }
+        }))
+        .expect("classifier should compile without a backend");
+        assert_eq!(g.name(), "classifier");
+        assert!(g.check("write the readme").is_none());
+        assert!(!g.streaming_safe());
+    }
+
+    #[test]
+    fn classifier_does_not_break_a_mixed_pipeline() {
+        // The regression this guards: an unloadable classifier next to a
+        // real security guard must not stop that guard from compiling.
+        // GuardrailsConfig does not derive Default, and every field carries
+        // #[serde(default)], so build it through serde.
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "input": [
+                {
+                    "type": "classifier",
+                    "model_path": "/unused/model.onnx",
+                    "tokenizer_path": "/unused/tokenizer.json",
+                    "classes": { "documentation": ["write the readme"] }
+                },
+                {"type": "regex", "patterns": ["SECRET"]}
+            ]
+        }))
+        .expect("config should deserialize");
+        let pipeline = compile_pipeline(&cfg).expect("mixed pipeline should compile");
+        assert_eq!(pipeline.input.len(), 2);
+        assert!(pipeline.input[1].check("this is SECRET").is_some());
     }
 }

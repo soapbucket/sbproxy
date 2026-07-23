@@ -95,7 +95,7 @@ impl MeshDecision {
 /// Relative execution cost of a guardrail, so the cascade runs the cheap
 /// detectors before the expensive classifiers. `0` is cheap (regex / PII /
 /// schema / context-poisoning rules), `1` is an ONNX or multi-token
-/// classifier.
+/// classifier, including the embedding-backed [`Guardrail::Classifier`].
 fn cost_rank(g: &Guardrail) -> u8 {
     match g {
         Guardrail::Regex(_)
@@ -106,7 +106,8 @@ fn cost_rank(g: &Guardrail) -> u8 {
         | Guardrail::Jailbreak(_)
         | Guardrail::ContentSafety(_)
         | Guardrail::Injection(_)
-        | Guardrail::AgentAlignment(_) => 1,
+        | Guardrail::AgentAlignment(_)
+        | Guardrail::Classifier(_) => 1,
     }
 }
 
