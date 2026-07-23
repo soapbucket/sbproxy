@@ -51,6 +51,7 @@
         "model_host": null,
         "mtls": null,
         "observability": null,
+        "response_cache_store": null,
         "scripting": {
           "javascript": {
             "sandbox": {
@@ -426,6 +427,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/CacheReserveConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "response_cache_store": {
+          "description": "Optional selection of the shared response-cache backing store.\n\nOne store serves every origin: the cache key already carries workspace, hostname, method, and path, so origins never collide. When this block is absent, the store is chosen the way it always was, Redis if `l2_cache` is set and an in-process map otherwise, so an existing config keeps the backend it has today.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ResponseCacheStoreConfig"
             },
             {
               "type": "null"
@@ -4352,6 +4365,151 @@
           }
         }
       ]
+    },
+    "ResponseCacheStoreConfig": {
+      "description": "Top-level selection of the response cache's backing store.\n\nThe response cache is process-wide: `CompiledPipeline` builds one store and every origin whose `response_cache.enabled` is true shares it. Origins do not collide because the cache key already includes workspace, hostname, method, path, canonical query, and the Vary fingerprint.\n\nYAML key: `proxy.response_cache_store`.",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "description": "Which store holds cached responses. Defaults to the in-process map.",
+          "default": {
+            "type": "memory"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/ResponseCacheBackendConfig"
+            }
+          ]
+        },
+        "encryption": {
+          "description": "Optional encryption of cached payloads at rest. Absent or `enabled: false` stores payloads as the backend receives them.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ResponseCacheEncryptionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ResponseCacheBackendConfig": {
+      "description": "Backend selector for [`ResponseCacheStoreConfig`].\n\nTagged externally on `type`. This is a closed set: unlike `cache_reserve`, the response-cache store has no out-of-tree registration path, so an unrecognized `type` is a parse error rather than a silent fallback.",
+      "oneOf": [
+        {
+          "description": "In-process map, capped by the largest per-origin `response_cache.max_size`. Per-replica, so a multi-replica deployment caches independently. The default.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "memory"
+              ]
+            }
+          }
+        },
+        {
+          "description": "One file per entry under `path`, named by the SHA-256 of the cache key. Survives a restart and is shared by every process pointed at the same directory. Prefix purge is unavailable because keys are hashed into filenames, so `invalidate_on_mutation` is a no-op on this backend and entries fall out by TTL.",
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "file"
+              ]
+            },
+            "path": {
+              "description": "Directory holding the cache files. Created at startup if it does not exist; startup fails if it cannot be created.",
+              "type": "string"
+            },
+            "max_size_mb": {
+              "description": "Ceiling on the total size of the directory, in megabytes. `0`, the default, means no ceiling. When set, each write walks the directory to measure it, so leave it at `0` unless the disk budget is real.",
+              "default": 0,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "description": "Memcached over the ASCII protocol. Shared across replicas. Stale-while-revalidate and prefix purge are both unavailable: memcached expires items server-side and offers no key scan.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "memcached"
+              ]
+            },
+            "host": {
+              "description": "Server hostname or IP.",
+              "default": "127.0.0.1",
+              "type": "string"
+            },
+            "port": {
+              "description": "Server port.",
+              "default": 11211,
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "description": "Redis, reusing the connection configured under `proxy.l2_cache`. Selecting this without an `l2_cache` block is a startup error.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "redis"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "ResponseCacheEncryptionConfig": {
+      "description": "At-rest encryption settings for [`ResponseCacheStoreConfig`].\n\nCached response headers and bodies are sealed with AES-256-GCM before they reach the backing store. Status, cache time, and TTL stay readable because the file and memcached backends need them to compute expiry; status is authenticated so it cannot be altered.\n\nThere is no plaintext fallback. A key that is missing, unresolvable, or shorter than 16 bytes aborts startup.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch. Defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "description": "Secret reference for the active key. Used to seal new entries and to open entries sealed under it.\n\nResolved through the same mechanism as every other config secret: a provider URI (`secret://backend/name`, `vault://...`) against a backend declared under `proxy.secrets.backends`, a `file:/path` reference, or a whole-value `${ENV_VAR}`. An unresolvable reference aborts startup rather than being used as key material verbatim. Required when `enabled` is `true`.\n\nThe resolved value should be 32 random bytes (base64 or hex encoded), not a human-chosen passphrase: the logged key fingerprint is a weak offline oracle against a short passphrase, but not against 256 bits of real entropy.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "previous_keys": {
+          "description": "Retired keys, used only to open entries sealed before a rotation. Same reference syntax as [`Self::key`].\n\nTo rotate: move the current `key` into this list and name the new one as `key`. Entries reseal under the active key as they are rewritten. Removing a reference from this list retires its entries; they are evicted the next time they are read.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
     },
     "MessengerSettings": {
       "description": "Configuration for the shared message bus used by inter-component events (config updates, semantic-cache purges, etc.).\n\nThe `driver` selects the backend implementation: * `\"memory\"` - in-process bounded mpsc channels (single-replica use only). * `\"redis\"`  - Redis Streams over the DSN in `params.dsn`. * `\"sqs\"`    - AWS SQS; requires `params.queue_url`, `params.region`, `params.api_key`. * `\"gcp_pubsub\"` - GCP Pub/Sub; requires `params.project`, `params.topic`, `params.subscription`, `params.access_token`.\n\nUnknown drivers cause `build_messenger` to return an error; the caller decides whether to treat that as fatal or fall back to no-bus semantics.",

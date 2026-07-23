@@ -99,6 +99,10 @@ sbproxy-cache.workspace = true
 sbproxy-platform.workspace = true
 sbproxy-openapi.workspace = true
 sbproxy-security.workspace = true
+# Process secret resolver, used to turn a response-cache encryption key
+# reference into key material at boot. Already in the graph through
+# sbproxy-modules; this makes the use direct.
+sbproxy-vault.workspace = true
 # WOR-1546: the dynamic key plane (mutable store, policy cache, at-rest crypto).
 # Redis backend/tier + cross-replica invalidation enabled here so the assembly
 # in `key_plane.rs` can build either backend from config.

@@ -595,6 +595,15 @@ pub struct ProxyServerConfig {
     /// entry back into the hot tier on hit.
     #[serde(default)]
     pub cache_reserve: Option<CacheReserveConfig>,
+    /// Optional selection of the shared response-cache backing store.
+    ///
+    /// One store serves every origin: the cache key already carries
+    /// workspace, hostname, method, and path, so origins never collide.
+    /// When this block is absent, the store is chosen the way it always
+    /// was, Redis if `l2_cache` is set and an in-process map otherwise,
+    /// so an existing config keeps the backend it has today.
+    #[serde(default)]
+    pub response_cache_store: Option<ResponseCacheStoreConfig>,
     /// Optional shared message bus for inter-component eventing (config
     /// updates, semantic-cache purges, etc.). When unset, components that
     /// need a bus degrade to no-op semantics.
@@ -759,6 +768,7 @@ impl Default for ProxyServerConfig {
             key_management: None,
             l2_cache: None,
             cache_reserve: None,
+            response_cache_store: None,
             messenger_settings: None,
             ai_providers_file: None,
             device_parser_file: None,
@@ -2282,6 +2292,129 @@ fn default_reserve_min_ttl() -> u64 {
 
 fn default_reserve_max_size_bytes() -> u64 {
     1_048_576
+}
+
+// --- Response Cache Store Config ---
+
+/// Top-level selection of the response cache's backing store.
+///
+/// The response cache is process-wide: `CompiledPipeline` builds one
+/// store and every origin whose `response_cache.enabled` is true shares
+/// it. Origins do not collide because the cache key already includes
+/// workspace, hostname, method, path, canonical query, and the Vary
+/// fingerprint.
+///
+/// YAML key: `proxy.response_cache_store`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ResponseCacheStoreConfig {
+    /// Which store holds cached responses. Defaults to the in-process
+    /// map.
+    #[serde(default)]
+    pub backend: ResponseCacheBackendConfig,
+
+    /// Optional encryption of cached payloads at rest. Absent or
+    /// `enabled: false` stores payloads as the backend receives them.
+    #[serde(default)]
+    pub encryption: Option<ResponseCacheEncryptionConfig>,
+}
+
+/// Backend selector for [`ResponseCacheStoreConfig`].
+///
+/// Tagged externally on `type`. This is a closed set: unlike
+/// `cache_reserve`, the response-cache store has no out-of-tree
+/// registration path, so an unrecognized `type` is a parse error rather
+/// than a silent fallback.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseCacheBackendConfig {
+    /// In-process map, capped by the largest per-origin
+    /// `response_cache.max_size`. Per-replica, so a multi-replica
+    /// deployment caches independently. The default.
+    #[default]
+    Memory,
+    /// One file per entry under `path`, named by the SHA-256 of the
+    /// cache key. Survives a restart and is shared by every process
+    /// pointed at the same directory. Prefix purge is unavailable
+    /// because keys are hashed into filenames, so
+    /// `invalidate_on_mutation` is a no-op on this backend and entries
+    /// fall out by TTL.
+    File {
+        /// Directory holding the cache files. Created at startup if it
+        /// does not exist; startup fails if it cannot be created.
+        path: String,
+        /// Ceiling on the total size of the directory, in megabytes.
+        /// `0`, the default, means no ceiling. When set, each write
+        /// walks the directory to measure it, so leave it at `0` unless
+        /// the disk budget is real.
+        #[serde(default)]
+        max_size_mb: u64,
+    },
+    /// Memcached over the ASCII protocol. Shared across replicas.
+    /// Stale-while-revalidate and prefix purge are both unavailable:
+    /// memcached expires items server-side and offers no key scan.
+    Memcached {
+        /// Server hostname or IP.
+        #[serde(default = "default_memcached_host")]
+        host: String,
+        /// Server port.
+        #[serde(default = "default_memcached_port")]
+        port: u16,
+    },
+    /// Redis, reusing the connection configured under
+    /// `proxy.l2_cache`. Selecting this without an `l2_cache` block is
+    /// a startup error.
+    Redis,
+}
+
+/// At-rest encryption settings for [`ResponseCacheStoreConfig`].
+///
+/// Cached response headers and bodies are sealed with AES-256-GCM
+/// before they reach the backing store. Status, cache time, and TTL
+/// stay readable because the file and memcached backends need them to
+/// compute expiry; status is authenticated so it cannot be altered.
+///
+/// There is no plaintext fallback. A key that is missing, unresolvable,
+/// or shorter than 16 bytes aborts startup.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ResponseCacheEncryptionConfig {
+    /// Master switch. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Secret reference for the active key. Used to seal new entries
+    /// and to open entries sealed under it.
+    ///
+    /// Resolved through the same mechanism as every other config
+    /// secret: a provider URI (`secret://backend/name`, `vault://...`)
+    /// against a backend declared under `proxy.secrets.backends`, a
+    /// `file:/path` reference, or a whole-value `${ENV_VAR}`. An
+    /// unresolvable reference aborts startup rather than being used as
+    /// key material verbatim. Required when `enabled` is `true`.
+    ///
+    /// The resolved value should be 32 random bytes (base64 or hex
+    /// encoded), not a human-chosen passphrase: the logged key
+    /// fingerprint is a weak offline oracle against a short passphrase,
+    /// but not against 256 bits of real entropy.
+    #[serde(default)]
+    pub key: Option<String>,
+
+    /// Retired keys, used only to open entries sealed before a
+    /// rotation. Same reference syntax as [`Self::key`].
+    ///
+    /// To rotate: move the current `key` into this list and name the
+    /// new one as `key`. Entries reseal under the active key as they
+    /// are rewritten. Removing a reference from this list retires its
+    /// entries; they are evicted the next time they are read.
+    #[serde(default)]
+    pub previous_keys: Vec<String>,
+}
+
+fn default_memcached_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_memcached_port() -> u16 {
+    11211
 }
 
 // --- Messenger Settings ---

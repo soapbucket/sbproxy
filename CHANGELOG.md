@@ -12,6 +12,32 @@ the next version cut.
 
 ### Added
 
+- **A response-cache store you can pick.** The response cache has had
+  four storage backends for a while, but only one of them was reachable:
+  nothing in the pipeline built the others, so no config could ask for
+  them. The new top-level `proxy.response_cache_store` block selects
+  `memory`, `file`, `memcached`, or `redis` and the pipeline builds what
+  it names. `file` gives you a cache that survives a restart and can be
+  shared by replicas pointed at one directory; `memcached` gives you a
+  shared cache without standing up Redis. The block sits under `proxy`
+  rather than on an origin because one store serves the whole process,
+  and every origin with `response_cache.enabled` shares it. Leave it out
+  and nothing moves: the store is still Redis when `l2_cache_settings`
+  is configured and an in-process map otherwise. See
+  [`docs/configuration.md`](docs/configuration.md#choosing-the-backing-store).
+- **Encryption at rest for cached responses.** An `encryption` block
+  under `proxy.response_cache_store` seals cached headers and bodies
+  with AES-256-GCM on the way to whichever backend you chose, so a
+  cache directory or a shared memcached is no longer a plaintext copy
+  of everything your upstreams returned. The key is a secret reference
+  like any other in the config, so it stays out of the config file, and
+  it should be 32 random bytes rather than a passphrase. `previous_keys`
+  covers rotation: new writes seal under the active key while retired
+  keys keep opening older entries. There is no plaintext fallback. A key
+  that cannot be resolved stops startup instead of quietly caching in
+  the clear, and an entry that fails its integrity check is evicted
+  rather than served. Runnable example in
+  [`examples/response-cache-encrypted/`](examples/response-cache-encrypted/).
 - **Classifier-based routing.** A `type: classifier` input guardrail
   labels a prompt with one of the classes you declare, the label lands
   in `ai.guardrails.labels`, and a CEL expression turns it into a
@@ -30,6 +56,26 @@ the next version cut.
   `block_threshold: 0`, since a label otherwise counts toward the block
   quorum. See [`docs/ai-classifier-routing.md`](docs/ai-classifier-routing.md)
   and the runnable [`examples/ai-classifier-routing/`](examples/ai-classifier-routing/).
+
+### Fixed
+
+- **Memcached cache keys are hashed.** Memcached rejects a key longer
+  than 250 bytes outright, and a response-cache key carries the
+  hostname, path, query, and Vary fingerprint, so any reasonably long
+  URL produced a key the server refused. Those requests missed on every
+  single read. Keys are now hashed before they go on the wire.
+- **Memcached TTLs are clamped at 30 days.** The protocol reads any
+  expiry above 30 days as an absolute Unix timestamp rather than an
+  offset, so a longer configured TTL was stored as a moment in 1970 and
+  the entry was dead the instant it was written. Relative TTLs are now
+  capped at the protocol ceiling.
+- **The file cache no longer discards entries it was asked to keep.** A
+  stale-while-revalidate read deleted the entry it had just fetched, so
+  the grace window it existed to serve was gone after one request.
+- **Concurrent file-cache writes no longer tear.** Two threads writing
+  the same key shared one staging file and could interleave their bytes
+  into it, and the atomic rename then published the mixture. Each write
+  now stages in its own file.
 
 ## [1.7.0] - 2026-07-22
 

@@ -17,6 +17,6 @@ pub use response::{
     path_invalidation_prefix, vary_fingerprint, QueryMode, ResponseCacheConfig,
 };
 pub use store::{
-    CacheStore, CachedResponse, FileCacheConfig, FileCacheStore, MemcachedConfig, MemcachedStore,
-    MemoryCacheStore, RedisCacheStore,
+    CacheKeyMaterial, CacheStore, CachedResponse, EncryptedCacheStore, FileCacheConfig,
+    FileCacheStore, MemcachedConfig, MemcachedStore, MemoryCacheStore, RedisCacheStore,
 };

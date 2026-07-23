@@ -1,8 +1,8 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-21*
+*Last modified: 2026-07-23*
 
-The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial — a skeleton showing which keys nest where, or one field in isolation — so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
+The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
 For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, Lua, JavaScript, and WASM scripting, see [scripting.md](scripting.md). For the event system, see [events.md](events.md).
 
@@ -109,7 +109,7 @@ The CI gate `scripts/check-config-schema.sh` runs the generator and `diff`s agai
 
 ## Top-level structure
 
-**Map, not a config** — every `{ ... }` and `[ ... ]` below is a placeholder for a real block documented in its own section, not literal YAML. This shows which keys nest where; it does not validate or run. For a complete file, see [`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml) for the smallest real one, or any [`examples/<name>/sb.yml`](../examples/) for a feature-specific full config.
+**Map, not a config.** Every `{ ... }` and `[ ... ]` below is a placeholder for a real block documented in its own section, not literal YAML. This shows which keys nest where; it does not validate or run. For a complete file, see [`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml) for the smallest real one, or any [`examples/<name>/sb.yml`](../examples/) for a feature-specific full config.
 
 ```yaml
 # Server settings (ports, TLS, ACME, admin, secrets, shared state)
@@ -248,6 +248,7 @@ proxy:
 | `cluster` | object | unset | Canonical local or distributed cluster identity, membership, mTLS, enrollment, snapshot, and signed deployment-authority settings. |
 | `model_host` | object | unset | Canonical managed-model authority, cache, engines, deployments, placement, and rollout policy. |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
+| `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
 | `messenger_settings` | object | | Optional shared message bus for inter-component eventing. |
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honoured. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
 | `correlation_id` | object | enabled, `X-Request-Id`, echo on | Correlation-ID propagation policy. See [Correlation ID](#correlation-id). |
@@ -2869,7 +2870,107 @@ origins:
 | `cacheable_status` | list | `[200]` | Status codes eligible for caching. Alias: `status_codes`. |
 | `max_size` | int | 10000 | Upper bound on the in-memory cache size in entries. Ignored when an L2 Redis backend is attached. |
 
-When `proxy.l2_cache_settings` is configured with `driver: redis`, response cache entries are stored in the shared backend; the in-memory `max_size` becomes irrelevant.
+### Choosing the backing store
+
+There is one response-cache store per process. Every origin with `response_cache.enabled` shares it, which is safe because the cache key already carries the workspace, hostname, method, path, canonical query, and the Vary fingerprint, so two origins cannot read each other's entries. The store is built only when at least one origin enables the cache.
+
+`proxy.response_cache_store` picks which store that is. It is a top-level `proxy` block, not a per-origin field.
+
+```yaml
+proxy:
+  response_cache_store:
+    backend:
+      type: file
+      path: /var/cache/sbproxy/responses
+      max_size_mb: 512
+```
+
+| `type` | Survives a proxy restart | Shared across replicas | Stale-while-revalidate | Prefix purge |
+|--------|--------------------------|------------------------|------------------------|--------------|
+| `memory` | no | no | yes | yes |
+| `file` | yes | yes, when replicas share the directory | yes | no |
+| `memcached` | yes, until memcached itself restarts | yes | no | no |
+| `redis` | yes | yes | no | yes |
+
+Backend fields:
+
+| Backend | Field | Type | Default | Description |
+|---------|-------|------|---------|-------------|
+| `memory` | | | | No fields. Sized by the largest per-origin `response_cache.max_size`. |
+| `file` | `path` | string | required | Directory holding one file per entry, named by a hash of the cache key. Created at startup; a directory that cannot be created stops startup. |
+| `file` | `max_size_mb` | int | 0 | Ceiling on total directory size. `0` means no ceiling. A write that would cross the ceiling is refused rather than evicting an older entry, and every write walks the directory to measure it, so the check costs more as the entry count grows. Leave it at `0` unless the disk budget is real. |
+| `memcached` | `host` | string | `127.0.0.1` | Server hostname or IP. |
+| `memcached` | `port` | int | `11211` | Server port. |
+| `redis` | | | | No fields. Reuses the connection from `proxy.l2_cache_settings`. Selecting `redis` without that block stops startup. |
+
+Omit the block and the store is chosen the way it always was: Redis if `l2_cache_settings` is set with `driver: redis`, an in-process map otherwise. Existing configs therefore keep the backend they have today. The per-origin `max_size` sizes the `memory` store only; the other three ignore it.
+
+Check these before picking one, because none of them are configurable away.
+
+- `file` and `memcached` hash cache keys, so neither can scan by prefix. `invalidate_on_mutation` (on by default) does nothing on them and entries fall out by TTL instead.
+- Neither `memcached` nor `redis` can hand back an entry that is past its TTL, so `stale_while_revalidate` never fires on them. Memcached expires items server-side, and the Redis entry carries its own expiry.
+- `memcached` opens a TCP connection per operation, and its server default caps a value at 1 MiB. Larger responses are refused by the server; the write is logged and the request proceeds.
+- `memcached` and `redis` are not dialled at startup. A config compiles and the proxy boots with the server down; the first cache read is where you find out.
+
+Cache keys sent to memcached are hashed to fit the protocol's 250-byte limit, and a TTL longer than 30 days is clamped to 30 days because memcached reads anything larger as an absolute timestamp.
+
+### Encrypting cached responses at rest
+
+A response cache holds whatever the upstream returned, and once that is on disk or in a shared memcached it outlives the request that produced it. The optional `encryption` block seals response headers and bodies with AES-256-GCM before they reach the backing store.
+
+```yaml
+proxy:
+  response_cache_store:
+    backend:
+      type: file
+      path: /var/cache/sbproxy/responses
+    encryption:
+      enabled: true
+      key: "secret://primary/response-cache"
+      previous_keys:
+        - "secret://primary/response-cache-2026-06"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | false | Master switch. |
+| `key` | string | unset | Secret reference for the active key. Seals new entries and opens entries sealed under it. Required when `enabled` is true. |
+| `previous_keys` | list of strings | `[]` | Retired keys, used only to open entries sealed before a rotation. |
+
+`key` and each entry in `previous_keys` take the same references as every other secret in the config: a provider URI such as `secret://backend/name` or `vault://...` resolved against a backend declared under [`proxy.secrets.backends`](#secret-reference-uri-schemes), a `file:/path` reference, or a whole-value `${ENV_VAR}`. The resolved material must be at least 16 bytes.
+
+Use 32 random bytes, not a passphrase. The proxy logs a short fingerprint of the key it loaded so operators can tell two keys apart, and that fingerprint gives an attacker something to guess against offline. Against 256 bits of entropy the guessing goes nowhere. Against a phrase somebody thought up, it finishes.
+
+```bash
+head -c 32 /dev/urandom | base64 > /etc/sbproxy/response-cache.key
+chmod 600 /etc/sbproxy/response-cache.key
+```
+
+Status, cache time, and TTL are stored readable, because the file and memcached backends need them to decide expiry without opening the entry. All three are authenticated, so they can be read but not altered: rewriting a cached `200` as a `500`, or stretching an entry's TTL, fails the integrity check.
+
+Every backend accepts the block, including `memory`, where it protects nothing meaningful: the plaintext lives in the same process either way. It is allowed there so a config can move between backends without anyone editing the encryption block.
+
+There is no plaintext fallback anywhere in this path:
+
+- A key that is missing, unresolvable, or shorter than 16 bytes stops startup with an error naming the field. A typo costs a failed boot, never a directory of plaintext you believed was sealed.
+- A secret reference is never used as key material verbatim. When no secret backend is configured to resolve it, startup fails and points at `proxy.secrets.backends`.
+- A write that cannot be sealed fails. It never falls back to storing the response in the clear.
+- A stored entry that no configured key can open is evicted and reported as a miss, so a cache that used to run unencrypted heals as entries are rewritten.
+- A stored entry that claims a configured key and then fails authentication is evicted, logged, and treated as a cache error; the request goes to the upstream.
+
+`sbproxy validate` checks the shape of the block but resolves no secrets and touches no filesystem, matching how it treats secrets everywhere else. A bad key reference surfaces the first time the config is served.
+
+#### Nonces
+
+Every entry draws its own random salt and derives a single-use key from the master material, so each 96-bit nonce is used under a key that seals exactly one message. That keeps the cache clear of the nonce-reuse ceiling a single long-lived key would reach in days at gateway write rates.
+
+#### Key rotation
+
+Move the current reference into `previous_keys` and name the new one as `key`. New writes seal under the new key; existing entries keep opening under the old one until they are rewritten or expire. Drop a reference out of `previous_keys` and its entries are evicted on the next read, at the cost of one cache miss each.
+
+Every entry carries a short identifier for the key that sealed it, so a read picks the right key directly rather than trying each one in turn.
+
+The runnable version of all of this is [`examples/response-cache-encrypted/`](../examples/response-cache-encrypted/).
 
 ---
 

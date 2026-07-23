@@ -80,7 +80,14 @@ impl FileCacheStore {
             .sum()
     }
 
-    fn read_entry(path: &Path) -> Result<Option<CachedResponse>> {
+    /// Read the record at `path`.
+    ///
+    /// `allow_expired` is the stale-while-revalidate switch. The live
+    /// `get` path passes `false`, so a past-TTL record is treated as a
+    /// miss and removed. The `get_including_expired` path passes `true`
+    /// and gets the record back untouched, which is what lets the
+    /// caller evaluate the SWR window and serve it stale.
+    fn read_entry(path: &Path, allow_expired: bool) -> Result<Option<CachedResponse>> {
         if !path.exists() {
             return Ok(None);
         }
@@ -104,7 +111,7 @@ impl FileCacheStore {
             .unwrap_or_default()
             .as_secs();
 
-        if now > expiry {
+        if now > expiry && !allow_expired {
             // Entry is expired; remove lazily.
             let _ = fs::remove_file(path);
             return Ok(None);
@@ -117,22 +124,42 @@ impl FileCacheStore {
         Ok(Some(entry))
     }
 
+    /// Stage the record in a writer-unique temp file, then rename it
+    /// into place.
+    ///
+    /// The temp name carries a process-wide counter because the target
+    /// path is derived from the cache key alone. Two threads writing the
+    /// same key used to share one temp file and interleave their bytes
+    /// into it, so the atomic rename could publish a torn record. Each
+    /// call now owns its staging file; the rename is still the only
+    /// operation observers can see.
     fn write_entry(path: &Path, entry: &CachedResponse) -> Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
         let expiry = Self::expiry_secs_static(entry);
         let payload = serde_json::to_vec(entry).context("FileCacheStore: JSON serialise failed")?;
 
-        // Write to a temp file then rename for atomicity.
-        let tmp_path = path.with_extension("tmp");
-        let mut file =
-            fs::File::create(&tmp_path).context("FileCacheStore: create temp file failed")?;
-        file.write_all(&expiry.to_be_bytes())
-            .context("FileCacheStore: write expiry failed")?;
-        file.write_all(&payload)
-            .context("FileCacheStore: write payload failed")?;
-        drop(file);
+        let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
 
-        fs::rename(&tmp_path, path).context("FileCacheStore: rename failed")?;
-        Ok(())
+        // Any early return past this point must not leak the staging
+        // file, so the body is wrapped and the temp file is removed on
+        // failure.
+        let staged = (|| -> Result<()> {
+            let mut file =
+                fs::File::create(&tmp_path).context("FileCacheStore: create temp file failed")?;
+            file.write_all(&expiry.to_be_bytes())
+                .context("FileCacheStore: write expiry failed")?;
+            file.write_all(&payload)
+                .context("FileCacheStore: write payload failed")?;
+            drop(file);
+            fs::rename(&tmp_path, path).context("FileCacheStore: rename failed")
+        })();
+        if staged.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        staged
     }
 
     fn expiry_secs_static(entry: &CachedResponse) -> u64 {
@@ -143,7 +170,16 @@ impl FileCacheStore {
 impl CacheStore for FileCacheStore {
     fn get(&self, key: &str) -> Result<Option<CachedResponse>> {
         let path = self.path_for(key);
-        Self::read_entry(&path)
+        Self::read_entry(&path, false)
+    }
+
+    /// Return the record even when it is past its TTL, without evicting
+    /// it. The stale-while-revalidate path needs this: the live `get`
+    /// removes an expired record, which would destroy the entry the SWR
+    /// window intended to serve.
+    fn get_including_expired(&self, key: &str) -> Result<Option<CachedResponse>> {
+        let path = self.path_for(key);
+        Self::read_entry(&path, true)
     }
 
     fn put(&self, key: &str, value: &CachedResponse) -> Result<()> {
@@ -347,5 +383,117 @@ mod tests {
             ttl_secs: 300,
         };
         assert!(store.put("huge", &huge).is_err());
+    }
+
+    #[test]
+    fn get_including_expired_returns_stale_without_deleting() {
+        // The SWR path always reads through get_including_expired. The
+        // trait default delegates to `get`, which evicts on expiry, so
+        // without an override a past-TTL entry is destroyed by the very
+        // lookup that wanted to serve it stale.
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+
+        let stale = CachedResponse {
+            status: 200,
+            headers: vec![],
+            body: b"stale".to_vec(),
+            cached_at: now_secs().saturating_sub(500),
+            ttl_secs: 60,
+        };
+        store.put("swr", &stale).unwrap();
+
+        let got = store.get_including_expired("swr").unwrap();
+        assert_eq!(
+            got.expect("stale entry must be returned").body,
+            b"stale",
+            "get_including_expired must return the past-TTL entry"
+        );
+        assert!(
+            store.path_for("swr").exists(),
+            "get_including_expired must not evict the entry it returned"
+        );
+        // A second read still finds it, which is what the SWR
+        // revalidation window depends on.
+        assert!(store.get_including_expired("swr").unwrap().is_some());
+    }
+
+    #[test]
+    fn get_including_expired_on_missing_key_is_none() {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+        assert!(store.get_including_expired("absent").unwrap().is_none());
+    }
+
+    #[test]
+    fn live_get_still_evicts_an_expired_entry() {
+        // The override must not change `get`. A past-TTL entry read
+        // through the live path is still a miss and is still removed.
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+
+        let stale = CachedResponse {
+            status: 200,
+            headers: vec![],
+            body: b"stale".to_vec(),
+            cached_at: now_secs().saturating_sub(500),
+            ttl_secs: 60,
+        };
+        store.put("gone", &stale).unwrap();
+        assert!(store.get("gone").unwrap().is_none());
+        assert!(!store.path_for("gone").exists());
+    }
+
+    #[test]
+    fn concurrent_writes_of_one_key_do_not_leave_a_torn_file() {
+        // Every writer used to stage through `<hash>.tmp`, a name derived
+        // only from the key, so two writers interleaved into the same
+        // temp file before the rename. Each write must stage through its
+        // own path.
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(make_store(&dir));
+
+        let mut handles = Vec::new();
+        for i in 0..8u8 {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let entry = CachedResponse {
+                    status: 200,
+                    headers: vec![("x-writer".into(), i.to_string())],
+                    body: vec![i; 64 * 1024],
+                    cached_at: now_secs(),
+                    ttl_secs: 300,
+                };
+                for _ in 0..16 {
+                    store.put("hot", &entry).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Whichever writer won, the published record must be one
+        // writer's bytes end to end, never a mix.
+        let got = store.get("hot").unwrap().expect("entry should exist");
+        assert_eq!(got.body.len(), 64 * 1024);
+        let first = got.body[0];
+        assert!(
+            got.body.iter().all(|b| *b == first),
+            "published entry is a mix of two writers' bodies"
+        );
+
+        // No temp files may survive a completed write.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "tmp").unwrap_or(false))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 }

@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# File-backed response cache with encryption at rest.
+#
+# Cached responses survive a restart because they live on disk, and the
+# headers and bodies on that disk are sealed with AES-256-GCM. The key
+# comes from a secret reference, so it never appears in this file.
+#
+# `response_cache_store` sits under `proxy:`, not under an origin. One
+# store serves the whole process and every origin with
+# `response_cache.enabled` shares it.
+#
+# Setup:
+#   # 32 random bytes, base64 so it is safe to paste around.
+#   head -c 32 /dev/urandom | base64 > /tmp/sbproxy-response-cache.key
+#   chmod 600 /tmp/sbproxy-response-cache.key
+#   make run CONFIG=examples/response-cache-encrypted/sb.yml
+#
+# Test:
+#   # First request: miss, fetched from upstream and sealed to disk.
+#   curl -s -D - -o /dev/null -H 'Host: cached.local' \
+#     http://127.0.0.1:8080/get | grep -i x-sbproxy-cache
+#   # Second request: HIT, opened from disk.
+#   curl -s -D - -o /dev/null -H 'Host: cached.local' \
+#     http://127.0.0.1:8080/get | grep -i x-sbproxy-cache
+#   # The bytes on disk carry none of the response. Prints 0.
+#   grep -rc 'content-type' /tmp/sbproxy-response-cache/
+
+proxy:
+  http_bind_port: 8080
+
+  # No `secrets:` block is needed here. A `file:` reference resolves
+  # without one, so this example runs as-is. Point `key` at
+  # `secret://<backend>/<name>` (or `vault://`, `awssm://`, `gcpsm://`,
+  # `k8ssecret://`) once you have a backend declared under
+  # `proxy.secrets.backends`.
+  #
+  # A key that cannot be resolved stops startup. Nothing here ever
+  # falls back to writing the cache in the clear.
+  response_cache_store:
+    backend:
+      type: file
+      # `max_size_mb` is a real ceiling, not a hint: a write that would
+      # cross it is refused rather than evicting something older. Every
+      # write measures the directory to check, so the cost grows with
+      # the entry count. Leave it at the default of 0 (no ceiling) when
+      # the disk budget is not tight.
+      path: /tmp/sbproxy-response-cache
+      max_size_mb: 256
+    encryption:
+      enabled: true
+      key: "file:/tmp/sbproxy-response-cache.key"
+      # After rotating, the retired reference moves here so entries
+      # sealed under it keep opening until they are rewritten:
+      # previous_keys:
+      #   - "file:/tmp/sbproxy-response-cache.key.old"
+
+origins:
+  "cached.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    response_cache:
+      enabled: true
+      ttl_secs: 60
+      cacheable_methods: [GET, HEAD]
+      cacheable_status: [200]
