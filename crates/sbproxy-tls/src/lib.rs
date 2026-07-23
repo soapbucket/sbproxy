@@ -110,35 +110,43 @@ impl AcmeExpiryReader {
     }
 
     fn earliest_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<AcmeCertExpiry> {
-        self.hostnames
-            .iter()
-            .filter_map(|hostname| {
-                let meta = match self.cert_store.get_meta(hostname) {
-                    Ok(Some(meta)) => meta,
-                    Ok(None) => return None,
-                    Err(error) => {
-                        tracing::debug!(
-                            %hostname,
-                            %error,
-                            "could not read ACME certificate metadata for alert sampling"
-                        );
-                        return None;
-                    }
-                };
-                let expires_at = match chrono::DateTime::parse_from_rfc3339(&meta.expires_at) {
-                    Ok(expires_at) => expires_at.with_timezone(&chrono::Utc),
-                    Err(error) => {
-                        tracing::debug!(
-                            %hostname,
-                            expires_at = %meta.expires_at,
-                            %error,
-                            "ignored invalid ACME expiry during alert sampling"
-                        );
-                        return None;
-                    }
-                };
-                Some((hostname.clone(), expires_at))
-            })
+        let mut expiries = Vec::with_capacity(self.hostnames.len());
+        for hostname in self.hostnames.iter() {
+            let meta = match self.cert_store.get_meta(hostname) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => {
+                    tracing::debug!(
+                        %hostname,
+                        "ACME expiry snapshot unavailable because certificate metadata is missing"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %hostname,
+                        %error,
+                        "ACME expiry snapshot unavailable because certificate metadata could not be read"
+                    );
+                    return None;
+                }
+            };
+            let expires_at = match chrono::DateTime::parse_from_rfc3339(&meta.expires_at) {
+                Ok(expires_at) => expires_at.with_timezone(&chrono::Utc),
+                Err(error) => {
+                    tracing::debug!(
+                        %hostname,
+                        expires_at = %meta.expires_at,
+                        %error,
+                        "ACME expiry snapshot unavailable because certificate metadata is invalid"
+                    );
+                    return None;
+                }
+            };
+            expiries.push((hostname.clone(), expires_at));
+        }
+
+        expiries
+            .into_iter()
             .min_by_key(|(_, expires_at)| *expires_at)
             .map(|(hostname, expires_at)| {
                 let seconds = expires_at.signed_duration_since(now).num_seconds();
@@ -872,5 +880,52 @@ mod tests {
         let expiry = reader.earliest_at(now).unwrap();
         assert_eq!(expiry.hostname, "near.example");
         assert_eq!(expiry.days_remaining, 7);
+    }
+
+    #[test]
+    fn acme_expiry_reader_rejects_a_partial_snapshot_with_invalid_metadata() {
+        let store = Arc::new(CertStore::new(Arc::new(MemoryKVStore::new(0))));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        store
+            .put_meta(
+                "healthy.example",
+                &meta(&(now + chrono::Duration::days(90)).to_rfc3339()),
+            )
+            .unwrap();
+        store
+            .put_meta("unreadable.example", &meta("not-an-rfc3339-timestamp"))
+            .unwrap();
+
+        let reader = AcmeExpiryReader {
+            cert_store: store,
+            hostnames: Arc::from([
+                "healthy.example".to_string(),
+                "unreadable.example".to_string(),
+            ]),
+        };
+
+        assert_eq!(reader.earliest_at(now), None);
+    }
+
+    #[test]
+    fn acme_expiry_reader_rejects_a_partial_snapshot_with_missing_metadata() {
+        let store = Arc::new(CertStore::new(Arc::new(MemoryKVStore::new(0))));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        store
+            .put_meta(
+                "healthy.example",
+                &meta(&(now + chrono::Duration::days(90)).to_rfc3339()),
+            )
+            .unwrap();
+        let reader = AcmeExpiryReader {
+            cert_store: store,
+            hostnames: Arc::from(["healthy.example".to_string(), "missing.example".to_string()]),
+        };
+
+        assert_eq!(reader.earliest_at(now), None);
     }
 }

@@ -609,6 +609,9 @@ pub struct RegistrySnapshot {
     pub provider_counters: ProviderCounters,
     /// Highest active budget utilization.
     pub budget_utilization: Option<f64>,
+    /// Whether the proxy request counter family is available. This separates
+    /// a real idle minute from an absent input source.
+    pub request_metrics_present: bool,
     /// Proxy requests and 5xx responses.
     pub request_counters: RequestCounters,
     /// Aggregate p99 request latency in milliseconds.
@@ -642,6 +645,7 @@ pub fn sample_registry() -> RegistrySnapshot {
                 snapshot.budget_utilization = Some(max_gauge(&family));
             }
             "sbproxy_requests_total" => {
+                snapshot.request_metrics_present = true;
                 for metric in family.get_metric() {
                     let count = metric.get_counter().value();
                     snapshot.request_counters.requests += count;
@@ -814,16 +818,17 @@ pub fn provider_attempt_delta(prev: ProviderCounters, now: ProviderCounters) -> 
 
 /// Turn monotonic request counters into one complete minute of burn history.
 ///
-/// Idle windows and counter resets return `None`; a missing latency histogram
-/// does not discard availability data and records `0ms` for the unused
-/// latency field.
+/// Idle windows return a zero-request sample so the bounded ring advances with
+/// wall-clock minutes and old failures eventually age out. Counter resets
+/// return `None`; a missing latency histogram does not discard availability
+/// data and records `0ms` for the unused latency field.
 pub fn minute_sample_delta(
     prev: RequestCounters,
     now: RequestCounters,
     p99_latency_ms: Option<f64>,
 ) -> Option<MinuteSample> {
     let requests = now.requests - prev.requests;
-    if requests <= 0.0 {
+    if requests < 0.0 {
         return None;
     }
     let requests = requests as u64;
@@ -1046,6 +1051,28 @@ mod tests {
         assert!(resolved[0].resolved);
         assert_eq!(resolved[0].labels["origin"], "near-expiry.example");
         assert!(engine.evaluate(&renewed).is_empty());
+    }
+
+    #[test]
+    fn absent_certificate_input_is_inactive_and_preserves_an_open_incident() {
+        let mut engine = AlertEngine::new(EngineConfig::default());
+        let near_expiry = MetricReadings {
+            cert_expiry: Some(CertExpiryReading {
+                hostname: "near-expiry.example".to_string(),
+                days_remaining: 6,
+            }),
+            ..MetricReadings::default()
+        };
+        assert_eq!(engine.evaluate(&near_expiry).len(), 1);
+
+        assert!(engine.evaluate(&MetricReadings::default()).is_empty());
+        assert_eq!(engine.firing_count(), 1);
+        let evaluation = engine
+            .latest_evaluations()
+            .iter()
+            .find(|evaluation| evaluation.rule == "cert_expiry")
+            .unwrap();
+        assert_eq!(evaluation.state, RuleEvaluationState::Inactive);
     }
 
     #[test]
@@ -1309,6 +1336,7 @@ mod tests {
         crate::metrics::record_rate_limit_decision("/alert-sampler", "throttle_route");
 
         let snapshot = sample_registry();
+        assert!(snapshot.request_metrics_present);
         assert!(snapshot.request_counters.requests >= 1.0);
         assert!(snapshot.request_counters.errors >= 1.0);
         assert!(snapshot.p99_latency_ms.is_some());
@@ -1336,7 +1364,11 @@ mod tests {
         );
         assert_eq!(
             minute_sample_delta(request_now, request_now, Some(250.0)),
-            None
+            Some(MinuteSample {
+                requests: 0,
+                errors: 0,
+                p99_ms: 250.0,
+            })
         );
 
         let limit_prev = RateLimitCounters {
