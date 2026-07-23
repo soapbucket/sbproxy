@@ -2957,6 +2957,35 @@ pub(super) async fn handle_ai_proxy(
     // WOR-1154: input guardrails run BEFORE the semantic-cache
     // lookup below, so a prompt a guardrail would block cannot be
     // served from a cache hit that short-circuits the request.
+    let mut guardrail_flagged_count = 0_usize;
+    let guardrail_pipeline = match config.guardrail_pipeline() {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            // Handler compilation validates this configuration before it
+            // is published. Keep the request path fail-closed as a final
+            // defense against a future compiler/runtime mismatch.
+            tracing::error!(
+                error = %error,
+                "AI proxy: guardrail pipeline compilation failed; rejecting request"
+            );
+            sbproxy_ai::tracing_spans::record_error(
+                &ai_span,
+                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                "guardrail configuration failed to compile",
+            );
+            let error_body = serde_json::json!({
+                "error": {
+                    "message": "AI guardrail configuration failed to compile",
+                    "type": "configuration_error",
+                    "code": "guardrail_configuration_error",
+                }
+            });
+            let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+            send_response(session, 500, "application/json", &body_bytes).await?;
+            return Ok(());
+        }
+    };
+
     // --- Input guardrails: check messages before forwarding ---
     if let Some(ref guardrails_config) = config.guardrails {
         // WOR-1529: external HTTP guardrail providers (Presidio / Lakera /
@@ -3015,7 +3044,7 @@ pub(super) async fn handle_ai_proxy(
                 }
             }
         }
-        if let Some(pipeline) = cached_guardrails_pipeline(guardrails_config) {
+        if let Some(pipeline) = guardrail_pipeline.as_ref() {
             if pipeline.has_input() {
                 // Parse messages from the body. WOR-1145: deserialize
                 // each element independently rather than the whole array
@@ -3046,16 +3075,12 @@ pub(super) async fn handle_ai_proxy(
                 if let Some(mesh_cfg) = guardrails_config.mesh.clone() {
                     let mesh = sbproxy_ai::guardrails::GuardrailMesh::new(mesh_cfg);
                     let text = sbproxy_ai::guardrails::message_text(&messages);
-                    // The async entry point: it runs the same synchronous
-                    // cascade and then awaits the guardrails whose backend
-                    // needs I/O (a `kind: llm` classifier). We are already
-                    // inside an async function, so no worker thread is
-                    // blocked on that call.
-                    let decision = mesh.evaluate_input_async(&pipeline, &messages, &text).await;
+                    let decision = mesh.evaluate_input(pipeline, &messages, &text);
+                    guardrail_flagged_count = decision.flagged_count();
                     ctx.ai_guardrail_labels = decision.labels.clone();
                     if decision.block {
                         warn!(
-                            guardrails = ?decision.labels,
+                            guardrails = ?decision.security_labels,
                             "AI proxy: guardrail mesh blocked request"
                         );
                         let reason = decision.reasons.join("; ");
@@ -3064,12 +3089,12 @@ pub(super) async fn handle_ai_proxy(
                             sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                             &reason,
                         );
-                        mark_guardrail_block(ctx, decision.labels.join(","));
+                        mark_guardrail_block(ctx, decision.security_labels.join(","));
                         let error_body = serde_json::json!({
                             "error": {
                                 "message": reason,
                                 "type": "guardrail_violation",
-                                "code": decision.labels.join(","),
+                                "code": decision.security_labels.join(","),
                             }
                         });
                         let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
@@ -3081,31 +3106,38 @@ pub(super) async fn handle_ai_proxy(
                             redactor.redact_json(&mut body);
                         }
                     }
-                } else if let Some(block) = pipeline.check_input(&messages) {
-                    warn!(
-                        guardrail = %block.name,
-                        reason = %block.reason,
-                        "AI proxy: input guardrail blocked request"
-                    );
-                    sbproxy_ai::tracing_spans::record_error(
-                        &ai_span,
-                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                        &block.reason,
-                    );
-                    // WOR-1496: a guardrail block surfaces as a generic
-                    // 400, so stamp the precise outcome for the
-                    // value-vs-waste metric.
-                    mark_guardrail_block(ctx, block.name.clone());
-                    let error_body = serde_json::json!({
-                        "error": {
-                            "message": block.reason,
-                            "type": "guardrail_violation",
-                            "code": block.name,
-                        }
-                    });
-                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
-                    send_response(session, 400, "application/json", &body_bytes).await?;
-                    return Ok(());
+                } else {
+                    if let Some(block) = pipeline.check_input(&messages) {
+                        warn!(
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: input guardrail blocked request"
+                        );
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.reason,
+                        );
+                        // WOR-1496: a guardrail block surfaces as a generic
+                        // 400, so stamp the precise outcome for the
+                        // value-vs-waste metric.
+                        mark_guardrail_block(ctx, block.name.clone());
+                        let error_body = serde_json::json!({
+                            "error": {
+                                "message": block.reason,
+                                "type": "guardrail_violation",
+                                "code": block.name,
+                            }
+                        });
+                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                        send_response(session, 400, "application/json", &body_bytes).await?;
+                        return Ok(());
+                    }
+                    ctx.ai_guardrail_labels = pipeline
+                        .classify_input(&messages)
+                        .into_iter()
+                        .map(|label| label.name)
+                        .collect();
                 }
 
                 // WOR-801: body-aware input guardrails (today only
@@ -3217,6 +3249,7 @@ pub(super) async fn handle_ai_proxy(
             tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
             // Populated by the guardrail mesh (WOR-1543) when configured.
             guardrail_labels: ctx.ai_guardrail_labels.clone(),
+            guardrail_flagged_count,
             // Populated by predictive soft-landing (WOR-1544).
             budget_fraction: ctx.ai_budget_fraction,
             budget_exceeded: ctx.ai_budget_fraction >= 1.0,
@@ -5016,7 +5049,7 @@ pub(super) async fn handle_ai_proxy(
                 config
                     .guardrails
                     .as_ref()
-                    .and_then(cached_guardrails_pipeline)
+                    .and(guardrail_pipeline.clone())
                     .filter(|p| p.has_output()),
                 // WOR-1810: identity for the streamed tool-call rbac
                 // rule, mirroring the buffered input check.
@@ -5074,7 +5107,7 @@ pub(super) async fn handle_ai_proxy(
                 config
                     .guardrails
                     .as_ref()
-                    .and_then(cached_guardrails_pipeline)
+                    .and(guardrail_pipeline.clone())
                     .filter(|p| p.has_output()),
                 // WOR-1529: external output guardrails (post_call) run on the
                 // response after the sync pipeline; empty when none configured.

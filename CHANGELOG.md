@@ -92,24 +92,17 @@ the next version cut.
   the clear, and an entry that fails its integrity check is evicted
   rather than served. Runnable example in
   [`examples/response-cache-encrypted/`](examples/response-cache-encrypted/).
-- **Classifier-based routing.** A `type: classifier` input guardrail
-  labels a prompt with one of the classes you declare, the label lands
-  in `ai.guardrails.labels`, and a CEL expression turns it into a
-  `route_to:<model>`. The gateway can therefore route on what a request
-  is asking for rather than on a header, a path, or a separate API key.
-  Two backends fill in the same class map. `kind: embedding` runs a
-  local ONNX sentence-embedding model with one averaged vector per
-  class, so the decision costs no network call and the prompt never
-  leaves the process; `min_score` and `min_margin` decide whether a
-  class wins. `kind: llm` asks any OpenAI-compatible
-  `/chat/completions` endpoint, hosted or local, to name the class, and
-  caches the answer per prompt. The guardrail never rejects a request.
-  A model that will not load, a call that times out, and an answer
-  outside the configured class set all emit no label, and the request
-  stays on the route it arrived with. Label-only routing needs the mesh's
-  `block_threshold: 0`, since a label otherwise counts toward the block
-  quorum. See [`docs/ai-classifier-routing.md`](docs/ai-classifier-routing.md)
-  and the runnable [`examples/ai-classifier-routing/`](examples/ai-classifier-routing/).
+- **Local classifier-based routing.** A `type: classifier` input guardrail
+  embeds a prompt with a verified local ONNX model, chooses the nearest
+  configured class centroid, and publishes the label to
+  `ai.guardrails.labels`. CEL can turn that label into
+  `route_to:<model>`, so the gateway routes on request intent without
+  sending the prompt to a classifier service. Invalid or unresolved
+  classifier artifacts remain inert, and score and margin thresholds prevent
+  ambiguous labels. See
+  [`docs/ai-gateway.md`](docs/ai-gateway.md#embedding-classifier) and the
+  runnable
+  [`examples/ai-classifier-routing/`](examples/ai-classifier-routing/).
 
 ### Changed
 

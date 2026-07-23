@@ -1,12 +1,14 @@
 # Local inference (embeddings and prompt-injection classify)
-*Last modified: 2026-07-04*
+*Last modified: 2026-07-22*
 
-SBproxy can run two AI-gateway features on local ONNX models instead of paid
+SBproxy can run three AI-gateway features on local ONNX models instead of paid
 APIs:
 
 - The **embedding semantic cache** vectorizes prompts to serve near-duplicate
   requests from cache.
 - **Prompt-injection v2** classifies prompts for injection attempts.
+- The **embedding classifier guardrail** maps prompts onto operator-defined
+  classes that can feed model-routing policy.
 
 For running a full **LLM** locally (the gateway pulls weights, fits an engine
 to the GPU, and supervises it), see [model-host.md](model-host.md). This page
@@ -210,6 +212,26 @@ The released `sbproxy` binary is built with the `inprocess-embed` feature, so
 `source: inprocess` works out of the box. If you build from source without the
 default features, add `--features inprocess-embed`; without it, `source:
 inprocess` returns a clear error and the cache treats lookups as misses.
+
+## Enable classifier-backed routing
+
+The `classifier` input guardrail uses the same `OnnxEmbedder` implementation
+to build a nearest-centroid classifier from operator-provided examples. The
+released binary includes `inprocess-classify`; a source build without default
+features must enable it.
+
+Multiple classifier entries share one loaded embedder when the resolved model
+and tokenizer paths and digests match and each entry's model-size limit
+accepts the artifact. Replacing either file at the same path invalidates reuse
+on reload. The implementation lives in `sbproxy-core` behind the
+`TextClassifier` trait from `sbproxy-ai`: `sbproxy-classifiers` depends on
+`sbproxy-ai`, so placing the concrete ONNX implementation in `sbproxy-ai`
+would introduce a crate cycle.
+
+Classifier results are always non-enforcing routing labels; no mesh override
+is required to prevent them from blocking. The complete configuration and
+model download commands are in
+[ai-classifier-routing](../examples/ai-classifier-routing/).
 
 ## Metrics and usage tracking
 

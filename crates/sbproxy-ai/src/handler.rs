@@ -172,6 +172,17 @@ pub struct AiHandlerConfig {
     /// exist. Process-local only unless a future atomic backend lands.
     #[serde(default)]
     pub quota_pool: Option<crate::quota_pool::QuotaPoolConfig>,
+    /// Lazy-compiled guardrail pipeline, owned by this reload-managed
+    /// handler config. Keeping the cache here makes its lifetime follow
+    /// the published config: a reload cannot reuse a pipeline by recycled
+    /// memory address, and dropping the old config releases its pipeline
+    /// once in-flight requests finish.
+    ///
+    /// Compilation failures are cached as strings so every request fails
+    /// closed consistently without retrying deterministic bad config.
+    #[serde(skip)]
+    pub(crate) guardrails_pipeline:
+        OnceLock<Result<std::sync::Arc<crate::guardrails::GuardrailPipeline>, String>>,
     /// Lazy-built compiled redactor cached on the per-origin
     /// config. Built on first use so config-load does not pay the
     /// regex-compile cost for origins that never serve a request.
@@ -220,6 +231,30 @@ fn default_usage_parser() -> String {
 }
 
 impl AiHandlerConfig {
+    /// Return this handler's compiled guardrail pipeline, building it once.
+    ///
+    /// The returned `Arc` lets in-flight requests finish against the old
+    /// pipeline during a config reload. The owning cache lives on this
+    /// handler rather than in process-global address-keyed state, so the old
+    /// generation is released when both the old config and those requests
+    /// are gone. A compile error remains an error and must fail the request
+    /// closed.
+    pub fn guardrail_pipeline(
+        &self,
+    ) -> anyhow::Result<Option<std::sync::Arc<crate::guardrails::GuardrailPipeline>>> {
+        let Some(config) = self.guardrails.as_ref() else {
+            return Ok(None);
+        };
+        match self.guardrails_pipeline.get_or_init(|| {
+            crate::guardrails::compile_pipeline(config)
+                .map(std::sync::Arc::new)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(pipeline) => Ok(Some(std::sync::Arc::clone(pipeline))),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+
     /// Return the compiled PII redactor for this handler, building
     /// it on first call. `None` when redaction is not configured
     /// or the configuration failed to compile (which is logged).
@@ -715,6 +750,10 @@ impl AiHandlerConfig {
     /// Build from a generic JSON value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         let mut config: Self = serde_json::from_value(value)?;
+        if let Some(guardrails) = &config.guardrails {
+            crate::guardrails::validate_pipeline_config(guardrails)
+                .map_err(|error| anyhow::anyhow!("ai guardrails: {error}"))?;
+        }
         // WOR-1044 PR4: reversible PII and semantic caching cannot
         // safely co-exist on the same origin. The semantic cache
         // keys responses on a similarity hash of the prompt; two
@@ -1229,6 +1268,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
         };
@@ -1268,6 +1308,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
         };
@@ -1307,6 +1348,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
         };
@@ -1347,6 +1389,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
         };
@@ -1422,6 +1465,235 @@ mod tests {
         assert!(config.max_body_size.is_none());
         assert!(!config.require_governed_key);
         assert!(config.quota_pool.is_none());
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_guardrail_placement_before_serving() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "regex",
+                    "patterns": ["secret"],
+                    "action": "block"
+                }],
+                "output": [{
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/unused/model.onnx",
+                        "tokenizer_path": "/unused/tokenizer.json"
+                    },
+                    "classes": {
+                        "documentation": ["write the readme"]
+                    }
+                }]
+            }
+        });
+
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("an input-only classifier under output must fail config compilation")
+            .to_string();
+        assert!(
+            error.contains("classifier") && error.contains("input-only"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_malformed_classifier_before_serving() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [
+                    {
+                        "type": "regex",
+                        "patterns": ["secret"],
+                        "action": "block"
+                    },
+                    {
+                        "type": "classifier",
+                        "backend": {
+                            "kind": "embedding",
+                            "model_path": "/unused/model.onnx",
+                            "tokenizer_path": "/unused/tokenizer.json"
+                        },
+                        "classes": {}
+                    }
+                ]
+            }
+        });
+
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("a malformed classifier must fail config compilation")
+            .to_string();
+        assert!(
+            error.contains("classifier") && error.contains("classes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_classifier_fields_before_serving() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/unused/model.onnx",
+                        "tokenizer_path": "/unused/tokenizer.json",
+                        "min_socre": 0.30
+                    },
+                    "classes": {
+                        "documentation": ["write the readme"]
+                    }
+                }]
+            }
+        });
+
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("unknown classifier fields must fail config compilation")
+            .to_string();
+        assert!(
+            error.contains("unknown field") && error.contains("min_socre"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_overlong_classifier_examples_before_serving() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/unused/model.onnx",
+                        "tokenizer_path": "/unused/tokenizer.json"
+                    },
+                    "classes": {
+                        "documentation": ["five!"]
+                    },
+                    "max_chars": 4
+                }]
+            }
+        });
+
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("overlong examples must fail config compilation")
+            .to_string();
+        assert!(
+            error.contains("documentation") && error.contains("max_chars"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_validates_classifier_without_loading_artifacts() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/not-loaded-during-validation/model.onnx",
+                        "tokenizer_path": "/not-loaded-during-validation/tokenizer.json"
+                    },
+                    "classes": {
+                        "documentation": ["write the readme"]
+                    }
+                }]
+            }
+        });
+
+        AiHandlerConfig::from_config(json)
+            .expect("config compilation validates structure without opening model artifacts");
+    }
+
+    #[test]
+    fn guardrail_pipeline_lifetime_tracks_reload_managed_handler_config() {
+        fn config(pattern: &str) -> AiHandlerConfig {
+            AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{"name": "openai", "api_key": "sk-test"}],
+                "guardrails": {
+                    "input": [{
+                        "type": "regex",
+                        "patterns": [pattern],
+                        "action": "block"
+                    }]
+                }
+            }))
+            .expect("valid handler config")
+        }
+
+        let old_config = config("old-secret");
+        let old_pipeline = old_config
+            .guardrail_pipeline()
+            .expect("old pipeline compiles")
+            .expect("old pipeline configured");
+        let old_pipeline_again = old_config
+            .guardrail_pipeline()
+            .expect("cached old pipeline")
+            .expect("old pipeline configured");
+        assert!(
+            std::sync::Arc::ptr_eq(&old_pipeline, &old_pipeline_again),
+            "one handler config should compile its pipeline only once"
+        );
+        assert!(old_pipeline.check_input_text("old-secret").is_some());
+        drop(old_pipeline_again);
+        assert_eq!(
+            std::sync::Arc::strong_count(&old_pipeline),
+            2,
+            "the handler config and in-flight request should be the only owners"
+        );
+
+        let new_config = config("new-secret");
+        let new_pipeline = new_config
+            .guardrail_pipeline()
+            .expect("replacement pipeline compiles")
+            .expect("replacement pipeline configured");
+        assert!(new_pipeline.check_input_text("old-secret").is_none());
+        assert!(new_pipeline.check_input_text("new-secret").is_some());
+
+        drop(old_config);
+        assert_eq!(
+            std::sync::Arc::strong_count(&old_pipeline),
+            1,
+            "publishing a replacement config must release the old compiled pipeline"
+        );
+    }
+
+    #[test]
+    fn guardrail_pipeline_runtime_compilation_error_remains_fail_closed() {
+        // Production publication goes through `from_config` and rejects this
+        // first. Deserializing directly exercises the request path's final
+        // defense against a future validation/compiler mismatch.
+        let config: AiHandlerConfig = serde_json::from_value(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "regex",
+                    "patterns": ["("],
+                    "action": "block"
+                }]
+            }
+        }))
+        .expect("raw handler shape");
+
+        let first = config
+            .guardrail_pipeline()
+            .expect_err("invalid guardrail compilation must be an error")
+            .to_string();
+        let second = config
+            .guardrail_pipeline()
+            .expect_err("cached invalid guardrail compilation must remain an error")
+            .to_string();
+        assert!(first.contains("invalid regex pattern"), "{first}");
+        assert_eq!(first, second);
     }
 
     #[test]

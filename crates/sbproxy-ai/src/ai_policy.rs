@@ -170,8 +170,10 @@ pub struct AiDecisionView {
     pub api_key_id: String,
     /// Principal tier / plan tag (e.g. `free`, `pro`), when known.
     pub tier: String,
-    /// Labels of the guardrails that flagged the request.
+    /// Security verdict and non-enforcing routing labels exposed to policy.
     pub guardrail_labels: Vec<String>,
+    /// Number of enforcing security guardrails that flagged.
+    pub guardrail_flagged_count: usize,
     /// Fraction (0.0-1.0+) of the tightest active budget window consumed.
     pub budget_fraction: f64,
     /// True when a budget window is already exceeded.
@@ -186,11 +188,11 @@ impl AiDecisionView {
         let guardrails = HashMap::from([
             (
                 "flagged".to_string(),
-                CelValue::Bool(!self.guardrail_labels.is_empty()),
+                CelValue::Bool(self.guardrail_flagged_count > 0),
             ),
             (
                 "flagged_count".to_string(),
-                CelValue::Int(self.guardrail_labels.len() as i64),
+                CelValue::Int(self.guardrail_flagged_count as i64),
             ),
             (
                 "labels".to_string(),
@@ -450,10 +452,29 @@ mod tests {
         let p = policy(r#"ai.guardrails.flagged_count >= 2 ? "block" : "allow""#);
         let mut view = AiDecisionView {
             guardrail_labels: vec!["pii".into(), "injection".into()],
+            guardrail_flagged_count: 2,
             ..Default::default()
         };
         assert!(p.evaluate(&view).is_block());
         view.guardrail_labels = vec!["pii".into()];
+        view.guardrail_flagged_count = 1;
+        assert!(!p.evaluate(&view).is_block());
+    }
+
+    #[test]
+    fn routing_label_does_not_become_a_security_flag() {
+        let p = policy(
+            r#""documentation" in ai.guardrails.labels
+               && ai.guardrails.flagged_count == 0
+               && !ai.guardrails.flagged
+               ? "allow"
+               : "block""#,
+        );
+        let view = AiDecisionView {
+            guardrail_labels: vec!["documentation".into()],
+            ..Default::default()
+        };
+
         assert!(!p.evaluate(&view).is_block());
     }
 
@@ -467,6 +488,7 @@ mod tests {
         let view = AiDecisionView {
             tier: "free".into(),
             guardrail_labels: vec!["pii".into(), "toxicity".into()],
+            guardrail_flagged_count: 2,
             ..Default::default()
         };
         let d = p.evaluate(&view);

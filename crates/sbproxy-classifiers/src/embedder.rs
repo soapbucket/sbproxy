@@ -99,6 +99,41 @@ impl OnnxEmbedder {
         Ok(Self { model, tokenizer })
     }
 
+    /// Load an embedding model and tokenizer from an immutable byte snapshot.
+    ///
+    /// This variant is for callers that fingerprint artifacts for caching:
+    /// the same byte slices used to derive the cache identity are handed to
+    /// tract and tokenizers, so replacing a configured pathname during load
+    /// cannot cache one generation under another generation's digest. Size
+    /// budgets are enforced against the actual slice lengths.
+    ///
+    /// The ONNX model must be self-contained. Tract's reader API has no model
+    /// directory from which to resolve external tensor files; such models are
+    /// rejected during parsing rather than reopening mutable paths.
+    pub fn load_from_bytes_with_options(
+        model_bytes: &[u8],
+        tokenizer_bytes: &[u8],
+        options: &LoadOptions,
+    ) -> Result<Self> {
+        check_snapshot_size_budget(model_bytes, "model", options.effective_model_limit())?;
+        check_snapshot_size_budget(
+            tokenizer_bytes,
+            "tokenizer",
+            options.effective_tokenizer_limit(),
+        )?;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
+            .map_err(|e| anyhow!("failed to load tokenizer from verified snapshot: {e}"))?;
+        let mut model_reader = std::io::Cursor::new(model_bytes);
+        let model = tract_onnx::onnx()
+            .model_for_read(&mut model_reader)
+            .context("failed to parse ONNX model from verified snapshot")?
+            .into_optimized()
+            .context("failed to optimise ONNX model")?
+            .into_runnable()
+            .context("failed to make ONNX model runnable")?;
+        Ok(Self { model, tokenizer })
+    }
+
     /// Embed one text into an L2-normalized vector.
     ///
     /// Tokenises `text`, runs the model, mean-pools the last hidden state
@@ -179,6 +214,18 @@ impl OnnxEmbedder {
     }
 }
 
+fn check_snapshot_size_budget(bytes: &[u8], kind: &str, max_bytes: u64) -> Result<()> {
+    let byte_len = u64::try_from(bytes.len())
+        .map_err(|_| anyhow!("{kind} snapshot length does not fit in u64"))?;
+    if max_bytes != 0 && byte_len > max_bytes {
+        return Err(anyhow!(
+            "{kind} snapshot is {byte_len} bytes, exceeding the configured \
+             {max_bytes}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +266,24 @@ mod tests {
         let mut v = vec![0.0, 0.0];
         l2_normalize(&mut v);
         assert_eq!(v, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn snapshot_loader_enforces_the_budget_against_actual_bytes() {
+        let options = LoadOptions::default().with_max_model_bytes(3);
+        let error = OnnxEmbedder::load_from_bytes_with_options(
+            b"four",
+            b"tokenizer parsing must not be reached",
+            &options,
+        )
+        .err()
+        .expect("oversized snapshot must fail before parsing")
+        .to_string();
+        assert!(
+            error.contains("model snapshot is 4 bytes")
+                && error.contains("configured 3-byte limit"),
+            "unexpected error: {error}"
+        );
     }
 
     // Gated: needs a downloaded MiniLM model. Run locally with

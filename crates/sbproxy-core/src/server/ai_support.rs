@@ -1,5 +1,5 @@
-//! AI request support helpers: guardrail-pipeline memoization,
-//! budget gating, usage extraction, upstream-error mapping, HTTP
+//! AI request support helpers: budget gating, usage extraction,
+//! upstream-error mapping, HTTP
 //! message-signature verification, AI billing, and idempotency.
 //!
 //! Extracted from `server.rs`. Behavior-preserving move:
@@ -7,49 +7,6 @@
 //! `use` aliases, so the moved code needs no rewiring.
 
 use super::*;
-
-/// Process-wide memoization of compiled guardrail pipelines, keyed by
-/// the address of the configured `GuardrailsConfig`. The address is
-/// stable for the lifetime of an `AiHandlerConfig` (held in the
-/// reload-managed `Arc<Pipeline>`), so a hit returns the
-/// already-compiled `GuardrailPipeline` rather than re-running regex
-/// compilation on every request. Hot reload swaps in a new pipeline
-/// (and therefore a new config address), so stale entries fall out of
-/// use; the map is small (one entry per ai handler config) and never
-/// grows hot.
-pub(super) static GUARDRAIL_PIPELINE_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<
-        std::collections::HashMap<usize, std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-/// Look up (or compile-and-cache) the guardrail pipeline for the given
-/// configuration. Returns `None` and emits a `tracing::warn!` when
-/// `compile_pipeline` fails so the AI proxy can fall through to its
-/// no-guardrails behaviour (matching the previous best-effort policy).
-pub(super) fn cached_guardrails_pipeline(
-    guardrails_config: &sbproxy_ai::guardrails::GuardrailsConfig,
-) -> Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>> {
-    let key = guardrails_config as *const _ as usize;
-    if let Ok(map) = GUARDRAIL_PIPELINE_CACHE.lock() {
-        if let Some(p) = map.get(&key) {
-            return Some(p.clone());
-        }
-    }
-    match sbproxy_ai::guardrails::compile_pipeline(guardrails_config) {
-        Ok(pipeline) => {
-            let arc = std::sync::Arc::new(pipeline);
-            if let Ok(mut map) = GUARDRAIL_PIPELINE_CACHE.lock() {
-                map.insert(key, arc.clone());
-            }
-            Some(arc)
-        }
-        Err(e) => {
-            warn!(error = %e, "AI proxy: failed to compile guardrails, skipping");
-            None
-        }
-    }
-}
 
 /// Best-effort extraction of a single prompt string from a parsed AI request
 /// body.
@@ -1435,9 +1392,7 @@ pub(super) fn build_signature_verification_request(
 }
 
 /// Cache of compiled `MessageSignatureVerifier` instances keyed by
-/// the configuration's memory address. Same pattern as
-/// `cached_guardrails_pipeline`: hot reload swaps in a new config
-/// address, so stale entries fall out of use.
+/// the configuration's memory address.
 pub(super) static MESSAGE_SIGNATURE_VERIFIER_CACHE: std::sync::LazyLock<
     std::sync::Mutex<
         std::collections::HashMap<

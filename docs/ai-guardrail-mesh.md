@@ -1,9 +1,10 @@
 # Guardrail mesh
-*Last modified: 2026-07-23*
+*Last modified: 2026-07-22*
 
-The serial guardrail chain blocks on the first detector that flags. The
-guardrail mesh instead runs the input detectors as a cascade, collects the
-full verdict set, and fuses it into one decision under a configurable rule.
+The serial guardrail chain blocks on the first security detector that flags.
+The guardrail mesh instead runs the input detectors as a cascade, collects
+security verdicts and routing labels, and fuses the security verdicts under a
+configurable rule.
 That unlocks three behaviors the serial chain cannot express: a quorum
 block, redact-and-continue, and a latency-budgeted cascade with a verdict
 cache.
@@ -34,17 +35,17 @@ guardrails:
 ## Fusion
 
 The mesh runs every input detector (cheap regex / PII / schema first, then
-the ONNX classifiers) and counts how many flag.
+the more expensive classifiers) and counts security verdicts. A
+`type: classifier` prompt-routing label is still published to the policy
+plane, but it is non-enforcing and does not contribute to the count.
 
 - `block_threshold` is the quorum: the request is blocked when
-  `flagged_count >= block_threshold`. `1` reproduces the serial behavior;
-  `0` never blocks on the count. Setting it to `0` turns the mesh into a
-  pure labeler, which is what a routing signal needs;
-  [classifier-based routing](ai-classifier-routing.md) is the worked
-  example.
-- `redact_on_flag`: when a request is flagged but the count is below the
-  block threshold, the prompt is masked by the origin's PII redactor and
-  the request continues, instead of passing through untouched.
+  security `flagged_count >= block_threshold`. `1` reproduces the serial
+  security behavior; `0` never blocks on the count.
+- `redact_on_flag`: when a security guardrail flags but the count is below
+  the block threshold, the prompt is masked by the origin's PII redactor
+  and the request continues, instead of passing through untouched. Routing
+  labels do not trigger redaction.
 
 The full label set is published to the AI policy plane's
 [`ai.guardrails.*`](ai-policy-cel.md) namespace, so a CEL rule can fuse the
@@ -58,9 +59,11 @@ spent the remaining (expensive) detectors are skipped, so the mesh degrades
 gracefully under load rather than paying every classifier on every request.
 
 With `cache` enabled, a verdict is cached by a combined hash of the prompt
-text and the configured guardrail set, so a repeated or replayed prompt
-skips re-running the detectors. The key includes the guardrail set, so two
-origins with different guardrails never share an entry.
+text, message roles/content structure, and role-aware classifier scope, so a
+repeated or replayed prompt skips re-running the detectors without aliasing
+two conversations that flatten to the same text. The cache lives on the
+compiled pipeline, so two origins with different guardrails never share an
+entry.
 
 ## Try it
 

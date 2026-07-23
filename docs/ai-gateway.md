@@ -473,7 +473,7 @@ The sliding window is one minute, shared across all configured origins (state is
 
 Input guardrails inspect the parsed prompt ahead of egress ([config](../examples/ai-guardrails/)).
 
-The proxy supports nine guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, and `agent_alignment`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
+The proxy supports ten guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, `agent_alignment`, and `classifier`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
 
 Input guardrails apply to whichever body field the surface carries user text in:
 
@@ -487,9 +487,79 @@ Input guardrails apply to whichever body field the surface carries user text in:
 
 A single guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the input-guardrail check today because their bodies are forwarded byte-transparently; output-side scanning for those surfaces is reserved for a follow-up.
 
+### Embedding classifier
+
+The input-only `classifier` guardrail labels a prompt with the nearest
+operator-defined class. It runs a local sentence-embedding model, embeds each
+configured example once when the guardrail is built, averages those vectors
+into one unit centroid per class, and compares each request with cosine
+similarity. A class wins only when it clears both `min_score` and the
+`min_margin` over the runner-up.
+
+```yaml
+guardrails:
+  input:
+    - type: classifier
+      backend:
+        kind: embedding
+        model_path: /var/lib/sbproxy/models/minilm/model.onnx
+        tokenizer_path: /var/lib/sbproxy/models/minilm/tokenizer.json
+        min_score: 0.30
+        min_margin: 0.05
+        max_model_bytes: 209715200
+      classes:
+        documentation:
+          - "write the readme"
+          - "prepare an upgrade guide"
+        coding:
+          - "implement the parser"
+          - "fix the request handler"
+      scope: last_user_message
+      max_chars: 2000
+```
+
+Classifier output is a non-enforcing routing label, separate from security
+guardrail block verdicts. The winning class appears in
+`ai.guardrails.labels` in both the serial and mesh paths, where an `ai_policy`
+expression can select `route_to:<model>`. A classifier label never contributes
+to the mesh's `flagged_count`, block quorum, or redaction decision. Putting
+`classifier` under `output:` is a hard config error because the backend needs
+message scope and cannot safely classify streaming response chunks.
+
+Classifier configuration fails before publication when it contains unknown
+fields, blank artifact paths or labels, a class without a nonblank example, or
+non-finite/out-of-range score thresholds. `max_chars` is a Unicode-character
+limit for both request subjects and configured centroid examples; an example
+over the limit is rejected rather than silently embedding an unbounded string.
+
+The released binary includes `inprocess-classify`. Source builds that disable
+default features must enable it explicitly. Model and tokenizer files remain
+operator-supplied. A load or inference failure emits a warning and no class,
+so existing routing continues and neighboring security guardrails remain
+active.
+
+The public JSON schema deliberately leaves `action` as raw JSON so the module
+registry can accept built-in and external actions without regenerating one
+union for every plugin. It therefore cannot enumerate the nested classifier
+fields in editor completion. The field table in
+[configuration.md](configuration.md#classifier-input-guardrail) is the
+normative public schema, and the AI action compiler validates the tagged
+backend shape when it builds the pipeline.
+
+Internally, `sbproxy-ai` owns the `TextClassifier` trait and config shape,
+while `sbproxy-core` installs the ONNX implementation. That split is
+intentional: `sbproxy-classifiers` already depends on `sbproxy-ai`, so naming
+its `OnnxEmbedder` directly inside `sbproxy-ai` would create a crate cycle.
+Classifier entries share one loaded embedder when the resolved artifact paths
+and digests match and each entry's model-size limit accepts the current file.
+Replacing either file at the same path invalidates reuse on reload.
+
+The runnable configuration is
+[ai-classifier-routing](../examples/ai-classifier-routing/).
+
 ### Guardrail mesh
 
-By default the input guardrails run as a serial chain that blocks on the first detector to flag. The opt-in mesh runs them as a cascade instead, collects the full verdict set, and fuses it under a quorum rule, with optional redact-and-continue, a verdict cache, and a latency budget for the expensive classifiers. Switch it on with a `mesh` block under `guardrails`:
+By default the input guardrails run as a serial chain that blocks on the first security detector to flag. The opt-in mesh runs them as a cascade instead, collects security verdicts plus routing labels, and fuses the security verdicts under a quorum rule, with optional redact-and-continue, a verdict cache, and a latency budget for the expensive classifiers. Switch it on with a `mesh` block under `guardrails`:
 
 ```yaml
 guardrails:

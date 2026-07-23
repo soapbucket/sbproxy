@@ -163,8 +163,180 @@ impl sbproxy_ai::guardrails::TextClassifier for CentroidClassifier {
     }
 }
 
+#[cfg(feature = "inprocess-classify")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ArtifactIdentity {
+    /// Absolute configured pathname before resolving symlinks. This lets a
+    /// reload retire the previous generation when the same symlink is
+    /// repointed to a different canonical file.
+    source_path: std::path::PathBuf,
+    canonical_path: std::path::PathBuf,
+    byte_len: u64,
+    sha256: [u8; 32],
+}
+
+#[cfg(feature = "inprocess-classify")]
+#[derive(Debug)]
+struct ArtifactSnapshot {
+    identity: ArtifactIdentity,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "inprocess-classify")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EmbedderCacheKey {
+    model: ArtifactIdentity,
+    tokenizer: ArtifactIdentity,
+    max_model_bytes: Option<u64>,
+}
+
+#[cfg(feature = "inprocess-classify")]
+#[derive(Debug)]
+struct EmbedderArtifactSnapshots {
+    key: EmbedderCacheKey,
+    model: ArtifactSnapshot,
+    tokenizer: ArtifactSnapshot,
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn cache_entry_is_stale(cached: &EmbedderCacheKey, current: &EmbedderCacheKey) -> bool {
+    let same_model_source = cached.model.source_path == current.model.source_path
+        || cached.model.canonical_path == current.model.canonical_path;
+    let same_tokenizer_source = cached.tokenizer.source_path == current.tokenizer.source_path
+        || cached.tokenizer.canonical_path == current.tokenizer.canonical_path;
+    let replaced_model = same_model_source && cached.model != current.model;
+    let replaced_tokenizer = same_tokenizer_source && cached.tokenizer != current.tokenizer;
+    replaced_model || replaced_tokenizer
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn artifact_snapshot(
+    path: &std::path::Path,
+    kind: &str,
+    max_bytes: u64,
+) -> anyhow::Result<ArtifactSnapshot> {
+    use anyhow::{anyhow, Context};
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let source_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the current directory for classifier artifacts")?
+            .join(path)
+    };
+    let canonical_path = std::fs::canonicalize(&source_path)
+        .with_context(|| format!("failed to resolve classifier {kind} at {source_path:?}"))?;
+    // Open once, then derive both the digest and the exact parser input from
+    // this handle. A rename can replace `canonical_path` after this point
+    // without changing the generation represented by `file`.
+    let mut file = std::fs::File::open(&canonical_path)
+        .with_context(|| format!("failed to open classifier {kind} at {canonical_path:?}"))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect classifier {kind} at {canonical_path:?}"))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "classifier {kind} at {canonical_path:?} is not a regular file"
+        ));
+    }
+    let byte_len = metadata.len();
+    if max_bytes != 0 && byte_len > max_bytes {
+        return Err(anyhow!(
+            "classifier {kind} at {canonical_path:?} is {byte_len} bytes, \
+             exceeding the configured {max_bytes}-byte limit"
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let initial_capacity = usize::try_from(byte_len.min(1024 * 1024))
+        .context("classifier artifact length does not fit in memory")?;
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    let mut bytes_read = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).with_context(|| {
+            format!("failed to snapshot classifier {kind} at {canonical_path:?}")
+        })?;
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(count as u64)
+            .ok_or_else(|| anyhow!("classifier {kind} size overflow while reading"))?;
+        if max_bytes != 0 && bytes_read > max_bytes {
+            return Err(anyhow!(
+                "classifier {kind} at {canonical_path:?} grew beyond the configured \
+                 {max_bytes}-byte limit while it was read"
+            ));
+        }
+        hasher.update(&buffer[..count]);
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    let after_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to re-inspect classifier {kind} at {canonical_path:?}"))?;
+    if bytes_read != byte_len || after_metadata.len() != byte_len {
+        return Err(anyhow!(
+            "classifier {kind} at {canonical_path:?} changed while its snapshot was read"
+        ));
+    }
+
+    Ok(ArtifactSnapshot {
+        identity: ArtifactIdentity {
+            source_path,
+            canonical_path,
+            byte_len,
+            sha256: hasher.finalize().into(),
+        },
+        bytes,
+    })
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn embedder_artifact_snapshots(
+    cfg: &sbproxy_ai::guardrails::EmbeddingBackendConfig,
+) -> anyhow::Result<EmbedderArtifactSnapshots> {
+    let model_limit = cfg
+        .max_model_bytes
+        .unwrap_or(sbproxy_classifiers::MAX_MODEL_BYTES_DEFAULT);
+    let model = artifact_snapshot(std::path::Path::new(&cfg.model_path), "model", model_limit)?;
+    let tokenizer = artifact_snapshot(
+        std::path::Path::new(&cfg.tokenizer_path),
+        "tokenizer",
+        sbproxy_classifiers::MAX_MODEL_BYTES_DEFAULT,
+    )?;
+    let key = EmbedderCacheKey {
+        model: model.identity.clone(),
+        tokenizer: tokenizer.identity.clone(),
+        max_model_bytes: cfg.max_model_bytes,
+    };
+    Ok(EmbedderArtifactSnapshots {
+        key,
+        model,
+        tokenizer,
+    })
+}
+
+#[cfg(all(feature = "inprocess-classify", test))]
+fn embedder_cache_key(
+    cfg: &sbproxy_ai::guardrails::EmbeddingBackendConfig,
+) -> anyhow::Result<EmbedderCacheKey> {
+    Ok(embedder_artifact_snapshots(cfg)?.key)
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn load_embedder_from_snapshots_with<T>(
+    snapshots: &EmbedderArtifactSnapshots,
+    options: &sbproxy_classifiers::LoadOptions,
+    loader: impl FnOnce(&[u8], &[u8], &sbproxy_classifiers::LoadOptions) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    loader(&snapshots.model.bytes, &snapshots.tokenizer.bytes, options)
+}
+
 /// Load the embedder for `cfg`, reusing an already-loaded one when the
-/// same model and tokenizer pair has been seen before.
+/// same immutable artifacts and size policy have been seen before.
 ///
 /// Loading parses the ONNX graph and can take hundreds of milliseconds,
 /// so two origins that point at the same model share one instance.
@@ -173,32 +345,57 @@ fn shared_embedder(
     cfg: &sbproxy_ai::guardrails::EmbeddingBackendConfig,
 ) -> anyhow::Result<std::sync::Arc<sbproxy_classifiers::OnnxEmbedder>> {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-    /// Already-loaded embedders keyed by their (model_path, tokenizer_path)
-    /// pair, so two classifier origins pointed at the same files share one
-    /// loaded model instead of parsing the ONNX graph twice.
-    type EmbedderCache = HashMap<(String, String), Arc<sbproxy_classifiers::OnnxEmbedder>>;
+    /// Already-loaded embedders keyed by artifact content and the requested
+    /// model-size policy. Paths alone are insufficient: a hot reload can
+    /// replace either artifact in place, and a stricter origin must not reuse
+    /// a model that bypassed its own limit. Weak values ensure the cache never
+    /// pins a model after every reload-managed pipeline using it is gone.
+    type EmbedderCache = HashMap<EmbedderCacheKey, Weak<sbproxy_classifiers::OnnxEmbedder>>;
 
     static CACHE: OnceLock<Mutex<EmbedderCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (cfg.model_path.clone(), cfg.tokenizer_path.clone());
-    if let Ok(map) = cache.lock() {
-        if let Some(e) = map.get(&key) {
-            return Ok(Arc::clone(e));
+    // Capture the exact bytes and derive their identity before any cache
+    // lookup. The eventual parser consumes these buffers rather than
+    // reopening the configured pathname.
+    let snapshots = embedder_artifact_snapshots(cfg)?;
+    let key = snapshots.key.clone();
+    if let Ok(mut map) = cache.lock() {
+        // Drop an older generation at these paths before looking up the
+        // current identity. Existing pipelines keep their Arc until their
+        // in-flight requests finish, while the process-global cache no longer
+        // pins the stale files.
+        map.retain(|cached, embedder| {
+            !cache_entry_is_stale(cached, &key) && embedder.strong_count() > 0
+        });
+        if let Some(embedder) = map.get(&key).and_then(Weak::upgrade) {
+            return Ok(embedder);
+        }
+        // The file-size policy was checked before this lookup. Reusing the
+        // same immutable artifacts across two acceptable limits is safe and
+        // avoids parsing the ONNX graph twice; record the current policy as
+        // an alias so subsequent lookups are exact.
+        if let Some(existing) = map.iter().find_map(|(cached, embedder)| {
+            (cached.model == key.model && cached.tokenizer == key.tokenizer)
+                .then(|| embedder.upgrade())
+                .flatten()
+        }) {
+            map.insert(key, Arc::downgrade(&existing));
+            return Ok(existing);
         }
     }
     let mut options = sbproxy_classifiers::LoadOptions::default();
     if let Some(bytes) = cfg.max_model_bytes {
         options = options.with_max_model_bytes(bytes);
     }
-    let embedder = Arc::new(sbproxy_classifiers::OnnxEmbedder::load_with_options(
-        std::path::Path::new(&cfg.model_path),
-        std::path::Path::new(&cfg.tokenizer_path),
+    let embedder = Arc::new(load_embedder_from_snapshots_with(
+        &snapshots,
         &options,
+        sbproxy_classifiers::OnnxEmbedder::load_from_bytes_with_options,
     )?);
     if let Ok(mut map) = cache.lock() {
-        map.insert(key, Arc::clone(&embedder));
+        map.insert(key, Arc::downgrade(&embedder));
     }
     Ok(embedder)
 }
@@ -210,29 +407,40 @@ fn shared_embedder(
 /// warning rather than failing the whole load, so one bad example does
 /// not cost the operator the other classes.
 #[cfg(feature = "inprocess-classify")]
-fn build_backend(
+fn embed_class_examples(
     cfg: &sbproxy_ai::guardrails::ClassifierConfig,
-) -> anyhow::Result<std::sync::Arc<dyn sbproxy_ai::guardrails::TextClassifier>> {
-    // This factory only serves the embedding backend. The LLM backend
-    // is async and is built inside sbproxy-ai, so it never reaches
-    // here; the guard exists so a future third variant fails loudly
-    // instead of being silently treated as an embedding one.
-    let sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(backend) = &cfg.backend else {
-        anyhow::bail!("the in-process classifier factory only builds `kind: embedding` backends");
-    };
-    let embedder = shared_embedder(backend)?;
-    let mut centroids: Vec<(String, Vec<f32>)> = Vec::new();
-    for (label, examples) in &cfg.classes {
-        let vectors: Vec<Vec<f32>> = examples
-            .iter()
-            .filter_map(|e| match embedder.embed(e) {
-                Ok(o) => Some(o.values),
+    label: &str,
+    examples: &[String],
+    mut embed: impl FnMut(&str) -> anyhow::Result<Vec<f32>>,
+) -> Vec<Vec<f32>> {
+    examples
+        .iter()
+        .filter_map(|example| {
+            let bounded = cfg.bounded_text(example);
+            match embed(bounded) {
+                Ok(values) => Some(values),
                 Err(err) => {
                     tracing::warn!(error = %err, class = %label, "skipping unembeddable example");
                     None
                 }
-            })
-            .collect();
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn build_backend(
+    cfg: &sbproxy_ai::guardrails::ClassifierConfig,
+) -> anyhow::Result<std::sync::Arc<dyn sbproxy_ai::guardrails::TextClassifier>> {
+    // Only one backend variant exists today, so this destructure is
+    // irrefutable.
+    let sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(backend) = &cfg.backend;
+    let embedder = shared_embedder(backend)?;
+    let mut centroids: Vec<(String, Vec<f32>)> = Vec::new();
+    for (label, examples) in &cfg.classes {
+        let vectors = embed_class_examples(cfg, label, examples, |example| {
+            embedder.embed(example).map(|output| output.values)
+        });
         match build_centroid(&vectors) {
             Some(c) => centroids.push((label.clone(), c)),
             None => tracing::warn!(class = %label, "class has no usable examples; dropping it"),
@@ -396,6 +604,61 @@ mod tests {
         assert_eq!(v.label, "good");
     }
 
+    #[cfg(feature = "inprocess-classify")]
+    fn classifier_config_with_max_chars(
+        max_chars: usize,
+    ) -> sbproxy_ai::guardrails::ClassifierConfig {
+        sbproxy_ai::guardrails::ClassifierConfig {
+            backend: sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(
+                sbproxy_ai::guardrails::EmbeddingBackendConfig {
+                    model_path: "/unused/model.onnx".to_string(),
+                    tokenizer_path: "/unused/tokenizer.json".to_string(),
+                    min_score: 0.30,
+                    min_margin: 0.05,
+                    max_model_bytes: None,
+                },
+            ),
+            classes: std::collections::BTreeMap::from([(
+                "documentation".to_string(),
+                vec!["write docs".to_string()],
+            )]),
+            scope: sbproxy_ai::guardrails::ClassifierScope::LastUserMessage,
+            max_chars,
+        }
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn centroid_example_at_exact_character_cap_is_unchanged() {
+        let cfg = classifier_config_with_max_chars(4);
+        let examples = vec!["éabc".to_string()];
+        let mut seen = Vec::new();
+
+        let vectors = embed_class_examples(&cfg, "documentation", &examples, |text| {
+            seen.push(text.to_string());
+            Ok(vec![1.0])
+        });
+
+        assert_eq!(seen, ["éabc"]);
+        assert_eq!(vectors, [vec![1.0]]);
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn centroid_example_over_character_cap_is_truncated_before_embedding() {
+        let cfg = classifier_config_with_max_chars(4);
+        let examples = vec!["éabcd".to_string()];
+        let mut seen = Vec::new();
+
+        let vectors = embed_class_examples(&cfg, "documentation", &examples, |text| {
+            seen.push(text.to_string());
+            Ok(vec![1.0])
+        });
+
+        assert_eq!(seen, ["éabc"]);
+        assert_eq!(vectors, [vec![1.0]]);
+    }
+
     #[test]
     fn factory_rejects_a_config_whose_model_is_missing() {
         // The factory must return an error rather than panicking, because
@@ -418,5 +681,110 @@ mod tests {
             max_chars: 2000,
         };
         assert!(build_backend(&cfg).is_err());
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn embedder_cache_key_includes_the_requested_model_size_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"small-model").expect("model fixture");
+        std::fs::write(&tokenizer, b"tokenizer").expect("tokenizer fixture");
+
+        let permissive = sbproxy_ai::guardrails::EmbeddingBackendConfig {
+            model_path: model.display().to_string(),
+            tokenizer_path: tokenizer.display().to_string(),
+            min_score: 0.30,
+            min_margin: 0.05,
+            max_model_bytes: Some(100),
+        };
+        let mut strict = permissive.clone();
+        strict.max_model_bytes = Some(5);
+
+        let permissive_key = embedder_cache_key(&permissive).expect("permissive key");
+        assert!(
+            embedder_cache_key(&strict).is_err(),
+            "a stricter limit must be enforced before a cache lookup can reuse the model"
+        );
+        assert_eq!(permissive_key.max_model_bytes, Some(100));
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn embedder_cache_key_changes_when_an_artifact_changes_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"model-v1").expect("model fixture");
+        std::fs::write(&tokenizer, b"tokenizer").expect("tokenizer fixture");
+        let cfg = sbproxy_ai::guardrails::EmbeddingBackendConfig {
+            model_path: model.display().to_string(),
+            tokenizer_path: tokenizer.display().to_string(),
+            min_score: 0.30,
+            min_margin: 0.05,
+            max_model_bytes: Some(100),
+        };
+
+        let before = embedder_cache_key(&cfg).expect("first key");
+        std::fs::write(&model, b"model-v2").expect("replace model fixture");
+        let after = embedder_cache_key(&cfg).expect("second key");
+
+        assert_ne!(
+            before, after,
+            "replacing a model at the same path must invalidate cached state"
+        );
+        assert!(
+            cache_entry_is_stale(&before, &after),
+            "the cache must release the superseded artifact generation"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn embedder_loader_consumes_the_fingerprinted_snapshot_during_aba_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let replacement = dir.path().join("model-b.onnx");
+        let restoration = dir.path().join("model-a-restored.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"model-a").expect("model A fixture");
+        std::fs::write(&replacement, b"model-b").expect("model B fixture");
+        std::fs::write(&restoration, b"model-a").expect("restored model A fixture");
+        std::fs::write(&tokenizer, b"tokenizer-a").expect("tokenizer fixture");
+        let cfg = sbproxy_ai::guardrails::EmbeddingBackendConfig {
+            model_path: model.display().to_string(),
+            tokenizer_path: tokenizer.display().to_string(),
+            min_score: 0.30,
+            min_margin: 0.05,
+            max_model_bytes: Some(100),
+        };
+
+        let snapshots =
+            embedder_artifact_snapshots(&cfg).expect("capture fingerprinted artifact bytes");
+        let consumed = load_embedder_from_snapshots_with(
+            &snapshots,
+            &sbproxy_classifiers::LoadOptions::default(),
+            |model_bytes, tokenizer_bytes, _| {
+                std::fs::remove_file(&model).expect("remove model A");
+                std::fs::rename(&replacement, &model).expect("install model B");
+                assert_eq!(
+                    std::fs::read(&model).expect("read path during load"),
+                    b"model-b"
+                );
+                std::fs::remove_file(&model).expect("remove model B");
+                std::fs::rename(&restoration, &model).expect("restore model A");
+                Ok((model_bytes.to_vec(), tokenizer_bytes.to_vec()))
+            },
+        )
+        .expect("snapshot consumer");
+
+        assert_eq!(consumed.0, b"model-a");
+        assert_eq!(consumed.1, b"tokenizer-a");
+        assert_eq!(
+            snapshots.key,
+            embedder_cache_key(&cfg).expect("identity after ABA restoration"),
+            "the A-to-B-to-A path identity is intentionally unchanged"
+        );
     }
 }

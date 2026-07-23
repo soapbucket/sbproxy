@@ -239,6 +239,16 @@ fn the_config_authority_example_compiles_on_both_sides_of_the_wire() {
 }
 
 #[test]
+fn classifier_routing_example_compiles() {
+    export_example_env_dummies();
+    let file = examples_root().join("ai-classifier-routing/sb.yml");
+    let yaml = std::fs::read_to_string(&file)
+        .unwrap_or_else(|error| panic!("{}: read failed: {error}", file.display()));
+    sbproxy_config::compile_config(&yaml)
+        .unwrap_or_else(|error| panic!("{}: compile_config: {error}", file.display()));
+}
+
+#[test]
 fn every_split_model_cluster_role_compiles() {
     export_example_env_dummies();
     let example = examples_root().join("model-cluster-split");

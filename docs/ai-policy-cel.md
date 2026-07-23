@@ -1,6 +1,6 @@
 # AI policy plane (CEL)
 
-*Last modified: 2026-07-23*
+*Last modified: 2026-07-19*
 
 The AI policy plane is one sandboxed CEL expression that expresses
 cross-cutting rules over the AI decision pipeline. Instead of spreading a
@@ -93,9 +93,9 @@ for the shared grammar and rejection rules.
 | `ai.principal.tenant` | string | Tenant the request resolved to. |
 | `ai.principal.api_key_id` | string | Authenticated key id. |
 | `ai.principal.tier` | string | Principal risk tier (from the `SB-Attr-Risk-Tier` tag). |
-| `ai.guardrails.flagged` | bool | Whether any guardrail flagged the request. |
-| `ai.guardrails.flagged_count` | int | Number of guardrails that flagged. |
-| `ai.guardrails.labels` | list | Labels of the flagging guardrails. |
+| `ai.guardrails.flagged` | bool | Whether any enforcing security guardrail flagged the request. |
+| `ai.guardrails.flagged_count` | int | Number of enforcing security guardrails that flagged. |
+| `ai.guardrails.labels` | list | Security verdict labels plus non-enforcing routing labels such as prompt classes. |
 | `ai.budget.fraction` | double | Fraction of the tightest active budget window consumed. |
 | `ai.budget.exceeded` | bool | Whether a budget window is already exceeded. |
 | `ai.tokens.input_est` | int | Target-model input estimate for the current uncompressed JSON messages. |
@@ -106,11 +106,6 @@ the documented UTF-8 byte-length heuristic. This makes an expression such as
 `ai.tokens.input_est > 12000 ? "compression:compact" : "compression:off"`
 depend on the caller's original context rather than a stale or post-compression
 accounting field.
-
-`ai.guardrails.labels` carries the name of every guardrail that flagged. A
-[`classifier` guardrail](ai-classifier-routing.md) contributes its predicted
-class instead, so an expression can read that label and emit a matching
-`route_to:`.
 
 The guardrail-verdict and budget-fraction dimensions are richest when the
 [guardrail mesh](ai-guardrail-mesh.md) and
