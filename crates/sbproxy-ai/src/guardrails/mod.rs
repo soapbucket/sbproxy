@@ -1,6 +1,7 @@
 //! AI guardrails pipeline - input/output content safety checks.
 
 mod agent_alignment;
+pub mod classifier;
 mod content_safety;
 mod context_poisoning;
 mod context_poisoning_rules;
@@ -18,6 +19,10 @@ pub mod stream;
 mod toxicity;
 
 pub use agent_alignment::{AgentAlignmentConfig, AgentAlignmentGuardrail, AgentAlignmentMode};
+pub use classifier::{
+    build_classifier, register_classifier_factory, ClassifierConfig, ClassifierFactory,
+    ClassifierGuardrail, ClassifierScope, ClassifierVerdict, TextClassifier,
+};
 pub use content_safety::ContentSafetyGuardrail;
 pub use context_poisoning::{
     ContextPoisoningConfig, ContextPoisoningGuardrail, Finding as ContextPoisoningFinding,
