@@ -9,12 +9,105 @@ use std::collections::{HashMap, HashSet};
 use graphql_parser::query::{
     parse_query, Definition, Document, OperationDefinition, Selection, SelectionSet,
 };
-use serde::Deserialize;
+use serde::{
+    de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer,
+};
 
 use super::ForwardingHeaderControls;
 
 fn default_allow_introspection() -> bool {
     true
+}
+
+struct UniqueJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_string(value.to_string())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(UniqueJsonValue(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom(format!(
+                    "duplicate JSON object key {key:?}"
+                )));
+            }
+            let UniqueJsonValue(value) = map.next_value()?;
+            values.insert(key, value);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Object(values)))
+    }
 }
 
 /// GraphQL action config - proxies GraphQL requests to an upstream HTTP server.
@@ -77,6 +170,7 @@ impl GraphQLAction {
 
         let document = parse_query::<String>(query)
             .map_err(|error| format!("invalid GraphQL query: {error}"))?;
+        reject_duplicate_fragment_definitions(&document)?;
         if !self.allow_introspection && document_selects_introspection(&document) {
             return Err("GraphQL introspection is disabled".to_string());
         }
@@ -136,7 +230,7 @@ impl GraphQLAction {
             return Ok(());
         }
 
-        let value: serde_json::Value = serde_json::from_slice(body)
+        let UniqueJsonValue(value) = serde_json::from_slice(body)
             .map_err(|error| format!("invalid GraphQL JSON body: {error}"))?;
         match value {
             serde_json::Value::Object(object) => self.validate_json_envelope(&object),
@@ -169,6 +263,21 @@ impl GraphQLAction {
     }
 }
 
+fn reject_duplicate_fragment_definitions(document: &Document<'_, String>) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for definition in &document.definitions {
+        if let Definition::Fragment(fragment) = definition {
+            if !names.insert(fragment.name.as_str()) {
+                return Err(format!(
+                    "GraphQL query contains duplicate fragment definition {}",
+                    fragment.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn document_selects_introspection(document: &Document<'_, String>) -> bool {
     document.definitions.iter().any(|definition| {
         let selection_set = match definition {
@@ -198,6 +307,10 @@ fn selection_set_selects_introspection(selection_set: &SelectionSet<'_, String>)
 }
 
 fn document_max_depth(document: &Document<'_, String>) -> Result<usize, String> {
+    document_max_depth_with_work(document).map(|(depth, _)| depth)
+}
+
+fn document_max_depth_with_work(document: &Document<'_, String>) -> Result<(usize, usize), String> {
     let fragments: HashMap<&str, &SelectionSet<'_, String>> = document
         .definitions
         .iter()
@@ -208,63 +321,79 @@ fn document_max_depth(document: &Document<'_, String>) -> Result<usize, String> 
             Definition::Operation(_) => None,
         })
         .collect();
-    let mut active_fragments = HashSet::new();
+    // `None` marks a fragment currently being visited (cycle detection);
+    // `Some(depth)` memoizes a completed fragment so a DAG with repeated
+    // spreads is evaluated once per fragment instead of expanded recursively.
+    let mut fragment_depths: HashMap<String, Option<usize>> = HashMap::new();
+    let mut selection_visits = 0;
+    let mut max_depth = 0;
 
-    document
-        .definitions
-        .iter()
-        .filter_map(|definition| match definition {
-            Definition::Operation(operation) => Some(match operation {
-                OperationDefinition::SelectionSet(selection_set) => {
-                    selection_set_max_depth(selection_set, &fragments, &mut active_fragments)
-                }
-                OperationDefinition::Query(query) => {
-                    selection_set_max_depth(&query.selection_set, &fragments, &mut active_fragments)
-                }
-                OperationDefinition::Mutation(mutation) => selection_set_max_depth(
-                    &mutation.selection_set,
-                    &fragments,
-                    &mut active_fragments,
-                ),
-                OperationDefinition::Subscription(subscription) => selection_set_max_depth(
-                    &subscription.selection_set,
-                    &fragments,
-                    &mut active_fragments,
-                ),
-            }),
-            Definition::Fragment(_) => None,
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|depths| depths.into_iter().max().unwrap_or(0))
+    for definition in &document.definitions {
+        let Definition::Operation(operation) = definition else {
+            continue;
+        };
+        let selection_set = match operation {
+            OperationDefinition::SelectionSet(selection_set) => selection_set,
+            OperationDefinition::Query(query) => &query.selection_set,
+            OperationDefinition::Mutation(mutation) => &mutation.selection_set,
+            OperationDefinition::Subscription(subscription) => &subscription.selection_set,
+        };
+        let depth = selection_set_max_depth(
+            selection_set,
+            &fragments,
+            &mut fragment_depths,
+            &mut selection_visits,
+        )?;
+        max_depth = max_depth.max(depth);
+    }
+
+    Ok((max_depth, selection_visits))
 }
 
 fn selection_set_max_depth(
     selection_set: &SelectionSet<'_, String>,
     fragments: &HashMap<&str, &SelectionSet<'_, String>>,
-    active_fragments: &mut HashSet<String>,
+    fragment_depths: &mut HashMap<String, Option<usize>>,
+    selection_visits: &mut usize,
 ) -> Result<usize, String> {
+    *selection_visits += selection_set.items.len();
     selection_set
         .items
         .iter()
         .map(|selection| match selection {
-            Selection::Field(field) => {
-                selection_set_max_depth(&field.selection_set, fragments, active_fragments)
-                    .map(|child_depth| 1 + child_depth)
-            }
-            Selection::InlineFragment(fragment) => {
-                selection_set_max_depth(&fragment.selection_set, fragments, active_fragments)
-            }
+            Selection::Field(field) => selection_set_max_depth(
+                &field.selection_set,
+                fragments,
+                fragment_depths,
+                selection_visits,
+            )
+            .map(|child_depth| 1 + child_depth),
+            Selection::InlineFragment(fragment) => selection_set_max_depth(
+                &fragment.selection_set,
+                fragments,
+                fragment_depths,
+                selection_visits,
+            ),
             Selection::FragmentSpread(spread) => {
                 let name = spread.fragment_name.as_str();
+                if let Some(depth) = fragment_depths.get(name) {
+                    return depth
+                        .ok_or_else(|| format!("GraphQL query contains fragment cycle at {name}"));
+                }
                 let fragment = fragments
                     .get(name)
                     .ok_or_else(|| format!("GraphQL query references unknown fragment {name}"))?;
-                if !active_fragments.insert(name.to_string()) {
-                    return Err(format!("GraphQL query contains fragment cycle at {name}"));
+                fragment_depths.insert(name.to_string(), None);
+                let depth = selection_set_max_depth(
+                    fragment,
+                    fragments,
+                    fragment_depths,
+                    selection_visits,
+                )?;
+                if let Some(cached) = fragment_depths.get_mut(name) {
+                    *cached = Some(depth);
                 }
-                let depth = selection_set_max_depth(fragment, fragments, active_fragments);
-                active_fragments.remove(name);
-                depth
+                Ok(depth)
             }
         })
         .collect::<Result<Vec<_>, _>>()
@@ -497,6 +626,38 @@ mod tests {
     }
 
     #[test]
+    fn fragment_depth_analysis_does_not_expand_repeated_spreads_exponentially() {
+        let gql = GraphQLAction {
+            url: "http://localhost/graphql".to_string(),
+            max_depth: 100,
+            allow_introspection: true,
+            validate_queries: false,
+            host_override: None,
+            forwarding: Default::default(),
+        };
+        let mut query = String::from("query { ...F0 }\n");
+        for depth in 0..22 {
+            query.push_str(&format!(
+                "fragment F{depth} on Query {{ ...F{} ...F{} }}\n",
+                depth + 1,
+                depth + 1
+            ));
+        }
+        query.push_str("fragment F22 on Query { leaf }\n");
+
+        let document = parse_query::<String>(&query).expect("parse generated fragment DAG");
+        let (depth, selection_visits) =
+            document_max_depth_with_work(&document).expect("analyze fragment DAG");
+
+        assert_eq!(depth, 1);
+        assert_eq!(
+            selection_visits, 46,
+            "each fragment selection set must be evaluated only once"
+        );
+        assert!(gql.validate_query(&query).is_ok());
+    }
+
+    #[test]
     fn validated_post_requires_json_and_rejects_persisted_query_only_envelope() {
         let gql = GraphQLAction {
             url: "http://localhost/graphql".to_string(),
@@ -521,5 +682,50 @@ mod tests {
         assert!(gql
             .validate_post_body(Some("application/json; charset=utf-8"), persisted_only)
             .is_err());
+    }
+
+    #[test]
+    fn validated_json_rejects_duplicate_keys_at_every_level() {
+        let gql = GraphQLAction {
+            url: "http://localhost/graphql".to_string(),
+            max_depth: 0,
+            allow_introspection: true,
+            validate_queries: true,
+            host_override: None,
+            forwarding: Default::default(),
+        };
+
+        assert!(gql
+            .validate_json_body(br#"{"query":"{ safe }","query":"{ unsafe }"}"#)
+            .is_err());
+        assert!(gql
+            .validate_json_body(
+                br#"{"query":"{ safe }","variables":{"role":"user","role":"admin"}}"#,
+            )
+            .is_err());
+        assert!(gql
+            .validate_json_body(
+                br#"[{"query":"{ safe }"},{"query":"{ safe }","extensions":{"id":1,"id":2}}]"#,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn validated_query_rejects_duplicate_fragment_definitions() {
+        let gql = GraphQLAction {
+            url: "http://localhost/graphql".to_string(),
+            max_depth: 0,
+            allow_introspection: true,
+            validate_queries: true,
+            host_override: None,
+            forwarding: Default::default(),
+        };
+        let query = r#"
+            query { viewer { ...Fields } }
+            fragment Fields on User { id }
+            fragment Fields on User { secret }
+        "#;
+
+        assert!(gql.validate_query(query).is_err());
     }
 }

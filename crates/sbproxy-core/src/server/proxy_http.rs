@@ -1284,6 +1284,62 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // Validate GraphQL only after every request modifier has produced the
+        // outbound method, URI, headers, and replacement body. This closes the
+        // gap where a benign client document could pass validation and then
+        // be rewritten into a forbidden request before proxying.
+        if ctx.graphql_validation_pending {
+            let pipeline = ctx.pipeline.clone();
+            let validation_result = if let Some(origin_idx) = ctx.origin_idx {
+                let forwarded_action = ctx.forward_rule_idx.and_then(|forward_idx| {
+                    pipeline
+                        .forward_rules
+                        .get(origin_idx)
+                        .and_then(|rules| rules.get(forward_idx))
+                        .map(|rule| &rule.action)
+                });
+                let effective_action =
+                    forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
+                match effective_action {
+                    Some(Action::GraphQL(graphql)) => match upstream_request.method {
+                        http::Method::GET => {
+                            graphql.validate_get_query(upstream_request.uri.query())
+                        }
+                        http::Method::POST => {
+                            let content_type = upstream_request
+                                .headers
+                                .get(http::header::CONTENT_TYPE)
+                                .and_then(|value| value.to_str().ok());
+                            let body = ctx
+                                .replacement_request_body
+                                .as_deref()
+                                .or(ctx.graphql_request_body.as_deref())
+                                .unwrap_or_default();
+                            graphql.validate_post_body(content_type, body)
+                        }
+                        _ => Err("validated GraphQL actions accept GET or POST only".to_string()),
+                    },
+                    _ => Err("validated GraphQL action is no longer available".to_string()),
+                }
+            } else {
+                Err("validated GraphQL action has no resolved origin".to_string())
+            };
+
+            if let Err(detail) = validation_result {
+                debug!(detail = %detail, "GraphQL request validation failed");
+                let body = serde_json::json!({
+                    "error": "GraphQL request validation failed",
+                    "detail": detail,
+                })
+                .to_string();
+                ctx.validator_failed = Some((400, body, "application/json".to_string()));
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(400),
+                    "GraphQL request validation failed",
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -3976,6 +4032,19 @@ impl ProxyHttp for SbProxy {
         // validation failure. Surface the configured status / body
         // here rather than the generic 502.
         if let Some((status, body, content_type)) = ctx.validator_failed.take() {
+            // GraphQL validation runs in `upstream_request_filter`, after
+            // Pingora selected an upstream. Pingora cannot reuse an HTTP/1
+            // downstream after an error at that phase, so advertise the
+            // close explicitly instead of emitting a misleading keep-alive.
+            let close_downstream = ctx.graphql_validation_pending;
+            let close_http1 = close_downstream
+                && matches!(
+                    session.req_header().version,
+                    http::Version::HTTP_10 | http::Version::HTTP_11
+                );
+            if close_http1 {
+                session.set_keepalive(None);
+            }
             let mut header = match pingora_http::ResponseHeader::build(status, Some(2)) {
                 Ok(h) => h,
                 Err(_) => {
@@ -3983,12 +4052,15 @@ impl ProxyHttp for SbProxy {
                     ctx.response_status = Some(status);
                     return FailToProxy {
                         error_code: status,
-                        can_reuse_downstream: true,
+                        can_reuse_downstream: !close_downstream,
                     };
                 }
             };
             let _ = header.insert_header("content-type", content_type);
             let _ = header.insert_header("content-length", body.len().to_string());
+            if close_http1 {
+                let _ = header.insert_header("connection", "close");
+            }
             let _ = session.write_response_header(Box::new(header), false).await;
             let _ = session
                 .write_response_body(Some(bytes::Bytes::from(body)), true)
@@ -3996,7 +4068,7 @@ impl ProxyHttp for SbProxy {
             ctx.response_status = Some(status);
             return FailToProxy {
                 error_code: status,
-                can_reuse_downstream: true,
+                can_reuse_downstream: !close_downstream,
             };
         }
 

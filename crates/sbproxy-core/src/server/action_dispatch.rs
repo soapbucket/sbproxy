@@ -26,57 +26,39 @@ pub(super) async fn handle_action(
                 return Ok(false);
             }
 
+            // The request's final method, URI, headers, and replacement body
+            // do not exist until `upstream_request_filter` applies request
+            // modifiers. Mark it for validation there. POST bodies still
+            // need to be captured now so both validation and forwarding see
+            // the same bytes.
+            ctx.graphql_validation_pending = true;
             let method = session.req_header().method.clone();
-            let result: Result<(), (u16, String)> = match method {
-                http::Method::GET => graphql
-                    .validate_get_query(session.req_header().uri.query())
-                    .map_err(|detail| (400, detail)),
-                http::Method::POST => {
-                    // Pingora copies bodies consumed from request_filter into
-                    // its replay buffer. Reading the complete JSON envelope
-                    // here lets us reject before upstream request headers are
-                    // sent while a validated body is still forwarded
-                    // unchanged.
-                    let content_type = session
-                        .req_header()
-                        .headers
-                        .get(http::header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_string);
-                    session.as_mut().enable_retry_buffering();
-                    let mut body = Vec::new();
-                    let mut replay_buffer_truncated = false;
-                    while let Some(chunk) = session.read_request_body().await? {
-                        if !replay_buffer_truncated {
-                            replay_buffer_truncated = session.as_ref().retry_buffer_truncated();
-                            if replay_buffer_truncated {
-                                body.clear();
-                            } else {
-                                body.extend_from_slice(&chunk);
-                            }
+            if method == http::Method::POST {
+                // Pingora copies bodies consumed from request_filter into its
+                // replay buffer. The fixed 64 KiB buffer is therefore also
+                // the maximum body that can be validated and then forwarded
+                // byte-for-byte.
+                session.as_mut().enable_retry_buffering();
+                let mut body = Vec::new();
+                let mut replay_buffer_truncated = false;
+                while let Some(chunk) = session.read_request_body().await? {
+                    if !replay_buffer_truncated {
+                        replay_buffer_truncated = session.as_ref().retry_buffer_truncated();
+                        if replay_buffer_truncated {
+                            body.clear();
+                        } else {
+                            body.extend_from_slice(&chunk);
                         }
                     }
-                    if replay_buffer_truncated {
-                        Err((
-                            413,
-                            "validated GraphQL POST body exceeds the 64 KiB replay limit"
-                                .to_string(),
-                        ))
-                    } else {
-                        graphql
-                            .validate_post_body(content_type.as_deref(), &body)
-                            .map_err(|detail| (400, detail))
-                    }
                 }
-                _ => Err((
-                    400,
-                    "validated GraphQL actions accept GET or POST only".to_string(),
-                )),
-            };
-            if let Err((status, detail)) = result {
-                debug!(detail = %detail, "GraphQL request validation failed");
-                send_error(session, status, &detail).await?;
-                return Ok(true);
+                if replay_buffer_truncated {
+                    let detail =
+                        "validated GraphQL POST body exceeds the 64 KiB replay limit".to_string();
+                    debug!(detail = %detail, "GraphQL request validation failed");
+                    send_error(session, 413, &detail).await?;
+                    return Ok(true);
+                }
+                ctx.graphql_request_body = Some(bytes::Bytes::from(body));
             }
             Ok(false)
         }

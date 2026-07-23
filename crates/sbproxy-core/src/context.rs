@@ -470,6 +470,14 @@ pub struct RequestContext {
     /// so that the body filter phase can swap it in before sending upstream.
     pub replacement_request_body: Option<bytes::Bytes>,
 
+    // --- GraphQL validation state ---
+    /// Whether the resolved GraphQL action requires validation of the final
+    /// outbound request after request modifiers have run.
+    pub graphql_validation_pending: bool,
+    /// Original POST bytes captured into Pingora's replay buffer. The final
+    /// validator uses these unless a body modifier supplies replacement bytes.
+    pub graphql_request_body: Option<bytes::Bytes>,
+
     // --- Response modifier state ---
     /// If a response modifier specifies a status code override, it is stored here
     /// so that response_filter can apply it.
@@ -1201,6 +1209,8 @@ impl RequestContext {
             fallback_body: None,
             csrf_cookie: None,
             replacement_request_body: None,
+            graphql_validation_pending: false,
+            graphql_request_body: None,
             response_status_override: None,
             response_body_replacement: None,
             trust_headers: None,

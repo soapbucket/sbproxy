@@ -93,6 +93,45 @@ origins:
 }
 
 #[test]
+fn graphql_validates_the_body_after_request_modifiers() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      allow_introspection: false
+    request_modifiers:
+      - body:
+          replace_json:
+            query: "{{ __schema {{ queryType {{ name }} }} }}"
+"#,
+        upstream.base_url()
+    );
+
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    let resp = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!({"query": "{ hello }"}),
+            &[("content-type", "application/json")],
+        )
+        .expect("send benign GraphQL query");
+
+    assert_eq!(resp.status, 400);
+    assert!(
+        upstream.captured().is_empty(),
+        "a request modifier must not introduce a GraphQL validation bypass"
+    );
+}
+
+#[test]
 fn graphql_validates_percent_encoded_get_queries_before_upstream() {
     let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
     let yaml = format!(
@@ -277,15 +316,23 @@ origins:
         )
         .expect("send malformed query");
     assert_eq!(malformed.status, 400);
+    assert_eq!(
+        malformed.headers.get("connection").map(String::as_str),
+        Some("close"),
+        "a rejection after upstream selection must advertise that HTTP/1.1 cannot be reused"
+    );
 
+    let valid_batch_body = json!([
+        {"query": "{ viewer { id } }"},
+        {"query": "mutation { updateName(name: \"Ada\") { id } }"}
+    ]);
+    let expected_batch_bytes =
+        serde_json::to_vec(&valid_batch_body).expect("serialize expected batch bytes");
     let valid_batch = proxy
         .post_json(
             "/graphql",
             "gql.localhost",
-            &json!([
-                {"query": "{ viewer { id } }"},
-                {"query": "mutation { updateName(name: \"Ada\") { id } }"}
-            ]),
+            &valid_batch_body,
             &[("content-type", "application/json")],
         )
         .expect("send valid batch");
@@ -303,10 +350,15 @@ origins:
         )
         .expect("send invalid batch");
     assert_eq!(invalid_batch.status, 400);
+    let captured = upstream.captured();
     assert_eq!(
-        upstream.captured().len(),
+        captured.len(),
         1,
         "only the valid batch may reach the upstream"
+    );
+    assert_eq!(
+        captured[0].body, expected_batch_bytes,
+        "validated batch bytes must be replayed upstream unchanged"
     );
 }
 
