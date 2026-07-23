@@ -39,6 +39,7 @@ default = [
   "llms-txt",
   "tls-fingerprint",
   "inprocess-embed",
+  "inprocess-classify",
   "gpu-nvidia",
   "gpu-apple",
   "model-weights",
@@ -47,6 +48,9 @@ tiered-pricing = ["sbproxy-modules/tiered-pricing"]
 # WOR-1235: in-process semantic-cache embedder (single-binary). Forwards to
 # sbproxy-core/inprocess-embed.
 inprocess-embed = ["sbproxy-core/inprocess-embed"]
+# In-process MiniLM classifier backing the `type: classifier` AI
+# guardrail. Forwards to sbproxy-core/inprocess-classify.
+inprocess-classify = ["sbproxy-core/inprocess-classify"]
 agent-class = ["sbproxy-core/agent-class"]
 http-ledger = ["sbproxy-modules/http-ledger"]
 content-negotiate = ["sbproxy-modules/content-negotiate"]

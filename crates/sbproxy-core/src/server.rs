@@ -3253,6 +3253,8 @@ mod callbacks;
 use callbacks::*;
 
 // --- AI proxy helpers ---
+pub(crate) mod ai_classifier;
+
 pub(crate) mod ai_support;
 use ai_support::*;
 

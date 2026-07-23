@@ -1,0 +1,164 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: route on what the prompt is asking for.
+#
+# A `type: classifier` input guardrail labels each prompt with one of the
+# classes declared below. The mesh publishes that label into
+# `ai.guardrails.labels`, the CEL policy turns the label into a
+# `route_to:`, and model-based routing hands the request to whichever
+# provider declares that model. Documentation work runs on the local
+# model. Everything else stays on the hosted provider.
+#
+# `block_threshold: 0` is not optional here. A label counts as a flag,
+# and the mesh's default threshold of 1 would reject every classified
+# prompt with a 400. Zero turns the mesh into a pure labeler.
+#
+# The embedding backend reads two files off disk and downloads nothing.
+# Paths are absolute and `~` is not expanded, so point them at wherever
+# you put all-MiniLM-L6-v2. README.md has the curl commands.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   ollama serve &
+#   ollama pull qwen3-coder:30b
+#   make run CONFIG=examples/ai-classifier-routing/sb.yml
+#
+# Test (a coding prompt stays on Anthropic):
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user",
+#          "content":"Refactor this function to remove the nested loop."}]}' \
+#     | jq -r .model
+#   # claude-sonnet-4-5
+#
+# Test (a documentation prompt goes local):
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-sonnet-4-5","max_tokens":256,"messages":[{"role":"user",
+#          "content":"Write the README section documenting this endpoint."}]}' \
+#     | jq -r .model
+#   # qwen3-coder:30b
+#
+# Test (a phrasing no pattern list would have caught):
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-sonnet-4-5","max_tokens":256,"messages":[{"role":"user",
+#          "content":"Put together a page explaining the retry logic."}]}' \
+#     | jq -r .model
+#   # qwen3-coder:30b
+#
+# Expected behaviour:
+#   A prompt that matches a class is rerouted. A prompt that matches
+#   nothing, or a classifier that cannot load its model, produces no
+#   label, the CEL expression takes its else branch, and the request
+#   keeps the model the client asked for. Nothing here rejects a request.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: fallback_chain
+
+      providers:
+        - name: anthropic
+          priority: 1
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-sonnet-4-5
+          models:
+            - claude-sonnet-4-5
+
+        # The local runtime. `route_to:qwen3-coder:30b` lands here
+        # because this provider is the one that declares that model.
+        - name: ollama
+          priority: 2
+          default_model: qwen3-coder:30b
+          models:
+            - qwen3-coder:30b
+
+      guardrails:
+        # A classifier label reaches the policy plane only through the
+        # mesh, so this block is required. `block_threshold: 0` means no
+        # guardrail on this origin blocks on the flag count, which is
+        # what makes the classifier a labeler instead of a rejector.
+        # Leave `redact_on_flag` off (the default) or every classified
+        # prompt gets masked on its way upstream.
+        mesh:
+          block_threshold: 0
+          cache: true
+          cache_capacity: 1024
+          latency_budget_ms: 250
+
+        input:
+          - type: classifier
+            # Classify the final user turn only. `full_text` reads the
+            # whole conversation instead.
+            scope: last_user_message
+            # Characters kept before the backend sees the text.
+            max_chars: 2000
+            backend:
+              kind: embedding
+              model_path: /var/lib/sbproxy/models/minilm/model.onnx
+              tokenizer_path: /var/lib/sbproxy/models/minilm/tokenizer.json
+              # Cosine floor for the winning class, and the gap it has to
+              # open over the runner-up. A prompt that clears neither is
+              # left unlabeled.
+              min_score: 0.30
+              min_margin: 0.05
+            classes:
+              documentation:
+                - "Write the README section documenting this endpoint."
+                - "Add a docstring to this function explaining its arguments."
+                - "Draft release notes for the changes in this version."
+                - "Write a getting started guide for new users of this library."
+                - "Document the configuration options for this module."
+                - "Explain what this API returns, for the reference docs."
+              coding:
+                - "Refactor this function to remove the nested loop."
+                - "Fix the panic in this parser when the input is empty."
+                - "Write a unit test covering the retry path."
+                - "Implement a binary search over this sorted slice."
+                - "Why does this build fail with a borrow checker error?"
+                - "Optimize this query, it does a full table scan."
+
+      ai_policy:
+        expression: |
+          "documentation" in ai.guardrails.labels
+            ? ["route_to:qwen3-coder:30b", "set_sink_tag:docs-local"]
+            : ["allow"]
+        # Applied when the expression errors or returns something
+        # unrecognized. Allow keeps the client's own model choice.
+        on_error: allow
+
+# --- Alternative: ask a model instead of loading one ---
+#
+# Swap the `backend:` block above for this one to classify by asking an
+# OpenAI-compatible /chat/completions endpoint which class fits. No model
+# files, better on phrasings your examples never covered, and one network
+# call plus its cost on every prompt the verdict cache misses.
+#
+# The `classes:` block is unchanged: the same example prompts become
+# few-shot guidance in the instruction the endpoint receives.
+#
+#           backend:
+#             kind: llm
+#             # The full endpoint path, not a prefix.
+#             base_url: http://localhost:11434/v1/chat/completions
+#             model: qwen3-coder:30b
+#             # Omit `api_key` entirely for a local runtime that needs
+#             # none. For a hosted endpoint:
+#             #   api_key: ${OPENAI_API_KEY}
+#             # A `${VAR}` that was unset when the config loaded leaves
+#             # this classifier inert and logs at error. It is never sent
+#             # as a literal bearer token.
+#             timeout_ms: 2000
+#             cache_capacity: 1024
+#             # Log level for a failed call, not a decision. Both
+#             # settings produce no label and keep the original routing.
+#             fail_open: true
+#
+# This backend runs on the mesh's async pass, so it needs the `mesh:`
+# block to run at all. Without one it stays silently inert and the proxy
+# says so once at startup.

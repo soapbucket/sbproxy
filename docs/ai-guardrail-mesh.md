@@ -1,5 +1,5 @@
 # Guardrail mesh
-*Last modified: 2026-06-24*
+*Last modified: 2026-07-23*
 
 The serial guardrail chain blocks on the first detector that flags. The
 guardrail mesh instead runs the input detectors as a cascade, collects the
@@ -38,7 +38,10 @@ the ONNX classifiers) and counts how many flag.
 
 - `block_threshold` is the quorum: the request is blocked when
   `flagged_count >= block_threshold`. `1` reproduces the serial behavior;
-  `0` never blocks on the count.
+  `0` never blocks on the count. Setting it to `0` turns the mesh into a
+  pure labeler, which is what a routing signal needs;
+  [classifier-based routing](ai-classifier-routing.md) is the worked
+  example.
 - `redact_on_flag`: when a request is flagged but the count is below the
   block threshold, the prompt is masked by the origin's PII redactor and
   the request continues, instead of passing through untouched.

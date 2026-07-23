@@ -1,6 +1,7 @@
 //! AI guardrails pipeline - input/output content safety checks.
 
 mod agent_alignment;
+pub mod classifier;
 mod content_safety;
 mod context_poisoning;
 mod context_poisoning_rules;
@@ -10,6 +11,10 @@ mod context_poisoning_rules;
 // constants without duplicating the lists.
 pub mod injection;
 mod jailbreak;
+// The LLM classifier backend lives here rather than in `sbproxy-core`
+// (where the ONNX embedding backend has to live) because it has no ONNX
+// dependency, so it can sit next to the trait it implements.
+pub mod llm_classifier;
 pub mod mesh;
 mod pii;
 mod regex_guard;
@@ -18,6 +23,11 @@ pub mod stream;
 mod toxicity;
 
 pub use agent_alignment::{AgentAlignmentConfig, AgentAlignmentGuardrail, AgentAlignmentMode};
+pub use classifier::{
+    build_classifier, register_classifier_factory, AsyncTextClassifier, ClassifierBackendConfig,
+    ClassifierConfig, ClassifierFactory, ClassifierGuardrail, ClassifierScope, ClassifierVerdict,
+    EmbeddingBackendConfig, TextClassifier,
+};
 pub use content_safety::ContentSafetyGuardrail;
 pub use context_poisoning::{
     ContextPoisoningConfig, ContextPoisoningGuardrail, Finding as ContextPoisoningFinding,
@@ -26,6 +36,10 @@ pub use context_poisoning::{
 pub use context_poisoning_rules::{ContextPoisoningRule, CONTEXT_POISONING_RULES};
 pub use injection::InjectionGuardrail;
 pub use jailbreak::JailbreakGuardrail;
+pub use llm_classifier::{
+    ChatCompletionsTransport, ClassifierTransportError, LlmBackendConfig, LlmClassifier,
+    ReqwestChatTransport,
+};
 pub use mesh::{GuardrailMesh, GuardrailMeshConfig, MeshDecision};
 pub use pii::{PiiAction, PiiGuardrail};
 pub use regex_guard::{RegexAction, RegexGuardrail};
@@ -93,6 +107,12 @@ pub enum Guardrail {
     /// body so it can read the structured tool-call shape, which
     /// `Message` would otherwise strip.
     AgentAlignment(AgentAlignmentGuardrail),
+    /// Class labeler, backed either by a local embedding model
+    /// (`kind: embedding`) or by an LLM over an OpenAI-compatible
+    /// endpoint (`kind: llm`). Emits the predicted class as the
+    /// guardrail label so the CEL policy plane can route on it. Never
+    /// blocks on its own.
+    Classifier(classifier::ClassifierGuardrail),
 }
 
 impl Guardrail {
@@ -108,6 +128,7 @@ impl Guardrail {
             Self::Regex(_) => "regex",
             Self::ContextPoisoning(_) => "context_poisoning",
             Self::AgentAlignment(_) => "agent_alignment",
+            Self::Classifier(_) => "classifier",
         }
     }
 
@@ -127,6 +148,9 @@ impl Guardrail {
             // text-only check is inert here. See
             // [`Guardrail::check_body`] for the actual entry point.
             Self::AgentAlignment(_) => None,
+            // Scope resolution needs the message list, which this
+            // text-only entry point does not carry. See `check_with_text`.
+            Self::Classifier(_) => None,
         }
     }
 
@@ -153,6 +177,11 @@ impl Guardrail {
             // text-fallback path so alignment does not flag on
             // every benign user message.
             Self::AgentAlignment(_) => None,
+            // Only the sync (embedding) backend answers here; an LLM
+            // backend needs a network call, which the mesh runs from
+            // its async entry point instead of blocking a worker
+            // thread on this one.
+            Self::Classifier(g) => g.check_messages(content, messages),
             _ => self.check(content),
         }
     }
@@ -225,6 +254,10 @@ impl Guardrail {
             // each completed call instead of running a text check, so
             // the per-chunk TEXT classification stays false.
             Self::AgentAlignment(_) => false,
+            // A centroid score is meaningful only over the full text.
+            // Scoring an accumulating prefix is not prefix-stable: the
+            // winning class can flip mid-stream.
+            Self::Classifier(_) => false,
         }
     }
 }
@@ -433,6 +466,9 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
         "regex" => Ok(Guardrail::Regex(regex_guard::RegexGuardrail::from_config(
             config,
         )?)),
+        "classifier" => Ok(Guardrail::Classifier(
+            classifier::ClassifierGuardrail::from_config(config)?,
+        )),
         "regex_guard" => {
             // Go format: type: "regex_guard", config: { deny: [...] }
             // Map to Rust regex guard with deny patterns.
@@ -459,14 +495,51 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
     }
 }
 
+/// Guards the one-time warning below. A guardrail pipeline recompiles
+/// whenever the memoization in `sbproxy-core` misses, which can be per
+/// request, so the log line has to be emitted at most once per process.
+static ASYNC_CLASSIFIER_WITHOUT_MESH: std::sync::Once = std::sync::Once::new();
+
 /// Compile a full guardrail pipeline from a GuardrailsConfig.
 pub fn compile_pipeline(config: &GuardrailsConfig) -> Result<GuardrailPipeline> {
     let mut pipeline = GuardrailPipeline::default();
     for guard_cfg in &config.input {
         pipeline.input.push(compile_guardrail(guard_cfg)?);
     }
+    // A `kind: llm` classifier only ever runs on the mesh's async pass.
+    // With no `mesh:` block the dispatch path takes the serial
+    // `check_input` route, which cannot await, so the guardrail is
+    // silently inert forever. Say so rather than failing: a later reload
+    // may add the mesh block, and a routing hint must never be able to
+    // take an origin's real guards down with it.
+    if config.mesh.is_none()
+        && pipeline
+            .input
+            .iter()
+            .any(|g| matches!(g, Guardrail::Classifier(c) if c.is_async()))
+    {
+        ASYNC_CLASSIFIER_WITHOUT_MESH.call_once(|| {
+            tracing::warn!(
+                "a `type: classifier` guardrail with `backend.kind: llm` is configured \
+                 without a `guardrails.mesh` block; it needs one to run at all, because \
+                 the serial input path cannot await it, so it emits no label today. Add \
+                 a `mesh:` block, with `block_threshold: 0` for label-only routing use"
+            );
+        });
+    }
     for guard_cfg in &config.output {
-        pipeline.output.push(compile_guardrail(guard_cfg)?);
+        let guardrail = compile_guardrail(guard_cfg)?;
+        // The classifier guardrail is input-only: `check` unconditionally
+        // returns `None` because classification needs the message list to
+        // honor `last_user_message` scope, and the output paths (buffered
+        // `check_output` and the streaming `on_close` close-policy path)
+        // only ever call `check`. Accepting it here would compile fine and
+        // then silently do nothing forever, so reject it as a hard config
+        // error instead.
+        if let Guardrail::Classifier(_) = &guardrail {
+            bail!("the `classifier` guardrail is input-only; move it from `output:` to `input:`");
+        }
+        pipeline.output.push(guardrail);
         // Per-entry streaming policy rides the same raw entry; unknown
         // to the individual guardrail structs (serde ignores it there).
         let policy = guard_cfg
@@ -862,5 +935,158 @@ mod tests {
         // existing `check_input` path is unaffected.
         let messages = vec![make_msg("any user text")];
         assert!(pipeline.check_input(&messages).is_none());
+    }
+
+    #[test]
+    fn classifier_type_requires_at_least_one_class() {
+        // A config with no classes is a hard error: it can only ever be a
+        // no-op, and silently accepting it hides an operator mistake.
+        let err = compile_guardrail(&serde_json::json!({
+            "type": "classifier",
+            "backend": {
+                "kind": "embedding",
+                "model_path": "/unused/model.onnx",
+                "tokenizer_path": "/unused/tokenizer.json"
+            },
+            "classes": {}
+        }))
+        .expect_err("empty classes must be rejected");
+        assert!(
+            err.to_string()
+                .contains("at least one entry under `classes`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn classifier_type_compiles_and_is_inert_without_a_backend() {
+        // No factory is registered in this unit-test process, so the
+        // guardrail must compile and return no label rather than failing
+        // and taking the rest of the pipeline down with it.
+        let g = compile_guardrail(&serde_json::json!({
+            "type": "classifier",
+            "backend": {
+                "kind": "embedding",
+                "model_path": "/unused/model.onnx",
+                "tokenizer_path": "/unused/tokenizer.json"
+            },
+            "classes": { "documentation": ["write the readme"] }
+        }))
+        .expect("classifier should compile without a backend");
+        assert_eq!(g.name(), "classifier");
+        assert!(g.check("write the readme").is_none());
+        assert!(!g.streaming_safe());
+    }
+
+    #[test]
+    fn classifier_does_not_break_a_mixed_pipeline() {
+        // The regression this guards: an unloadable classifier next to a
+        // real security guard must not stop that guard from compiling.
+        // GuardrailsConfig does not derive Default, and every field carries
+        // #[serde(default)], so build it through serde.
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "input": [
+                {
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/unused/model.onnx",
+                        "tokenizer_path": "/unused/tokenizer.json"
+                    },
+                    "classes": { "documentation": ["write the readme"] }
+                },
+                {"type": "regex", "patterns": ["SECRET"]}
+            ]
+        }))
+        .expect("config should deserialize");
+        let pipeline = compile_pipeline(&cfg).expect("mixed pipeline should compile");
+        assert_eq!(pipeline.input.len(), 2);
+        assert!(pipeline.input[1].check("this is SECRET").is_some());
+    }
+
+    #[test]
+    fn an_unresolvable_api_key_does_not_break_a_mixed_pipeline() {
+        // The failure this guards is the worst one available: an LLM
+        // classifier whose `${VAR}` was unset on this host used to error
+        // out of `compile_pipeline`, and the caller in `sbproxy-core`
+        // turns a compile failure into "run with no guardrails at all".
+        // One unset variable would then disable PII, injection, and
+        // regex on the origin, and re-log the warning per request
+        // because the failure is not negatively cached.
+        //
+        // The classifier itself is expected to go quiet. Its sibling is
+        // not. GuardrailsConfig does not derive Default, and every field
+        // carries #[serde(default)], so build it through serde.
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "input": [
+                {
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "llm",
+                        "base_url": "http://localhost:11434/v1/chat/completions",
+                        "model": "qwen3-coder:30b",
+                        "api_key": "${SBPROXY_TEST_PIPELINE_KEY_UNSET}"
+                    },
+                    "classes": { "documentation": ["write the readme"] }
+                },
+                {"type": "regex", "patterns": ["SECRET"]}
+            ]
+        }))
+        .expect("config should deserialize");
+        let pipeline = compile_pipeline(&cfg).expect("an unset key must not fail the pipeline");
+        assert_eq!(pipeline.input.len(), 2);
+        assert!(
+            pipeline.input[1].check("this is SECRET").is_some(),
+            "the sibling guardrail must still run"
+        );
+        let Guardrail::Classifier(classifier) = &pipeline.input[0] else {
+            panic!("first entry should be the classifier");
+        };
+        assert!(
+            !classifier.is_async(),
+            "the classifier degraded to inert; a live LLM backend would report async"
+        );
+        assert!(pipeline.input[0]
+            .check_with_text("write the readme", &[])
+            .is_none());
+    }
+
+    #[test]
+    fn classifier_is_rejected_under_output_but_allowed_under_input() {
+        // The classifier guardrail is input-only: `check` always returns
+        // `None`, and both output paths (buffered check_output and the
+        // streaming on_close close-policy path) call only `check`. An
+        // operator putting it under `output:` would compile fine and then
+        // silently do nothing forever, so compile_pipeline must reject it.
+        // GuardrailsConfig does not derive Default, and every field carries
+        // #[serde(default)], so build it through serde.
+        let classifier_entry = serde_json::json!({
+            "type": "classifier",
+            "backend": {
+                "kind": "embedding",
+                "model_path": "/unused/model.onnx",
+                "tokenizer_path": "/unused/tokenizer.json"
+            },
+            "classes": { "documentation": ["write the readme"] }
+        });
+
+        let output_cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "output": [classifier_entry]
+        }))
+        .expect("config should deserialize");
+        let err = compile_pipeline(&output_cfg).expect_err("classifier under output must fail");
+        assert!(
+            err.to_string()
+                .contains("is input-only; move it from `output:` to `input:`"),
+            "unexpected error: {err}"
+        );
+
+        let input_cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "input": [classifier_entry]
+        }))
+        .expect("config should deserialize");
+        let pipeline =
+            compile_pipeline(&input_cfg).expect("classifier under input should compile fine");
+        assert_eq!(pipeline.input.len(), 1);
     }
 }

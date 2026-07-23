@@ -98,6 +98,10 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
 /// actually takes effect; every slot it touches is swap-backed and
 /// degrades to a warn on failure rather than blocking the reload.
 fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
+    // Registered before any origin compiles its guardrail pipeline, since
+    // pipelines are built lazily on first request and need the factory.
+    super::ai_classifier::install_classifier_factory();
+
     // --- Wave 3 / G1.4: agent-class resolver ---
     //
     // Build the process-wide `AgentClassResolver` from the parsed
