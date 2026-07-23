@@ -350,54 +350,95 @@ fn document_max_depth_with_work(document: &Document<'_, String>) -> Result<(usiz
     Ok((max_depth, selection_visits))
 }
 
-fn selection_set_max_depth(
-    selection_set: &SelectionSet<'_, String>,
-    fragments: &HashMap<&str, &SelectionSet<'_, String>>,
+fn selection_set_max_depth<'document, 'query>(
+    selection_set: &'document SelectionSet<'query, String>,
+    fragments: &HashMap<&'document str, &'document SelectionSet<'query, String>>,
     fragment_depths: &mut HashMap<String, Option<usize>>,
     selection_visits: &mut usize,
 ) -> Result<usize, String> {
-    *selection_visits += selection_set.items.len();
-    selection_set
-        .items
-        .iter()
-        .map(|selection| match selection {
-            Selection::Field(field) => selection_set_max_depth(
-                &field.selection_set,
-                fragments,
-                fragment_depths,
-                selection_visits,
-            )
-            .map(|child_depth| 1 + child_depth),
-            Selection::InlineFragment(fragment) => selection_set_max_depth(
-                &fragment.selection_set,
-                fragments,
-                fragment_depths,
-                selection_visits,
-            ),
-            Selection::FragmentSpread(spread) => {
-                let name = spread.fragment_name.as_str();
-                if let Some(depth) = fragment_depths.get(name) {
-                    return depth
-                        .ok_or_else(|| format!("GraphQL query contains fragment cycle at {name}"));
-                }
-                let fragment = fragments
-                    .get(name)
-                    .ok_or_else(|| format!("GraphQL query references unknown fragment {name}"))?;
-                fragment_depths.insert(name.to_string(), None);
-                let depth = selection_set_max_depth(
-                    fragment,
-                    fragments,
-                    fragment_depths,
-                    selection_visits,
-                )?;
+    struct DepthFrame<'document, 'query> {
+        selections: &'document [Selection<'query, String>],
+        next_selection: usize,
+        max_depth: usize,
+        result_adjustment: usize,
+        fragment_name: Option<&'document str>,
+    }
+
+    impl<'document, 'query> DepthFrame<'document, 'query> {
+        fn new(
+            selection_set: &'document SelectionSet<'query, String>,
+            result_adjustment: usize,
+            fragment_name: Option<&'document str>,
+        ) -> Self {
+            Self {
+                selections: &selection_set.items,
+                next_selection: 0,
+                max_depth: 0,
+                result_adjustment,
+                fragment_name,
+            }
+        }
+    }
+
+    let mut stack = vec![DepthFrame::new(selection_set, 0, None)];
+    loop {
+        let selection = {
+            let frame = stack
+                .last_mut()
+                .expect("depth traversal always retains a root frame");
+            let selection = frame.selections.get(frame.next_selection);
+            frame.next_selection += usize::from(selection.is_some());
+            selection
+        };
+
+        let Some(selection) = selection else {
+            let completed = stack
+                .pop()
+                .expect("completed depth traversal frame must exist");
+            let depth = completed.max_depth + completed.result_adjustment;
+            if let Some(name) = completed.fragment_name {
                 if let Some(cached) = fragment_depths.get_mut(name) {
                     *cached = Some(depth);
                 }
-                Ok(depth)
             }
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|depths| depths.into_iter().max().unwrap_or(0))
+            if let Some(parent) = stack.last_mut() {
+                parent.max_depth = parent.max_depth.max(depth);
+                continue;
+            }
+            return Ok(depth);
+        };
+
+        *selection_visits += 1;
+        match selection {
+            Selection::Field(field) => {
+                stack.push(DepthFrame::new(&field.selection_set, 1, None));
+            }
+            Selection::InlineFragment(fragment) => {
+                stack.push(DepthFrame::new(&fragment.selection_set, 0, None));
+            }
+            Selection::FragmentSpread(spread) => {
+                let name = spread.fragment_name.as_str();
+                match fragment_depths.get(name).copied() {
+                    Some(Some(depth)) => {
+                        let frame = stack
+                            .last_mut()
+                            .expect("fragment spread has a parent depth frame");
+                        frame.max_depth = frame.max_depth.max(depth);
+                    }
+                    Some(None) => {
+                        return Err(format!("GraphQL query contains fragment cycle at {name}"));
+                    }
+                    None => {
+                        let fragment = fragments.get(name).ok_or_else(|| {
+                            format!("GraphQL query references unknown fragment {name}")
+                        })?;
+                        fragment_depths.insert(name.to_string(), None);
+                        stack.push(DepthFrame::new(fragment, 0, Some(name)));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -655,6 +696,60 @@ mod tests {
             "each fragment selection set must be evaluated only once"
         );
         assert!(gql.validate_query(&query).is_ok());
+    }
+
+    #[test]
+    fn fragment_depth_analysis_handles_body_limit_chain_on_production_stack() {
+        const CHILD_ENV: &str = "SBPROXY_GRAPHQL_FRAGMENT_CHAIN_CHILD";
+        const TEST_FILTER: &str =
+            "fragment_depth_analysis_handles_body_limit_chain_on_production_stack";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mut query = String::from("query { ...F0 }\n");
+            for fragment in 0..1_000 {
+                query.push_str(&format!(
+                    "fragment F{fragment} on Query {{ ...F{} }}\n",
+                    fragment + 1
+                ));
+            }
+            query.push_str("fragment F1000 on Query { leaf }\n");
+            assert_eq!(query.len(), 34_832);
+
+            let validation = std::thread::Builder::new()
+                .name("graphql-production-worker".to_string())
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || {
+                    let gql = GraphQLAction {
+                        url: "http://localhost/graphql".to_string(),
+                        max_depth: 10,
+                        allow_introspection: true,
+                        validate_queries: true,
+                        host_override: None,
+                        forwarding: Default::default(),
+                    };
+                    gql.validate_query(&query)
+                })
+                .expect("spawn production-sized GraphQL worker stack")
+                .join()
+                .expect("GraphQL validation worker must not panic");
+            assert_eq!(validation, Ok(()));
+            return;
+        }
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve the current unit-test executable"),
+        )
+        .arg(TEST_FILTER)
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("run the fragment-chain validation in an isolated child process");
+        assert!(
+            output.status.success(),
+            "fragment-chain validation failed on a production-sized stack\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
