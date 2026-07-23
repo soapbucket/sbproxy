@@ -196,6 +196,66 @@ impl AlertRuntime {
                 sample_count: None,
                 last_evaluated_at: None,
             },
+            AlertRuleSnapshot {
+                rule: "burn_rate".to_string(),
+                description:
+                    "Multi-window availability burn rate over a process-local 1,440-minute ring"
+                        .to_string(),
+                thresholds: vec![3.0, 6.0, 14.4],
+                minimum_samples: None,
+                state: RuleEvaluationState::Inactive,
+                reading: None,
+                sample_count: None,
+                last_evaluated_at: None,
+            },
+            AlertRuleSnapshot {
+                rule: "latency_slo".to_string(),
+                description: "Proxy-wide request p99 latency".to_string(),
+                thresholds: vec![
+                    config.slo_p99_threshold_ms,
+                    config.slo_p99_threshold_ms * 2.0,
+                ],
+                minimum_samples: None,
+                state: RuleEvaluationState::Inactive,
+                reading: None,
+                sample_count: None,
+                last_evaluated_at: None,
+            },
+            AlertRuleSnapshot {
+                rule: "rate_limit_approaching".to_string(),
+                description: "Fraction of rate-limit decisions rejected in the latest window"
+                    .to_string(),
+                thresholds: vec![config.rate_limit_rejection_threshold, 0.95],
+                minimum_samples: None,
+                state: RuleEvaluationState::Inactive,
+                reading: None,
+                sample_count: None,
+                last_evaluated_at: None,
+            },
+            AlertRuleSnapshot {
+                rule: "cert_expiry".to_string(),
+                description: "Soonest active ACME certificate expiry, in days".to_string(),
+                thresholds: config
+                    .cert_expiry_warn_days
+                    .iter()
+                    .map(|days| f64::from(*days))
+                    .collect(),
+                minimum_samples: None,
+                state: RuleEvaluationState::Inactive,
+                reading: None,
+                sample_count: None,
+                last_evaluated_at: None,
+            },
+            AlertRuleSnapshot {
+                rule: "circuit_breaker_trip".to_string(),
+                description: "Configured upstream circuit breakers currently open".to_string(),
+                thresholds: vec![1.0],
+                minimum_samples: None,
+                state: RuleEvaluationState::Inactive,
+                reading: None,
+                sample_count: None,
+                last_evaluated_at: None,
+            },
         ];
         let channels = channels
             .iter()
@@ -378,6 +438,7 @@ mod tests {
             budget_utilization: Some(0.50),
             provider_error_rate: Some(0.25),
             provider_attempts: 4,
+            ..MetricReadings::default()
         });
         runtime.record_evaluations(engine.latest_evaluations());
 
@@ -385,7 +446,7 @@ mod tests {
         assert!(snapshot.enabled);
         assert_eq!(snapshot.authority, AlertAuthority::File);
         assert!(snapshot.read_only);
-        assert_eq!(snapshot.rules.len(), 2);
+        assert_eq!(snapshot.rules.len(), 7);
         let budget = snapshot
             .rules
             .iter()

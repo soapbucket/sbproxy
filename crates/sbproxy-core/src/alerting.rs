@@ -26,12 +26,13 @@ use std::time::Duration;
 use pingora_core::server::ExecutionPhase;
 use sbproxy_observe::alerting::{
     self, Alert, AlertChannelConfig, AlertDispatcher, AlertEngine, AlertRuntime,
-    AlertRuntimeSnapshot, EngineConfig, MetricReadings, ProviderCounters,
+    AlertRuntimeSnapshot, CertExpiryReading, CircuitBreakerReading, CircuitBreakerState,
+    EngineConfig, MetricReadings,
 };
 use tokio::sync::{broadcast, mpsc};
 
 /// How often the loop samples the registry and evaluates the rules.
-const EVAL_INTERVAL_SECS: u64 = 30;
+const EVAL_INTERVAL_SECS: u64 = 60;
 const ALERT_COMMAND_CAPACITY: usize = 32;
 
 #[derive(Debug)]
@@ -80,7 +81,10 @@ fn alerting_runtime() -> &'static tokio::runtime::Runtime {
 ///
 /// `phase_rx` is Pingora's execution-phase broadcast; the loop flushes
 /// in-flight webhook deliveries when it reports graceful termination.
-pub(crate) fn install(phase_rx: broadcast::Receiver<ExecutionPhase>) {
+pub(crate) fn install(
+    phase_rx: broadcast::Receiver<ExecutionPhase>,
+    cert_expiry_reader: Option<sbproxy_tls::AcmeExpiryReader>,
+) {
     if !alerting::has_alerting_config() {
         return;
     }
@@ -95,6 +99,7 @@ pub(crate) fn install(phase_rx: broadcast::Receiver<ExecutionPhase>) {
         channels,
         control.runtime,
         command_rx,
+        cert_expiry_reader,
     ));
 }
 
@@ -146,6 +151,7 @@ async fn run(
     channels: Vec<AlertChannelConfig>,
     runtime: AlertRuntime,
     mut command_rx: mpsc::Receiver<AlertCommand>,
+    cert_expiry_reader: Option<sbproxy_tls::AcmeExpiryReader>,
 ) {
     let dispatcher = AlertDispatcher::with_runtime(channels.clone(), runtime.clone());
     let engine_config = EngineConfig::default();
@@ -156,17 +162,51 @@ async fn run(
     // The first tick returns immediately; take it to establish the counter
     // baseline so the first evaluated window spans a full interval.
     tick.tick().await;
-    let mut prev: ProviderCounters = alerting::sample_registry().0;
+    let mut prev = alerting::sample_registry();
     let mut commands_open = true;
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let (now, budget) = alerting::sample_registry();
+                let now = alerting::sample_registry();
+                let p99_latency_ms = alerting::histogram_quantile_delta_ms(
+                    &prev.request_latency,
+                    &now.request_latency,
+                    0.99,
+                );
+                let minute_sample = alerting::minute_sample_delta(
+                    prev.request_counters,
+                    now.request_counters,
+                    p99_latency_ms,
+                );
+                let rate_limit_window =
+                    alerting::rate_limit_delta(prev.rate_limit_counters, now.rate_limit_counters);
                 let readings = MetricReadings {
-                    budget_utilization: budget,
-                    provider_error_rate: alerting::error_burn(prev, now),
-                    provider_attempts: alerting::provider_attempt_delta(prev, now),
+                    budget_utilization: now.budget_utilization,
+                    provider_error_rate: alerting::error_burn(
+                        prev.provider_counters,
+                        now.provider_counters,
+                    ),
+                    provider_attempts: alerting::provider_attempt_delta(
+                        prev.provider_counters,
+                        now.provider_counters,
+                    ),
+                    p99_latency_ms: minute_sample.and(p99_latency_ms),
+                    rate_limit_rejections: rate_limit_window.map(|(rejections, _)| rejections),
+                    rate_limit_decisions: rate_limit_window
+                        .map(|(_, decisions)| decisions)
+                        .unwrap_or_default(),
+                    cert_expiry: cert_expiry_reader
+                        .as_ref()
+                        .and_then(sbproxy_tls::AcmeExpiryReader::earliest)
+                        .map(|expiry| CertExpiryReading {
+                            hostname: expiry.hostname,
+                            days_remaining: expiry.days_remaining,
+                        }),
+                    circuit_breakers: sample_circuit_breakers(
+                        &crate::reload::current_pipeline().actions,
+                    ),
+                    minute_sample,
                 };
                 prev = now;
                 let alerts = engine.evaluate(&readings);
@@ -208,6 +248,34 @@ async fn run(
             }
         }
     }
+}
+
+fn sample_circuit_breakers(
+    actions: &[sbproxy_modules::Action],
+) -> Option<Vec<CircuitBreakerReading>> {
+    let mut configured = false;
+    let mut readings = Vec::new();
+    for action in actions {
+        let sbproxy_modules::Action::LoadBalancer(load_balancer) = action else {
+            continue;
+        };
+        let Some(breakers) = load_balancer.circuit_breakers.as_ref() else {
+            continue;
+        };
+        configured = true;
+        readings.extend(breakers.iter().enumerate().map(|(index, breaker)| {
+            let state = match breaker.state() {
+                sbproxy_platform::CircuitState::Closed => CircuitBreakerState::Closed,
+                sbproxy_platform::CircuitState::Open => CircuitBreakerState::Open,
+                sbproxy_platform::CircuitState::HalfOpen => CircuitBreakerState::HalfOpen,
+            };
+            CircuitBreakerReading {
+                origin: load_balancer.target_id(index),
+                state,
+            }
+        }));
+    }
+    configured.then_some(readings)
 }
 
 fn channel_test_alert(channel_index: usize, channel: &AlertChannelConfig) -> Alert {
@@ -252,7 +320,14 @@ mod tests {
         let (control, command_rx) = build_alert_control(&channels);
         let runtime = control.runtime.clone();
         let (phase_tx, phase_rx) = broadcast::channel(4);
-        let loop_task = tokio::spawn(run(phase_rx, 3_600, channels, runtime.clone(), command_rx));
+        let loop_task = tokio::spawn(run(
+            phase_rx,
+            3_600,
+            channels,
+            runtime.clone(),
+            command_rx,
+            None,
+        ));
 
         control.queue_channel_test(0).unwrap();
         // Sleep between polls rather than spinning on `yield_now`: under
@@ -284,5 +359,31 @@ mod tests {
 
         phase_tx.send(ExecutionPhase::GracefulTerminate).unwrap();
         loop_task.await.unwrap();
+    }
+
+    #[test]
+    fn breaker_sampler_reads_configured_load_balancer_state() {
+        let load_balancer = std::sync::Arc::new(
+            sbproxy_modules::LoadBalancerAction::from_config(serde_json::json!({
+                "targets": [{"url": "https://upstream.example"}],
+                "circuit_breaker": {
+                    "failure_threshold": 1,
+                    "success_threshold": 1,
+                    "open_duration_secs": 60
+                }
+            }))
+            .unwrap(),
+        );
+        load_balancer.record_breaker_failure(0);
+        let actions = vec![sbproxy_modules::Action::LoadBalancer(load_balancer)];
+
+        let readings = sample_circuit_breakers(&actions).unwrap();
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].origin, "https://upstream.example#0");
+        assert_eq!(
+            readings[0].state,
+            sbproxy_observe::alerting::CircuitBreakerState::Open
+        );
+        assert_eq!(sample_circuit_breakers(&[]), None);
     }
 }

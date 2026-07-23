@@ -29,8 +29,11 @@ pub mod slo;
 
 pub use channels::{Alert, AlertChannelConfig, AlertDispatcher};
 pub use engine::{
-    error_burn, provider_attempt_delta, sample_registry, AlertEngine, EngineConfig, MetricReadings,
-    ProviderCounters, RuleEvaluation, RuleEvaluationState,
+    error_burn, histogram_quantile_delta_ms, minute_sample_delta, provider_attempt_delta,
+    rate_limit_delta, sample_registry, AlertEngine, CertExpiryReading, CircuitBreakerReading,
+    CircuitBreakerState, EngineConfig, HistogramBucket, HistogramCounters, MetricReadings,
+    ProviderCounters, RateLimitCounters, RegistrySnapshot, RequestCounters, RuleEvaluation,
+    RuleEvaluationState,
 };
 pub use runtime::{AlertRuntime, AlertRuntimeSnapshot};
 

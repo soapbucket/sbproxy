@@ -599,8 +599,12 @@ fn instance_id() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alerting::burn_rate::MinuteSample;
     use crate::alerting::runtime::{AlertRuntime, DeliveryStatus};
-    use crate::alerting::EngineConfig;
+    use crate::alerting::{
+        AlertEngine, CertExpiryReading, CircuitBreakerReading, CircuitBreakerState, EngineConfig,
+        MetricReadings,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn local_http_server(status: u16) -> (String, tokio::sync::oneshot::Receiver<String>) {
@@ -886,6 +890,172 @@ mod tests {
         assert_eq!(resolve["event_action"], "resolve");
         assert_eq!(resolve["dedup_key"].as_str().unwrap(), dedup);
         assert!(resolve.get("payload").is_none());
+    }
+
+    #[test]
+    fn every_engine_rule_resolves_the_pagerduty_incident_it_opened() {
+        let mut pairs = Vec::new();
+
+        let mut budget = AlertEngine::new(EngineConfig::default());
+        let fired = budget
+            .evaluate(&MetricReadings {
+                budget_utilization: Some(0.99),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = budget
+            .evaluate(&MetricReadings {
+                budget_utilization: Some(0.10),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut error_rate = AlertEngine::new(EngineConfig::default());
+        let fired = error_rate
+            .evaluate(&MetricReadings {
+                provider_error_rate: Some(0.50),
+                provider_attempts: 100,
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = error_rate
+            .evaluate(&MetricReadings {
+                provider_error_rate: Some(0.01),
+                provider_attempts: 100,
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut slo = AlertEngine::new(EngineConfig {
+            slo_p99_threshold_ms: 100.0,
+            ..EngineConfig::default()
+        });
+        let fired = slo
+            .evaluate(&MetricReadings {
+                p99_latency_ms: Some(250.0),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = slo
+            .evaluate(&MetricReadings {
+                p99_latency_ms: Some(50.0),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut rate_limit = AlertEngine::new(EngineConfig::default());
+        let fired = rate_limit
+            .evaluate(&MetricReadings {
+                rate_limit_rejections: Some(9),
+                rate_limit_decisions: 10,
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = rate_limit
+            .evaluate(&MetricReadings {
+                rate_limit_rejections: Some(1),
+                rate_limit_decisions: 10,
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut cert = AlertEngine::new(EngineConfig::default());
+        let fired = cert
+            .evaluate(&MetricReadings {
+                cert_expiry: Some(CertExpiryReading {
+                    hostname: "near.example".to_string(),
+                    days_remaining: 6,
+                }),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = cert
+            .evaluate(&MetricReadings {
+                cert_expiry: Some(CertExpiryReading {
+                    hostname: "near.example".to_string(),
+                    days_remaining: 90,
+                }),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut breaker = AlertEngine::new(EngineConfig::default());
+        let fired = breaker
+            .evaluate(&MetricReadings {
+                circuit_breakers: Some(vec![CircuitBreakerReading {
+                    origin: "https://upstream.example#0".to_string(),
+                    state: CircuitBreakerState::Open,
+                }]),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = breaker
+            .evaluate(&MetricReadings {
+                circuit_breakers: Some(vec![CircuitBreakerReading {
+                    origin: "https://upstream.example#0".to_string(),
+                    state: CircuitBreakerState::Closed,
+                }]),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let clean = MinuteSample {
+            requests: 100,
+            errors: 0,
+            p99_ms: 20.0,
+        };
+        let burning = MinuteSample {
+            requests: 100,
+            errors: 10,
+            p99_ms: 20.0,
+        };
+        let mut burn = AlertEngine::new(EngineConfig::default());
+        for _ in 0..30 {
+            burn.evaluate(&MetricReadings {
+                minute_sample: Some(clean),
+                ..MetricReadings::default()
+            });
+        }
+        let mut fired = None;
+        for _ in 0..30 {
+            fired = burn
+                .evaluate(&MetricReadings {
+                    minute_sample: Some(burning),
+                    ..MetricReadings::default()
+                })
+                .into_iter()
+                .find(|alert| alert.rule == "burn_rate")
+                .or(fired);
+        }
+        let mut resolved = None;
+        for _ in 0..30 {
+            resolved = burn
+                .evaluate(&MetricReadings {
+                    minute_sample: Some(clean),
+                    ..MetricReadings::default()
+                })
+                .into_iter()
+                .find(|alert| alert.rule == "burn_rate" && alert.resolved)
+                .or(resolved);
+        }
+        pairs.push((fired.unwrap(), resolved.unwrap()));
+
+        assert_eq!(pairs.len(), 7);
+        for (triggered, resolved) in pairs {
+            assert!(!triggered.resolved);
+            assert!(resolved.resolved);
+            let trigger = pagerduty_payload(&triggered, "rk");
+            let resolve = pagerduty_payload(&resolved, "rk");
+            assert_eq!(trigger["event_action"], "trigger");
+            assert_eq!(resolve["event_action"], "resolve");
+            assert_eq!(trigger["dedup_key"], resolve["dedup_key"]);
+        }
     }
 
     #[test]

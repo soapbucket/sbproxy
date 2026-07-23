@@ -1969,7 +1969,12 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // pre-resolved by the binary) and run the evaluation loop, draining
     // in-flight deliveries on the same execution-phase broadcast. A no-op when
     // no channels are configured.
-    crate::alerting::install(server.watch_execution_phase());
+    crate::alerting::install(
+        server.watch_execution_phase(),
+        tls_state
+            .as_ref()
+            .and_then(sbproxy_tls::TlsState::acme_expiry_reader),
+    );
 
     // `run_forever()` calls `std::process::exit(0)` after Pingora drains,
     // which skips Rust destructors and used to orphan managed engine

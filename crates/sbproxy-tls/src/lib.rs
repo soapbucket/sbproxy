@@ -84,6 +84,77 @@ pub struct TlsState {
     manual_cert_pem: Option<Vec<u8>>,
 }
 
+/// Earliest active ACME certificate expiry for alert evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcmeCertExpiry {
+    /// Certificate hostname.
+    pub hostname: String,
+    /// Whole days remaining, rounded up so `30d 1s` does not report 30 days.
+    pub days_remaining: u32,
+}
+
+/// Cloneable, read-only ACME certificate-expiry input seam.
+///
+/// The alert loop owns this lightweight reader instead of reaching through a
+/// process global. Reads use the same persistent metadata store as renewal.
+#[derive(Clone)]
+pub struct AcmeExpiryReader {
+    cert_store: Arc<CertStore>,
+    hostnames: Arc<[String]>,
+}
+
+impl AcmeExpiryReader {
+    /// Return the certificate with the earliest parseable expiry.
+    pub fn earliest(&self) -> Option<AcmeCertExpiry> {
+        self.earliest_at(chrono::Utc::now())
+    }
+
+    fn earliest_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<AcmeCertExpiry> {
+        self.hostnames
+            .iter()
+            .filter_map(|hostname| {
+                let meta = match self.cert_store.get_meta(hostname) {
+                    Ok(Some(meta)) => meta,
+                    Ok(None) => return None,
+                    Err(error) => {
+                        tracing::debug!(
+                            %hostname,
+                            %error,
+                            "could not read ACME certificate metadata for alert sampling"
+                        );
+                        return None;
+                    }
+                };
+                let expires_at = match chrono::DateTime::parse_from_rfc3339(&meta.expires_at) {
+                    Ok(expires_at) => expires_at.with_timezone(&chrono::Utc),
+                    Err(error) => {
+                        tracing::debug!(
+                            %hostname,
+                            expires_at = %meta.expires_at,
+                            %error,
+                            "ignored invalid ACME expiry during alert sampling"
+                        );
+                        return None;
+                    }
+                };
+                Some((hostname.clone(), expires_at))
+            })
+            .min_by_key(|(_, expires_at)| *expires_at)
+            .map(|(hostname, expires_at)| {
+                let seconds = expires_at.signed_duration_since(now).num_seconds();
+                let days_remaining = if seconds <= 0 {
+                    0
+                } else {
+                    seconds.saturating_add(86_399) / 86_400
+                };
+                AcmeCertExpiry {
+                    hostname,
+                    days_remaining: u32::try_from(days_remaining).unwrap_or(u32::MAX),
+                }
+            })
+    }
+}
+
 /// Open the KVStore backing the ACME cert store, chosen by
 /// `acme.storage_backend` at `acme.storage_path` (WOR-1773).
 ///
@@ -285,6 +356,17 @@ impl TlsState {
             ocsp_stapler,
             manual_cert_pem,
         })
+    }
+
+    /// Build a read-only expiry source when ACME is enabled.
+    pub fn acme_expiry_reader(&self) -> Option<AcmeExpiryReader> {
+        self.acme_config
+            .as_ref()
+            .is_some_and(|config| config.enabled)
+            .then(|| AcmeExpiryReader {
+                cert_store: Arc::clone(&self.cert_store),
+                hostnames: Arc::from(self.hostnames.clone()),
+            })
     }
 
     /// Spawn the OCSP refresh task for the manual fallback cert.
@@ -760,5 +842,35 @@ mod tests {
             cert_needs_renewal(&m, 30),
             "bad date should trigger renewal"
         );
+    }
+
+    #[test]
+    fn acme_expiry_reader_returns_the_nearest_fixture_certificate() {
+        let store = Arc::new(CertStore::new(Arc::new(MemoryKVStore::new(0))));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        store
+            .put_meta(
+                "later.example",
+                &meta(&(now + chrono::Duration::days(20)).to_rfc3339()),
+            )
+            .unwrap();
+        store
+            .put_meta(
+                "near.example",
+                &meta(
+                    &(now + chrono::Duration::days(6) + chrono::Duration::seconds(1)).to_rfc3339(),
+                ),
+            )
+            .unwrap();
+
+        let reader = AcmeExpiryReader {
+            cert_store: store,
+            hostnames: Arc::from(["later.example".to_string(), "near.example".to_string()]),
+        };
+        let expiry = reader.earliest_at(now).unwrap();
+        assert_eq!(expiry.hostname, "near.example");
+        assert_eq!(expiry.days_remaining, 7);
     }
 }

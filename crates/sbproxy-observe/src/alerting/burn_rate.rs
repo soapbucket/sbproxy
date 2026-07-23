@@ -1,7 +1,7 @@
 //! Multi-window SLO burn-rate replay helpers.
 
 /// One synthetic minute of substrate traffic.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MinuteSample {
     /// Requests observed in the minute.
     pub requests: u64,
@@ -71,6 +71,23 @@ pub fn replay_and_evaluate(samples: &[MinuteSample], target: f64) -> AlertSnapsh
     out
 }
 
+/// Highest active availability burn-rate window for the supplied history.
+///
+/// Windows use the same eligibility rules as [`replay_and_evaluate`]: the
+/// concentrated 30-minute window becomes active after 60 samples, and the
+/// 24-hour window requires a complete 1,440-minute history.
+pub fn peak_availability_burn_rate(samples: &[MinuteSample], target: f64) -> f64 {
+    let budget = (1.0 - target).max(f64::EPSILON);
+    let mut peak = error_burn_rate(samples, budget);
+    if samples.len() >= 60 {
+        peak = peak.max(error_burn_rate(tail(samples, 30), budget));
+    }
+    if samples.len() >= 24 * 60 {
+        peak = peak.max(error_burn_rate(tail(samples, 24 * 60), budget));
+    }
+    peak
+}
+
 fn tail(samples: &[MinuteSample], minutes: usize) -> &[MinuteSample] {
     let start = samples.len().saturating_sub(minutes);
     &samples[start..]
@@ -113,5 +130,22 @@ mod tests {
             p99_ms: 200.0,
         });
         assert!(!replay_and_evaluate(&samples, 0.99).fired("SBPROXY-SUBSTRATE-LATENCY-P99"));
+    }
+
+    #[test]
+    fn full_history_activates_the_24_hour_window_without_short_window_burn() {
+        let samples = vec![
+            MinuteSample {
+                requests: 1_000,
+                errors: 31,
+                p99_ms: 20.0,
+            };
+            24 * 60
+        ];
+
+        let snapshot = replay_and_evaluate(&samples, 0.99);
+        assert!(snapshot.fired("SBPROXY-SUBSTRATE-AVAIL-INBOUND-24H"));
+        assert!(!snapshot.fired("SBPROXY-SUBSTRATE-AVAIL-INBOUND-1H"));
+        assert!(!snapshot.fired("SBPROXY-SUBSTRATE-AVAIL-INBOUND-6H"));
     }
 }
