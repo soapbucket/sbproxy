@@ -1,4 +1,4 @@
-//! Newtype wrapper enforcer for the `Policy::RateLimit` variant.
+//! Wrapper enforcer for the `Policy::RateLimit` variant.
 //!
 //! Calls
 //! [`sbproxy_modules::policy::RateLimitPolicy::allow_with_info_for`]
@@ -23,14 +23,28 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use compact_str::CompactString;
 use sbproxy_modules::policy::RateLimitPolicy;
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
 use crate::context::RequestContext;
 
-/// Newtype wrapper that adapts [`RateLimitPolicy`] to the
+/// Wrapper that adapts [`RateLimitPolicy`] to the
 /// [`PolicyEnforcer`] trait surface.
-pub struct RateLimitEnforcer(pub Arc<RateLimitPolicy>);
+pub struct RateLimitEnforcer {
+    policy: Arc<RateLimitPolicy>,
+    metric_policy: CompactString,
+}
+
+impl RateLimitEnforcer {
+    /// Pair a compiled rate-limit policy with its bounded route-pattern label.
+    pub fn new(policy: Arc<RateLimitPolicy>, metric_policy: &str) -> Self {
+        Self {
+            policy,
+            metric_policy: CompactString::new(metric_policy),
+        }
+    }
+}
 
 impl PolicyEnforcer for RateLimitEnforcer {
     fn policy_type(&self) -> &'static str {
@@ -43,7 +57,7 @@ impl PolicyEnforcer for RateLimitEnforcer {
         ctx: &mut dyn std::any::Any,
     ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<PolicyDecision>> + Send + '_>>
     {
-        let policy = Arc::clone(&self.0);
+        let policy = Arc::clone(&self.policy);
         let ctx = match ctx.downcast_mut::<RequestContext>() {
             Some(c) => c,
             None => {
@@ -72,6 +86,17 @@ impl PolicyEnforcer for RateLimitEnforcer {
         // mutation off the `.await` boundary so the trait's
         // `Send + '_` future bound holds.
         let info = policy.allow_with_info_for(&client_id);
+        // The label is the configured route pattern captured once during
+        // pipeline compilation, never a request-derived hostname. The metric
+        // helper additionally applies the shared cardinality cap.
+        sbproxy_observe::metrics::record_rate_limit_decision(
+            self.metric_policy.as_str(),
+            if info.allowed {
+                "allow"
+            } else {
+                "throttle_route"
+            },
+        );
         if !info.allowed {
             ctx.rate_limit_info = Some(info);
             ctx.deny_policy_type = Some("rate_limit");
@@ -166,18 +191,56 @@ pub(crate) fn rate_limit_key_from_cel(
 
 #[cfg(test)]
 mod tests {
-    //! Behavioural tests for the rate-limit enforcer live in the
-    //! existing `sbproxy-modules` rate-limiter unit suite. The
-    //! wrapper itself is a thin trait-adapter; the bad-context
-    //! short-circuit is the only branch worth pinning here.
-
     use super::*;
+
+    fn decision_count(policy: &str, result: &str) -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_rate_limit_decisions_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let label = |name: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .find(|label| label.name() == name)
+                                .map(|label| label.value())
+                        };
+                        label("policy") == Some(policy) && label("result") == Some(result)
+                    })
+                    .map(|metric| metric.get_counter().value() as u64)
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    fn request_context(hostname: &str) -> RequestContext {
+        let mut ctx = RequestContext::new();
+        ctx.hostname = hostname.into();
+        ctx
+    }
+
+    fn one_request_enforcer(metric_policy: &str) -> RateLimitEnforcer {
+        RateLimitEnforcer::new(
+            Arc::new(
+                RateLimitPolicy::from_config(serde_json::json!({
+                    "requests_per_second": 0.001,
+                    "burst": 1
+                }))
+                .unwrap(),
+            ),
+            metric_policy,
+        )
+    }
 
     #[tokio::test]
     async fn bad_context_short_circuits_with_deny() {
         let cfg = serde_json::json!({"requests_per_second": 1.0, "burst": 1});
         let policy: RateLimitPolicy = serde_json::from_value(cfg).expect("default rate-limit");
-        let enforcer = RateLimitEnforcer(Arc::new(policy));
+        let enforcer = RateLimitEnforcer::new(Arc::new(policy), "bad-context.example");
         let req = http::Request::builder()
             .uri("/")
             .body(Bytes::new())
@@ -188,5 +251,46 @@ mod tests {
             PolicyDecision::Deny { status, .. } => assert_eq!(status, 500),
             other => panic!("expected Deny(500), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn production_enforcer_records_an_allowed_decision() {
+        let metric_policy = "*.rate-limit-allow-metric.example";
+        let enforcer = one_request_enforcer(metric_policy);
+        let req = http::Request::builder()
+            .uri("/")
+            .body(Bytes::new())
+            .unwrap();
+        let mut ctx = request_context("customer-42.rate-limit-allow-metric.example");
+        let before = decision_count(metric_policy, "allow");
+
+        assert!(matches!(
+            enforcer.enforce(&req, &mut ctx).await.unwrap(),
+            PolicyDecision::Allow
+        ));
+        assert_eq!(decision_count(metric_policy, "allow"), before + 1);
+    }
+
+    #[tokio::test]
+    async fn production_enforcer_records_a_route_throttle_decision() {
+        let metric_policy = "*.rate-limit-deny-metric.example";
+        let enforcer = one_request_enforcer(metric_policy);
+        let req = http::Request::builder()
+            .uri("/")
+            .body(Bytes::new())
+            .unwrap();
+        let mut first = request_context("customer-1.rate-limit-deny-metric.example");
+        assert!(matches!(
+            enforcer.enforce(&req, &mut first).await.unwrap(),
+            PolicyDecision::Allow
+        ));
+        let before = decision_count(metric_policy, "throttle_route");
+
+        let mut second = request_context("customer-2.rate-limit-deny-metric.example");
+        assert!(matches!(
+            enforcer.enforce(&req, &mut second).await.unwrap(),
+            PolicyDecision::Deny { status: 429, .. }
+        ));
+        assert_eq!(decision_count(metric_policy, "throttle_route"), before + 1);
     }
 }

@@ -226,7 +226,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_policy_evaluation_duration_seconds` | Histogram | `stable` | `beta` | `origin`, `verdict` | Wall-clock latency of one full policy-chain evaluation. |
 | `sbproxy_policy_triggers_total` | Counter | `stable` | `stable` | `origin`, `policy_type`, `action`, `agent_id`, `agent_class` | Policy enforcement results. |
 | `sbproxy_projection_render_failures_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `projection` | Well-known projection render failures, by projection. |
-| `sbproxy_rate_limit_decisions_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `policy`, `result` | Rate-limit middleware decisions, by policy and outcome. |
+| `sbproxy_rate_limit_decisions_total` | Counter | `stable` | `alpha` | `policy`, `result` | Rate-limit middleware decisions, by policy and outcome. |
 | `sbproxy_rate_limit_suspend_total` | Counter | `stable` | `beta` | `workspace` | Workspace auto-suspend transitions. |
 | `sbproxy_rate_limit_total` | Counter | `stable` | `beta` | `workspace`, `result` | Workspace rate-limit budget outcomes by workspace and result (soft/throttle). |
 | `sbproxy_redis_kv_connections_total` | Counter | `stable` | `beta` | `result` | Redis KV connection attempts by result. |

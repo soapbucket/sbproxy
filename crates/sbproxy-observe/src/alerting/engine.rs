@@ -446,19 +446,28 @@ impl AlertEngine {
         match &readings.circuit_breakers {
             Some(breakers) => {
                 let mut observed_keys = HashSet::with_capacity(breakers.len());
-                let mut open_count = 0_u64;
+                let mut tripped_count = 0_u64;
                 for breaker in breakers {
                     let key = format!("circuit_breaker_trip:origin={}", breaker.origin);
                     observed_keys.insert(key.clone());
-                    let alert = if breaker.state == CircuitBreakerState::Open {
-                        open_count += 1;
-                        check_circuit_breaker_trip(
-                            &breaker.origin,
-                            CircuitBreakerState::Closed.as_str(),
-                            breaker.state.as_str(),
-                        )
-                    } else {
-                        None
+                    let alert = match breaker.state {
+                        CircuitBreakerState::Closed => None,
+                        CircuitBreakerState::Open => {
+                            tripped_count += 1;
+                            check_circuit_breaker_trip(
+                                &breaker.origin,
+                                CircuitBreakerState::Closed.as_str(),
+                                breaker.state.as_str(),
+                            )
+                        }
+                        CircuitBreakerState::HalfOpen => {
+                            tripped_count += 1;
+                            check_circuit_breaker_trip(
+                                &breaker.origin,
+                                CircuitBreakerState::Open.as_str(),
+                                breaker.state.as_str(),
+                            )
+                        }
                     };
                     self.apply_active_rule(&key, alert, &mut to_fire);
                 }
@@ -479,12 +488,12 @@ impl AlertEngine {
 
                 evaluations.push(RuleEvaluation {
                     rule: "circuit_breaker_trip".to_string(),
-                    state: if open_count > 0 {
+                    state: if tripped_count > 0 {
                         RuleEvaluationState::Firing
                     } else {
                         RuleEvaluationState::Ok
                     },
-                    reading: Some(open_count as f64),
+                    reading: Some(tripped_count as f64),
                     sample_count: Some(breakers.len() as u64),
                     evaluated_at: evaluated_at.clone(),
                 });
@@ -1130,6 +1139,43 @@ mod tests {
         assert!(resolved[0].resolved);
         assert_eq!(resolved[0].rule, "circuit_breaker_trip");
         assert!(engine.evaluate(&closed).is_empty());
+    }
+
+    #[test]
+    fn half_open_breaker_stays_firing_without_resolve_retrigger_flapping() {
+        let mut engine = AlertEngine::new(EngineConfig::default());
+        let reading = |state| MetricReadings {
+            circuit_breakers: Some(vec![CircuitBreakerReading {
+                origin: "workspace/origin#target-0".to_string(),
+                state,
+            }]),
+            ..MetricReadings::default()
+        };
+
+        let fired = engine.evaluate(&reading(CircuitBreakerState::Open));
+        assert_eq!(fired.len(), 1);
+        assert!(!fired[0].resolved);
+
+        assert!(engine
+            .evaluate(&reading(CircuitBreakerState::HalfOpen))
+            .is_empty());
+        assert_eq!(engine.firing_count(), 1);
+        let evaluation = engine
+            .latest_evaluations()
+            .iter()
+            .find(|evaluation| evaluation.rule == "circuit_breaker_trip")
+            .unwrap();
+        assert_eq!(evaluation.state, RuleEvaluationState::Firing);
+
+        assert!(engine
+            .evaluate(&reading(CircuitBreakerState::Open))
+            .is_empty());
+        assert_eq!(engine.firing_count(), 1);
+
+        let resolved = engine.evaluate(&reading(CircuitBreakerState::Closed));
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].resolved);
+        assert_eq!(engine.firing_count(), 0);
     }
 
     #[test]

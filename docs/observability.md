@@ -970,7 +970,7 @@ these seven built-in rules:
 | `latency_slo` | Proxy-wide request p99 for the latest minute. Warning above 200 ms, critical above 400 ms. |
 | `rate_limit_approaching` | Rejected route and tenant rate-limit decisions as a fraction of all decisions in the latest minute. Warning above 80%, critical at 95%. |
 | `cert_expiry` | Soonest certificate in the active ACME store. Warning at 30 days remaining, critical at 7 days. |
-| `circuit_breaker_trip` | Any configured load-balancer target whose circuit breaker is open is critical. Closing or removing that breaker resolves its incident. |
+| `circuit_breaker_trip` | A configured load-balancer target remains firing while its breaker is open or probing in half-open state. Only closing or removing that breaker resolves its incident. |
 
 Each rule reports `firing`, `ok`, or `inactive` in the admin alert snapshot.
 `inactive` means the evaluator did not receive a complete usable input, not

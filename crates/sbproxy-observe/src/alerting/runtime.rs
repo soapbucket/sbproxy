@@ -248,7 +248,9 @@ impl AlertRuntime {
             },
             AlertRuleSnapshot {
                 rule: "circuit_breaker_trip".to_string(),
-                description: "Configured upstream circuit breakers currently open".to_string(),
+                description:
+                    "Configured upstream circuit breakers open or probing in half-open state"
+                        .to_string(),
                 thresholds: vec![1.0],
                 minimum_samples: None,
                 state: RuleEvaluationState::Inactive,

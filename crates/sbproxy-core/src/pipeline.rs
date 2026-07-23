@@ -1219,7 +1219,10 @@ impl CompiledPipeline {
                 config.l2_store.clone(),
                 origin.origin_id.as_str(),
             )?;
-            enforcers.push(compile_builtin_enforcers(policies_for_enforcers));
+            enforcers.push(compile_builtin_enforcers(
+                policies_for_enforcers,
+                origin.hostname.as_str(),
+            ));
             policies.push(origin_policies);
 
             // Compile transforms (zero or more per origin).

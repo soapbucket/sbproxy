@@ -49,17 +49,25 @@ pub struct CompiledEnforcer {
 /// non-cloneable `Box<dyn PolicyEnforcer>`; consuming the input
 /// lets the Plugin variant move its enforcer out without
 /// imposing a `dyn-clone`-style extension on the public trait.
-pub fn compile_builtin_enforcers(policies: Vec<Policy>) -> Vec<CompiledEnforcer> {
-    policies.into_iter().map(compile_one).collect()
+/// `metric_policy` is the configured route pattern used by
+/// route-scoped policy metrics.
+pub fn compile_builtin_enforcers(
+    policies: Vec<Policy>,
+    metric_policy: &str,
+) -> Vec<CompiledEnforcer> {
+    policies
+        .into_iter()
+        .map(|policy| compile_one(policy, metric_policy))
+        .collect()
 }
 
 /// Compile a single [`Policy`] into a [`CompiledEnforcer`].
 ///
 /// Pulled out as a free function so the unit tests can drive
 /// each variant in isolation without standing up a Vec.
-fn compile_one(policy: Policy) -> CompiledEnforcer {
+fn compile_one(policy: Policy, metric_policy: &str) -> CompiledEnforcer {
     match policy {
-        Policy::RateLimit(p) => builtin(RateLimitEnforcer(Arc::new(p))),
+        Policy::RateLimit(p) => builtin(RateLimitEnforcer::new(Arc::new(p), metric_policy)),
         Policy::RateLimitBudget(p) => builtin(RateLimitBudgetEnforcer(Arc::new(p))),
         Policy::IpFilter(p) => builtin(IpFilterEnforcer(Arc::new(p))),
         Policy::SecHeaders(p) => builtin(SecHeadersEnforcer(Arc::new(p))),
@@ -138,7 +146,7 @@ mod tests {
     #[test]
     fn plugin_variant_hands_back_enforcer() {
         let policy = Policy::Plugin(Box::new(FakePlugin));
-        let compiled = compile_one(policy);
+        let compiled = compile_one(policy, "test-route");
         assert_eq!(compiled.enforcer.policy_type(), "fake_plugin");
         assert_eq!(compiled.surface, PolicySurface::Plugin);
     }
@@ -177,7 +185,10 @@ mod tests {
             ),
         ];
         for (policy, expected_label) in cases {
-            assert_eq!(compile_one(policy).enforcer.policy_type(), expected_label);
+            assert_eq!(
+                compile_one(policy, "test-route").enforcer.policy_type(),
+                expected_label
+            );
         }
     }
 
@@ -218,7 +229,10 @@ mod tests {
             ),
         ];
         for (policy, expected_label) in cases {
-            assert_eq!(compile_one(policy).enforcer.policy_type(), expected_label);
+            assert_eq!(
+                compile_one(policy, "test-route").enforcer.policy_type(),
+                expected_label
+            );
         }
     }
 
@@ -231,7 +245,7 @@ mod tests {
             ))
             .expect("agent_class default"),
         );
-        let compiled = compile_one(policy);
+        let compiled = compile_one(policy, "test-route");
         assert_eq!(compiled.enforcer.policy_type(), "agent_class");
         assert_eq!(compiled.surface, PolicySurface::BuiltIn);
     }
@@ -249,7 +263,7 @@ mod tests {
                     .expect("csrf default"),
             ),
         ];
-        let outcomes = compile_builtin_enforcers(inputs);
+        let outcomes = compile_builtin_enforcers(inputs, "test-route");
         assert_eq!(outcomes.len(), 3);
         assert_eq!(outcomes[0].enforcer.policy_type(), "waf");
         assert_eq!(outcomes[0].surface, PolicySurface::BuiltIn);
@@ -354,7 +368,10 @@ mod tests {
             ),
         ];
         for (policy, expected_label) in cases {
-            assert_eq!(compile_one(policy).enforcer.policy_type(), expected_label);
+            assert_eq!(
+                compile_one(policy, "test-route").enforcer.policy_type(),
+                expected_label
+            );
         }
     }
 }
