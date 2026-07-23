@@ -146,8 +146,7 @@ use sbproxy_plugin::PolicyEnforcer;
 pub enum Policy {
     /// Rate limiting policy.
     RateLimit(RateLimitPolicy),
-    /// WOR-1130: workspace rate-limit budget marker (the budget
-    /// state machine lives binary-side).
+    /// WOR-1130: workspace rate-limit budget policy and state machine.
     RateLimitBudget(rate_limit_budget::RateLimitBudgetPolicy),
     /// IP allow/deny filter based on CIDR lists.
     IpFilter(IpFilterPolicy),

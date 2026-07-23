@@ -127,6 +127,12 @@ the next version cut.
   `proxy.admin.**` as a reload: `AdminConfig` is read once at startup, so
   a rotated admin password or a swapped certificate needs a restart, and
   the plan now says so. See [`docs/admin.md`](docs/admin.md).
+- **Workspace rate-budget behavior now has one owner.** The
+  `rate_limit_budget` policy module owns the soft, throttle, and auto-suspend
+  state machine and its tests. The previously ignored `per_route_rps` field is
+  now a config error; use `rate_limiting` for a per-route ceiling. The
+  `headers.include_ratelimit_policy` switch now controls the corresponding
+  response header.
 
 ### Fixed
 

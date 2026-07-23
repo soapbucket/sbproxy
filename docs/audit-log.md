@@ -5,7 +5,9 @@ SBproxy's audit surface is a set of narrow, structured channels rather than one 
 
 ## Admin-action audit rows
 
-Admin actions that change runtime state record an `AuditRow` (defined in `crates/sbproxy-core/src/rate_limit_budget.rs`):
+Admin actions that change runtime state record an `AuditRow` (defined with the
+module-owned state machine in
+`crates/sbproxy-modules/src/policy/rate_limit_budget/runtime.rs`):
 
 | Field | Type | Notes |
 |---|---|---|

@@ -195,6 +195,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                     reset_secs: retry_after_seconds as u64,
                     headers_enabled: false,
                     include_retry_after: true,
+                    include_ratelimit_policy: false,
                 });
                 ctx.deny_policy_type = Some("ai_crawl_ledger_unavailable");
                 Box::pin(async move {

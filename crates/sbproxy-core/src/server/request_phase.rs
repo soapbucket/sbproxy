@@ -2708,9 +2708,13 @@ pub(super) async fn request_filter(
                                 .insert_header("RateLimit-Remaining", info.remaining.to_string());
                             let _ = header
                                 .insert_header("RateLimit-Reset", info.reset_secs.to_string());
-                            // Window is the per-second budget window.
-                            let _ = header
-                                .insert_header("RateLimit-Policy", format!("{};w=1", info.limit));
+                            if info.include_ratelimit_policy {
+                                // Window is the per-second budget window.
+                                let _ = header.insert_header(
+                                    "RateLimit-Policy",
+                                    format!("{};w=1", info.limit),
+                                );
+                            }
                         }
                     } else if info.headers_enabled {
                         let _ = header.insert_header("X-RateLimit-Limit", info.limit.to_string());

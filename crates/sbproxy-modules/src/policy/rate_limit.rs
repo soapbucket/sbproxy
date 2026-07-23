@@ -25,6 +25,10 @@ pub struct RateLimitInfo {
     pub headers_enabled: bool,
     /// Whether to include the Retry-After header on 429 responses.
     pub include_retry_after: bool,
+    /// Whether a workspace-budget response includes `RateLimit-Policy`.
+    ///
+    /// The ordinary rate limiter and DDoS policy leave this false.
+    pub include_ratelimit_policy: bool,
 }
 
 /// Rate limit policy using a token bucket algorithm.
@@ -427,6 +431,7 @@ impl RateLimitPolicy {
                 reset_secs,
                 headers_enabled,
                 include_retry_after,
+                include_ratelimit_policy: false,
             }
         } else {
             let full_reset = if bucket.refill_rate > 0.0 {
@@ -444,6 +449,7 @@ impl RateLimitPolicy {
                 reset_secs: full_reset,
                 headers_enabled,
                 include_retry_after,
+                include_ratelimit_policy: false,
             }
         }
     }
@@ -471,6 +477,7 @@ impl RateLimitPolicy {
             reset_secs: until.duration_since(now).as_secs().max(1),
             headers_enabled,
             include_retry_after,
+            include_ratelimit_policy: false,
         })
     }
 
@@ -541,6 +548,7 @@ impl RateLimitPolicy {
             reset_secs: window,
             headers_enabled,
             include_retry_after,
+            include_ratelimit_policy: false,
         };
 
         let incr_result: anyhow::Result<i64> = if let Some(async_store) = self.async_store.as_ref()
@@ -591,6 +599,7 @@ impl RateLimitPolicy {
             reset_secs,
             headers_enabled,
             include_retry_after,
+            include_ratelimit_policy: false,
         }
     }
 }

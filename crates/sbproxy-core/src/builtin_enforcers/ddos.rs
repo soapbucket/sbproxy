@@ -60,6 +60,7 @@ impl PolicyEnforcer for DdosEnforcer {
                     reset_secs: retry_after_secs,
                     headers_enabled: true,
                     include_retry_after: true,
+                    include_ratelimit_policy: false,
                 });
                 ctx.deny_policy_type = Some("ddos");
                 Box::pin(async move {

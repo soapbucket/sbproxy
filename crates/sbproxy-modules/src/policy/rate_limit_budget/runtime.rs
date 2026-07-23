@@ -3,7 +3,7 @@
 //!
 //! This is the workspace-wide ceiling that sits ahead of the per-origin
 //! `rate_limiting` policy. A process-wide
-//! [`RateLimitBudgetRegistry`](crate::rate_limit_budget::RateLimitBudgetRegistry) is
+//! [`RateLimitBudgetRegistry`] is
 //! installed at startup from the top-level `rate_limits:` config and is
 //! reached by:
 //!   - the `rate_limit_budget` policy enforcer (per request), and
@@ -238,7 +238,12 @@ pub struct RateLimitBudgetRegistry {
 }
 
 impl RateLimitBudgetRegistry {
-    fn new(cfg: &RateLimitsConfig) -> Self {
+    /// Build an isolated registry from parsed top-level configuration.
+    ///
+    /// Production installs one process-wide instance with
+    /// [`install_registry`]; the public constructor also gives callers
+    /// and tests a state-machine instance without touching that singleton.
+    pub fn new(cfg: &RateLimitsConfig) -> Self {
         Self {
             sustained: cfg.workspace_default.http_rps_sustained.max(1),
             burst: cfg.workspace_default.http_rps_burst.max(1),

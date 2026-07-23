@@ -1,5 +1,5 @@
 # Policy engine
-*Last modified: 2026-07-22*
+*Last modified: 2026-07-23*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
@@ -145,6 +145,41 @@ policies:
 ```
 
 Runnable example: `examples/concurrent-limit/sb.yml`.
+
+## rate_limit_budget
+
+`rate_limit_budget` opts an origin into the workspace ceiling configured by the
+top-level `rate_limits:` block. Its module owns the token buckets and the full
+`Normal` → `Soft` → `Throttle` → `AutoSuspend` state machine; the proxy core
+only turns a denied decision into HTTP 429.
+
+```yaml
+rate_limits:
+  workspace_default:
+    http_rps_sustained: 100
+    http_rps_burst: 200
+    soft_threshold_rps: 80
+  escalation:
+    abuse_threshold_throttle_to_suspend: 1000
+    auto_suspend_cooldown_secs: 3600
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://backend:3000
+    policies:
+      - type: rate_limit_budget
+        headers:
+          enabled: true
+          include_retry_after: true
+          include_ratelimit_policy: true
+```
+
+`per_route_rps` is not implemented and is rejected during config compilation
+instead of being silently ignored. Use a separate `rate_limiting` policy for
+per-route RPS control. The three header switches above are all enforced on the
+429 response.
 
 ## http_framing
 

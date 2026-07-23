@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use sbproxy_modules::policy::rate_limit_budget::RateLimitBudgetPolicy;
+use sbproxy_modules::policy::rate_limit_budget::{BudgetDecision, RateLimitBudgetPolicy};
 use sbproxy_modules::RateLimitInfo;
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
@@ -24,6 +24,18 @@ const DEFAULT_WORKSPACE: &str = "default";
 
 /// Newtype wrapper adapting [`RateLimitBudgetPolicy`] to [`PolicyEnforcer`].
 pub struct RateLimitBudgetEnforcer(pub Arc<RateLimitBudgetPolicy>);
+
+fn response_info(policy: &RateLimitBudgetPolicy, decision: &BudgetDecision) -> RateLimitInfo {
+    RateLimitInfo {
+        allowed: decision.allowed,
+        limit: decision.limit,
+        remaining: decision.remaining,
+        reset_secs: decision.reset_secs,
+        headers_enabled: policy.headers_enabled(),
+        include_retry_after: policy.include_retry_after(),
+        include_ratelimit_policy: policy.include_ratelimit_policy(),
+    }
+}
 
 impl PolicyEnforcer for RateLimitBudgetEnforcer {
     fn policy_type(&self) -> &'static str {
@@ -67,14 +79,7 @@ impl PolicyEnforcer for RateLimitBudgetEnforcer {
         }
 
         // Throttled: stash the info for the 429 header emitter.
-        ctx.rate_limit_info = Some(RateLimitInfo {
-            allowed: false,
-            limit: decision.limit,
-            remaining: decision.remaining,
-            reset_secs: decision.reset_secs,
-            headers_enabled: policy.headers_enabled(),
-            include_retry_after: policy.include_retry_after(),
-        });
+        ctx.rate_limit_info = Some(response_info(&policy, &decision));
         ctx.deny_policy_type = Some("rate_limit_budget");
         Box::pin(async move {
             Ok(PolicyDecision::Deny {
@@ -82,5 +87,35 @@ impl PolicyEnforcer for RateLimitBudgetEnforcer {
                 message: "rate limit budget exceeded".to_string(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sbproxy_modules::policy::rate_limit_budget::Tier;
+
+    #[test]
+    fn response_info_honors_rate_limit_policy_header_preference() {
+        let policy = RateLimitBudgetPolicy::from_config(serde_json::json!({
+            "type": "rate_limit_budget",
+            "headers": {
+                "enabled": true,
+                "include_retry_after": true,
+                "include_ratelimit_policy": false
+            }
+        }))
+        .unwrap();
+        let decision = BudgetDecision {
+            allowed: false,
+            tier: Tier::Throttle,
+            limit: 10,
+            remaining: 0,
+            reset_secs: 1,
+            window_secs: 1,
+        };
+
+        let info = response_info(&policy, &decision);
+        assert!(!info.include_ratelimit_policy);
     }
 }
