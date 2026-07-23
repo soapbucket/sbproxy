@@ -5,17 +5,45 @@
 //! can be layered on top if needed.
 //!
 //! Protocol overview:
-//! - `get {key}\r\n` → `VALUE {key} {flags} {bytes}\r\n{data}\r\n END\r\n`
-//! - `set {key} 0 {ttl} {bytes}\r\n{data}\r\n` → `STORED\r\n`
-//! - `delete {key}\r\n` → `DELETED\r\n` | `NOT_FOUND\r\n`
+//! - `get {key}` -> `VALUE {key} {flags} {bytes}` then the data then `END`
+//! - `set {key} 0 {ttl} {bytes}` then the data -> `STORED`
+//! - `delete {key}` -> `DELETED` or `NOT_FOUND`
+//!
+//! Known limits of this backend, all of them properties of memcached
+//! rather than of this code:
+//!
+//! - **No stale-while-revalidate.** Memcached expires items server-side
+//!   at the TTL it was given, and the store has no way to learn the SWR
+//!   window, so `get_including_expired` can never return a past-TTL
+//!   entry and `stale_while_revalidate` never fires.
+//! - **No prefix purge.** Keys are hashed to fit the protocol's 250-byte
+//!   limit, and memcached has no key scan, so `delete_prefix` returns
+//!   `Ok(0)` and `invalidate_on_mutation` is a no-op. Entries fall out
+//!   by TTL.
+//! - **A default 1 MiB value cap.** Larger responses are refused by the
+//!   server and the write returns an error, which the response phase
+//!   logs and moves past.
+//! - **One TCP connection per operation.** Cache reads run on the
+//!   blocking pool, so this costs latency rather than reactor time.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
 
 use super::{CacheStore, CachedResponse};
+
+/// Memcached reads any expiration above 30 days as an absolute Unix
+/// timestamp rather than a relative offset (see the `set` command in
+/// the ASCII protocol spec). Relative TTLs are clamped here so a long
+/// configured TTL cannot be read as a 1970 timestamp, which would
+/// expire the item the instant it is written.
+const MAX_RELATIVE_TTL_SECS: u64 = 60 * 60 * 24 * 30;
+
+/// Upper bound on a memcached key, in bytes.
+const MAX_KEY_BYTES: usize = 250;
 
 // --- Config ---
 
@@ -68,26 +96,42 @@ impl MemcachedStore {
     }
 
     /// Compute remaining TTL in seconds.  Returns 0 for expired entries.
+    ///
+    /// Clamped to [`MAX_RELATIVE_TTL_SECS`]. An entry configured with a
+    /// TTL past that ceiling expires early on this backend rather than
+    /// never being cached at all, which is the honest degradation.
     fn remaining_ttl(entry: &CachedResponse) -> u64 {
         let expiry = entry.cached_at.saturating_add(entry.ttl_secs);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        expiry.saturating_sub(now)
+        expiry.saturating_sub(now).min(MAX_RELATIVE_TTL_SECS)
     }
 
-    /// Sanitize a cache key for memcached: replace whitespace with `_`.
-    fn sanitize_key(key: &str) -> String {
-        key.chars()
-            .map(|c| if c.is_ascii_whitespace() { '_' } else { c })
-            .collect()
+    /// Encode a cache key into a memcached-safe key.
+    ///
+    /// Response-cache keys are `workspace:host:METHOD:/path:query:varyfp`
+    /// and carry no length bound, while memcached caps keys at 250 bytes
+    /// and rejects spaces and control characters. Hashing unconditionally
+    /// makes every key fixed-length, printable, and deterministic, so the
+    /// request path and an admin purge-by-key agree on the same key.
+    ///
+    /// One consequence: keys are one-way on this backend, so
+    /// `delete_prefix` cannot be implemented (it already returns `Ok(0)`
+    /// through the trait default) and `invalidate_on_mutation` is a
+    /// no-op here. That is documented in `docs/configuration.md`.
+    fn encode_key(key: &str) -> String {
+        let digest = Sha256::digest(key.as_bytes());
+        let encoded = format!("sbrc:{}", hex::encode(digest));
+        debug_assert!(encoded.len() <= MAX_KEY_BYTES);
+        encoded
     }
 }
 
 impl CacheStore for MemcachedStore {
     fn get(&self, key: &str) -> Result<Option<CachedResponse>> {
-        let key = Self::sanitize_key(key);
+        let key = Self::encode_key(key);
         let stream = self.connect()?;
         let mut writer = stream.try_clone().context("MemcachedStore: clone stream")?;
         let mut reader = BufReader::new(stream);
@@ -152,7 +196,7 @@ impl CacheStore for MemcachedStore {
     }
 
     fn put(&self, key: &str, value: &CachedResponse) -> Result<()> {
-        let key = Self::sanitize_key(key);
+        let key = Self::encode_key(key);
         let ttl = Self::remaining_ttl(value);
         if ttl == 0 {
             // Already expired; skip write.
@@ -192,7 +236,7 @@ impl CacheStore for MemcachedStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let key = Self::sanitize_key(key);
+        let key = Self::encode_key(key);
         let stream = self.connect()?;
         let mut writer = stream.try_clone().context("MemcachedStore: clone stream")?;
         let mut reader = BufReader::new(stream);
@@ -276,9 +320,75 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_key_replaces_whitespace() {
-        assert_eq!(MemcachedStore::sanitize_key("hello world"), "hello_world");
-        assert_eq!(MemcachedStore::sanitize_key("no-spaces"), "no-spaces");
+    fn encode_key_is_short_and_protocol_safe_for_any_input() {
+        // Real cache keys are `workspace:host:METHOD:/path:query:varyfp`
+        // with no length bound. Memcached caps keys at 250 bytes and
+        // rejects control characters and spaces, so a normal API path
+        // used to draw `CLIENT_ERROR bad command line format` and the
+        // cache silently never hit.
+        let long_path = "/".to_string() + &"segment/".repeat(200);
+        let raw = format!(":api.example.com:GET:{long_path}:a=1&b=2:fp");
+        let encoded = MemcachedStore::encode_key(&raw);
+
+        assert!(
+            encoded.len() <= 250,
+            "encoded key is {} bytes, over the memcached limit",
+            encoded.len()
+        );
+        assert!(
+            encoded.bytes().all(|b| b > 0x20 && b < 0x7f),
+            "encoded key contains a byte memcached rejects: {encoded}"
+        );
+        assert!(encoded.starts_with("sbrc:"));
+    }
+
+    #[test]
+    fn encode_key_is_deterministic_and_collision_free_for_distinct_keys() {
+        // Admin purge-by-key and the request path must land on the same
+        // memcached key for the same logical cache key.
+        let a = MemcachedStore::encode_key("ws:host:GET:/users/42::fp");
+        let b = MemcachedStore::encode_key("ws:host:GET:/users/42::fp");
+        let c = MemcachedStore::encode_key("ws:host:GET:/users/43::fp");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn encode_key_handles_whitespace_and_control_bytes() {
+        // The old sanitizer only swapped whitespace for underscores and
+        // passed control bytes straight through.
+        let encoded = MemcachedStore::encode_key("hello world\r\nset evil 0 0 1\r\n");
+        assert!(encoded.starts_with("sbrc:"));
+        assert!(!encoded.contains(' '));
+        assert!(!encoded.contains('\r'));
+        assert!(!encoded.contains('\n'));
+    }
+
+    #[test]
+    fn remaining_ttl_is_clamped_to_the_relative_expiry_ceiling() {
+        // Memcached reads any expiration above 30 days as an absolute
+        // Unix timestamp. An unclamped 60-day TTL was therefore read as
+        // a 1970 timestamp and the item expired the moment it was
+        // written, so long-TTL entries never cached at all.
+        let entry = CachedResponse {
+            status: 200,
+            headers: vec![],
+            body: vec![],
+            cached_at: now_secs(),
+            ttl_secs: 60 * 60 * 24 * 60,
+        };
+        let ttl = MemcachedStore::remaining_ttl(&entry);
+        assert_eq!(
+            ttl, 2_592_000,
+            "TTL above 30 days must clamp to the relative-expiry ceiling"
+        );
+    }
+
+    #[test]
+    fn remaining_ttl_below_the_ceiling_is_untouched() {
+        let entry = make_entry(3600);
+        let ttl = MemcachedStore::remaining_ttl(&entry);
+        assert!(ttl > 3500 && ttl <= 3600, "expected ~3600 got {ttl}");
     }
 
     #[test]
