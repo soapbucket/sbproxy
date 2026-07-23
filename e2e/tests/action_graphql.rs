@@ -151,6 +151,122 @@ origins:
 }
 
 #[test]
+fn graphql_request_validator_forwards_the_exact_validated_replacement_body() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let forbidden_original = br#"{"query":"{__schema{id}}"}"#.to_vec();
+    let safe_replacement = br#"{"query":"{safeName{id}}"}"#.to_vec();
+    assert_eq!(
+        forbidden_original.len(),
+        safe_replacement.len(),
+        "the regression must not depend on content-length changing"
+    );
+
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      allow_introspection: false
+    request_modifiers:
+      - body:
+          replace_json:
+            query: "{{safeName{{id}}}}"
+    policies:
+      - type: request_validator
+        content_types:
+          - application/json
+        schema:
+          type: object
+          required:
+            - query
+          properties:
+            query:
+              type: string
+          additionalProperties: false
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let response = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "application/json",
+            forbidden_original,
+            &[],
+        )
+        .expect("send forbidden GraphQL body");
+
+    assert_eq!(response.status, 200);
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].body, safe_replacement,
+        "the body that passed GraphQL validation must be the body sent upstream"
+    );
+}
+
+#[test]
+fn graphql_idempotency_miss_forwards_the_exact_validated_replacement_body() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let forbidden_original = br#"{"query":"{__schema{id}}"}"#.to_vec();
+    let safe_replacement = br#"{"query":"{safeName{id}}"}"#.to_vec();
+    assert_eq!(
+        forbidden_original.len(),
+        safe_replacement.len(),
+        "the regression must not depend on content-length changing"
+    );
+
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      allow_introspection: false
+    request_modifiers:
+      - body:
+          replace_json:
+            query: "{{safeName{{id}}}}"
+    idempotency:
+      enabled: true
+      header_name: Idempotency-Key
+      ttl_secs: 60
+      methods: [POST]
+      backend: memory
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let response = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "application/json",
+            forbidden_original,
+            &[("Idempotency-Key", "graphql-replacement-miss")],
+        )
+        .expect("send idempotency cache miss");
+
+    assert_eq!(response.status, 200);
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].body, safe_replacement,
+        "an idempotency miss must forward the GraphQL-validated replacement"
+    );
+}
+
+#[test]
 fn graphql_validates_percent_encoded_get_queries_before_upstream() {
     let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
     let yaml = format!(
@@ -221,6 +337,42 @@ origins:
     assert!(
         upstream.captured().is_empty(),
         "validated GraphQL GET bodies must not reach the upstream"
+    );
+}
+
+#[test]
+fn graphql_validated_get_rejects_inbound_body_even_with_empty_replacement() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      validate_queries: true
+    request_modifiers:
+      - body:
+          replace: ""
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let status = get_with_body(
+        &proxy,
+        "/graphql?query=%7Bhello%7D",
+        "gql.localhost",
+        br#"{"query":"{ hello }"}"#.to_vec(),
+    )
+    .expect("send GraphQL GET with inbound body and empty replacement");
+
+    assert_eq!(status, 400);
+    assert!(
+        upstream.captured().is_empty(),
+        "an empty replacement must not mask a nonempty inbound GET body"
     );
 }
 
@@ -366,6 +518,52 @@ origins:
     assert!(
         upstream.captured().is_empty(),
         "an unreplayable validated body must not reach the upstream"
+    );
+}
+
+#[test]
+fn graphql_validation_replays_body_consumed_by_threat_protection() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      validate_queries: true
+    threat_protection:
+      enabled: true
+      json:
+        max_depth: 4
+        max_keys: 8
+        max_string_length: 128
+        max_array_size: 4
+        max_total_size: 1024
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    let request_body = br#"{"query":"{viewer{id}}"}"#.to_vec();
+
+    let response = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "application/json",
+            request_body.clone(),
+            &[],
+        )
+        .expect("send GraphQL body through threat protection");
+
+    assert_eq!(response.status, 200);
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].body, request_body,
+        "GraphQL must validate and replay bytes consumed by earlier middleware"
     );
 }
 

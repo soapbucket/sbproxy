@@ -39,26 +39,21 @@ pub(super) async fn handle_action(
                 // the maximum body that can be validated and then forwarded
                 // byte-for-byte.
                 session.as_mut().enable_retry_buffering();
-                let mut body = Vec::new();
-                let mut replay_buffer_truncated = false;
-                while let Some(chunk) = session.read_request_body().await? {
-                    if !replay_buffer_truncated {
-                        replay_buffer_truncated = session.as_ref().retry_buffer_truncated();
-                        if replay_buffer_truncated {
-                            body.clear();
-                        } else {
-                            body.extend_from_slice(&chunk);
-                        }
-                    }
-                }
-                if replay_buffer_truncated {
+                while session.read_request_body().await?.is_some() {}
+                if session.as_ref().retry_buffer_truncated() {
                     let detail = "validated GraphQL request body exceeds the 64 KiB replay limit"
                         .to_string();
                     debug!(detail = %detail, "GraphQL request validation failed");
                     send_error(session, 413, &detail).await?;
                     return Ok(true);
                 }
-                ctx.graphql_request_body = Some(bytes::Bytes::from(body));
+                let Some(body) = session.as_ref().get_retry_buffer() else {
+                    let detail = "validated GraphQL request body could not be captured for replay";
+                    debug!(detail, "GraphQL request validation failed");
+                    send_error(session, 400, detail).await?;
+                    return Ok(true);
+                };
+                ctx.graphql_request_body = Some(body);
             }
             Ok(false)
         }

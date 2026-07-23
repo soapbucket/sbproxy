@@ -74,6 +74,42 @@ mod concurrent_limit_denial_response_tests {
     }
 }
 
+/// Resolve whether the request's eventual base/forward-rule action is a
+/// GraphQL action with parsing enabled.
+///
+/// Forward-rule matching later in this phase reads the same immutable request
+/// path, query, and headers. Resolving it here lets us enable Pingora's bounded
+/// replay buffer before threat protection or another origin middleware reads
+/// the body.
+fn request_requires_graphql_replay(
+    session: &Session,
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+) -> bool {
+    let request = session.req_header();
+    let path = request.uri.path();
+    let query = request.uri.query();
+    let forwarded_action = pipeline
+        .forward_rules
+        .get(origin_idx)
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule.matchers.iter().any(|matcher| {
+                    matcher
+                        .match_request(path, query, &request.headers)
+                        .is_some()
+                })
+            })
+        })
+        .map(|rule| &rule.action);
+    let effective_action = forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
+
+    matches!(
+        effective_action,
+        Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
+    )
+}
+
 /// Handle an incoming request before proxying. See the trait method
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 pub(super) async fn request_filter(
@@ -1020,6 +1056,15 @@ pub(super) async fn request_filter(
         }
     };
     ctx.origin_idx = Some(origin_idx);
+
+    // Validated GraphQL requests may pass through body-consuming middleware
+    // (notably threat protection) before action dispatch. Enable replay at
+    // the origin boundary so every consumed chunk is still available for
+    // GraphQL validation and byte-for-byte upstream forwarding.
+    if request_requires_graphql_replay(session, &pipeline, origin_idx) {
+        session.as_mut().enable_retry_buffering();
+    }
+
     // WOR-1053: stamp the matched origin's tenant on the request
     // context so downstream auth / policy / vault resolution can
     // partition by tenant. The compiler defaults the field to

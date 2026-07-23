@@ -21,6 +21,31 @@ fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Op
     }
 }
 
+/// Make the GraphQL-validated POST body authoritative at the final
+/// request-body boundary.
+///
+/// Body-aware policies and idempotency deliberately inspect/hash the inbound
+/// bytes, so both paths return before the generic request-body replacement
+/// below. Hold all inbound chunks and emit the exact validated outbound bytes
+/// once at end-of-stream, regardless of which body-aware path ran.
+fn emit_graphql_validated_request_body(
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+    ctx: &mut RequestContext,
+) {
+    if ctx.graphql_validated_request_body.is_none() {
+        return;
+    }
+
+    if end_of_stream {
+        *body = ctx.graphql_validated_request_body.take();
+        // The authoritative slot supersedes the ordinary modifier slot.
+        ctx.replacement_request_body = None;
+    } else {
+        *body = None;
+    }
+}
+
 /// Stable admin-console label for the generic load balancer's closed
 /// algorithm set.
 fn load_balancer_algorithm_name(algorithm: &sbproxy_modules::action::Algorithm) -> &'static str {
@@ -1289,8 +1314,11 @@ impl ProxyHttp for SbProxy {
         // gap where a benign client document could pass validation and then
         // be rewritten into a forbidden request before proxying.
         if ctx.graphql_validation_pending {
+            ctx.graphql_validated_request_body = None;
             let pipeline = ctx.pipeline.clone();
-            let validation_result = if let Some(origin_idx) = ctx.origin_idx {
+            let (validation_result, validated_request_body) = if let Some(origin_idx) =
+                ctx.origin_idx
+            {
                 let forwarded_action = ctx.forward_rule_idx.and_then(|forward_idx| {
                     pipeline
                         .forward_rules
@@ -1302,17 +1330,28 @@ impl ProxyHttp for SbProxy {
                     forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
                 match effective_action {
                     Some(Action::GraphQL(graphql)) => match upstream_request.method {
-                        http::Method::GET => match ctx
-                            .replacement_request_body
-                            .as_deref()
-                            .or(ctx.graphql_request_body.as_deref())
-                        {
-                            Some(body) if !body.is_empty() => {
-                                Err("validated GraphQL GET requests must not contain a body"
-                                    .to_string())
+                        http::Method::GET => {
+                            let has_replacement_body = ctx
+                                .replacement_request_body
+                                .as_ref()
+                                .is_some_and(|body| !body.is_empty());
+                            let has_inbound_body = ctx
+                                .graphql_request_body
+                                .as_ref()
+                                .is_some_and(|body| !body.is_empty());
+                            if has_replacement_body || has_inbound_body {
+                                (
+                                    Err("validated GraphQL GET requests must not contain a body"
+                                        .to_string()),
+                                    None,
+                                )
+                            } else {
+                                (
+                                    graphql.validate_get_query(upstream_request.uri.query()),
+                                    None,
+                                )
                             }
-                            _ => graphql.validate_get_query(upstream_request.uri.query()),
-                        },
+                        }
                         http::Method::POST => {
                             let content_type = upstream_request
                                 .headers
@@ -1320,17 +1359,26 @@ impl ProxyHttp for SbProxy {
                                 .and_then(|value| value.to_str().ok());
                             let body = ctx
                                 .replacement_request_body
-                                .as_deref()
-                                .or(ctx.graphql_request_body.as_deref())
+                                .clone()
+                                .or_else(|| ctx.graphql_request_body.clone())
                                 .unwrap_or_default();
-                            graphql.validate_post_body(content_type, body)
+                            (graphql.validate_post_body(content_type, &body), Some(body))
                         }
-                        _ => Err("validated GraphQL actions accept GET or POST only".to_string()),
+                        _ => (
+                            Err("validated GraphQL actions accept GET or POST only".to_string()),
+                            None,
+                        ),
                     },
-                    _ => Err("validated GraphQL action is no longer available".to_string()),
+                    _ => (
+                        Err("validated GraphQL action is no longer available".to_string()),
+                        None,
+                    ),
                 }
             } else {
-                Err("validated GraphQL action has no resolved origin".to_string())
+                (
+                    Err("validated GraphQL action has no resolved origin".to_string()),
+                    None,
+                )
             };
 
             if let Err(detail) = validation_result {
@@ -1346,6 +1394,7 @@ impl ProxyHttp for SbProxy {
                     "GraphQL request validation failed",
                 ));
             }
+            ctx.graphql_validated_request_body = validated_request_body;
         }
 
         Ok(())
@@ -3045,6 +3094,7 @@ impl ProxyHttp for SbProxy {
                     }
                 }
             }
+            emit_graphql_validated_request_body(body, end_of_stream, ctx);
             // Mid-stream chunks: hold off forwarding until end_of_stream.
             return Ok(());
         }
@@ -3086,6 +3136,7 @@ impl ProxyHttp for SbProxy {
                 ctx.request_body_buf = None;
                 ctx.idempotency_permit = None;
                 ctx.idempotency_skip_reason = Some("SKIPPED-OVERSIZE-REQUEST");
+                emit_graphql_validated_request_body(body, end_of_stream, ctx);
                 return Ok(());
             }
             if let Some(chunk) = body.as_ref() {
@@ -3112,7 +3163,8 @@ impl ProxyHttp for SbProxy {
                 ctx.idempotency_miss = Some((key, body_hash));
                 ctx.idempotency_response_body_buf = Some(bytes::BytesMut::with_capacity(8192));
             }
-            // Pass the chunk through to upstream unchanged.
+            emit_graphql_validated_request_body(body, end_of_stream, ctx);
+            // Non-GraphQL requests pass the chunk through unchanged.
             return Ok(());
         }
 
@@ -3153,7 +3205,9 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        if let Some(replacement) = ctx.replacement_request_body.take() {
+        if ctx.graphql_validated_request_body.is_some() {
+            emit_graphql_validated_request_body(body, end_of_stream, ctx);
+        } else if let Some(replacement) = ctx.replacement_request_body.take() {
             *body = Some(replacement);
         }
         Ok(())
