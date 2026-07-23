@@ -94,6 +94,7 @@ percent-encoding.workspace = true
 regex.workspace = true
 minijinja.workspace = true
 pulldown-cmark.workspace = true
+graphql-parser.workspace = true
 tracing.workspace = true
 md-5 = "0.10"
 sha2.workspace = true

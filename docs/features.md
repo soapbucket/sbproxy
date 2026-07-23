@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-07-22*
+*Last modified: 2026-07-23*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -2010,7 +2010,7 @@ Brief schemas for actions, policies, transforms, and origin fields not covered a
 
 | Type | Description |
 |---|---|
-| `graphql` | Proxy GraphQL requests to an upstream HTTP endpoint, with operation parsing |
+| `graphql` | Proxy GraphQL requests with optional syntax, depth, and introspection enforcement |
 | `storage` | Serve files from object storage (S3, GCS, Azure, local) |
 | `a2a` | Proxy to an Agent-to-Agent endpoint |
 | `mcp` | MCP (Model Context Protocol) gateway that federates one or more upstream MCP servers |

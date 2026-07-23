@@ -54,3 +54,293 @@ origins:
         "upstream body should carry the GraphQL query: {upstream_body}"
     );
 }
+
+#[test]
+fn graphql_rejects_nested_aliased_introspection_before_upstream() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      allow_introspection: false
+"#,
+        upstream.base_url()
+    );
+
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    let resp = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!({
+                "query": "{ viewer { hidden: __type(name: \"User\") { name } } }"
+            }),
+            &[("content-type", "application/json")],
+        )
+        .expect("send graphql query");
+
+    assert_eq!(resp.status, 400);
+    assert!(
+        upstream.captured().is_empty(),
+        "rejected GraphQL requests must not reach the upstream"
+    );
+}
+
+#[test]
+fn graphql_validates_percent_encoded_get_queries_before_upstream() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      allow_introspection: false
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let valid = proxy
+        .get(
+            "/graphql?query=%7Bviewer%7Bid%7D%7D&variables=%7B%7D",
+            "gql.localhost",
+        )
+        .expect("send valid GraphQL GET");
+    assert_eq!(valid.status, 200);
+
+    let resp = proxy
+        .get(
+            "/graphql?query=%7Bviewer%7Bhidden%3A__schema%7BqueryType%7Bname%7D%7D%7D%7D",
+            "gql.localhost",
+        )
+        .expect("send GraphQL GET");
+
+    assert_eq!(resp.status, 400);
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "only the valid GraphQL GET request may reach the upstream"
+    );
+}
+
+#[test]
+fn graphql_validation_fails_closed_for_unsupported_multipart_post() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      validate_queries: true
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let resp = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "multipart/form-data; boundary=graphql",
+            br#"{"query":"{ hello }"}"#.to_vec(),
+            &[],
+        )
+        .expect("send unsupported GraphQL multipart request");
+
+    assert_eq!(resp.status, 400);
+    assert!(
+        upstream.captured().is_empty(),
+        "unsupported validated GraphQL transports must fail closed"
+    );
+}
+
+#[test]
+fn graphql_validation_rejects_body_larger_than_replay_buffer() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      validate_queries: true
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    let oversized = json!({
+        "query": "{ hello }",
+        "variables": {"padding": "x".repeat(70 * 1024)}
+    });
+
+    let resp = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &oversized,
+            &[("content-type", "application/json")],
+        )
+        .expect("send oversized GraphQL request");
+
+    assert_eq!(resp.status, 413);
+    assert!(
+        upstream.captured().is_empty(),
+        "an unreplayable validated body must not reach the upstream"
+    );
+}
+
+#[test]
+fn graphql_max_depth_allows_exact_limit_and_rejects_excess() {
+    let upstream = MockUpstream::start(json!({"data": {"viewer": {"id": "1"}}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      max_depth: 2
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let exact = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!({"query": "{ viewer { id } }"}),
+            &[("content-type", "application/json")],
+        )
+        .expect("send exact-depth query");
+    assert_eq!(exact.status, 200);
+
+    let too_deep = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!({"query": "{ viewer { profile { id } } }"}),
+            &[("content-type", "application/json")],
+        )
+        .expect("send over-depth query");
+    assert_eq!(too_deep.status, 400);
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "only the exact-limit query may reach the upstream"
+    );
+}
+
+#[test]
+fn graphql_validates_malformed_and_batched_post_documents() {
+    let upstream = MockUpstream::start(json!({"data": {"ok": true}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      validate_queries: true
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let malformed = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!({"query": "{ viewer( }"}),
+            &[("content-type", "application/json")],
+        )
+        .expect("send malformed query");
+    assert_eq!(malformed.status, 400);
+
+    let valid_batch = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!([
+                {"query": "{ viewer { id } }"},
+                {"query": "mutation { updateName(name: \"Ada\") { id } }"}
+            ]),
+            &[("content-type", "application/json")],
+        )
+        .expect("send valid batch");
+    assert_eq!(valid_batch.status, 200);
+
+    let invalid_batch = proxy
+        .post_json(
+            "/graphql",
+            "gql.localhost",
+            &json!([
+                {"query": "{ viewer { id } }"},
+                {"query": "{ broken( }"}
+            ]),
+            &[("content-type", "application/json")],
+        )
+        .expect("send invalid batch");
+    assert_eq!(invalid_batch.status, 400);
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "only the valid batch may reach the upstream"
+    );
+}
+
+#[test]
+fn graphql_default_config_remains_a_transparent_proxy() {
+    let upstream = MockUpstream::start(json!({"data": {"ok": true}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let resp = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "multipart/form-data; boundary=graphql",
+            b"not a supported GraphQL transport".to_vec(),
+            &[],
+        )
+        .expect("send unvalidated body");
+
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "default GraphQL configuration must not parse or reject the request"
+    );
+}

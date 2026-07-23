@@ -17,11 +17,69 @@ pub(super) async fn handle_action(
     ctx: &mut RequestContext,
 ) -> Result<bool> {
     match action {
-        Action::Proxy(_)
-        | Action::LoadBalancer(_)
-        | Action::WebSocket(_)
-        | Action::GraphQL(_)
-        | Action::A2a(_) => Ok(false),
+        Action::Proxy(_) | Action::LoadBalancer(_) | Action::WebSocket(_) | Action::A2a(_) => {
+            Ok(false)
+        }
+
+        Action::GraphQL(graphql) => {
+            if !graphql.validation_enabled() {
+                return Ok(false);
+            }
+
+            let method = session.req_header().method.clone();
+            let result: Result<(), (u16, String)> = match method {
+                http::Method::GET => graphql
+                    .validate_get_query(session.req_header().uri.query())
+                    .map_err(|detail| (400, detail)),
+                http::Method::POST => {
+                    // Pingora copies bodies consumed from request_filter into
+                    // its replay buffer. Reading the complete JSON envelope
+                    // here lets us reject before upstream request headers are
+                    // sent while a validated body is still forwarded
+                    // unchanged.
+                    let content_type = session
+                        .req_header()
+                        .headers
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    session.as_mut().enable_retry_buffering();
+                    let mut body = Vec::new();
+                    let mut replay_buffer_truncated = false;
+                    while let Some(chunk) = session.read_request_body().await? {
+                        if !replay_buffer_truncated {
+                            replay_buffer_truncated = session.as_ref().retry_buffer_truncated();
+                            if replay_buffer_truncated {
+                                body.clear();
+                            } else {
+                                body.extend_from_slice(&chunk);
+                            }
+                        }
+                    }
+                    if replay_buffer_truncated {
+                        Err((
+                            413,
+                            "validated GraphQL POST body exceeds the 64 KiB replay limit"
+                                .to_string(),
+                        ))
+                    } else {
+                        graphql
+                            .validate_post_body(content_type.as_deref(), &body)
+                            .map_err(|detail| (400, detail))
+                    }
+                }
+                _ => Err((
+                    400,
+                    "validated GraphQL actions accept GET or POST only".to_string(),
+                )),
+            };
+            if let Err((status, detail)) = result {
+                debug!(detail = %detail, "GraphQL request validation failed");
+                send_error(session, status, &detail).await?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
 
         Action::Grpc(g) => {
             // WOR-819: a REST request (not native `application/grpc`) sent

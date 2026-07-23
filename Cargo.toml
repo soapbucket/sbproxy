@@ -178,6 +178,7 @@ percent-encoding = "2"
 regex = "1"
 minijinja = "2"
 pulldown-cmark = "0.12"
+graphql-parser = "0.4.1"
 
 # Networking
 ipnetwork = "0.20"

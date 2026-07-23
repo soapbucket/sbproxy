@@ -14600,9 +14600,25 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Backend GraphQL endpoint URL (`http://` or `https://`). |
-| `max_depth` | int | 0 | Maximum query nesting depth. `0` means unlimited. |
-| `allow_introspection` | bool | true | When false, introspection queries are rejected. |
-| `validate_queries` | bool | false | When true, validate incoming GraphQL queries. |
+| `max_depth` | int | 0 | Maximum field nesting depth, including named-fragment expansion. The exact limit is accepted; `0` means unlimited. |
+| `allow_introspection` | bool | true | When false, operations selecting `__schema` or `__type` are rejected, including aliased or nested selections. |
+| `validate_queries` | bool | false | When true, parse GraphQL document syntax before proxying. This does not perform schema-aware validation. |
+
+With all three fields at their defaults, the action remains a transparent
+proxy and does not parse the request. Setting `validate_queries: true`,
+setting `max_depth` above zero, or setting `allow_introspection: false`
+enables fail-closed parsing. Validated requests support a percent-encoded
+`query` parameter on `GET`, plus an `application/json` object or batched
+array on `POST`. Every entry in a batch must contain a string `query`
+field and the complete batch is rejected when any entry fails.
+
+Validation failures return `400` before an HTTP request is sent upstream.
+Validated POST bodies are limited to 64 KiB so the accepted body can be
+replayed unchanged after the pre-upstream check; larger bodies return
+`413`. Multipart uploads and persisted-query-only envelopes are not
+validated transports and therefore return `400` when any validation
+control is enabled. They continue to pass through unchanged under the
+default transparent configuration.
 
 ### storage
 
@@ -19099,7 +19115,7 @@ The store does not currently emit metrics. Wire a metric of your choice around t
 
 ## SBproxy features manual
 
-*Last modified: 2026-07-22*
+*Last modified: 2026-07-23*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -21109,7 +21125,7 @@ Brief schemas for actions, policies, transforms, and origin fields not covered a
 
 | Type | Description |
 |---|---|
-| `graphql` | Proxy GraphQL requests to an upstream HTTP endpoint, with operation parsing |
+| `graphql` | Proxy GraphQL requests with optional syntax, depth, and introspection enforcement |
 | `storage` | Serve files from object storage (S3, GCS, Azure, local) |
 | `a2a` | Proxy to an Agent-to-Agent endpoint |
 | `mcp` | MCP (Model Context Protocol) gateway that federates one or more upstream MCP servers |
