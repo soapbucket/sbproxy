@@ -11,6 +11,9 @@ sbproxy-platform.workspace = true
 # AES-256-GCM and HKDF for at-rest encryption of cached payloads.
 # Already in the graph; this adds no external crate.
 sbproxy-security.workspace = true
+# Scrubs cache encryption key material on drop. Already a workspace
+# dependency; this adds no external crate.
+zeroize.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

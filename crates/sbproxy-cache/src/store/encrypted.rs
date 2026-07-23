@@ -67,10 +67,16 @@
 //! matching no configured key is deleted and reported as a miss, so a
 //! cache that used to run unencrypted heals rather than silently serving
 //! records this store cannot vouch for. A record whose fingerprint does
-//! match but which fails to authenticate is tampering or corruption and
-//! returns `Err`, which the request path logs and treats as a cache
-//! bypass. No path returns plaintext that the AEAD did not authenticate,
-//! and no path falls back to serving the record unsealed.
+//! match but which fails to authenticate is tampering or corruption: it
+//! is deleted as well and then reported as `Err`, which the request path
+//! logs and treats as a cache bypass. Every unreadable record is
+//! evicted, whichever way it is unreadable. Leaving the authentication
+//! failures in place would be the worse of the two, because `ttl_secs`
+//! is in the clear: a forged record can name its own lifetime, and the
+//! bypassing read path never rewrites the key it just refused, so the
+//! poisoned entry would sit there driving origin load until an operator
+//! purged it. No path returns plaintext that the AEAD did not
+//! authenticate, and no path falls back to serving the record unsealed.
 
 use std::sync::Arc;
 
@@ -79,6 +85,7 @@ use sbproxy_security::{
     aes256gcm_decrypt, aes256gcm_encrypt, hkdf_derive_purpose, random_aes256_key,
     random_aes_gcm_nonce, HkdfPurpose, AES256_KEY_LEN, AES_GCM_NONCE_LEN,
 };
+use zeroize::Zeroizing;
 
 use super::{CacheStore, CachedResponse};
 
@@ -97,8 +104,12 @@ const HEADER_LEN: usize = MAGIC.len() + 1 + KEY_FP_LEN + SALT_LEN + AES_GCM_NONC
 const MIN_KEY_MATERIAL_BYTES: usize = 16;
 /// Fixed HKDF salt used only for deriving a key's public fingerprint.
 /// Its length differs from [`SALT_LEN`], so it can never collide with a
-/// per-entry salt.
+/// per-entry salt. That separation is what keeps the fingerprint we
+/// print in logs from being the leading bytes of a live per-entry key,
+/// and the assert below is what enforces it: shrink `KEY_ID_SALT` to 16
+/// bytes and the build stops rather than quietly leaking key bytes.
 const KEY_ID_SALT: &[u8] = b"sbproxy.response-cache.key-id.v1";
+const _: () = assert!(KEY_ID_SALT.len() != SALT_LEN);
 
 /// Emitted once per process when the decorator is asked to encrypt an
 /// in-process cache, so a config that moves between backends does not
@@ -111,9 +122,12 @@ static MEMORY_BACKEND_ADVISORY: std::sync::Once = std::sync::Once::new();
 /// envelopes. The `Debug` impl prints only the fingerprint, so the
 /// material never reaches a log line. The type is deliberately neither
 /// `Clone` nor `Serialize`: every copy is another place the secret can
-/// escape from, and there is no reason to make one.
+/// escape from, and there is no reason to make one. The material sits
+/// in a [`Zeroizing`] wrapper so the heap allocation is scrubbed when
+/// the key is dropped, rather than being left for the next allocation
+/// or a core dump to pick up.
 pub struct CacheKeyMaterial {
-    material: Vec<u8>,
+    material: Zeroizing<Vec<u8>>,
     fingerprint: [u8; KEY_FP_LEN],
 }
 
@@ -136,6 +150,9 @@ impl CacheKeyMaterial {
     /// no other constructor, so an [`EncryptedCacheStore`] cannot be
     /// built without material that passed this check.
     pub fn new(material: Vec<u8>) -> Result<Self> {
+        // Wrap before the length check so material we reject is scrubbed
+        // too. A passphrase short enough to refuse is still a secret.
+        let material = Zeroizing::new(material);
         if material.len() < MIN_KEY_MATERIAL_BYTES {
             return Err(anyhow!(
                 "response-cache encryption key must contain at least {MIN_KEY_MATERIAL_BYTES} bytes of material, got {}",
@@ -164,14 +181,19 @@ impl CacheKeyMaterial {
     }
 
     /// Derive the single-use AES-256 key for an entry with this salt.
-    fn entry_key(&self, salt: &[u8]) -> [u8; AES256_KEY_LEN] {
-        let derived = hkdf_derive_purpose(
+    ///
+    /// Both the HKDF output buffer and the returned key are wrapped so
+    /// they are scrubbed on drop. This runs on every cache read and
+    /// every cache write, so without it a busy gateway leaves a trail of
+    /// freed 32-byte keys across the heap at request rate.
+    fn entry_key(&self, salt: &[u8]) -> Zeroizing<[u8; AES256_KEY_LEN]> {
+        let derived = Zeroizing::new(hkdf_derive_purpose(
             &self.material,
             salt,
             HkdfPurpose::ResponseCacheAtRest,
             AES256_KEY_LEN,
-        );
-        let mut key = [0u8; AES256_KEY_LEN];
+        ));
+        let mut key = Zeroizing::new([0u8; AES256_KEY_LEN]);
         key.copy_from_slice(&derived);
         key
     }
@@ -387,7 +409,9 @@ impl EncryptedCacheStore {
     /// `Ok(None)` means "this store cannot read this record under any
     /// configured key", which the caller turns into an eviction and a
     /// miss. `Err` means the record claimed a key we hold and then
-    /// failed to authenticate, which is tampering or corruption.
+    /// failed to authenticate, which is tampering or corruption; that
+    /// record is evicted here before the error is returned, so a forged
+    /// entry cannot pin itself in the cache behind a cleartext TTL.
     fn open(&self, key: &str, stored: &CachedResponse) -> Result<Option<CachedResponse>> {
         let body = &stored.body;
         if body.len() < HEADER_LEN || body[..MAGIC.len()] != MAGIC {
@@ -440,12 +464,27 @@ impl EncryptedCacheStore {
         // A fingerprint we hold that will not authenticate is tampering
         // or corruption, never a miss. The message names only the public
         // fingerprint, never the material behind it.
-        let plaintext = opened.ok_or_else(|| {
-            anyhow!(
-                "response-cache entry sealed under key {} failed authentication",
+        let Some(plaintext) = opened else {
+            // Evict before reporting. `ttl_secs` rides in the clear, so
+            // a forged record can name a lifetime measured in years and
+            // the backing store will honour it: the entry never ages
+            // out, and the read path logs the error and bypasses the
+            // cache without recording a key to repopulate, so the
+            // response phase never overwrites it either. One tampered
+            // write per hot key would otherwise buy indefinite origin
+            // load until an operator purges by hand. Deleting concedes
+            // nothing, because whoever forged the record already holds
+            // the write access needed to delete it. Note the asymmetry
+            // this closes: the `Ok(None)` arm below self-heals only
+            // because it evicts, and the stronger failure signal should
+            // not be the one that persists. The `Err` still surfaces,
+            // so the security event is not swallowed.
+            let _ = self.inner.delete(key);
+            return Err(anyhow!(
+                "response-cache entry sealed under key {} failed authentication; entry evicted",
                 hex::encode(fp)
-            )
-        })?;
+            ));
+        };
 
         let (headers, plain_body) = unframe_payload(&plaintext)?;
         Ok(Some(CachedResponse {
@@ -736,6 +775,71 @@ mod tests {
     }
 
     #[test]
+    fn an_authentication_failure_evicts_the_poisoned_entry() {
+        // The exact shared-store attack this decorator exists for: flip
+        // one ciphertext byte and set the cleartext ttl_secs to a decade.
+        // ttl_secs is AAD-bound, so every read fails to authenticate,
+        // but the backing store honours the cleartext value, so nothing
+        // ages the record out. The read path logs the error and bypasses
+        // the cache without recording a key to repopulate, so the
+        // response phase never overwrites it either. Unless the failed
+        // read evicts, one forged write pins that key on origin fetches
+        // until an operator purges by hand.
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let store = wrap(Arc::clone(&inner), material(27), Vec::new());
+        store.put("k", &entry()).unwrap();
+
+        let mut poisoned = inner.get("k").unwrap().unwrap();
+        let last = poisoned.body.len() - 1;
+        poisoned.body[last] ^= 0xff;
+        poisoned.ttl_secs = 86_400 * 365 * 10;
+        inner.put("k", &poisoned).unwrap();
+
+        assert!(
+            store.get("k").is_err(),
+            "the security event must still reach the caller"
+        );
+        assert!(
+            inner.get("k").unwrap().is_none(),
+            "the poisoned record must be gone from the backing store"
+        );
+
+        // With the record gone the next write repopulates the key, which
+        // is the whole point: the cache heals instead of staying poisoned.
+        store.put("k", &entry()).unwrap();
+        let got = store
+            .get("k")
+            .unwrap()
+            .expect("the key must be cacheable again after eviction");
+        assert_eq!(got.body, entry().body);
+    }
+
+    #[test]
+    fn an_unknown_envelope_version_is_a_miss_and_evicts() {
+        // The version byte is the forward-compatibility hinge: a future
+        // sbproxy writes version 2, an older binary reads it back and
+        // must treat it as unreadable rather than guessing at the
+        // layout. Same handling as any other envelope this store cannot
+        // vouch for, eviction included.
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let store = wrap(Arc::clone(&inner), material(28), Vec::new());
+        store.put("k", &entry()).unwrap();
+
+        let mut stored = inner.get("k").unwrap().unwrap();
+        stored.body[MAGIC.len()] = VERSION + 1;
+        inner.put("k", &stored).unwrap();
+
+        assert!(
+            store.get("k").unwrap().is_none(),
+            "an unknown envelope version must be a miss, never a hit"
+        );
+        assert!(
+            inner.get("k").unwrap().is_none(),
+            "an unreadable version must be evicted like any other unreadable record"
+        );
+    }
+
+    #[test]
     fn a_truncated_envelope_never_yields_plaintext() {
         // Two truncation shapes: shorter than the header (no envelope
         // this store can even parse) and a header with a stub of
@@ -916,17 +1020,32 @@ mod tests {
         assert_eq!(material(21).fingerprint_hex().len(), 8);
     }
 
+    /// How a `#[derive(Debug)]` regression would actually render key
+    /// material: as a decimal byte list, not as hex. Checking only the
+    /// hex form would let exactly the regression this test guards
+    /// against walk straight past it.
+    fn decimal_bytes(raw: &[u8]) -> String {
+        format!("{raw:?}")
+    }
+
     #[test]
     fn debug_output_never_carries_key_material() {
         // Key material must not reach a log line through Debug, on the
-        // material itself or on the store that holds it.
+        // material itself or on the store that holds it. Both encodings
+        // are checked: hex is how this file would leak it deliberately,
+        // decimal is how a lost manual impl would leak it by accident.
         let raw = vec![0xABu8; 32];
         let raw_hex = hex::encode(&raw);
+        let raw_decimal = decimal_bytes(&raw);
         let key = CacheKeyMaterial::new(raw).expect("32 bytes is enough");
         let rendered = format!("{key:?}");
         assert!(
             !rendered.contains(&raw_hex),
-            "material leaked through Debug: {rendered}"
+            "material leaked through Debug as hex: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&raw_decimal),
+            "material leaked through Debug as bytes: {rendered}"
         );
         assert!(rendered.contains("[redacted]"), "unexpected: {rendered}");
         assert!(rendered.contains(&key.fingerprint_hex()));
@@ -940,6 +1059,8 @@ mod tests {
         let rendered = format!("{store:?}");
         assert!(!rendered.contains(&hex::encode([0xCDu8; 32])));
         assert!(!rendered.contains(&hex::encode([0xEFu8; 32])));
+        assert!(!rendered.contains(&decimal_bytes(&[0xCDu8; 32])));
+        assert!(!rendered.contains(&decimal_bytes(&[0xEFu8; 32])));
         assert!(rendered.contains("[redacted]"), "unexpected: {rendered}");
     }
 }
