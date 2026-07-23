@@ -11,6 +11,10 @@ mod context_poisoning_rules;
 // constants without duplicating the lists.
 pub mod injection;
 mod jailbreak;
+// The LLM classifier backend lives here rather than in `sbproxy-core`
+// (where the ONNX embedding backend has to live) because it has no ONNX
+// dependency, so it can sit next to the trait it implements.
+pub mod llm_classifier;
 pub mod mesh;
 mod pii;
 mod regex_guard;
@@ -20,8 +24,8 @@ mod toxicity;
 
 pub use agent_alignment::{AgentAlignmentConfig, AgentAlignmentGuardrail, AgentAlignmentMode};
 pub use classifier::{
-    build_classifier, register_classifier_factory, ClassifierBackendConfig, ClassifierConfig,
-    ClassifierFactory, ClassifierGuardrail, ClassifierScope, ClassifierVerdict,
+    build_classifier, register_classifier_factory, AsyncTextClassifier, ClassifierBackendConfig,
+    ClassifierConfig, ClassifierFactory, ClassifierGuardrail, ClassifierScope, ClassifierVerdict,
     EmbeddingBackendConfig, TextClassifier,
 };
 pub use content_safety::ContentSafetyGuardrail;
@@ -32,6 +36,10 @@ pub use context_poisoning::{
 pub use context_poisoning_rules::{ContextPoisoningRule, CONTEXT_POISONING_RULES};
 pub use injection::InjectionGuardrail;
 pub use jailbreak::JailbreakGuardrail;
+pub use llm_classifier::{
+    ChatCompletionsTransport, ClassifierTransportError, LlmBackendConfig, LlmClassifier,
+    ReqwestChatTransport,
+};
 pub use mesh::{GuardrailMesh, GuardrailMeshConfig, MeshDecision};
 pub use pii::{PiiAction, PiiGuardrail};
 pub use regex_guard::{RegexAction, RegexGuardrail};
@@ -99,7 +107,9 @@ pub enum Guardrail {
     /// body so it can read the structured tool-call shape, which
     /// `Message` would otherwise strip.
     AgentAlignment(AgentAlignmentGuardrail),
-    /// Embedding-backed class labeler. Emits the predicted class as the
+    /// Class labeler, backed either by a local embedding model
+    /// (`kind: embedding`) or by an LLM over an OpenAI-compatible
+    /// endpoint (`kind: llm`). Emits the predicted class as the
     /// guardrail label so the CEL policy plane can route on it. Never
     /// blocks on its own.
     Classifier(classifier::ClassifierGuardrail),
@@ -167,6 +177,10 @@ impl Guardrail {
             // text-fallback path so alignment does not flag on
             // every benign user message.
             Self::AgentAlignment(_) => None,
+            // Only the sync (embedding) backend answers here; an LLM
+            // backend needs a network call, which the mesh runs from
+            // its async entry point instead of blocking a worker
+            // thread on this one.
             Self::Classifier(g) => g.check_messages(content, messages),
             _ => self.check(content),
         }

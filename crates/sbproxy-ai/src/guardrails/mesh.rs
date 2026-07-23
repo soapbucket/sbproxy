@@ -18,6 +18,15 @@
 //!
 //! Default off: with no `mesh` block the dispatch path keeps using the
 //! serial, block-on-any check.
+//!
+//! There are two entry points. [`GuardrailMesh::evaluate_input`] is the
+//! synchronous one and runs the cascade only.
+//! [`GuardrailMesh::evaluate_input_async`] runs that same cascade and
+//! then awaits the guardrails whose backend needs I/O (today: a
+//! `kind: llm` classifier), merging both verdict sets into one
+//! [`MeshDecision`]. Async work is a second pass rather than an async
+//! cascade because the cheap detectors are pure CPU: making them await
+//! would box a future per detector per request and buy nothing.
 
 use super::{Guardrail, GuardrailBlock, GuardrailPipeline};
 use crate::types::Message;
@@ -95,7 +104,9 @@ impl MeshDecision {
 /// Relative execution cost of a guardrail, so the cascade runs the cheap
 /// detectors before the expensive classifiers. `0` is cheap (regex / PII /
 /// schema / context-poisoning rules), `1` is an ONNX or multi-token
-/// classifier, including the embedding-backed [`Guardrail::Classifier`].
+/// classifier, including [`Guardrail::Classifier`]. An LLM-backed
+/// classifier is more expensive still, but it is not ranked here: it runs
+/// in the async pass after this cascade, never inside it.
 fn cost_rank(g: &Guardrail) -> u8 {
     match g {
         Guardrail::Regex(_)
@@ -120,15 +131,34 @@ fn cost_rank(g: &Guardrail) -> u8 {
 /// one pipeline. A SHA-256 (not the previous fixed-key `DefaultHasher`
 /// 64-bit hash) makes a crafted collision, where a benign prompt inherits
 /// a blocked prompt's cached verdict, infeasible.
-fn cache_key(content: &str) -> [u8; 32] {
+///
+/// `with_async` domain-separates the two entry points.
+/// [`GuardrailMesh::evaluate_input`] collects the sync cascade only,
+/// while [`GuardrailMesh::evaluate_input_async`] collects that plus the
+/// async classifiers, so their verdict sets are not interchangeable: a
+/// sync-path entry answering an async-path lookup would silently drop
+/// the classifier's label, and an async-path entry answering a sync-path
+/// lookup would report a label the sync pass never produced. Hashing a
+/// one-byte tag ahead of the content keeps the two sets in one LRU
+/// without either being able to answer for the other.
+fn cache_key(content: &str, with_async: bool) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
+    h.update([u8::from(with_async)]);
     h.update(content.as_bytes());
     h.finalize().into()
 }
 
 /// Flagged labels + reasons cached for a given prompt.
 type CacheEntry = (Vec<String>, Vec<String>);
+
+/// Split a collected verdict set into the parallel label and reason
+/// vectors that both the cache and [`MeshDecision`] hold.
+fn split_blocks(blocks: &[GuardrailBlock]) -> CacheEntry {
+    let labels: Vec<String> = blocks.iter().map(|b| b.name.clone()).collect();
+    let reasons: Vec<String> = blocks.iter().map(|b| b.reason.clone()).collect();
+    (labels, reasons)
+}
 
 /// The guardrail mesh runtime.
 #[derive(Debug, Clone)]
@@ -165,24 +195,72 @@ impl GuardrailMesh {
     /// the verdicts. `content` is the already-extracted prompt text (the
     /// cache and the cheap detectors operate on it); `messages` is passed
     /// to the role-aware detectors.
+    ///
+    /// This is the synchronous path: guardrails backed by an async
+    /// classifier contribute nothing here. Callers already inside an
+    /// async function should use [`Self::evaluate_input_async`], which
+    /// runs this same cascade and then awaits those.
     pub fn evaluate_input(
         &self,
         pipeline: &GuardrailPipeline,
         messages: &[Message],
         content: &str,
     ) -> MeshDecision {
-        let key = cache_key(content);
+        let key = cache_key(content, false);
         let (labels, reasons) = match self.cache_lookup(pipeline, &key) {
             Some(hit) => hit,
             None => {
                 let collected = self.collect_cascade(pipeline, messages, content);
-                let labels: Vec<String> = collected.iter().map(|b| b.name.clone()).collect();
-                let reasons: Vec<String> = collected.iter().map(|b| b.reason.clone()).collect();
-                self.cache_store(pipeline, key, &(labels.clone(), reasons.clone()));
-                (labels, reasons)
+                let entry = split_blocks(&collected);
+                self.cache_store(pipeline, key, &entry);
+                entry
             }
         };
+        self.fuse(labels, reasons)
+    }
 
+    /// Run the cascade, then await every async classifier guardrail, and
+    /// fuse the two verdict sets into one [`MeshDecision`].
+    ///
+    /// The synchronous cascade runs first and unchanged, so the cheap
+    /// detectors keep their existing behavior and ordering; the async
+    /// classifiers are a second pass whose labels and reasons are
+    /// appended. The whole merged set goes into the same per-pipeline
+    /// verdict cache under an async-tagged key, so a repeated prompt
+    /// serves both halves from memory and makes no second network call.
+    /// That matters more here than on the sync path: an uncached
+    /// classifier would put an LLM round trip on every request.
+    ///
+    /// The mesh verdict cache is opt-in (`mesh.cache`), so the LLM
+    /// backend keeps its own always-on label cache underneath this one.
+    /// A repeated prompt therefore costs no network call even when the
+    /// operator never turned the mesh cache on.
+    pub async fn evaluate_input_async(
+        &self,
+        pipeline: &GuardrailPipeline,
+        messages: &[Message],
+        content: &str,
+    ) -> MeshDecision {
+        let key = cache_key(content, true);
+        let (labels, reasons) = match self.cache_lookup(pipeline, &key) {
+            Some(hit) => hit,
+            None => {
+                let started = Instant::now();
+                let mut collected = self.collect_cascade(pipeline, messages, content);
+                collected.extend(
+                    self.collect_async(pipeline, messages, content, started)
+                        .await,
+                );
+                let entry = split_blocks(&collected);
+                self.cache_store(pipeline, key, &entry);
+                entry
+            }
+        };
+        self.fuse(labels, reasons)
+    }
+
+    /// Apply the fusion rule to a collected verdict set.
+    fn fuse(&self, labels: Vec<String>, reasons: Vec<String>) -> MeshDecision {
         let flagged = labels.len();
         let threshold = self.config.block_threshold;
         let block = threshold > 0 && flagged >= threshold;
@@ -194,6 +272,41 @@ impl GuardrailMesh {
             labels,
             reasons,
         }
+    }
+
+    /// Await every input guardrail that needs I/O to reach a verdict.
+    ///
+    /// Only the classifier guardrail has an async backend today, and
+    /// only when it is configured with `kind: llm`; every other
+    /// guardrail was already decided by the cascade. `started` is the
+    /// cascade's own start instant so the configured latency budget
+    /// covers both passes: an LLM call is the most expensive detector in
+    /// the mesh, so it is the first thing a spent budget should skip.
+    async fn collect_async(
+        &self,
+        pipeline: &GuardrailPipeline,
+        messages: &[Message],
+        content: &str,
+        started: Instant,
+    ) -> Vec<GuardrailBlock> {
+        let mut out = Vec::new();
+        for guard in pipeline.input.iter() {
+            let Guardrail::Classifier(classifier) = guard else {
+                continue;
+            };
+            if !classifier.is_async() {
+                continue;
+            }
+            if let Some(ms) = self.config.latency_budget_ms {
+                if started.elapsed().as_millis() as u64 >= ms {
+                    break;
+                }
+            }
+            if let Some(block) = classifier.check_messages_async(content, messages).await {
+                out.push(block);
+            }
+        }
+        out
     }
 
     /// Run every input guardrail, cheap-first, collecting all verdicts.
@@ -233,13 +346,72 @@ impl GuardrailMesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guardrails::classifier::{
+        AsyncTextClassifier, ClassifierBackendConfig, ClassifierConfig, ClassifierGuardrail,
+        ClassifierScope, ClassifierVerdict,
+    };
+    use crate::guardrails::llm_classifier::LlmBackendConfig;
     use crate::guardrails::{InjectionGuardrail, RegexAction, RegexGuardrail};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn msg(content: &str) -> Message {
         Message {
             role: "user".to_string(),
             content: serde_json::Value::String(content.to_string()),
         }
+    }
+
+    /// An async backend that labels anything containing `readme` and
+    /// counts how often it was asked, standing in for the LLM call.
+    #[derive(Debug, Default)]
+    struct CountingAsync {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AsyncTextClassifier for CountingAsync {
+        async fn classify(&self, text: &str) -> Option<ClassifierVerdict> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            text.contains("readme").then(|| ClassifierVerdict {
+                label: "documentation".to_string(),
+                score: 1.0,
+            })
+        }
+    }
+
+    fn classifier_config() -> ClassifierConfig {
+        ClassifierConfig {
+            backend: ClassifierBackendConfig::Llm(LlmBackendConfig {
+                base_url: "http://localhost:11434/v1/chat/completions".to_string(),
+                model: "qwen3-coder:30b".to_string(),
+                api_key: None,
+                timeout_ms: 2_000,
+                cache_capacity: 16,
+                fail_open: true,
+            }),
+            classes: std::collections::BTreeMap::from([(
+                "documentation".to_string(),
+                vec!["write the readme".to_string()],
+            )]),
+            scope: ClassifierScope::FullText,
+            max_chars: 2000,
+        }
+    }
+
+    /// A regex deny rule on `badword` plus an async classifier, so one
+    /// prompt can flag a sync guardrail, the async one, or both.
+    fn pipeline_sync_and_async(backend: Arc<CountingAsync>) -> GuardrailPipeline {
+        let mut p = GuardrailPipeline::default();
+        p.input.push(Guardrail::Regex(RegexGuardrail {
+            patterns: vec![regex::Regex::new("badword").unwrap()],
+            action: RegexAction::Block,
+        }));
+        p.input.push(Guardrail::Classifier(
+            ClassifierGuardrail::with_async_backend(classifier_config(), backend),
+        ));
+        p
     }
 
     /// A pipeline with a regex deny rule that fires on `badword` and an
@@ -371,5 +543,123 @@ mod tests {
             "differently-configured pipeline must not inherit the cached block"
         );
         assert!(b.labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_entry_merges_sync_and_async_labels() {
+        let backend = Arc::new(CountingAsync::default());
+        let p = pipeline_sync_and_async(backend.clone());
+        // Threshold 0 so the regex flag does not short-circuit into a
+        // block; this test is about the merged label set.
+        let mesh = GuardrailMesh::new(cfg(0));
+        let content = "badword, and update the readme";
+        let d = mesh
+            .evaluate_input_async(&p, &[msg(content)], content)
+            .await;
+        assert_eq!(d.flagged_count(), 2, "merged set: {:?}", d.labels);
+        assert!(d.labels.contains(&"regex".to_string()), "{:?}", d.labels);
+        assert!(
+            d.labels.contains(&"documentation".to_string()),
+            "{:?}",
+            d.labels
+        );
+        assert_eq!(
+            d.reasons.len(),
+            2,
+            "reasons stay parallel to labels: {:?}",
+            d.reasons
+        );
+        assert!(
+            d.reasons.iter().any(|r| r.contains("classifier")),
+            "{:?}",
+            d.reasons
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn async_entry_labels_without_any_sync_flag() {
+        let backend = Arc::new(CountingAsync::default());
+        let p = pipeline_sync_and_async(backend);
+        let mesh = GuardrailMesh::new(cfg(0));
+        let content = "update the readme";
+        let d = mesh
+            .evaluate_input_async(&p, &[msg(content)], content)
+            .await;
+        assert_eq!(d.labels, vec!["documentation".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn sync_entry_never_runs_the_async_classifier() {
+        // The sync cascade must not block a worker thread on a network
+        // call, so an async classifier contributes nothing there.
+        let backend = Arc::new(CountingAsync::default());
+        let p = pipeline_sync_and_async(backend.clone());
+        let mesh = GuardrailMesh::new(cfg(0));
+        let content = "badword, and update the readme";
+        let d = mesh.evaluate_input(&p, &[msg(content)], content);
+        assert_eq!(d.labels, vec!["regex".to_string()]);
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            0,
+            "the sync path must never reach an async backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_entry_cache_prevents_a_second_backend_call() {
+        // The point of the verdict cache on this path: a repeated prompt
+        // must not repeat the network call.
+        let backend = Arc::new(CountingAsync::default());
+        let p = pipeline_sync_and_async(backend.clone());
+        let mut c = cfg(0);
+        c.cache = true;
+        let mesh = GuardrailMesh::new(c);
+        let content = "update the readme";
+        let first = mesh
+            .evaluate_input_async(&p, &[msg(content)], content)
+            .await;
+        let second = mesh
+            .evaluate_input_async(&p, &[msg(content)], content)
+            .await;
+        assert_eq!(first.labels, second.labels);
+        assert_eq!(first.reasons, second.reasons);
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            1,
+            "the second evaluation must be served from the verdict cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sync_cache_entry_cannot_answer_an_async_lookup() {
+        // Without domain separation the sync entry point's verdict set
+        // (which is missing the classifier's label) would answer here
+        // and the route would silently stop being taken.
+        let backend = Arc::new(CountingAsync::default());
+        let p = pipeline_sync_and_async(backend.clone());
+        let mut c = cfg(0);
+        c.cache = true;
+        let mesh = GuardrailMesh::new(c);
+        let content = "update the readme";
+        let sync_first = mesh.evaluate_input(&p, &[msg(content)], content);
+        assert!(sync_first.labels.is_empty());
+        let then_async = mesh
+            .evaluate_input_async(&p, &[msg(content)], content)
+            .await;
+        assert_eq!(then_async.labels, vec!["documentation".to_string()]);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn async_entry_still_blocks_on_the_configured_quorum() {
+        let backend = Arc::new(CountingAsync::default());
+        let p = pipeline_sync_and_async(backend);
+        let mesh = GuardrailMesh::new(cfg(2));
+        let content = "badword, and update the readme";
+        let d = mesh
+            .evaluate_input_async(&p, &[msg(content)], content)
+            .await;
+        assert!(d.block, "two flags meet the quorum of 2: {:?}", d.labels);
     }
 }

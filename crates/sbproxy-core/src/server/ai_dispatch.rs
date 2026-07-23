@@ -3024,7 +3024,12 @@ pub(super) async fn handle_ai_proxy(
                 if let Some(mesh_cfg) = guardrails_config.mesh.clone() {
                     let mesh = sbproxy_ai::guardrails::GuardrailMesh::new(mesh_cfg);
                     let text = sbproxy_ai::guardrails::message_text(&messages);
-                    let decision = mesh.evaluate_input(&pipeline, &messages, &text);
+                    // The async entry point: it runs the same synchronous
+                    // cascade and then awaits the guardrails whose backend
+                    // needs I/O (a `kind: llm` classifier). We are already
+                    // inside an async function, so no worker thread is
+                    // blocked on that call.
+                    let decision = mesh.evaluate_input_async(&pipeline, &messages, &text).await;
                     ctx.ai_guardrail_labels = decision.labels.clone();
                     if decision.block {
                         warn!(

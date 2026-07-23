@@ -205,9 +205,13 @@ fn shared_embedder(
 fn build_backend(
     cfg: &sbproxy_ai::guardrails::ClassifierConfig,
 ) -> anyhow::Result<std::sync::Arc<dyn sbproxy_ai::guardrails::TextClassifier>> {
-    // Only one backend variant exists today, so this destructure is
-    // irrefutable.
-    let sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(backend) = &cfg.backend;
+    // This factory only serves the embedding backend. The LLM backend
+    // is async and is built inside sbproxy-ai, so it never reaches
+    // here; the guard exists so a future third variant fails loudly
+    // instead of being silently treated as an embedding one.
+    let sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(backend) = &cfg.backend else {
+        anyhow::bail!("the in-process classifier factory only builds `kind: embedding` backends");
+    };
     let embedder = shared_embedder(backend)?;
     let mut centroids: Vec<(String, Vec<f32>)> = Vec::new();
     for (label, examples) in &cfg.classes {
