@@ -1197,6 +1197,28 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
+    {
+        let mut names = std::collections::HashSet::with_capacity(config_file.flags.len());
+        for flag in &config_file.flags {
+            if flag.name.trim().is_empty() {
+                anyhow::bail!("config compile: flags[].name must not be empty");
+            }
+            if !names.insert(flag.name.as_str()) {
+                anyhow::bail!(
+                    "config compile: duplicate top-level feature flag name `{}`",
+                    flag.name
+                );
+            }
+            if flag.rules.rollout_percent > 100 {
+                anyhow::bail!(
+                    "config compile: flag `{}` has rollout_percent {}; expected 0..=100",
+                    flag.name,
+                    flag.rules.rollout_percent
+                );
+            }
+        }
+    }
+
     if config_file
         .proxy
         .http3
@@ -1414,6 +1436,8 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         audit: config_file.audit,
         // WOR-1186: session-ledger emission config.
         session_ledger: config_file.session_ledger,
+        // WOR-1971: hand the complete top-level flag set to the binary.
+        flags: config_file.flags,
     })
 }
 
@@ -1822,6 +1846,85 @@ fn transform_type_is(value: &serde_json::Value, wanted: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn top_level_feature_flags_compile_into_the_runtime_snapshot() {
+        let compiled = compile_config(
+            r#"
+flags:
+  - name: new-checkout
+    default: false
+    rules:
+      allow_list: [alice]
+      block_list: [mallory]
+      rollout_percent: 25
+"#,
+        )
+        .expect("top-level flags should compile");
+
+        assert_eq!(compiled.flags.len(), 1);
+        let flag = &compiled.flags[0];
+        assert_eq!(flag.name, "new-checkout");
+        assert!(!flag.default);
+        assert_eq!(flag.rules.allow_list, ["alice"]);
+        assert_eq!(flag.rules.block_list, ["mallory"]);
+        assert_eq!(flag.rules.rollout_percent, 25);
+    }
+
+    #[test]
+    fn duplicate_top_level_feature_flag_names_fail_compile() {
+        let error = compile_config(
+            r#"
+flags:
+  - name: new-checkout
+    default: true
+  - name: new-checkout
+    default: false
+"#,
+        )
+        .err()
+        .expect("duplicate flag names must be rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("duplicate"), "{message}");
+        assert!(message.contains("new-checkout"), "{message}");
+    }
+
+    #[test]
+    fn feature_flag_rollout_percent_must_be_at_most_one_hundred() {
+        let error = compile_config(
+            r#"
+flags:
+  - name: impossible-rollout
+    rules:
+      rollout_percent: 101
+"#,
+        )
+        .err()
+        .expect("an out-of-range rollout must be rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("impossible-rollout"), "{message}");
+        assert!(message.contains("0..=100"), "{message}");
+    }
+
+    #[test]
+    fn feature_flag_segments_are_rejected_until_cel_accepts_a_segment() {
+        let error = compile_config(
+            r#"
+flags:
+  - name: segment-only
+    rules:
+      segments: [beta]
+"#,
+        )
+        .err()
+        .expect("an unread segment rule must be rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("segments"), "{message}");
+        assert!(message.contains("unknown or misspelled"), "{message}");
+    }
 
     fn custom_field(
         name: &str,

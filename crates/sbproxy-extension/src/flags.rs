@@ -57,9 +57,9 @@ pub struct FlagConfig {
     pub rules: FlagRule,
 }
 
-/// Run-time flag store. Reads are lock-free; writes take an exclusive
-/// lock on the underlying map. The intent is config-driven seeding plus
-/// occasional updates from a control plane.
+/// Run-time flag store. Reads take a shared lock and writes take an
+/// exclusive lock on the underlying map. Config reloads normally replace
+/// the process-wide `Arc<FlagStore>` instead of mutating this map in place.
 #[derive(Debug, Default)]
 pub struct FlagStore {
     inner: RwLock<HashMap<String, FlagConfig>>,
@@ -348,5 +348,44 @@ mod tests {
         assert!(store.enabled("f", "alice", None));
         store.remove("f");
         assert!(!store.enabled("f", "alice", None));
+    }
+
+    #[test]
+    fn replacing_the_global_store_never_exposes_a_partial_flag_set() {
+        let previous = global_store();
+        let first = Arc::new(FlagStore::from_configs(vec![
+            flag("first-a", true, FlagRule::default()),
+            flag("first-b", true, FlagRule::default()),
+        ]));
+        let second = Arc::new(FlagStore::from_configs(vec![
+            flag("second-a", true, FlagRule::default()),
+            flag("second-b", true, FlagRule::default()),
+        ]));
+        set_global_store(first.clone());
+
+        let writer = std::thread::spawn(move || {
+            for index in 0..2_000 {
+                let next = if index % 2 == 0 {
+                    second.clone()
+                } else {
+                    first.clone()
+                };
+                set_global_store(next);
+            }
+        });
+
+        for _ in 0..10_000 {
+            let names: Vec<String> = global_store()
+                .snapshot()
+                .into_iter()
+                .map(|flag| flag.name)
+                .collect();
+            assert!(
+                names == ["first-a", "first-b"] || names == ["second-a", "second-b"],
+                "reader observed a torn flag set: {names:?}"
+            );
+        }
+        writer.join().expect("writer should finish");
+        set_global_store(previous);
     }
 }

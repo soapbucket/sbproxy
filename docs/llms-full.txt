@@ -19012,9 +19012,9 @@ Accepted levels: `trace`, `debug`, `info`, `warn`, `error`. Default is `info`. `
 ================================================================
 
 ## Edge feature flags
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-22*
 
-`sbproxy-extension` ships a small, sticky-bucketing feature-flag store and a `flag_enabled(name, key)` CEL helper. Flags are evaluated against a per-request bucketing key (user id, tenant id, JWT subject) so a request that lands inside a 25% rollout stays inside it across calls. The OSS store is seeded from code by the embedding binary today; the enterprise build will layer a Redis Streams update channel for sub-second propagation across replicas.
+`sbproxy-extension` ships a small, sticky-bucketing feature-flag store and a `flag_enabled(name, key)` CEL helper. Flags are evaluated against a per-request bucketing key (user id, tenant id, JWT subject) so a request that lands inside a 25% rollout stays inside it across calls. The running proxy seeds the process-wide store from the top-level `flags:` block at boot and atomically replaces the complete set after each successful config reload.
 
 ## Rule grammar
 
@@ -19024,35 +19024,15 @@ Each flag carries a `default` plus an ordered rule set:
 |------|--------|
 | `block_list` | Keys in this set always evaluate `false`. Wins over everything. |
 | `allow_list` | Keys in this set always evaluate `true`. |
-| `segments` | When the request's segment label is in this set, the flag is `true`. |
 | `rollout_percent` | Sticky `hash(name + key) % 100 < rollout_percent`. |
 
-Order: `block_list` → `allow_list` → `segments` → `rollout_percent` → `default`. The first match wins. The block list winning over the allow list is deliberate: a key that ends up on both lists (typically a config typo) defaults to safe.
+Order: `block_list` → `allow_list` → `rollout_percent` → `default`. The first match wins. The block list winning over the allow list is deliberate: a key that ends up on both lists (typically a config typo) defaults to safe.
+
+The underlying Rust `FlagStore` also supports an optional segment argument for direct embedders. The shipped CEL helper deliberately has only `name` and `key` arguments, so top-level YAML rejects a `segments` rule instead of accepting configuration that no request could exercise.
 
 ## Configuring flags
 
-Today the OSS path seeds flags from code in the embedding binary:
-
-```rust,no_run
-use std::sync::Arc;
-use sbproxy_extension::flags::{set_global_store, FlagConfig, FlagRule, FlagStore};
-
-let store = FlagStore::from_configs(vec![
-    FlagConfig {
-        name: "new-checkout".into(),
-        default: false,
-        rules: FlagRule {
-            allow_list: ["alice@acme.io".to_string()].into_iter().collect(),
-            rollout_percent: 25,
-            segments: ["beta".to_string()].into_iter().collect(),
-            ..FlagRule::default()
-        },
-    },
-]);
-set_global_store(Arc::new(store));
-```
-
-A follow-up wires a top-level `flags:` block in `sb.yml` so operators can declare flags in YAML without writing Rust. That block has not shipped; the YAML below shows the intended shape, and the config loader ignores it today:
+Declare process-wide flags at the top level of `sb.yml`:
 
 ```yaml
 flags:
@@ -19061,10 +19041,12 @@ flags:
     rules:
       allow_list:
         - alice@acme.io
-      segments:
-        - beta
       rollout_percent: 25
 ```
+
+Flag names must be unique and non-empty, and `rollout_percent` must be between 0 and 100. Invalid declarations fail config compilation, so a duplicate or impossible rollout cannot silently replace another flag.
+
+An absent `flags:` block is an explicit empty set. Removing the block on reload clears previously configured flags after the candidate config and pipeline have both compiled successfully.
 
 ## CEL helper
 
@@ -19074,7 +19056,7 @@ The `flag_enabled(name, key)` CEL function reads the global store. The most comm
 flag_enabled("new-checkout", jwt.claims.sub)
 ```
 
-Use it in any CEL surface (forward rules, expression policies, request modifiers, AI selectors). Unknown flags evaluate to `false`. The function ignores segments today; add a per-request segment label by extending the helper or using a `segments`-only rule.
+Use it in any CEL surface (forward rules, expression policies, request modifiers, AI selectors). Unknown flags evaluate to `false`. Segment rules are not part of the YAML surface because this helper has no segment argument.
 
 ## Sticky bucketing
 
@@ -19086,7 +19068,9 @@ The bucket function is FNV-1a 64-bit over `flag_name | key`, mod 100. Properties
 
 ## Hot reloading
 
-Calls to `FlagStore::upsert(flag)` and `FlagStore::remove(name)` rewrite the global store under an `RwLock`. Reads are cheap (`RwLock::read`); writes are the dominant cost only during config swaps. Embedders that need cross-replica propagation should layer a small consumer that reads from their control plane and calls `upsert` / `remove` accordingly. The enterprise build ships exactly that consumer with Redis Streams.
+The proxy builds a fresh store from each compiled config and publishes it by replacing one process-wide `Arc`. A reader therefore observes either the complete previous flag set or the complete new set, never an incrementally updated mixture. A reload that fails validation or pipeline construction leaves the previous store installed.
+
+Direct embedders can still call `FlagStore::upsert(flag)` and `FlagStore::remove(name)`; those operations rewrite one store under an `RwLock`.
 
 ## Counters and observability
 
@@ -34111,6 +34095,8 @@ CEL includes the standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, 
 | `s.split(sep)` | list | Split `s` on `sep` |
 | `flag_enabled(name, key)` | bool | Resolve a feature flag against the live flag store; unknown flags evaluate false |
 | `tls_fingerprint_matches(ja4, agent_class_id)` | bool | True when `ja4` is a known fingerprint for the catalogued agent class, or when the catalogue has no entry for the class (conservative) |
+
+`flag_enabled` reads the process-wide set declared by the top-level `flags:` block. Its second argument is the stable bucketing key; use a user, tenant, or subject identifier rather than a random request ID. Successful hot reloads replace the full flag set atomically, and an absent `flags:` block clears it. Unknown flags evaluate to `false`. See [Edge feature flags](feature-flags.md) for the rule grammar.
 
 ### 3.3 CEL policy examples
 

@@ -435,6 +435,40 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     }
 }
 
+/// Build a complete feature-flag store from one compiled snapshot.
+///
+/// The candidate is prepared before pipeline construction and published only
+/// after every fallible reload step succeeds. Publishing replaces one `Arc`,
+/// so readers observe either the complete old set or the complete new set.
+fn feature_flag_store(
+    compiled: &sbproxy_config::CompiledConfig,
+) -> std::sync::Arc<sbproxy_extension::flags::FlagStore> {
+    use sbproxy_extension::flags::{FlagConfig, FlagRule, FlagStore};
+
+    let flags = compiled.flags.iter().map(|flag| FlagConfig {
+        name: flag.name.clone(),
+        default: flag.default,
+        rules: FlagRule {
+            allow_list: flag.rules.allow_list.iter().cloned().collect(),
+            block_list: flag.rules.block_list.iter().cloned().collect(),
+            rollout_percent: flag.rules.rollout_percent,
+            // The shipped CEL helper intentionally has two arguments
+            // (`name`, `key`), so top-level YAML rejects `segments`
+            // instead of accepting a rule no request could exercise.
+            segments: std::collections::HashSet::new(),
+        },
+    });
+    std::sync::Arc::new(FlagStore::from_configs(flags))
+}
+
+fn publish_pipeline_with_feature_flags(
+    pipeline: CompiledPipeline,
+    flags: std::sync::Arc<sbproxy_extension::flags::FlagStore>,
+) {
+    sbproxy_extension::flags::set_global_store(flags);
+    reload::load_pipeline(pipeline);
+}
+
 fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<ReloadOutcome> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{config_path}': {e}"))?;
@@ -537,6 +571,7 @@ pub fn hold_config_reload_lock_for_test() -> std::sync::MutexGuard<'static, ()> 
 /// The reload transaction body. Callers hold `CONFIG_RELOAD_LOCK`.
 fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Result<ReloadOutcome> {
     let compiled = sbproxy_config::compile_config(yaml)?;
+    let next_feature_flags = feature_flag_store(&compiled);
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
@@ -687,7 +722,6 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
         .unwrap_or_else(|| std::path::Path::new("."));
     super::model_host::reconcile_model_runtime_blocking(&new_pipeline, config_dir)
         .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
-
     // --- Phase 3: commit ---
     //
     // Every fallible step is behind us. From here the reload returns
@@ -762,7 +796,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     // until both clustering and approximate governance are configured.
     crate::cluster::start_governance_dissemination();
 
-    reload::load_pipeline(new_pipeline);
+    publish_pipeline_with_feature_flags(new_pipeline, next_feature_flags);
 
     // Move the drift baseline here, in the one place every reload path
     // converges, rather than in the individual callers. Only startup and
@@ -1103,7 +1137,6 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // forever.
     let initial_content_hash = crate::identity::config_revision(yaml.as_bytes());
     let compiled = sbproxy_config::compile_config(&yaml)?;
-
     // Fold a cached config-authority bundle into the boot document before
     // anything downstream reads the compiled config: listener ports, TLS
     // hostnames, and the request pipeline all have to describe the
@@ -1117,6 +1150,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     let (_effective_yaml, compiled, config_subscriber) =
         crate::config_subscriber::fold_boot_bundle(config_path, yaml, compiled)?;
 
+    let initial_feature_flags = feature_flag_store(&compiled);
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
@@ -1368,7 +1402,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     let _model_plane_shutdown = start_process_model_plane(model_plane_body_limit)?;
 
     // Store in hot-reload slot.
-    reload::load_pipeline(pipeline);
+    publish_pipeline_with_feature_flags(pipeline, initial_feature_flags);
 
     // Start file watcher for config hot-reload.
     start_config_watcher(config_path.to_string());
@@ -3028,6 +3062,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compiled_flags_seed_cel_and_an_absent_block_clears_them() {
+        let _guard = CONFIG_RELOAD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = sbproxy_extension::flags::global_store();
+
+        let configured = sbproxy_config::compile_config(
+            r#"
+flags:
+  - name: new-auth-path
+    default: false
+    rules:
+      allow_list: [alice]
+"#,
+        )
+        .expect("flag config should compile");
+        let configured_flags = feature_flag_store(&configured);
+        let configured_pipeline =
+            CompiledPipeline::from_config(configured).expect("flag config should build a pipeline");
+        publish_pipeline_with_feature_flags(configured_pipeline, configured_flags);
+
+        let engine = sbproxy_extension::cel::CelEngine::new();
+        let context = sbproxy_extension::cel::CelContext::new();
+        assert!(engine
+            .eval_bool_source(r#"flag_enabled("new-auth-path", "alice")"#, &context)
+            .expect("CEL should evaluate"));
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("new-auth-path", "mallory")"#, &context)
+            .expect("CEL should evaluate"));
+
+        let cleared = sbproxy_config::compile_config("proxy: {}\n")
+            .expect("config without flags should compile");
+        let cleared_flags = feature_flag_store(&cleared);
+        let cleared_pipeline = CompiledPipeline::from_config(cleared)
+            .expect("config without flags should build a pipeline");
+        publish_pipeline_with_feature_flags(cleared_pipeline, cleared_flags);
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("new-auth-path", "alice")"#, &context)
+            .expect("CEL should evaluate after clearing"));
+
+        sbproxy_extension::flags::set_global_store(previous);
+    }
+
+    #[test]
     fn proxy_service_startup_error_preserves_native_cert_hint() {
         let payload = "called `Result::unwrap()` on an `Err` value: Failed to load native certificates: No keychain is available";
         let err = proxy_service_startup_error(&payload);
@@ -3195,6 +3273,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         };
 
         install_op_redact_state(&compiled);

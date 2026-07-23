@@ -2084,6 +2084,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         }
     }
 
@@ -2236,6 +2237,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         }
     }
 

@@ -151,6 +151,14 @@
         }
       ]
     },
+    "flags": {
+      "description": "Process-wide feature flags available to CEL through `flag_enabled(name, key)`. An absent or empty list installs an empty runtime store, including on hot reload.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/FeatureFlagConfig"
+      }
+    },
     "update": {
       "description": "WOR-1804: how `sbproxy update` behaves for the binary and the managed inference engines. Optional; an absent block is the same as the defaults (stable channel, no background check).",
       "default": {
@@ -8071,6 +8079,66 @@
           ]
         }
       ]
+    },
+    "FeatureFlagConfig": {
+      "description": "One process-wide feature flag exposed to CEL.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Unique name passed as the first argument to `flag_enabled`.",
+          "type": "string"
+        },
+        "default": {
+          "description": "Value returned when none of the configured rules match.",
+          "default": false,
+          "type": "boolean"
+        },
+        "rules": {
+          "description": "Allow/block lists and sticky rollout rules.",
+          "default": {
+            "allow_list": [],
+            "block_list": [],
+            "rollout_percent": 0
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/FeatureFlagRuleConfig"
+            }
+          ]
+        }
+      }
+    },
+    "FeatureFlagRuleConfig": {
+      "description": "Rules for a process-wide feature flag.",
+      "type": "object",
+      "properties": {
+        "allow_list": {
+          "description": "Bucketing keys that always evaluate to true.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "block_list": {
+          "description": "Bucketing keys that always evaluate to false.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rollout_percent": {
+          "description": "Sticky rollout cutoff in the inclusive range 0..=100.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
     },
     "UpdateConfig": {
       "description": "The `update:` block: how `sbproxy update` behaves (WOR-1804).\n\nPinning always wins. A `path` / `brew` / `apt`-managed artifact, or one pinned to an explicit version or digest, is reported but never replaced unless a run explicitly targets it. A background check (see `auto`) only ever reports; applying an update is always an explicit `sbproxy update` run.",

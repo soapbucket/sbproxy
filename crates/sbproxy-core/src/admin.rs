@@ -5627,6 +5627,7 @@ origins:
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         };
         let pipeline = CompiledPipeline::from_config(cfg).expect("pipeline compiles");
         crate::reload::load_pipeline(pipeline);

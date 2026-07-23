@@ -57,11 +57,43 @@ pub struct ConfigFile {
     /// block is present and `enabled: true`.
     #[serde(default)]
     pub session_ledger: Option<SessionLedgerConfig>,
+    /// Process-wide feature flags available to CEL through
+    /// `flag_enabled(name, key)`. An absent or empty list installs an
+    /// empty runtime store, including on hot reload.
+    #[serde(default)]
+    pub flags: Vec<FeatureFlagConfig>,
     /// WOR-1804: how `sbproxy update` behaves for the binary and the
     /// managed inference engines. Optional; an absent block is the same
     /// as the defaults (stable channel, no background check).
     #[serde(default)]
     pub update: UpdateConfig,
+}
+
+/// One process-wide feature flag exposed to CEL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FeatureFlagConfig {
+    /// Unique name passed as the first argument to `flag_enabled`.
+    pub name: String,
+    /// Value returned when none of the configured rules match.
+    #[serde(default)]
+    pub default: bool,
+    /// Allow/block lists and sticky rollout rules.
+    #[serde(default)]
+    pub rules: FeatureFlagRuleConfig,
+}
+
+/// Rules for a process-wide feature flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FeatureFlagRuleConfig {
+    /// Bucketing keys that always evaluate to true.
+    #[serde(default)]
+    pub allow_list: Vec<String>,
+    /// Bucketing keys that always evaluate to false.
+    #[serde(default)]
+    pub block_list: Vec<String>,
+    /// Sticky rollout cutoff in the inclusive range 0..=100.
+    #[serde(default)]
+    pub rollout_percent: u32,
 }
 
 /// Which release stream `sbproxy update` follows for the binary and the

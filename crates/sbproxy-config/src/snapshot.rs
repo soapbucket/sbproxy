@@ -249,6 +249,10 @@ pub struct CompiledConfig {
     /// `enabled: false`) leaves the ledger off. The binary registers a
     /// ledger sink from this at startup.
     pub session_ledger: Option<crate::types::SessionLedgerConfig>,
+    /// Process-wide flags compiled from the top-level `flags:` block.
+    /// The binary atomically replaces the live CEL store from this
+    /// complete snapshot at boot and after every successful reload.
+    pub flags: Vec<crate::types::FeatureFlagConfig>,
 }
 
 impl CompiledConfig {

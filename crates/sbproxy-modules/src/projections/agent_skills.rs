@@ -1435,6 +1435,7 @@ spec:
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         };
         let map = render_indices(&cfg, Path::new("."));
         assert!(map.contains_key(&CompactString::new("with.example.com")));
