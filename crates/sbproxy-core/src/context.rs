@@ -222,6 +222,10 @@ pub struct RequestContext {
     /// guards release their slots when dropped, which happens when the
     /// context is dropped at the end of the request lifecycle.
     pub concurrent_limit_guards: Vec<ConcurrentLimitGuard>,
+    /// Configured concurrent-limit rejection body. The enforcer stores
+    /// this separately from the decision message so the response phase
+    /// can emit it verbatim.
+    pub concurrent_limit_denial_body: Option<String>,
     /// Permits issued by `AgentBudgetPolicy`. Same lifecycle
     /// as `concurrent_limit_guards`: each guard tracks an in-flight
     /// agent-keyed slot and releases it when the request finishes.
@@ -1142,6 +1146,7 @@ impl RequestContext {
             admin_load_balancer_strategy: None,
             admin_load_balancer_target: None,
             concurrent_limit_guards: Vec::new(),
+            concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
             request_body_buf: None,

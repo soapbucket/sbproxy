@@ -8,6 +8,53 @@ use serde::Deserialize;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
+#[cfg(test)]
+thread_local! {
+    /// Deterministic pause between resolving a key's map entry and
+    /// incrementing its counter. The race regression installs this only
+    /// on its delayed-acquirer thread.
+    static ACQUIRE_PAUSE: std::cell::RefCell<
+        Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    > = const { std::cell::RefCell::new(None) };
+    /// Deterministic pause after a guard decrements its counter but
+    /// before it attempts idle-entry cleanup.
+    static RELEASE_PAUSE: std::cell::RefCell<
+        Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_acquire_pause(reached: Arc<std::sync::Barrier>, resume: Arc<std::sync::Barrier>) {
+    ACQUIRE_PAUSE.with(|slot| {
+        *slot.borrow_mut() = Some((reached, resume));
+    });
+}
+
+#[cfg(test)]
+fn pause_after_counter_resolution() {
+    let pause = ACQUIRE_PAUSE.with(|slot| slot.borrow_mut().take());
+    if let Some((reached, resume)) = pause {
+        reached.wait();
+        resume.wait();
+    }
+}
+
+#[cfg(test)]
+fn install_release_pause(reached: Arc<std::sync::Barrier>, resume: Arc<std::sync::Barrier>) {
+    RELEASE_PAUSE.with(|slot| {
+        *slot.borrow_mut() = Some((reached, resume));
+    });
+}
+
+#[cfg(test)]
+fn pause_after_counter_decrement() {
+    let pause = RELEASE_PAUSE.with(|slot| slot.borrow_mut().take());
+    if let Some((reached, resume)) = pause {
+        reached.wait();
+        resume.wait();
+    }
+}
+
 /// Caps in-flight requests per key, returning a configurable status
 /// code (default 503) when the limit is reached.
 ///
@@ -139,18 +186,24 @@ impl ConcurrentLimitPolicy {
     /// caller should reject the request with `self.status`.
     pub fn try_acquire(&self, key: &str) -> Option<ConcurrentLimitGuard> {
         use std::sync::atomic::Ordering;
-        let counter = Arc::clone(
-            self.counters
-                .entry(key.to_string())
-                .or_insert_with(|| Arc::new(AtomicU32::new(0)))
-                .value(),
-        );
-        if counter
+        // Keep the entry guard until the increment has completed. Otherwise
+        // the last live permit can remove the entry after this thread clones
+        // its Arc but before it increments, leaving two live counters for the
+        // same key.
+        let entry = self
+            .counters
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(AtomicU32::new(0)));
+        let counter = Arc::clone(entry.value());
+        #[cfg(test)]
+        pause_after_counter_resolution();
+        let acquired = counter
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < self.max).then_some(current + 1)
             })
-            .is_err()
-        {
+            .is_ok();
+        drop(entry);
+        if !acquired {
             return None;
         }
         Some(ConcurrentLimitGuard {
@@ -198,6 +251,8 @@ impl Drop for ConcurrentLimitGuard {
         use std::sync::atomic::Ordering;
         let previous = self.counter.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "concurrent-limit guard underflow");
+        #[cfg(test)]
+        pause_after_counter_decrement();
         if previous == 1 {
             self.counters.remove_if(&self.key, |_, candidate| {
                 Arc::ptr_eq(candidate, &self.counter) && candidate.load(Ordering::Acquire) == 0
@@ -308,6 +363,69 @@ mod tests {
             "idle key map retained {} entries",
             policy.counters.len()
         );
+    }
+
+    #[test]
+    fn delayed_acquirer_cannot_split_one_key_across_two_live_counters() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let policy = Arc::new(policy(serde_json::json!({"max": 1})));
+        let key = "shared";
+        let first = policy.try_acquire(key).expect("first permit");
+
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let delayed_policy = Arc::clone(&policy);
+        let delayed_reached = Arc::clone(&reached);
+        let delayed_resume = Arc::clone(&resume);
+        let delayed = std::thread::spawn(move || {
+            install_acquire_pause(delayed_reached, delayed_resume);
+            delayed_policy
+                .try_acquire(key)
+                .expect("delayed permit after the first releases")
+        });
+
+        // The delayed acquirer has resolved the current map entry but has
+        // not incremented it yet.
+        reached.wait();
+
+        // Release the last live permit on another thread. The old
+        // implementation could remove the map entry while the delayed
+        // acquirer retained an Arc to its now-detached counter.
+        let decremented = Arc::new(std::sync::Barrier::new(2));
+        let continue_cleanup = Arc::new(std::sync::Barrier::new(2));
+        let dropper_decremented = Arc::clone(&decremented);
+        let dropper_continue_cleanup = Arc::clone(&continue_cleanup);
+        let (drop_done_tx, drop_done_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            install_release_pause(dropper_decremented, dropper_continue_cleanup);
+            drop(first);
+            drop_done_tx.send(()).expect("signal drop completion");
+        });
+        // Pin the counter at zero before allowing cleanup to race with
+        // the delayed increment.
+        decremented.wait();
+        continue_cleanup.wait();
+        let drop_finished_before_resume = drop_done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok();
+
+        resume.wait();
+        let delayed_guard = delayed.join().expect("delayed acquirer thread");
+        if !drop_finished_before_resume {
+            drop_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("drop completes after delayed acquire");
+        }
+        dropper.join().expect("dropper thread");
+
+        assert!(
+            policy.try_acquire(key).is_none(),
+            "the delayed permit must remain visible under the same key"
+        );
+        drop(delayed_guard);
+        assert!(policy.counters.is_empty(), "idle key must still be removed");
     }
 
     #[test]

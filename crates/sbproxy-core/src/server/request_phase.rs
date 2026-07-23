@@ -7,6 +7,73 @@
 
 use super::*;
 
+struct ConcurrentLimitDenialResponse {
+    status: u16,
+    content_type: &'static str,
+    body: String,
+}
+
+fn take_concurrent_limit_denial_response(
+    ctx: &mut RequestContext,
+    status: u16,
+    message: &str,
+    policy_type: &str,
+) -> Option<ConcurrentLimitDenialResponse> {
+    if policy_type != "concurrent_limit" {
+        return None;
+    }
+    let body = ctx
+        .concurrent_limit_denial_body
+        .take()
+        .unwrap_or_else(|| error_json_body(message));
+    Some(ConcurrentLimitDenialResponse {
+        status,
+        content_type: "application/json",
+        body,
+    })
+}
+
+#[cfg(test)]
+mod concurrent_limit_denial_response_tests {
+    use super::*;
+
+    #[test]
+    fn configured_body_is_emitted_byte_for_byte() {
+        let configured = "{\"error\":\"busy\"}";
+        let mut ctx = RequestContext::new();
+        ctx.concurrent_limit_denial_body = Some(configured.to_string());
+
+        let response =
+            take_concurrent_limit_denial_response(&mut ctx, 529, configured, "concurrent_limit")
+                .expect("concurrent-limit response");
+
+        assert_eq!(response.status, 529);
+        assert_eq!(response.content_type, "application/json");
+        assert_eq!(response.body.as_bytes(), configured.as_bytes());
+        assert!(ctx.concurrent_limit_denial_body.is_none());
+    }
+
+    #[test]
+    fn default_message_keeps_the_generic_json_envelope() {
+        let mut ctx = RequestContext::new();
+
+        let response = take_concurrent_limit_denial_response(
+            &mut ctx,
+            503,
+            "too many concurrent requests",
+            "concurrent_limit",
+        )
+        .expect("concurrent-limit response");
+
+        assert_eq!(response.status, 503);
+        assert_eq!(response.content_type, "application/json");
+        assert_eq!(
+            response.body,
+            "{\"error\":\"too many concurrent requests\"}"
+        );
+    }
+}
+
 /// Handle an incoming request before proxying. See the trait method
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 pub(super) async fn request_filter(
@@ -2592,7 +2659,17 @@ pub(super) async fn request_filter(
             )
             .with_tenant_id(ctx.tenant_id.to_string())
             .emit();
-            if status == 429
+            if let Some(response) =
+                take_concurrent_limit_denial_response(ctx, status, &msg, policy_type)
+            {
+                send_response(
+                    session,
+                    response.status,
+                    response.content_type,
+                    response.body.as_bytes(),
+                )
+                .await?;
+            } else if status == 429
                 && (policy_type == "rate_limit"
                     || policy_type == "ddos"
                     || policy_type == "rate_limit_budget")

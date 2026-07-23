@@ -62,10 +62,11 @@ impl PolicyEnforcer for ConcurrentLimitEnforcer {
             }
             None => {
                 let status = policy.status;
-                let message = policy
-                    .error_body
+                let configured_body = policy.error_body.clone();
+                let message = configured_body
                     .clone()
                     .unwrap_or_else(|| "too many concurrent requests".to_string());
+                ctx.concurrent_limit_denial_body = configured_body;
                 ctx.deny_policy_type = Some("concurrent_limit");
                 tracing::debug!(
                     key_by = %policy.key,
@@ -170,6 +171,7 @@ mod tests {
         let policy = Arc::new(
             ConcurrentLimitPolicy::from_config(serde_json::json!({
                 "max": 1,
+                "status": 529,
                 "error_body": "{\"error\":\"busy\"}"
             }))
             .expect("policy"),
@@ -192,9 +194,13 @@ mod tests {
         assert!(matches!(
             decision,
             PolicyDecision::Deny {
-                status: 503,
+                status: 529,
                 ref message
             } if message == "{\"error\":\"busy\"}"
         ));
+        assert_eq!(
+            blocked.concurrent_limit_denial_body.as_deref(),
+            Some("{\"error\":\"busy\"}")
+        );
     }
 }
