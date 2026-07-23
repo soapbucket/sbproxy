@@ -8,8 +8,9 @@
 //!
 //! In addition to the compiled modules, a `CompiledPipeline` owns:
 //! * an optional shared `CacheStore` (from `sbproxy-cache`) for the
-//!   response cache: Redis when `config.l2_store` is set, in-memory LRU
-//!   otherwise,
+//!   response cache: whichever backend `proxy.response_cache_store`
+//!   selects, or, when that block is absent, Redis if `config.l2_store`
+//!   is set and an in-memory LRU otherwise,
 //! * an enterprise [`Hooks`](crate::hooks::Hooks) bundle of optional traits
 //!   that OSS leaves as `None` and enterprise populates via the
 //!   [`EnterpriseStartupHook`](crate::hooks::EnterpriseStartupHook) pattern.
@@ -23,8 +24,9 @@ use std::sync::Arc;
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
 use crate::router::HostRouter;
 use sbproxy_cache::{
-    CacheReserveBackend, CacheStore, FsReserve, MemoryCacheStore, MemoryReserve, RedisCacheStore,
-    RedisReserve,
+    CacheKeyMaterial, CacheReserveBackend, CacheStore, EncryptedCacheStore, FileCacheConfig,
+    FileCacheStore, FsReserve, MemcachedConfig, MemcachedStore, MemoryCacheStore, MemoryReserve,
+    RedisCacheStore, RedisReserve,
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_modules::compile::{compile_action, compile_auth, compile_policy, compile_transform};
@@ -522,6 +524,149 @@ fn build_cache_reserve(
     }
 }
 
+/// Resolve a response-cache encryption key reference into raw material.
+///
+/// Routes through the process secret resolver when one is installed, so
+/// `secret://`, `vault://`, `file:`, and whole-value `${VAR}` references
+/// all behave exactly as they do everywhere else in the config.
+///
+/// When no resolver is installed, which happens for `sbproxy validate`,
+/// for unit tests, and for a serve run whose config declares no
+/// `proxy.secrets` backends, `file:` is handled here and any
+/// provider-URI scheme is a hard error. The reference text is never used
+/// as key material, because a literal `secret://...` silently becoming
+/// the AES key is exactly the failure this feature exists to prevent.
+fn resolve_cache_key_material(reference: &str) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+
+    if let Some(resolver) = sbproxy_vault::process_resolver() {
+        return Ok(resolver.resolve(reference)?.into_bytes());
+    }
+    if let Some(path) = reference.strip_prefix("file:") {
+        let raw = std::fs::read(path)
+            .with_context(|| format!("read response-cache encryption key file '{path}'"))?;
+        // Trim so a trailing newline in the key file does not silently
+        // change the derived key. Matches the resolver's `file:`
+        // semantics, which also trim.
+        return Ok(raw.trim_ascii().to_vec());
+    }
+    if sbproxy_vault::looks_like_secret_reference_uri(reference) {
+        anyhow::bail!(
+            "proxy.response_cache_store.encryption references the secret '{reference}' but no \
+             secret backend is configured to resolve it; declare one under proxy.secrets.backends"
+        );
+    }
+    Ok(reference.as_bytes().to_vec())
+}
+
+/// Build the shared response-cache store.
+///
+/// `store_cfg` is `proxy.response_cache_store`. When it is `None` the
+/// legacy selection applies: `redis_store` if the operator configured
+/// `proxy.l2_cache`, otherwise an in-process map. That branch exists so
+/// upgrading does not silently move an existing Redis deployment onto a
+/// per-replica cache.
+///
+/// `redis_store` is the already-wrapped Redis store, passed in rather
+/// than built here so this function never has to name the KV trait and
+/// stays unit-testable.
+///
+/// In `Validation` mode the shape is checked but no secret is resolved
+/// and no directory is created, matching how the rest of `sbproxy
+/// validate` treats secrets and the filesystem.
+fn build_response_cache_store(
+    store_cfg: Option<&sbproxy_config::ResponseCacheStoreConfig>,
+    redis_store: Option<Arc<dyn CacheStore>>,
+    memory_max_entries: usize,
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<Arc<dyn CacheStore>> {
+    use anyhow::Context;
+
+    let validating = matches!(mode, PipelineConstructionMode::Validation);
+
+    let Some(cfg) = store_cfg else {
+        // Legacy selection, byte-identical to the pre-block behaviour.
+        return Ok(match redis_store {
+            Some(store) => store,
+            None => Arc::new(MemoryCacheStore::new(memory_max_entries)),
+        });
+    };
+
+    let base: Arc<dyn CacheStore> = match &cfg.backend {
+        sbproxy_config::ResponseCacheBackendConfig::Memory => {
+            Arc::new(MemoryCacheStore::new(memory_max_entries))
+        }
+        sbproxy_config::ResponseCacheBackendConfig::File { path, max_size_mb } => {
+            if validating {
+                // Do not create directories during `sbproxy validate`.
+                Arc::new(MemoryCacheStore::new(memory_max_entries))
+            } else {
+                Arc::new(
+                    FileCacheStore::new(FileCacheConfig {
+                        directory: path.clone(),
+                        max_size_mb: *max_size_mb,
+                    })
+                    .context("proxy.response_cache_store.backend type `file`")?,
+                )
+            }
+        }
+        sbproxy_config::ResponseCacheBackendConfig::Memcached { host, port } => {
+            Arc::new(MemcachedStore::new(MemcachedConfig {
+                host: host.clone(),
+                port: *port,
+            }))
+        }
+        sbproxy_config::ResponseCacheBackendConfig::Redis => match redis_store {
+            Some(store) => store,
+            None => anyhow::bail!(
+                "proxy.response_cache_store.backend type `redis` needs a connection; \
+                 configure proxy.l2_cache with driver: redis or pick another backend"
+            ),
+        },
+    };
+
+    let Some(enc) = cfg.encryption.as_ref().filter(|e| e.enabled) else {
+        tracing::info!(
+            backend = base.backend_name(),
+            "response cache backend ready without at-rest encryption"
+        );
+        return Ok(base);
+    };
+
+    let reference = enc.key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "proxy.response_cache_store.encryption.enabled is true but no `key` is set; \
+             point `key` at a secret reference such as `secret://local/response-cache` \
+             or set `enabled: false`"
+        )
+    })?;
+
+    if validating {
+        // The shape is valid. Resolving the key would read files and
+        // dial secret backends, which `sbproxy validate` does not do.
+        return Ok(base);
+    }
+
+    let active = CacheKeyMaterial::new(resolve_cache_key_material(reference)?)
+        .context("proxy.response_cache_store.encryption.key")?;
+    let mut previous = Vec::with_capacity(enc.previous_keys.len());
+    for (index, reference) in enc.previous_keys.iter().enumerate() {
+        previous.push(
+            CacheKeyMaterial::new(resolve_cache_key_material(reference)?).with_context(|| {
+                format!("proxy.response_cache_store.encryption.previous_keys[{index}]")
+            })?,
+        );
+    }
+
+    tracing::info!(
+        backend = base.backend_name(),
+        key_id = %active.fingerprint_hex(),
+        retired_keys = previous.len(),
+        "response cache backend ready with at-rest encryption"
+    );
+    Ok(Arc::new(EncryptedCacheStore::new(base, active, previous)))
+}
+
 /// TLS-fingerprint capture mode.
 ///
 /// `passive` and `sidecar` are wire-equivalent today; the OSS path
@@ -867,10 +1012,14 @@ pub struct CompiledPipeline {
     pub idempotencies: Vec<Option<Arc<CompiledIdempotency>>>,
     /// Shared response cache backend.
     ///
-    /// Points at a Redis-backed store when `CompiledConfig.l2_store` is set,
-    /// otherwise at an in-process `MemoryCacheStore`. A single backend is
-    /// shared by all origins; per-origin `ResponseCacheConfig` gates whether
-    /// the cache is actually used for that origin.
+    /// Selected by `proxy.response_cache_store`, which names one of
+    /// memory, file, memcached, or redis and can wrap the choice in
+    /// at-rest encryption. When that block is absent the historical
+    /// selection applies: a Redis-backed store when
+    /// `CompiledConfig.l2_store` is set, otherwise an in-process
+    /// `MemoryCacheStore`. A single backend is shared by all origins;
+    /// per-origin `ResponseCacheConfig` gates whether the cache is
+    /// actually used for that origin.
     pub cache_store: Option<Arc<dyn CacheStore>>,
     /// Optional Cache Reserve cold-tier backend.
     ///
@@ -1161,30 +1310,41 @@ impl CompiledPipeline {
 
         // --- Shared response cache backend ---
         //
-        // Pick Redis when the top-level `l2_cache` block is set, otherwise
-        // fall back to an in-process LRU. The cache is only created when
-        // at least one origin has `response_cache.enabled = true`; this
-        // avoids allocating a store for configs that don't use caching.
+        // One store serves every origin; the cache key namespaces by
+        // workspace and hostname so they cannot collide. The store is
+        // only built when at least one origin has
+        // `response_cache.enabled = true`, so a config that does not
+        // cache pays nothing.
+        //
+        // `proxy.response_cache_store` selects the backend explicitly.
+        // When that block is absent the selection is the historical one,
+        // Redis if `proxy.l2_cache` is set and an in-process map
+        // otherwise, so an upgrade never moves an existing deployment
+        // off the backend it already had.
         let any_cache_enabled = config
             .origins
             .iter()
             .any(|o| o.response_cache.as_ref().is_some_and(|c| c.enabled));
         let cache_store: Option<Arc<dyn CacheStore>> = if any_cache_enabled {
-            match config.l2_store.clone() {
-                Some(kv) => Some(Arc::new(RedisCacheStore::new(kv))),
-                None => {
-                    // Take the largest configured max_size across origins
-                    // so the shared memory cache can fit all of them.
-                    let max = config
-                        .origins
-                        .iter()
-                        .filter_map(|o| o.response_cache.as_ref())
-                        .map(|c| c.max_size)
-                        .max()
-                        .unwrap_or(10_000);
-                    Some(Arc::new(MemoryCacheStore::new(max)))
-                }
-            }
+            // Take the largest configured max_size across origins so the
+            // shared memory cache can fit all of them.
+            let memory_max = config
+                .origins
+                .iter()
+                .filter_map(|o| o.response_cache.as_ref())
+                .map(|c| c.max_size)
+                .max()
+                .unwrap_or(10_000);
+            let redis_store: Option<Arc<dyn CacheStore>> = config
+                .l2_store
+                .clone()
+                .map(|kv| Arc::new(RedisCacheStore::new(kv)) as Arc<dyn CacheStore>);
+            Some(build_response_cache_store(
+                config.server.response_cache_store.as_ref(),
+                redis_store,
+                memory_max,
+                mode,
+            )?)
         } else {
             None
         };
@@ -2902,5 +3062,299 @@ origins: {}
         let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions);
         // Default => disabled (safe).
         assert!(!tls.enabled);
+    }
+
+    // --- response cache store selection ---
+
+    /// Stand-in for a Redis-backed store, so the selection tests can
+    /// assert which backend was chosen without a live Redis.
+    struct FakeRedisStore;
+
+    impl sbproxy_cache::CacheStore for FakeRedisStore {
+        fn get(&self, _key: &str) -> anyhow::Result<Option<sbproxy_cache::CachedResponse>> {
+            Ok(None)
+        }
+        fn put(&self, _key: &str, _value: &sbproxy_cache::CachedResponse) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn clear(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn backend_name(&self) -> &'static str {
+            "redis"
+        }
+    }
+
+    fn fake_redis() -> Option<Arc<dyn CacheStore>> {
+        Some(Arc::new(FakeRedisStore) as Arc<dyn CacheStore>)
+    }
+
+    #[test]
+    fn no_store_block_with_l2_still_selects_redis() {
+        // The compatibility promise: an operator who has only
+        // proxy.l2_cache set keeps Redis after this change.
+        let store = build_response_cache_store(
+            None,
+            fake_redis(),
+            10_000,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("legacy selection should build");
+        assert_eq!(store.backend_name(), "redis");
+    }
+
+    #[test]
+    fn no_store_block_without_l2_selects_memory() {
+        let store =
+            build_response_cache_store(None, None, 10_000, PipelineConstructionMode::Runtime)
+                .expect("legacy selection should build");
+        assert_eq!(store.backend_name(), "memory");
+    }
+
+    #[test]
+    fn an_explicit_memory_backend_overrides_a_configured_l2() {
+        // An explicit block means the operator chose; it must win over
+        // the presence of an l2_cache connection.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig::default();
+        let store = build_response_cache_store(
+            Some(&cfg),
+            fake_redis(),
+            10_000,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("explicit memory should build");
+        assert_eq!(store.backend_name(), "memory");
+    }
+
+    #[test]
+    fn a_file_backend_is_constructed_and_creates_its_directory() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("responses");
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::File {
+                path: path.to_string_lossy().into_owned(),
+                max_size_mb: 0,
+            },
+            encryption: None,
+        };
+        let store =
+            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
+                .expect("file backend should build");
+        assert_eq!(store.backend_name(), "file");
+        assert!(path.is_dir(), "the cache directory must be created");
+    }
+
+    #[test]
+    fn a_file_backend_that_cannot_be_created_fails_the_build() {
+        // A file created where the directory should be. create_dir_all
+        // fails, and that must abort rather than silently downgrade to
+        // memory.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker");
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::File {
+                path: blocker.to_string_lossy().into_owned(),
+                max_size_mb: 0,
+            },
+            encryption: None,
+        };
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            PipelineConstructionMode::Runtime,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_memcached_backend_is_constructed_without_connecting() {
+        // Construction must not dial the server; the store opens a
+        // connection per operation, so a config load against a
+        // temporarily-down memcached still boots.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memcached {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+            encryption: None,
+        };
+        let store =
+            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
+                .expect("memcached backend should build without dialing");
+        assert_eq!(store.backend_name(), "memcached");
+    }
+
+    #[test]
+    fn a_redis_backend_without_l2_cache_is_a_startup_error() {
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Redis,
+            encryption: None,
+        };
+        let Err(err) =
+            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
+        else {
+            panic!("redis without l2_cache must fail loudly");
+        };
+        assert!(
+            err.to_string().contains("proxy.l2_cache"),
+            "the error must point at the missing block: {err}"
+        );
+    }
+
+    #[test]
+    fn encryption_enabled_without_a_key_is_a_startup_error() {
+        // The core security requirement: never fall through to storing
+        // plaintext because the key was left out.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: None,
+                previous_keys: Vec::new(),
+            }),
+        };
+        let Err(err) =
+            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
+        else {
+            panic!("encryption without a key must fail loudly");
+        };
+        assert!(
+            err.to_string().contains("no `key` is set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn encryption_with_short_key_material_is_a_startup_error() {
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: Some("short".to_string()),
+                previous_keys: Vec::new(),
+            }),
+        };
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            PipelineConstructionMode::Runtime,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_unresolvable_secret_reference_is_never_used_as_key_material() {
+        // The footgun this closes: with no secret backend installed, a
+        // `secret://` reference must not become the literal key.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: Some("secret://primary/response-cache-key".to_string()),
+                previous_keys: Vec::new(),
+            }),
+        };
+        let Err(err) =
+            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
+        else {
+            panic!("an unresolvable reference must not be used verbatim");
+        };
+        assert!(
+            err.to_string().contains("proxy.secrets.backends"),
+            "the error must point at the missing backend: {err}"
+        );
+    }
+
+    #[test]
+    fn encryption_reads_key_material_from_a_file_reference() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let key_file = dir.path().join("cache.key");
+        std::fs::write(&key_file, b"0123456789abcdef0123456789abcdef\n").expect("write key");
+
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: Some(format!("file:{}", key_file.display())),
+                previous_keys: Vec::new(),
+            }),
+        };
+        let store =
+            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
+                .expect("file-referenced key should build");
+
+        // Still reports the wrapped backend, and actually encrypts.
+        assert_eq!(store.backend_name(), "memory");
+        let entry = sbproxy_cache::CachedResponse {
+            status: 200,
+            headers: vec![],
+            body: b"needle-in-the-haystack".to_vec(),
+            cached_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            ttl_secs: 300,
+        };
+        store.put("k", &entry).unwrap();
+        assert_eq!(store.get("k").unwrap().expect("hit").body, entry.body);
+    }
+
+    #[test]
+    fn a_disabled_encryption_block_leaves_the_store_unwrapped() {
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: false,
+                key: None,
+                previous_keys: Vec::new(),
+            }),
+        };
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            PipelineConstructionMode::Runtime,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validation_mode_skips_key_resolution_but_still_checks_shape() {
+        // `sbproxy validate` must not read key files or dial secret
+        // backends, but a redis backend with no l2_cache is a config
+        // error it can and should report.
+        let encrypted = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: Some("file:/definitely/not/here.key".to_string()),
+                previous_keys: Vec::new(),
+            }),
+        };
+        assert!(build_response_cache_store(
+            Some(&encrypted),
+            None,
+            10_000,
+            PipelineConstructionMode::Validation,
+        )
+        .is_ok());
+
+        let bad_redis = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Redis,
+            encryption: None,
+        };
+        assert!(build_response_cache_store(
+            Some(&bad_redis),
+            None,
+            10_000,
+            PipelineConstructionMode::Validation,
+        )
+        .is_err());
     }
 }
