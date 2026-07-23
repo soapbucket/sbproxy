@@ -1,5 +1,5 @@
 # Policy engine
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-22*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
@@ -126,15 +126,20 @@ Caps in-flight requests per key. Distinct from `rate_limiting`, which throttles 
 
 Key strategies:
 
-- `origin` (default): one global counter for the route.
+- `global` (default): one counter for the policy mount.
 - `ip`: one counter per client IP.
 - `api_key`: one counter per `X-Api-Key` header (or `Authorization: Bearer` when no api-key auth is configured).
+- `route`: one counter per request path. Query strings do not create separate buckets.
+- `header:<name>`: one counter per value of the named request header.
+
+The former `key` field and its `origin` value remain accepted for schema-v1
+compatibility. New configuration should use `key_by`.
 
 ```yaml
 policies:
   - type: concurrent_limit
     max: 3
-    key: ip
+    key_by: ip
     status: 503
     error_body: '{"error":"too many concurrent requests, retry shortly"}'
 ```

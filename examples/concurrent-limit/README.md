@@ -1,6 +1,6 @@
 # Concurrent request limit
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-22*
 
 ![Concurrent request limit](../../docs/assets/concurrent-limit.gif)
 
@@ -44,7 +44,7 @@ curl -s -H 'Host: localhost' http://127.0.0.1:8080/get | jq .url
 ## What this exercises
 
 - `concurrent_limit` policy - permit-based in-flight cap with configurable rejection status and body
-- `key: ip` - per-client-IP counter (alternatives are `origin` for a global counter and `api_key` for per-token)
+- `key_by: ip` - per-client-IP counter; alternatives are `global`, `api_key`, `route`, and `header:<name>`
 - `proxy` action - permits release on completion regardless of upstream outcome
 
 ## See also

@@ -15,9 +15,11 @@
 # rejected with `status` (default 503) and the configured error body.
 #
 # Key strategies:
-#   * `origin` (default) - one global counter for this route
+#   * `global` (default) - one counter for this policy mount
 #   * `ip`               - per-client-IP counter
 #   * `api_key`          - per-`X-Api-Key` (or Bearer token) counter
+#   * `route`            - per request path, excluding the query
+#   * `header:<name>`    - per value of the named request header
 #
 # Run:
 #   make run CONFIG=examples/concurrent-limit/sb.yml
@@ -38,6 +40,6 @@ origins:
     policies:
       - type: concurrent_limit
         max: 3
-        key: ip          # one counter per client IP; use 'origin' for global
+        key_by: ip       # one counter per client IP; use global for one shared budget
         status: 503
         error_body: '{"error":"too many concurrent requests, retry shortly"}'

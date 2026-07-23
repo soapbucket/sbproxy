@@ -2129,7 +2129,7 @@ Cap in-flight requests per key. Distinct from `rate_limiting`, which throttles R
 policies:
   - type: concurrent_limit
     max: 50
-    key: api_key      # or 'ip', or 'origin' (default)
+    key_by: api_key   # or ip, route, header:<name>, or global (default)
     status: 503
     error_body: '{"error":"too many concurrent requests"}'
 ```
@@ -2137,11 +2137,12 @@ policies:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max` | int | required | Maximum concurrent requests per key. Must be `> 0`. |
-| `key` | string | `origin` | Bucket strategy: `origin` (one global counter for the route), `ip` (per client IP), or `api_key` (per `X-Api-Key` or `Bearer` token). |
+| `key_by` | string | `global` | Bucket strategy: `global`, `ip`, `api_key`, `route`, or `header:<name>`. Route keys use the request path without its query. |
+| `key` | string | unset | Legacy schema-v1 spelling retained for compatibility. Supports `origin`, `ip`, and `api_key`; use `key_by` in new configuration. |
 | `status` | int | 503 | HTTP status when the limit is exceeded. |
 | `error_body` | string | unset | Optional response body for rejections. |
 
-Each accepted request takes a permit; the permit is released when the request finishes (success, error, or client disconnect). Counters use a sharded `DashMap` so contention across keys is bounded.
+Each accepted request takes a permit; the permit is released when the request finishes (success, error, panic, or client disconnect). Idle keys are removed from the sharded map, so one-off client keys do not accumulate after their requests drain.
 
 See [example 82](../examples/concurrent-limit/sb.yml).
 

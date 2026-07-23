@@ -91,6 +91,6 @@ origins:
     policies:
       - type: concurrent_limit
         max: 100
-        key: ip
+        key_by: ip
         status: 503
         error_body: '{"error":"too many concurrent requests"}'

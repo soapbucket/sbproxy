@@ -1,6 +1,6 @@
 # Getting started: Sovereign / multi-cloud deployment
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-22*
 
 ## What you will build
 
@@ -96,7 +96,7 @@ origins:
       # preserves headroom for other clients.
       - type: concurrent_limit
         max: 100
-        key: ip
+        key_by: ip
         status: 503
         error_body: '{"error":"too many concurrent requests"}'
 ```
