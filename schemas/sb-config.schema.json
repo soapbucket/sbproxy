@@ -8109,7 +8109,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "FeatureFlagRuleConfig": {
       "description": "Rules for a process-wide feature flag.",
@@ -8136,9 +8137,11 @@
           "default": 0,
           "type": "integer",
           "format": "uint32",
+          "maximum": 100.0,
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "UpdateConfig": {
       "description": "The `update:` block: how `sbproxy update` behaves (WOR-1804).\n\nPinning always wins. A `path` / `brew` / `apt`-managed artifact, or one pinned to an explicit version or digest, is reported but never replaced unless a run explicitly targets it. A background check (see `auto`) only ever reports; applying an update is always an explicit `sbproxy update` run.",

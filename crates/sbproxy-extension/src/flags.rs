@@ -10,14 +10,15 @@
 //!
 //! Each flag carries a `default` plus an ordered list of rules:
 //!
-//! - `allow_list`: keys in this set always evaluate `true`.
 //! - `block_list`: keys in this set always evaluate `false`.
-//! - `rollout_percent`: sticky bucketing on `hash(flag_name + key) % 100`.
+//! - `allow_list`: keys in this set always evaluate `true`.
+//! - `rollout_percent`: sticky FNV-1a bucketing on
+//!   `hash(flag_name + key) % 100`.
 //! - `segments`: `true` when the request's segment label matches one
 //!   of the configured values.
 //!
-//! Rules apply in the listed order; the first match wins. When no rule
-//! matches, the flag falls back to `default`.
+//! Rules apply in the listed order (block, allow, segment, rollout); the
+//! first match wins. When no rule matches, the flag falls back to `default`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -168,6 +169,23 @@ pub fn set_global_store(store: Arc<FlagStore>) -> Arc<FlagStore> {
     let prev = guard.clone();
     *guard = store;
     prev
+}
+
+/// Run `publish` and then replace the global store while CEL readers are
+/// excluded from the transition.
+///
+/// Embedders that publish another snapshot containing the flag configuration
+/// use this to keep the two pointer swaps adjacent: a reader that observes the
+/// newly published snapshot and calls [`global_store`] blocks until the
+/// matching flag store is installed.
+pub fn replace_global_store_after<T>(
+    store: Arc<FlagStore>,
+    publish: impl FnOnce() -> T,
+) -> (Arc<FlagStore>, T) {
+    let mut guard = GLOBAL_HANDLE.write();
+    let result = publish();
+    let previous = std::mem::replace(&mut *guard, store);
+    (previous, result)
 }
 
 /// Snapshot of the live global store handle.

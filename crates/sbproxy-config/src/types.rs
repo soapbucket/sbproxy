@@ -71,6 +71,7 @@ pub struct ConfigFile {
 
 /// One process-wide feature flag exposed to CEL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureFlagConfig {
     /// Unique name passed as the first argument to `flag_enabled`.
     pub name: String,
@@ -84,6 +85,7 @@ pub struct FeatureFlagConfig {
 
 /// Rules for a process-wide feature flag.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureFlagRuleConfig {
     /// Bucketing keys that always evaluate to true.
     #[serde(default)]
@@ -93,7 +95,28 @@ pub struct FeatureFlagRuleConfig {
     pub block_list: Vec<String>,
     /// Sticky rollout cutoff in the inclusive range 0..=100.
     #[serde(default)]
+    #[schemars(range(max = 100))]
     pub rollout_percent: u32,
+}
+
+#[cfg(test)]
+mod feature_flag_config_tests {
+    use super::*;
+
+    #[test]
+    fn schema_rejects_unknown_flag_fields_and_caps_rollout() {
+        let flag_schema =
+            serde_json::to_value(schemars::schema_for!(FeatureFlagConfig)).expect("flag schema");
+        assert_eq!(flag_schema["additionalProperties"], false);
+
+        let rule_schema = serde_json::to_value(schemars::schema_for!(FeatureFlagRuleConfig))
+            .expect("rule schema");
+        assert_eq!(rule_schema["additionalProperties"], false);
+        assert_eq!(
+            rule_schema["properties"]["rollout_percent"]["maximum"].as_f64(),
+            Some(100.0)
+        );
+    }
 }
 
 /// Which release stream `sbproxy update` follows for the binary and the

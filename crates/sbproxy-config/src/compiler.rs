@@ -1923,7 +1923,7 @@ flags:
 
         let message = format!("{error:#}");
         assert!(message.contains("segments"), "{message}");
-        assert!(message.contains("unknown or misspelled"), "{message}");
+        assert!(message.contains("unknown field"), "{message}");
     }
 
     fn custom_field(
