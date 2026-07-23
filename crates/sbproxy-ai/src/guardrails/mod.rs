@@ -487,7 +487,18 @@ pub fn compile_pipeline(config: &GuardrailsConfig) -> Result<GuardrailPipeline> 
         pipeline.input.push(compile_guardrail(guard_cfg)?);
     }
     for guard_cfg in &config.output {
-        pipeline.output.push(compile_guardrail(guard_cfg)?);
+        let guardrail = compile_guardrail(guard_cfg)?;
+        // The classifier guardrail is input-only: `check` unconditionally
+        // returns `None` because classification needs the message list to
+        // honor `last_user_message` scope, and the output paths (buffered
+        // `check_output` and the streaming `on_close` close-policy path)
+        // only ever call `check`. Accepting it here would compile fine and
+        // then silently do nothing forever, so reject it as a hard config
+        // error instead.
+        if let Guardrail::Classifier(_) = &guardrail {
+            bail!("the `classifier` guardrail is input-only; move it from `output:` to `input:`");
+        }
+        pipeline.output.push(guardrail);
         // Per-entry streaming policy rides the same raw entry; unknown
         // to the individual guardrail structs (serde ignores it there).
         let policy = guard_cfg
@@ -941,5 +952,41 @@ mod tests {
         let pipeline = compile_pipeline(&cfg).expect("mixed pipeline should compile");
         assert_eq!(pipeline.input.len(), 2);
         assert!(pipeline.input[1].check("this is SECRET").is_some());
+    }
+
+    #[test]
+    fn classifier_is_rejected_under_output_but_allowed_under_input() {
+        // The classifier guardrail is input-only: `check` always returns
+        // `None`, and both output paths (buffered check_output and the
+        // streaming on_close close-policy path) call only `check`. An
+        // operator putting it under `output:` would compile fine and then
+        // silently do nothing forever, so compile_pipeline must reject it.
+        // GuardrailsConfig does not derive Default, and every field carries
+        // #[serde(default)], so build it through serde.
+        let classifier_entry = serde_json::json!({
+            "type": "classifier",
+            "model_path": "/unused/model.onnx",
+            "tokenizer_path": "/unused/tokenizer.json",
+            "classes": { "documentation": ["write the readme"] }
+        });
+
+        let output_cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "output": [classifier_entry]
+        }))
+        .expect("config should deserialize");
+        let err = compile_pipeline(&output_cfg).expect_err("classifier under output must fail");
+        assert!(
+            err.to_string()
+                .contains("is input-only; move it from `output:` to `input:`"),
+            "unexpected error: {err}"
+        );
+
+        let input_cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "input": [classifier_entry]
+        }))
+        .expect("config should deserialize");
+        let pipeline =
+            compile_pipeline(&input_cfg).expect("classifier under input should compile fine");
+        assert_eq!(pipeline.input.len(), 1);
     }
 }
