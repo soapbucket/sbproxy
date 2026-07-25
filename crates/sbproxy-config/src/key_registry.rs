@@ -34,17 +34,27 @@ const fn config_only(path: &'static str, note: &'static str) -> ConfigKeyCapabil
 
 /// Keys whose reader is indirect, plus deliberately inert compatibility keys.
 ///
-/// An override covers its complete schema subtree. Prefer the narrowest path
-/// that describes the indirect consumer or inert surface.
+/// Every override names one exact schema leaf. Parent entries never suppress
+/// reader checks for children added later.
 pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     stable(
         "access_log.output.type",
         "sbproxy_core::server::access_log::emit_access_log",
     ),
     config_only(
-        "agent_classes.hosted_feed",
+        "agent_classes.hosted_feed.bootstrap_keys",
         "The OSS resolver does not fetch hosted agent-class feeds; builtin and inline catalogs \
          remain live. Retained for compatibility and tracked by WOR-1976.",
+    ),
+    config_only(
+        "agent_classes.hosted_feed.url",
+        "The OSS resolver does not fetch hosted agent-class feeds; builtin and inline catalogs \
+         remain live. Retained for compatibility and tracked by WOR-1976.",
+    ),
+    config_only(
+        "audit.sink",
+        "The OSS admin-action audit path always retains its bounded in-memory ring and mirrors \
+         rows to tracing; this selector is not installed. Classified under WOR-1976.",
     ),
     config_only(
         "origins.*.agent_skills[].max_clock_skew_secs",
@@ -55,15 +65,45 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.agent_skills[].type",
         "sbproxy_config::compiler::compile_origin",
     ),
-    config_only(
-        "origins.*.connection_pool",
-        "Pingora owns upstream connection pooling; these per-origin limits are not applied by \
-         the OSS runtime. Classified under WOR-1976.",
+    stable(
+        "origins.*.agents_json.flows",
+        "sbproxy_modules::projections::agents_json::render",
+    ),
+    stable(
+        "origins.*.agents_json.info.description",
+        "sbproxy_modules::projections::agents_json::render",
+    ),
+    stable(
+        "origins.*.agents_json.info.title",
+        "sbproxy_modules::projections::agents_json::render",
+    ),
+    stable(
+        "origins.*.agents_json.info.version",
+        "sbproxy_modules::projections::agents_json::render",
     ),
     config_only(
         "origins.*.compression.level",
         "The OSS compressors use their library defaults; this compatibility value is not \
          applied. Classified under WOR-1976.",
+    ),
+    stable(
+        "origins.*.compression.min_size",
+        "sbproxy_config::compiler::compile_origin",
+    ),
+    config_only(
+        "origins.*.connection_pool.idle_timeout_secs",
+        "Pingora owns upstream connection pooling; these per-origin limits are not applied by \
+         the OSS runtime. Classified under WOR-1976.",
+    ),
+    config_only(
+        "origins.*.connection_pool.max_connections",
+        "Pingora owns upstream connection pooling; these per-origin limits are not applied by \
+         the OSS runtime. Classified under WOR-1976.",
+    ),
+    config_only(
+        "origins.*.connection_pool.max_lifetime_secs",
+        "Pingora owns upstream connection pooling; these per-origin limits are not applied by \
+         the OSS runtime. Classified under WOR-1976.",
     ),
     config_only(
         "origins.*.cors.enable",
@@ -78,18 +118,131 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.credentials[].type",
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
+    config_only(
+        "origins.*.credentials[].attrs.budget.reset",
+        "Credential lowering carries token and cost caps but does not install or enforce this \
+         reset window. Reserved under WOR-1976.",
+    ),
+    config_only(
+        "origins.*.forward_rules[].origin.hostname",
+        "The inline forward origin runtime consumes its action and modifiers but does not expose \
+         this informational hostname. Classified under WOR-1976.",
+    ),
+    stable(
+        "origins.*.forward_rules[].origin.request_modifiers[].js_script",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
+    stable(
+        "origins.*.forward_rules[].origin.request_modifiers[].lua_script",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
+    config_only(
+        "origins.*.forward_rules[].origin.version",
+        "The inline forward origin runtime consumes its action and modifiers but does not expose \
+         this informational version. Classified under WOR-1976.",
+    ),
+    config_only(
+        "origins.*.forward_rules[].origin.workspace_id",
+        "The inline forward origin runtime consumes its action and modifiers but does not apply \
+         this informational workspace identifier. Classified under WOR-1976.",
+    ),
+    stable(
+        "origins.*.forward_rules[].parameters[].description",
+        "sbproxy_openapi::build",
+    ),
     stable(
         "origins.*.forward_rules[].parameters[].in",
         "sbproxy_openapi::build",
     ),
     stable(
+        "origins.*.forward_rules[].parameters[].name",
+        "sbproxy_openapi::build",
+    ),
+    stable(
+        "origins.*.forward_rules[].parameters[].required",
+        "sbproxy_openapi::build",
+    ),
+    stable(
+        "origins.*.forward_rules[].parameters[].schema",
+        "sbproxy_openapi::build",
+    ),
+    stable(
+        "origins.*.forward_rules[].rules[].header.name",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
+    stable(
+        "origins.*.forward_rules[].rules[].header.prefix",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
+    stable(
+        "origins.*.forward_rules[].rules[].header.value",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
+    stable(
+        "origins.*.forward_rules[].rules[].match",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
+    stable(
+        "origins.*.forward_rules[].rules[].query.name",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
+    stable(
+        "origins.*.forward_rules[].rules[].query.value",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
+    stable(
+        "origins.*.hsts.max_age",
+        "sbproxy_config::compiler::compile_origin",
+    ),
+    stable(
+        "origins.*.observability.log.redact.disable",
+        "sbproxy_core::server::lifecycle::install_op_redact_state",
+    ),
+    stable(
+        "origins.*.observability.log.redact.fields",
+        "sbproxy_core::server::lifecycle::install_op_redact_state",
+    ),
+    stable(
         "origins.*.observability.log.sinks[].output.type",
         "sbproxy_core::server::lifecycle::compile_one_sink",
+    ),
+    stable(
+        "origins.*.olp.introspect.auth.mode",
+        "sbproxy_core::server::request_phase::handle_olp_introspect_or_revoke",
+    ),
+    stable(
+        "origins.*.olp.introspect.realm",
+        "sbproxy_core::server::request_phase::handle_olp_introspect_or_revoke",
+    ),
+    stable(
+        "origins.*.olp.introspect.revocation_store.backend",
+        "sbproxy_core::server::request_phase::handle_olp_introspect_or_revoke",
+    ),
+    stable(
+        "origins.*.proxy_status.enabled",
+        "sbproxy_config::compiler::compile_origin",
+    ),
+    stable(
+        "origins.*.proxy_status.identity",
+        "sbproxy_config::compiler::compile_origin",
     ),
     config_only(
         "origins.*.rate_limit_headers",
         "The OSS runtime does not consume the origin-level block; configure headers on the live \
          rate-limit policy instead. Classified under WOR-1976.",
+    ),
+    stable(
+        "origins.*.request_modifiers[].js_script",
+        "sbproxy_config::compiler::compile_origin",
+    ),
+    stable(
+        "origins.*.request_modifiers[].lua_script",
+        "sbproxy_config::compiler::compile_origin",
+    ),
+    config_only(
+        "origins.*.response_modifiers[].status.text",
+        "The response path applies the configured status code but does not emit this optional \
+         reason text. Classified under WOR-1976.",
     ),
     config_only(
         "origins.*.sessions.ttl_seconds",
@@ -110,6 +263,36 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy_core::pipeline::build_cache_reserve",
     ),
     stable(
+        "proxy.acme.challenge_types",
+        "sbproxy_core::server::lifecycle::run",
+    ),
+    stable(
+        "proxy.acme.directory_url",
+        "sbproxy_core::server::lifecycle::run",
+    ),
+    stable("proxy.acme.email", "sbproxy_core::server::lifecycle::run"),
+    stable(
+        "proxy.acme.renew_before_days",
+        "sbproxy_core::server::lifecycle::run",
+    ),
+    stable(
+        "proxy.admin.tls.cert",
+        "sbproxy_core::server::lifecycle::run",
+    ),
+    stable(
+        "proxy.admin.tls.key",
+        "sbproxy_core::server::lifecycle::run",
+    ),
+    stable(
+        "proxy.correlation_id.echo_response",
+        "sbproxy_core::server::lifecycle::run",
+    ),
+    config_only(
+        "proxy.credentials[].attrs.budget.reset",
+        "Credential lowering carries token and cost caps but does not install or enforce this \
+         reset window. Reserved under WOR-1976.",
+    ),
+    stable(
         "proxy.credentials[].policies[].type",
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
@@ -123,18 +306,40 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          for the parser swap tracked under WOR-1976.",
     ),
     config_only(
-        "proxy.http3",
+        "proxy.http3.enabled",
         "This build does not serve HTTP/3; enabled=true fails config compilation. Native HTTP/3 \
          support is tracked in WOR-1969.",
+    ),
+    config_only(
+        "proxy.http3.idle_timeout_secs",
+        "This build does not serve HTTP/3, so the QUIC idle timeout is not installed. Native \
+         HTTP/3 support is tracked in WOR-1969.",
+    ),
+    config_only(
+        "proxy.http3.max_streams",
+        "This build does not serve HTTP/3, so the QUIC stream limit is not installed. Native \
+         HTTP/3 support is tracked in WOR-1969.",
     ),
     stable(
         "proxy.key_management.governance.backend.type",
         "sbproxy_core::key_plane::build_governance_store",
     ),
+    stable(
+        "proxy.key_management.governance.failure_mode",
+        "sbproxy_core::server::ai_dispatch::handle_ai_proxy",
+    ),
     config_only(
         "proxy.key_management.governance.key_introspection",
         "The caller-only key-introspection route is not installed by the OSS runtime. Retained \
          for compatibility and classified under WOR-1976.",
+    ),
+    stable(
+        "proxy.key_management.governance.missing_rate",
+        "sbproxy_core::server::ai_dispatch::handle_ai_proxy",
+    ),
+    stable(
+        "proxy.key_management.governance.require_governed_key",
+        "sbproxy_core::server::ai_dispatch::handle_ai_proxy",
     ),
     config_only(
         "proxy.key_management.store.redis_source_of_truth",
@@ -142,8 +347,20 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          not alter runtime behavior. Classified under WOR-1976.",
     ),
     stable(
-        "proxy.l2_cache_settings",
-        "sbproxy_config::compiler::build_l2_store",
+        "proxy.model_host.cache.budget_gib",
+        "sbproxy_core::server::model_host::compile_runtime_candidate",
+    ),
+    stable(
+        "proxy.model_host.engines.*.acceleration",
+        "sbproxy_core::server::model_host::compile_runtime_candidate",
+    ),
+    stable(
+        "proxy.model_host.engines.*.path",
+        "sbproxy_core::server::model_host::compile_runtime_candidate",
+    ),
+    stable(
+        "proxy.model_host.engines.*.shm_size_gib",
+        "sbproxy_core::server::model_host::compile_runtime_candidate",
     ),
     config_only(
         "proxy.observability.log.level",
@@ -156,7 +373,17 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          value. Classified under WOR-1976.",
     ),
     config_only(
-        "proxy.observability.log.sampling",
+        "proxy.observability.log.sampling.debug",
+        "The process logger currently uses its fixed sampling defaults; these YAML rates are not \
+         installed. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.observability.log.sampling.info",
+        "The process logger currently uses its fixed sampling defaults; these YAML rates are not \
+         installed. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.observability.log.sampling.trace",
         "The process logger currently uses its fixed sampling defaults; these YAML rates are not \
          installed. Classified under WOR-1976.",
     ),
@@ -165,7 +392,17 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy_core::server::lifecycle::compile_one_sink",
     ),
     config_only(
-        "proxy.scripting.javascript",
+        "proxy.scripting.javascript.sandbox.budget_ms",
+        "QuickJS engines currently use their built-in sandbox defaults; this YAML block is not \
+         installed into JsEngine::new. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.scripting.javascript.sandbox.memory_mb",
+        "QuickJS engines currently use their built-in sandbox defaults; this YAML block is not \
+         installed into JsEngine::new. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.scripting.javascript.sandbox.stack_kb",
         "QuickJS engines currently use their built-in sandbox defaults; this YAML block is not \
          installed into JsEngine::new. Classified under WOR-1976.",
     ),
@@ -175,7 +412,7 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          proxy.secrets.backends. Classified under WOR-1976.",
     ),
     stable(
-        "proxy.secrets.backends[].auth.external_account_file",
+        "proxy.secrets.backends[].auth.external_account_file.path",
         "sbproxy::install_secret_resolver",
     ),
     stable(
@@ -187,11 +424,11 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy::install_secret_resolver",
     ),
     stable(
-        "proxy.secrets.backends[].auth.service_account_key_file",
+        "proxy.secrets.backends[].auth.service_account_key_file.path",
         "sbproxy::install_secret_resolver",
     ),
     stable(
-        "proxy.secrets.backends[].auth.service_account_key_json",
+        "proxy.secrets.backends[].auth.service_account_key_json.json",
         "sbproxy::install_secret_resolver",
     ),
     stable(
@@ -212,7 +449,17 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          this legacy fallback selector. Classified under WOR-1976.",
     ),
     config_only(
-        "proxy.secrets.hashicorp",
+        "proxy.secrets.hashicorp.addr",
+        "The legacy HashiCorp block is not installed; configure a hashicorp entry under \
+         proxy.secrets.backends. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.secrets.hashicorp.mount",
+        "The legacy HashiCorp block is not installed; configure a hashicorp entry under \
+         proxy.secrets.backends. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.secrets.hashicorp.token",
         "The legacy HashiCorp block is not installed; configure a hashicorp entry under \
          proxy.secrets.backends. Classified under WOR-1976.",
     ),
@@ -222,9 +469,19 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          compatibility and tracked by WOR-1976.",
     ),
     config_only(
-        "proxy.secrets.rotation",
+        "proxy.secrets.rotation.grace_period_secs",
         "The OSS process resolver does not schedule re-resolution or a dual-value grace window \
          from this block. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.secrets.rotation.re_resolve_interval_secs",
+        "The OSS process resolver does not schedule re-resolution or a dual-value grace window \
+         from this block. Classified under WOR-1976.",
+    ),
+    config_only(
+        "proxy.tenants[].credentials[].attrs.budget.reset",
+        "Credential lowering carries token and cost caps but does not install or enforce this \
+         reset window. Reserved under WOR-1976.",
     ),
     stable(
         "proxy.tenants[].credentials[].policies[].type",
@@ -235,11 +492,22 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
     stable(
+        "proxy.tenants[].observability.log.redact.disable",
+        "sbproxy_core::server::lifecycle::install_op_redact_state",
+    ),
+    stable(
+        "proxy.tenants[].observability.log.redact.fields",
+        "sbproxy_core::server::lifecycle::install_op_redact_state",
+    ),
+    stable(
         "proxy.tenants[].observability.log.sinks[].output.type",
         "sbproxy_core::server::lifecycle::compile_one_sink",
     ),
+    stable("source.kind", "sbproxy_config::source::load_with_depth"),
     stable("source.overlays", "sbproxy_config::source::load_with_depth"),
 ];
+
+const CONFIG_KEY_ALIASES: &[(&str, &str)] = &[("origins.*.cors.enabled", "origins.*.cors.enable")];
 
 /// Return the config-only registry entries explicitly present in raw YAML.
 ///
@@ -254,8 +522,16 @@ pub(crate) fn configured_config_only_keys(
         .iter()
         .filter(|entry| entry.support == SupportLevel::ConfigOnly)
         .filter(|entry| {
-            let segments: Vec<&str> = entry.path.split('.').collect();
-            yaml_path_exists(yaml, &segments)
+            std::iter::once(entry.path)
+                .chain(
+                    CONFIG_KEY_ALIASES.iter().filter_map(|(alias, canonical)| {
+                        (*canonical == entry.path).then_some(*alias)
+                    }),
+                )
+                .any(|path| {
+                    let segments: Vec<&str> = path.split('.').collect();
+                    yaml_path_exists(yaml, &segments)
+                })
         })
         .collect()
 }
@@ -342,11 +618,36 @@ origins:
             paths,
             [
                 "origins.*.agent_skills[].max_clock_skew_secs",
-                "proxy.observability.log.sampling",
+                "proxy.observability.log.sampling.info",
             ]
         );
         assert!(!paths.contains(&"origins.*.agent_skills[].type"));
         assert!(!paths.contains(&"proxy.http3"));
+    }
+
+    #[test]
+    fn cors_enable_alias_emits_the_canonical_config_only_warning() {
+        for spelling in ["enable", "enabled"] {
+            let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+                r#"
+origins:
+  api.example:
+    cors:
+      {spelling}: false
+    action: {{ type: static, status_code: 200 }}
+"#
+            ))
+            .expect("fixture parses");
+
+            let configured = configured_config_only_keys(&yaml);
+            let paths: Vec<&str> = configured.iter().map(|key| key.path).collect();
+
+            assert_eq!(
+                paths,
+                ["origins.*.cors.enable"],
+                "raw YAML spelling {spelling} must produce the same warning"
+            );
+        }
     }
 
     #[test]
