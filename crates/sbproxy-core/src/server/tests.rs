@@ -505,7 +505,7 @@ async fn bot_auth_signature_agent_uses_async_directory_path() {
 // dispatches into the boxed `AuthProvider` and translates the
 // returned `AuthDecision` into an `AuthResult`.
 
-use sbproxy_plugin::{AuthDecision, AuthProvider};
+use sbproxy_plugin::{AuthDecision, AuthDenialKind, AuthProvider};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -537,6 +537,40 @@ impl AuthProvider for StubAuthProvider {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let d = self.decision.clone();
         Box::pin(async move { Ok(d) })
+    }
+}
+
+/// Provider that explicitly classifies its header-bearing denial as a
+/// failed offered proof instead of the default protocol challenge.
+struct InvalidProofAuthProvider {
+    decision: AuthDecision,
+}
+
+impl AuthProvider for InvalidProofAuthProvider {
+    fn auth_type(&self) -> &'static str {
+        "stub-invalid-proof"
+    }
+
+    fn authenticate(
+        &self,
+        _req: &http::Request<bytes::Bytes>,
+        _ctx: &mut dyn std::any::Any,
+    ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<AuthDecision>> + Send + '_>> {
+        let decision = self.decision.clone();
+        Box::pin(async move { Ok(decision) })
+    }
+
+    fn denial_kind(&self, decision: &AuthDecision) -> AuthDenialKind {
+        assert!(
+            matches!(
+                decision,
+                AuthDecision::Deny { status, .. }
+                    | AuthDecision::DenyWithHeaders { status, .. }
+                    if *status < 500
+            ),
+            "core must not ask a provider to classify an allow or backend failure"
+        );
+        AuthDenialKind::InvalidProof
     }
 }
 
@@ -659,7 +693,7 @@ async fn plugin_deny_with_headers_propagates_custom_response_headers() {
 }
 
 #[tokio::test]
-async fn plugin_deny_with_headers_is_invalid_proof_independent_of_request_shape() {
+async fn plugin_protocol_challenge_is_neutral_independent_of_request_shape() {
     let cases = [
         ("empty request", http::HeaderMap::new(), None),
         (
@@ -683,7 +717,7 @@ async fn plugin_deny_with_headers_is_invalid_proof_independent_of_request_shape(
             type_name: "stub-deny-headers",
             decision: AuthDecision::DenyWithHeaders {
                 status: 401,
-                message: "invalid token".to_string(),
+                message: "credentials required".to_string(),
                 headers: vec![(
                     "WWW-Authenticate".to_string(),
                     "Bearer realm=\"api\"".to_string(),
@@ -702,7 +736,7 @@ async fn plugin_deny_with_headers_is_invalid_proof_independent_of_request_shape(
                     401,
                     ref message,
                     ref response_headers
-                ) if message == "invalid token"
+                ) if message == "credentials required"
                     && response_headers
                         == &[(
                             "WWW-Authenticate".to_string(),
@@ -717,8 +751,71 @@ async fn plugin_deny_with_headers_is_invalid_proof_independent_of_request_shape(
 
         assert_eq!(
             ctx.trust_tier,
+            sbproxy_modules::auth::TrustTier::Anonymous,
+            "{case}: a protocol challenge is neutral"
+        );
+    }
+}
+
+#[tokio::test]
+async fn plugin_explicit_invalid_proof_is_suspicious_independent_of_request_shape() {
+    let cases = [
+        ("empty request", http::HeaderMap::new(), None),
+        (
+            "query credential",
+            http::HeaderMap::new(),
+            Some("api_key=invalid"),
+        ),
+        (
+            "custom-header credential",
+            {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-api-key", http::HeaderValue::from_static("invalid"));
+                headers
+            },
+            None,
+        ),
+    ];
+
+    for (case, headers, query) in cases {
+        let provider = InvalidProofAuthProvider {
+            decision: AuthDecision::DenyWithHeaders {
+                status: 401,
+                message: "invalid token".to_string(),
+                headers: vec![(
+                    "WWW-Authenticate".to_string(),
+                    "Bearer error=\"invalid_token\"".to_string(),
+                )],
+            },
+        };
+        let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
+
+        let (result, _principal, trust_outcome) =
+            check_auth_with_outcome(&auth, &headers, query, "GET", "/", test_tenant(), None).await;
+        assert!(
+            matches!(
+                result,
+                AuthResult::DenyWithHeaders(
+                    401,
+                    ref message,
+                    ref response_headers
+                ) if message == "invalid token"
+                    && response_headers
+                        == &[(
+                            "WWW-Authenticate".to_string(),
+                            "Bearer error=\"invalid_token\"".to_string(),
+                        )]
+            ),
+            "{case}: trust classification must not change the terminal response"
+        );
+
+        let mut ctx = RequestContext::new();
+        crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+
+        assert_eq!(
+            ctx.trust_tier,
             sbproxy_modules::auth::TrustTier::Suspicious,
-            "{case}: AuthDecision::DenyWithHeaders is explicit invalid proof"
+            "{case}: the provider explicitly classified a failed proof"
         );
     }
 }
@@ -731,8 +828,8 @@ async fn plugin_authenticate_error_denies_with_500() {
     let auth = sbproxy_modules::Auth::Plugin(Box::new(ErrorAuthProvider));
     let headers = http::HeaderMap::new();
 
-    let (result, _principal) =
-        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    let (result, _principal, trust_outcome) =
+        check_auth_with_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
     match result {
         AuthResult::Deny(status, msg) => {
             assert_eq!(status, 500);
@@ -743,6 +840,41 @@ async fn plugin_authenticate_error_denies_with_500() {
         }
         other => panic!("expected Deny(500,...); got {}", auth_result_label(&other)),
     }
+    assert_eq!(trust_outcome, AuthTrustOutcome::BackendFailure);
+
+    let mut ctx = RequestContext::new();
+    crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+    assert_eq!(ctx.trust_tier, sbproxy_modules::auth::TrustTier::Anonymous);
+}
+
+#[tokio::test]
+async fn plugin_header_denial_5xx_is_backend_failure() {
+    let provider = InvalidProofAuthProvider {
+        decision: AuthDecision::DenyWithHeaders {
+            status: 503,
+            message: "identity service unavailable".to_string(),
+            headers: vec![("Retry-After".to_string(), "30".to_string())],
+        },
+    };
+    let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal, trust_outcome) =
+        check_auth_with_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(matches!(
+        result,
+        AuthResult::DenyWithHeaders(
+            503,
+            ref message,
+            ref response_headers
+        ) if message == "identity service unavailable"
+            && response_headers == &[("Retry-After".to_string(), "30".to_string())]
+    ));
+    assert_eq!(trust_outcome, AuthTrustOutcome::BackendFailure);
+
+    let mut ctx = RequestContext::new();
+    crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+    assert_eq!(ctx.trust_tier, sbproxy_modules::auth::TrustTier::Anonymous);
 }
 
 #[tokio::test]

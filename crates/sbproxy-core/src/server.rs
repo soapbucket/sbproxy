@@ -1889,6 +1889,21 @@ impl AuthTrustOutcome {
     }
 }
 
+fn plugin_denial_trust_outcome(
+    provider: &dyn sbproxy_plugin::AuthProvider,
+    decision: &sbproxy_plugin::AuthDecision,
+    status: u16,
+) -> AuthTrustOutcome {
+    if status >= 500 {
+        return AuthTrustOutcome::BackendFailure;
+    }
+
+    match provider.denial_kind(decision) {
+        sbproxy_plugin::AuthDenialKind::Challenge => AuthTrustOutcome::Challenge,
+        sbproxy_plugin::AuthDenialKind::InvalidProof => AuthTrustOutcome::InvalidProof,
+    }
+}
+
 fn api_key_was_offered(
     auth: &sbproxy_modules::auth::ApiKeyAuth,
     headers: &http::HeaderMap,
@@ -2683,52 +2698,51 @@ async fn check_auth_with_tls_outcome(
             // request context lands, swap the placeholder for it.
             let mut ctx: () = ();
             match provider.authenticate(&req, &mut ctx).await {
-                Ok(sbproxy_plugin::AuthDecision::Allow { sub, source }) => {
-                    // WOR-1047 PR2: build a minimal Principal for
-                    // out-of-tree plugins so the access-log + policy
-                    // pipeline sees the same shape every built-in
-                    // provider produces. Plugins that want richer
-                    // attribution will move to the principal-only
-                    // return type in the final PR of the credentials
-                    // epic; until then `attrs` is empty.
-                    let principal = sbproxy_plugin::Principal {
-                        tenant_id: tenant_id.clone(),
-                        sub: sub.clone().unwrap_or_default(),
-                        source: sbproxy_plugin::PrincipalSource::Plugin,
-                        virtual_key: None,
-                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                Ok(decision) => {
+                    let trust_outcome = match &decision {
+                        sbproxy_plugin::AuthDecision::Allow { .. } => AuthTrustOutcome::Allowed,
+                        sbproxy_plugin::AuthDecision::Deny { status, .. }
+                        | sbproxy_plugin::AuthDecision::DenyWithHeaders { status, .. } => {
+                            plugin_denial_trust_outcome(provider.as_ref(), &decision, *status)
+                        }
                     };
-                    (
-                        AuthResult::Allow { sub, source },
-                        Some(principal),
-                        AuthTrustOutcome::Allowed,
-                    )
+
+                    match decision {
+                        sbproxy_plugin::AuthDecision::Allow { sub, source } => {
+                            // WOR-1047 PR2: build a minimal Principal for
+                            // out-of-tree plugins so the access-log + policy
+                            // pipeline sees the same shape every built-in
+                            // provider produces. Plugins that want richer
+                            // attribution will move to the principal-only
+                            // return type in the final PR of the credentials
+                            // epic; until then `attrs` is empty.
+                            let principal = sbproxy_plugin::Principal {
+                                tenant_id: tenant_id.clone(),
+                                sub: sub.clone().unwrap_or_default(),
+                                source: sbproxy_plugin::PrincipalSource::Plugin,
+                                virtual_key: None,
+                                attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                            };
+                            (
+                                AuthResult::Allow { sub, source },
+                                Some(principal),
+                                trust_outcome,
+                            )
+                        }
+                        sbproxy_plugin::AuthDecision::Deny { status, message } => {
+                            (AuthResult::Deny(status, message), None, trust_outcome)
+                        }
+                        sbproxy_plugin::AuthDecision::DenyWithHeaders {
+                            status,
+                            message,
+                            headers,
+                        } => (
+                            AuthResult::DenyWithHeaders(status, message, headers),
+                            None,
+                            trust_outcome,
+                        ),
+                    }
                 }
-                Ok(sbproxy_plugin::AuthDecision::Deny { status, message }) => (
-                    AuthResult::Deny(status, message),
-                    None,
-                    if status >= 500 {
-                        AuthTrustOutcome::BackendFailure
-                    } else {
-                        AuthTrustOutcome::InvalidProof
-                    },
-                ),
-                Ok(sbproxy_plugin::AuthDecision::DenyWithHeaders {
-                    status,
-                    message,
-                    headers,
-                }) => (
-                    AuthResult::DenyWithHeaders(status, message, headers),
-                    None,
-                    if status >= 500 {
-                        AuthTrustOutcome::BackendFailure
-                    } else {
-                        // `DenyWithHeaders` is an explicit denial by contract.
-                        // Request shape cannot reveal whether a plugin examined
-                        // a query parameter, cookie, or custom header.
-                        AuthTrustOutcome::InvalidProof
-                    },
-                ),
                 Err(err) => {
                     tracing::warn!(
                         plugin = %provider.auth_type(),
