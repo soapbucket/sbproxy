@@ -659,49 +659,68 @@ async fn plugin_deny_with_headers_propagates_custom_response_headers() {
 }
 
 #[tokio::test]
-async fn plugin_authentication_challenge_finalizes_as_anonymous() {
-    let provider = StubAuthProvider {
-        type_name: "stub-challenge",
-        decision: AuthDecision::DenyWithHeaders {
-            status: 401,
-            message: "missing token".to_string(),
-            headers: vec![(
-                "WWW-Authenticate".to_string(),
-                "Bearer realm=\"api\"".to_string(),
-            )],
-        },
-        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-    };
-    let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
-    let headers = http::HeaderMap::new();
-
-    let (result, _principal, trust_outcome) =
-        check_auth_with_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
-    assert!(
-        matches!(
-            result,
-            AuthResult::DenyWithHeaders(
-                401,
-                ref message,
-                ref response_headers
-            ) if message == "missing token"
-                && response_headers
-                    == &[(
-                        "WWW-Authenticate".to_string(),
-                        "Bearer realm=\"api\"".to_string(),
-                    )]
+async fn plugin_deny_with_headers_is_invalid_proof_independent_of_request_shape() {
+    let cases = [
+        ("empty request", http::HeaderMap::new(), None),
+        (
+            "query credential",
+            http::HeaderMap::new(),
+            Some("api_key=invalid"),
         ),
-        "the typed trust outcome must not change the terminal challenge response"
-    );
+        (
+            "custom-header credential",
+            {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-api-key", http::HeaderValue::from_static("invalid"));
+                headers
+            },
+            None,
+        ),
+    ];
 
-    let mut ctx = RequestContext::new();
-    crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+    for (case, headers, query) in cases {
+        let provider = StubAuthProvider {
+            type_name: "stub-deny-headers",
+            decision: AuthDecision::DenyWithHeaders {
+                status: 401,
+                message: "invalid token".to_string(),
+                headers: vec![(
+                    "WWW-Authenticate".to_string(),
+                    "Bearer realm=\"api\"".to_string(),
+                )],
+            },
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
 
-    assert_eq!(
-        ctx.trust_tier,
-        sbproxy_modules::auth::TrustTier::Anonymous,
-        "an authentication challenge is absence of proof, not a failed proof"
-    );
+        let (result, _principal, trust_outcome) =
+            check_auth_with_outcome(&auth, &headers, query, "GET", "/", test_tenant(), None).await;
+        assert!(
+            matches!(
+                result,
+                AuthResult::DenyWithHeaders(
+                    401,
+                    ref message,
+                    ref response_headers
+                ) if message == "invalid token"
+                    && response_headers
+                        == &[(
+                            "WWW-Authenticate".to_string(),
+                            "Bearer realm=\"api\"".to_string(),
+                        )]
+            ),
+            "{case}: trust classification must not change the terminal response"
+        );
+
+        let mut ctx = RequestContext::new();
+        crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+
+        assert_eq!(
+            ctx.trust_tier,
+            sbproxy_modules::auth::TrustTier::Suspicious,
+            "{case}: AuthDecision::DenyWithHeaders is explicit invalid proof"
+        );
+    }
 }
 
 #[tokio::test]
