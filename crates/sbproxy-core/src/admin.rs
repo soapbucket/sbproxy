@@ -1209,7 +1209,10 @@ fn handle_config_write(
             )
         }
     };
-    if let Err(e) = crate::pipeline::CompiledPipeline::from_config(compiled) {
+    // Construct for validation only: this pipeline is dropped immediately,
+    // and the runtime constructor would spawn health-check probes that
+    // outlive it and keep hitting the operator's upstreams.
+    if let Err(e) = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled) {
         return (
             400,
             "application/json",

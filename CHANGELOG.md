@@ -59,6 +59,20 @@ the next version cut.
 
 ### Fixed
 
+- **Saving config from the admin console no longer leaks health probes.**
+  Validating a config meant building the whole pipeline to see whether
+  every module would construct, and that construction spawned the active
+  health-check probes for any load-balancer target configured with
+  `health_check`. The pipeline was then thrown away, but the probes were
+  not: each one held the discarded pipeline alive and kept issuing real
+  requests at the upstream on its own timer, forever. Every save in the
+  admin console's config editor started another full set. An operator
+  iterating on a config could leave a target being probed by a dozen
+  generations of dead pipelines at once. Validation now constructs
+  without starting anything that outlives the check, and the admin write
+  path asks for a validation pipeline rather than a live one. The
+  `validate` and `plan` subcommands were never affected, because they
+  run outside an async runtime where the spawn was already a no-op.
 - **Memcached cache keys are hashed.** Memcached rejects a key longer
   than 250 bytes outright, and a response-cache key carries the
   hostname, path, query, and Vary fingerprint, so any reasonably long
