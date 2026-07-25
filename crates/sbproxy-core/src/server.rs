@@ -1445,6 +1445,35 @@ async fn send_response(
     Ok(())
 }
 
+/// Replay one complete idempotency-cache hit with the same framing cleanup
+/// used by the early request-filter path.
+async fn send_idempotency_cache_hit(
+    session: &mut Session,
+    cached: sbproxy_middleware::idempotency::CachedResponse,
+) -> Result<u16> {
+    let status = cached.status;
+    let filtered_headers: Vec<(String, String)> = cached
+        .headers
+        .into_iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            lower != "content-length" && lower != "transfer-encoding" && lower != "connection"
+        })
+        .collect();
+    let mut header = pingora_http::ResponseHeader::build(status, Some(filtered_headers.len() + 1))?;
+    for (name, value) in filtered_headers {
+        let _ = header.insert_header(name, value);
+    }
+    let _ = header.insert_header("x-sbproxy-idempotency", "HIT");
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::from(cached.body)), true)
+        .await?;
+    Ok(status)
+}
+
 /// Build a `{"error": "<message>"}` JSON body with the message
 /// correctly escaped (WOR-1738).
 ///

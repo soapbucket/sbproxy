@@ -21,13 +21,12 @@ fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Op
     }
 }
 
-/// Make the GraphQL-validated POST body authoritative at the final
-/// request-body boundary.
+/// Make the GraphQL-validated POST body authoritative at the request-body
+/// boundary.
 ///
-/// Body-aware policies and idempotency deliberately inspect/hash the inbound
-/// bytes, so both paths return before the generic request-body replacement
-/// below. Hold all inbound chunks and emit the exact validated outbound bytes
-/// once at end-of-stream, regardless of which body-aware path ran.
+/// Hold every discarded inbound chunk and replace the end-of-stream chunk
+/// before any downstream body policy, idempotency state, accounting, or
+/// upstream emission can observe it.
 fn emit_graphql_validated_request_body(
     body: &mut Option<Bytes>,
     end_of_stream: bool,
@@ -44,6 +43,108 @@ fn emit_graphql_validated_request_body(
     } else {
         *body = None;
     }
+}
+
+/// Complete a deferred body-bound authentication proof against the bytes the
+/// client actually sent.
+///
+/// GraphQL request modifiers may replace those bytes before body policies and
+/// idempotency run. A signature over `content-digest` still authenticates the
+/// inbound representation, so finish that proof before a late cache hit can
+/// short-circuit and mark the deferred check as consumed.
+fn verify_graphql_inbound_body_binding(
+    headers: &http::HeaderMap,
+    inbound_body: &[u8],
+    ctx: &mut RequestContext,
+) -> bool {
+    if !ctx.bot_auth_digest_check_required {
+        return true;
+    }
+
+    let verified = headers
+        .get("content-digest")
+        .or_else(|| headers.get("repr-digest"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            sbproxy_middleware::digest::verify_content_digest(value, inbound_body)
+        });
+    if verified {
+        ctx.content_digest_verified = true;
+        ctx.bot_auth_digest_check_required = false;
+    }
+    verified
+}
+
+/// Engage idempotency only after GraphQL validation has established the final
+/// authoritative request body.
+///
+/// The ordinary path probes in `request_filter` so cache hits avoid policies
+/// and upstream selection. Validated GraphQL requests cannot safely do that:
+/// request modifiers do not produce the final method, headers, and body until
+/// `upstream_request_filter`. This late path preserves the cached response
+/// payload and conflict semantics while ensuring an older entry never bypasses
+/// the current validation rules.
+fn engage_validated_graphql_idempotency(
+    request_headers: &http::HeaderMap,
+    method: &http::Method,
+    authoritative_body: &[u8],
+    ctx: &mut RequestContext,
+) -> bool {
+    let pipeline = ctx.pipeline.clone();
+    let Some(origin_idx) = ctx.origin_idx else {
+        return false;
+    };
+    let Some(idem) = pipeline
+        .idempotencies
+        .get(origin_idx)
+        .and_then(|entry| entry.as_ref())
+        .cloned()
+    else {
+        return false;
+    };
+    if !idem.methods.contains(method) {
+        return false;
+    }
+    let Some(key) = request_headers
+        .get(idem.header_name.as_str())
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    if authoritative_body.len() > idem.max_request_body_bytes {
+        ctx.idempotency_skip_reason = Some("SKIPPED-OVERSIZE-REQUEST");
+        return false;
+    }
+    let Ok(permit) = idem.permits.clone().try_acquire_owned() else {
+        ctx.idempotency_skip_reason = Some("SKIPPED-POOL-FULL");
+        return false;
+    };
+    let workspace = pipeline.config.origins[origin_idx].workspace_id.to_string();
+    ctx.idempotency_workspace = Some(workspace.clone());
+    ctx.idempotency_permit = Some(permit);
+
+    let body_hash = sbproxy_middleware::idempotency::hash_body(authoritative_body);
+    if let Some(cached) = idem.cache.get(&workspace, &key) {
+        ctx.idempotency_permit = None;
+        if cached.request_body_hash == body_hash {
+            ctx.idempotency_deferred_hit = Some(cached);
+        } else {
+            let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
+            ctx.validator_failed = Some((
+                status.as_u16(),
+                String::from_utf8_lossy(&body).into_owned(),
+                content_type.to_string(),
+            ));
+        }
+        return true;
+    }
+
+    ctx.idempotency_miss = Some((key, body_hash));
+    ctx.idempotency_response_body_buf = Some(bytes::BytesMut::with_capacity(8192));
+    false
 }
 
 /// Stable admin-console label for the generic load balancer's closed
@@ -1395,6 +1496,42 @@ impl ProxyHttp for SbProxy {
                 ));
             }
             ctx.graphql_validated_request_body = validated_request_body;
+
+            // A body-bound inbound signature authenticates the bytes the
+            // client sent, before a request modifier replaces them. Complete
+            // that proof before an idempotency hit can short-circuit.
+            let inbound_body = ctx.graphql_request_body.clone().unwrap_or_default();
+            if !verify_graphql_inbound_body_binding(
+                &session.req_header().headers,
+                &inbound_body,
+                ctx,
+            ) {
+                let body = serde_json::json!({
+                    "error": "bot_auth: content-digest body mismatch",
+                })
+                .to_string();
+                ctx.validator_failed = Some((401, body, "application/json".to_string()));
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(401),
+                    "bot_auth: content-digest body binding failed",
+                ));
+            }
+
+            let authoritative_body = ctx
+                .graphql_validated_request_body
+                .clone()
+                .unwrap_or_default();
+            if engage_validated_graphql_idempotency(
+                &session.req_header().headers,
+                &upstream_request.method,
+                &authoritative_body,
+                ctx,
+            ) {
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::InternalError,
+                    "validated GraphQL idempotency response",
+                ));
+            }
         }
 
         Ok(())
@@ -2574,6 +2711,12 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // For validated GraphQL POSTs, replace the inbound replay stream
+        // before every downstream consumer. This is deliberately first:
+        // request limits, body policies, idempotency, and byte accounting must
+        // all agree with the exact bytes that can reach upstream.
+        emit_graphql_validated_request_body(body, end_of_stream, ctx);
+
         // Track total request body bytes for the access log /
         // billing / ML pipeline. Always-on; the size-limit policy
         // below tracks its own counter so the cap is enforced
@@ -4093,6 +4236,16 @@ impl ProxyHttp for SbProxy {
         // The body filter intentionally aborted the upstream after a
         // validation failure. Surface the configured status / body
         // here rather than the generic 502.
+        if let Some(cached) = ctx.idempotency_deferred_hit.take() {
+            let status = cached.status;
+            let _ = send_idempotency_cache_hit(session, cached).await;
+            ctx.response_status = Some(status);
+            return FailToProxy {
+                error_code: status,
+                can_reuse_downstream: false,
+            };
+        }
+
         if let Some((status, body, content_type)) = ctx.validator_failed.take() {
             // GraphQL validation runs in `upstream_request_filter`, after
             // Pingora selected an upstream. Pingora cannot reuse an HTTP/1

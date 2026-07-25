@@ -323,6 +323,10 @@ pub struct RequestContext {
     /// so operators can spot pool pressure or oversize bodies. None
     /// when the middleware engaged normally (hit / miss / conflict).
     pub idempotency_skip_reason: Option<&'static str>,
+    /// Cached response selected only after a validated GraphQL request has
+    /// produced its final authoritative body. `fail_to_proxy` replays it with
+    /// the normal idempotency headers after the upstream request phase aborts.
+    pub idempotency_deferred_hit: Option<sbproxy_middleware::idempotency::CachedResponse>,
 
     // --- Request body size limit (streaming) ---
     /// Streaming-time max body size cap from `RequestLimitPolicy`.
@@ -1181,6 +1185,7 @@ impl RequestContext {
             idempotency_response_headers: None,
             idempotency_permit: None,
             idempotency_skip_reason: None,
+            idempotency_deferred_hit: None,
             body_size_limit: None,
             body_bytes_seen: 0,
             request_body_bytes: 0,

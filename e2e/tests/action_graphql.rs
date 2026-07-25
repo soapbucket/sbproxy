@@ -5,8 +5,12 @@
 //! canned `{ "data": { "hello": "world" } }` response and verify
 //! the client sees the same payload after the proxy round-trip.
 
+use base64::Engine as _;
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
+use std::net::{TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn get_with_body(
     proxy: &ProxyHarness,
@@ -25,6 +29,120 @@ fn get_with_body(
         .send()?
         .status()
         .as_u16())
+}
+
+fn pick_loopback_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral loopback port")
+        .local_addr()
+        .expect("read ephemeral loopback port")
+        .port()
+}
+
+struct RedisGuard {
+    child: Child,
+    port: u16,
+}
+
+impl RedisGuard {
+    fn spawn() -> Option<Self> {
+        let port = pick_loopback_port();
+        let child = match Command::new("redis-server")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("spawn redis-server: {error}"),
+        };
+        let guard = Self { child, port };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return Some(guard);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("redis-server did not accept connections on port {port}");
+    }
+
+    fn url(&self) -> String {
+        format!("redis://127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for RedisGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn post_admin_reload(admin_port: u16) -> (u16, String) {
+    let credentials = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build admin client")
+        .post(format!("http://127.0.0.1:{admin_port}/admin/reload"))
+        .header("authorization", format!("Basic {credentials}"))
+        .send()
+        .expect("reload proxy");
+    (
+        response.status().as_u16(),
+        response.text().unwrap_or_default(),
+    )
+}
+
+fn graphql_reload_config(
+    admin_port: u16,
+    redis_url: &str,
+    upstream_url: &str,
+    strict: bool,
+) -> String {
+    let validation = if strict {
+        r#"
+      validate_queries: true
+      allow_introspection: false
+      max_depth: 1"#
+    } else {
+        ""
+    };
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  admin:
+    enabled: true
+    port: {admin_port}
+    username: admin
+    password: secret
+  l2_cache:
+    driver: redis
+    params:
+      dsn: "{redis_url}"
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{upstream_url}/graphql"{validation}
+    idempotency:
+      enabled: true
+      header_name: Idempotency-Key
+      ttl_secs: 60
+      methods: [POST]
+      backend: redis
+"#
+    )
 }
 
 #[test]
@@ -153,13 +271,10 @@ origins:
 #[test]
 fn graphql_request_validator_forwards_the_exact_validated_replacement_body() {
     let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
-    let forbidden_original = br#"{"query":"{__schema{id}}"}"#.to_vec();
-    let safe_replacement = br#"{"query":"{safeName{id}}"}"#.to_vec();
-    assert_eq!(
-        forbidden_original.len(),
-        safe_replacement.len(),
-        "the regression must not depend on content-length changing"
-    );
+    let forbidden_original = br#"{"query":"{__schema{id}}","source":"original"}"#.to_vec();
+    let safe_replacement =
+        serde_json::to_vec(&json!({"query": "{safeName{id}}", "source": "replacement"}))
+            .expect("serialize replacement");
 
     let yaml = format!(
         r#"
@@ -175,6 +290,7 @@ origins:
       - body:
           replace_json:
             query: "{{safeName{{id}}}}"
+            source: replacement
     policies:
       - type: request_validator
         content_types:
@@ -183,9 +299,13 @@ origins:
           type: object
           required:
             - query
+            - source
           properties:
             query:
               type: string
+            source:
+              type: string
+              enum: [replacement]
           additionalProperties: false
 "#,
         upstream.base_url()
@@ -212,15 +332,73 @@ origins:
 }
 
 #[test]
-fn graphql_idempotency_miss_forwards_the_exact_validated_replacement_body() {
+fn graphql_request_validator_rejects_invalid_replacement_even_when_original_is_valid() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{}/graphql"
+      validate_queries: true
+    request_modifiers:
+      - body:
+          replace_json:
+            query: "{{safeName{{id}}}}"
+            source: replacement
+    policies:
+      - type: request_validator
+        status: 422
+        content_types:
+          - application/json
+        schema:
+          type: object
+          required:
+            - query
+            - source
+          properties:
+            query:
+              type: string
+            source:
+              type: string
+              enum: [original]
+          additionalProperties: false
+"#,
+        upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let response = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "application/json",
+            br#"{"query":"{safeName{id}}","source":"original"}"#.to_vec(),
+            &[],
+        )
+        .expect("send body whose replacement violates the schema");
+
+    assert_eq!(response.status, 422);
+    let captured = upstream.captured();
+    assert!(
+        captured.len() <= 1,
+        "body rejection must not retry the upstream request"
+    );
+    assert!(
+        captured.iter().all(|request| request.body.is_empty()),
+        "a replacement rejected by the body policy must emit no upstream body bytes"
+    );
+}
+
+#[test]
+fn graphql_idempotency_keys_and_hashes_use_validated_replacement_body() {
     let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
     let forbidden_original = br#"{"query":"{__schema{id}}"}"#.to_vec();
+    let different_original = br#"{"query":"{malformed(}"}"#.to_vec();
     let safe_replacement = br#"{"query":"{safeName{id}}"}"#.to_vec();
-    assert_eq!(
-        forbidden_original.len(),
-        safe_replacement.len(),
-        "the regression must not depend on content-length changing"
-    );
 
     let yaml = format!(
         r#"
@@ -247,7 +425,7 @@ origins:
     );
     let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
 
-    let response = proxy
+    let first = proxy
         .post_bytes(
             "/graphql",
             "gql.localhost",
@@ -257,13 +435,51 @@ origins:
         )
         .expect("send idempotency cache miss");
 
-    assert_eq!(response.status, 200);
-    let captured = upstream.captured();
-    assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0].body, safe_replacement,
-        "an idempotency miss must forward the GraphQL-validated replacement"
+    assert_eq!(first.status, 200);
+    assert!(
+        !first.headers.contains_key("x-sbproxy-idempotency"),
+        "the first request must populate, not replay, the cache"
     );
+
+    let replay = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "application/json",
+            different_original.clone(),
+            &[("Idempotency-Key", "graphql-replacement-miss")],
+        )
+        .expect("replay with different discarded bytes");
+    assert_eq!(replay.status, 200);
+    assert_eq!(
+        replay
+            .headers
+            .get("x-sbproxy-idempotency")
+            .map(String::as_str),
+        Some("HIT"),
+        "equal authoritative replacements must share one body hash"
+    );
+
+    let distinct_key = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "application/json",
+            different_original,
+            &[("Idempotency-Key", "graphql-replacement-distinct-key")],
+        )
+        .expect("send the same replacement under a distinct key");
+    assert_eq!(distinct_key.status, 200);
+    assert!(
+        !distinct_key.headers.contains_key("x-sbproxy-idempotency"),
+        "a distinct key must remain a cache miss even for equal replacement bytes"
+    );
+
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 2, "only the two distinct keys may execute");
+    assert!(captured
+        .iter()
+        .all(|request| request.body == safe_replacement));
 }
 
 #[test]
@@ -716,5 +932,74 @@ origins:
         upstream.captured().len(),
         1,
         "default GraphQL configuration must not parse or reject the request"
+    );
+}
+
+#[test]
+fn graphql_revalidates_persisted_idempotency_hits_after_rules_tighten() {
+    let Some(redis) = RedisGuard::spawn() else {
+        eprintln!(
+            "SKIP action_graphql::graphql_revalidates_persisted_idempotency_hits_after_rules_tighten: redis-server not found on PATH"
+        );
+        return;
+    };
+    let admin_port = pick_loopback_port();
+    let upstream = MockUpstream::start(json!({"data": {"cached": true}})).expect("upstream");
+    let permissive = graphql_reload_config(admin_port, &redis.url(), &upstream.base_url(), false);
+    let proxy = ProxyHarness::start_with_yaml(&permissive).expect("start permissive proxy");
+    ProxyHarness::wait_for_port(admin_port, Duration::from_secs(5))
+        .expect("admin listener to bind");
+
+    let cached_requests = [
+        (
+            "cached-introspection",
+            json!({"query": "{ __schema { queryType { name } } }"}),
+        ),
+        (
+            "cached-depth",
+            json!({"query": "{ viewer { profile { id } } }"}),
+        ),
+        ("cached-malformed", json!({"query": "{ viewer( }"})),
+    ];
+    for (key, body) in &cached_requests {
+        let response = proxy
+            .post_json(
+                "/graphql",
+                "gql.localhost",
+                body,
+                &[("Idempotency-Key", key)],
+            )
+            .expect("prime permissive idempotency cache");
+        assert_eq!(response.status, 200);
+    }
+    assert_eq!(upstream.captured().len(), cached_requests.len());
+
+    let strict = graphql_reload_config(admin_port, &redis.url(), &upstream.base_url(), true);
+    proxy.rewrite_config(&strict).expect("write strict config");
+    let (reload_status, reload_body) = post_admin_reload(admin_port);
+    assert_eq!(reload_status, 200, "reload failed: {reload_body}");
+
+    for (key, body) in &cached_requests {
+        let response = proxy
+            .post_json(
+                "/graphql",
+                "gql.localhost",
+                body,
+                &[("Idempotency-Key", key)],
+            )
+            .expect("retry cached body under strict validation");
+        assert_eq!(
+            response.status, 400,
+            "current GraphQL rules must reject cached request {key}"
+        );
+        assert!(
+            !response.headers.contains_key("x-sbproxy-idempotency"),
+            "a rejected request must not replay the permissive cached response"
+        );
+    }
+    assert_eq!(
+        upstream.captured().len(),
+        cached_requests.len(),
+        "strict retries must neither replay a cached 200 nor reach upstream"
     );
 }

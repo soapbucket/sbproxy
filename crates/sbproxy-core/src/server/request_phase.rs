@@ -1063,6 +1063,10 @@ pub(super) async fn request_filter(
     // GraphQL validation and byte-for-byte upstream forwarding.
     if request_requires_graphql_replay(session, &pipeline, origin_idx) {
         session.as_mut().enable_retry_buffering();
+        // Mark this before the idempotency pre-check. A cached response from
+        // an older, more permissive configuration must not return before the
+        // current GraphQL action validates the final modified request.
+        ctx.graphql_validation_pending = true;
     }
 
     // WOR-1053: stamp the matched origin's tenant on the request
@@ -2445,6 +2449,7 @@ pub(super) async fn request_filter(
         .idempotencies
         .get(origin_idx)
         .and_then(|o| o.as_ref())
+        .filter(|_| !ctx.graphql_validation_pending)
     {
         let method_matches = idem.methods.contains(&session.req_header().method);
         let header_present = session
@@ -2579,38 +2584,12 @@ pub(super) async fn request_filter(
 
                             let body_hash = sbproxy_middleware::idempotency::hash_body(&buf);
                             if body_hash == cached_resp.request_body_hash {
-                                // Cache hit: replay the cached
-                                // response. Strip framing headers
-                                // so Pingora rederives them on
-                                // the client connection.
-                                let filtered_headers: Vec<(String, String)> = cached_resp
-                                    .headers
-                                    .into_iter()
-                                    .filter(|(name, _)| {
-                                        let lower = name.to_ascii_lowercase();
-                                        lower != "content-length"
-                                            && lower != "transfer-encoding"
-                                            && lower != "connection"
-                                    })
-                                    .collect();
-                                let mut header = pingora_http::ResponseHeader::build(
-                                    cached_resp.status,
-                                    Some(filtered_headers.len() + 1),
-                                )?;
-                                for (name, value) in filtered_headers {
-                                    let _ = header.insert_header(name, value);
-                                }
-                                let _ = header.insert_header("x-sbproxy-idempotency", "HIT");
-                                session
-                                    .write_response_header(Box::new(header), false)
-                                    .await?;
-                                session
-                                    .write_response_body(
-                                        Some(bytes::Bytes::from(cached_resp.body)),
-                                        true,
-                                    )
-                                    .await?;
-                                ctx.response_status = Some(cached_resp.status);
+                                // Cache hit: replay the cached response. The
+                                // shared helper also serves GraphQL hits that
+                                // must wait until final-request validation.
+                                let status =
+                                    send_idempotency_cache_hit(session, cached_resp).await?;
+                                ctx.response_status = Some(status);
                                 return Ok(true);
                             } else {
                                 // Body conflict: same key,
