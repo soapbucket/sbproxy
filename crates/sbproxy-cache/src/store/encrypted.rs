@@ -579,6 +579,11 @@ mod tests {
             headers: vec![
                 ("content-type".into(), "application/json".into()),
                 ("set-cookie".into(), "session=super-secret-value".into()),
+                ("etag".into(), r#"W/"encrypted-v1""#.into()),
+                (
+                    "last-modified".into(),
+                    "Sun, 06 Nov 1994 08:49:37 GMT".into(),
+                ),
             ],
             body: br#"{"account":"acct_1234","balance":9000}"#.to_vec(),
             cached_at: now_secs(),
@@ -612,6 +617,8 @@ mod tests {
         assert_eq!(got.body, original.body);
         assert_eq!(got.cached_at, original.cached_at);
         assert_eq!(got.ttl_secs, original.ttl_secs);
+        assert_eq!(got.etag(), Some(r#"W/"encrypted-v1""#));
+        assert_eq!(got.last_modified(), Some("Sun, 06 Nov 1994 08:49:37 GMT"));
     }
 
     #[test]
@@ -628,6 +635,8 @@ mod tests {
             b"acct_1234".as_slice(),
             b"super-secret-value".as_slice(),
             b"set-cookie".as_slice(),
+            b"encrypted-v1".as_slice(),
+            b"last-modified".as_slice(),
         ] {
             assert!(
                 !haystack.windows(needle.len()).any(|w| w == needle),

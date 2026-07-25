@@ -8421,6 +8421,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "hex",
+ "httpdate",
  "parking_lot",
  "rand 0.8.6",
  "redis",

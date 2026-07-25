@@ -31,6 +31,25 @@ origins:
     )
 }
 
+fn wait_for_cache_hit(proxy: &ProxyHarness, path: &str) -> sbproxy_e2e::Response {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let response = proxy.get(path, "cache.localhost").expect("cache poll");
+        if response
+            .headers
+            .get("x-sbproxy-cache")
+            .is_some_and(|value| value == "HIT")
+        {
+            return response;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cache did not warm within two seconds; last response: {response:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn first_request_is_miss_second_is_hit() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
@@ -155,6 +174,229 @@ fn non_cacheable_status_is_not_cached() {
         upstream.captured().len(),
         2,
         "untouched paths must not be served from cache"
+    );
+}
+
+#[test]
+fn matching_client_etag_returns_an_empty_304_from_the_hot_cache() {
+    let last_modified = "Sun, 06 Nov 1994 08:49:37 GMT";
+    let upstream = MockUpstream::start_with_response_headers(
+        json!({"version": 1}),
+        vec![
+            ("ETag".to_string(), r#"W/"version-1""#.to_string()),
+            ("Last-Modified".to_string(), last_modified.to_string()),
+            (
+                "Cache-Control".to_string(),
+                "public, max-age=60".to_string(),
+            ),
+            ("Content-Location".to_string(), "/conditional".to_string()),
+            ("Vary".to_string(), "Accept-Encoding".to_string()),
+            ("X-Origin-Metadata".to_string(), "not-for-304".to_string()),
+        ],
+    )
+    .expect("upstream");
+    let proxy =
+        ProxyHarness::start_with_yaml(&config_yaml(&upstream.base_url())).expect("start proxy");
+
+    let prime = proxy
+        .get("/conditional", "cache.localhost")
+        .expect("prime cache");
+    assert_eq!(prime.status, 200);
+    let warm = wait_for_cache_hit(&proxy, "/conditional");
+    assert_eq!(warm.body, br#"{"version":1}"#);
+    let upstream_count = upstream.captured().len();
+
+    let not_modified = proxy
+        .get_with_headers(
+            "/conditional",
+            "cache.localhost",
+            &[("if-none-match", r#""other", "version-1""#)],
+        )
+        .expect("conditional cache hit");
+
+    assert_eq!(not_modified.status, 304);
+    assert!(
+        not_modified.body.is_empty(),
+        "304 must not contain representation data"
+    );
+    assert_eq!(
+        not_modified.headers.get("etag").map(String::as_str),
+        Some(r#"W/"version-1""#)
+    );
+    assert_eq!(
+        not_modified
+            .headers
+            .get("last-modified")
+            .map(String::as_str),
+        Some(last_modified)
+    );
+    assert_eq!(
+        not_modified
+            .headers
+            .get("cache-control")
+            .map(String::as_str),
+        Some("public, max-age=60")
+    );
+    assert_eq!(
+        not_modified
+            .headers
+            .get("content-location")
+            .map(String::as_str),
+        Some("/conditional")
+    );
+    assert_eq!(
+        not_modified.headers.get("vary").map(String::as_str),
+        Some("Accept-Encoding")
+    );
+    assert_eq!(
+        not_modified
+            .headers
+            .get("x-sbproxy-cache")
+            .map(String::as_str),
+        Some("HIT")
+    );
+    assert!(!not_modified.headers.contains_key("content-type"));
+    assert!(!not_modified.headers.contains_key("x-origin-metadata"));
+    assert_eq!(
+        upstream.captured().len(),
+        upstream_count,
+        "client validation must be answered from the hot cache"
+    );
+}
+
+#[test]
+fn nonmatching_client_etag_returns_the_full_cached_200() {
+    let upstream = MockUpstream::start_with_response_headers(
+        json!({"version": 1}),
+        vec![("ETag".to_string(), r#""version-1""#.to_string())],
+    )
+    .expect("upstream");
+    let proxy =
+        ProxyHarness::start_with_yaml(&config_yaml(&upstream.base_url())).expect("start proxy");
+
+    let _ = proxy
+        .get("/conditional-miss", "cache.localhost")
+        .expect("prime cache");
+    let _ = wait_for_cache_hit(&proxy, "/conditional-miss");
+    let upstream_count = upstream.captured().len();
+
+    let response = proxy
+        .get_with_headers(
+            "/conditional-miss",
+            "cache.localhost",
+            &[("if-none-match", r#""version-2""#)],
+        )
+        .expect("conditional cache hit");
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, br#"{"version":1}"#);
+    assert_eq!(
+        response.headers.get("x-sbproxy-cache").map(String::as_str),
+        Some("HIT")
+    );
+    assert_eq!(upstream.captured().len(), upstream_count);
+}
+
+#[test]
+fn reserve_hit_preserves_validators_for_conditional_replay_and_hot_promotion() {
+    let upstream = MockUpstream::start_with_response_headers(
+        json!({"version": 1}),
+        vec![
+            ("ETag".to_string(), r#""reserve-v1""#.to_string()),
+            (
+                "Last-Modified".to_string(),
+                "Sun, 06 Nov 1994 08:49:37 GMT".to_string(),
+            ),
+        ],
+    )
+    .expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  cache_reserve:
+    enabled: true
+    backend:
+      type: memory
+    sample_rate: 1.0
+    min_ttl: 0
+    max_size_bytes: 1048576
+origins:
+  "cache.localhost":
+    action:
+      type: proxy
+      url: "{upstream}"
+    response_cache:
+      enabled: true
+      ttl: 7200
+      max_size: 1
+      cacheable_methods: [GET]
+      cacheable_status: [200]
+"#,
+        upstream = upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let _ = proxy
+        .get("/reserve-a", "cache.localhost")
+        .expect("prime reserve-a");
+    let _ = wait_for_cache_hit(&proxy, "/reserve-a");
+    let _ = proxy
+        .get("/reserve-b", "cache.localhost")
+        .expect("prime reserve-b and evict reserve-a");
+    let _ = wait_for_cache_hit(&proxy, "/reserve-b");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let upstream_count = upstream.captured().len();
+
+    let from_reserve = proxy
+        .get_with_headers(
+            "/reserve-a",
+            "cache.localhost",
+            &[("if-none-match", r#"W/"reserve-v1""#)],
+        )
+        .expect("conditional reserve hit");
+
+    assert_eq!(from_reserve.status, 304);
+    assert!(from_reserve.body.is_empty());
+    assert_eq!(
+        from_reserve.headers.get("etag").map(String::as_str),
+        Some(r#""reserve-v1""#)
+    );
+    assert_eq!(
+        from_reserve
+            .headers
+            .get("last-modified")
+            .map(String::as_str),
+        Some("Sun, 06 Nov 1994 08:49:37 GMT")
+    );
+    assert_eq!(
+        from_reserve
+            .headers
+            .get("x-sbproxy-cache")
+            .map(String::as_str),
+        Some("HIT-RESERVE")
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        upstream_count,
+        "reserve validation must not call the origin"
+    );
+
+    let promoted = proxy
+        .get_with_headers(
+            "/reserve-a",
+            "cache.localhost",
+            &[("if-none-match", r#""reserve-v1""#)],
+        )
+        .expect("conditional promoted hot hit");
+    assert_eq!(promoted.status, 304);
+    assert_eq!(
+        promoted.headers.get("x-sbproxy-cache").map(String::as_str),
+        Some("HIT")
+    );
+    assert_eq!(
+        promoted.headers.get("etag").map(String::as_str),
+        Some(r#""reserve-v1""#)
     );
 }
 
@@ -390,7 +632,7 @@ origins:
 "#,
         upstream = upstream.base_url()
     );
-    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    let proxy = ProxyHarness::start_with_workspace(&yaml, &[]).expect("start proxy");
 
     // Observe the SWR contract: an in-window request serves STALE and
     // triggers a background refresh. We assert the contract through a
@@ -456,6 +698,102 @@ origins:
         "stale serve must trigger a background revalidation (count {} -> {})",
         count_before_stale,
         upstream.captured().len()
+    );
+}
+
+#[test]
+fn stale_revalidation_sends_validators_and_a_304_refreshes_the_cached_body_ttl() {
+    let etag = r#""swr-version-1""#;
+    let last_modified = "Sun, 06 Nov 1994 08:49:37 GMT";
+    let upstream = MockUpstream::start_conditional(
+        json!({"version": 1}),
+        etag.to_string(),
+        last_modified.to_string(),
+    )
+    .expect("upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cache.localhost":
+    action:
+      type: proxy
+      url: "{upstream}"
+    response_cache:
+      enabled: true
+      ttl: 1
+      stale_while_revalidate: 60
+      cacheable_methods: [GET]
+      cacheable_status: [200]
+"#,
+        upstream = upstream.base_url()
+    );
+    let proxy = ProxyHarness::start_with_workspace(&yaml, &[]).expect("start proxy");
+
+    let prime = proxy
+        .get("/revalidate", "cache.localhost")
+        .expect("prime cache");
+    assert_eq!(prime.status, 200);
+    assert_eq!(prime.body, br#"{"version":1}"#);
+    let _ = wait_for_cache_hit(&proxy, "/revalidate");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let stale = proxy
+        .get("/revalidate", "cache.localhost")
+        .expect("serve stale and revalidate");
+    assert_eq!(stale.status, 200);
+    assert_eq!(stale.body, br#"{"version":1}"#);
+    assert_eq!(
+        stale.headers.get("x-sbproxy-cache").map(String::as_str),
+        Some("STALE"),
+        "expected stale replay, got headers={:?}, upstream_requests={:?}, proxy_stderr={}",
+        stale.headers,
+        upstream.captured(),
+        proxy.stderr_contents()
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while upstream.captured().len() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 2, "one conditional refresh expected");
+    assert_eq!(
+        captured[1].headers.get("if-none-match").map(String::as_str),
+        Some(etag)
+    );
+    assert_eq!(
+        captured[1]
+            .headers
+            .get("if-modified-since")
+            .map(String::as_str),
+        Some(last_modified)
+    );
+
+    let refreshed = wait_for_cache_hit(&proxy, "/revalidate");
+    assert_eq!(refreshed.status, 200);
+    assert_eq!(
+        refreshed.body, br#"{"version":1}"#,
+        "304 revalidation must retain the stored representation body"
+    );
+    assert_eq!(
+        refreshed.headers.get("etag").map(String::as_str),
+        Some(etag)
+    );
+    assert_eq!(
+        refreshed.headers.get("content-length").map(String::as_str),
+        Some("13"),
+        "304 metadata must not replace the stored representation length"
+    );
+    assert!(
+        !refreshed.headers.contains_key("x-refresh-hop"),
+        "connection-nominated validation fields must not be stored"
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        2,
+        "freshened entry must not fetch a replacement body"
     );
 }
 

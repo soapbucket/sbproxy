@@ -13,8 +13,9 @@ pub use reserve::{
     ReserveMetadata, ReserveStats,
 };
 pub use response::{
-    canonicalize_query, compute_cache_key, is_cacheable_method, is_mutation_method,
-    path_invalidation_prefix, vary_fingerprint, QueryMode, ResponseCacheConfig,
+    canonicalize_query, compute_cache_key, evaluate_cached_preconditions, headers_for_not_modified,
+    is_cacheable_method, is_mutation_method, path_invalidation_prefix, vary_fingerprint,
+    CachedPrecondition, QueryMode, ResponseCacheConfig,
 };
 pub use store::{
     CacheKeyMaterial, CacheStore, CachedResponse, EncryptedCacheStore, FileCacheConfig,

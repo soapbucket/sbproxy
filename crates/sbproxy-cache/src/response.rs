@@ -214,6 +214,195 @@ pub fn is_mutation_method(method: &str) -> bool {
     )
 }
 
+/// Result of evaluating request validators against a stored `200 OK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachedPrecondition {
+    /// Return the stored status, headers, and representation data.
+    ServeRepresentation,
+    /// Return `304 Not Modified` without representation data.
+    NotModified,
+    /// Return `412 Precondition Failed` without performing an unsafe method.
+    PreconditionFailed,
+}
+
+/// Evaluate cache-applicable request preconditions against stored headers.
+///
+/// `If-None-Match` uses weak entity-tag comparison and takes precedence
+/// whenever at least one field value is present. `If-Modified-Since` is
+/// evaluated only for `GET` and `HEAD`, only when `If-None-Match` is absent,
+/// and only when the stored response has a valid `Last-Modified` value.
+///
+/// A cache evaluates these fields only for a stored `200 OK`. Other stored
+/// statuses are replayed unchanged so a cached redirect or error cannot be
+/// hidden behind a synthetic `304`.
+pub fn evaluate_cached_preconditions(
+    method: &str,
+    cached_status: u16,
+    cached_headers: &[(String, String)],
+    if_none_match: &[&[u8]],
+    if_modified_since: Option<&[u8]>,
+) -> CachedPrecondition {
+    if cached_status != 200 {
+        return CachedPrecondition::ServeRepresentation;
+    }
+
+    if !if_none_match.is_empty() {
+        let current_etag = header_value(cached_headers, "etag");
+        if if_none_match_matches(if_none_match, current_etag) {
+            return if method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD") {
+                CachedPrecondition::NotModified
+            } else {
+                CachedPrecondition::PreconditionFailed
+            };
+        }
+        return CachedPrecondition::ServeRepresentation;
+    }
+
+    if !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) {
+        return CachedPrecondition::ServeRepresentation;
+    }
+    let Some(if_modified_since) = if_modified_since else {
+        return CachedPrecondition::ServeRepresentation;
+    };
+    let Some(last_modified) = header_value(cached_headers, "last-modified") else {
+        return CachedPrecondition::ServeRepresentation;
+    };
+    let Some(if_modified_since) = parse_http_date(if_modified_since) else {
+        return CachedPrecondition::ServeRepresentation;
+    };
+    let Some(last_modified) = parse_http_date(last_modified.as_bytes()) else {
+        return CachedPrecondition::ServeRepresentation;
+    };
+    if last_modified <= if_modified_since {
+        CachedPrecondition::NotModified
+    } else {
+        CachedPrecondition::ServeRepresentation
+    }
+}
+
+/// Select stored metadata that is relevant to a `304 Not Modified` response.
+///
+/// Representation fields such as `Content-Type` and `Content-Length` are
+/// omitted. `Last-Modified` is retained because it can guide a cache update
+/// when an entity tag is unavailable.
+pub fn headers_for_not_modified(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "cache-control"
+                    | "content-location"
+                    | "date"
+                    | "etag"
+                    | "expires"
+                    | "last-modified"
+                    | "vary"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn parse_http_date(value: &[u8]) -> Option<std::time::SystemTime> {
+    let value = std::str::from_utf8(value).ok()?;
+    httpdate::parse_http_date(value).ok()
+}
+
+fn if_none_match_matches(values: &[&[u8]], current_etag: Option<&str>) -> bool {
+    if values.len() == 1 && trim_ows(values[0]) == b"*" {
+        return true;
+    }
+    let Some(current_etag) = current_etag.and_then(parse_single_entity_tag) else {
+        return false;
+    };
+    values
+        .iter()
+        .any(|value| entity_tag_list_matches(value, current_etag))
+}
+
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn parse_single_entity_tag(value: &str) -> Option<&[u8]> {
+    let bytes = trim_ows(value.as_bytes());
+    let (opaque, next) = parse_entity_tag(bytes, 0)?;
+    (next == bytes.len()).then_some(opaque)
+}
+
+fn parse_entity_tag(value: &[u8], mut cursor: usize) -> Option<(&[u8], usize)> {
+    if value.get(cursor..cursor.saturating_add(2)) == Some(b"W/") {
+        cursor += 2;
+    }
+    if value.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    cursor += 1;
+    let opaque_start = cursor;
+    while let Some(&byte) = value.get(cursor) {
+        if byte == b'"' {
+            return Some((&value[opaque_start..cursor], cursor + 1));
+        }
+        if !(byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80) {
+            return None;
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn entity_tag_list_matches(value: &[u8], current_opaque: &[u8]) -> bool {
+    let mut cursor = 0usize;
+    let mut matched = false;
+    loop {
+        while value
+            .get(cursor)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b','))
+        {
+            cursor += 1;
+        }
+        if cursor == value.len() {
+            return matched;
+        }
+        let Some((candidate, next)) = parse_entity_tag(value, cursor) else {
+            return false;
+        };
+        matched |= candidate == current_opaque;
+        cursor = next;
+        while value
+            .get(cursor)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            cursor += 1;
+        }
+        match value.get(cursor) {
+            Some(b',') => cursor += 1,
+            None => return matched,
+            Some(_) => return false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +607,192 @@ mod tests {
         assert!(is_cacheable_method("POST", &methods));
         assert!(is_cacheable_method("post", &methods));
         assert!(!is_cacheable_method("PUT", &methods));
+    }
+
+    // --- cached conditional requests ---
+
+    fn validator_headers(etag: Option<&str>, last_modified: Option<&str>) -> Vec<(String, String)> {
+        let mut headers = vec![
+            (
+                "cache-control".to_string(),
+                "public, max-age=60".to_string(),
+            ),
+            ("content-location".to_string(), "/objects/42".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "date".to_string(),
+                "Sun, 06 Nov 1994 08:49:37 GMT".to_string(),
+            ),
+            (
+                "expires".to_string(),
+                "Sun, 06 Nov 1994 08:50:37 GMT".to_string(),
+            ),
+            ("vary".to_string(), "accept-encoding".to_string()),
+            ("content-length".to_string(), "12".to_string()),
+        ];
+        if let Some(etag) = etag {
+            headers.push(("etag".to_string(), etag.to_string()));
+        }
+        if let Some(last_modified) = last_modified {
+            headers.push(("last-modified".to_string(), last_modified.to_string()));
+        }
+        headers
+    }
+
+    #[test]
+    fn if_none_match_uses_weak_comparison_across_a_list() {
+        let headers = validator_headers(Some(r#"W/"opaque,tag""#), None);
+
+        assert_eq!(
+            evaluate_cached_preconditions(
+                "GET",
+                200,
+                &headers,
+                &[br#""other", "opaque,tag""#],
+                None,
+            ),
+            CachedPrecondition::NotModified
+        );
+    }
+
+    #[test]
+    fn if_none_match_wildcard_matches_a_cached_representation_without_an_etag() {
+        let headers = validator_headers(None, None);
+
+        assert_eq!(
+            evaluate_cached_preconditions("HEAD", 200, &headers, &[b"*"], None),
+            CachedPrecondition::NotModified
+        );
+    }
+
+    #[test]
+    fn nonmatching_if_none_match_returns_the_full_cached_response() {
+        let headers = validator_headers(Some(r#""current""#), None);
+
+        assert_eq!(
+            evaluate_cached_preconditions(
+                "GET",
+                200,
+                &headers,
+                &[br#""previous", W/"other""#],
+                None,
+            ),
+            CachedPrecondition::ServeRepresentation
+        );
+    }
+
+    #[test]
+    fn if_none_match_presence_suppresses_if_modified_since_fallback() {
+        let modified = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let headers = validator_headers(Some(r#""current""#), Some(modified));
+
+        assert_eq!(
+            evaluate_cached_preconditions(
+                "GET",
+                200,
+                &headers,
+                &[br#""different""#],
+                Some(modified.as_bytes()),
+            ),
+            CachedPrecondition::ServeRepresentation
+        );
+    }
+
+    #[test]
+    fn if_modified_since_falls_back_when_etag_condition_is_absent() {
+        let headers = validator_headers(None, Some("Sun, 06 Nov 1994 08:49:37 GMT"));
+
+        assert_eq!(
+            evaluate_cached_preconditions(
+                "GET",
+                200,
+                &headers,
+                &[],
+                Some(b"Sun, 06 Nov 1994 08:50:00 GMT"),
+            ),
+            CachedPrecondition::NotModified
+        );
+        assert_eq!(
+            evaluate_cached_preconditions(
+                "GET",
+                200,
+                &headers,
+                &[],
+                Some(b"Sun, 06 Nov 1994 08:00:00 GMT"),
+            ),
+            CachedPrecondition::ServeRepresentation
+        );
+    }
+
+    #[test]
+    fn malformed_or_inapplicable_dates_do_not_hide_the_representation() {
+        let headers = validator_headers(None, Some("Sun, 06 Nov 1994 08:49:37 GMT"));
+
+        assert_eq!(
+            evaluate_cached_preconditions("GET", 200, &headers, &[], Some(b"not-a-date")),
+            CachedPrecondition::ServeRepresentation
+        );
+        assert_eq!(
+            evaluate_cached_preconditions(
+                "POST",
+                200,
+                &headers,
+                &[],
+                Some(b"Sun, 06 Nov 1994 08:50:00 GMT"),
+            ),
+            CachedPrecondition::ServeRepresentation
+        );
+    }
+
+    #[test]
+    fn matching_if_none_match_on_an_unsafe_method_is_a_precondition_failure() {
+        let headers = validator_headers(Some(r#""current""#), None);
+
+        assert_eq!(
+            evaluate_cached_preconditions("POST", 200, &headers, &[br#"W/"current""#], None,),
+            CachedPrecondition::PreconditionFailed
+        );
+    }
+
+    #[test]
+    fn cache_only_evaluates_preconditions_for_a_stored_ok_response() {
+        let headers = validator_headers(Some(r#""missing""#), None);
+
+        assert_eq!(
+            evaluate_cached_preconditions("GET", 404, &headers, &[b"*"], None),
+            CachedPrecondition::ServeRepresentation
+        );
+    }
+
+    #[test]
+    fn not_modified_headers_keep_cache_metadata_and_drop_representation_fields() {
+        let headers =
+            validator_headers(Some(r#""current""#), Some("Sun, 06 Nov 1994 08:49:37 GMT"));
+
+        assert_eq!(
+            headers_for_not_modified(&headers),
+            vec![
+                (
+                    "cache-control".to_string(),
+                    "public, max-age=60".to_string()
+                ),
+                ("content-location".to_string(), "/objects/42".to_string()),
+                (
+                    "date".to_string(),
+                    "Sun, 06 Nov 1994 08:49:37 GMT".to_string()
+                ),
+                (
+                    "expires".to_string(),
+                    "Sun, 06 Nov 1994 08:50:37 GMT".to_string()
+                ),
+                ("vary".to_string(), "accept-encoding".to_string()),
+                ("etag".to_string(), r#""current""#.to_string()),
+                (
+                    "last-modified".to_string(),
+                    "Sun, 06 Nov 1994 08:49:37 GMT".to_string(),
+                ),
+            ]
+        );
     }
 
     // --- is_mutation_method ---

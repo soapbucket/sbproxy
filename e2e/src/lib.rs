@@ -914,6 +914,57 @@ impl MockUpstream {
         Self::start_sequence_full(encoded, "application/json".to_string())
     }
 
+    /// Start an upstream that returns a validator-bearing `200` initially
+    /// and an empty `304` when a later request sends the matching
+    /// `If-None-Match` value.
+    pub fn start_conditional(
+        reply_json: serde_json::Value,
+        etag: String,
+        last_modified: String,
+    ) -> anyhow::Result<Self> {
+        let reply_bytes = serde_json::to_vec(&reply_json)?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(false)?;
+        let port = listener.local_addr()?.port();
+        let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(Mutex::new(false));
+
+        let cap_clone = captured.clone();
+        let shut_clone = shutdown.clone();
+        let etag = Arc::new(etag);
+        let last_modified = Arc::new(last_modified);
+        let body = Arc::new(reply_bytes);
+        let join = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(false)
+                .expect("listener nonblocking config");
+            for incoming in listener.incoming() {
+                if *shut_clone.lock().unwrap() {
+                    break;
+                }
+                let stream = match incoming {
+                    Ok(stream) => stream,
+                    Err(_) => continue,
+                };
+                let captured = cap_clone.clone();
+                let etag = etag.clone();
+                let last_modified = last_modified.clone();
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let _ =
+                        handle_mock_conditional_conn(stream, captured, body, etag, last_modified);
+                });
+            }
+        });
+
+        Ok(Self {
+            port,
+            captured,
+            shutdown,
+            join: Some(join),
+        })
+    }
+
     /// WOR-1133: start a mock upstream that replies with a raw byte
     /// body and an explicit `Content-Type` (200). Useful for testing
     /// binary content-types (e.g. `image/png`) that the compression
@@ -1241,6 +1292,104 @@ fn handle_mock_conn(
     resp.push_str("Connection: close\r\n\r\n");
     stream.write_all(resp.as_bytes())?;
     stream.write_all(&reply_body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn handle_mock_conditional_conn(
+    mut stream: TcpStream,
+    captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    reply_body: Arc<Vec<u8>>,
+    etag: Arc<String>,
+    last_modified: Arc<String>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 4096];
+    let header_end;
+    loop {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_header_end(&buf) {
+            header_end = pos;
+            break;
+        }
+        if buf.len() > 1 << 20 {
+            return Ok(());
+        }
+    }
+
+    let head = match std::str::from_utf8(&buf[..header_end]) {
+        Ok(head) => head,
+        Err(_) => return Ok(()),
+    };
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    let mut headers = std::collections::HashMap::new();
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                content_length = value.parse().unwrap_or(0);
+            }
+            headers.insert(name, value);
+        }
+    }
+
+    let body_start = header_end + 4;
+    let mut request_body = if buf.len() > body_start {
+        buf[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
+    while request_body.len() < content_length {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break;
+        }
+        request_body.extend_from_slice(&tmp[..n]);
+    }
+    request_body.truncate(content_length);
+
+    let not_modified = headers
+        .get("if-none-match")
+        .is_some_and(|candidate| candidate == etag.as_str());
+    captured.lock().unwrap().push(CapturedRequest {
+        method,
+        path,
+        headers,
+        body: request_body,
+    });
+
+    if not_modified {
+        let response = format!(
+            "HTTP/1.1 304 Not Modified\r\nETag: {}\r\nLast-Modified: {}\r\n\
+             Cache-Control: public, max-age=60\r\nContent-Length: 999\r\n\
+             X-Refresh-Hop: never-store\r\nX-Sbproxy-Cache: upstream-poison\r\n\
+             Connection: close, X-Refresh-Hop\r\n\r\n",
+            etag, last_modified
+        );
+        stream.write_all(response.as_bytes())?;
+    } else {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: {}\r\n\
+             Last-Modified: {}\r\nCache-Control: public, max-age=60\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            etag,
+            last_modified,
+            reply_body.len()
+        );
+        stream.write_all(response.as_bytes())?;
+        stream.write_all(&reply_body)?;
+    }
     stream.flush()?;
     Ok(())
 }

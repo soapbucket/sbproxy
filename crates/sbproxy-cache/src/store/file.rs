@@ -239,7 +239,14 @@ mod tests {
     fn make_entry(ttl_secs: u64) -> CachedResponse {
         CachedResponse {
             status: 200,
-            headers: vec![("content-type".into(), "text/plain".into())],
+            headers: vec![
+                ("content-type".into(), "text/plain".into()),
+                ("etag".into(), r#""file-v1""#.into()),
+                (
+                    "last-modified".into(),
+                    "Sun, 06 Nov 1994 08:49:37 GMT".into(),
+                ),
+            ],
             body: b"hello from file cache".to_vec(),
             cached_at: now_secs(),
             ttl_secs,
@@ -265,6 +272,8 @@ mod tests {
         let got = store.get("key1").unwrap().expect("should hit");
         assert_eq!(got.status, 200);
         assert_eq!(got.body, b"hello from file cache");
+        assert_eq!(got.etag(), Some(r#""file-v1""#));
+        assert_eq!(got.last_modified(), Some("Sun, 06 Nov 1994 08:49:37 GMT"));
     }
 
     #[test]

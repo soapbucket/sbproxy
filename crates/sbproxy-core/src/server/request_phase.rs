@@ -3097,9 +3097,38 @@ pub(super) async fn request_filter(
                             // window replays so operators can tell
                             // them apart in logs and dashboards.
                             let cache_marker = if fresh { "HIT" } else { "STALE" };
-                            let mut header = pingora_http::ResponseHeader::build(
+                            let request_header = session.req_header();
+                            let if_none_match: Vec<&[u8]> = request_header
+                                .headers
+                                .get_all("if-none-match")
+                                .iter()
+                                .map(|value| value.as_bytes())
+                                .collect();
+                            let if_modified_since = request_header
+                                .headers
+                                .get("if-modified-since")
+                                .map(|value| value.as_bytes());
+                            let precondition = sbproxy_cache::evaluate_cached_preconditions(
+                                req_method.as_str(),
                                 entry.status,
-                                Some(entry.headers.len() + 1),
+                                &entry.headers,
+                                &if_none_match,
+                                if_modified_since,
+                            );
+                            let (response_status, response_headers) = match precondition {
+                                sbproxy_cache::CachedPrecondition::ServeRepresentation => {
+                                    (entry.status, entry.headers.clone())
+                                }
+                                sbproxy_cache::CachedPrecondition::NotModified => {
+                                    (304, sbproxy_cache::headers_for_not_modified(&entry.headers))
+                                }
+                                sbproxy_cache::CachedPrecondition::PreconditionFailed => {
+                                    (412, Vec::new())
+                                }
+                            };
+                            let mut header = pingora_http::ResponseHeader::build(
+                                response_status,
+                                Some(response_headers.len() + 1),
                             )
                             .map_err(|e| {
                                 Error::because(
@@ -3108,20 +3137,29 @@ pub(super) async fn request_filter(
                                     e,
                                 )
                             })?;
-                            for (name, value) in &entry.headers {
+                            for (name, value) in &response_headers {
                                 let _ = header.insert_header(name.clone(), value.clone());
                             }
                             let _ = header.insert_header("x-sbproxy-cache", cache_marker);
 
+                            let send_body = matches!(
+                                precondition,
+                                sbproxy_cache::CachedPrecondition::ServeRepresentation
+                            ) && !req_method.eq_ignore_ascii_case("HEAD")
+                                && response_status != 204
+                                && response_status != 304
+                                && !(100..200).contains(&response_status);
                             session
-                                .write_response_header(Box::new(header), false)
+                                .write_response_header(Box::new(header), !send_body)
                                 .await?;
-                            session
-                                .write_response_body(
-                                    Some(bytes::Bytes::copy_from_slice(&entry.body)),
-                                    true,
-                                )
-                                .await?;
+                            if send_body {
+                                session
+                                    .write_response_body(
+                                        Some(bytes::Bytes::copy_from_slice(&entry.body)),
+                                        true,
+                                    )
+                                    .await?;
+                            }
                             ctx.served_from_cache = true;
                             ctx.record_admin_cache_status(crate::context::AdminCacheStatus::Hit);
                             sbproxy_observe::metrics::record_cache(
@@ -3150,6 +3188,7 @@ pub(super) async fn request_filter(
                                 spawn_swr_revalidation(
                                     cache_store.clone(),
                                     key.clone(),
+                                    entry,
                                     new_ttl,
                                     origin.action_config.clone(),
                                     ctx.hostname.to_string(),
@@ -3218,27 +3257,74 @@ pub(super) async fn request_filter(
                                         let promote_body = body.clone();
                                         let promote_meta = metadata.clone();
                                         let _ = tokio::task::spawn_blocking(move || {
-                                            let cached = sbproxy_cache::CachedResponse {
-                                                status: promote_meta.status,
-                                                headers: vec![],
-                                                body: promote_body.to_vec(),
-                                                cached_at: std::time::SystemTime::now()
+                                            let cached = promote_meta.to_cached_response(
+                                                promote_body,
+                                                std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
                                                     .unwrap_or_default()
                                                     .as_secs(),
-                                                ttl_secs: promote_meta
+                                                promote_meta
                                                     .expires_at
                                                     .duration_since(std::time::SystemTime::now())
-                                                    .map(|d| d.as_secs())
+                                                    .map(|duration| duration.as_secs())
                                                     .unwrap_or(60),
-                                            };
+                                            );
                                             let _ = promote_store.put(&promote_key, &cached);
                                         })
                                         .await;
                                         // Serve.
+                                        let request_header = session.req_header();
+                                        let if_none_match: Vec<&[u8]> = request_header
+                                            .headers
+                                            .get_all("if-none-match")
+                                            .iter()
+                                            .map(|value| value.as_bytes())
+                                            .collect();
+                                        let if_modified_since = request_header
+                                            .headers
+                                            .get("if-modified-since")
+                                            .map(|value| value.as_bytes());
+                                        let precondition =
+                                            sbproxy_cache::evaluate_cached_preconditions(
+                                                req_method.as_str(),
+                                                metadata.status,
+                                                &metadata.headers,
+                                                &if_none_match,
+                                                if_modified_since,
+                                            );
+                                        let (response_status, mut response_headers) =
+                                            match precondition {
+                                                sbproxy_cache::CachedPrecondition::ServeRepresentation => {
+                                                    (metadata.status, metadata.headers.clone())
+                                                }
+                                                sbproxy_cache::CachedPrecondition::NotModified => (
+                                                    304,
+                                                    sbproxy_cache::headers_for_not_modified(
+                                                        &metadata.headers,
+                                                    ),
+                                                ),
+                                                sbproxy_cache::CachedPrecondition::PreconditionFailed => {
+                                                    (412, Vec::new())
+                                                }
+                                            };
+                                        if matches!(
+                                            precondition,
+                                            sbproxy_cache::CachedPrecondition::ServeRepresentation
+                                        ) && !response_headers.iter().any(|(name, _)| {
+                                            name.eq_ignore_ascii_case("content-type")
+                                        }) {
+                                            if let Some(content_type) =
+                                                metadata.content_type.as_ref()
+                                            {
+                                                response_headers.push((
+                                                    "content-type".to_string(),
+                                                    content_type.clone(),
+                                                ));
+                                            }
+                                        }
                                         let mut header = pingora_http::ResponseHeader::build(
-                                            metadata.status,
-                                            Some(2),
+                                            response_status,
+                                            Some(response_headers.len() + 1),
                                         )
                                         .map_err(|e| {
                                             Error::because(
@@ -3247,15 +3333,26 @@ pub(super) async fn request_filter(
                                                 e,
                                             )
                                         })?;
-                                        if let Some(ct) = metadata.content_type.as_ref() {
-                                            let _ = header.insert_header("content-type", ct);
+                                        for (name, value) in &response_headers {
+                                            let _ =
+                                                header.insert_header(name.clone(), value.clone());
                                         }
                                         let _ =
                                             header.insert_header("x-sbproxy-cache", "HIT-RESERVE");
+                                        let send_body = matches!(
+                                            precondition,
+                                            sbproxy_cache::CachedPrecondition::ServeRepresentation
+                                        ) && !req_method
+                                            .eq_ignore_ascii_case("HEAD")
+                                            && response_status != 204
+                                            && response_status != 304
+                                            && !(100..200).contains(&response_status);
                                         session
-                                            .write_response_header(Box::new(header), false)
+                                            .write_response_header(Box::new(header), !send_body)
                                             .await?;
-                                        session.write_response_body(Some(body), true).await?;
+                                        if send_body {
+                                            session.write_response_body(Some(body), true).await?;
+                                        }
                                         ctx.served_from_cache = true;
                                         ctx.record_admin_cache_status(
                                             crate::context::AdminCacheStatus::Hit,

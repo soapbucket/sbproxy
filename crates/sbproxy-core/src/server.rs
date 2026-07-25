@@ -939,10 +939,10 @@ fn swr_client() -> Option<&'static reqwest::Client> {
 
 /// Spawn an async refresh of `cache_key` against the origin's upstream.
 ///
-/// The SWR window has just elapsed for an entry; serve the stale value
-/// to the client (caller already did this) and dispatch a background
-/// fetch that re-populates the cache when the refresh succeeds. The
-/// task is registered with [`CACHE_REVALIDATE_TASKS`] so graceful
+/// The entry is stale but still inside its SWR window. The caller has
+/// already served it to the client; this dispatches a background
+/// validation and refreshes the stored TTL on a `304 Not Modified`.
+/// The task is registered with [`CACHE_REVALIDATE_TASKS`] so graceful
 /// shutdown drains it.
 ///
 /// Failures are logged at WARN and never propagate to the client.
@@ -954,6 +954,7 @@ fn swr_client() -> Option<&'static reqwest::Client> {
 fn spawn_swr_revalidation(
     cache_store: std::sync::Arc<dyn sbproxy_cache::CacheStore>,
     cache_key: String,
+    stale_entry: sbproxy_cache::CachedResponse,
     ttl_secs: u64,
     action_config: serde_json::Value,
     hostname: String,
@@ -990,7 +991,20 @@ fn spawn_swr_revalidation(
             // serving the cached entry.
             return;
         };
-        let resp = match client.get(&full_url).header("host", &hostname).send().await {
+        let mut request = client.get(&full_url).header("host", &hostname);
+        if let Some(etag) = stale_entry
+            .etag()
+            .and_then(|value| reqwest::header::HeaderValue::from_str(value).ok())
+        {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = stale_entry
+            .last_modified()
+            .and_then(|value| reqwest::header::HeaderValue::from_str(value).ok())
+        {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+        }
+        let resp = match request.send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -1002,6 +1016,56 @@ fn spawn_swr_revalidation(
             }
         };
         let status = resp.status().as_u16();
+        // Capture headers before consuming a successful response body.
+        // `freshen_from_not_modified` applies the stricter 304 merge
+        // rules, including preserving the stored Content-Length.
+        let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers().len());
+        for (name, value) in resp.headers() {
+            let n = name.as_str().to_ascii_lowercase();
+            if let Ok(v) = value.to_str() {
+                headers.push((n, v.to_string()));
+            }
+        }
+        let refreshed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if status == 304 {
+            let refreshed = stale_entry.freshen_from_not_modified(&headers, refreshed_at, ttl_secs);
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = cache_store.put(&cache_key, &refreshed) {
+                    tracing::warn!(error = %e, "swr: 304 write-back to cache failed");
+                }
+            })
+            .await;
+            return;
+        }
+
+        let connection_fields: Vec<String> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+            .flat_map(|(_, value)| value.split(','))
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect();
+        headers.retain(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "connection"
+                    | "transfer-encoding"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "x-sbproxy-cache"
+            ) && !connection_fields
+                .iter()
+                .any(|connection_name| connection_name.eq_ignore_ascii_case(name))
+        });
+
         // Apply the same cacheable_status gate the live path uses.
         // An empty list is treated as "200 only" to match the
         // response_filter default.
@@ -1018,43 +1082,47 @@ fn spawn_swr_revalidation(
             );
             return;
         }
-        // Capture headers before consuming the body. Skip hop-by-hop
-        // headers that the cache must not store.
-        let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers().len());
-        for (name, value) in resp.headers() {
-            let n = name.as_str().to_ascii_lowercase();
-            if matches!(
-                n.as_str(),
-                "connection"
-                    | "transfer-encoding"
-                    | "keep-alive"
-                    | "proxy-authenticate"
-                    | "proxy-authorization"
-                    | "te"
-                    | "trailer"
-                    | "upgrade"
-            ) {
-                continue;
-            }
-            if let Ok(v) = value.to_str() {
-                headers.push((n, v.to_string()));
-            }
+
+        // A revalidation response is buffered before write-back. Cap it
+        // so an origin cannot make the background path consume unbounded
+        // memory. Oversized refreshes leave the stale entry untouched.
+        const MAX_SWR_CACHE_BODY_BYTES: usize = 64 * 1024 * 1024;
+        if resp
+            .content_length()
+            .is_some_and(|length| length > MAX_SWR_CACHE_BODY_BYTES as u64)
+        {
+            tracing::warn!(
+                url = %full_url,
+                cap = MAX_SWR_CACHE_BODY_BYTES,
+                "swr: refresh Content-Length exceeds cache body cap"
+            );
+            return;
         }
-        let body = match resp.bytes().await {
-            Ok(b) => b.to_vec(),
-            Err(e) => {
-                tracing::warn!(error = %e, "swr: failed to read refresh body");
+        let mut body = Vec::new();
+        let mut body_stream = resp.bytes_stream();
+        while let Some(chunk) = body_stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    tracing::warn!(error = %e, "swr: failed to read refresh body");
+                    return;
+                }
+            };
+            if body.len().saturating_add(chunk.len()) > MAX_SWR_CACHE_BODY_BYTES {
+                tracing::warn!(
+                    url = %full_url,
+                    cap = MAX_SWR_CACHE_BODY_BYTES,
+                    "swr: refresh body exceeds cache body cap"
+                );
                 return;
             }
-        };
+            body.extend_from_slice(&chunk);
+        }
         let entry = sbproxy_cache::CachedResponse {
             status,
             headers,
             body,
-            cached_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            cached_at: refreshed_at,
             ttl_secs,
         };
         // Write-back goes through spawn_blocking for the same reason
@@ -1106,21 +1174,7 @@ fn maybe_admit_to_reserve(
     let body = bytes::Bytes::from(entry.body.clone());
     let now = std::time::SystemTime::now();
     let expires_at = now + std::time::Duration::from_secs(entry.ttl_secs);
-    // Pull content-type from the cached headers if present so the
-    // reserve can serve it without re-walking the header list.
-    let content_type = entry
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.clone());
-    let metadata = sbproxy_cache::ReserveMetadata {
-        created_at: now,
-        expires_at,
-        content_type,
-        vary_fingerprint: None,
-        size: entry.body.len() as u64,
-        status: entry.status,
-    };
+    let metadata = sbproxy_cache::ReserveMetadata::from_cached_response(entry, now, expires_at);
 
     tokio::spawn(async move {
         match reserve.put(&key, body, metadata).await {

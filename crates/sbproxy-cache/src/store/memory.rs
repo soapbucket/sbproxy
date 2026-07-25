@@ -120,7 +120,14 @@ mod tests {
     fn make_entry(ttl_secs: u64) -> CachedResponse {
         CachedResponse {
             status: 200,
-            headers: vec![("content-type".into(), "text/plain".into())],
+            headers: vec![
+                ("content-type".into(), "text/plain".into()),
+                ("etag".into(), r#""memory-v1""#.into()),
+                (
+                    "last-modified".into(),
+                    "Sun, 06 Nov 1994 08:49:37 GMT".into(),
+                ),
+            ],
             body: b"hello".to_vec(),
             cached_at: now_secs(),
             ttl_secs,
@@ -140,6 +147,8 @@ mod tests {
         let got = store.get("k1").unwrap().unwrap();
         assert_eq!(got.status, 200);
         assert_eq!(got.body, b"hello");
+        assert_eq!(got.etag(), Some(r#""memory-v1""#));
+        assert_eq!(got.last_modified(), Some("Sun, 06 Nov 1994 08:49:37 GMT"));
 
         // Delete.
         store.delete("k1").unwrap();
