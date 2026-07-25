@@ -2717,15 +2717,25 @@ async fn check_auth_with_tls_outcome(
                     status,
                     message,
                     headers,
-                }) => (
-                    AuthResult::DenyWithHeaders(status, message, headers),
-                    None,
-                    if status >= 500 {
+                }) => {
+                    let trust_outcome = if status >= 500 {
                         AuthTrustOutcome::BackendFailure
+                    } else if status == 401
+                        && !req.headers().contains_key(http::header::AUTHORIZATION)
+                        && headers
+                            .iter()
+                            .any(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+                    {
+                        AuthTrustOutcome::Challenge
                     } else {
                         AuthTrustOutcome::InvalidProof
-                    },
-                ),
+                    };
+                    (
+                        AuthResult::DenyWithHeaders(status, message, headers),
+                        None,
+                        trust_outcome,
+                    )
+                }
                 Err(err) => {
                     tracing::warn!(
                         plugin = %provider.auth_type(),

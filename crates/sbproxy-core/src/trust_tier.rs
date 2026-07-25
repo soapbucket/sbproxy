@@ -53,10 +53,7 @@ fn derive_with_bot_auth(
         );
 
     #[cfg(feature = "agent-class")]
-    let identity_deny = matches!(
-        ctx.kya_verdict,
-        Some("expired" | "revoked" | "invalid" | "directory_unavailable")
-    );
+    let identity_deny = matches!(ctx.kya_verdict, Some("expired" | "revoked" | "invalid"));
     #[cfg(not(feature = "agent-class"))]
     let identity_deny = false;
 
@@ -432,6 +429,19 @@ mod tests {
         assert_eq!(
             derive(&ctx, false),
             sbproxy_modules::auth::TrustTier::Anonymous
+        );
+    }
+
+    #[cfg(feature = "agent-class")]
+    #[test]
+    fn kya_directory_unavailable_is_not_caller_suspicion() {
+        let mut ctx = RequestContext::new();
+        ctx.kya_verdict = Some("directory_unavailable");
+
+        assert_eq!(
+            derive(&ctx, false),
+            sbproxy_modules::auth::TrustTier::Anonymous,
+            "a verifier-directory outage carries no adversarial caller evidence"
         );
     }
 }
