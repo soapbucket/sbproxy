@@ -146,7 +146,7 @@ Merge is a pure function from `(base_yaml, base_origin, remote_yaml, mode)` to `
 | Situation | Behaviour |
 | --- | --- |
 | Authority unreachable | Keep serving the last verified bundle. Alert. `sbproxy_config_bundle_age_seconds` climbs. |
-| Signature, schema, or compile failure | Reject the candidate. Previous config keeps serving. Counter plus alert. Never partially applied. |
+| Signature, schema, or compile failure | Reject the candidate. Previous config keeps serving. Counter plus alert. Never partially applied, which today is not true and is why CA-00 exists. |
 | Denied path in bundle | Same as above, with the offending paths named in the log. |
 | Cold boot, no cache, mode `overlay` | Boot on the local file with a loud warning, unless `require_bundle_on_boot` is set. |
 | Cold boot, no cache, mode `replace` | Refuse to start. There is nothing to serve. |
@@ -163,7 +163,93 @@ Build this on `ClusterHandle::publish_state`. Delete `config_broadcast.rs` and t
 
 ### Applying
 
-The subscriber produces merged YAML and calls `reload_from_config_yaml`, taking `CONFIG_RELOAD_LOCK` like every other reload path. Atomicity, subsystem reconciliation, and the `ArcSwap` publish all already work and are already tested by `empty_startup_reload_is_atomic_and_collects_every_origin`. The subscriber contributes a source of bytes and nothing else.
+The subscriber produces merged YAML and calls `reload_from_config_yaml`, taking `CONFIG_RELOAD_LOCK` like every other reload path. The subscriber contributes a source of bytes and nothing else.
+
+I originally wrote that atomicity and subsystem reconciliation already work here. They do not, and the correction is the most important thing in this document. See the next section.
+
+## Hard edges found in the code audit
+
+I read the reload, drift, validation, and admin paths line by line before committing to this plan. Most of what I found is pre-existing and survivable when a human drives reloads one box at a time. None of it is survivable when a control plane drives them automatically across a fleet. The difference is blast radius and the absence of a person watching the log.
+
+### The reload transaction is not atomic
+
+`reload_from_config_yaml` has four hard-error points (`compile_config`, `reconcile_process_cluster`, `CompiledPipeline::from_config`, `reconcile_model_runtime_blocking`) and the publish at the end. Between the second and third of those, it mutates process-global state: Lua sandbox limits, the operator redaction state, tenant cardinality caps, the sink dispatcher, usage rollups, the AI provider catalog, detection singletons, and the key plane. Those are all installed through their own swaps, before the pipeline publish.
+
+So a config that compiles but fails at `CompiledPipeline::from_config` returns `Err`, logs "serving prior pipeline", and leaves the node running new redaction rules, a new AI catalog, a new key plane, and the old pipeline. The failure message says nothing happened. Something happened.
+
+A human hitting this once on one box notices and restarts. A bad bundle hitting it does so on every subscriber at the same time, unattended.
+
+### "Applied" does not mean applied
+
+Seven subsystems fail soft inside a reload that reports success: the AI provider catalog and AI client, the dynamic key plane, the listings registry, the enterprise `on_reload` hook, sink validation and the sink dispatcher, the agent-detect scorer, and governance dissemination. Each logs and continues.
+
+That is a defensible choice for a local reload. It is not defensible for a managed service, where `sbproxy_config_bundle_applied_total` incrementing is what we would tell a customer means their config is live. Worth noting one specific trap: `reload_ai_client()` sits in the `else` branch of the provider-registry reload, so a registry failure silently skips the client rebuild too.
+
+### The secret resolver is set once per process
+
+`install_process_resolver` is a `OnceLock` and a second call is discarded with `let _ = ... .set(...)`. Nothing in `sbproxy-core` calls it. A reload that changes `proxy.secrets` is therefore silently ignored, and every handler is rebuilt against the boot-time `VaultManager`.
+
+Two consequences for this design. `proxy.secrets` is on the deny-list, so an authority can never ship a config that introduces a new secret backend; a bundle referencing `secret://newbackend/...` hard-fails at handler construction on every node. And git content is unrestricted, so a repo *can* change `proxy.secrets`, at which point the change is silently ignored and the references to it hard-fail. Silent ignore followed by a confusing hard failure is the worst of both.
+
+The fix is not to make the resolver reloadable, which is a much larger change involving live network clients. The fix is to detect the situation and refuse loudly, the way the cluster fingerprint already does.
+
+### `/admin/drift` is already wrong, and multi-source makes it worse
+
+`loaded_config_content_hash` is written in exactly two places: boot, and `POST /admin/reload`. The file watcher and SIGHUP paths do not update it. After a watcher or SIGHUP reload the running config matches disk while the stale baseline does not, so drift reports `true` incorrectly until the next admin reload or a restart.
+
+A subscriber poller would be the fifth path into reload. If it does not maintain that hash, every subscriber reports permanent drift. And on a git-sourced node the local file is a `source:` pointer, so both sides of the comparison hash the same unchanged pointer and drift reports `false` while the actual content moved. False positive on one path, false negative on the other.
+
+Drift needs to become per-source rather than one hash: local file against loaded local file, git against resolved commit, authority against accepted revision.
+
+### Node identity cannot come from a shared git repo
+
+This is the gap I got wrong when I first wrote the git section. I said git content is operator-owned and therefore unrestricted, which is true, and then did not follow it through.
+
+`ClusterRestartFingerprint` covers eighteen fields including `cluster_id`, `node_id`, `roles`, `labels`, `seeds`, both ports, both advertise addresses, `state_dir`, `security`, `enrollment`, `deployment_authority`, and `replication`. Any change rejects the entire reload, and so does removing `proxy.cluster:` from a process that had one.
+
+The obvious deployment, one repo pointed at by a whole fleet, therefore cannot work as written. Either every node claims the same `node_id`, or the repo omits `proxy.cluster` and every clustered node hard-fails its reload. Node-local values have to come from somewhere else.
+
+Two mechanisms already exist and either would do. `${VAR}` interpolation is a textual pre-pass, so a shared repo can carry `node_id: ${SB_NODE_ID}` and each host supplies its own. And `ConfigSource::GitOverlay` takes a base plus ordered overlays, with `Local` already a variant, so a git base with a node-local overlay is expressible. Pick one, document it as the supported pattern, and make the failure mode obvious when someone does neither.
+
+The `${VAR}` route carries its own edge: an unresolved reference is only a warning and is left as literal text. So a bundle referencing a variable a node does not set produces a literally wrong value rather than a refusal. Admin credentials are the sole exception and hard-fail. Any node-local value the design depends on needs the same treatment.
+
+### Publish-side validation is weaker than boot
+
+`compile_config` alone does not catch what boot catches. Action and policy and transform blocks are opaque `serde_json::Value` until `CompiledPipeline::from_config` constructs them, which is where a typo inside a `policies:` entry, an unknown transform type, or a provider setting both `serve:` and `base_url:` finally surfaces. The `validate` subcommand knows this and runs the full construction plus `validate_model_runtime`.
+
+If the authority validates with `compile_config` only, it will happily publish a bundle that fails on every subscriber. Publish has to run at least what `validate` runs. It must also use `from_config_for_validation` rather than `from_config`, because the runtime variant touches process-global state and starts background tasks on a pipeline that is then dropped. `PUT /admin/config` makes exactly that mistake today.
+
+### The admin listener is the wrong place to expose a fleet endpoint
+
+Admin credentials default to `admin` and `changeme`, hardcoded in three places. Nothing validates them against the bind address. `bind: 0.0.0.0` with `allow_ips: ["0.0.0.0/0"]`, default credentials, and no TLS boots cleanly and serves the full admin API in plaintext. `AdminIpFilter::new(vec![])` is fail-open, and the safe default lives in a single `is_empty()` branch at the one call site rather than in the type. `localhost_only()` compares literal strings, so an IPv4-mapped IPv6 loopback peer is rejected.
+
+Putting `GET /config-authority/v1/bundle` on this listener means telling operators to expose that port to their whole fleet. I am no longer comfortable with "operators must bind admin accordingly" as the mitigation. The authority endpoint gets its own listener, and a node configured to publish refuses to start with default admin credentials.
+
+### Smaller edges worth knowing before someone hits them
+
+The `reload_in_progress` single-flight flag is `/admin/reload` only, despite a doc comment claiming otherwise. The watcher, SIGHUP, and `apply` serialize on the mutex instead, which blocks rather than returning a conflict. A poller that blocks behind a slow reload will queue up, so it should try the lock and skip with a metric rather than wait.
+
+`PUT /admin/config` writes the file and then re-reads it from disk instead of applying the bytes it just validated, and the rename also wakes the file watcher, so a write can race itself.
+
+`proxy.admin.*` is never re-read on reload, but `plan.rs` declares it as `Reload` with the reason "admin auth / TLS settings re-read on reload". Any plan diff we show an operator is lying about that path.
+
+`sbproxy apply` calls `reload_from_config_path` in the short-lived CLI process. It swaps the CLI's own pipeline, prints a success line, and exits. The running server picks the change up only because its file watcher happens to see the file. There is no IPC and no admin call anywhere in that function.
+
+`migrate_features_to_extensions` does a full YAML round-trip whenever a `features:` block exists, so comments are already destroyed on those configs today. Our merge will round-trip too. Comment preservation is therefore a property of the local-file editing path only, never of the effective config, and CA-08 should say so rather than imply otherwise.
+
+`scan_yaml_hazards` early-returns an empty result when the generic YAML parse fails, so hazard detection is skipped entirely on a document that does not parse.
+
+Boot does not take `CONFIG_RELOAD_LOCK`, and the admin listener can come up before boot finishes its own publish.
+
+### What this changes about the plan
+
+Two new children, both prerequisites rather than follow-ons.
+
+**CA-00** makes the reload transaction honest: stage the process-global installs so nothing mutates before the last hard-error point, make the soft-failing subsystems report their status so "applied" can mean applied, and detect a changed `proxy.secrets` and refuse loudly instead of ignoring it. Nothing else in this epic is trustworthy until this lands, because every failure guarantee in the table above depends on it.
+
+**CA-11** hardens the admin surface and gives the authority its own listener, so exposing a config authority to a fleet is not the same act as exposing the full admin API with default credentials.
+
+The rest of the findings attach to the children that already own the relevant code.
 
 ### The editor
 
