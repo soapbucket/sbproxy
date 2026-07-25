@@ -28,7 +28,22 @@ use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-fn ed25519_config(upstream_url: &str, verifying_key_hex: &str) -> String {
+fn ed25519_config(
+    upstream_url: &str,
+    verifying_key_hex: &str,
+    require_provisional_trust: bool,
+) -> String {
+    let provisional_policy = if require_provisional_trust {
+        r#"
+    policies:
+      - type: expression
+        expression: 'request.trust_tier == "anonymous"'
+        deny_status: 403
+        deny_message: "body-bound trust must remain provisional"
+"#
+    } else {
+        ""
+    };
     format!(
         r#"
 proxy:
@@ -49,6 +64,43 @@ origins:
           required_components:
             - "@method"
             - "@target-uri"
+{provisional_policy}
+"#
+    )
+}
+
+fn ed25519_idempotency_config(upstream_url: &str, verifying_key_hex: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "blog.localhost":
+    action:
+      type: proxy
+      url: "{upstream_url}"
+    authentication:
+      type: bot_auth
+      clock_skew_seconds: 9999999999
+      agents:
+        - name: ed25519-bot
+          key_id: ed-bot-1
+          algorithm: ed25519
+          public_key: "{verifying_key_hex}"
+          required_components:
+            - "@method"
+            - "@target-uri"
+    policies:
+      - type: expression
+        expression: 'request.trust_tier == "anonymous"'
+        deny_status: 403
+        deny_message: "body-bound trust must remain provisional"
+    idempotency:
+      enabled: true
+      header_name: Idempotency-Key
+      ttl_secs: 60
+      methods: [POST]
+      backend: memory
 "#
     )
 }
@@ -85,15 +137,38 @@ fn fresh_keypair() -> SigningKey {
     SigningKey::from_bytes(&bytes)
 }
 
+fn trust_tier_count(harness: &ProxyHarness, tier: &str) -> f64 {
+    // A body-filter rejection closes the current downstream connection.
+    // The blocking client may try that stale keep-alive connection once
+    // before opening a fresh one, so retry this idempotent metrics read.
+    let response = harness
+        .get("/metrics", "blog.localhost")
+        .or_else(|_| harness.get("/metrics", "blog.localhost"))
+        .expect("fetch metrics");
+    let metrics = response.text().unwrap_or_default();
+    let prefix = format!("sbproxy_trust_tier_requests_total{{tier=\"{tier}\"}} ");
+    metrics
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(&prefix)
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0)
+}
+
 #[test]
 fn signed_post_with_matching_content_digest_is_accepted() {
     let signing_key = fresh_keypair();
     let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
-    let harness =
-        ProxyHarness::start_with_yaml(&ed25519_config(&upstream.base_url(), &verifying_key_hex))
-            .expect("start");
+    let harness = ProxyHarness::start_with_yaml(&ed25519_config(
+        &upstream.base_url(),
+        &verifying_key_hex,
+        true,
+    ))
+    .expect("start");
+    let strong_before = trust_tier_count(&harness, "strong");
 
     let body: Vec<u8> = br#"{"event":"signed-payload"}"#.to_vec();
     let digest = content_digest_header(&body);
@@ -131,6 +206,11 @@ fn signed_post_with_matching_content_digest_is_accepted() {
         !upstream.captured().is_empty(),
         "request must reach upstream"
     );
+    assert_eq!(
+        trust_tier_count(&harness, "strong"),
+        strong_before + 1.0,
+        "the completed body proof must emit one final Strong observation"
+    );
 }
 
 #[test]
@@ -139,9 +219,14 @@ fn signed_post_with_tampered_body_fails_content_digest_binding() {
     let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
-    let harness =
-        ProxyHarness::start_with_yaml(&ed25519_config(&upstream.base_url(), &verifying_key_hex))
-            .expect("start");
+    let harness = ProxyHarness::start_with_yaml(&ed25519_config(
+        &upstream.base_url(),
+        &verifying_key_hex,
+        true,
+    ))
+    .expect("start");
+    let strong_before = trust_tier_count(&harness, "strong");
+    let suspicious_before = trust_tier_count(&harness, "suspicious");
 
     // The signer signed THIS body...
     let original_body: Vec<u8> = br#"{"event":"signed-payload"}"#.to_vec();
@@ -195,6 +280,106 @@ fn signed_post_with_tampered_body_fails_content_digest_binding() {
             captured.body.len()
         );
     }
+    assert_eq!(
+        trust_tier_count(&harness, "strong"),
+        strong_before,
+        "a provisional header signature must not be recorded as final Strong"
+    );
+    assert_eq!(
+        trust_tier_count(&harness, "suspicious"),
+        suspicious_before + 1.0,
+        "the late body mismatch must be the request's one final observation"
+    );
+}
+
+#[test]
+fn idempotency_hit_cannot_bypass_late_body_binding() {
+    let signing_key = fresh_keypair();
+    let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness = ProxyHarness::start_with_yaml(&ed25519_idempotency_config(
+        &upstream.base_url(),
+        &verifying_key_hex,
+    ))
+    .expect("start");
+
+    let signed_body: Vec<u8> = br#"{"event":"signed-payload"}"#.to_vec();
+    let digest = content_digest_header(&signed_body);
+    let inner_list = r#""@method" "@target-uri" "content-digest""#;
+    let params = r#"created=1700000000;keyid="ed-bot-1";alg="ed25519""#;
+    let base = build_base_for_post_with_digest(inner_list, params, &digest);
+    let signature = signing_key.sign(base.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+    let signature_input = format!("sig1=({});{}", inner_list, params);
+    let signature_header = format!("sig1=:{}:", sig_b64);
+    let headers = [
+        ("signature-input", signature_input.as_str()),
+        ("signature", signature_header.as_str()),
+        ("content-digest", digest.as_str()),
+        ("idempotency-key", "trust-body-key"),
+    ];
+
+    let first = harness
+        .post_bytes(
+            "/",
+            "blog.localhost",
+            "application/json",
+            signed_body.clone(),
+            &headers,
+        )
+        .expect("prime cache");
+    assert_eq!(first.status, 200);
+
+    let replay = harness
+        .post_bytes(
+            "/",
+            "blog.localhost",
+            "application/json",
+            signed_body,
+            &headers,
+        )
+        .expect("replay cached request");
+    assert_eq!(replay.status, 200);
+    assert_eq!(
+        replay
+            .headers
+            .get("x-sbproxy-idempotency")
+            .map(String::as_str),
+        Some("HIT"),
+        "the first verified request must populate the idempotency cache"
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "a verified cache hit must not contact the upstream twice"
+    );
+
+    let suspicious_before = trust_tier_count(&harness, "suspicious");
+    let strong_before = trust_tier_count(&harness, "strong");
+
+    let tampered = harness
+        .post_bytes(
+            "/",
+            "blog.localhost",
+            "application/json",
+            br#"{"event":"tampered-payload"}"#.to_vec(),
+            &headers,
+        )
+        .expect("retry with tampered body");
+
+    assert_eq!(
+        tampered.status, 401,
+        "body authentication must run before idempotency replay/conflict"
+    );
+    assert_eq!(
+        trust_tier_count(&harness, "strong"),
+        strong_before,
+        "the tampered retry must not add a Strong observation"
+    );
+    assert_eq!(
+        trust_tier_count(&harness, "suspicious"),
+        suspicious_before + 1.0
+    );
 }
 
 #[test]
@@ -207,9 +392,12 @@ fn signed_post_without_digest_in_covered_set_skips_body_check() {
     let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
-    let harness =
-        ProxyHarness::start_with_yaml(&ed25519_config(&upstream.base_url(), &verifying_key_hex))
-            .expect("start");
+    let harness = ProxyHarness::start_with_yaml(&ed25519_config(
+        &upstream.base_url(),
+        &verifying_key_hex,
+        false,
+    ))
+    .expect("start");
 
     let inner_list = r#""@method" "@target-uri""#;
     let params = r#"created=1700000000;keyid="ed-bot-1";alg="ed25519""#;

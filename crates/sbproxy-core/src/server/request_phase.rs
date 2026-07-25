@@ -2188,8 +2188,8 @@ pub(super) async fn request_filter(
                     ctx.trust_headers = Some(trust_headers);
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
                 }
-                Err((status, msg)) => {
-                    crate::trust_tier::finalize(ctx, true);
+                Err((status, msg, trust_outcome)) => {
+                    crate::trust_tier::finalize(ctx, trust_outcome.is_suspicious());
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);
                     emit_auth_audit(
                         "forward_auth_denied",
@@ -2231,7 +2231,7 @@ pub(super) async fn request_filter(
                 crate::agent_class::cap_binding_agent_id(ctx).map(|s| s.to_string());
             #[cfg(not(feature = "agent-class"))]
             let resolved_agent_id: Option<String> = None;
-            let (auth_result, principal_opt) = check_auth(
+            let (auth_result, principal_opt, trust_outcome) = check_auth_with_outcome(
                 auth,
                 req_headers,
                 query,
@@ -2297,7 +2297,7 @@ pub(super) async fn request_filter(
                 }
             }
             if !auth_succeeded {
-                crate::trust_tier::finalize(ctx, true);
+                crate::trust_tier::finalize(ctx, trust_outcome.is_suspicious());
             }
             match auth_result {
                 AuthResult::Allow { sub, source } => {
@@ -2588,6 +2588,23 @@ pub(super) async fn request_filter(
                                     .write_response_body(Some(bytes::Bytes::from(body)), true)
                                     .await?;
                                 ctx.response_status = Some(status_u16);
+                                return Ok(true);
+                            }
+
+                            // Cached idempotency responses drain and short
+                            // circuit inside request_filter, before
+                            // request_body_filter runs. Complete the
+                            // body-bound BotAuth proof here first so neither a
+                            // replay nor a 409 conflict can bypass it.
+                            if !crate::trust_tier::verify_and_finalize_body_proof(
+                                ctx,
+                                &session.req_header().headers,
+                                &buf,
+                            ) {
+                                ctx.idempotency_permit = None;
+                                send_error(session, 401, "bot_auth: content-digest body mismatch")
+                                    .await?;
+                                ctx.response_status = Some(401);
                                 return Ok(true);
                             }
 

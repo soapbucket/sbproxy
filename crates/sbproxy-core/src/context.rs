@@ -173,6 +173,10 @@ pub struct RequestContext {
     /// authentication. Downstream policies and scripting read this field
     /// instead of independently combining signature, agent, and deny signals.
     pub trust_tier: sbproxy_modules::auth::TrustTier,
+    /// Whether the request's final trust-tier metric observation has been
+    /// emitted. Body-bound Web Bot Auth remains provisional until the body
+    /// digest is checked, so the metric writer must be exactly-once.
+    pub(crate) trust_tier_metric_recorded: bool,
 
     // --- Flags ---
     /// Whether the force-SSL redirect check has already been performed.
@@ -1197,6 +1201,7 @@ impl RequestContext {
             mirror_pending: None,
             auth_result: None,
             trust_tier: sbproxy_modules::auth::TrustTier::Anonymous,
+            trust_tier_metric_recorded: false,
             force_ssl_checked: false,
             short_circuit_status: None,
             short_circuit_body: None,

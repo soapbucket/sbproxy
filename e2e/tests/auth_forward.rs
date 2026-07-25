@@ -20,6 +20,22 @@
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
 
+fn trust_tier_count(harness: &ProxyHarness, tier: &str) -> f64 {
+    let metrics = harness
+        .get("/metrics", "fwd.localhost")
+        .expect("fetch metrics")
+        .text()
+        .unwrap_or_default();
+    let prefix = format!("sbproxy_trust_tier_requests_total{{tier=\"{tier}\"}} ");
+    metrics
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(&prefix)
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0)
+}
+
 fn config_yaml(auth_url: &str, app_url: &str) -> String {
     format!(
         r#"
@@ -102,6 +118,8 @@ fn unreachable_auth_service_blocks_request() {
     let dead_auth_url = "http://127.0.0.1:1"; // reserved, unlikely to bind
     let harness =
         ProxyHarness::start_with_yaml(&config_yaml(dead_auth_url, &app.base_url())).expect("start");
+    let anonymous_before = trust_tier_count(&harness, "anonymous");
+    let suspicious_before = trust_tier_count(&harness, "suspicious");
 
     let resp = harness.get("/anything", "fwd.localhost").expect("send");
     assert!(
@@ -112,6 +130,50 @@ fn unreachable_auth_service_blocks_request() {
     assert!(
         app.captured().is_empty(),
         "app upstream must not see traffic when auth fails"
+    );
+    assert_eq!(
+        trust_tier_count(&harness, "anonymous"),
+        anonymous_before + 1.0,
+        "an auth-service outage carries no adversarial caller evidence"
+    );
+    assert_eq!(
+        trust_tier_count(&harness, "suspicious"),
+        suspicious_before,
+        "backend failure must not be attributed to suspicious callers"
+    );
+}
+
+#[test]
+fn auth_service_5xx_is_a_backend_failure_not_a_failed_proof() {
+    let auth = MockUpstream::start_with_status(json!({"error": "unavailable"}), 503).expect("auth");
+    let app = MockUpstream::start(json!({"ok": true})).expect("app");
+    let harness = ProxyHarness::start_with_yaml(&config_yaml(&auth.base_url(), &app.base_url()))
+        .expect("start");
+    let anonymous_before = trust_tier_count(&harness, "anonymous");
+    let suspicious_before = trust_tier_count(&harness, "suspicious");
+
+    let resp = harness
+        .get_with_headers(
+            "/anything",
+            "fwd.localhost",
+            &[("authorization", "Bearer demo")],
+        )
+        .expect("send");
+
+    assert_eq!(
+        resp.status, 401,
+        "forward auth must continue to fail closed"
+    );
+    assert!(app.captured().is_empty());
+    assert_eq!(
+        trust_tier_count(&harness, "anonymous"),
+        anonymous_before + 1.0,
+        "a verifier outage carries no adversarial caller evidence"
+    );
+    assert_eq!(
+        trust_tier_count(&harness, "suspicious"),
+        suspicious_before,
+        "the backend's 5xx must not be attributed to the caller"
     );
 }
 

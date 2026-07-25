@@ -2944,6 +2944,27 @@ impl ProxyHttp for SbProxy {
             }
             if end_of_stream {
                 let collected = ctx.request_body_buf.take().unwrap_or_default();
+                // A verified header signature that covers content-digest is
+                // provisional until the complete pre-transform body arrives.
+                // Authenticate that body before any validator can short
+                // circuit so a mismatch is always attributed to the failed
+                // proof and never reaches the upstream.
+                if !crate::trust_tier::verify_and_finalize_body_proof(
+                    ctx,
+                    &session.req_header().headers,
+                    &collected,
+                ) {
+                    debug!("bot_auth content-digest body binding check failed; rejecting request");
+                    let body_str = serde_json::json!({
+                        "error": "bot_auth: content-digest body mismatch",
+                    })
+                    .to_string();
+                    ctx.validator_failed = Some((401, body_str, "application/json".into()));
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(401),
+                        "bot_auth: content-digest body binding failed",
+                    ));
+                }
                 let pipeline = ctx.pipeline.clone();
                 let content_type = session
                     .req_header()
@@ -3161,50 +3182,30 @@ impl ProxyHttp for SbProxy {
                         "request body failed schema validation",
                     ));
                 }
-                // WOR-805 F1.6.1: the auth phase flagged that
-                // `bot_auth` verified a signature covering
-                // `content-digest`, so the body's actual SHA-256 has
-                // to match the `Content-Digest` header value the
-                // signature attests to. Run the deferred check now
-                // that the body is fully buffered. A failure here is
-                // an authentication failure (the body the client
-                // sent does not match the body the client signed),
-                // so map it to 401 with a generic message.
-                if ctx.bot_auth_digest_check_required {
-                    let header_value = session
+                // Body validation and idempotency share the same request
+                // buffer. When both are active, the validator branch owns
+                // the end-of-stream chunk and must also register the
+                // idempotency miss; otherwise the response is never cached
+                // and the key-only replay path cannot engage.
+                if ctx.idempotency_buffering {
+                    let body_hash = sbproxy_middleware::idempotency::hash_body(&collected);
+                    let header_name = ctx
+                        .origin_idx
+                        .and_then(|i| pipeline.idempotencies.get(i))
+                        .and_then(|opt| opt.as_ref())
+                        .map(|i| i.header_name.clone())
+                        .unwrap_or_else(|| "Idempotency-Key".to_string());
+                    let key = session
                         .req_header()
                         .headers
-                        .get("content-digest")
-                        .or_else(|| session.req_header().headers.get("repr-digest"))
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    let ok = match header_value.as_deref() {
-                        Some(hv) => {
-                            sbproxy_middleware::digest::verify_content_digest(hv, &collected)
-                        }
-                        // A signature that covered `content-digest`
-                        // without a corresponding header is a wire-
-                        // shape contradiction; reject.
-                        None => false,
-                    };
-                    if !ok {
-                        debug!(
-                            "bot_auth content-digest body binding check failed; rejecting request"
-                        );
-                        let body_str = serde_json::json!({
-                            "error": "bot_auth: content-digest body mismatch",
-                        })
+                        .get(header_name.as_str())
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
+                        .unwrap_or_default()
                         .to_string();
-                        ctx.validator_failed = Some((401, body_str, "application/json".into()));
-                        return Err(pingora_error::Error::explain(
-                            pingora_error::ErrorType::HTTPStatus(401),
-                            "bot_auth: content-digest body binding failed",
-                        ));
-                    }
-                    // Mirror the content_digest-policy path: surface
-                    // a single audit flag so downstream composition
-                    // can attest "body matches signed digest".
-                    ctx.content_digest_verified = true;
+                    ctx.idempotency_miss = Some((key, body_hash));
+                    ctx.idempotency_response_body_buf = Some(bytes::BytesMut::with_capacity(8192));
+                    ctx.idempotency_buffering = false;
                 }
                 // Validation passed - release the buffered body as one
                 // chunk so the upstream sees the full payload.
@@ -4428,6 +4429,12 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // A body-bound BotAuth signature is provisional during the header
+        // and policy phases. If a short circuit prevented the body verifier
+        // from running, close the observation conservatively without
+        // granting Strong from the unverified body binding.
+        crate::trust_tier::finalize_pending_body_proof_at_request_end(ctx);
+
         // Decrement active connections gauge (global + per-origin).
         metrics().active_connections.dec();
 

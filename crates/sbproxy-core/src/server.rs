@@ -1868,6 +1868,43 @@ impl AuthResult {
     }
 }
 
+/// Trust-specific outcome of an authentication attempt.
+///
+/// HTTP denials are not all evidence of hostile traffic. Missing credentials,
+/// an interactive challenge, and verifier infrastructure failures remain
+/// neutral; only a proof that was actually offered and failed verification is
+/// load-bearing evidence for the `suspicious` tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthTrustOutcome {
+    Allowed,
+    Missing,
+    Challenge,
+    InvalidProof,
+    BackendFailure,
+}
+
+impl AuthTrustOutcome {
+    fn is_suspicious(self) -> bool {
+        matches!(self, Self::InvalidProof)
+    }
+}
+
+fn api_key_was_offered(
+    auth: &sbproxy_modules::auth::ApiKeyAuth,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+) -> bool {
+    if headers.contains_key(auth.header_name.as_str()) {
+        return true;
+    }
+    let Some(param_name) = auth.query_param.as_deref() else {
+        return false;
+    };
+    query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == param_name)
+    })
+}
+
 /// WOR-892 PR1 step 3/3: OIDC Relying-Party request-time check.
 ///
 /// Two outcomes:
@@ -1998,6 +2035,7 @@ fn read_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
 /// the corresponding [`AuthResult`] variant; `DenyWithHeaders` is
 /// preserved end-to-end so providers can attach challenge headers
 /// (RFC 9728, OAuth 2.0 PRM, etc.) on the 4xx response.
+#[cfg(test)]
 async fn check_auth(
     auth: &Auth,
     headers: &http::HeaderMap,
@@ -2018,7 +2056,34 @@ async fn check_auth(
     // thumbprint is available (the verifier treats `None` as
     // "no TLS binding"). The DPoP wire-up does not need a
     // thumbprint and works through the `None` path unchanged.
-    check_auth_with_tls(
+    let (result, principal, _) = check_auth_with_outcome(
+        auth,
+        headers,
+        query,
+        method,
+        path,
+        tenant_id,
+        resolved_agent_id,
+    )
+    .await;
+    (result, principal)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn check_auth_with_outcome(
+    auth: &Auth,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: sbproxy_plugin::TenantId,
+    resolved_agent_id: Option<&str>,
+) -> (
+    AuthResult,
+    Option<sbproxy_plugin::Principal>,
+    AuthTrustOutcome,
+) {
+    check_auth_with_tls_outcome(
         auth,
         headers,
         query,
@@ -2056,6 +2121,7 @@ fn format_htu(headers: &http::HeaderMap, path: &str) -> String {
 /// `require_mtls_bound = true` deployment fails closed (every
 /// request rejected) instead of silently allowing.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn check_auth_with_tls(
     auth: &Auth,
     headers: &http::HeaderMap,
@@ -2067,6 +2133,35 @@ async fn check_auth_with_tls(
     // WOR-1149: resolved agent id for CAP `sub` binding (see `check_auth`).
     resolved_agent_id: Option<&str>,
 ) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
+    let (result, principal, _) = check_auth_with_tls_outcome(
+        auth,
+        headers,
+        query,
+        method,
+        path,
+        tenant_id,
+        tls_cert_thumbprint,
+        resolved_agent_id,
+    )
+    .await;
+    (result, principal)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn check_auth_with_tls_outcome(
+    auth: &Auth,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: sbproxy_plugin::TenantId,
+    tls_cert_thumbprint: Option<&str>,
+    resolved_agent_id: Option<&str>,
+) -> (
+    AuthResult,
+    Option<sbproxy_plugin::Principal>,
+    AuthTrustOutcome,
+) {
     use sbproxy_modules::auth::dpop::DpopVerifier;
     use sbproxy_modules::auth::mtls_bound::{MtlsBoundVerifier, MtlsBoundVerifierConfig};
     // WOR-1136: the DPoP verifier owns the (jkt, jti) replay cache that
@@ -2080,8 +2175,20 @@ async fn check_auth_with_tls(
     match auth {
         Auth::ApiKey(a) => {
             match a.check_request_with_principal(headers, query, tenant_id.clone()) {
-                Some(principal) => (AuthResult::allow_anonymous(), Some(principal)),
-                None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
+                Some(principal) => (
+                    AuthResult::allow_anonymous(),
+                    Some(principal),
+                    AuthTrustOutcome::Allowed,
+                ),
+                None => (
+                    AuthResult::Deny(401, "unauthorized".to_string()),
+                    None,
+                    if api_key_was_offered(a, headers, query) {
+                        AuthTrustOutcome::InvalidProof
+                    } else {
+                        AuthTrustOutcome::Missing
+                    },
+                ),
             }
         }
         Auth::BasicAuth(a) => match a.check_request_with_principal(headers, tenant_id.clone()) {
@@ -2093,9 +2200,18 @@ async fn check_auth_with_tls(
                         source: Some(sbproxy_plugin::AuthSubjectSource::Header),
                     },
                     Some(principal),
+                    AuthTrustOutcome::Allowed,
                 )
             }
-            None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
+            None => (
+                AuthResult::Deny(401, "unauthorized".to_string()),
+                None,
+                if headers.contains_key(http::header::AUTHORIZATION) {
+                    AuthTrustOutcome::InvalidProof
+                } else {
+                    AuthTrustOutcome::Missing
+                },
+            ),
         },
         Auth::Bearer(a) => match a.check_request_with_token(headers, tenant_id.clone()) {
             Some((principal, token)) => {
@@ -2120,6 +2236,7 @@ async fn check_auth_with_tls(
                                     .to_string(),
                             ),
                             None,
+                            AuthTrustOutcome::BackendFailure,
                         );
                     };
                     let htu = format_htu(headers, path);
@@ -2130,15 +2247,33 @@ async fn check_auth_with_tls(
                         expected_jkt,
                         std::time::SystemTime::now(),
                     ) {
+                        let outcome = if dpop_header.is_some() {
+                            AuthTrustOutcome::InvalidProof
+                        } else {
+                            AuthTrustOutcome::Missing
+                        };
                         return (
                             AuthResult::Deny(401, format!("DPoP verification failed: {err}")),
                             None,
+                            outcome,
                         );
                     }
                 }
-                (AuthResult::allow_anonymous(), Some(principal))
+                (
+                    AuthResult::allow_anonymous(),
+                    Some(principal),
+                    AuthTrustOutcome::Allowed,
+                )
             }
-            None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
+            None => (
+                AuthResult::Deny(401, "unauthorized".to_string()),
+                None,
+                if headers.contains_key(http::header::AUTHORIZATION) {
+                    AuthTrustOutcome::InvalidProof
+                } else {
+                    AuthTrustOutcome::Missing
+                },
+            ),
         },
         Auth::Jwt(a) => match a.check_request_with_claims(headers, tenant_id.clone()) {
             Some((principal, claims)) => {
@@ -2165,6 +2300,7 @@ async fn check_auth_with_tls(
                                     .to_string(),
                             ),
                             None,
+                            AuthTrustOutcome::InvalidProof,
                         );
                     };
                     let htu = format_htu(headers, path);
@@ -2175,9 +2311,15 @@ async fn check_auth_with_tls(
                         expected_jkt,
                         std::time::SystemTime::now(),
                     ) {
+                        let outcome = if dpop_header.is_some() {
+                            AuthTrustOutcome::InvalidProof
+                        } else {
+                            AuthTrustOutcome::Missing
+                        };
                         return (
                             AuthResult::Deny(401, format!("DPoP verification failed: {err}")),
                             None,
+                            outcome,
                         );
                     }
                 }
@@ -2197,6 +2339,11 @@ async fn check_auth_with_tls(
                                 format!("mTLS-bound token verification failed: {err}"),
                             ),
                             None,
+                            if tls_cert_thumbprint.is_some() {
+                                AuthTrustOutcome::InvalidProof
+                            } else {
+                                AuthTrustOutcome::Missing
+                            },
                         );
                     }
                 }
@@ -2214,9 +2361,17 @@ async fn check_auth_with_tls(
                         source: Some(sbproxy_plugin::AuthSubjectSource::Jwt),
                     }
                 };
-                (auth_result, Some(principal))
+                (auth_result, Some(principal), AuthTrustOutcome::Allowed)
             }
-            None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
+            None => (
+                AuthResult::Deny(401, "unauthorized".to_string()),
+                None,
+                if headers.contains_key(http::header::AUTHORIZATION) {
+                    AuthTrustOutcome::InvalidProof
+                } else {
+                    AuthTrustOutcome::Missing
+                },
+            ),
         },
         Auth::Digest(d) => {
             if headers.get(http::header::AUTHORIZATION).is_some() {
@@ -2235,16 +2390,25 @@ async fn check_auth_with_tls(
                                 source: Some(sbproxy_plugin::AuthSubjectSource::Header),
                             },
                             Some(principal),
+                            AuthTrustOutcome::Allowed,
                         )
                     }
                     None => {
                         let nonce = sbproxy_modules::auth::DigestAuth::generate_nonce();
-                        (AuthResult::DigestChallenge(d.challenge(&nonce)), None)
+                        (
+                            AuthResult::DigestChallenge(d.challenge(&nonce)),
+                            None,
+                            AuthTrustOutcome::InvalidProof,
+                        )
                     }
                 }
             } else {
                 let nonce = sbproxy_modules::auth::DigestAuth::generate_nonce();
-                (AuthResult::DigestChallenge(d.challenge(&nonce)), None)
+                (
+                    AuthResult::DigestChallenge(d.challenge(&nonce)),
+                    None,
+                    AuthTrustOutcome::Challenge,
+                )
             }
         }
         // ForwardAuth runs as a separate async subrequest in the
@@ -2256,6 +2420,7 @@ async fn check_auth_with_tls(
         Auth::ForwardAuth(_) => (
             AuthResult::allow_anonymous(),
             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+            AuthTrustOutcome::Allowed,
         ),
         Auth::BotAuth(b) => {
             use sbproxy_modules::auth::BotAuthVerdict;
@@ -2281,6 +2446,7 @@ async fn check_auth_with_tls(
                     return (
                         AuthResult::Deny(500, "bot_auth: bad request".to_string()),
                         None,
+                        AuthTrustOutcome::BackendFailure,
                     );
                 }
             };
@@ -2313,15 +2479,21 @@ async fn check_auth_with_tls(
                             ..sbproxy_plugin::PrincipalAttrs::default()
                         },
                     };
-                    (AuthResult::allow_anonymous(), Some(principal))
+                    (
+                        AuthResult::allow_anonymous(),
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
                 }
                 BotAuthVerdict::Missing => (
                     AuthResult::Deny(401, "bot_auth: signature required".to_string()),
                     None,
+                    AuthTrustOutcome::Missing,
                 ),
                 BotAuthVerdict::UnknownAgent { key_id } => (
                     AuthResult::Deny(401, format!("bot_auth: unknown agent keyid {}", key_id)),
                     None,
+                    AuthTrustOutcome::InvalidProof,
                 ),
                 BotAuthVerdict::Failed { agent_name, reason } => {
                     let agent = agent_name.unwrap_or_else(|| "<unknown>".to_string());
@@ -2329,6 +2501,7 @@ async fn check_auth_with_tls(
                     (
                         AuthResult::Deny(401, "bot_auth: verification failed".to_string()),
                         None,
+                        AuthTrustOutcome::InvalidProof,
                     )
                 }
                 BotAuthVerdict::DirectoryUnavailable { reason } => {
@@ -2342,6 +2515,7 @@ async fn check_auth_with_tls(
                     (
                         AuthResult::Deny(401, "bot_auth: directory unavailable".to_string()),
                         None,
+                        AuthTrustOutcome::BackendFailure,
                     )
                 }
             }
@@ -2375,7 +2549,11 @@ async fn check_auth_with_tls(
             let mut req = match builder.uri(target_uri.as_str()).body(bytes::Bytes::new()) {
                 Ok(r) => r,
                 Err(_) => {
-                    return (AuthResult::Deny(500, "cap: bad request".to_string()), None);
+                    return (
+                        AuthResult::Deny(500, "cap: bad request".to_string()),
+                        None,
+                        AuthTrustOutcome::BackendFailure,
+                    );
                 }
             };
             *req.headers_mut() = headers.clone();
@@ -2399,7 +2577,11 @@ async fn check_auth_with_tls(
                         virtual_key: None,
                         attrs: sbproxy_plugin::PrincipalAttrs::default(),
                     };
-                    (AuthResult::allow_anonymous(), Some(principal))
+                    (
+                        AuthResult::allow_anonymous(),
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
                 }
                 CapVerdict::Missing => (
                     AuthResult::DenyWithHeaders(
@@ -2408,10 +2590,17 @@ async fn check_auth_with_tls(
                         vec![("WWW-Authenticate".to_string(), "License".to_string())],
                     ),
                     None,
+                    AuthTrustOutcome::Missing,
                 ),
                 CapVerdict::Invalid(err) => {
                     let status = err.http_status();
                     let code = err.www_auth_code();
+                    let trust_outcome =
+                        if matches!(&err, sbproxy_modules::auth::CapError::DirectoryUnavailable) {
+                            AuthTrustOutcome::BackendFailure
+                        } else {
+                            AuthTrustOutcome::InvalidProof
+                        };
                     (
                         AuthResult::DenyWithHeaders(
                             status,
@@ -2422,6 +2611,7 @@ async fn check_auth_with_tls(
                             )],
                         ),
                         None,
+                        trust_outcome,
                     )
                 }
             }
@@ -2429,9 +2619,21 @@ async fn check_auth_with_tls(
         Auth::Noop => (
             AuthResult::allow_anonymous(),
             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+            AuthTrustOutcome::Allowed,
         ),
         Auth::Oidc(cfg) => {
             let result = oidc_check(cfg.as_ref(), headers);
+            let trust_outcome = match &result {
+                AuthResult::Allow { .. } => AuthTrustOutcome::Allowed,
+                AuthResult::Deny(status, _) | AuthResult::DenyWithHeaders(status, _, _)
+                    if *status >= 500 =>
+                {
+                    AuthTrustOutcome::BackendFailure
+                }
+                AuthResult::Deny(..)
+                | AuthResult::DenyWithHeaders(..)
+                | AuthResult::DigestChallenge(..) => AuthTrustOutcome::Challenge,
+            };
             // The OIDC happy path stamps the principal on `Allow`;
             // pull the sub off the AuthResult before we return so
             // the call site can copy the full principal onto ctx.
@@ -2440,7 +2642,7 @@ async fn check_auth_with_tls(
             } else {
                 None
             };
-            (result, principal)
+            (result, principal, trust_outcome)
         }
         Auth::Plugin(provider) => {
             // Build a synthetic http::Request the provider can read
@@ -2468,6 +2670,7 @@ async fn check_auth_with_tls(
                             ),
                         ),
                         None,
+                        AuthTrustOutcome::BackendFailure,
                     );
                 }
             };
@@ -2495,16 +2698,34 @@ async fn check_auth_with_tls(
                         virtual_key: None,
                         attrs: sbproxy_plugin::PrincipalAttrs::default(),
                     };
-                    (AuthResult::Allow { sub, source }, Some(principal))
+                    (
+                        AuthResult::Allow { sub, source },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
                 }
-                Ok(sbproxy_plugin::AuthDecision::Deny { status, message }) => {
-                    (AuthResult::Deny(status, message), None)
-                }
+                Ok(sbproxy_plugin::AuthDecision::Deny { status, message }) => (
+                    AuthResult::Deny(status, message),
+                    None,
+                    if status >= 500 {
+                        AuthTrustOutcome::BackendFailure
+                    } else {
+                        AuthTrustOutcome::InvalidProof
+                    },
+                ),
                 Ok(sbproxy_plugin::AuthDecision::DenyWithHeaders {
                     status,
                     message,
                     headers,
-                }) => (AuthResult::DenyWithHeaders(status, message, headers), None),
+                }) => (
+                    AuthResult::DenyWithHeaders(status, message, headers),
+                    None,
+                    if status >= 500 {
+                        AuthTrustOutcome::BackendFailure
+                    } else {
+                        AuthTrustOutcome::InvalidProof
+                    },
+                ),
                 Err(err) => {
                     tracing::warn!(
                         plugin = %provider.auth_type(),
@@ -2517,6 +2738,7 @@ async fn check_auth_with_tls(
                             format!("auth plugin {:?} error", provider.auth_type()),
                         ),
                         None,
+                        AuthTrustOutcome::BackendFailure,
                     )
                 }
             }
@@ -2573,7 +2795,7 @@ fn bot_auth_directory_client() -> &'static reqwest::Client {
 async fn check_forward_auth(
     fwd: &sbproxy_modules::auth::ForwardAuthProvider,
     request_headers: &http::HeaderMap,
-) -> std::result::Result<Vec<(String, String)>, (u16, String)> {
+) -> std::result::Result<Vec<(String, String)>, (u16, String, AuthTrustOutcome)> {
     let client = forward_auth_client();
     let default_request_secs = reload::current_pipeline()
         .config
@@ -2598,7 +2820,11 @@ async fn check_forward_auth(
 
     let response = req.send().await.map_err(|e| {
         warn!(error = %e, url = %fwd.url, "forward auth request failed");
-        (503u16, "auth service unavailable".to_string())
+        (
+            503u16,
+            "auth service unavailable".to_string(),
+            AuthTrustOutcome::BackendFailure,
+        )
     })?;
 
     let status = response.status().as_u16();
@@ -2615,7 +2841,15 @@ async fn check_forward_auth(
         }
         Ok(forwarded)
     } else {
-        Err((401u16, "unauthorized".to_string()))
+        Err((
+            401u16,
+            "unauthorized".to_string(),
+            if status >= 500 {
+                AuthTrustOutcome::BackendFailure
+            } else {
+                AuthTrustOutcome::InvalidProof
+            },
+        ))
     }
 }
 
