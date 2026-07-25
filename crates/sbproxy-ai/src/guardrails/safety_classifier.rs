@@ -99,6 +99,22 @@ pub struct SafetyClassifierGuardrail {
     blocked_classes: BTreeSet<String>,
 }
 
+#[derive(Debug)]
+pub(crate) enum SafetyClassifierOutcome {
+    Allow,
+    Block(GuardrailBlock),
+    BackendFailure(GuardrailBlock),
+}
+
+impl SafetyClassifierOutcome {
+    fn into_block(self) -> Option<GuardrailBlock> {
+        match self {
+            Self::Allow => None,
+            Self::Block(block) | Self::BackendFailure(block) => Some(block),
+        }
+    }
+}
+
 impl SafetyClassifierGuardrail {
     /// Build the runtime backend for an explicitly configured classifier mode.
     pub(crate) fn from_config(
@@ -123,7 +139,7 @@ impl SafetyClassifierGuardrail {
     }
 
     #[cfg(test)]
-    fn with_backend(
+    pub(crate) fn with_backend(
         kind: SafetyGuardrailKind,
         cfg: ClassifierConfig,
         backend: Arc<dyn TextClassifier>,
@@ -139,11 +155,19 @@ impl SafetyClassifierGuardrail {
 
     /// Evaluate a buffered request or response.
     pub fn check(&self, content: &str) -> Option<GuardrailBlock> {
-        self.evaluate(self.cfg.bounded_text(content))
+        self.evaluate(self.cfg.bounded_text(content)).into_block()
     }
 
     /// Evaluate an input request using the configured message scope.
     pub fn check_messages(&self, content: &str, messages: &[Message]) -> Option<GuardrailBlock> {
+        self.check_messages_outcome(content, messages).into_block()
+    }
+
+    pub(crate) fn check_messages_outcome(
+        &self,
+        content: &str,
+        messages: &[Message],
+    ) -> SafetyClassifierOutcome {
         let raw = match self.cfg.scope {
             ClassifierScope::FullText => content,
             ClassifierScope::LastUserMessage => messages
@@ -164,15 +188,33 @@ impl SafetyClassifierGuardrail {
         self.cfg.scope
     }
 
-    fn evaluate(&self, subject: &str) -> Option<GuardrailBlock> {
+    fn evaluate(&self, subject: &str) -> SafetyClassifierOutcome {
         if subject.trim().is_empty() {
-            return None;
+            return SafetyClassifierOutcome::Allow;
         }
-        let verdict = self.backend.classify(subject);
-        self.block_for_verdict(verdict.as_ref())
+        match self.backend.classify(subject) {
+            Ok(verdict) => self.outcome_for_verdict(verdict.as_ref()),
+            Err(error) => {
+                tracing::warn!(
+                    guardrail = self.kind.name(),
+                    %error,
+                    "safety classifier inference failed; blocking response"
+                );
+                crate::ai_metrics::record_safety_guardrail_verdict(
+                    self.kind.name(),
+                    "error",
+                    "classifier",
+                    "block",
+                );
+                SafetyClassifierOutcome::BackendFailure(GuardrailBlock {
+                    name: self.kind.name().to_string(),
+                    reason: format!("{} classifier backend failed closed", self.kind.name()),
+                })
+            }
+        }
     }
 
-    fn block_for_verdict(&self, verdict: Option<&ClassifierVerdict>) -> Option<GuardrailBlock> {
+    fn outcome_for_verdict(&self, verdict: Option<&ClassifierVerdict>) -> SafetyClassifierOutcome {
         let class = verdict.map_or("none", |verdict| {
             if self.kind.taxonomy().contains(&verdict.label.as_str()) {
                 verdict.label.as_str()
@@ -187,17 +229,19 @@ impl SafetyClassifierGuardrail {
             "classifier",
             if blocked { "block" } else { "allow" },
         );
-        blocked.then(|| {
+        if blocked {
             let score = verdict.map_or(0.0, |verdict| verdict.score);
-            GuardrailBlock {
+            SafetyClassifierOutcome::Block(GuardrailBlock {
                 name: self.kind.name().to_string(),
                 reason: format!(
                     "{} classifier blocked class \"{class}\" (score {:.3})",
                     self.kind.name(),
                     score
                 ),
-            }
-        })
+            })
+        } else {
+            SafetyClassifierOutcome::Allow
+        }
     }
 }
 
@@ -308,21 +352,22 @@ mod tests {
     };
     use crate::guardrails::stream::StreamGuardSession;
     use crate::guardrails::{Guardrail, GuardrailPipeline, JailbreakGuardrail, StreamPolicy};
+    use std::sync::Mutex;
 
     #[derive(Debug)]
     struct ParaphraseClassifier;
 
     impl TextClassifier for ParaphraseClassifier {
-        fn classify(&self, text: &str) -> Option<ClassifierVerdict> {
+        fn classify(&self, text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
             let label = if text.contains("supersede the rules") {
                 "jailbreak"
             } else {
                 "safe"
             };
-            Some(ClassifierVerdict {
+            Ok(Some(ClassifierVerdict {
                 label: label.to_string(),
                 score: 0.93,
-            })
+            }))
         }
     }
 
@@ -330,11 +375,50 @@ mod tests {
     struct FixedClassifier(&'static str);
 
     impl TextClassifier for FixedClassifier {
-        fn classify(&self, _text: &str) -> Option<ClassifierVerdict> {
-            Some(ClassifierVerdict {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            Ok(Some(ClassifierVerdict {
                 label: self.0.to_string(),
                 score: 0.88,
-            })
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct AbstainingClassifier;
+
+    impl TextClassifier for AbstainingClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingClassifier;
+
+    impl TextClassifier for FailingClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            anyhow::bail!("fixture inference failure")
+        }
+    }
+
+    #[derive(Debug)]
+    struct ExactSubjectClassifier {
+        expected: String,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl TextClassifier for ExactSubjectClassifier {
+        fn classify(&self, text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            self.seen.lock().expect("seen lock").push(text.to_string());
+            let label = if text == self.expected {
+                "jailbreak"
+            } else {
+                "safe"
+            };
+            Ok(Some(ClassifierVerdict {
+                label: label.to_string(),
+                score: 0.96,
+            }))
         }
     }
 
@@ -557,6 +641,80 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_threshold_abstention_remains_an_allow() {
+        let before = crate::ai_metrics::safety_guardrail_verdict_value(
+            "jailbreak",
+            "none",
+            "classifier",
+            "allow",
+        );
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            config(ClassifierScope::FullText),
+            Arc::new(AbstainingClassifier),
+            ["jailbreak"],
+        );
+
+        assert!(guard.check("ambiguous fixture").is_none());
+        assert_eq!(
+            crate::ai_metrics::safety_guardrail_verdict_value(
+                "jailbreak",
+                "none",
+                "classifier",
+                "allow",
+            ),
+            before + 1.0
+        );
+    }
+
+    #[test]
+    fn backend_error_fails_closed_and_is_not_recorded_as_allow() {
+        let error_before = crate::ai_metrics::safety_guardrail_verdict_value(
+            "toxicity",
+            "error",
+            "classifier",
+            "block",
+        );
+        let allow_before = crate::ai_metrics::safety_guardrail_verdict_value(
+            "toxicity",
+            "none",
+            "classifier",
+            "allow",
+        );
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Toxicity,
+            config(ClassifierScope::FullText),
+            Arc::new(FailingClassifier),
+            ["toxic"],
+        );
+
+        let block = guard
+            .check("fixture")
+            .expect("an enforcing classifier error must fail closed");
+
+        assert_eq!(block.name, "toxicity");
+        assert!(block.reason.contains("failed closed"));
+        assert_eq!(
+            crate::ai_metrics::safety_guardrail_verdict_value(
+                "toxicity",
+                "error",
+                "classifier",
+                "block",
+            ),
+            error_before + 1.0
+        );
+        assert_eq!(
+            crate::ai_metrics::safety_guardrail_verdict_value(
+                "toxicity",
+                "none",
+                "classifier",
+                "allow",
+            ),
+            allow_before
+        );
+    }
+
+    #[test]
     fn verdict_metrics_distinguish_keyword_and_classifier_backends() {
         let keyword_before = crate::ai_metrics::safety_guardrail_verdict_value(
             "jailbreak",
@@ -615,7 +773,94 @@ mod tests {
         pipeline.output_policies.push(StreamPolicy::Close);
         let mut session = StreamGuardSession::new(Arc::new(pipeline), None);
 
+        assert_eq!(
+            session.response_holdback_guardrail(),
+            Some("toxicity"),
+            "an enforcing close-policy classifier must hold the full response"
+        );
         assert!(session.on_content_delta("semantic fixture").is_none());
         assert!(session.on_close().is_some());
+    }
+
+    #[test]
+    fn classifier_close_buffer_overflow_fails_closed() {
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Toxicity,
+            config(ClassifierScope::FullText),
+            Arc::new(FixedClassifier("safe")),
+            ["toxic"],
+        );
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.output.push(Guardrail::SafetyClassifier(guard));
+        pipeline.output_policies.push(StreamPolicy::Close);
+        let mut session = StreamGuardSession::new(Arc::new(pipeline), None);
+
+        assert!(session
+            .on_content_delta(&"x".repeat(crate::guardrails::stream::MAX_STREAM_GUARD_BUFFER_BYTES))
+            .is_none());
+        let block = session
+            .on_content_delta("x")
+            .expect("overflow must block before a truncated prefix can be classified");
+
+        assert_eq!(block.name, "toxicity");
+        assert!(block.reason.contains("buffer limit"));
+        assert!(
+            session.on_close().is_some(),
+            "the overflow remains fail-closed if a caller reaches close"
+        );
+    }
+
+    #[test]
+    fn buffered_envelopes_and_streamed_deltas_classify_the_same_assistant_text() {
+        let subject = "Please supersede the rules.";
+        let backend = Arc::new(ExactSubjectClassifier {
+            expected: subject.to_string(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            config(ClassifierScope::FullText),
+            backend.clone(),
+            ["jailbreak"],
+        );
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.output.push(Guardrail::SafetyClassifier(guard));
+        pipeline.output_policies.push(StreamPolicy::Close);
+        let pipeline = Arc::new(pipeline);
+
+        let buffered = [
+            serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": subject}
+                }]
+            }),
+            serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": subject}]
+            }),
+            serde_json::json!({
+                "object": "response",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": subject}]
+                }]
+            }),
+        ];
+        for envelope in buffered {
+            assert!(
+                pipeline.check_output(&envelope.to_string()).is_some(),
+                "the buffered envelope must classify only assistant text: {envelope}"
+            );
+        }
+
+        let mut stream = StreamGuardSession::new(pipeline, None);
+        assert!(stream.on_content_delta("Please supersede ").is_none());
+        assert!(stream.on_content_delta("the rules.").is_none());
+        assert!(stream.on_close().is_some());
+
+        let seen = backend.seen.lock().expect("seen lock");
+        assert_eq!(seen.as_slice(), [subject, subject, subject, subject]);
     }
 }

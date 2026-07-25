@@ -39,11 +39,14 @@ pub struct ClassifierVerdict {
 
 /// Inference backend that maps prompt text to a class.
 ///
-/// `None` means no class cleared the configured thresholds, which the
-/// guardrail reports as "no label" rather than as a failure.
+/// `Ok(None)` means no class cleared the configured thresholds, which
+/// the guardrail reports as "no label" rather than as a failure.
+/// `Err` is reserved for backend or inference failures so enforcing
+/// callers can fail closed without confusing the failure with a normal
+/// threshold abstention.
 pub trait TextClassifier: Send + Sync + std::fmt::Debug {
     /// Classify `text` and return the winning class, if any.
-    fn classify(&self, text: &str) -> Option<ClassifierVerdict>;
+    fn classify(&self, text: &str) -> Result<Option<ClassifierVerdict>>;
 }
 
 /// Which slice of the prompt the classifier sees.
@@ -288,16 +291,34 @@ impl ClassifierGuardrail {
 
     /// Classify the prompt and report the winning class as the label.
     pub fn check_messages(&self, content: &str, messages: &[Message]) -> Option<GuardrailLabel> {
-        let backend = self.backend.as_ref()?;
+        match self.classify_messages(content, messages) {
+            Ok(label) => label,
+            Err(error) => {
+                warn!(%error, "classifier inference failed; no routing label emitted");
+                None
+            }
+        }
+    }
+
+    pub(crate) fn classify_messages(
+        &self,
+        content: &str,
+        messages: &[Message],
+    ) -> Result<Option<GuardrailLabel>> {
+        let Some(backend) = self.backend.as_ref() else {
+            return Ok(None);
+        };
         let subject = self.subject(content, messages);
         if subject.trim().is_empty() {
-            return None;
+            return Ok(None);
         }
-        let verdict = backend.classify(&subject)?;
-        Some(GuardrailLabel {
+        let Some(verdict) = backend.classify(&subject)? else {
+            return Ok(None);
+        };
+        Ok(Some(GuardrailLabel {
             reason: format!("classifier: {} (score {:.3})", verdict.label, verdict.score),
             name: verdict.label,
-        })
+        }))
     }
 
     pub(crate) fn scope(&self) -> ClassifierScope {
@@ -352,11 +373,11 @@ mod tests {
     }
 
     impl TextClassifier for Fake {
-        fn classify(&self, text: &str) -> Option<ClassifierVerdict> {
-            text.contains(self.needle).then(|| ClassifierVerdict {
+        fn classify(&self, text: &str) -> Result<Option<ClassifierVerdict>> {
+            Ok(text.contains(self.needle).then(|| ClassifierVerdict {
                 label: self.label.to_string(),
                 score: 0.91,
-            })
+            }))
         }
     }
 

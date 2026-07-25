@@ -243,9 +243,12 @@ block when their configured unsafe class wins.
 
 Classifier mode is never an automatic upgrade. Keyword mode remains the
 zero-dependency default, and it is a literal substring matcher. When
-classifier mode is explicit, the model and tokenizer must be usable while the
-candidate AI action is compiled; otherwise publication fails instead of
-quietly weakening the guardrail.
+classifier mode is explicit, publication validates the configuration structure
+without opening the model or tokenizer. The published handler loads those
+artifacts lazily when its guardrail pipeline is first used. An unavailable
+artifact fails that request and every later request on the same handler
+generation closed with a configuration error instead of quietly weakening the
+guardrail.
 
 The three guardrails use separate closed class taxonomies but share the
 process-level model cache. Multiple entries that point at the same resolved

@@ -497,9 +497,13 @@ model files, but it does not understand paraphrases, obfuscation, translation,
 or meaning. Do not describe it as ML classification.
 
 `mode: classifier` uses the local embedding classifier and is enforcing. It
-does not silently fall back to keyword matching: a missing classifier block,
-unavailable model, invalid taxonomy, or ignored keyword-only field makes the
-candidate configuration fail before publication.
+does not silently fall back to keyword matching. Structural errors such as a
+missing classifier block, invalid taxonomy, or ignored keyword-only field make
+the candidate configuration fail before publication. Model and tokenizer
+artifacts are loaded lazily when the published handler first builds its
+guardrail pipeline. If either artifact is unavailable, that request and every
+later request on the same handler generation fail closed with a configuration
+error; keyword matching is never substituted.
 
 ```yaml
 guardrails:
@@ -536,14 +540,20 @@ All three use the same `min_score` and `min_margin` behavior as the routing
 classifier, and classifier entries that resolve to the same artifacts share
 one loaded embedder. Input classification defaults to the last user message;
 set `scope: full_text` to classify the complete prompt. Output classification
-always sees the complete buffered response. An explicit
-`scope: last_user_message` is therefore rejected under `output:`.
+always sees the complete assistant text, extracted from OpenAI Chat, Anthropic
+Messages, or OpenAI Responses envelopes using the same concatenation as
+decoded streaming deltas. An explicit `scope: last_user_message` is therefore
+rejected under `output:`.
 
 Classifier-backed output checks default to `stream_policy: close`. For a
 non-streaming response this blocks before the response is returned. For a
-streaming response it evaluates the accumulated text at stream close, records
-the verdict, and prevents cache admission, but it cannot retract bytes already
-sent to the client. Use `stream_policy: off` only as an explicit coverage
+streaming response the relay holds every response-body frame until it evaluates
+the accumulated assistant text at stream close. A clean verdict releases the
+original frames in order. A blocked verdict, classifier error, decode failure,
+or 1 MiB decoded-text or relay-buffer overflow fails closed without releasing
+body bytes and prevents cache admission. Response headers may already have
+been sent, so a blocked client sees an empty terminated stream rather than a
+new error status. Use `stream_policy: off` only as an explicit coverage
 tradeoff; `stream_policy: chunk` is rejected because a full-text classifier is
 not prefix-stable.
 
@@ -552,7 +562,9 @@ Every evaluation increments
 The `backend` label distinguishes `keyword` from `classifier`, so dashboards
 can verify which path is actually active. This is an evaluation counter, not
 a request counter: streaming keyword mode can record more than one allowed
-evaluation while successive deltas are scanned. The complete enforcing example is
+evaluation while successive deltas are scanned. Classifier inference errors
+use `class="error"` and `verdict="block"`; they are never counted or cached as
+allows. The complete enforcing example is
 [ai-safety-classifiers](../examples/ai-safety-classifiers/).
 
 ### Embedding classifier
@@ -602,9 +614,13 @@ over the limit is rejected rather than silently embedding an unbounded string.
 
 The released binary includes `inprocess-classify`. Source builds that disable
 default features must enable it explicitly. Model and tokenizer files remain
-operator-supplied. A load or inference failure emits a warning and no class,
-so existing routing continues and neighboring security guardrails remain
-active.
+operator-supplied and are opened lazily when the first request builds the
+published handler's guardrail pipeline. For the routing-only `classifier`
+guardrail, a load or inference failure emits a warning and no class, so
+existing routing continues and neighboring security guardrails remain active.
+For classifier-backed safety guardrails, an artifact load failure rejects the
+request with a configuration error, and an inference failure produces a
+fail-closed block.
 
 The public JSON schema deliberately leaves `action` as raw JSON so the module
 registry can accept built-in and external actions without regenerating one
@@ -644,7 +660,7 @@ Fusion semantics, verdict-cache keying, and the latency cascade are in [ai-guard
 
 ### Streaming policy
 
-Every built-in output guardrail runs on streaming responses, and the verdicts match what the buffered path would decide for the same text. The proxy decodes each streamed delta (the JSON content, not the raw SSE frame bytes) and feeds it to a per-stream guardrail session that keeps matcher state across chunks, so a pattern split across two deltas still matches.
+Every built-in output guardrail runs on streaming responses, and the verdicts match what the buffered path would decide for the same assistant text. The proxy decodes each streamed delta (the JSON content, not the raw SSE frame bytes) and feeds it to a per-stream guardrail session that keeps matcher state across chunks, so a pattern split across two deltas still matches.
 
 | Guardrail | On streaming output | How |
 |---|---|---|
@@ -653,12 +669,12 @@ Every built-in output guardrail runs on streaming responses, and the verdicts ma
 | `schema` | yes | decided on the parsed value |
 | `context_poisoning` | yes | rule matches are per-message |
 | `injection` | yes | case-insensitive substring set, matched over a cumulative window |
-| `toxicity` | yes | keyword mode matches over a cumulative window; classifier mode defaults to full-response evaluation at close |
-| `jailbreak` | yes | keyword mode includes the standalone-DAN word rule and a cumulative window; classifier mode defaults to full-response evaluation at close |
-| `content_safety` | yes | keyword mode matches category terms over a cumulative window; classifier mode defaults to full-response evaluation at close |
+| `toxicity` | yes | keyword mode matches over a cumulative window; classifier mode holds body frames for full-response evaluation at close |
+| `jailbreak` | yes | keyword mode includes the standalone-DAN word rule and a cumulative window; classifier mode holds body frames for full-response evaluation at close |
+| `content_safety` | yes | keyword mode matches category terms over a cumulative window; classifier mode holds body frames for full-response evaluation at close |
 | `agent_alignment` | yes | streamed `tool_calls` deltas are assembled per call and judged when each call completes; block mode holds tool-call frames back until their call is judged, while text deltas flow |
 
-A block terminates the stream: the violating content and everything after it is withheld, and the response is never admitted to any cache. Headers are already sent by then, so the client sees the stream cut rather than an error status. Input guardrails always run against the full request regardless of `stream`.
+A block terminates the stream and the response is never admitted to any cache. Live keyword and chunk-policy guards can only withhold the violating chunk and everything after it. Classifier-backed close-policy guards hold the entire response body, so a block releases no body bytes. Headers may already be sent, so the client sees the stream terminate rather than receive a new error status. Input guardrails always run against the full request regardless of `stream`.
 
 Each output entry takes an optional `stream_policy` when the default live evaluation is not what you want:
 

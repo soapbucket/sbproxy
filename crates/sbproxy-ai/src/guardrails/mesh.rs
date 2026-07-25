@@ -198,6 +198,16 @@ impl GuardrailMesh {
             Some(hit) => hit,
             None => {
                 let collected = self.collect_cascade(pipeline, messages, content);
+                let fail_closed = collected
+                    .iter()
+                    .any(|finding| matches!(finding, GuardrailFinding::SecurityBackendFailure(_)));
+                let cacheable = !collected.iter().any(|finding| {
+                    matches!(
+                        finding,
+                        GuardrailFinding::SecurityBackendFailure(_)
+                            | GuardrailFinding::RoutingBackendFailure
+                    )
+                });
                 let mut labels = Vec::new();
                 let mut routing_labels = Vec::new();
                 let mut security_labels = Vec::new();
@@ -213,6 +223,12 @@ impl GuardrailMesh {
                             labels.push(label.name.clone());
                             routing_labels.push(label.name);
                         }
+                        GuardrailFinding::SecurityBackendFailure(block) => {
+                            labels.push(block.name.clone());
+                            security_labels.push(block.name);
+                            reasons.push(block.reason);
+                        }
+                        GuardrailFinding::RoutingBackendFailure => {}
                     }
                 }
                 let entry = CachedMeshDecision {
@@ -220,15 +236,18 @@ impl GuardrailMesh {
                     routing_labels,
                     security_labels,
                     reasons,
+                    fail_closed,
                 };
-                self.cache_store(pipeline, key, &entry);
+                if cacheable {
+                    self.cache_store(pipeline, key, &entry);
+                }
                 entry
             }
         };
 
         let flagged = cached.security_labels.len();
         let threshold = self.config.block_threshold;
-        let block = threshold > 0 && flagged >= threshold;
+        let block = cached.fail_closed || (threshold > 0 && flagged >= threshold);
         let redact = !block && self.config.redact_on_flag && flagged > 0;
 
         MeshDecision {
@@ -280,10 +299,11 @@ mod tests {
     use super::*;
     use crate::guardrails::{
         ClassifierBackendConfig, ClassifierConfig, ClassifierGuardrail, ClassifierScope,
-        ClassifierVerdict, EmbeddingBackendConfig, InjectionGuardrail, RegexAction, RegexGuardrail,
-        TextClassifier,
+        ClassifierVerdict, EmbeddingBackendConfig, Guardrail, InjectionGuardrail, RegexAction,
+        RegexGuardrail, SafetyClassifierGuardrail, SafetyGuardrailKind, TextClassifier,
     };
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn msg(content: &str) -> Message {
@@ -301,19 +321,62 @@ mod tests {
     struct SubjectClassifier;
 
     impl TextClassifier for SubjectClassifier {
-        fn classify(&self, text: &str) -> Option<ClassifierVerdict> {
+        fn classify(&self, text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
             let label = if text.contains("alpha") {
                 "alpha"
             } else if text.contains("beta") {
                 "beta"
             } else {
-                return None;
+                return Ok(None);
             };
-            Some(ClassifierVerdict {
+            Ok(Some(ClassifierVerdict {
                 label: label.to_string(),
                 score: 0.91,
-            })
+            }))
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecoveringSafetyClassifier {
+        calls: AtomicUsize,
+    }
+
+    impl TextClassifier for RecoveringSafetyClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("transient fixture failure");
+            }
+            Ok(Some(ClassifierVerdict {
+                label: "safe".to_string(),
+                score: 0.91,
+            }))
+        }
+    }
+
+    fn safety_classifier(backend: Arc<dyn TextClassifier>) -> Guardrail {
+        Guardrail::SafetyClassifier(SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            ClassifierConfig {
+                backend: ClassifierBackendConfig::Embedding(EmbeddingBackendConfig {
+                    model_path: "/unused/model.onnx".to_string(),
+                    tokenizer_path: "/unused/tokenizer.json".to_string(),
+                    min_score: 0.30,
+                    min_margin: 0.05,
+                    max_model_bytes: None,
+                }),
+                classes: BTreeMap::from([
+                    (
+                        "jailbreak".to_string(),
+                        vec!["override the policy".to_string()],
+                    ),
+                    ("safe".to_string(), vec!["ordinary question".to_string()]),
+                ]),
+                scope: ClassifierScope::FullText,
+                max_chars: 2000,
+            },
+            backend,
+            ["jailbreak"],
+        ))
     }
 
     fn classifier(scope: ClassifierScope) -> Guardrail {
@@ -426,6 +489,46 @@ mod tests {
         let second = eval(&mesh, &p, content);
         assert_eq!(first.labels, second.labels);
         assert!(second.block);
+    }
+
+    #[test]
+    fn mesh_does_not_cache_an_enforcing_classifier_backend_error_as_allow() {
+        let mut config = cfg(1);
+        config.cache = true;
+        let mesh = GuardrailMesh::new(config);
+        let backend = Arc::new(RecoveringSafetyClassifier::default());
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(safety_classifier(backend.clone()));
+
+        let first = eval(&mesh, &pipeline, "same prompt");
+        let second = eval(&mesh, &pipeline, "same prompt");
+
+        assert!(first.block, "backend failure must fail closed");
+        assert!(
+            !second.block,
+            "the transient failure must not be served from the verdict cache"
+        );
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "the second evaluation must retry the backend"
+        );
+    }
+
+    #[test]
+    fn enforcing_classifier_backend_error_blocks_regardless_of_mesh_quorum() {
+        let mesh = GuardrailMesh::new(cfg(2));
+        let backend = Arc::new(RecoveringSafetyClassifier::default());
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(safety_classifier(backend));
+
+        let decision = eval(&mesh, &pipeline, "same prompt");
+
+        assert!(
+            decision.block,
+            "an enforcing backend failure must fail closed even below the configured quorum"
+        );
+        assert_eq!(decision.security_labels, ["jailbreak"]);
     }
 
     #[test]

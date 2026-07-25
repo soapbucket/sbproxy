@@ -67,6 +67,8 @@ pub struct GuardrailLabel {
 pub(crate) enum GuardrailFinding {
     Security(GuardrailBlock),
     Routing(GuardrailLabel),
+    SecurityBackendFailure(GuardrailBlock),
+    RoutingBackendFailure,
 }
 
 /// Per-entry streaming evaluation policy (WOR-1810, absorbing the
@@ -205,9 +207,26 @@ impl Guardrail {
         messages: &[Message],
     ) -> Option<GuardrailFinding> {
         match self {
-            Self::Classifier(g) => g
-                .check_messages(content, messages)
-                .map(GuardrailFinding::Routing),
+            Self::Classifier(g) => match g.classify_messages(content, messages) {
+                Ok(Some(label)) => Some(GuardrailFinding::Routing(label)),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "classifier inference failed; mesh verdict will not be cached"
+                    );
+                    Some(GuardrailFinding::RoutingBackendFailure)
+                }
+            },
+            Self::SafetyClassifier(g) => match g.check_messages_outcome(content, messages) {
+                safety_classifier::SafetyClassifierOutcome::Allow => None,
+                safety_classifier::SafetyClassifierOutcome::Block(block) => {
+                    Some(GuardrailFinding::Security(block))
+                }
+                safety_classifier::SafetyClassifierOutcome::BackendFailure(block) => {
+                    Some(GuardrailFinding::SecurityBackendFailure(block))
+                }
+            },
             _ => self
                 .check_with_text(content, messages)
                 .map(GuardrailFinding::Security),
@@ -325,6 +344,7 @@ pub(crate) struct CachedMeshDecision {
     routing_labels: Vec<String>,
     security_labels: Vec<String>,
     reasons: Vec<String>,
+    fail_closed: bool,
 }
 
 /// Per-pipeline mesh verdict cache: a bounded LRU from a structured prompt
@@ -452,13 +472,89 @@ impl GuardrailPipeline {
 
     /// Check output content. Returns first block encountered.
     pub fn check_output(&self, content: &str) -> Option<GuardrailBlock> {
+        let classifier_subject = assistant_response_text(content);
         for guard in &self.output {
-            if let Some(block) = guard.check(content) {
+            let block = match guard {
+                Guardrail::SafetyClassifier(classifier) => {
+                    classifier.check(classifier_subject.as_deref().unwrap_or(content))
+                }
+                _ => guard.check(content),
+            };
+            if let Some(block) = block {
                 return Some(block);
             }
         }
         None
     }
+}
+
+/// Extract the assistant text that the streaming hub emits as text deltas.
+///
+/// Buffered responses can leave the gateway in OpenAI Chat, Anthropic
+/// Messages, or OpenAI Responses shape. Classifier-backed output safety
+/// guards must classify the same text in every shape and in streaming
+/// mode, while non-classifier guards continue to inspect the raw body.
+fn assistant_response_text(content: &str) -> Option<String> {
+    fn append_content(value: &serde_json::Value, out: &mut String) -> bool {
+        match value {
+            serde_json::Value::String(text) => {
+                out.push_str(text);
+                true
+            }
+            serde_json::Value::Array(parts) => {
+                let mut recognized = false;
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                        out.push_str(text);
+                        recognized = true;
+                    }
+                }
+                recognized
+            }
+            _ => false,
+        }
+    }
+
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let mut out = String::new();
+
+    if let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) {
+        let mut recognized = false;
+        for choice in choices {
+            if let Some(message) = choice.get("message") {
+                if let Some(message_content) = message.get("content") {
+                    recognized |= append_content(message_content, &mut out);
+                }
+            }
+        }
+        return recognized.then_some(out);
+    }
+
+    if let Some(output) = value.get("output").and_then(serde_json::Value::as_array) {
+        let mut recognized = false;
+        for item in output {
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                && item.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            {
+                if let Some(message_content) = item.get("content") {
+                    recognized |= append_content(message_content, &mut out);
+                }
+            }
+        }
+        return recognized.then_some(out);
+    }
+
+    let is_anthropic_message = value.get("type").and_then(serde_json::Value::as_str)
+        == Some("message")
+        && value.get("role").and_then(serde_json::Value::as_str) == Some("assistant");
+    if is_anthropic_message {
+        return value
+            .get("content")
+            .filter(|message_content| append_content(message_content, &mut out))
+            .map(|_| out);
+    }
+
+    None
 }
 
 /// Public text view of a slice of messages, used by the guardrail mesh as
@@ -711,11 +807,11 @@ mod tests {
     struct SafeClassifier;
 
     impl TextClassifier for SafeClassifier {
-        fn classify(&self, _text: &str) -> Option<ClassifierVerdict> {
-            Some(ClassifierVerdict {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            Ok(Some(ClassifierVerdict {
                 label: "safe".to_string(),
                 score: 0.90,
-            })
+            }))
         }
     }
 

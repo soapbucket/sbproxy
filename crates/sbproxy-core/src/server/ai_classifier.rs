@@ -136,7 +136,7 @@ impl std::fmt::Debug for CentroidClassifier {
 
 #[cfg(feature = "inprocess-classify")]
 impl sbproxy_ai::guardrails::TextClassifier for CentroidClassifier {
-    fn classify(&self, text: &str) -> Option<ClassifierVerdict> {
+    fn classify(&self, text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
         let started = std::time::Instant::now();
         let embedded = self.embedder.embed(text);
         let result = if embedded.is_ok() { "ok" } else { "error" };
@@ -151,15 +151,15 @@ impl sbproxy_ai::guardrails::TextClassifier for CentroidClassifier {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(error = %e, "classifier embedding failed; no label emitted");
-                return None;
+                return Err(e);
             }
         };
-        nearest_centroid(
+        Ok(nearest_centroid(
             &out.values,
             &self.centroids,
             self.min_score,
             self.min_margin,
-        )
+        ))
     }
 }
 
@@ -402,10 +402,10 @@ fn shared_embedder(
 
 /// Build a classifier backend for `cfg`.
 ///
-/// Embeds every example prompt once and folds each class into a unit
-/// centroid. A class whose examples all fail to embed is dropped with a
-/// warning rather than failing the whole load, so one bad example does
-/// not cost the operator the other classes.
+/// Embed every configured class and require each one to produce a unit
+/// centroid. Individual bad examples are skipped, but dropping an entire
+/// class would silently change the configured taxonomy and is therefore
+/// a construction error.
 #[cfg(feature = "inprocess-classify")]
 fn embed_class_examples(
     cfg: &sbproxy_ai::guardrails::ClassifierConfig,
@@ -429,6 +429,32 @@ fn embed_class_examples(
 }
 
 #[cfg(feature = "inprocess-classify")]
+fn build_class_centroids(
+    cfg: &sbproxy_ai::guardrails::ClassifierConfig,
+    mut embed: impl FnMut(&str) -> anyhow::Result<Vec<f32>>,
+) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
+    let mut centroids = Vec::with_capacity(cfg.classes.len());
+    let mut expected_dimension = None;
+    for (label, examples) in &cfg.classes {
+        let vectors = embed_class_examples(cfg, label, examples, &mut embed);
+        let centroid = build_centroid(&vectors)
+            .ok_or_else(|| anyhow::anyhow!("classifier class `{label}` has no usable centroid"))?;
+        match expected_dimension {
+            Some(dimension) if centroid.len() != dimension => {
+                anyhow::bail!(
+                    "classifier class `{label}` centroid dimension {} does not match {dimension}",
+                    centroid.len()
+                );
+            }
+            None => expected_dimension = Some(centroid.len()),
+            Some(_) => {}
+        }
+        centroids.push((label.clone(), centroid));
+    }
+    Ok(centroids)
+}
+
+#[cfg(feature = "inprocess-classify")]
 fn build_backend(
     cfg: &sbproxy_ai::guardrails::ClassifierConfig,
 ) -> anyhow::Result<std::sync::Arc<dyn sbproxy_ai::guardrails::TextClassifier>> {
@@ -436,19 +462,9 @@ fn build_backend(
     // irrefutable.
     let sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(backend) = &cfg.backend;
     let embedder = shared_embedder(backend)?;
-    let mut centroids: Vec<(String, Vec<f32>)> = Vec::new();
-    for (label, examples) in &cfg.classes {
-        let vectors = embed_class_examples(cfg, label, examples, |example| {
-            embedder.embed(example).map(|output| output.values)
-        });
-        match build_centroid(&vectors) {
-            Some(c) => centroids.push((label.clone(), c)),
-            None => tracing::warn!(class = %label, "class has no usable examples; dropping it"),
-        }
-    }
-    if centroids.is_empty() {
-        anyhow::bail!("classifier has no usable class centroids");
-    }
+    let centroids = build_class_centroids(cfg, |example| {
+        embedder.embed(example).map(|output| output.values)
+    })?;
     let model_label = std::path::Path::new(&backend.model_path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -657,6 +673,53 @@ mod tests {
 
         assert_eq!(seen, ["éabc"]);
         assert_eq!(vectors, [vec![1.0]]);
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_requires_a_centroid_for_every_configured_class() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec!["ordinary conversation".to_string()],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "ordinary conversation" {
+                anyhow::bail!("fixture embedding failure");
+            }
+            Ok(vec![1.0, 0.0])
+        })
+        .expect_err("a missing required centroid must fail classifier construction");
+
+        assert!(
+            error.to_string().contains("safe"),
+            "error must identify the class without a usable centroid: {error}"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_rejects_mismatched_class_dimensions() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec!["ordinary conversation".to_string()],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "ordinary conversation" {
+                Ok(vec![1.0, 0.0, 0.0])
+            } else {
+                Ok(vec![1.0, 0.0])
+            }
+        })
+        .expect_err("all configured class centroids must have the same dimension");
+
+        assert!(
+            error.to_string().contains("dimension"),
+            "error must explain the malformed centroid dimensions: {error}"
+        );
     }
 
     #[test]

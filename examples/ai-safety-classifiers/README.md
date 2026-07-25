@@ -52,15 +52,17 @@ sum by (guardrail, class, backend, verdict) (
 
 - Keyword matching remains the default when `mode` is omitted. It is a
   case-insensitive substring matcher, not an ML classifier.
-- `mode: classifier` is explicit and enforcing. Missing artifacts or an
-  invalid class map reject the candidate configuration; there is no silent
-  keyword fallback.
+- `mode: classifier` is explicit and enforcing. An invalid class map rejects
+  the candidate configuration. Artifacts load lazily on the first request;
+  missing artifacts fail that request and later requests on the same handler
+  generation closed. There is no silent keyword fallback.
 - Input classifiers default to the last user message. The output toxicity
   entry uses the complete response.
 - The output entry uses `stream_policy: close`. Non-streaming responses are
-  checked before return. With streaming enabled, the close verdict cannot
-  retract bytes already delivered, though it still records the violation and
-  prevents cache admission.
+  checked before return. With streaming enabled, response-body frames are held
+  until the complete assistant text receives a clean close verdict. A block,
+  classifier error, decode failure, or buffer overflow releases no body bytes
+  and prevents cache admission.
 - The sample centroids are starting points, not a certification set. Measure
   false positives and false negatives on representative prompts, then tune
   examples, `min_score`, and `min_margin`.

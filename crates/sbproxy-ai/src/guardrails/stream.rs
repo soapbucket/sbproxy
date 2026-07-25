@@ -27,7 +27,7 @@ use crate::format::HubToolCallDelta;
 
 /// Cap on the accumulated close-policy buffer and on assembled
 /// tool-call arguments. Mirrors the SSE framer's 1 MiB bound.
-const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+pub const MAX_STREAM_GUARD_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// A streamed tool call assembled from its deltas.
 #[derive(Debug, Clone)]
@@ -193,6 +193,33 @@ impl StreamGuardSession {
         })
     }
 
+    /// Name of the first close-policy safety classifier that requires
+    /// the relay to hold every response-body byte until [`Self::on_close`]
+    /// allows release.
+    pub fn response_holdback_guardrail(&self) -> Option<&str> {
+        self.at_close.iter().find_map(|&i| {
+            let Guardrail::SafetyClassifier(guard) = &self.pipeline.output[i] else {
+                return None;
+            };
+            Some(guard.name())
+        })
+    }
+
+    fn close_buffer_overflow_block(&self) -> GuardrailBlock {
+        let name = self
+            .at_close
+            .first()
+            .map(|&i| self.pipeline.output[i].name())
+            .unwrap_or("output_guardrail");
+        GuardrailBlock {
+            name: name.to_string(),
+            reason: format!(
+                "{name} close-policy stream exceeded the {}-byte buffer limit; failed closed",
+                MAX_STREAM_GUARD_BUFFER_BYTES
+            ),
+        }
+    }
+
     /// Feed one decoded content delta. Returns the first block verdict.
     pub fn on_content_delta(&mut self, text: &str) -> Option<GuardrailBlock> {
         // More text arrived: any deferred boundary verdict re-derives
@@ -229,8 +256,9 @@ impl StreamGuardSession {
         }
 
         if !self.at_close.is_empty() && !self.close_buf_full {
-            if self.close_buf.len() + text.len() > MAX_BUFFER_BYTES {
+            if self.close_buf.len() + text.len() > MAX_STREAM_GUARD_BUFFER_BYTES {
                 self.close_buf_full = true;
+                return Some(self.close_buffer_overflow_block());
             } else {
                 self.close_buf.push_str(text);
             }
@@ -275,7 +303,7 @@ impl StreamGuardSession {
             }
         }
         if let Some(chunk) = &delta.arguments_chunk {
-            if entry.args.len() + chunk.len() > MAX_BUFFER_BYTES {
+            if entry.args.len() + chunk.len() > MAX_STREAM_GUARD_BUFFER_BYTES {
                 entry.truncated = true;
             } else {
                 entry.args.push_str(chunk);
@@ -347,6 +375,9 @@ impl StreamGuardSession {
     pub fn on_close(&mut self) -> Option<GuardrailBlock> {
         if let Some(block) = self.deferred.take() {
             return Some(block);
+        }
+        if self.close_buf_full {
+            return Some(self.close_buffer_overflow_block());
         }
         for &i in &self.at_close {
             if let Some(block) = self.pipeline.output[i].check(&self.close_buf) {

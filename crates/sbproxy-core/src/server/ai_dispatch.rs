@@ -2961,9 +2961,10 @@ pub(super) async fn handle_ai_proxy(
     let guardrail_pipeline = match config.guardrail_pipeline() {
         Ok(pipeline) => pipeline,
         Err(error) => {
-            // Handler compilation validates this configuration before it
-            // is published. Keep the request path fail-closed as a final
-            // defense against a future compiler/runtime mismatch.
+            // Publication validates the configuration structure. Classifier
+            // artifacts load lazily while building this request-time
+            // pipeline, so an unavailable enforcing backend lands here too.
+            // Keep every such failure closed.
             tracing::error!(
                 error = %error,
                 "AI proxy: guardrail pipeline compilation failed; rejecting request"
@@ -6650,6 +6651,226 @@ fn process_guard_events(
     (None, released)
 }
 
+#[derive(Debug)]
+struct RelayBodyHoldback {
+    guardrail: Option<String>,
+    max_bytes: usize,
+    buffered_bytes: usize,
+    chunks: Vec<Bytes>,
+    failed: bool,
+}
+
+impl RelayBodyHoldback {
+    fn new(guardrail: Option<&str>, max_bytes: usize) -> Self {
+        Self {
+            guardrail: guardrail.map(str::to_string),
+            max_bytes,
+            buffered_bytes: 0,
+            chunks: Vec::new(),
+            failed: false,
+        }
+    }
+
+    fn stage(
+        &mut self,
+        bytes: Bytes,
+    ) -> std::result::Result<Option<Bytes>, sbproxy_ai::guardrails::GuardrailBlock> {
+        let Some(guardrail) = self.guardrail.as_deref() else {
+            return Ok(Some(bytes));
+        };
+        if self.failed || self.buffered_bytes.saturating_add(bytes.len()) > self.max_bytes {
+            self.failed = true;
+            self.buffered_bytes = 0;
+            self.chunks.clear();
+            return Err(sbproxy_ai::guardrails::GuardrailBlock {
+                name: guardrail.to_string(),
+                reason: format!(
+                    "{guardrail} enforcing stream exceeded the {}-byte relay hold-back limit; \
+                     failed closed",
+                    self.max_bytes
+                ),
+            });
+        }
+        self.buffered_bytes += bytes.len();
+        self.chunks.push(bytes);
+        Ok(None)
+    }
+
+    fn release(&mut self) -> Vec<Bytes> {
+        if self.failed {
+            return Vec::new();
+        }
+        self.buffered_bytes = 0;
+        std::mem::take(&mut self.chunks)
+    }
+
+    fn decode_fallback_block(&self) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+        let guardrail = self.guardrail.as_deref()?;
+        Some(sbproxy_ai::guardrails::GuardrailBlock {
+            name: guardrail.to_string(),
+            reason: format!(
+                "{guardrail} enforcing stream could not decode a canonical assistant response; \
+                 failed closed"
+            ),
+        })
+    }
+
+    fn contains_malformed_sse_data(&self) -> bool {
+        let mut framer = sbproxy_ai::format::SseFramer::new();
+        let mut frames = Vec::new();
+        for chunk in &self.chunks {
+            frames.extend(framer.feed(chunk));
+        }
+        if let Some(frame) = framer.flush() {
+            frames.push(frame);
+        }
+        frames.into_iter().any(|frame| {
+            let (_, data) = sbproxy_ai::format::split_sse_frame(&frame);
+            let data = data.trim();
+            !data.is_empty()
+                && data != "[DONE]"
+                && serde_json::from_str::<serde_json::Value>(data).is_err()
+        })
+    }
+
+    fn close_decode_block(
+        &self,
+        decoder_yielded: bool,
+    ) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+        if self.buffered_bytes == 0 {
+            return None;
+        }
+        (!decoder_yielded || self.contains_malformed_sse_data())
+            .then(|| self.decode_fallback_block())
+            .flatten()
+    }
+}
+
+#[cfg(test)]
+mod stream_classifier_holdback_tests {
+    use super::RelayBodyHoldback;
+    use bytes::Bytes;
+
+    fn relay_one(
+        holdback: &mut RelayBodyHoldback,
+        downstream: &mut Vec<Bytes>,
+        bytes: &'static [u8],
+    ) -> std::result::Result<(), sbproxy_ai::guardrails::GuardrailBlock> {
+        if let Some(ready) = holdback.stage(Bytes::from_static(bytes))? {
+            downstream.push(ready);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn relay_emits_no_body_bytes_before_classifier_close_verdict() {
+        let mut holdback = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        let mut downstream = Vec::new();
+
+        relay_one(&mut holdback, &mut downstream, b"data: first\n\n").expect("first frame");
+        relay_one(&mut holdback, &mut downstream, b"data: second\n\n").expect("second frame");
+
+        assert!(
+            downstream.is_empty(),
+            "no response-body frame may reach the client before the close verdict"
+        );
+
+        downstream.extend(holdback.release());
+        assert_eq!(
+            downstream.concat(),
+            b"data: first\n\ndata: second\n\n",
+            "a clean close releases the original frames in order"
+        );
+    }
+
+    #[test]
+    fn relay_holdback_overflow_fails_closed_without_releasing_a_prefix() {
+        let mut holdback = RelayBodyHoldback::new(Some("toxicity"), 5);
+        let mut downstream = Vec::new();
+        relay_one(&mut holdback, &mut downstream, b"12345").expect("at limit");
+
+        let block = relay_one(&mut holdback, &mut downstream, b"6")
+            .expect_err("one byte above the limit must fail closed");
+
+        assert_eq!(block.name, "toxicity");
+        assert!(block.reason.contains("hold-back limit"));
+        assert!(downstream.is_empty());
+        assert!(
+            holdback.release().is_empty(),
+            "an overflowed prefix must never become releasable"
+        );
+    }
+
+    #[test]
+    fn relay_without_a_close_classifier_forwards_immediately() {
+        let mut holdback = RelayBodyHoldback::new(None, 1);
+        let mut downstream = Vec::new();
+
+        relay_one(&mut holdback, &mut downstream, b"unbounded").expect("pass-through");
+
+        assert_eq!(downstream.concat(), b"unbounded");
+    }
+
+    #[test]
+    fn undecodable_enforcing_stream_fails_closed_instead_of_classifying_raw_sse() {
+        let protected = RelayBodyHoldback::new(Some("content_safety"), 1024);
+        let block = protected
+            .decode_fallback_block()
+            .expect("canonical text is mandatory for an enforcing classifier");
+        assert_eq!(block.name, "content_safety");
+        assert!(block.reason.contains("decode"));
+
+        let unprotected = RelayBodyHoldback::new(None, 1024);
+        assert!(
+            unprotected.decode_fallback_block().is_none(),
+            "ordinary stream guardrails retain their raw fallback"
+        );
+    }
+
+    #[test]
+    fn short_undecodable_enforcing_body_fails_closed_at_stream_end() {
+        let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        assert!(protected
+            .stage(Bytes::from_static(b"not valid SSE"))
+            .expect("stage")
+            .is_none());
+
+        let block = protected
+            .close_decode_block(false)
+            .expect("a nonempty body with no decoded event must fail closed");
+        assert_eq!(block.name, "jailbreak");
+        assert!(protected.close_decode_block(true).is_none());
+
+        let empty = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        assert!(
+            empty.close_decode_block(false).is_none(),
+            "an actually empty response has no unclassified body bytes"
+        );
+    }
+
+    #[test]
+    fn malformed_frame_after_a_decoded_event_still_fails_closed() {
+        let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        assert!(protected
+            .stage(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"safe\"}}]}\n\n"
+            ))
+            .expect("valid frame")
+            .is_none());
+        assert!(protected
+            .stage(Bytes::from_static(b"data: not-json\n\n"))
+            .expect("malformed frame is still held")
+            .is_none());
+
+        let block = protected
+            .close_decode_block(true)
+            .expect("unclassified malformed data must not be released");
+
+        assert_eq!(block.name, "jailbreak");
+        assert!(block.reason.contains("decode"));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_ai_stream(
     session: &mut Session,
@@ -6861,6 +7082,14 @@ pub(super) async fn relay_ai_stream(
     let holds_tool_frames = guard_session
         .as_ref()
         .is_some_and(|s| s.holds_tool_frames());
+    let response_holdback_guardrail = guard_session
+        .as_ref()
+        .and_then(|session| session.response_holdback_guardrail())
+        .map(str::to_string);
+    let mut response_body_holdback = RelayBodyHoldback::new(
+        response_holdback_guardrail.as_deref(),
+        sbproxy_ai::guardrails::stream::MAX_STREAM_GUARD_BUFFER_BYTES,
+    );
 
     // --- Native-format streaming translator ---
     //
@@ -7022,6 +7251,27 @@ pub(super) async fn relay_ai_stream(
                         None
                     };
 
+                if guard_raw_mode {
+                    if let Some(block) = response_body_holdback.decode_fallback_block() {
+                        warn!(
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: enforcing output classifier stream decode failed closed"
+                        );
+                        sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.reason,
+                        );
+                        if let Some(c) = ctx.as_deref_mut() {
+                            mark_guardrail_block(c, block.name.clone());
+                        }
+                        output_guard_blocked = true;
+                        break 'relay;
+                    }
+                }
+
                 let mut released_tool_chunks: Vec<sbproxy_ai::format::HubChunk> = Vec::new();
                 if let Some(sessn) = guard_session.as_mut() {
                     let pending_block = if let Some(events) = decoded.as_deref() {
@@ -7132,12 +7382,33 @@ pub(super) async fn relay_ai_stream(
                     // and wait for the next chunk to flush.
                     continue;
                 }
-                if let Some(trace) = trace_stream_content.as_mut() {
-                    trace.feed(&outbound_bytes);
+                match response_body_holdback.stage(outbound_bytes) {
+                    Ok(Some(ready)) => {
+                        if let Some(trace) = trace_stream_content.as_mut() {
+                            trace.feed(&ready);
+                        }
+                        session.write_response_body(Some(ready), false).await?;
+                    }
+                    Ok(None) => {}
+                    Err(block) => {
+                        warn!(
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: output guardrail relay hold-back failed closed"
+                        );
+                        sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.reason,
+                        );
+                        if let Some(c) = ctx.as_deref_mut() {
+                            mark_guardrail_block(c, block.name.clone());
+                        }
+                        output_guard_blocked = true;
+                        break 'relay;
+                    }
                 }
-                session
-                    .write_response_body(Some(outbound_bytes), false)
-                    .await?;
             }
             Some(Err(e)) => {
                 let kind = if e.is_timeout() {
@@ -7170,6 +7441,31 @@ pub(super) async fn relay_ai_stream(
                     } else {
                         Vec::new()
                     };
+                if guard_decoder.is_some() && !tail_events.is_empty() {
+                    guard_decoder_yielded = true;
+                }
+                if guard_decoder.is_some() {
+                    if let Some(block) =
+                        response_body_holdback.close_decode_block(guard_decoder_yielded)
+                    {
+                        warn!(
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: enforcing output classifier stream decode failed closed"
+                        );
+                        sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.reason,
+                        );
+                        if let Some(c) = ctx.as_deref_mut() {
+                            mark_guardrail_block(c, block.name.clone());
+                        }
+                        output_guard_blocked = true;
+                        break;
+                    }
+                }
 
                 // --- WOR-1810: final guardrail pass BEFORE tail
                 // emission: tail events, pending tool calls, the
@@ -7214,8 +7510,6 @@ pub(super) async fn relay_ai_stream(
                     output_guard_blocked = true;
                     break;
                 }
-                upstream_complete = true;
-
                 if let Some(emitter) = inbound_emitter
                     .as_ref()
                     .filter(|_| native_translator.is_some())
@@ -7246,10 +7540,35 @@ pub(super) async fn relay_ai_stream(
                             reversible_restore.process_chunk(&bytes)
                         };
                         if !bytes.is_empty() {
-                            if let Some(trace) = trace_stream_content.as_mut() {
-                                trace.feed(&bytes);
+                            match response_body_holdback.stage(bytes) {
+                                Ok(Some(ready)) => {
+                                    if let Some(trace) = trace_stream_content.as_mut() {
+                                        trace.feed(&ready);
+                                    }
+                                    session.write_response_body(Some(ready), false).await?;
+                                }
+                                Ok(None) => {}
+                                Err(block) => {
+                                    warn!(
+                                        guardrail = %block.name,
+                                        reason = %block.reason,
+                                        "AI proxy: output guardrail relay hold-back failed closed"
+                                    );
+                                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation(
+                                        &block.name,
+                                    );
+                                    sbproxy_ai::tracing_spans::record_error(
+                                        &ai_span,
+                                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                        &block.reason,
+                                    );
+                                    if let Some(c) = ctx.as_deref_mut() {
+                                        mark_guardrail_block(c, block.name.clone());
+                                    }
+                                    output_guard_blocked = true;
+                                    break 'relay;
+                                }
                             }
-                            let _ = session.write_response_body(Some(bytes), false).await;
                         }
                     }
                 }
@@ -7263,11 +7582,41 @@ pub(super) async fn relay_ai_stream(
                 )
                 .finish();
                 if !tail.is_empty() {
-                    if let Some(trace) = trace_stream_content.as_mut() {
-                        trace.feed(&tail);
+                    match response_body_holdback.stage(tail) {
+                        Ok(Some(ready)) => {
+                            if let Some(trace) = trace_stream_content.as_mut() {
+                                trace.feed(&ready);
+                            }
+                            session.write_response_body(Some(ready), false).await?;
+                        }
+                        Ok(None) => {}
+                        Err(block) => {
+                            warn!(
+                                guardrail = %block.name,
+                                reason = %block.reason,
+                                "AI proxy: output guardrail relay hold-back failed closed"
+                            );
+                            sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                            sbproxy_ai::tracing_spans::record_error(
+                                &ai_span,
+                                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                &block.reason,
+                            );
+                            if let Some(c) = ctx.as_deref_mut() {
+                                mark_guardrail_block(c, block.name.clone());
+                            }
+                            output_guard_blocked = true;
+                            break 'relay;
+                        }
                     }
-                    let _ = session.write_response_body(Some(tail), false).await;
                 }
+                for ready in response_body_holdback.release() {
+                    if let Some(trace) = trace_stream_content.as_mut() {
+                        trace.feed(&ready);
+                    }
+                    session.write_response_body(Some(ready), false).await?;
+                }
+                upstream_complete = true;
                 break;
             }
         }

@@ -728,7 +728,7 @@ pub fn record_safety_guardrail_verdict(guardrail: &str, class: &str, backend: &s
     };
     let class = match class {
         "toxic" | "jailbreak" | "violence" | "self_harm" | "sexual" | "hate_speech" | "illegal"
-        | "safe" | "none" | "unknown" => class,
+        | "safe" | "none" | "error" | "unknown" => class,
         _ => "unknown",
     };
     let backend = match backend {
