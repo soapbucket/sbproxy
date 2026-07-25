@@ -8443,6 +8443,7 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "syn 2.0.117",
 ]
 
 [[package]]

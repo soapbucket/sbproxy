@@ -12,11 +12,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
+use syn::visit::Visit;
 
 use crate::scan::SourceFile;
 use crate::{validate_config_keys, ConfigKeyCapability, RegistryError, SupportLevel};
 
-/// One named key reached from the root of the generated configuration schema.
+/// One leaf key reached from the root of the generated configuration schema.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConfigSchemaKey {
     /// Canonical dotted path. Dynamic map keys use `*`; array elements use
@@ -24,10 +25,13 @@ pub struct ConfigSchemaKey {
     pub path: String,
     /// Best-effort Rust field name derived from the serialized property.
     pub rust_field: String,
+    /// Rust type that owns the field, derived from the schema definition that
+    /// declares the property.
+    pub rust_owner: Option<String>,
 }
 
-/// Walk a generated JSON Schema and return every named property reachable
-/// from its root.
+/// Walk a generated JSON Schema and return every leaf property reachable from
+/// its root.
 ///
 /// Local references, object maps, arrays, and schema compositions are
 /// followed. Definitions are not listed on their own: a definition contributes
@@ -35,7 +39,8 @@ pub struct ConfigSchemaKey {
 pub fn schema_key_paths(schema: &Value) -> Vec<ConfigSchemaKey> {
     let mut out = BTreeSet::new();
     let mut refs = Vec::new();
-    collect_schema(schema, schema, "", &mut refs, &mut out);
+    let owner = schema.get("title").and_then(Value::as_str);
+    collect_schema(schema, schema, "", owner, &mut refs, &mut out);
     out.into_iter().collect()
 }
 
@@ -43,41 +48,47 @@ fn collect_schema(
     root: &Value,
     node: &Value,
     path: &str,
+    owner: Option<&str>,
     refs: &mut Vec<String>,
     out: &mut BTreeSet<ConfigSchemaKey>,
 ) {
     if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
-        if refs.iter().any(|active| active == reference) {
-            return;
-        }
-        if let Some(target) = local_ref(root, reference) {
-            refs.push(reference.to_string());
-            collect_schema(root, target, path, refs, out);
-            refs.pop();
+        if !refs.iter().any(|active| active == reference) {
+            if let Some(target) = local_ref(root, reference) {
+                refs.push(reference.to_string());
+                collect_schema(root, target, path, ref_owner(reference), refs, out);
+                refs.pop();
+            }
         }
     }
 
     for keyword in ["allOf", "anyOf", "oneOf"] {
         if let Some(parts) = node.get(keyword).and_then(Value::as_array) {
             for part in parts {
-                collect_schema(root, part, path, refs, out);
+                collect_schema(root, part, path, owner, refs, out);
             }
         }
     }
     for keyword in ["if", "then", "else", "not"] {
         if let Some(part) = node.get(keyword) {
-            collect_schema(root, part, path, refs, out);
+            collect_schema(root, part, path, owner, refs, out);
         }
     }
 
     if let Some(properties) = node.get("properties").and_then(Value::as_object) {
         for (name, child) in properties {
             let child_path = join_path(path, name);
-            out.insert(ConfigSchemaKey {
-                path: child_path.clone(),
-                rust_field: rust_field_name(name),
-            });
-            collect_schema(root, child, &child_path, refs, out);
+            let mut descendants = BTreeSet::new();
+            collect_schema(root, child, &child_path, owner, refs, &mut descendants);
+            if descendants.is_empty() {
+                out.insert(ConfigSchemaKey {
+                    path: child_path,
+                    rust_field: rust_field_name(name),
+                    rust_owner: owner.map(str::to_string),
+                });
+            } else {
+                out.extend(descendants);
+            }
         }
     }
 
@@ -86,10 +97,10 @@ fn collect_schema(
         match items {
             Value::Array(variants) => {
                 for variant in variants {
-                    collect_schema(root, variant, &item_path, refs, out);
+                    collect_schema(root, variant, &item_path, owner, refs, out);
                 }
             }
-            _ => collect_schema(root, items, &item_path, refs, out),
+            _ => collect_schema(root, items, &item_path, owner, refs, out),
         }
     }
 
@@ -100,7 +111,7 @@ fn collect_schema(
             } else {
                 format!("{path}.*")
             };
-            collect_schema(root, additional, &value_path, refs, out);
+            collect_schema(root, additional, &value_path, owner, refs, out);
         }
     }
 
@@ -111,9 +122,16 @@ fn collect_schema(
             format!("{path}.*")
         };
         for child in patterns.values() {
-            collect_schema(root, child, &value_path, refs, out);
+            collect_schema(root, child, &value_path, owner, refs, out);
         }
     }
+}
+
+fn ref_owner(reference: &str) -> Option<&str> {
+    reference
+        .rsplit('/')
+        .next()
+        .filter(|owner| !owner.is_empty())
 }
 
 fn local_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
@@ -170,25 +188,49 @@ pub fn verify_config_readers(
         }
     }
 
-    let cleaned: Vec<(&SourceFile, String)> = sources
+    let production_sources: Vec<&SourceFile> = sources
         .iter()
-        .map(|source| (source, production_tokens(&source.text)))
+        .filter(|source| source_is_production(&source.path))
         .collect();
+    for source in &production_sources {
+        if let Err(error) = syn::parse_file(&source.raw_text) {
+            errors.push(RegistryError {
+                subject: source.path.display().to_string(),
+                message: format!(
+                    "could not parse production Rust source while proving config readers: {error}"
+                ),
+            });
+        }
+    }
+    let type_index = rust_type_index(&production_sources);
+    let typed_reads = typed_field_reads(&production_sources, &type_index);
 
     for key in keys {
-        if override_index
-            .keys()
-            .any(|root| path_is_in_subtree(&key.path, root))
-        {
+        if let Some(entry) = override_index.get(key.path.as_str()) {
+            if entry.support == SupportLevel::Stable {
+                if let Some(consumer) = entry.consumer {
+                    if !production_consumer_exists(consumer, &production_sources) {
+                        errors.push(RegistryError {
+                            subject: key.path.clone(),
+                            message: format!(
+                                "names stable consumer `{consumer}`, but that symbol does not \
+                                 exist in non-test production source"
+                            ),
+                        });
+                    }
+                }
+            }
             continue;
         }
-        if !has_field_read(&key.rust_field, &cleaned) {
+        if !has_unambiguous_field_read(key, &typed_reads) {
             errors.push(RegistryError {
                 subject: key.path.clone(),
                 message: format!(
-                    "is accepted by the generated schema but no non-test Rust read of `.{}` \
-                     exists. Wire the key, or add a reviewed ConfigOnly override with a reason",
-                    key.rust_field
+                    "is accepted by the generated schema but has no unambiguous non-test Rust \
+                     read of `{}::{}`. Wire the key, or add an exact reviewed override with \
+                     production consumer evidence or a ConfigOnly reason",
+                    key.rust_owner.as_deref().unwrap_or("<unknown>"),
+                    key.rust_field,
                 ),
             });
         }
@@ -197,117 +239,606 @@ pub fn verify_config_readers(
     errors
 }
 
-fn path_is_in_subtree(path: &str, root: &str) -> bool {
-    path == root
-        || path
-            .strip_prefix(root)
-            .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with("[]"))
+fn source_is_production(path: &std::path::Path) -> bool {
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    let Some(crates_at) = components
+        .iter()
+        .position(|component| *component == "crates")
+    else {
+        return false;
+    };
+    let within_crate = &components[crates_at.saturating_add(2)..];
+    if matches!(
+        within_crate.first().copied(),
+        Some("tests" | "benches" | "examples")
+    ) {
+        return false;
+    }
+    !within_crate.iter().any(|component| *component == "tests")
+        && within_crate.last().copied() != Some("tests.rs")
 }
 
-fn has_field_read(field: &str, sources: &[(&SourceFile, String)]) -> bool {
-    let candidates = [
-        format!(".{field}"),
-        format!(".r#{field}"),
-        format!(".{field}_"),
-    ];
-    sources.iter().any(|(_, text)| {
-        candidates
+#[derive(Default)]
+struct RustTypeIndex {
+    fields: BTreeMap<String, BTreeMap<String, Option<String>>>,
+    function_returns: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl RustTypeIndex {
+    fn record_fields(&mut self, owner: &str, fields: &syn::Fields) {
+        for field in fields {
+            if let Some(ident) = &field.ident {
+                let field_name = ident.to_string().trim_start_matches("r#").to_string();
+                self.fields
+                    .entry(owner.to_string())
+                    .or_default()
+                    .insert(field_name.clone(), innermost_type_name(&field.ty));
+            }
+        }
+    }
+
+    fn field_type(&self, owner: &str, field: &str) -> Option<&str> {
+        self.fields
+            .get(owner)
+            .and_then(|fields| fields.get(field))
+            .and_then(Option::as_deref)
+    }
+
+    fn record_function_return(&mut self, signature: &syn::Signature) {
+        let syn::ReturnType::Type(_, ty) = &signature.output else {
+            return;
+        };
+        if let Some(owner) = innermost_type_name(ty) {
+            self.function_returns
+                .entry(signature.ident.to_string())
+                .or_default()
+                .insert(owner);
+        }
+    }
+
+    fn function_return(&self, function: &str) -> Option<&str> {
+        let owners = self.function_returns.get(function)?;
+        (owners.len() == 1)
+            .then(|| owners.first().map(String::as_str))
+            .flatten()
+    }
+}
+
+struct TypeIndexVisitor<'a> {
+    index: &'a mut RustTypeIndex,
+}
+
+impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !attributes_are_test_only(&node.attrs) {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        if attributes_are_test_only(&node.attrs) {
+            return;
+        }
+        self.index
+            .record_fields(&node.ident.to_string(), &node.fields);
+        syn::visit::visit_item_struct(self, node);
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        if attributes_are_test_only(&node.attrs) {
+            return;
+        }
+        let owner = node.ident.to_string();
+        for variant in &node.variants {
+            self.index.record_fields(&owner, &variant.fields);
+        }
+        syn::visit::visit_item_enum(self, node);
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if attributes_are_test_only(&node.attrs) {
+            return;
+        }
+        self.index.record_function_return(&node.sig);
+        syn::visit::visit_item_fn(self, node);
+    }
+}
+
+fn rust_type_index(sources: &[&SourceFile]) -> RustTypeIndex {
+    let mut index = RustTypeIndex::default();
+    for source in sources {
+        if let Ok(file) = syn::parse_file(&source.raw_text) {
+            let mut visitor = TypeIndexVisitor { index: &mut index };
+            visitor.visit_file(&file);
+        }
+    }
+    index
+}
+
+fn innermost_type_name(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Array(array) => innermost_type_name(&array.elem),
+        syn::Type::Group(group) => innermost_type_name(&group.elem),
+        syn::Type::Paren(paren) => innermost_type_name(&paren.elem),
+        syn::Type::Ptr(pointer) => innermost_type_name(&pointer.elem),
+        syn::Type::Reference(reference) => innermost_type_name(&reference.elem),
+        syn::Type::Slice(slice) => innermost_type_name(&slice.elem),
+        syn::Type::Path(path) => {
+            let segment = path.path.segments.last()?;
+            let generic_types: Vec<&syn::Type> = match &segment.arguments {
+                syn::PathArguments::AngleBracketed(arguments) => arguments
+                    .args
+                    .iter()
+                    .filter_map(|argument| match argument {
+                        syn::GenericArgument::Type(ty) => Some(ty),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let wrapper = segment.ident.to_string();
+            let inner = match wrapper.as_str() {
+                "HashMap" | "BTreeMap" | "IndexMap" => generic_types.get(1).copied(),
+                "Result" => generic_types.first().copied(),
+                "Option" | "Vec" | "VecDeque" | "Box" | "Arc" | "Rc" | "Cow" | "SmallVec"
+                | "HashSet" | "BTreeSet" | "Guard" | "MappedGuard" | "MutexGuard"
+                | "RwLockReadGuard" | "RwLockWriteGuard" => generic_types.first().copied(),
+                _ => None,
+            };
+            inner
+                .and_then(innermost_type_name)
+                .or_else(|| Some(wrapper))
+        }
+        _ => None,
+    }
+}
+
+struct FieldReadVisitor<'a> {
+    types: &'a RustTypeIndex,
+    reads: BTreeSet<(String, String)>,
+    environment: BTreeMap<String, String>,
+    impl_owner: Option<String>,
+}
+
+impl<'a> FieldReadVisitor<'a> {
+    fn new(types: &'a RustTypeIndex) -> Self {
+        Self {
+            types,
+            reads: BTreeSet::new(),
+            environment: BTreeMap::new(),
+            impl_owner: None,
+        }
+    }
+
+    fn visit_function(
+        &mut self,
+        inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
+        block: &syn::Block,
+    ) {
+        let saved_environment = std::mem::take(&mut self.environment);
+        for input in inputs {
+            match input {
+                syn::FnArg::Receiver(_) => {
+                    if let Some(owner) = &self.impl_owner {
+                        self.environment
+                            .insert("self".to_string(), owner.to_string());
+                    }
+                }
+                syn::FnArg::Typed(typed) => {
+                    let owner = innermost_type_name(&typed.ty);
+                    self.bind_pattern(&typed.pat, owner.as_deref());
+                }
+            }
+        }
+        self.visit_block(block);
+        self.environment = saved_environment;
+    }
+
+    fn bind_pattern(&mut self, pattern: &syn::Pat, owner: Option<&str>) {
+        match pattern {
+            syn::Pat::Ident(ident) => {
+                let name = ident.ident.to_string();
+                if let Some(owner) = owner {
+                    self.environment.insert(name, owner.to_string());
+                } else {
+                    self.environment.remove(&name);
+                }
+            }
+            syn::Pat::Reference(reference) => self.bind_pattern(&reference.pat, owner),
+            syn::Pat::Type(typed) => {
+                let explicit = innermost_type_name(&typed.ty);
+                self.bind_pattern(&typed.pat, explicit.as_deref().or(owner));
+            }
+            syn::Pat::Tuple(tuple) => {
+                for element in &tuple.elems {
+                    self.bind_pattern(element, owner);
+                }
+            }
+            syn::Pat::TupleStruct(tuple) => {
+                for element in &tuple.elems {
+                    self.bind_pattern(element, owner);
+                }
+            }
+            syn::Pat::Struct(record) => {
+                let pattern_owner = record
+                    .path
+                    .segments
+                    .iter()
+                    .rev()
+                    .map(|segment| segment.ident.to_string())
+                    .find(|candidate| self.types.fields.contains_key(candidate))
+                    .or_else(|| owner.map(str::to_string));
+                if let Some(pattern_owner) = pattern_owner {
+                    for field in &record.fields {
+                        if let Some(member) = Self::named_member(&field.member) {
+                            self.reads.insert((pattern_owner.clone(), member.clone()));
+                            let target = self
+                                .types
+                                .field_type(&pattern_owner, &member)
+                                .map(str::to_string);
+                            self.bind_pattern(&field.pat, target.as_deref());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn named_member(member: &syn::Member) -> Option<String> {
+        match member {
+            syn::Member::Named(ident) => {
+                Some(ident.to_string().trim_start_matches("r#").to_string())
+            }
+            syn::Member::Unnamed(_) => None,
+        }
+    }
+
+    fn infer_item_closure(
+        &mut self,
+        closure: &syn::ExprClosure,
+        item_owner: Option<&str>,
+    ) -> Option<String> {
+        let saved_environment = self.environment.clone();
+        for (index, input) in closure.inputs.iter().enumerate() {
+            self.bind_pattern(input, (index == 0).then_some(item_owner).flatten());
+        }
+        let result = self.infer_expr(&closure.body);
+        self.environment = saved_environment;
+        result
+    }
+
+    fn infer_expr(&mut self, expression: &syn::Expr) -> Option<String> {
+        match expression {
+            syn::Expr::Await(awaited) => self.infer_expr(&awaited.base),
+            syn::Expr::Call(call) => {
+                self.visit_expr(&call.func);
+                for argument in &call.args {
+                    self.visit_expr(argument);
+                }
+                let syn::Expr::Path(path) = call.func.as_ref() else {
+                    return None;
+                };
+                path.path
+                    .segments
+                    .last()
+                    .and_then(|segment| self.types.function_return(&segment.ident.to_string()))
+                    .map(str::to_string)
+            }
+            syn::Expr::Field(field) => {
+                let owner = self.infer_expr(&field.base)?;
+                let member = Self::named_member(&field.member)?;
+                let target = self.types.field_type(&owner, &member).map(str::to_string);
+                if self.types.fields.contains_key(&owner) {
+                    self.reads.insert((owner, member));
+                }
+                target
+            }
+            syn::Expr::Group(group) => self.infer_expr(&group.expr),
+            syn::Expr::Index(index) => {
+                let owner = self.infer_expr(&index.expr);
+                self.visit_expr(&index.index);
+                owner
+            }
+            syn::Expr::MethodCall(call) => {
+                let owner = self.infer_expr(&call.receiver);
+                let method = call.method.to_string();
+                let passes_item_to_closure = matches!(
+                    method.as_str(),
+                    "all"
+                        | "and_then"
+                        | "any"
+                        | "filter"
+                        | "filter_map"
+                        | "find"
+                        | "find_map"
+                        | "for_each"
+                        | "inspect"
+                        | "is_some_and"
+                        | "map"
+                        | "map_or"
+                        | "map_or_else"
+                        | "max_by_key"
+                        | "min_by_key"
+                        | "partition"
+                        | "position"
+                        | "retain"
+                        | "rposition"
+                        | "skip_while"
+                        | "sort_by_key"
+                        | "take_while"
+                );
+                let mut closure_result = None;
+                for argument in &call.args {
+                    if passes_item_to_closure {
+                        if let syn::Expr::Closure(closure) = argument {
+                            closure_result = self.infer_item_closure(closure, owner.as_deref());
+                            continue;
+                        }
+                    }
+                    self.visit_expr(argument);
+                }
+                if matches!(method.as_str(), "and_then" | "filter_map" | "map") {
+                    return closure_result;
+                }
+                matches!(
+                    method.as_str(),
+                    "as_ref"
+                        | "as_mut"
+                        | "borrow"
+                        | "borrow_mut"
+                        | "chain"
+                        | "clone"
+                        | "copied"
+                        | "enumerate"
+                        | "expect"
+                        | "first"
+                        | "first_mut"
+                        | "flatten"
+                        | "fuse"
+                        | "get"
+                        | "get_mut"
+                        | "into_iter"
+                        | "iter"
+                        | "iter_mut"
+                        | "last"
+                        | "last_mut"
+                        | "next"
+                        | "peekable"
+                        | "rev"
+                        | "skip"
+                        | "filter"
+                        | "inspect"
+                        | "skip_while"
+                        | "take"
+                        | "take_while"
+                        | "unwrap"
+                        | "unwrap_or"
+                        | "unwrap_or_default"
+                        | "values"
+                        | "values_mut"
+                )
+                .then_some(owner)
+                .flatten()
+            }
+            syn::Expr::Paren(paren) => self.infer_expr(&paren.expr),
+            syn::Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|ident| self.environment.get(&ident.to_string()).cloned()),
+            syn::Expr::Reference(reference) => self.infer_expr(&reference.expr),
+            syn::Expr::Struct(record) => record.path.segments.last().map(|segment| {
+                for field in &record.fields {
+                    self.visit_expr(&field.expr);
+                }
+                segment.ident.to_string()
+            }),
+            syn::Expr::Try(tried) => self.infer_expr(&tried.expr),
+            syn::Expr::Unary(unary) => self.infer_expr(&unary.expr),
+            _ => {
+                syn::visit::visit_expr(self, expression);
+                None
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !attributes_are_test_only(&node.attrs) {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if attributes_are_test_only(&node.attrs) {
+            return;
+        }
+        let saved_owner = self.impl_owner.clone();
+        self.impl_owner = innermost_type_name(&node.self_ty);
+        syn::visit::visit_item_impl(self, node);
+        self.impl_owner = saved_owner;
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if !attributes_are_test_only(&node.attrs) {
+            self.visit_function(&node.sig.inputs, &node.block);
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if !attributes_are_test_only(&node.attrs) {
+            self.visit_function(&node.sig.inputs, &node.block);
+        }
+    }
+
+    fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+        let _ = self.infer_expr(&syn::Expr::Field(node.clone()));
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let _ = self.infer_expr(&syn::Expr::MethodCall(node.clone()));
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        let inferred = node
+            .init
+            .as_ref()
+            .and_then(|init| self.infer_expr(&init.expr));
+        self.bind_pattern(&node.pat, inferred.as_deref());
+        if let Some(init) = &node.init {
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+        }
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        let owner = self.infer_expr(&node.expr);
+        let saved_environment = self.environment.clone();
+        self.bind_pattern(&node.pat, owner.as_deref());
+        self.visit_block(&node.body);
+        self.environment = saved_environment;
+    }
+
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        let owner = self.infer_expr(&node.expr);
+        self.bind_pattern(&node.pat, owner.as_deref());
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        let owner = self.infer_expr(&node.expr);
+        for arm in &node.arms {
+            let saved_environment = self.environment.clone();
+            self.bind_pattern(&arm.pat, owner.as_deref());
+            if let Some((_, guard)) = &arm.guard {
+                self.visit_expr(guard);
+            }
+            self.visit_expr(&arm.body);
+            self.environment = saved_environment;
+        }
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        let saved_environment = self.environment.clone();
+        for input in &node.inputs {
+            self.bind_pattern(input, None);
+        }
+        self.visit_expr(&node.body);
+        self.environment = saved_environment;
+    }
+}
+
+fn typed_field_reads(sources: &[&SourceFile], types: &RustTypeIndex) -> BTreeSet<(String, String)> {
+    let mut visitor = FieldReadVisitor::new(types);
+    for source in sources {
+        if let Ok(file) = syn::parse_file(&source.raw_text) {
+            visitor.visit_file(&file);
+        }
+    }
+    visitor.reads
+}
+
+fn has_unambiguous_field_read(
+    key: &ConfigSchemaKey,
+    typed_reads: &BTreeSet<(String, String)>,
+) -> bool {
+    let Some(owner) = key.rust_owner.as_deref() else {
+        return false;
+    };
+    typed_reads.contains(&(owner.to_string(), key.rust_field.clone()))
+}
+
+fn production_consumer_exists(consumer: &str, sources: &[&SourceFile]) -> bool {
+    let segments: Vec<&str> = consumer.split("::").collect();
+    let [crate_name, modules @ .., symbol] = segments.as_slice() else {
+        return false;
+    };
+    let crate_dir = crate_name.replace('_', "-");
+    let module_path = modules.join("/");
+    let expected_files: Vec<String> = if module_path.is_empty() {
+        vec![
+            format!("crates/{crate_dir}/src/lib.rs"),
+            format!("crates/{crate_dir}/src/main.rs"),
+        ]
+    } else {
+        vec![
+            format!("crates/{crate_dir}/src/{module_path}.rs"),
+            format!("crates/{crate_dir}/src/{module_path}/mod.rs"),
+        ]
+    };
+
+    sources.iter().any(|source| {
+        let normalized = source.path.to_string_lossy().replace('\\', "/");
+        expected_files
             .iter()
-            .any(|needle| token_count(text, needle) > 0)
+            .any(|expected| normalized.ends_with(expected))
+            && source_declares_function(&source.raw_text, symbol)
     })
 }
 
-fn production_tokens(source: &str) -> String {
-    blank_strings(&strip_comments(source))
-}
+fn source_declares_function(source: &str, symbol: &str) -> bool {
+    struct FunctionVisitor<'a> {
+        symbol: &'a str,
+        found: bool,
+    }
 
-fn strip_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out = bytes.to_vec();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => i = skip_string(source, i),
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    out[i] = b' ';
-                    i += 1;
-                }
+    impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            if !attributes_are_test_only(&node.attrs) {
+                syn::visit::visit_item_mod(self, node);
             }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                out[i] = b' ';
-                if i + 1 < out.len() {
-                    out[i + 1] = b' ';
-                }
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    out[i] = b' ';
-                    i += 1;
-                }
-                if i < out.len() {
-                    out[i] = b' ';
-                }
-                if i + 1 < out.len() {
-                    out[i + 1] = b' ';
-                }
-                i += 2;
+        }
+
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            if !attributes_are_test_only(&node.attrs) && node.sig.ident == self.symbol {
+                self.found = true;
             }
-            _ => i += 1,
-        }
-    }
-    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
-}
-
-fn blank_strings(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out = bytes.to_vec();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'"' {
-            let end = skip_string(source, i);
-            for byte in out.iter_mut().take(end).skip(i) {
-                *byte = b' ';
+            if !self.found && !attributes_are_test_only(&node.attrs) {
+                syn::visit::visit_item_fn(self, node);
             }
-            i = end;
-        } else {
-            i += 1;
         }
     }
-    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+
+    let Ok(file) = syn::parse_file(source) else {
+        return false;
+    };
+    let mut visitor = FunctionVisitor {
+        symbol,
+        found: false,
+    };
+    visitor.visit_file(&file);
+    visitor.found
 }
 
-fn skip_string(source: &str, start: usize) -> usize {
-    let bytes = source.as_bytes();
-    let mut i = start + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return i + 1,
-            _ => i += 1,
+fn attributes_are_test_only(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        let path = attribute.path();
+        if path.is_ident("test") {
+            return true;
         }
-    }
-    bytes.len()
-}
-
-fn token_count(haystack: &str, needle: &str) -> usize {
-    fn ident(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || byte == b'_'
-    }
-
-    let check_after = needle.as_bytes().last().is_some_and(|byte| ident(*byte));
-    let bytes = haystack.as_bytes();
-    let mut count = 0;
-    let mut from = 0;
-    while let Some(found) = haystack[from..].find(needle) {
-        let at = from + found;
-        let end = at + needle.len();
-        let after_ok = !check_after || end >= bytes.len() || !ident(bytes[end]);
-        if after_ok {
-            count += 1;
+        if path.is_ident("cfg") {
+            return matches!(
+                &attribute.meta,
+                syn::Meta::List(list) if list.tokens.to_string() == "test"
+            );
         }
-        from = end;
-    }
-    count
+        let mut segments = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string());
+        matches!(
+            (
+                segments.next().as_deref(),
+                segments.next().as_deref(),
+                segments.next()
+            ),
+            (Some("tokio" | "async_std"), Some("test"), None)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -317,9 +848,22 @@ mod tests {
     use super::*;
 
     fn source(text: &str) -> SourceFile {
+        source_at("crates/example/src/lib.rs", text)
+    }
+
+    fn source_at(path: &str, text: &str) -> SourceFile {
         SourceFile {
-            path: PathBuf::from("crates/example/src/lib.rs"),
+            path: PathBuf::from(path),
+            raw_text: text.to_string(),
             text: crate::scan::strip_test_regions(text),
+        }
+    }
+
+    fn source_with_views(path: &str, raw_text: &str, text: &str) -> SourceFile {
+        SourceFile {
+            path: PathBuf::from(path),
+            raw_text: raw_text.to_string(),
+            text: text.to_string(),
         }
     }
 
@@ -327,6 +871,7 @@ mod tests {
         ConfigSchemaKey {
             path: path.to_string(),
             rust_field: field.to_string(),
+            rust_owner: Some("Config".to_string()),
         }
     }
 
@@ -374,11 +919,18 @@ mod tests {
             .map(|key| (key.path, key.rust_field))
             .collect();
 
-        assert_eq!(paths.get("proxy"), Some(&"proxy".to_string()));
         assert_eq!(paths.get("proxy.live-key"), Some(&"live_key".to_string()));
         assert!(paths.contains_key("proxy.nested.value"));
         assert!(paths.contains_key("proxy.routes[].path"));
         assert!(paths.contains_key("origins.*.enabled"));
+        assert!(
+            !paths.contains_key("proxy"),
+            "object containers are not configuration leaves"
+        );
+        assert!(
+            !paths.contains_key("proxy.nested"),
+            "only leaf keys need reader evidence"
+        );
     }
 
     #[test]
@@ -386,6 +938,11 @@ mod tests {
         let keys = [key("proxy.live", "live"), key("proxy.unread", "unread")];
         let sources = [source(
             r#"
+struct Config {
+    live: bool,
+    unread: bool,
+}
+
 pub fn production(config: &Config) {
     consume(config.live);
 }
@@ -401,7 +958,9 @@ mod tests {
 
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0].subject, "proxy.unread");
-        assert!(errors[0].message.contains("no non-test Rust read"));
+        assert!(errors[0]
+            .message
+            .contains("no unambiguous non-test Rust read"));
     }
 
     #[test]
@@ -418,11 +977,10 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_parent_override_covers_its_schema_subtree() {
+    fn parent_override_does_not_exempt_a_new_unread_child() {
         let keys = [
             key("proxy.reserved", "reserved"),
             key("proxy.reserved.enabled", "enabled"),
-            key("proxy.reserved.nested.value", "value"),
         ];
         let override_entry = ConfigKeyCapability {
             path: "proxy.reserved",
@@ -431,7 +989,428 @@ mod tests {
             note: Some("reserved until WOR-9999"),
         };
 
-        assert_eq!(verify_config_readers(&keys, &[override_entry], &[]), vec![]);
+        let errors = verify_config_readers(&keys, &[override_entry], &[]);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.subject == "proxy.reserved.enabled"),
+            "a parent classification must not silently classify future leaves: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_same_named_field_read_does_not_cover_a_schema_leaf() {
+        let schema = serde_json::json!({
+            "title": "ConfigFile",
+            "type": "object",
+            "properties": {
+                "proxy": {"$ref": "#/definitions/ProxyConfig"}
+            },
+            "definitions": {
+                "ProxyConfig": {
+                    "type": "object",
+                    "properties": {
+                        "new_guard": {"$ref": "#/definitions/NewGuardConfig"}
+                    }
+                },
+                "NewGuardConfig": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"}
+                    }
+                }
+            }
+        });
+        let keys = schema_key_paths(&schema);
+        let sources = [source(
+            r#"
+struct ExistingFeature {
+    enabled: bool,
+}
+
+struct NewGuardConfig {
+    enabled: bool,
+}
+
+fn production(existing: &ExistingFeature) {
+    consume(existing.enabled);
+}
+"#,
+        )];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.subject == "proxy.new_guard.enabled"),
+            "a read of ExistingFeature::enabled must not prove NewGuardConfig::enabled: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn undeclared_external_receiver_cannot_cover_a_schema_leaf_by_last_token() {
+        let schema = serde_json::json!({
+            "title": "ConfigFile",
+            "type": "object",
+            "properties": {
+                "proxy": {"$ref": "#/definitions/ProxyConfig"}
+            },
+            "definitions": {
+                "ProxyConfig": {
+                    "type": "object",
+                    "properties": {
+                        "new_guard": {"$ref": "#/definitions/NewGuardConfig"}
+                    }
+                },
+                "NewGuardConfig": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"}
+                    }
+                }
+            }
+        });
+        let keys = schema_key_paths(&schema);
+        let sources = [source(
+            r#"
+struct NewGuardConfig {
+    enabled: bool,
+}
+
+fn production(external: &ExternalFeature) {
+    consume(external.enabled);
+}
+"#,
+        )];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.subject == "proxy.new_guard.enabled"),
+            "a global `.enabled` token must not prove NewGuardConfig::enabled: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn typed_owner_read_covers_the_matching_ambiguous_field() {
+        let keys = [key("proxy.live", "live")];
+        let sources = [source(
+            r#"
+struct Config {
+    live: bool,
+}
+
+struct Unrelated {
+    live: bool,
+}
+
+fn production(config: &Config) {
+    consume(config.live);
+}
+"#,
+        )];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(
+            errors,
+            vec![],
+            "an explicitly typed Config::live read is exact evidence"
+        );
+    }
+
+    #[test]
+    fn typed_nested_field_chain_covers_each_exact_owner() {
+        let schema = serde_json::json!({
+            "title": "Config",
+            "type": "object",
+            "properties": {
+                "nested": {"$ref": "#/definitions/Nested"}
+            },
+            "definitions": {
+                "Nested": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "boolean"}
+                    }
+                }
+            }
+        });
+        let keys = schema_key_paths(&schema);
+        let sources = [source(
+            r#"
+struct Config {
+    nested: Nested,
+}
+
+struct Nested {
+    value: bool,
+}
+
+struct Unrelated {
+    value: bool,
+}
+
+fn production(config: &Config) {
+    consume(config.nested.value);
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn typed_match_binding_covers_the_matched_owner() {
+        let keys = [key("proxy.live", "live")];
+        let sources = [source(
+            r#"
+struct Config {
+    live: bool,
+}
+
+struct Unrelated {
+    live: bool,
+}
+
+fn production(config: Option<&Config>) {
+    match config {
+        Some(config) => consume(config.live),
+        None => {}
+    }
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn typed_struct_pattern_is_reader_evidence() {
+        let keys = [key("proxy.live", "live")];
+        let sources = [source(
+            r#"
+struct Config {
+    live: bool,
+}
+
+struct Unrelated {
+    live: bool,
+}
+
+fn production(config: &Config) {
+    let Config { live } = config;
+    consume(live);
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn typed_iterator_closure_covers_the_item_owner() {
+        let keys = [key("proxy.live", "live")];
+        let sources = [source(
+            r#"
+struct Config {
+    live: bool,
+}
+
+struct Unrelated {
+    live: bool,
+}
+
+fn production(configs: &[Config]) {
+    configs
+        .iter()
+        .for_each(|config| consume(config.live));
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn typed_chained_iterator_covers_the_item_owner() {
+        let keys = [key("proxy.live", "live")];
+        let sources = [source(
+            r#"
+struct Config {
+    live: bool,
+}
+
+struct Unrelated {
+    live: bool,
+}
+
+fn production(left: &[Config], right: &[Config]) {
+    for config in left.iter().chain(right.iter()) {
+        consume(config.live);
+    }
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn typed_free_function_return_covers_the_returned_owner() {
+        let keys = [key("proxy.live", "live")];
+        let sources = [source(
+            r#"
+struct Config {
+    live: bool,
+}
+
+struct Unrelated {
+    live: bool,
+}
+
+fn current_config() -> Config {
+    todo!()
+}
+
+fn production() {
+    consume(current_config().live);
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn unparseable_production_source_cannot_be_silently_skipped() {
+        let keys = [key("proxy.indirect", "indirect")];
+        let override_entry = ConfigKeyCapability {
+            path: "proxy.indirect",
+            support: SupportLevel::ConfigOnly,
+            consumer: None,
+            note: Some("reserved under WOR-9999"),
+        };
+        let sources = [source("fn malformed( {")];
+
+        let errors = verify_config_readers(&keys, &[override_entry], &sources);
+
+        assert!(
+            errors.iter().any(|error| {
+                error.subject.contains("crates/example/src/lib.rs")
+                    && error.message.contains("could not parse")
+            }),
+            "source parsing failures must make the guard fail: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn syntax_analysis_uses_the_unmodified_source_view() {
+        let keys = [key("proxy.live", "live")];
+        let sources = [source_with_views(
+            "crates/example/src/lib.rs",
+            r#"
+struct Config {
+    live: bool,
+}
+
+fn production(config: &Config) {
+    consume(config.live);
+}
+"#,
+            "fn broken_by_textual_stripping( {",
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn syntax_analysis_does_not_count_test_attributed_items() {
+        let keys = [key("proxy.unread", "unread")];
+        let raw_text = r#"
+struct Config {
+    unread: bool,
+}
+
+#[test]
+fn unit_test(config: &Config) {
+    consume(config.unread);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_test(config: &Config) {
+    consume(config.unread);
+}
+
+#[cfg(test)]
+fn cfg_test(config: &Config) {
+    consume(config.unread);
+}
+"#;
+        let sources = [source_with_views(
+            "crates/example/src/lib.rs",
+            raw_text,
+            &crate::scan::strip_test_regions(raw_text),
+        )];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].subject, "proxy.unread");
+    }
+
+    #[test]
+    fn integration_test_bench_and_example_reads_are_not_production_evidence() {
+        for path in [
+            "crates/example/tests/reader.rs",
+            "crates/example/benches/reader.rs",
+            "crates/example/examples/reader.rs",
+        ] {
+            let keys = [key("proxy.unread", "unread")];
+            let sources = [source_at(
+                path,
+                "fn fixture(config: &Config) { consume(config.unread); }",
+            )];
+
+            let errors = verify_config_readers(&keys, &[], &sources);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "{path} must not make a configuration key live: {errors:?}"
+            );
+            assert_eq!(errors[0].subject, "proxy.unread");
+        }
+    }
+
+    #[test]
+    fn stable_override_must_name_an_existing_production_consumer() {
+        let keys = [key("proxy.indirect", "indirect")];
+        let override_entry = ConfigKeyCapability {
+            path: "proxy.indirect",
+            support: SupportLevel::Stable,
+            consumer: Some("example::compiler::missing_consumer"),
+            note: None,
+        };
+        let sources = [source_at(
+            "crates/example/src/compiler.rs",
+            "pub fn actual_consumer() {}",
+        )];
+
+        let errors = verify_config_readers(&keys, &[override_entry], &sources);
+
+        assert!(
+            errors.iter().any(|error| {
+                error.subject == "proxy.indirect"
+                    && error.message.contains("missing_consumer")
+                    && error.message.contains("production")
+            }),
+            "stable evidence must resolve to production source: {errors:?}"
+        );
     }
 
     #[test]
@@ -455,6 +1434,10 @@ mod tests {
         let keys = [key("proxy.unread", "unread")];
         let sources = [source(
             r#"
+struct Config {
+    unread: bool,
+}
+
 // config.unread is intentionally absent.
 const DOC: &str = "config.unread";
 "#,

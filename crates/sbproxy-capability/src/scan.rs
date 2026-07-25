@@ -66,10 +66,12 @@ const QUERY_DIRS: &[&str] = &[
     "deploy/alerts",
 ];
 
-/// A Rust source file with test-gated code removed.
+/// A Rust source file with both its original and production-only views.
 pub struct SourceFile {
     /// Path, relative to the repo root.
     pub path: PathBuf,
+    /// Original file text, used for syntax-aware analysis.
+    pub raw_text: String,
     /// File text with `#[cfg(test)]` items and `#[test]` functions stripped.
     pub text: String,
 }
@@ -100,19 +102,20 @@ pub struct ReferenceExemption {
     pub reason: &'static str,
 }
 
-/// Read every `.rs` file under `crates/`, with test-gated code stripped.
+/// Read production `.rs` files under `crates/`, with test-gated code stripped.
 ///
-/// `e2e/` sits outside `crates/` and is therefore excluded, which is what we
-/// want: an end-to-end test driving a metric does not make it live in
-/// production.
+/// Integration tests, benches, examples, conventional `tests.rs` modules, and
+/// `e2e/` are excluded. A test driving a metric or reading a configuration
+/// field does not make that behavior live in production.
 pub fn rust_sources(root: &Path) -> Vec<SourceFile> {
     let mut out = Vec::new();
-    walk(&root.join("crates"), &mut out);
+    let crates = root.join("crates");
+    walk(&crates, &crates, &mut out);
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-fn walk(dir: &Path, out: &mut Vec<SourceFile>) {
+fn walk(crates_root: &Path, dir: &Path, out: &mut Vec<SourceFile>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -120,15 +123,32 @@ fn walk(dir: &Path, out: &mut Vec<SourceFile>) {
         let path = entry.path();
         if path.is_dir() {
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name == "target" || name.starts_with('.') {
+            let relative = path.strip_prefix(crates_root).unwrap_or(&path);
+            let depth = relative.components().count();
+            if name == "target"
+                || name.starts_with('.')
+                || (depth == 2 && matches!(name, "tests" | "benches" | "examples"))
+                || (depth > 2 && name == "tests")
+            {
                 continue;
             }
-            walk(&path, out);
+            walk(crates_root, &path, out);
         } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            if path.file_name().and_then(|name| name.to_str()) == Some("tests.rs") {
+                continue;
+            }
             if let Ok(text) = fs::read_to_string(&path) {
                 out.push(SourceFile {
                     text: strip_test_regions(&text),
-                    path,
+                    raw_text: text,
+                    path: path
+                        .strip_prefix(
+                            crates_root
+                                .parent()
+                                .expect("crates directory has repository parent"),
+                        )
+                        .unwrap_or(&path)
+                        .to_path_buf(),
                 });
             }
         }
@@ -141,8 +161,6 @@ fn walk(dir: &Path, out: &mut Vec<SourceFile>) {
 /// item it guards, skipping string literals and comments so a `{` inside
 /// either does not throw off the count. What remains is code that ships.
 pub fn strip_test_regions(src: &str) -> String {
-    const MARKERS: &[&str] = &["#[cfg(test)]", "#[test]", "#[tokio::test]"];
-
     // Byte-wise, not char-wise: source files contain multi-byte characters
     // (an em dash in a doc comment is enough), and slicing `src[i..i + 1]` on
     // one of them panics. Every offset this walk produces lands on an ASCII
@@ -151,12 +169,15 @@ pub fn strip_test_regions(src: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
 
-    'outer: while i < bytes.len() {
-        for marker in MARKERS {
-            if bytes[i..].starts_with(marker.as_bytes()) {
-                i = end_of_item(src, i + marker.len());
-                continue 'outer;
-            }
+    while i < bytes.len() {
+        if let Some(end) = lexical_region_end(src, i) {
+            out.extend_from_slice(&bytes[i..end]);
+            i = end;
+            continue;
+        }
+        if let Some(attribute_end) = test_attribute_end(src, i) {
+            i = end_of_item(src, attribute_end);
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -174,6 +195,10 @@ fn end_of_item(src: &str, from: usize) -> usize {
     // Skip to whichever comes first: the item's opening brace, or the
     // semicolon that ends a brace-less item such as a gated `use`.
     while i < bytes.len() && bytes[i] != b'{' && bytes[i] != b';' {
+        if let Some(end) = lexical_region_end(src, i) {
+            i = end;
+            continue;
+        }
         i += 1;
     }
     if i >= bytes.len() {
@@ -185,20 +210,11 @@ fn end_of_item(src: &str, from: usize) -> usize {
 
     let mut depth = 0usize;
     while i < bytes.len() {
+        if let Some(end) = lexical_region_end(src, i) {
+            i = end;
+            continue;
+        }
         match bytes[i] {
-            b'"' => i = skip_string(src, i),
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 2;
-            }
             b'{' => {
                 depth += 1;
                 i += 1;
@@ -214,6 +230,126 @@ fn end_of_item(src: &str, from: usize) -> usize {
         }
     }
     bytes.len()
+}
+
+fn test_attribute_end(src: &str, start: usize) -> Option<usize> {
+    const EXACT: &[&str] = &["#[cfg(test)]", "#[test]"];
+    for marker in EXACT {
+        if src.as_bytes()[start..].starts_with(marker.as_bytes()) {
+            return Some(start + marker.len());
+        }
+    }
+
+    for prefix in ["#[tokio::test", "#[async_std::test"] {
+        if src.as_bytes()[start..].starts_with(prefix.as_bytes()) {
+            let after = start + prefix.len();
+            if !matches!(src.as_bytes().get(after), Some(b']' | b'(')) {
+                continue;
+            }
+            return attribute_end(src, start);
+        }
+    }
+    None
+}
+
+fn attribute_end(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut i = start + 2;
+    let mut parens = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = lexical_region_end(src, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => parens += 1,
+            b')' => parens = parens.saturating_sub(1),
+            b']' if parens == 0 => return Some(i + 1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn lexical_region_end(src: &str, start: usize) -> Option<usize> {
+    if let Some(end) = skip_raw_string(src, start) {
+        return Some(end);
+    }
+
+    let bytes = src.as_bytes();
+    match bytes.get(start).copied()? {
+        b'"' => Some(skip_string(src, start)),
+        b'\'' => skip_char_literal(src, start),
+        b'/' if bytes.get(start + 1) == Some(&b'/') => {
+            let mut i = start + 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            Some(i)
+        }
+        b'/' if bytes.get(start + 1) == Some(&b'*') => {
+            let mut i = start + 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes.get(i..i + 2) == Some(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes.get(i..i + 2) == Some(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Some(i)
+        }
+        _ => None,
+    }
+}
+
+fn skip_raw_string(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut i = start;
+    if bytes.get(i) == Some(&b'b') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'r') {
+        return None;
+    }
+    i += 1;
+    let hashes_start = i;
+    while bytes.get(i) == Some(&b'#') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let hashes = i - hashes_start;
+    i += 1;
+    while i < bytes.len() {
+        if bytes[i] == b'"'
+            && bytes
+                .get(i + 1..i + 1 + hashes)
+                .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
+        {
+            return Some(i + 1 + hashes);
+        }
+        i += 1;
+    }
+    Some(bytes.len())
+}
+
+fn skip_char_literal(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut i = start + 1;
+    if bytes.get(i) == Some(&b'\\') {
+        i += 2;
+    } else {
+        let ch = src.get(i..)?.chars().next()?;
+        i += ch.len_utf8();
+    }
+    (bytes.get(i) == Some(&b'\'')).then_some(i + 1)
 }
 
 /// Skip a double-quoted Rust string literal, honoring backslash escapes.
@@ -945,6 +1081,40 @@ pub fn live() { record_thing("a"); }
         let stripped = strip_test_regions(src);
         assert!(stripped.contains("pub fn live"));
         assert!(!stripped.contains("mod tests"));
+    }
+
+    #[test]
+    fn test_markers_inside_strings_and_comments_are_not_attributes() {
+        let src = r##"
+const FIXTURE: &str = r#"#[cfg(test)] fn fixture() { record_thing("fixture"); }"#;
+// #[test] fn comment_only() { record_thing("comment"); }
+pub fn live() { record_thing("live"); }
+"##;
+
+        let stripped = strip_test_regions(src);
+
+        assert!(
+            syn::parse_file(&stripped).is_ok(),
+            "stripping must preserve valid Rust: {stripped}"
+        );
+        assert!(stripped.contains("const FIXTURE"));
+        assert!(stripped.contains("record_thing(\"fixture\")"));
+        assert!(stripped.contains("record_thing(\"live\")"));
+    }
+
+    #[test]
+    fn attributed_tokio_test_with_arguments_is_stripped() {
+        let src = r#"
+#[tokio::test(flavor = "multi_thread")]
+async fn only_test() { record_thing("test"); }
+
+pub fn live() { record_thing("live"); }
+"#;
+
+        let stripped = strip_test_regions(src);
+
+        assert_eq!(count_tokens(&stripped, "record_thing("), 1);
+        assert!(!stripped.contains("only_test"));
     }
 
     #[test]
