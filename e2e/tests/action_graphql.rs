@@ -9,8 +9,10 @@ use base64::Engine as _;
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 
 fn get_with_body(
     proxy: &ProxyHarness,
@@ -142,6 +144,87 @@ origins:
       methods: [POST]
       backend: redis
 "#
+    )
+}
+
+fn sha256_digest_header(body: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let raw = Sha256::digest(body);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+    format!("sha-256=:{encoded}:")
+}
+
+fn wait_for_access_log_bytes(path: &Path, expected: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let contents = std::fs::read_to_string(path).unwrap_or_default();
+        if contents.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|row| {
+                    row["origin"] == "gql.localhost" && row["bytes_in"].as_u64() == Some(expected)
+                })
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "access log never recorded {expected} authoritative request bytes; got: {contents}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn graphql_content_digest_config(
+    upstream_url: &str,
+    access_log_path: &Path,
+    replacement_source: &str,
+) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+access_log:
+  enabled: true
+  sample_rate: 1.0
+  status_codes: [200]
+  methods: [POST]
+  output:
+    type: file
+    path: "{}"
+origins:
+  "gql.localhost":
+    action:
+      type: graphql
+      url: "{upstream_url}/graphql"
+      validate_queries: true
+      allow_introspection: false
+    request_modifiers:
+      - body:
+          replace_json:
+            query: "{{safeName{{id}}}}"
+            source: {replacement_source}
+    policies:
+      - type: content_digest
+      - type: request_validator
+        status: 422
+        content_types:
+          - application/json
+        schema:
+          type: object
+          required:
+            - query
+            - source
+          properties:
+            query:
+              type: string
+            source:
+              type: string
+              enum: [{replacement_source}]
+          additionalProperties: false
+"#,
+        access_log_path.display()
     )
 }
 
@@ -390,6 +473,112 @@ origins:
     assert!(
         captured.iter().all(|request| request.body.is_empty()),
         "a replacement rejected by the body policy must emit no upstream body bytes"
+    );
+}
+
+#[test]
+fn graphql_content_digest_authenticates_original_while_consumers_see_replacement() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let access_log = NamedTempFile::new().expect("create access log");
+    let original =
+        br#"{"query":"{__schema{id}}","source":"client-original-with-more-bytes"}"#.to_vec();
+    let replacement =
+        serde_json::to_vec(&json!({"query": "{safeName{id}}", "source": "replacement"}))
+            .expect("serialize replacement");
+    assert_ne!(original.len(), replacement.len());
+    let digest = sha256_digest_header(&original);
+    let yaml =
+        graphql_content_digest_config(&upstream.base_url(), access_log.path(), "replacement");
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let response = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "application/json",
+            original,
+            &[("content-digest", digest.as_str())],
+        )
+        .expect("send GraphQL replacement with original digest");
+
+    assert_eq!(
+        response.status, 200,
+        "the digest must authenticate the inbound representation"
+    );
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].body, replacement,
+        "downstream body policy and upstream must use the validated replacement"
+    );
+    wait_for_access_log_bytes(access_log.path(), replacement.len() as u64);
+}
+
+#[test]
+fn graphql_content_digest_authenticates_empty_original_before_replacement() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let access_log = NamedTempFile::new().expect("create access log");
+    let replacement =
+        serde_json::to_vec(&json!({"query": "{safeName{id}}", "source": "replacement"}))
+            .expect("serialize replacement");
+    let empty_digest = sha256_digest_header(b"");
+    let yaml =
+        graphql_content_digest_config(&upstream.base_url(), access_log.path(), "replacement");
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let response = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "application/json",
+            Vec::new(),
+            &[("content-digest", empty_digest.as_str())],
+        )
+        .expect("send GraphQL replacement with empty original digest");
+
+    assert_eq!(
+        response.status, 200,
+        "an empty inbound representation must verify before replacement"
+    );
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].body, replacement);
+}
+
+#[test]
+fn graphql_content_digest_of_replacement_cannot_authenticate_different_original() {
+    let upstream = MockUpstream::start(json!({"data": {"hello": "world"}})).expect("upstream");
+    let access_log = NamedTempFile::new().expect("create access log");
+    let original =
+        br#"{"query":"{safeName{id}}","source":"different-client-representation"}"#.to_vec();
+    let replacement =
+        serde_json::to_vec(&json!({"query": "{safeName{id}}", "source": "replacement"}))
+            .expect("serialize replacement");
+    let replacement_digest = sha256_digest_header(&replacement);
+    let yaml =
+        graphql_content_digest_config(&upstream.base_url(), access_log.path(), "replacement");
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    let response = proxy
+        .post_bytes(
+            "/graphql",
+            "gql.localhost",
+            "application/json",
+            original,
+            &[("content-digest", replacement_digest.as_str())],
+        )
+        .expect("send different original with replacement digest");
+
+    assert_eq!(
+        response.status, 400,
+        "a digest of transformed bytes must not authenticate the inbound representation"
+    );
+    assert!(
+        upstream
+            .captured()
+            .iter()
+            .all(|request| request.body.is_empty()),
+        "a falsely attested request must emit no upstream body bytes"
     );
 }
 

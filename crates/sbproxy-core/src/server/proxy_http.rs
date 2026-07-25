@@ -2951,6 +2951,9 @@ impl ProxyHttp for SbProxy {
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
                 let mut failed: Option<(u16, String, String)> = None;
+                let mut graphql_content_digest_body = None;
+                let mut graphql_content_digest_body_taken = false;
+                let content_digest_uses_graphql_original = ctx.graphql_validation_pending;
                 if let Some(origin_idx) = ctx.origin_idx {
                     if let Some(policies) = pipeline.policies.get(origin_idx) {
                         for policy in policies {
@@ -2976,16 +2979,28 @@ impl ProxyHttp for SbProxy {
                                     }
                                 }
                                 Policy::ContentDigest(cd) => {
-                                    // WOR-805: verify inbound RFC 9530
-                                    // `Content-Digest` against the
-                                    // buffered request body. IMPORTANT:
-                                    // this arm runs BEFORE any
-                                    // request-body modifier
-                                    // (transcoders, body modifiers).
-                                    // The digest applies to the
-                                    // pre-transform bytes, so the
-                                    // ordering must not be swapped.
-                                    if collected.len() > cd.max_body_bytes {
+                                    // RFC 9530 digests bind the inbound
+                                    // representation. A validated GraphQL
+                                    // modifier makes `collected` authoritative
+                                    // for every downstream consumer, but the
+                                    // digest alone must inspect the saved
+                                    // pre-transform bytes. Take that slot once
+                                    // at EOS and reuse it if configuration
+                                    // contains more than one digest policy.
+                                    if !graphql_content_digest_body_taken {
+                                        graphql_content_digest_body =
+                                            ctx.graphql_request_body.take();
+                                        graphql_content_digest_body_taken = true;
+                                    }
+                                    let representation_body =
+                                        if content_digest_uses_graphql_original {
+                                            graphql_content_digest_body
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                        } else {
+                                            &collected
+                                        };
+                                    if representation_body.len() > cd.max_body_bytes {
                                         // Mirror the request_limit
                                         // pattern: reject 413 the
                                         // moment the cap is exceeded.
@@ -2993,7 +3008,7 @@ impl ProxyHttp for SbProxy {
                                             "error": "request body exceeds content_digest max_body_bytes",
                                             "detail": format!(
                                                 "body length {} > cap {}",
-                                                collected.len(),
+                                                representation_body.len(),
                                                 cd.max_body_bytes
                                             ),
                                         })
@@ -3017,7 +3032,7 @@ impl ProxyHttp for SbProxy {
                                         .get("content-digest")
                                         .or_else(|| req_headers.get("repr-digest"))
                                         .and_then(|v| v.to_str().ok());
-                                    let outcome = cd.verify(header_value, &collected);
+                                    let outcome = cd.verify(header_value, representation_body);
                                     // WOR-805 PR2: on a verified body,
                                     // stamp the audit flag so the
                                     // Message Signatures composition
@@ -3126,6 +3141,12 @@ impl ProxyHttp for SbProxy {
                             }
                         }
                     }
+                }
+                if graphql_content_digest_body_taken {
+                    // Preserve the captured original for a possible upstream
+                    // retry. The representation slot is borrowed by digest
+                    // verification exactly once per body-filter pass.
+                    ctx.graphql_request_body = graphql_content_digest_body;
                 }
                 if let Some((status, body_str, ct)) = failed {
                     debug!(status = %status, "request body validator rejected");
