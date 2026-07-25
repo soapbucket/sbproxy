@@ -241,6 +241,10 @@ bloomfilter = "1"
 sha2 = "0.11"
 hex = "0.4"
 hmac = "0.13"
+# Constant-time equality for digest, MAC, and token comparison. Promoted to a
+# workspace dependency so new crates reach for one audited implementation
+# instead of hand-rolling another byte-by-byte comparison loop.
+subtle = "2"
 
 # MCP tool-versioning compatibility oracle (mcp/compat). `semver` compares
 # declared tool versions for the version-bump linter; `serde_json_canonicalizer`

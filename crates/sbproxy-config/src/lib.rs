@@ -5,12 +5,18 @@
 //! - Intermediate representation ([`raw`])
 //! - Compiling configs into immutable, performance-optimized snapshots ([`snapshot`], [`compiler`])
 //! - The repo-native [`listing::Listing`] primitive
+//! - Signed configuration bundles published by a config authority
+//!   ([`config_bundle`])
+//! - Merging an authority-supplied document into a locally owned one
+//!   ([`config_merge`])
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod cluster;
 pub mod compiler;
+pub mod config_bundle;
+pub mod config_merge;
 pub mod duration;
 pub mod key_registry;
 pub mod listing;
@@ -25,6 +31,16 @@ pub mod validate;
 
 pub use cluster::*;
 pub use compiler::*;
+pub use config_bundle::{
+    BundleAlgorithm, BundleError, BundleMode, ConfigBundle, ConfigBundleCursor, ConfigBundleSigner,
+    CursorError, SignedConfigBundle, VerifyingKeyMaterial, VerifyingKeySet,
+    CONFIG_BUNDLE_CLOCK_SKEW_MS, CONFIG_BUNDLE_CONTEXT, CONFIG_BUNDLE_SCHEMA_VERSION,
+    MAX_CONFIG_YAML_BYTES,
+};
+pub use config_merge::{
+    merge_config, BaseOrigin, MergeError, MergeMode, MergeOutcome, Provenance, ProvenanceMap,
+    AUTHORITY_DENIED_PATHS,
+};
 pub use listing::{
     is_well_placed_skill_url, load_listing_file, load_listings_from_repo, validate_listings,
     Listing, ListingAccessPlan, ListingAuth, ListingFreeTier, ListingLifecycle, ListingLoadError,

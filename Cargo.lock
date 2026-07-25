@@ -8509,8 +8509,12 @@ name = "sbproxy-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "compact_str 0.8.1",
+ "ed25519-dalek",
+ "hex",
+ "hmac",
  "http 1.4.0",
  "rcgen",
  "sbproxy-capability",
@@ -8521,7 +8525,10 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
+ "serde_json_canonicalizer",
+ "sha2 0.11.0",
  "smallvec 1.15.1",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
