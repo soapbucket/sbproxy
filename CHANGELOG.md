@@ -127,6 +127,15 @@ the next version cut.
   `proxy.admin.**` as a reload: `AdminConfig` is read once at startup, so
   a rotated admin password or a swapped certificate needs a restart, and
   the plan now says so. See [`docs/admin.md`](docs/admin.md).
+- **Accepted configuration now has an accountable runtime owner.** GraphQL
+  depth, introspection, and syntax controls are enforced before upstream
+  dispatch; configured CEL feature flags publish atomically across reloads;
+  concurrent limits can be keyed by client, API key, header, or route; and AI
+  shadow requests run through a bounded, drop-on-saturation lane that cannot
+  delay the primary response. Enabling the reserved HTTP/3 listener now fails
+  configuration compilation instead of logging and continuing without QUIC.
+  A build-time schema audit rejects future keys that have neither a production
+  reader nor an exact reviewed `ConfigOnly` justification.
 - **Workspace rate-budget behavior now has one owner.** The
   `rate_limit_budget` policy module owns the soft, throttle, and auto-suspend
   state machine and its tests. The previously ignored `per_route_rps` field is
