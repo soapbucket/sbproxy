@@ -1154,8 +1154,22 @@ impl CompiledPipeline {
         Self::from_config_with_mode(config, PipelineConstructionMode::Runtime)
     }
 
-    /// Compile every module against declared dependencies without consulting
-    /// process-global runtime state. Intended for CLI validation only.
+    /// Compile every module for validation, without side effects that
+    /// outlive the returned pipeline.
+    ///
+    /// Use this whenever the pipeline is built only to find out whether a
+    /// config would construct, and is then dropped. Unlike
+    /// [`Self::from_config`] it spawns no background tasks, does not create
+    /// cache directories, and does not resolve the response-cache
+    /// encryption key. It also avoids the process cluster handle and the
+    /// shared AI client, deriving equivalents from the config instead.
+    ///
+    /// It is not fully isolated from process state. Module construction
+    /// still reads the AI provider registry, still resolves secret
+    /// references through the process secret resolver, and still populates
+    /// the shared JWKS cache. Those are reads and idempotent inserts rather
+    /// than installs, so repeated calls are safe, but a caller cannot treat
+    /// this as a pure function.
     pub fn from_config_for_validation(config: CompiledConfig) -> anyhow::Result<Self> {
         Self::from_config_with_mode(config, PipelineConstructionMode::Validation)
     }
@@ -1522,7 +1536,17 @@ impl CompiledPipeline {
         // target that has `health_check:` configured. Best-effort: if
         // we are not running inside a Tokio runtime (e.g. unit tests),
         // the call is a no-op.
-        pipeline.start_background_tasks();
+        //
+        // Validation-mode pipelines are thrown away by the caller, so
+        // spawning here would leak one probe task per health-checked
+        // target on every validation. The tasks hold an Arc on the
+        // dropped pipeline and keep issuing real outbound requests, so
+        // a caller that validates repeatedly (the admin config write
+        // path, a config authority validating each publish) would
+        // accumulate probes against the operator's upstreams forever.
+        if matches!(mode, PipelineConstructionMode::Runtime) {
+            pipeline.start_background_tasks();
+        }
         Ok(pipeline)
     }
 
