@@ -321,13 +321,11 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     // Build the process-wide `AgentClassResolver` from the parsed
     // top-level `agent_classes:` block (or from defaults when the block
     // is absent), then install it in the global slot the request
-    // pipeline reads in `request_filter`. The catalog source toggles
-    // between the embedded `builtin` defaults, an external `hosted-feed`
-    // (placeholder until G2.2 lands the registry fetcher), or the two
-    // `merged` (currently equivalent to defaults; the registry overlay
-    // arrives in G2.2). All paths are infallible: a malformed
-    // `hosted_feed` block degrades gracefully to defaults so a
-    // misconfiguration does not block serving.
+    // pipeline reads in `request_filter`. `builtin` and `inline` are
+    // live. The compatibility values `hosted-feed` and `merged` warn
+    // and use the embedded defaults; the OSS runtime does not fetch or
+    // validate the reserved `hosted_feed` block. All paths are
+    // infallible so an unsupported selection does not block serving.
     #[cfg(feature = "agent-class")]
     {
         install_agent_class_resolver(compiled.agent_classes.as_ref());

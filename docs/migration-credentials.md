@@ -127,9 +127,9 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 | `cost_center` | string | Cost center. Lifted onto `Principal.attrs.metadata` under the `cost_center` key. |
 | `tags` | list | Operator-supplied tags. Each tag becomes a separate attribution row. |
 | `metadata` | map | Free-form metadata copied verbatim onto `Principal.attrs.metadata`. |
-| `budget.max_tokens` | int | Total input + output tokens per reset window. |
-| `budget.max_cost_usd` | float | USD spend cap per reset window. |
-| `budget.reset` | string | Reset window in LiteLLM-style `30s|30m|30h|30d`. |
+| `budget.max_tokens` | int | Enforced input + output token cap for the credential. |
+| `budget.max_cost_usd` | float | Enforced USD spend cap for the credential. |
+| `budget.reset` | string | Compatibility-only reset hint. Accepted with a warning; no reset schedule is installed. |
 
 ## Secret Reference Migration
 

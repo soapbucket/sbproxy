@@ -731,7 +731,7 @@ request_modifiers:
 |---|---|---|
 | `headers.set` / `headers.add` / `headers.remove` | map / map / list | Same semantics as the request side |
 | `status.code` | int | Override the response status code |
-| `status.text` | string | Optional reason phrase (informational; not sent in HTTP/2) |
+| `status.text` | string | Compatibility-only reason phrase; accepted with a warning and ignored |
 | `body.replace` | string | Replace the response body with this string |
 | `body.replace_json` | any | Replace the response body with this JSON value |
 | `lua_script` | string | Lua `modify_response(resp, ctx)`; returned `set_headers` applied |

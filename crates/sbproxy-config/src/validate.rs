@@ -8,10 +8,12 @@
 //! * [`orphan-ref`](validate#orphan-references): a `fallback_origin`
 //!   or forward-rule action target names a hostname that is not
 //!   present under `origins.*` in the same proposed config.
-//! * [`missing-secret`](validate#missing-secrets): a legacy
-//!   `secret:` / `secret://` template reference whose logical name
-//!   does not appear under `proxy.secrets.map` in the proposed
-//!   config. Provider-specific references such as `vault://`,
+//! * [`missing-secret`](validate#missing-secrets): a removed
+//!   `secret:<name>` reference or legacy logical-name
+//!   `secret://<name>` reference whose name does not appear under
+//!   `proxy.secrets.map` in the proposed config. This diagnostic
+//!   support does not make the removed colon form runtime-valid.
+//!   Provider-specific references such as `vault://`,
 //!   `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and
 //!   `secret://<backend>/...` resolve through configured vault
 //!   backends rather than `proxy.secrets.map`, so this rule does not
@@ -399,10 +401,11 @@ fn is_hostname_like(host: &str) -> bool {
 
 // --- Missing-secret check ------------------------------------------
 
-/// Walk a JSON value tree and emit a finding for each legacy
-/// `secret:` / `secret://` map reference whose logical name is not
-/// in `secret_keys`. References embedded in arbitrary string fields
-/// (e.g. `auth.secret: "secret:my_jwt"`) are caught.
+/// Walk a JSON value tree and emit a finding for each removed
+/// `secret:<name>` or legacy logical-name `secret://<name>` map
+/// reference whose name is not in `secret_keys`. References embedded
+/// in arbitrary string fields (e.g. `auth.secret:
+/// "secret:my_jwt"`) are caught for migration diagnostics.
 ///
 /// When the proxy has no `secrets:` block at all
 /// (`secrets_block_present = false`), missing references downgrade
@@ -471,10 +474,10 @@ fn walk_secrets(
     }
 }
 
-/// Pull every legacy `secret:` or `secret://` map reference out of a
-/// free-form string. Returns the bare logical name (the part after
-/// the prefix) for each match. Multiple references in one string
-/// (e.g. an interpolated template) are all returned.
+/// Pull every removed `secret:<name>` or legacy logical-name
+/// `secret://<name>` map reference out of a free-form string. Returns
+/// the bare logical name for each match. Multiple references in one
+/// string (e.g. an interpolated template) are all returned.
 fn extract_secret_refs(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     for prefix in ["secret://", "secret:"] {

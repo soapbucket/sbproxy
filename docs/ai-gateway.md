@@ -851,7 +851,7 @@ origins:
 | `models.deny` | list of string | `[]` | Takes precedence over `models.allow`. |
 | `principals` | list | `[]` | Principal selectors gating who may use the credential. Empty matches everyone. |
 | `policies` | list | `[]` | Closed set: `rate_limit` (with `rpm`) and `require_pii_redaction`. There is no per-key tokens-per-minute knob; cap token spend with `attrs.budget.max_tokens`. |
-| `attrs` | object | unset | Attribution: `project`, `user`, `team`, `cost_center`, `tags`, `metadata`, and `budget` (`max_tokens`, `max_cost_usd`, `reset`). The per-key budget is independent of the global `budget` block. |
+| `attrs` | object | unset | Attribution: `project`, `user`, `team`, `cost_center`, `tags`, `metadata`, and `budget`. `budget.max_tokens` and `.max_cost_usd` add total per-key ceilings; `.reset` is accepted with a config-only warning and does not install a reset schedule. The per-key budget is independent of the global `budget` block. |
 | `route_to_model` | string | unset | Pins every request from this credential to one model. |
 | `compression_profile` | string | unset | Selects `on`, `off`, or a named compression profile declared by this AI route. |
 | `inject_tools` | list | `[]` | Provider-native tool definitions injected into requests from this credential. |

@@ -272,7 +272,7 @@ Both `data` and `stringData` fields are honoured. `data` keys are base64-decoded
 
 ## File And Static Map Backends
 
-Use `secretfile://` for a backend-configured YAML or JSON secret file. Use `secret://` for a backend-configured static secret map. Keep `file:/path/to/secret` and `secret:<name>` for legacy configs that already use those forms.
+Use `secretfile://` for a backend-configured YAML or JSON secret file. Use `secret://` for a backend-configured static secret map. The legacy `file:/path/to/secret` form remains valid. The removed `secret:<name>` form does not; migrate it to `secret://<backend>/<name>`.
 
 Configure these backends under `proxy.secrets.backends`. Each has a `name` used in the reference. A `local` backend's `entries` values may be `${ENV}` so real secrets stay in the environment rather than the config file. A reference in an AI provider `api_key` resolves against these at startup, and an unresolved reference stops the proxy from starting rather than being sent verbatim as a bearer token.
 

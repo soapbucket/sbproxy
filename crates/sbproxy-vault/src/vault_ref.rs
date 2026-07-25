@@ -32,10 +32,12 @@
 //!
 //! ## Backward compatibility
 //!
-//! `${ENV_VAR}`, `file:/path/to/secret`, and `secret:<name>` shapes
-//! ship a sibling parser; the resolver tries each in turn. Reserved
-//! URI schemes such as `https://` and `file://` are not treated as
-//! secret references and pass through as literals.
+//! `${ENV_VAR}` and `file:/path/to/secret` shapes ship sibling
+//! parsers; the resolver tries each in turn. The removed
+//! `secret:<name>` form is rejected in favor of
+//! `secret://<backend>/<name>`. Reserved URI schemes such as
+//! `https://` and `file://` are not treated as secret references and
+//! pass through as literals.
 //!
 //! ## Multi-tenant resolution
 //!

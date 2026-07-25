@@ -1422,7 +1422,7 @@ origins:
 | `provider` | string | | Provider this key routes to. Matches an entry in the action's `providers:` list. |
 | `key` | string | | Client-facing key material. Accepts `${ENV}` and secret reference URIs. |
 | `models.allow` / `models.deny` | list | | Per-key model gate, enforced with a 403 before any upstream call. Stacks on the origin-level allow-list; most restrictive wins. |
-| `attrs` | object | | Attribution metadata (`project`, `tags`, `budget`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. The `budget` here is attribution, not an enforced ceiling; enforced spend caps live in the action-level `budget:` block. |
+| `attrs` | object | | Attribution metadata (`project`, `tags`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. `attrs.budget.max_tokens` and `.max_cost_usd` add total per-key ceilings; `.reset` is compatibility-only and does not install a reset schedule. |
 | `policies` | list | | Sub-policies that fire when this credential matches. `{type: rate_limit, rpm: <n>}` lowers to an enforced per-key requests-per-minute cap; there is no per-key tokens-per-minute knob. `{type: require_pii_redaction, rules: [...]}` gates dispatch on active PII redaction. |
 | `route_to_model` | string | | Pin the upstream `model` field; the client-supplied value is ignored. |
 | `compression_profile` | string | | Select `on`, `off`, or a named profile declared by this AI route. |
@@ -2846,7 +2846,7 @@ origins:
 | `headers.add` | map | Append headers |
 | `headers.remove` | list | Remove headers (alias: `delete`) |
 | `status.code` | int | Override the response status code |
-| `status.text` | string | Optional reason phrase (informational only; not sent in HTTP/2) |
+| `status.text` | string | Compatibility-only reason phrase; accepted with a warning and ignored |
 | `body.replace` | string | Replace the response body with this string |
 | `body.replace_json` | object | Replace the response body with this JSON value |
 

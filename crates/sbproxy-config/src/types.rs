@@ -36,9 +36,10 @@ pub struct ConfigFile {
     /// Top-level agent-class catalog selection and resolver tuning.
     /// When unset, the binary constructs a resolver from the embedded
     /// default catalog (so per-agent metric labels keep firing);
-    /// operators only set this block when they want to point at a
-    /// hosted feed, merge a custom catalog, or change the rDNS /
-    /// bot-auth / cache settings.
+    /// operators set this block to provide an inline catalog or change
+    /// the rDNS / bot-auth / cache settings. Hosted-feed fields remain
+    /// parseable for compatibility but are not fetched by the OSS
+    /// runtime.
     #[serde(default)]
     pub agent_classes: Option<AgentClassesConfig>,
     /// WOR-1130: top-level workspace rate-limit budget + auto-suspend
@@ -47,9 +48,9 @@ pub struct ConfigFile {
     /// with a soft / throttle / auto-suspend state machine.
     #[serde(default)]
     pub rate_limits: Option<RateLimitsConfig>,
-    /// WOR-1130: audit sink selection for admin-action audit rows
-    /// (e.g. the auto-suspend transition). `memory` keeps the last N
-    /// rows queryable via `/api/audit/recent` (used by tests + ops).
+    /// WOR-1130: compatibility-only audit sink shape. The OSS runtime
+    /// always retains admin-action rows in memory and mirrors them to
+    /// tracing; selecting a sink here has no effect.
     #[serde(default)]
     pub audit: Option<AuditConfig>,
     /// WOR-1186: emit the canonical session ledger (per-tool-call run
@@ -321,15 +322,16 @@ pub enum RateLimitClockMode {
     Manual,
 }
 
-/// WOR-1130: audit sink selection.
+/// WOR-1130: compatibility-only audit sink selection.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct AuditConfig {
-    /// Where admin-action audit rows are kept.
+    /// Accepted for config compatibility but not consumed by the OSS
+    /// runtime. Rows always use both the in-memory ring and tracing.
     #[serde(default)]
     pub sink: AuditSinkKind,
 }
 
-/// WOR-1130: audit sink kinds.
+/// WOR-1130: accepted audit sink names.
 #[derive(
     Debug,
     Clone,
@@ -343,10 +345,12 @@ pub struct AuditConfig {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AuditSinkKind {
-    /// Keep the last N rows in memory, queryable via `/api/audit/recent`.
+    /// Compatibility value; rows remain queryable via `/api/audit/recent`
+    /// and are also mirrored to tracing.
     #[default]
     Memory,
-    /// Emit to the structured `security_audit` tracing target only.
+    /// Compatibility value; rows are still retained in memory as well
+    /// as emitted to the structured `security_audit` tracing target.
     Tracing,
 }
 
@@ -450,11 +454,10 @@ pub enum ConfigSource {
 /// resolver tuning. Most operators leave it untouched.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AgentClassesConfig {
-    /// Catalog source. `builtin` (default) loads the embedded YAML
-    /// catalog. `inline` loads the entries in `entries`. `hosted-feed`
-    /// fetches from `hosted_feed.url`. `merged` loads the hosted feed
-    /// and overlays it on top of the embedded defaults so an operator's
-    /// feed only needs to ship deltas.
+    /// Catalog source. `builtin` (default) loads the embedded YAML and
+    /// `inline` loads `entries`. The compatibility values `hosted-feed`
+    /// and `merged` currently warn and fall back to the embedded
+    /// defaults; the OSS runtime does not fetch `hosted_feed.url`.
     #[serde(default = "default_agent_classes_catalog")]
     pub catalog: String,
     /// Inline catalog entries. Used when `catalog: inline`; each entry
@@ -462,8 +465,8 @@ pub struct AgentClassesConfig {
     /// embedded catalog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<serde_json::Value>,
-    /// Hosted-feed configuration. Required when `catalog: hosted-feed`
-    /// or `catalog: merged`.
+    /// Compatibility-only hosted-feed configuration. It remains
+    /// parseable but the OSS runtime does not fetch or merge it.
     #[serde(default)]
     pub hosted_feed: Option<HostedFeedConfig>,
     /// Resolver tuning (rDNS toggle, bot-auth toggle, cache size).
@@ -489,19 +492,17 @@ fn default_agent_classes_catalog() -> String {
 
 /// Hosted-feed source for the agent-class catalog.
 ///
-/// Pulled at startup and refreshed on a schedule the registry owns.
-/// The fetch loop is not implemented in this crate; the field is
-/// reserved here so YAML written against the merged or hosted-feed
-/// shapes parses cleanly.
+/// Reserved so YAML written against the `hosted-feed` or `merged`
+/// shapes parses cleanly. The OSS runtime does not fetch, refresh, or
+/// verify this feed; selecting either catalog value warns and falls
+/// back to the embedded defaults.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HostedFeedConfig {
-    /// Feed URL. Plain `http://` is allowed only against `127.0.0.1`
-    /// and `localhost` for local development; the registry crate
-    /// enforces HTTPS at fetch time for any other host.
+    /// Reserved feed URL. It is accepted but not fetched or validated
+    /// by the OSS runtime.
     pub url: String,
-    /// Bootstrap public keys (base64-encoded ed25519 keys) used to
-    /// verify the feed's detached signature on the first fetch.
-    /// Empty in dev configs; required for production.
+    /// Reserved bootstrap public keys. They are accepted but no
+    /// signature verification is installed in the OSS runtime.
     #[serde(default)]
     pub bootstrap_keys: Vec<String>,
 }
@@ -4144,7 +4145,7 @@ pub struct TenantObservabilityRedactConfig {
 /// * Where the secret material lives (`key`, a provider-specific
 ///   secret reference such as `vault://`, `awssm://`, `gcpsm://`,
 ///   `k8ssecret://`, `secretfile://`, or `secret://`, or a legacy
-///   `${ENV}` / `file:` / `secret:` reference).
+///   `${ENV}` / `file:` reference).
 /// * Which inbound principals can use it (`principals` selectors).
 /// * Per-credential attribution metadata (`attrs`).
 /// * Allow / deny model lists that stack on top of the origin-level
@@ -4167,9 +4168,10 @@ pub struct CredentialBlock {
     pub provider: Option<String>,
     /// Secret material reference. Provider-specific schemes include
     /// `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`,
-    /// `secretfile://`, and `secret://`; legacy `${ENV}`, `file:`,
-    /// and `secret:` forms also remain valid. The resolver dispatches
-    /// at runtime; the config parser carries it as a string.
+    /// `secretfile://`, and `secret://`; legacy `${ENV}` and `file:`
+    /// forms also remain valid. The removed `secret:<name>` form is
+    /// rejected. The resolver dispatches at runtime; the config parser
+    /// carries the value as a string.
     #[serde(default)]
     pub key: Option<String>,
     /// Principal selectors that match this credential to inbound
@@ -4277,17 +4279,19 @@ pub struct CredentialAttrs {
     pub budget: Option<CredentialBudget>,
 }
 
-/// Per-credential budget. Reset windows use the LiteLLM-style
-/// `30s|30m|30h|30d` syntax.
+/// Per-credential budget. The token and cost caps are lowered into
+/// the live credential registry. `reset` remains a reserved,
+/// compatibility-only field and does not install a reset schedule.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CredentialBudget {
-    /// Maximum tokens (input + output combined) per reset window.
+    /// Maximum input + output tokens enforced for this credential.
     #[serde(default)]
     pub max_tokens: Option<u64>,
-    /// Maximum USD spend per reset window.
+    /// Maximum USD spend enforced for this credential.
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
-    /// Reset window. Parsed at config-load.
+    /// Reserved reset-window hint. It is accepted but not parsed or
+    /// enforced by the OSS runtime.
     #[serde(default)]
     pub reset: Option<String>,
 }
@@ -5010,19 +5014,21 @@ pub struct PathMatcher {
 }
 
 /// Inline child origin used when a forward rule fires. Carries the action plus
-/// optional request modifiers and identifying metadata.
+/// optional request modifiers. Compatibility metadata fields remain parseable
+/// but are not copied into the compiled child origin.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ForwardRuleOrigin {
     /// Optional identifier used in metrics and logs.
     #[serde(default)]
     pub id: Option<String>,
-    /// Optional hostname tag (informational; the parent origin's hostname is what routed the request).
+    /// Compatibility-only hostname tag. The parent origin's hostname
+    /// routes the request; this value is not consumed.
     #[serde(default)]
     pub hostname: Option<String>,
-    /// Optional workspace identifier.
+    /// Compatibility-only workspace identifier; not consumed.
     #[serde(default)]
     pub workspace_id: Option<String>,
-    /// Optional version label.
+    /// Compatibility-only version label; not consumed.
     #[serde(default)]
     pub version: Option<String>,
     /// Action executed when the rule fires. Stays as raw JSON because action
@@ -5124,7 +5130,8 @@ pub struct ResponseModifierConfig {
     /// Header set/add/remove operations.
     #[serde(default)]
     pub headers: Option<HeaderModifiers>,
-    /// Override the response status code and optional reason text.
+    /// Override the response status code. A supplied `text` value is
+    /// accepted for compatibility but ignored.
     #[serde(default)]
     pub status: Option<StatusOverride>,
     /// Response body replacement.
@@ -5143,7 +5150,8 @@ pub struct ResponseModifierConfig {
 pub struct StatusOverride {
     /// The HTTP status code to set.
     pub code: u16,
-    /// Optional reason phrase (not sent in HTTP/2, informational only).
+    /// Compatibility-only reason phrase. The runtime applies `code`
+    /// and ignores this value for every HTTP version.
     #[serde(default)]
     pub text: Option<String>,
 }

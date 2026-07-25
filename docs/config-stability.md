@@ -81,19 +81,23 @@ and stale entries fail when their schema path is removed or renamed.
 
 | Field or subtree | What happens today |
 |---|---|
-| `agent_classes.hosted_feed` | The OSS resolver uses builtin or inline catalogs; it does not fetch a hosted feed. |
+| `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The OSS resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. |
+| `audit.sink` | Admin-action rows always use the in-memory ring and tracing mirror; this selector has no effect. |
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
 | `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
 | `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |
 | `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |
+| `origins.*.credentials[].attrs.budget.reset` | Reserved reset hint; no credential reset schedule is installed. The same leaf is config-only at proxy and tenant credential scopes. |
+| `origins.*.forward_rules[].origin.hostname`, `.workspace_id`, `.version` | Inline forward-origin metadata is accepted but not copied into the compiled child origin. |
 | `origins.*.rate_limit_headers` | Use the live rate-limit policy's `headers` block instead. |
+| `origins.*.response_modifiers[].status.text` | The status code is applied; the compatibility reason text is ignored. |
 | `origins.*.sessions.ttl_seconds` | Reserved retention hint; the in-process request ring does not expire entries from it. |
 | `origins.*.traffic_capture` | No OSS capture consumer; use `mirror` for live fire-and-forget request mirroring. |
 | `proxy.device_parser_file` | The current pure-Rust device parser does not load this catalog override. |
 | `proxy.key_management.governance.key_introspection` | The caller-only introspection route is not installed. |
 | `proxy.key_management.store.redis_source_of_truth` | Redis is authoritative whenever `store.backend: redis`; this legacy boolean changes nothing. |
 | `proxy.observability.log.level`, `.format`, `.sampling` | Process logging uses CLI/environment selection and fixed sampling defaults. Sink-local `format` remains live. |
-| `proxy.scripting.javascript` | QuickJS engines use built-in sandbox defaults; this YAML subtree is not installed. |
+| `proxy.scripting.javascript.sandbox.budget_ms`, `.memory_mb`, `.stack_kb` | QuickJS engines use built-in sandbox defaults; these YAML leaves are not installed. |
 | `proxy.secrets.backend`, `.hashicorp`, `.map`, `.rotation`, `.fallback` | Legacy single-backend surface. Use named `proxy.secrets.backends` and provider URI references. |
 
 ---

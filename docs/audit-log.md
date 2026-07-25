@@ -27,17 +27,20 @@ GET /api/audit/recent?limit=50
 
 The response is a JSON array of rows, newest first. `limit` defaults to 50.
 
-### Sink selection
+### Compatibility-only sink selector
 
-The top-level `audit:` block selects where admin-action audit rows are kept:
+The top-level `audit:` block remains parseable, but the OSS runtime does not
+use its `sink` value:
 
 ```yaml
 audit:
-  sink: memory        # memory (default) | tracing
+  sink: memory        # accepted for compatibility; no runtime effect
 ```
 
-- `memory` (default): keep the last rows in memory, queryable via `/api/audit/recent`.
-- `tracing`: emit to the structured `security_audit` tracing target only.
+Admin-action rows always use both live paths: the most recent 256 rows remain
+queryable via `/api/audit/recent`, and every row is mirrored to the structured
+`security_audit` tracing target. Explicitly authoring `audit.sink` emits a
+config-only warning.
 
 ## Tracing audit channels
 

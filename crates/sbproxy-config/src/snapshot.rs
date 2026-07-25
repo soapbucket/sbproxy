@@ -234,16 +234,17 @@ pub struct CompiledConfig {
     /// Parsed top-level `agent_classes:` block. `None` means the
     /// operator did not author the block; the binary startup code
     /// constructs a resolver from defaults in that case. `Some(_)`
-    /// carries the typed catalog source / hosted-feed URL / resolver
-    /// tuning so the binary can build the correct `AgentClassResolver`
-    /// at startup.
+    /// carries the catalog selection and resolver tuning. Hosted-feed
+    /// fields remain compatibility-only; the OSS runtime falls back to
+    /// the built-in catalog instead of fetching them.
     pub agent_classes: Option<AgentClassesConfig>,
     /// WOR-1130: parsed top-level `rate_limits:` workspace budget +
     /// auto-suspend escalation. `None` means no workspace ceiling is
     /// configured. The binary installs a process-wide budget registry
     /// from this at startup.
     pub rate_limits: Option<crate::types::RateLimitsConfig>,
-    /// WOR-1130: audit sink selection (`memory` / `tracing`).
+    /// WOR-1130: compatibility-only audit sink selection. The runtime
+    /// always retains rows in memory and mirrors them to tracing.
     pub audit: Option<crate::types::AuditConfig>,
     /// WOR-1186: session-ledger emission config. `None` (or
     /// `enabled: false`) leaves the ledger off. The binary registers a
