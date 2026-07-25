@@ -241,13 +241,45 @@ The `reload_in_progress` single-flight flag is `/admin/reload` only, despite a d
 
 Boot does not take `CONFIG_RELOAD_LOCK`, and the admin listener can come up before boot finishes its own publish.
 
+## Solutions
+
+Every finding above has a worked answer. Two of them are smaller than they first looked, and one is a limit we accept rather than solve.
+
+### Reload atomicity: reordering, not a rewrite
+
+I estimated this as the most invasive ticket in the epic, then traced what `CompiledPipeline::from_config` actually reads. **Only one of the nine installs is a genuine construction-time dependency.** The other eight are pure request-path state and constrain nothing.
+
+The one that matters is the AI provider registry, which `AiHandlerConfig::from_config` reads twice and can `bail!` on. Its static is already `OnceLock<ArcSwap<Registry>>` and it self-initializes from the embedded catalog, so the ordering only bites when an `ai_providers_file:` override is in play. Two more construction-time reads exist that were not on my list, and both are already handled: the process secret resolver is boot-only and never touched by reload, and the cluster handle plus AI client are already abstracted behind `PipelineConstructionMode`.
+
+Everything else is read on the request path or the admin path and nowhere else. The Lua sandbox config is read only by `LuaEngine::new()` during WAF evaluation. Redact state is read at the log-emit chokepoint. Tenant cardinality is read when recording metrics. The sink dispatcher is read on emit, usage rollups from one admin handler, all five detection singletons from `request_phase.rs`, and the key plane from four admin and dispatch call sites with zero at construction.
+
+So the work is: move the six request-path installs to after the last hard-error point, build the key plane early but install it late (its construction does real I/O and is fallible), and thread one `Arc<Registry>` into `from_config` instead of installing it first. A context struct carrying one value, plus a reordering. Contained.
+
+### Reporting: report, do not escalate
+
+The seven soft-failing subsystems stay soft. Making them hard would change behaviour for existing operators, and a degraded AI catalog really is better than a refused reload on a box someone is watching. The fix is a `ReloadOutcome` that names what degraded, returned rather than logged, so each caller picks its own policy. A human reload sees a warning; a subscriber treats degraded as a rejected bundle and keeps the previous config. That also gives the managed service something honest to show a customer.
+
+### Secrets: a documented limit, not a fix
+
+Do not make the secret resolver reloadable. It owns live network clients for Vault, AWS, GCP, and Kubernetes, and swapping it under a running fleet is a bigger problem than this epic needs solved. Detect that `proxy.secrets` changed, refuse loudly the way the cluster fingerprint already does, and document that secret backends are process-owned and need a restart.
+
+This is a real product limit the managed service will eventually hit, so it belongs in the docs now rather than as a support surprise later.
+
+### Node identity: env interpolation by default
+
+Support both mechanisms, and document `${VAR}` as the default pattern. It needs no new machinery, and environment is the natural carrier in containers and Kubernetes where a shared repo is most likely. Use a local overlay when the difference between nodes is structural rather than a handful of scalars; `GitOverlay` already models it and CA-06 wires it anyway.
+
+The one thing that must change is the failure mode. An unresolved `${VAR}` currently warns and leaves literal text, so a host that forgets to export its node id gets `${SB_NODE_ID}` as a node id. Node-local values must hard-fail when unresolved, the way admin credentials already do.
+
+### The rest
+
+Publish validation runs the full `validate` sequence with `from_config_for_validation`. Drift becomes per-source rather than one hash. The admin listener gets a sibling listener for the authority endpoint, plus startup checks that refuse default credentials off loopback. The three lying doc comments get corrected. All mechanical.
+
 ### What this changes about the plan
 
-Two new children, both prerequisites rather than follow-ons.
+Two new children, both prerequisites rather than follow-ons. **CA-00** makes the reload transaction honest. **CA-11** hardens the admin surface and gives the authority its own listener.
 
-**CA-00** makes the reload transaction honest: stage the process-global installs so nothing mutates before the last hard-error point, make the soft-failing subsystems report their status so "applied" can mean applied, and detect a changed `proxy.secrets` and refuse loudly instead of ignoring it. Nothing else in this epic is trustworthy until this lands, because every failure guarantee in the table above depends on it.
-
-**CA-11** hardens the admin surface and gives the authority its own listener, so exposing a config authority to a fleet is not the same act as exposing the full admin API with default credentials.
+Two pre-existing bugs came out of the audit and are filed separately, because neither should wait on this epic. `sbproxy apply` reloads the CLI's own process and exits, so its success message is not evidence the server did anything. And `start_background_tasks()` is called unconditionally regardless of construction mode, so every `PUT /admin/config` spawns health-probe tasks for a pipeline that is immediately dropped; they hold the pipeline alive and keep probing the operator's upstreams forever. The admin UI's save button triggers it. That one is a one-line mode guard.
 
 The rest of the findings attach to the children that already own the relevant code.
 
