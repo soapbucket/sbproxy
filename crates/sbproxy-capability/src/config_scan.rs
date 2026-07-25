@@ -264,6 +264,8 @@ fn source_is_production(path: &std::path::Path) -> bool {
 #[derive(Default)]
 struct RustTypeIndex {
     fields: BTreeMap<String, BTreeMap<String, Option<String>>>,
+    enum_tags: BTreeMap<String, String>,
+    enum_variants: BTreeMap<String, BTreeSet<String>>,
     function_returns: BTreeMap<String, BTreeSet<String>>,
 }
 
@@ -278,6 +280,29 @@ impl RustTypeIndex {
                     .insert(field_name.clone(), innermost_type_name(&field.ty));
             }
         }
+    }
+
+    fn record_enum(&mut self, item: &syn::ItemEnum) {
+        let owner = item.ident.to_string();
+        self.enum_variants.insert(
+            owner.clone(),
+            item.variants
+                .iter()
+                .map(|variant| variant.ident.to_string())
+                .collect(),
+        );
+        if let Some(tag) = serde_enum_tag(&item.attrs) {
+            self.enum_tags.insert(owner, rust_field_name(&tag));
+        }
+    }
+
+    fn enum_tag_for_variant_path(&self, path: &syn::Path) -> Option<(&str, &str)> {
+        let mut segments = path.segments.iter().rev();
+        let variant = segments.next()?.ident.to_string();
+        let owner = segments.next()?.ident.to_string();
+        let (owner, variants) = self.enum_variants.get_key_value(&owner)?;
+        variants.contains(&variant).then_some(())?;
+        Some((owner.as_str(), self.enum_tags.get(owner)?.as_str()))
     }
 
     fn field_type(&self, owner: &str, field: &str) -> Option<&str> {
@@ -332,6 +357,7 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
             return;
         }
         let owner = node.ident.to_string();
+        self.index.record_enum(node);
         for variant in &node.variants {
             self.index.record_fields(&owner, &variant.fields);
         }
@@ -356,6 +382,24 @@ fn rust_type_index(sources: &[&SourceFile]) -> RustTypeIndex {
         }
     }
     index
+}
+
+fn serde_enum_tag(attributes: &[syn::Attribute]) -> Option<String> {
+    let mut tag = None;
+    for attribute in attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("serde"))
+    {
+        let _ = attribute.parse_nested_meta(|meta| {
+            if meta.path.is_ident("tag") {
+                tag = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+            } else if meta.input.peek(syn::Token![=]) {
+                let _ = meta.value()?.parse::<syn::Expr>()?;
+            }
+            Ok(())
+        });
+    }
+    tag
 }
 
 fn innermost_type_name(ty: &syn::Type) -> Option<String> {
@@ -458,11 +502,13 @@ impl<'a> FieldReadVisitor<'a> {
                 }
             }
             syn::Pat::TupleStruct(tuple) => {
+                self.record_tagged_enum_match(&tuple.path);
                 for element in &tuple.elems {
                     self.bind_pattern(element, owner);
                 }
             }
             syn::Pat::Struct(record) => {
+                self.record_tagged_enum_match(&record.path);
                 let pattern_owner = record
                     .path
                     .segments
@@ -484,7 +530,14 @@ impl<'a> FieldReadVisitor<'a> {
                     }
                 }
             }
+            syn::Pat::Path(path) => self.record_tagged_enum_match(&path.path),
             _ => {}
+        }
+    }
+
+    fn record_tagged_enum_match(&mut self, path: &syn::Path) {
+        if let Some((owner, tag)) = self.types.enum_tag_for_variant_path(path) {
+            self.reads.insert((owner.to_string(), tag.to_string()));
         }
     }
 
@@ -1187,6 +1240,74 @@ fn production(config: Option<&Config>) {
         )];
 
         assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn matched_serde_enum_variant_covers_its_exact_tag_leaf() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.backend.type".to_string(),
+            rust_field: "type".to_string(),
+            rust_owner: Some("BackendConfig".to_string()),
+        }];
+        let sources = [source(
+            r#"
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BackendConfig {
+    Memory,
+    File { path: String },
+}
+
+fn build(config: &BackendConfig) {
+    match config {
+        BackendConfig::Memory => {}
+        BackendConfig::File { path } => consume(path),
+    }
+}
+"#,
+        )];
+
+        assert_eq!(
+            verify_config_readers(&keys, &[], &sources),
+            vec![],
+            "matching a tagged enum proves the exact serde discriminator is consumed"
+        );
+    }
+
+    #[test]
+    fn unrelated_tagged_enum_match_does_not_cover_the_same_tag_name() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.backend.type".to_string(),
+            rust_field: "type".to_string(),
+            rust_owner: Some("BackendConfig".to_string()),
+        }];
+        let sources = [source(
+            r#"
+#[serde(tag = "type")]
+enum BackendConfig {
+    Memory,
+}
+
+#[serde(tag = "type")]
+enum UnrelatedBackend {
+    Memory,
+}
+
+fn build(config: &UnrelatedBackend) {
+    match config {
+        UnrelatedBackend::Memory => {}
+    }
+}
+"#,
+        )];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.subject == "proxy.backend.type"),
+            "a match on another enum's `type` tag is not reader evidence: {errors:?}"
+        );
     }
 
     #[test]
