@@ -91,7 +91,7 @@ e2e runs occasionally and locally, not on every PR.
 | Trusted proxies + client IP (`trusted_*`) | 1 | Post-trust-boundary client IP resolution from X-Forwarded-For |
 | Variables + templating (`variables_*`) | 1 | `{{ variables.<name> }}` substitution + env-var interpolation |
 | Upstream retries + connect (`upstream_*`) | 1 | DNS failure, refused, unreachable, TLS handshake fail → retry behaviour |
-| HTTP basics (`http_*`, `proxy_*`) | 4 | HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket upgrade |
+| HTTP basics (`http_*`, `proxy_*`) | 4 | HTTP/1.1, HTTP/2, WebSocket upgrade |
 | Headers (`header_*`) | 1 | Vary, Cache-Control + secret-redaction passthrough |
 | Admin (`admin_*`) | 2 | Admin server bind + basic-auth + `/api/*` + `/admin/reload` |
 | Misc cross-cutting | rest | Plug-in registry, classifier sidecar lifecycle, sidecar transport, ledger + 402, vault backend, well-known projections |
