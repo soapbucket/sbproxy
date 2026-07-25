@@ -30,6 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use syn::parse::Parser;
+
 use crate::{MetricCapability, RegistryError, SupportLevel, Writer};
 
 /// Labels Prometheus itself attaches, which no metric declares.
@@ -76,6 +78,65 @@ pub struct SourceFile {
     pub text: String,
 }
 
+/// Whether an item's attributes make it reachable only in test builds.
+///
+/// A conjunctive predicate containing `test` (for example,
+/// `cfg(all(test, unix))`) is test-only. A disjunction is test-only only when
+/// every branch requires `test`; `cfg(any(test, feature = "fixtures"))` still
+/// has a production-feature build and must remain visible.
+pub(crate) fn attributes_are_test_only(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        let path = attribute.path();
+        if path.is_ident("test") {
+            return true;
+        }
+        if path.is_ident("cfg") {
+            return match &attribute.meta {
+                syn::Meta::List(list) => list
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|predicate| cfg_predicate_requires_test(&predicate)),
+                _ => false,
+            };
+        }
+        let mut segments = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string());
+        matches!(
+            (
+                segments.next().as_deref(),
+                segments.next().as_deref(),
+                segments.next()
+            ),
+            (Some("tokio" | "async_std"), Some("test"), None)
+        )
+    })
+}
+
+fn cfg_predicate_requires_test(predicate: &syn::Meta) -> bool {
+    match predicate {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") => parse_meta_items(list)
+            .is_some_and(|items| items.iter().any(cfg_predicate_requires_test)),
+        syn::Meta::List(list) if list.path.is_ident("any") => {
+            parse_meta_items(list).is_some_and(|items| {
+                !items.is_empty() && items.iter().all(cfg_predicate_requires_test)
+            })
+        }
+        // Negation can make a predicate production-only, but it never proves
+        // the item requires a test build.
+        syn::Meta::List(list) if list.path.is_ident("not") => false,
+        syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
+    }
+}
+
+fn parse_meta_items(list: &syn::MetaList) -> Option<Vec<syn::Meta>> {
+    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+        .parse2(list.tokens.clone())
+        .ok()
+        .map(|items| items.into_iter().collect())
+}
+
 /// One metric reference found in a dashboard or rule file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricReference {
@@ -109,50 +170,135 @@ pub struct ReferenceExemption {
 /// field does not make that behavior live in production.
 pub fn rust_sources(root: &Path) -> Vec<SourceFile> {
     let mut out = Vec::new();
+    let mut visited = BTreeSet::new();
     let crates = root.join("crates");
-    walk(&crates, &crates, &mut out);
+    let Ok(crate_entries) = fs::read_dir(&crates) else {
+        return out;
+    };
+    for crate_entry in crate_entries.flatten() {
+        let crate_dir = crate_entry.path();
+        let src_dir = crate_dir.join("src");
+        if !src_dir.is_dir() {
+            continue;
+        }
+        for root_name in ["lib.rs", "main.rs"] {
+            let crate_root = src_dir.join(root_name);
+            if crate_root.is_file() {
+                collect_reachable_source(root, &crate_root, &mut visited, &mut out);
+            }
+        }
+        let bin_dir = src_dir.join("bin");
+        let Ok(bin_entries) = fs::read_dir(bin_dir) else {
+            continue;
+        };
+        for bin_entry in bin_entries.flatten() {
+            let path = bin_entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                collect_reachable_source(root, &path, &mut visited, &mut out);
+            } else {
+                let main = path.join("main.rs");
+                if main.is_file() {
+                    collect_reachable_source(root, &main, &mut visited, &mut out);
+                }
+            }
+        }
+    }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-fn walk(crates_root: &Path, dir: &Path, out: &mut Vec<SourceFile>) {
-    let Ok(entries) = fs::read_dir(dir) else {
+fn collect_reachable_source(
+    repo_root: &Path,
+    path: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    out: &mut Vec<SourceFile>,
+) {
+    let normalized = path.to_path_buf();
+    if !visited.insert(normalized) {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let relative = path.strip_prefix(crates_root).unwrap_or(&path);
-            let depth = relative.components().count();
-            if name == "target"
-                || name.starts_with('.')
-                || (depth == 2 && matches!(name, "tests" | "benches" | "examples"))
-                || (depth > 2 && name == "tests")
-            {
-                continue;
-            }
-            walk(crates_root, &path, out);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-            if path.file_name().and_then(|name| name.to_str()) == Some("tests.rs") {
-                continue;
-            }
-            if let Ok(text) = fs::read_to_string(&path) {
-                out.push(SourceFile {
-                    text: strip_test_regions(&text),
-                    raw_text: text,
-                    path: path
-                        .strip_prefix(
-                            crates_root
-                                .parent()
-                                .expect("crates directory has repository parent"),
-                        )
-                        .unwrap_or(&path)
-                        .to_path_buf(),
-                });
-            }
+    out.push(SourceFile {
+        text: strip_test_regions(&text),
+        raw_text: text.clone(),
+        path: path.strip_prefix(repo_root).unwrap_or(path).to_path_buf(),
+    });
+
+    let Ok(file) = syn::parse_file(&text) else {
+        return;
+    };
+    let module_dir = child_module_directory(path);
+    collect_external_modules(repo_root, &file.items, &module_dir, visited, out);
+}
+
+fn collect_external_modules(
+    repo_root: &Path,
+    items: &[syn::Item],
+    module_dir: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    out: &mut Vec<SourceFile>,
+) {
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        if attributes_are_test_only(&module.attrs) {
+            continue;
+        }
+        if let Some((_, inline_items)) = &module.content {
+            collect_external_modules(
+                repo_root,
+                inline_items,
+                &module_dir.join(module.ident.to_string()),
+                visited,
+                out,
+            );
+            continue;
+        }
+
+        if let Some(target) = module_path_override(module)
+            .map(|relative| module_dir.join(relative))
+            .or_else(|| {
+                let name = module.ident.to_string();
+                [
+                    module_dir.join(format!("{name}.rs")),
+                    module_dir.join(name).join("mod.rs"),
+                ]
+                .into_iter()
+                .find(|candidate| candidate.is_file())
+            })
+        {
+            collect_reachable_source(repo_root, &target, visited, out);
         }
     }
+}
+
+fn child_module_directory(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    match path.file_stem().and_then(|stem| stem.to_str()) {
+        Some("lib" | "main" | "mod") | None => parent.to_path_buf(),
+        Some(stem) => parent.join(stem),
+    }
+}
+
+fn module_path_override(module: &syn::ItemMod) -> Option<PathBuf> {
+    module.attrs.iter().find_map(|attribute| {
+        if !attribute.path().is_ident("path") {
+            return None;
+        }
+        let syn::Meta::NameValue(name_value) = &attribute.meta else {
+            return None;
+        };
+        let syn::Expr::Lit(expression) = &name_value.value else {
+            return None;
+        };
+        let syn::Lit::Str(path) = &expression.lit else {
+            return None;
+        };
+        Some(PathBuf::from(path.value()))
+    })
 }
 
 /// Remove `#[cfg(test)]` items and `#[test]` functions from Rust source.

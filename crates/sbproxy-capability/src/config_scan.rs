@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 use syn::visit::Visit;
 
-use crate::scan::SourceFile;
+use crate::scan::{attributes_are_test_only, SourceFile};
 use crate::{validate_config_keys, ConfigKeyCapability, RegistryError, SupportLevel};
 
 /// One leaf key reached from the root of the generated configuration schema.
@@ -40,8 +40,14 @@ pub fn schema_key_paths(schema: &Value) -> Vec<ConfigSchemaKey> {
     let mut out = BTreeSet::new();
     let mut refs = Vec::new();
     let owner = schema.get("title").and_then(Value::as_str);
-    collect_schema(schema, schema, "", owner, &mut refs, &mut out);
+    collect_schema(schema, schema, "", owner, None, &mut refs, &mut out);
     out.into_iter().collect()
+}
+
+#[derive(Clone, Copy)]
+struct LeafOwner<'a> {
+    rust_field: &'a str,
+    rust_owner: Option<&'a str>,
 }
 
 fn collect_schema(
@@ -49,6 +55,7 @@ fn collect_schema(
     node: &Value,
     path: &str,
     owner: Option<&str>,
+    leaf_owner: Option<LeafOwner<'_>>,
     refs: &mut Vec<String>,
     out: &mut BTreeSet<ConfigSchemaKey>,
 ) {
@@ -56,7 +63,15 @@ fn collect_schema(
         if !refs.iter().any(|active| active == reference) {
             if let Some(target) = local_ref(root, reference) {
                 refs.push(reference.to_string());
-                collect_schema(root, target, path, ref_owner(reference), refs, out);
+                collect_schema(
+                    root,
+                    target,
+                    path,
+                    ref_owner(reference),
+                    leaf_owner,
+                    refs,
+                    out,
+                );
                 refs.pop();
             }
         }
@@ -65,25 +80,38 @@ fn collect_schema(
     for keyword in ["allOf", "anyOf", "oneOf"] {
         if let Some(parts) = node.get(keyword).and_then(Value::as_array) {
             for part in parts {
-                collect_schema(root, part, path, owner, refs, out);
+                collect_schema(root, part, path, owner, leaf_owner, refs, out);
             }
         }
     }
     for keyword in ["if", "then", "else", "not"] {
         if let Some(part) = node.get(keyword) {
-            collect_schema(root, part, path, owner, refs, out);
+            collect_schema(root, part, path, owner, leaf_owner, refs, out);
         }
     }
 
     if let Some(properties) = node.get("properties").and_then(Value::as_object) {
         for (name, child) in properties {
             let child_path = join_path(path, name);
+            let rust_field = rust_field_name(name);
+            let child_leaf_owner = LeafOwner {
+                rust_field: &rust_field,
+                rust_owner: owner,
+            };
             let mut descendants = BTreeSet::new();
-            collect_schema(root, child, &child_path, owner, refs, &mut descendants);
+            collect_schema(
+                root,
+                child,
+                &child_path,
+                owner,
+                Some(child_leaf_owner),
+                refs,
+                &mut descendants,
+            );
             if descendants.is_empty() {
                 out.insert(ConfigSchemaKey {
                     path: child_path,
-                    rust_field: rust_field_name(name),
+                    rust_field,
                     rust_owner: owner.map(str::to_string),
                 });
             } else {
@@ -97,21 +125,21 @@ fn collect_schema(
         match items {
             Value::Array(variants) => {
                 for variant in variants {
-                    collect_schema(root, variant, &item_path, owner, refs, out);
+                    collect_schema_or_leaf(root, variant, &item_path, owner, leaf_owner, refs, out);
                 }
             }
-            _ => collect_schema(root, items, &item_path, owner, refs, out),
+            _ => collect_schema_or_leaf(root, items, &item_path, owner, leaf_owner, refs, out),
         }
     }
 
     if let Some(additional) = node.get("additionalProperties") {
-        if additional.is_object() {
+        if additional.is_object() || additional == &Value::Bool(true) {
             let value_path = if path.is_empty() {
                 "*".to_string()
             } else {
                 format!("{path}.*")
             };
-            collect_schema(root, additional, &value_path, owner, refs, out);
+            collect_schema_or_leaf(root, additional, &value_path, owner, leaf_owner, refs, out);
         }
     }
 
@@ -122,9 +150,32 @@ fn collect_schema(
             format!("{path}.*")
         };
         for child in patterns.values() {
-            collect_schema(root, child, &value_path, owner, refs, out);
+            collect_schema_or_leaf(root, child, &value_path, owner, leaf_owner, refs, out);
         }
     }
+}
+
+fn collect_schema_or_leaf(
+    root: &Value,
+    node: &Value,
+    path: &str,
+    owner: Option<&str>,
+    leaf_owner: Option<LeafOwner<'_>>,
+    refs: &mut Vec<String>,
+    out: &mut BTreeSet<ConfigSchemaKey>,
+) {
+    let mut descendants = BTreeSet::new();
+    collect_schema(root, node, path, owner, leaf_owner, refs, &mut descendants);
+    if descendants.is_empty() {
+        if let Some(leaf_owner) = leaf_owner {
+            descendants.insert(ConfigSchemaKey {
+                path: path.to_string(),
+                rust_field: leaf_owner.rust_field.to_string(),
+                rust_owner: leaf_owner.rust_owner.map(str::to_string),
+            });
+        }
+    }
+    out.extend(descendants);
 }
 
 fn ref_owner(reference: &str) -> Option<&str> {
@@ -222,7 +273,7 @@ pub fn verify_config_readers(
             }
             continue;
         }
-        if !has_unambiguous_field_read(key, &typed_reads) {
+        if !has_unambiguous_field_read(key, &typed_reads, &type_index) {
             errors.push(RegistryError {
                 subject: key.path.clone(),
                 message: format!(
@@ -257,127 +308,411 @@ fn source_is_production(path: &std::path::Path) -> bool {
     ) {
         return false;
     }
-    !within_crate.iter().any(|component| *component == "tests")
-        && within_crate.last().copied() != Some("tests.rs")
+    !within_crate.contains(&"tests") && within_crate.last().copied() != Some("tests.rs")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModuleContext {
+    crate_name: String,
+    modules: Vec<String>,
+}
+
+impl ModuleContext {
+    fn from_source_path(path: &std::path::Path) -> Option<Self> {
+        let components: Vec<_> = path
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect();
+        let crates_at = components
+            .iter()
+            .position(|component| *component == "crates")?;
+        let crate_name = normalize_crate_name(components.get(crates_at + 1)?);
+        let src_at = components[crates_at + 2..]
+            .iter()
+            .position(|component| *component == "src")?
+            + crates_at
+            + 2;
+        let relative = &components[src_at + 1..];
+        let (file, directories) = relative.split_last()?;
+        let mut modules: Vec<String> = directories
+            .iter()
+            .map(|component| (*component).to_string())
+            .collect();
+        let stem = std::path::Path::new(file)
+            .file_stem()
+            .and_then(|stem| stem.to_str())?;
+        if !matches!(stem, "lib" | "main" | "mod") {
+            modules.push(stem.to_string());
+        }
+        Some(Self {
+            crate_name,
+            modules,
+        })
+    }
+
+    fn child(&self, module: &syn::Ident) -> Self {
+        let mut child = self.clone();
+        child.modules.push(module.to_string());
+        child
+    }
+
+    fn symbol(&self, name: &str) -> String {
+        std::iter::once(self.crate_name.as_str())
+            .chain(self.modules.iter().map(String::as_str))
+            .chain(std::iter::once(name))
+            .collect::<Vec<_>>()
+            .join("::")
+    }
+}
+
+fn normalize_crate_name(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+#[derive(Debug, Clone)]
+struct TypeReference {
+    segments: Vec<String>,
+    context: ModuleContext,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionReturn {
+    symbol: String,
+    result: TypeReference,
 }
 
 #[derive(Default)]
 struct RustTypeIndex {
-    fields: BTreeMap<String, BTreeMap<String, Option<String>>>,
+    fields: BTreeMap<String, BTreeMap<String, Option<TypeReference>>>,
+    types_by_name: BTreeMap<String, BTreeSet<String>>,
     enum_tags: BTreeMap<String, String>,
     enum_variants: BTreeMap<String, BTreeSet<String>>,
-    function_returns: BTreeMap<String, BTreeSet<String>>,
+    function_returns: BTreeMap<String, Vec<FunctionReturn>>,
 }
 
 impl RustTypeIndex {
-    fn record_fields(&mut self, owner: &str, fields: &syn::Fields) {
+    fn record_type(&mut self, owner: &str, simple_name: &str) {
+        self.fields.entry(owner.to_string()).or_default();
+        self.types_by_name
+            .entry(simple_name.to_string())
+            .or_default()
+            .insert(owner.to_string());
+    }
+
+    fn record_fields(&mut self, owner: &str, fields: &syn::Fields, context: &ModuleContext) {
         for field in fields {
             if let Some(ident) = &field.ident {
                 let field_name = ident.to_string().trim_start_matches("r#").to_string();
                 self.fields
                     .entry(owner.to_string())
                     .or_default()
-                    .insert(field_name.clone(), innermost_type_name(&field.ty));
+                    .insert(field_name, type_reference(&field.ty, context));
             }
         }
     }
 
-    fn record_enum(&mut self, item: &syn::ItemEnum) {
-        let owner = item.ident.to_string();
+    fn record_enum(&mut self, owner: &str, item: &syn::ItemEnum, context: &ModuleContext) {
+        self.record_type(owner, &item.ident.to_string());
         self.enum_variants.insert(
-            owner.clone(),
+            owner.to_string(),
             item.variants
                 .iter()
                 .map(|variant| variant.ident.to_string())
                 .collect(),
         );
         if let Some(tag) = serde_enum_tag(&item.attrs) {
-            self.enum_tags.insert(owner, rust_field_name(&tag));
+            self.enum_tags
+                .insert(owner.to_string(), rust_field_name(&tag));
+        }
+        for variant in &item.variants {
+            self.record_fields(owner, &variant.fields, context);
         }
     }
 
-    fn enum_tag_for_variant_path(&self, path: &syn::Path) -> Option<(&str, &str)> {
-        let mut segments = path.segments.iter().rev();
-        let variant = segments.next()?.ident.to_string();
-        let owner = segments.next()?.ident.to_string();
-        let (owner, variants) = self.enum_variants.get_key_value(&owner)?;
-        variants.contains(&variant).then_some(())?;
-        Some((owner.as_str(), self.enum_tags.get(owner)?.as_str()))
+    fn enum_tag_for_variant_path(
+        &self,
+        path: &syn::Path,
+        context: &ModuleContext,
+    ) -> Option<(&str, &str)> {
+        let mut segments: Vec<String> = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        let variant = segments.pop()?;
+        let owner = self.resolve_path_segments(&segments, context)?;
+        self.enum_variants
+            .get(&owner)?
+            .contains(&variant)
+            .then_some(())?;
+        let (owner, tag) = self.enum_tags.get_key_value(&owner)?;
+        Some((owner.as_str(), tag.as_str()))
     }
 
-    fn field_type(&self, owner: &str, field: &str) -> Option<&str> {
+    fn field_type(&self, owner: &str, field: &str) -> Option<String> {
         self.fields
             .get(owner)
             .and_then(|fields| fields.get(field))
-            .and_then(Option::as_deref)
+            .and_then(Option::as_ref)
+            .and_then(|reference| {
+                self.resolve_path_segments(&reference.segments, &reference.context)
+            })
     }
 
-    fn record_function_return(&mut self, signature: &syn::Signature) {
+    fn resolve_type(&self, ty: &syn::Type, context: &ModuleContext) -> Option<String> {
+        let reference = type_reference(ty, context)?;
+        self.resolve_path_segments(&reference.segments, &reference.context)
+    }
+
+    fn resolve_path(&self, path: &syn::Path, context: &ModuleContext) -> Option<String> {
+        let segments: Vec<String> = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        self.resolve_path_segments(&segments, context)
+    }
+
+    fn resolve_path_segments(
+        &self,
+        segments: &[String],
+        context: &ModuleContext,
+    ) -> Option<String> {
+        let simple_name = segments.last()?;
+        let candidates = self.types_by_name.get(simple_name)?;
+
+        if segments.len() == 1 {
+            let local = context.symbol(simple_name);
+            if candidates.contains(&local) {
+                return Some(local);
+            }
+        } else {
+            let first = segments.first()?.as_str();
+            let mut prefixes = Vec::new();
+            match first {
+                "crate" => {
+                    prefixes.push(
+                        std::iter::once(context.crate_name.as_str())
+                            .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                    );
+                }
+                "self" => {
+                    prefixes.push(
+                        std::iter::once(context.crate_name.as_str())
+                            .chain(context.modules.iter().map(String::as_str))
+                            .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                    );
+                }
+                "super" => {
+                    let mut modules = context.modules.clone();
+                    let mut skip = 0usize;
+                    while segments.get(skip).is_some_and(|segment| segment == "super") {
+                        modules.pop();
+                        skip += 1;
+                    }
+                    prefixes.push(
+                        std::iter::once(context.crate_name.as_str())
+                            .chain(modules.iter().map(String::as_str))
+                            .chain(
+                                segments[skip..segments.len() - 1]
+                                    .iter()
+                                    .map(String::as_str),
+                            )
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                    );
+                }
+                external => prefixes.push(
+                    std::iter::once(normalize_crate_name(external))
+                        .chain(segments[1..segments.len() - 1].iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                ),
+            }
+
+            let exact = prefixes
+                .iter()
+                .map(|prefix| {
+                    if prefix.is_empty() {
+                        simple_name.clone()
+                    } else {
+                        format!("{prefix}::{simple_name}")
+                    }
+                })
+                .filter(|candidate| candidates.contains(candidate))
+                .collect::<Vec<_>>();
+            if exact.len() == 1 {
+                return exact.into_iter().next();
+            }
+
+            // Public re-exports often omit the defining module
+            // (`sbproxy_config::Foo` vs `sbproxy_config::types::Foo`).
+            // An explicit crate path still resolves safely when that crate
+            // owns exactly one type with the requested simple name.
+            if !matches!(first, "crate" | "self" | "super") {
+                let crate_name = normalize_crate_name(first);
+                let in_crate: Vec<_> = candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate
+                            .split("::")
+                            .next()
+                            .is_some_and(|owner| owner == crate_name)
+                    })
+                    .cloned()
+                    .collect();
+                if in_crate.len() == 1 {
+                    return in_crate.into_iter().next();
+                }
+            }
+        }
+
+        (candidates.len() == 1)
+            .then(|| candidates.first().cloned())
+            .flatten()
+    }
+
+    fn schema_owner(&self, owner: &str) -> Option<String> {
+        let candidates = self.types_by_name.get(owner)?;
+        if candidates.len() == 1 {
+            return candidates.first().cloned();
+        }
+        let config_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.split("::").next().is_some_and(|crate_name| {
+                    crate_name == "config"
+                        || crate_name == "sbproxy_config"
+                        || crate_name.ends_with("_config")
+                })
+            })
+            .cloned()
+            .collect();
+        (config_candidates.len() == 1)
+            .then(|| config_candidates.into_iter().next())
+            .flatten()
+    }
+
+    fn record_function_return(&mut self, signature: &syn::Signature, context: &ModuleContext) {
         let syn::ReturnType::Type(_, ty) = &signature.output else {
             return;
         };
-        if let Some(owner) = innermost_type_name(ty) {
-            self.function_returns
-                .entry(signature.ident.to_string())
-                .or_default()
-                .insert(owner);
-        }
+        let Some(result) = type_reference(ty, context) else {
+            return;
+        };
+        let name = signature.ident.to_string();
+        self.function_returns
+            .entry(name.clone())
+            .or_default()
+            .push(FunctionReturn {
+                symbol: context.symbol(&name),
+                result,
+            });
     }
 
-    fn function_return(&self, function: &str) -> Option<&str> {
-        let owners = self.function_returns.get(function)?;
-        (owners.len() == 1)
-            .then(|| owners.first().map(String::as_str))
-            .flatten()
+    fn function_return(&self, path: &syn::Path, context: &ModuleContext) -> Option<String> {
+        let name = path.segments.last()?.ident.to_string();
+        let candidates = self.function_returns.get(&name)?;
+        let symbol = if path.segments.len() == 1 {
+            let local = context.symbol(&name);
+            candidates
+                .iter()
+                .find(|candidate| candidate.symbol == local)
+                .map(|candidate| candidate.symbol.clone())
+                .or_else(|| (candidates.len() == 1).then(|| candidates[0].symbol.clone()))?
+        } else {
+            let path_segments: Vec<String> = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect();
+            let first = path_segments.first()?.as_str();
+            let crate_name = if first == "crate" {
+                context.crate_name.clone()
+            } else {
+                normalize_crate_name(first)
+            };
+            let in_crate: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| candidate.symbol.starts_with(&format!("{crate_name}::")))
+                .collect();
+            (in_crate.len() == 1).then(|| in_crate[0].symbol.clone())?
+        };
+        let result = &candidates
+            .iter()
+            .find(|candidate| candidate.symbol == symbol)?
+            .result;
+        self.resolve_path_segments(&result.segments, &result.context)
     }
 }
 
 struct TypeIndexVisitor<'a> {
     index: &'a mut RustTypeIndex,
+    context: ModuleContext,
 }
 
 impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if !attributes_are_test_only(&node.attrs) {
-            syn::visit::visit_item_mod(self, node);
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if !item_attributes(node).is_some_and(attributes_are_test_only) {
+            syn::visit::visit_item(self, node);
         }
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if attributes_are_test_only(&node.attrs) {
+            return;
+        }
+        let Some((_, items)) = &node.content else {
+            return;
+        };
+        let saved_context = self.context.clone();
+        self.context = self.context.child(&node.ident);
+        for item in items {
+            self.visit_item(item);
+        }
+        self.context = saved_context;
     }
 
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         if attributes_are_test_only(&node.attrs) {
             return;
         }
+        let owner = self.context.symbol(&node.ident.to_string());
+        self.index.record_type(&owner, &node.ident.to_string());
         self.index
-            .record_fields(&node.ident.to_string(), &node.fields);
-        syn::visit::visit_item_struct(self, node);
+            .record_fields(&owner, &node.fields, &self.context);
     }
 
     fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
         if attributes_are_test_only(&node.attrs) {
             return;
         }
-        let owner = node.ident.to_string();
-        self.index.record_enum(node);
-        for variant in &node.variants {
-            self.index.record_fields(&owner, &variant.fields);
-        }
-        syn::visit::visit_item_enum(self, node);
+        let owner = self.context.symbol(&node.ident.to_string());
+        self.index.record_enum(&owner, node, &self.context);
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if attributes_are_test_only(&node.attrs) {
-            return;
+        if !attributes_are_test_only(&node.attrs) {
+            self.index.record_function_return(&node.sig, &self.context);
         }
-        self.index.record_function_return(&node.sig);
-        syn::visit::visit_item_fn(self, node);
     }
 }
 
 fn rust_type_index(sources: &[&SourceFile]) -> RustTypeIndex {
     let mut index = RustTypeIndex::default();
     for source in sources {
+        let Some(context) = ModuleContext::from_source_path(&source.path) else {
+            continue;
+        };
         if let Ok(file) = syn::parse_file(&source.raw_text) {
-            let mut visitor = TypeIndexVisitor { index: &mut index };
+            let mut visitor = TypeIndexVisitor {
+                index: &mut index,
+                context,
+            };
             visitor.visit_file(&file);
         }
     }
@@ -402,14 +737,26 @@ fn serde_enum_tag(attributes: &[syn::Attribute]) -> Option<String> {
     tag
 }
 
-fn innermost_type_name(ty: &syn::Type) -> Option<String> {
+fn type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<TypeReference> {
+    let path = innermost_type_path(ty)?;
+    Some(TypeReference {
+        segments: path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect(),
+        context: context.clone(),
+    })
+}
+
+fn innermost_type_path(ty: &syn::Type) -> Option<&syn::Path> {
     match ty {
-        syn::Type::Array(array) => innermost_type_name(&array.elem),
-        syn::Type::Group(group) => innermost_type_name(&group.elem),
-        syn::Type::Paren(paren) => innermost_type_name(&paren.elem),
-        syn::Type::Ptr(pointer) => innermost_type_name(&pointer.elem),
-        syn::Type::Reference(reference) => innermost_type_name(&reference.elem),
-        syn::Type::Slice(slice) => innermost_type_name(&slice.elem),
+        syn::Type::Array(array) => innermost_type_path(&array.elem),
+        syn::Type::Group(group) => innermost_type_path(&group.elem),
+        syn::Type::Paren(paren) => innermost_type_path(&paren.elem),
+        syn::Type::Ptr(pointer) => innermost_type_path(&pointer.elem),
+        syn::Type::Reference(reference) => innermost_type_path(&reference.elem),
+        syn::Type::Slice(slice) => innermost_type_path(&slice.elem),
         syn::Type::Path(path) => {
             let segment = path.path.segments.last()?;
             let generic_types: Vec<&syn::Type> = match &segment.arguments {
@@ -432,9 +779,7 @@ fn innermost_type_name(ty: &syn::Type) -> Option<String> {
                 | "RwLockReadGuard" | "RwLockWriteGuard" => generic_types.first().copied(),
                 _ => None,
             };
-            inner
-                .and_then(innermost_type_name)
-                .or_else(|| Some(wrapper))
+            inner.and_then(innermost_type_path).or(Some(&path.path))
         }
         _ => None,
     }
@@ -445,15 +790,17 @@ struct FieldReadVisitor<'a> {
     reads: BTreeSet<(String, String)>,
     environment: BTreeMap<String, String>,
     impl_owner: Option<String>,
+    context: ModuleContext,
 }
 
 impl<'a> FieldReadVisitor<'a> {
-    fn new(types: &'a RustTypeIndex) -> Self {
+    fn new(types: &'a RustTypeIndex, context: ModuleContext) -> Self {
         Self {
             types,
             reads: BTreeSet::new(),
             environment: BTreeMap::new(),
             impl_owner: None,
+            context,
         }
     }
 
@@ -472,7 +819,7 @@ impl<'a> FieldReadVisitor<'a> {
                     }
                 }
                 syn::FnArg::Typed(typed) => {
-                    let owner = innermost_type_name(&typed.ty);
+                    let owner = self.types.resolve_type(&typed.ty, &self.context);
                     self.bind_pattern(&typed.pat, owner.as_deref());
                 }
             }
@@ -493,7 +840,7 @@ impl<'a> FieldReadVisitor<'a> {
             }
             syn::Pat::Reference(reference) => self.bind_pattern(&reference.pat, owner),
             syn::Pat::Type(typed) => {
-                let explicit = innermost_type_name(&typed.ty);
+                let explicit = self.types.resolve_type(&typed.ty, &self.context);
                 self.bind_pattern(&typed.pat, explicit.as_deref().or(owner));
             }
             syn::Pat::Tuple(tuple) => {
@@ -509,22 +856,21 @@ impl<'a> FieldReadVisitor<'a> {
             }
             syn::Pat::Struct(record) => {
                 self.record_tagged_enum_match(&record.path);
-                let pattern_owner = record
-                    .path
-                    .segments
-                    .iter()
-                    .rev()
-                    .map(|segment| segment.ident.to_string())
-                    .find(|candidate| self.types.fields.contains_key(candidate))
+                let pattern_owner = self
+                    .types
+                    .resolve_path(&record.path, &self.context)
                     .or_else(|| owner.map(str::to_string));
                 if let Some(pattern_owner) = pattern_owner {
                     for field in &record.fields {
+                        if matches!(field.pat.as_ref(), syn::Pat::Wild(_)) {
+                            continue;
+                        }
                         if let Some(member) = Self::named_member(&field.member) {
                             self.reads.insert((pattern_owner.clone(), member.clone()));
                             let target = self
                                 .types
                                 .field_type(&pattern_owner, &member)
-                                .map(str::to_string);
+                                .map(|target| target.to_string());
                             self.bind_pattern(&field.pat, target.as_deref());
                         }
                     }
@@ -536,7 +882,7 @@ impl<'a> FieldReadVisitor<'a> {
     }
 
     fn record_tagged_enum_match(&mut self, path: &syn::Path) {
-        if let Some((owner, tag)) = self.types.enum_tag_for_variant_path(path) {
+        if let Some((owner, tag)) = self.types.enum_tag_for_variant_path(path, &self.context) {
             self.reads.insert((owner.to_string(), tag.to_string()));
         }
     }
@@ -575,16 +921,12 @@ impl<'a> FieldReadVisitor<'a> {
                 let syn::Expr::Path(path) = call.func.as_ref() else {
                     return None;
                 };
-                path.path
-                    .segments
-                    .last()
-                    .and_then(|segment| self.types.function_return(&segment.ident.to_string()))
-                    .map(str::to_string)
+                self.types.function_return(&path.path, &self.context)
             }
             syn::Expr::Field(field) => {
                 let owner = self.infer_expr(&field.base)?;
                 let member = Self::named_member(&field.member)?;
-                let target = self.types.field_type(&owner, &member).map(str::to_string);
+                let target = self.types.field_type(&owner, &member);
                 if self.types.fields.contains_key(&owner) {
                     self.reads.insert((owner, member));
                 }
@@ -683,12 +1025,12 @@ impl<'a> FieldReadVisitor<'a> {
                 .get_ident()
                 .and_then(|ident| self.environment.get(&ident.to_string()).cloned()),
             syn::Expr::Reference(reference) => self.infer_expr(&reference.expr),
-            syn::Expr::Struct(record) => record.path.segments.last().map(|segment| {
+            syn::Expr::Struct(record) => {
                 for field in &record.fields {
                     self.visit_expr(&field.expr);
                 }
-                segment.ident.to_string()
-            }),
+                self.types.resolve_path(&record.path, &self.context)
+            }
             syn::Expr::Try(tried) => self.infer_expr(&tried.expr),
             syn::Expr::Unary(unary) => self.infer_expr(&unary.expr),
             _ => {
@@ -700,10 +1042,43 @@ impl<'a> FieldReadVisitor<'a> {
 }
 
 impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if !attributes_are_test_only(&node.attrs) {
-            syn::visit::visit_item_mod(self, node);
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if !item_attributes(node).is_some_and(attributes_are_test_only) {
+            syn::visit::visit_item(self, node);
         }
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if !impl_item_attributes(node).is_some_and(attributes_are_test_only) {
+            syn::visit::visit_impl_item(self, node);
+        }
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        if !trait_item_attributes(node).is_some_and(attributes_are_test_only) {
+            syn::visit::visit_trait_item(self, node);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+        if !foreign_item_attributes(node).is_some_and(attributes_are_test_only) {
+            syn::visit::visit_foreign_item(self, node);
+        }
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if attributes_are_test_only(&node.attrs) {
+            return;
+        }
+        let Some((_, items)) = &node.content else {
+            return;
+        };
+        let saved_context = self.context.clone();
+        self.context = self.context.child(&node.ident);
+        for item in items {
+            self.visit_item(item);
+        }
+        self.context = saved_context;
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
@@ -711,7 +1086,7 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
             return;
         }
         let saved_owner = self.impl_owner.clone();
-        self.impl_owner = innermost_type_name(&node.self_ty);
+        self.impl_owner = self.types.resolve_type(&node.self_ty, &self.context);
         syn::visit::visit_item_impl(self, node);
         self.impl_owner = saved_owner;
     }
@@ -732,6 +1107,12 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
         let _ = self.infer_expr(&syn::Expr::Field(node.clone()));
     }
 
+    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+        // The destination is a place, not a value read. The right-hand side
+        // can still contain genuine config reads.
+        self.visit_expr(&node.right);
+    }
+
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let _ = self.infer_expr(&syn::Expr::MethodCall(node.clone()));
     }
@@ -747,6 +1128,12 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
                 self.visit_expr(diverge);
             }
         }
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        let saved_environment = self.environment.clone();
+        syn::visit::visit_block(self, node);
+        self.environment = saved_environment;
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
@@ -786,23 +1173,32 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
 }
 
 fn typed_field_reads(sources: &[&SourceFile], types: &RustTypeIndex) -> BTreeSet<(String, String)> {
-    let mut visitor = FieldReadVisitor::new(types);
+    let mut reads = BTreeSet::new();
     for source in sources {
+        let Some(context) = ModuleContext::from_source_path(&source.path) else {
+            continue;
+        };
         if let Ok(file) = syn::parse_file(&source.raw_text) {
+            let mut visitor = FieldReadVisitor::new(types, context);
             visitor.visit_file(&file);
+            reads.extend(visitor.reads);
         }
     }
-    visitor.reads
+    reads
 }
 
 fn has_unambiguous_field_read(
     key: &ConfigSchemaKey,
     typed_reads: &BTreeSet<(String, String)>,
+    types: &RustTypeIndex,
 ) -> bool {
     let Some(owner) = key.rust_owner.as_deref() else {
         return false;
     };
-    typed_reads.contains(&(owner.to_string(), key.rust_field.clone()))
+    let Some(owner) = types.schema_owner(owner) else {
+        return false;
+    };
+    typed_reads.contains(&(owner, key.rust_field.clone()))
 }
 
 fn production_consumer_exists(consumer: &str, sources: &[&SourceFile]) -> bool {
@@ -834,64 +1230,68 @@ fn production_consumer_exists(consumer: &str, sources: &[&SourceFile]) -> bool {
 }
 
 fn source_declares_function(source: &str, symbol: &str) -> bool {
-    struct FunctionVisitor<'a> {
-        symbol: &'a str,
-        found: bool,
-    }
-
-    impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
-        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            if !attributes_are_test_only(&node.attrs) {
-                syn::visit::visit_item_mod(self, node);
-            }
-        }
-
-        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-            if !attributes_are_test_only(&node.attrs) && node.sig.ident == self.symbol {
-                self.found = true;
-            }
-            if !self.found && !attributes_are_test_only(&node.attrs) {
-                syn::visit::visit_item_fn(self, node);
-            }
-        }
-    }
-
     let Ok(file) = syn::parse_file(source) else {
         return false;
     };
-    let mut visitor = FunctionVisitor {
-        symbol,
-        found: false,
-    };
-    visitor.visit_file(&file);
-    visitor.found
-}
-
-fn attributes_are_test_only(attributes: &[syn::Attribute]) -> bool {
-    attributes.iter().any(|attribute| {
-        let path = attribute.path();
-        if path.is_ident("test") {
-            return true;
-        }
-        if path.is_ident("cfg") {
-            return matches!(
-                &attribute.meta,
-                syn::Meta::List(list) if list.tokens.to_string() == "test"
-            );
-        }
-        let mut segments = path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string());
+    file.items.iter().any(|item| {
         matches!(
-            (
-                segments.next().as_deref(),
-                segments.next().as_deref(),
-                segments.next()
-            ),
-            (Some("tokio" | "async_std"), Some("test"), None)
+            item,
+            syn::Item::Fn(function)
+                if function.sig.ident == symbol
+                    && !attributes_are_test_only(&function.attrs)
         )
     })
+}
+
+fn item_attributes(item: &syn::Item) -> Option<&[syn::Attribute]> {
+    match item {
+        syn::Item::Const(item) => Some(&item.attrs),
+        syn::Item::Enum(item) => Some(&item.attrs),
+        syn::Item::ExternCrate(item) => Some(&item.attrs),
+        syn::Item::Fn(item) => Some(&item.attrs),
+        syn::Item::ForeignMod(item) => Some(&item.attrs),
+        syn::Item::Impl(item) => Some(&item.attrs),
+        syn::Item::Macro(item) => Some(&item.attrs),
+        syn::Item::Mod(item) => Some(&item.attrs),
+        syn::Item::Static(item) => Some(&item.attrs),
+        syn::Item::Struct(item) => Some(&item.attrs),
+        syn::Item::Trait(item) => Some(&item.attrs),
+        syn::Item::TraitAlias(item) => Some(&item.attrs),
+        syn::Item::Type(item) => Some(&item.attrs),
+        syn::Item::Union(item) => Some(&item.attrs),
+        syn::Item::Use(item) => Some(&item.attrs),
+        syn::Item::Verbatim(_) | _ => None,
+    }
+}
+
+fn impl_item_attributes(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
+    match item {
+        syn::ImplItem::Const(item) => Some(&item.attrs),
+        syn::ImplItem::Fn(item) => Some(&item.attrs),
+        syn::ImplItem::Type(item) => Some(&item.attrs),
+        syn::ImplItem::Macro(item) => Some(&item.attrs),
+        syn::ImplItem::Verbatim(_) | _ => None,
+    }
+}
+
+fn trait_item_attributes(item: &syn::TraitItem) -> Option<&[syn::Attribute]> {
+    match item {
+        syn::TraitItem::Const(item) => Some(&item.attrs),
+        syn::TraitItem::Fn(item) => Some(&item.attrs),
+        syn::TraitItem::Type(item) => Some(&item.attrs),
+        syn::TraitItem::Macro(item) => Some(&item.attrs),
+        syn::TraitItem::Verbatim(_) | _ => None,
+    }
+}
+
+fn foreign_item_attributes(item: &syn::ForeignItem) -> Option<&[syn::Attribute]> {
+    match item {
+        syn::ForeignItem::Fn(item) => Some(&item.attrs),
+        syn::ForeignItem::Static(item) => Some(&item.attrs),
+        syn::ForeignItem::Type(item) => Some(&item.attrs),
+        syn::ForeignItem::Macro(item) => Some(&item.attrs),
+        syn::ForeignItem::Verbatim(_) | _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -983,6 +1383,43 @@ mod tests {
         assert!(
             !paths.contains_key("proxy.nested"),
             "only leaf keys need reader evidence"
+        );
+    }
+
+    #[test]
+    fn scalar_collections_emit_element_leaves_with_the_container_field_owner() {
+        let schema = serde_json::json!({
+            "title": "Config",
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "labels": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                }
+            }
+        });
+
+        let keys: BTreeMap<_, _> = schema_key_paths(&schema)
+            .into_iter()
+            .map(|key| (key.path, (key.rust_owner, key.rust_field)))
+            .collect();
+
+        assert_eq!(
+            keys,
+            BTreeMap::from([
+                (
+                    "labels.*".to_string(),
+                    (Some("Config".to_string()), "labels".to_string()),
+                ),
+                (
+                    "tags[]".to_string(),
+                    (Some("Config".to_string()), "tags".to_string()),
+                ),
+            ])
         );
     }
 
@@ -1099,6 +1536,35 @@ fn production(existing: &ExistingFeature) {
                 .iter()
                 .any(|error| error.subject == "proxy.new_guard.enabled"),
             "a read of ExistingFeature::enabled must not prove NewGuardConfig::enabled: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn same_named_type_in_another_crate_cannot_prove_the_schema_owner() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [
+            source_at(
+                "crates/config/src/types.rs",
+                "struct GuardConfig { enabled: bool }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "struct GuardConfig { enabled: bool }\n\
+                 fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+            ),
+        ];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.subject == "proxy.guard.enabled"),
+            "a runtime-local namesake must not prove the config type: {errors:?}"
         );
     }
 
@@ -1485,6 +1951,70 @@ fn cfg_test(config: &Config) {
     }
 
     #[test]
+    fn composite_cfg_and_non_function_test_items_are_not_reader_evidence() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for text in [
+            "struct GuardConfig { enabled: bool }\n\
+             #[cfg(all(test, unix))]\n\
+             fn only_test(v: &GuardConfig) { consume(v.enabled); }",
+            "struct GuardConfig { enabled: bool }\n\
+             #[cfg(test)]\n\
+             const ONLY_TEST: bool = {\n\
+                 let v: GuardConfig = todo!();\n\
+                 v.enabled\n\
+             };",
+        ] {
+            let errors = verify_config_readers(&keys, &[], &[source(text)]);
+            assert_eq!(
+                errors.len(),
+                1,
+                "test-only item must not prove a reader: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn externally_defined_test_module_is_not_production_evidence() {
+        for cfg in ["test", "all(test, unix)"] {
+            let temp = tempfile::tempdir().expect("temp repo");
+            let src = temp.path().join("crates/example/src");
+            std::fs::create_dir_all(&src).expect("crate source directory");
+            std::fs::write(
+                src.join("lib.rs"),
+                format!(
+                    "struct GuardConfig {{ enabled: bool }}\n\
+                     #[cfg({cfg})]\n\
+                     mod fixture;\n"
+                ),
+            )
+            .expect("crate root");
+            std::fs::write(
+                src.join("fixture.rs"),
+                "fn only_test(v: &GuardConfig) { consume(v.enabled); }\n",
+            )
+            .expect("test-only module");
+
+            let keys = [ConfigSchemaKey {
+                path: "proxy.guard.enabled".to_string(),
+                rust_field: "enabled".to_string(),
+                rust_owner: Some("GuardConfig".to_string()),
+            }];
+            let sources = crate::scan::rust_sources(temp.path());
+            let errors = verify_config_readers(&keys, &[], &sources);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "externally defined #[cfg({cfg})] module must be excluded: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
     fn integration_test_bench_and_example_reads_are_not_production_evidence() {
         for path in [
             "crates/example/tests/reader.rs",
@@ -1532,6 +2062,61 @@ fn cfg_test(config: &Config) {
             }),
             "stable evidence must resolve to production source: {errors:?}"
         );
+    }
+
+    #[test]
+    fn stable_consumer_must_be_an_exact_top_level_production_symbol() {
+        let keys = [key("proxy.guard.enabled", "enabled")];
+        let override_entry = ConfigKeyCapability {
+            path: "proxy.guard.enabled",
+            support: SupportLevel::Stable,
+            consumer: Some("example::compiler::consume_guard"),
+            note: None,
+        };
+        for text in [
+            "mod hidden { pub fn consume_guard() {} }",
+            "#[cfg(all(test, unix))] pub fn consume_guard() {}",
+        ] {
+            let sources = [source_at("crates/example/src/compiler.rs", text)];
+            let errors = verify_config_readers(&keys, &[override_entry], &sources);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.subject == "proxy.guard.enabled"),
+                "nested or test-only namesake must not prove an exact consumer: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_ignored_patterns_and_inner_shadowing_are_not_reads() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for text in [
+            "struct GuardConfig { enabled: bool }\n\
+             fn normalize(v: &mut GuardConfig) { v.enabled = false; }",
+            "struct GuardConfig { enabled: bool }\n\
+             fn ignore(v: &GuardConfig) {\n\
+                 let GuardConfig { enabled: _, .. } = v;\n\
+             }",
+            "struct GuardConfig { enabled: bool }\n\
+             struct Existing { enabled: bool }\n\
+             fn f(existing: &Existing, guard: &GuardConfig) {\n\
+                 let value = existing;\n\
+                 { let value = guard; consume(value); }\n\
+                 consume(value.enabled);\n\
+             }",
+        ] {
+            let errors = verify_config_readers(&keys, &[], &[source(text)]);
+            assert_eq!(
+                errors.len(),
+                1,
+                "non-read syntax must not prove a reader: {errors:?}"
+            );
+        }
     }
 
     #[test]

@@ -38,11 +38,19 @@ const fn config_only(path: &'static str, note: &'static str) -> ConfigKeyCapabil
 /// reader checks for children added later.
 pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     stable(
+        "access_log.capture_headers.max_value_bytes",
+        "sbproxy_core::server::access_log::emit_access_log",
+    ),
+    stable(
+        "access_log.capture_headers.redact_pii",
+        "sbproxy_core::server::access_log::emit_access_log",
+    ),
+    stable(
         "access_log.output.type",
         "sbproxy_core::server::access_log::emit_access_log",
     ),
     config_only(
-        "agent_classes.hosted_feed.bootstrap_keys",
+        "agent_classes.hosted_feed.bootstrap_keys[]",
         "The OSS resolver does not fetch hosted agent-class feeds; builtin and inline catalogs \
          remain live. Retained for compatibility and tracked by WOR-1976.",
     ),
@@ -66,7 +74,7 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy_config::compiler::compile_origin",
     ),
     stable(
-        "origins.*.agents_json.flows",
+        "origins.*.agents_json.flows[]",
         "sbproxy_modules::projections::agents_json::render",
     ),
     stable(
@@ -122,6 +130,15 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.credentials[].attrs.budget.reset",
         "Credential lowering carries token and cost caps but does not install or enforce this \
          reset window. Reserved under WOR-1976.",
+    ),
+    stable(
+        "origins.*.credentials[].attrs.tags[]",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
+    ),
+    config_only(
+        "origins.*.credentials[].attrs.team",
+        "Credential lowering does not copy this attribution value into the virtual-key principal; \
+         project, user, tags, metadata, and cost_center remain live. Reserved under WOR-1976.",
     ),
     config_only(
         "origins.*.forward_rules[].origin.hostname",
@@ -195,11 +212,11 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy_config::compiler::compile_origin",
     ),
     stable(
-        "origins.*.observability.log.redact.disable",
+        "origins.*.observability.log.redact.disable[]",
         "sbproxy_core::server::lifecycle::install_op_redact_state",
     ),
     stable(
-        "origins.*.observability.log.redact.fields",
+        "origins.*.observability.log.redact.fields[]",
         "sbproxy_core::server::lifecycle::install_op_redact_state",
     ),
     stable(
@@ -249,10 +266,26 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "Session capture does not expire its in-process request-ring entries from this value; it \
          is a reserved retention hint under WOR-1976.",
     ),
+    stable(
+        "origins.*.sessions.budget.max_per_window",
+        "sbproxy_observe::capture::budget_admits",
+    ),
+    stable(
+        "origins.*.sessions.budget.window_seconds",
+        "sbproxy_observe::capture::budget_admits",
+    ),
     config_only(
         "origins.*.traffic_capture",
         "The OSS runtime has no traffic-capture consumer; use the live mirror block or an \
          out-of-tree extension. Classified under WOR-1976.",
+    ),
+    stable(
+        "origins.*.user.budget.max_per_window",
+        "sbproxy_observe::capture::budget_admits",
+    ),
+    stable(
+        "origins.*.user.budget.window_seconds",
+        "sbproxy_observe::capture::budget_admits",
     ),
     stable(
         "proxy.alerting.channels[].type",
@@ -263,7 +296,7 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy_core::pipeline::build_cache_reserve",
     ),
     stable(
-        "proxy.acme.challenge_types",
+        "proxy.acme.challenge_types[]",
         "sbproxy_core::server::lifecycle::run",
     ),
     stable(
@@ -293,6 +326,15 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          reset window. Reserved under WOR-1976.",
     ),
     stable(
+        "proxy.credentials[].attrs.tags[]",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
+    ),
+    config_only(
+        "proxy.credentials[].attrs.team",
+        "Credential lowering does not copy this attribution value into the virtual-key principal; \
+         project, user, tags, metadata, and cost_center remain live. Reserved under WOR-1976.",
+    ),
+    stable(
         "proxy.credentials[].policies[].type",
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
@@ -319,6 +361,26 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.http3.max_streams",
         "This build does not serve HTTP/3, so the QUIC stream limit is not installed. Native \
          HTTP/3 support is tracked in WOR-1969.",
+    ),
+    stable(
+        "proxy.http_client_timeouts.bot_auth_directory_client_secs",
+        "sbproxy_core::server::bot_auth_directory_client",
+    ),
+    stable(
+        "proxy.http_client_timeouts.callback_client_secs",
+        "sbproxy_core::server::callbacks::callback_client",
+    ),
+    stable(
+        "proxy.http_client_timeouts.forward_auth_client_secs",
+        "sbproxy_core::server::forward_auth_client",
+    ),
+    stable(
+        "proxy.http_client_timeouts.forward_auth_request_secs",
+        "sbproxy_core::server::check_forward_auth",
+    ),
+    stable(
+        "proxy.http_client_timeouts.swr_client_secs",
+        "sbproxy_core::server::swr_client",
     ),
     stable(
         "proxy.key_management.governance.backend.type",
@@ -412,6 +474,14 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          proxy.secrets.backends. Classified under WOR-1976.",
     ),
     stable(
+        "proxy.secrets.backends[].auth.access_key_id",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.external_id",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
         "proxy.secrets.backends[].auth.external_account_file.path",
         "sbproxy::install_secret_resolver",
     ),
@@ -420,7 +490,27 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy::install_secret_resolver",
     ),
     stable(
+        "proxy.secrets.backends[].auth.mount",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.role",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.role_arn",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
         "proxy.secrets.backends[].auth.role_id",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.secret_access_key",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.secret_id",
         "sbproxy::install_secret_resolver",
     ),
     stable(
@@ -433,6 +523,14 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     ),
     stable(
         "proxy.secrets.backends[].auth.session_name",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.session_token",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.token",
         "sbproxy::install_secret_resolver",
     ),
     stable(
@@ -464,7 +562,7 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          proxy.secrets.backends. Classified under WOR-1976.",
     ),
     config_only(
-        "proxy.secrets.map",
+        "proxy.secrets.map.*",
         "The secret:<name> form was removed; use secret://<backend>/<name>. Retained for \
          compatibility and tracked by WOR-1976.",
     ),
@@ -484,6 +582,15 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          reset window. Reserved under WOR-1976.",
     ),
     stable(
+        "proxy.tenants[].credentials[].attrs.tags[]",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
+    ),
+    config_only(
+        "proxy.tenants[].credentials[].attrs.team",
+        "Credential lowering does not copy this attribution value into the virtual-key principal; \
+         project, user, tags, metadata, and cost_center remain live. Reserved under WOR-1976.",
+    ),
+    stable(
         "proxy.tenants[].credentials[].policies[].type",
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
@@ -492,11 +599,11 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
     stable(
-        "proxy.tenants[].observability.log.redact.disable",
+        "proxy.tenants[].observability.log.redact.disable[]",
         "sbproxy_core::server::lifecycle::install_op_redact_state",
     ),
     stable(
-        "proxy.tenants[].observability.log.redact.fields",
+        "proxy.tenants[].observability.log.redact.fields[]",
         "sbproxy_core::server::lifecycle::install_op_redact_state",
     ),
     stable(
@@ -504,10 +611,16 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy_core::server::lifecycle::compile_one_sink",
     ),
     stable("source.kind", "sbproxy_config::source::load_with_depth"),
-    stable("source.overlays", "sbproxy_config::source::load_with_depth"),
 ];
 
-const CONFIG_KEY_ALIASES: &[(&str, &str)] = &[("origins.*.cors.enabled", "origins.*.cors.enable")];
+const CONFIG_KEY_ALIASES: &[(&str, &str)] = &[
+    (
+        "agent_classes.hosted_feed.bootstrap_keys",
+        "agent_classes.hosted_feed.bootstrap_keys[]",
+    ),
+    ("origins.*.cors.enabled", "origins.*.cors.enable"),
+    ("proxy.secrets.map", "proxy.secrets.map.*"),
+];
 
 /// Return the config-only registry entries explicitly present in raw YAML.
 ///
@@ -623,6 +736,67 @@ origins:
         );
         assert!(!paths.contains(&"origins.*.agent_skills[].type"));
         assert!(!paths.contains(&"proxy.http3"));
+    }
+
+    #[test]
+    fn credential_team_warns_at_every_supported_scope() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+proxy:
+  credentials:
+    - attrs: { team: global }
+  tenants:
+    - credentials:
+        - attrs: { team: tenant }
+origins:
+  api.example:
+    credentials:
+      - attrs: { team: origin }
+"#,
+        )
+        .expect("fixture parses");
+
+        let paths: Vec<&str> = configured_config_only_keys(&yaml)
+            .iter()
+            .map(|key| key.path)
+            .collect();
+
+        assert_eq!(
+            paths,
+            [
+                "origins.*.credentials[].attrs.team",
+                "proxy.credentials[].attrs.team",
+                "proxy.tenants[].credentials[].attrs.team",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_config_only_collections_still_warn_when_explicitly_authored() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+agent_classes:
+  hosted_feed:
+    bootstrap_keys: []
+proxy:
+  secrets:
+    map: {}
+"#,
+        )
+        .expect("fixture parses");
+
+        let paths: Vec<&str> = configured_config_only_keys(&yaml)
+            .iter()
+            .map(|key| key.path)
+            .collect();
+
+        assert_eq!(
+            paths,
+            [
+                "agent_classes.hosted_feed.bootstrap_keys[]",
+                "proxy.secrets.map.*",
+            ]
+        );
     }
 
     #[test]

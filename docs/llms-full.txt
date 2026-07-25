@@ -9126,7 +9126,7 @@ origins:
 | `models.deny` | list of string | `[]` | Takes precedence over `models.allow`. |
 | `principals` | list | `[]` | Principal selectors gating who may use the credential. Empty matches everyone. |
 | `policies` | list | `[]` | Closed set: `rate_limit` (with `rpm`) and `require_pii_redaction`. There is no per-key tokens-per-minute knob; cap token spend with `attrs.budget.max_tokens`. |
-| `attrs` | object | unset | Attribution: `project`, `user`, `team`, `cost_center`, `tags`, `metadata`, and `budget`. `budget.max_tokens` and `.max_cost_usd` add total per-key ceilings; `.reset` is accepted with a config-only warning and does not install a reset schedule. The per-key budget is independent of the global `budget` block. |
+| `attrs` | object | unset | Attribution: `project`, `user`, `cost_center`, `tags`, `metadata`, and `budget`. `team` is accepted with a config-only warning but is not copied into the principal; use `tags` or `metadata` instead. `budget.max_tokens` and `.max_cost_usd` add total per-key ceilings; `.reset` is also accepted with a config-only warning and does not install a reset schedule. The per-key budget is independent of the global `budget` block. |
 | `route_to_model` | string | unset | Pins every request from this credential to one model. |
 | `compression_profile` | string | unset | Selects `on`, `off`, or a named compression profile declared by this AI route. |
 | `inject_tools` | list | `[]` | Provider-native tool definitions injected into requests from this credential. |
@@ -12181,7 +12181,7 @@ The `TTL` is the recommended starting point for a SaaS deployment. Hot-data dash
 
 Two map columns carry per-request labels, from different sources:
 
-* `attribution` is the resolved business attribution tag set: the credential's `attrs:` defaults (project, team) merged with the inbound `SB-Attr-*` headers (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id). Per-request headers override the credential default. The metric side carries only a bounded projection of this, not the full map: `sbproxy_tokens_attributed_total{project,user,tag,direction}` counts tokens against the matched credential. Pivots on the higher-cardinality keys (`attribution['customer']`, `attribution['okr']`, and so on) are log-side queries; that is what this table is for.
+* `attribution` is the resolved business attribution tag set: the credential's live `attrs.project` default merged with the inbound `SB-Attr-*` headers (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id). Per-request headers override the credential default. Credential `attrs.team` is currently config-only and does not populate this set; explicitly authoring it emits a warning. The metric side carries only a bounded projection of this, not the full map: `sbproxy_tokens_attributed_total{project,user,tag,direction}` counts tokens against the matched credential. Pivots on the higher-cardinality keys (`attribution['customer']`, `attribution['okr']`, and so on) are log-side queries; that is what this table is for.
 * `metadata` is free-form key/values the operator pins on the credential's `attrs.metadata:`. Use it for dimensions outside the fixed attribution schema (cost_center is lifted in here for back-compat).
 
 To pivot spend by any attribution dimension, group on the map value:
@@ -12293,7 +12293,7 @@ HAVING budget_tokens > 0
 ORDER BY percent_used DESC;
 ```
 
-The query reads each line's `tags` array (populated from the credential's `attrs.tags:` list). To slice by team instead, group on the first-class `team` column the same way. Free-form `metadata` is still available for any key/value an operator declares on the credential. Replace the inline `tag_budgets` map with a join against an operator-maintained budget table for production use.
+The query reads each line's `tags` array (populated from the credential's `attrs.tags:` list). To slice by team, supply the live inbound team attribution or encode the team as a credential tag; credential `attrs.team` itself is currently compatibility-only. Free-form `metadata` is still available for any key/value an operator declares on the credential. Replace the inline `tag_budgets` map with a join against an operator-maintained budget table for production use.
 
 ## Materialised view: per-day-per-project pre-aggregation
 
@@ -12904,6 +12904,7 @@ and stale entries fail when their schema path is removed or renamed.
 | `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |
 | `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |
 | `origins.*.credentials[].attrs.budget.reset` | Reserved reset hint; no credential reset schedule is installed. The same leaf is config-only at proxy and tenant credential scopes. |
+| `origins.*.credentials[].attrs.team` | Parsed with a warning but not copied into the virtual-key principal. The same leaf is config-only at proxy and tenant credential scopes; use live `attrs.tags` or `attrs.metadata` attribution instead. |
 | `origins.*.forward_rules[].origin.hostname`, `.workspace_id`, `.version` | Inline forward-origin metadata is accepted but not copied into the compiled child origin. |
 | `origins.*.rate_limit_headers` | Use the live rate-limit policy's `headers` block instead. |
 | `origins.*.response_modifiers[].status.text` | The status code is applied; the compatibility reason text is ignored. |
@@ -14525,7 +14526,7 @@ origins:
 | `provider` | string | | Provider this key routes to. Matches an entry in the action's `providers:` list. |
 | `key` | string | | Client-facing key material. Accepts `${ENV}` and secret reference URIs. |
 | `models.allow` / `models.deny` | list | | Per-key model gate, enforced with a 403 before any upstream call. Stacks on the origin-level allow-list; most restrictive wins. |
-| `attrs` | object | | Attribution metadata (`project`, `tags`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. `attrs.budget.max_tokens` and `.max_cost_usd` add total per-key ceilings; `.reset` is compatibility-only and does not install a reset schedule. |
+| `attrs` | object | | Attribution metadata (`project`, `tags`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. `attrs.team` is compatibility-only and is not copied into the principal; use `tags` or `metadata` instead. `attrs.budget.max_tokens` and `.max_cost_usd` add total per-key ceilings; `.reset` is also compatibility-only and does not install a reset schedule. Explicit compatibility-only keys emit a warning. |
 | `policies` | list | | Sub-policies that fire when this credential matches. `{type: rate_limit, rpm: <n>}` lowers to an enforced per-key requests-per-minute cap; there is no per-key tokens-per-minute knob. `{type: require_pii_redaction, rules: [...]}` gates dispatch on active PII redaction. |
 | `route_to_model` | string | | Pin the upstream `model` field; the client-supplied value is ignored. |
 | `compression_profile` | string | | Select `on`, `off`, or a named profile declared by this AI route. |
@@ -27816,7 +27817,7 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 | `provider` | string | Provider name for `ai_provider` credentials. Matches an entry in the origin's `providers:` list. |
 | `key` | string | Secret reference. Accepts provider-specific schemes such as `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and `secret://`, plus `${ENV}`, `file:`, and `secret:`. |
 | `principals` | list | Principal selectors. Empty matches every principal. |
-| `attrs` | object | Attribution attributes copied onto matched principals. See below. |
+| `attrs` | object | Attribution attributes lowered onto matched principals, except the documented compatibility-only fields. See below. |
 | `models.allow` / `models.deny` | lists | Stack on top of the origin-level allowlist. Most-restrictive wins. |
 | `policies` | list | Per-credential sub-policies. Closed enum: `rate_limit`, `require_pii_redaction`. |
 
@@ -27826,7 +27827,7 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 |---|---|---|
 | `project` | string | Project the credential's spend rolls up to. |
 | `user` | string | User the credential is owned by. |
-| `team` | string | Team grouping. |
+| `team` | string | Compatibility-only team grouping. Accepted with a warning but not copied into the principal; use `tags` or `metadata` instead. |
 | `cost_center` | string | Cost center. Lifted onto `Principal.attrs.metadata` under the `cost_center` key. |
 | `tags` | list | Operator-supplied tags. Each tag becomes a separate attribution row. |
 | `metadata` | map | Free-form metadata copied verbatim onto `Principal.attrs.metadata`. |

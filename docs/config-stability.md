@@ -88,6 +88,7 @@ and stale entries fail when their schema path is removed or renamed.
 | `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |
 | `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |
 | `origins.*.credentials[].attrs.budget.reset` | Reserved reset hint; no credential reset schedule is installed. The same leaf is config-only at proxy and tenant credential scopes. |
+| `origins.*.credentials[].attrs.team` | Parsed with a warning but not copied into the virtual-key principal. The same leaf is config-only at proxy and tenant credential scopes; use live `attrs.tags` or `attrs.metadata` attribution instead. |
 | `origins.*.forward_rules[].origin.hostname`, `.workspace_id`, `.version` | Inline forward-origin metadata is accepted but not copied into the compiled child origin. |
 | `origins.*.rate_limit_headers` | Use the live rate-limit policy's `headers` block instead. |
 | `origins.*.response_modifiers[].status.text` | The status code is applied; the compatibility reason text is ignored. |
