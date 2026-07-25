@@ -22,13 +22,13 @@ The reload transaction in `crates/sbproxy-core/src/server/lifecycle.rs` is the p
 
 `/admin/cluster/enroll` is dispatched before the admin auth gate and authenticates with a single-use token instead of admin credentials. That is exactly the shape the subscriber endpoint needs, and the token format (`sbce1.<id>.<secret>`, stored as SHA-256, compared in constant time) is already written and tested.
 
-## Two things I found that this epic has to clean up
+## Two things I found that this epic has to fix
 
-`ConfigSource` (`Local | Git | GitOverlay`) parses, appears in the JSON Schema, and is silently ignored. `compile_config_from_source` has no production call site; boot and reload both call `compile_config` directly. Two Linear tickets closed this as Done in May, and the ADR one of them references (`docs/adr-config-source-modes.md`) does not exist. So an operator can write `source: {kind: git, ...}` today, get no error, and run their local file.
+`ConfigSource` (`Local | Git | GitOverlay`) parses, appears in the JSON Schema, and is silently ignored. `compile_config_from_source` has no production call site; boot and reload both call `compile_config` directly. Two Linear tickets closed this as Done in May, and the ADR one of them references (`docs/adr-config-source-modes.md`) does not exist. So an operator can write `source: {kind: git, ...}` today, get no error, and run their local file. `source.rs` itself is 452 lines of real, tested implementation that nothing calls.
 
 `ConfigBroadcaster` and `ConfigVersion` in `crates/sbproxy-mesh/src/state/config_broadcast.rs` are dead. Nothing constructs a broadcaster. The only reference is an unwritten `PersistedState.config_version` field.
 
-Both answer the question "where does config come from", which is the question this epic exists to answer. Leaving them in place means three overlapping mechanisms and one true one. The epic owns deleting or wiring them.
+Both answer the question "where does config come from", which is the question this epic exists to answer. Git source gets wired properly (see below). The mesh broadcaster gets deleted, because typed cluster state already does that job with signing and generation fencing, and maintaining a weaker second version of it helps nobody.
 
 ## Design
 
@@ -62,6 +62,28 @@ proxy:
 ```
 
 A node may set `upstream` or `publish`, never both. Chained authorities are rejected at config validation. One hop keeps the provenance story answerable.
+
+### Git as a source
+
+`source:` and `config_authority:` answer different questions, so both stay. `source:` says where a config document comes from. `config_authority:` says who is allowed to change it remotely and how that change is proven. A document fetched from git is still a document, and it can still have an authority overlaid on top of it.
+
+That gives one mechanism and three useful deployment shapes:
+
+- **Standalone GitOps.** A proxy with `source: {kind: git, ...}` and no authority pulls its whole config from a repo on a timer. This is the Kong-declarative and Flux-style story people ask for, and it needs no signing infrastructure.
+- **Git base with an authority overlay.** A subscriber whose local file declares a git source resolves that first, then merges the signed authority overlay on top. The operator keeps their own baseline in their repo, and central policy still lands on it.
+- **Git-backed authority.** An authority whose published document declares a git source resolves it before signing. Customers keep config in their own repo, and we sign and distribute it. This is the shape the managed service wants, and it falls out for free as long as the publish path in CA-04 calls the source-resolving compile rather than the plain one.
+
+Resolution order is fixed: resolve `source:` to get the base document, then apply the authority overlay, then compile. The authority always wins over git, because the deny-list is what protects the box and the authority is the layer the deny-list is enforced against. Git content is operator-owned and therefore unrestricted, which is right, since it is equivalent to the operator editing the file by hand.
+
+Two things about git deserve to be said plainly rather than discovered later.
+
+**Git is a weaker trust story than a signed bundle.** There is no signature, no revision fence, and no provenance beyond "the remote said so". It is transport trust: HTTPS plus whatever the git host authenticated. That is fine and it is what every GitOps tool does, but it is not the same guarantee as a bundle, and the docs should not imply that it is. Two cheap hardening steps close most of the gap. Pin `revision` to a full commit SHA and verify the resolved HEAD matches it, which buys immutability against a branch moving underneath you. And offer `verify_signature: true` for repos using signed tags or commits, for operators who want the real guarantee.
+
+**The `git` binary is a runtime dependency.** `GitBinaryCloner` shells out. Every proxy host that uses a git source needs git installed, container images included. Make that a loud preflight failure with a clear message rather than a confusing clone error, and have `doctor` report it. Also note that `git clone --depth 1` cannot fetch an arbitrary commit SHA against a server without `uploadpack.allowReachableSHA1InWant`, so pinning to a SHA needs `git init` plus `git fetch origin <sha> --depth 1` with a fallback to a full fetch. That is the kind of detail that eats an afternoon if it is not written down.
+
+Refresh borrows wholesale from the subscriber poller: an interval with jitter, a cached last-good document, and the same failure table. The resolved commit SHA plays the part the ETag plays for bundles, so an unchanged SHA means no recompile and no reload. The fetch gets a hard timeout that kills the child process, because a config-load path with no timeout has already hung startup in this codebase once.
+
+Credentials for private repos resolve through `SecretResolver`, so a deploy token can be `env:`, `file:`, or `vault://` and never sits inline in YAML. Credentials must never reach a log line, including inside a URL.
 
 ### The bundle
 
@@ -106,7 +128,7 @@ Paths the authority may never set:
 - `proxy.secrets`
 - `proxy.config_authority` (a bundle that could repoint the subscriber at a different authority, or turn verification off, defeats the whole design)
 - `proxy.model_host` (`SignedDeploymentBundle` already owns that channel; two signed writers on one piece of state is a correctness hazard)
-- `source`
+- `source` (the authority overlays the base document, it does not get to choose which repo the base comes from)
 
 Everything else is fair game: origins, AI providers, policies, transforms, rate limits, agent classes, audit, access log, extensions.
 
@@ -117,7 +139,7 @@ The two modes then differ in one sentence each:
 - **overlay**: the local file is the base, the remote document merges on top, and remote wins key by key.
 - **replace**: the remote document is the base, deny-listed paths are grafted in from local, and every other local key is discarded.
 
-Merge is a pure function from `(local_yaml, remote_yaml, mode)` to `(merged_yaml, provenance_map)` where the provenance map records, for every leaf path, whether the value came from local or from the authority. Table-test it hard. It is the piece most likely to produce a subtle wrong answer.
+Merge is a pure function from `(base_yaml, base_origin, remote_yaml, mode)` to `(merged_yaml, provenance_map)` where the provenance map records, for every leaf path, whether the value came from the base or from the authority. Git resolution happens before merge and produces the base document, so the caller tags the base as `local` or `git` and merge propagates that tag. The function itself never knows what git is. Table-test it hard. It is the piece most likely to produce a subtle wrong answer.
 
 ### Failure behaviour
 
@@ -145,13 +167,17 @@ The subscriber produces merged YAML and calls `reload_from_config_yaml`, taking 
 
 ### The editor
 
-The rule is that the editor is live only where the node owns its own config. A node that pulls from an upstream authority must not offer an editing surface that the next poll will silently overwrite.
+The rule is that the editor is live only where the node owns its own config. A node that pulls config from anywhere else must not offer an editing surface that the next poll will silently overwrite. That applies to a git source exactly as it applies to an authority, since a local edit is just as doomed either way.
 
 Concretely:
 
-- No `upstream` configured: the editor works as it does today.
+- No `upstream` and no remote `source`: the editor works as it does today.
 - `upstream` in `replace` mode: fully read-only, with a banner naming the authority, its id, and the current revision.
 - `upstream` in `overlay` mode: locally-owned keys stay editable, and every key the authority defines renders locked with an `authority: <id> rev <n>` badge.
+- `source` resolving to git, with no authority: fully read-only, with a banner naming the repo, ref, and resolved SHA, and a pointer at the repo as the place to make the change.
+- Git base with an authority overlay: read-only throughout, since neither layer is locally owned. The provenance badge distinguishes which of the two supplied each key, which is what makes an operator's "why is this value here" question answerable.
+
+Provenance therefore has three sources rather than two: `local`, `git`, and `authority`.
 
 Enforcement is server-side. `PUT /admin/config` rejects any write touching an authority-owned path with 409 and the conflicting paths listed, so the rule holds for curl and for the UI equally. The UI state is a courtesy on top of a real guard.
 
@@ -174,6 +200,7 @@ The part that is easy to get wrong: a form must never destroy config it did not 
 - `sbproxy_config_bundle_age_seconds` gauge, measured from `issued_at`
 - `sbproxy_config_bundle_fetch_total{result}` where result is `ok`, `not_modified`, `unreachable`, `verify_failed`, `compile_failed`, or `denied_path`
 - `sbproxy_config_bundle_applied_total`
+- `sbproxy_config_source_fetch_total{kind, result}` and `sbproxy_config_source_revision_info{sha}` for the git path, so a stuck source is as visible as a stale bundle
 
 Wire them at the point of use. Three metrics in the observability epic shipped declared-but-never-incremented and had to be fixed later, and the counter-name collision hazard from that work applies here too.
 
@@ -191,6 +218,7 @@ Each of these should be understandable and testable on its own.
 | --- | --- | --- |
 | Bundle format, sign, verify, revision cursor | `sbproxy-config` | nothing |
 | Merge engine and deny-list | `sbproxy-config` | nothing |
+| Git source resolution and refresh | `sbproxy-config` + `sbproxy-core` | existing `source.rs` |
 | Subscriber client and poller | `sbproxy-core` | bundle, merge |
 | Authority server and revision store | `sbproxy-core` | bundle |
 | Gossip accelerator | `sbproxy-core` + `sbproxy-mesh` | subscriber, authority |
@@ -206,8 +234,12 @@ Unit and table tests cover bundle round-trip, signature rejection under every mu
 
 Integration tests cover subscriber boot from cache, 304 handling, apply through the real reload transaction, and the `PUT /admin/config` guard rejecting authority-owned paths.
 
-End-to-end certification is a two-node drill: authority publishes, subscriber applies, then key rotation, then a replayed old bundle, then authority killed mid-poll. These run locally and stay out of the required CI gate, matching existing practice for `sbproxy-e2e`.
+Git source gets its own integration coverage against a local bare repo, which needs no network: resolve and compile, unchanged SHA producing no reload, a moved branch triggering one, a pinned SHA refusing to follow a moved branch, unreachable remote falling back to the cached document, clone timeout, and a missing `git` binary producing a clear preflight error. Layering is tested directly: git base plus an authority overlay resolves in the documented order, and an authority bundle carrying `source:` is rejected.
+
+End-to-end certification is a two-node drill: authority publishes, subscriber applies, then key rotation, then a replayed old bundle, then authority killed mid-poll. A third shape covers git, with a git-backed authority publishing from a repo and a standalone git-source proxy with no authority at all. These run locally and stay out of the required CI gate, matching existing practice for `sbproxy-e2e`.
 
 ## Non-goals for v1
 
 Per-subscriber targeting and label selectors, staged or canary rollout, config history and diff browsing beyond one rollback step, secret values traveling in bundles (URI references travel, resolved values never do), and chained authorities.
+
+On the git side specifically: no write-back (the editor never commits to a repo, and a git-sourced node is read-only in the same way a subscriber is), no `db` source mode, no submodule or LFS support, and no in-process git implementation. The `git` binary stays the transport.
