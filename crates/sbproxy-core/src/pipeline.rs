@@ -29,7 +29,9 @@ use sbproxy_cache::{
     RedisCacheStore, RedisReserve,
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
-use sbproxy_modules::compile::{compile_action, compile_auth, compile_policy, compile_transform};
+use sbproxy_modules::compile::{
+    compile_action, compile_action_for_origin, compile_auth, compile_policy, compile_transform,
+};
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
 
@@ -1192,7 +1194,8 @@ impl CompiledPipeline {
 
         for origin in &config.origins {
             // Compile action (required for every origin).
-            let action = compile_action(&origin.action_config)?;
+            let action =
+                compile_action_for_origin(&origin.action_config, origin.origin_id.as_str())?;
             actions.push(action);
 
             // Compile auth (optional per origin).
@@ -1255,7 +1258,8 @@ impl CompiledPipeline {
             transforms.push(origin_transforms);
 
             // Compile forward rules (zero or more per origin).
-            let origin_fwd_rules = compile_forward_rules(&origin.forward_rules)?;
+            let origin_fwd_rules =
+                compile_forward_rules(&origin.forward_rules, origin.origin_id.as_str())?;
             forward_rules.push(origin_fwd_rules);
 
             // Compile fallback origin (optional per origin).
@@ -1714,10 +1718,12 @@ fn compile_origin_policy_chain(
 
 fn compile_forward_rules(
     raw_rules: &[serde_json::Value],
+    origin_id: &str,
 ) -> anyhow::Result<Vec<CompiledForwardRule>> {
     let mut compiled = Vec::with_capacity(raw_rules.len());
-    for rule_val in raw_rules {
-        let fwd = compile_single_forward_rule(rule_val)?;
+    for (rule_index, rule_val) in raw_rules.iter().enumerate() {
+        let rule_id = format!("{origin_id}:forward-rule:{rule_index}");
+        let fwd = compile_single_forward_rule(rule_val, &rule_id)?;
         compiled.push(fwd);
     }
     Ok(compiled)
@@ -1752,7 +1758,10 @@ fn compile_forward_rules(
 /// same `path` block, precedence is `template` > `regex` > `exact` >
 /// `prefix`. The shorthand `match: <prefix>` field is always treated as a
 /// prefix match.
-fn compile_single_forward_rule(val: &serde_json::Value) -> anyhow::Result<CompiledForwardRule> {
+fn compile_single_forward_rule(
+    val: &serde_json::Value,
+    rule_id: &str,
+) -> anyhow::Result<CompiledForwardRule> {
     let rules_arr = val
         .get("rules")
         .and_then(|v| v.as_array())
@@ -1785,7 +1794,7 @@ fn compile_single_forward_rule(val: &serde_json::Value) -> anyhow::Result<Compil
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("forward rule origin missing 'action'"))?;
-    let action = compile_action(action_config)?;
+    let action = compile_action_for_origin(action_config, rule_id)?;
 
     // Parse request modifiers (optional).
     // Supports both Rust format ({ headers: { set: ... } }) and Go format

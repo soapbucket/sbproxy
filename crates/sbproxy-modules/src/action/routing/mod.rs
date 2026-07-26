@@ -254,9 +254,12 @@ pub fn build_routing_strategy(
 /// List the names of every registered routing strategy. Useful for
 /// diagnostics and the `clictl` config validator.
 pub fn list_routing_strategies() -> Vec<&'static str> {
-    inventory::iter::<RoutingStrategyRegistration>()
+    let mut names: Vec<_> = inventory::iter::<RoutingStrategyRegistration>()
         .map(|r| r.name)
-        .collect()
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 // --- Built-in: AlwaysFirstHealthyStrategy ---
@@ -378,6 +381,22 @@ mod tests {
             "test-noop should be registered, got: {:?}",
             names
         );
+    }
+
+    #[test]
+    fn list_routing_strategies_is_sorted_with_unique_production_builtins() {
+        let names = list_routing_strategies();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "registry names must be deterministic");
+
+        for builtin in ["bandit", "first-healthy", "gpu-aware", "lora", "lora-aware"] {
+            assert_eq!(
+                names.iter().filter(|name| **name == builtin).count(),
+                1,
+                "{builtin} must appear exactly once"
+            );
+        }
     }
 
     #[test]
