@@ -177,13 +177,25 @@ async fn empty_startup_reload_is_atomic_and_collects_every_origin() {
         .expect("hold capacity through drain");
     let drain_runtime = Arc::clone(&runtime);
     let drain = tokio::spawn(async move { drain_runtime.drain("coder").await });
-    for _ in 0..100 {
+    // Wait on a clock, not on yields. This test runs on a multi-threaded
+    // runtime, where `yield_now` reschedules the current task and does not
+    // hand control to the spawned drain, so the old `for _ in 0..100` loop
+    // could finish in microseconds with the drain not yet started. The
+    // admission below would then be accepted by a still-Ready deployment and
+    // `expect_err` would panic. That race went unnoticed until a branch added
+    // enough tests to slow the runner down, and then it failed twice in a row.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
         if runtime.status("coder").await.is_some_and(|status| {
             status.state == sbproxy_model_host::DeploymentRuntimeState::Draining
         }) {
             break;
         }
-        tokio::task::yield_now().await;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deployment never entered Draining, so the drain task never ran"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     let rejection = runtime
         .admit_request("coder", sbproxy_model_host::PriorityClass::Interactive)
