@@ -680,9 +680,10 @@ async fn resolve_oidc_mapped_key(
 }
 
 /// Resolve an inbound bearer token against the dynamic key plane: parse the
-/// `sk-<key_id>-<secret>` shape, look the id up through the cache then store,
-/// constant-time verify the secret, and gate on status/expiry. Fail-closed: a
-/// store outage denies unless `failure_mode_allow` is set.
+/// `sbp_<key_id>_<secret>` shape (or the legacy `sk-<key_id>-<secret>`), look
+/// the id up through the cache then store, constant-time verify the secret, and
+/// gate on status/expiry. Fail-closed: a store outage denies unless
+/// `failure_mode_allow` is set.
 async fn resolve_dynamic_virtual_key(
     plane: &crate::key_plane::KeyPlane,
     raw_token: Option<&str>,
@@ -690,10 +691,16 @@ async fn resolve_dynamic_virtual_key(
     let Some(token) = raw_token else {
         return DynamicKeyOutcome::NotApplicable;
     };
-    let Some((key_id, secret)) = sbproxy_keystore::crypto::parse_token(token) else {
+    // Accept both shapes. `sbp_` is unambiguously ours. The legacy `sk-` rule
+    // is loose enough to swallow a genuine provider key (`sk-proj-...` parses
+    // with a key_id of "proj"), so a parse alone is not proof of ownership.
+    let Some((key_id, secret)) = sbproxy_keystore::crypto::parse_minted_token(token)
+        .or_else(|| sbproxy_keystore::crypto::parse_token(token))
+    else {
         // Not a virtual-key-shaped token; a different auth provider may own it.
         return DynamicKeyOutcome::NotApplicable;
     };
+    let conforming_id = sbproxy_keystore::crypto::is_conforming_key_id(key_id);
     let now = chrono::Utc::now();
     match plane.cache().resolve_key(key_id).await {
         Err(e) => {
@@ -705,8 +712,11 @@ async fn resolve_dynamic_virtual_key(
             }
         }
         // Unknown id and a wrong secret return the same status so neither is an
-        // existence oracle.
-        Ok(None) => DynamicKeyOutcome::Deny(401, "invalid key".to_string()),
+        // existence oracle. But only for an id that could plausibly have been
+        // minted here: a caller presenting their own `sk-proj-...` provider key
+        // must pass through to whoever owns it, not collect a 401 from us.
+        Ok(None) if conforming_id => DynamicKeyOutcome::Deny(401, "invalid key".to_string()),
+        Ok(None) => DynamicKeyOutcome::NotApplicable,
         Ok(Some(rec)) => {
             if !plane.crypto().verify_record(&rec, secret, now) {
                 DynamicKeyOutcome::Deny(401, "invalid key".to_string())
@@ -9082,9 +9092,11 @@ mod dynamic_key_resolution_tests {
             resolve_dynamic_virtual_key(&plane, Some(&wrong)).await,
             DynamicKeyOutcome::Deny(401, _)
         ));
-        // Unknown id is also 401.
+        // Unknown but CONFORMING id is also 401: it could have been minted
+        // here, so it is a revoked or bogus key of ours and must keep denying.
+        let unknown_conforming = format!("sk-{}-secretsecret", "0".repeat(16));
         assert!(matches!(
-            resolve_dynamic_virtual_key(&plane, Some("sk-nope-secretsecret")).await,
+            resolve_dynamic_virtual_key(&plane, Some(&unknown_conforming)).await,
             DynamicKeyOutcome::Deny(401, _)
         ));
         // Revoked key with the correct secret is 403 (known but not active).
@@ -9097,6 +9109,22 @@ mod dynamic_key_resolution_tests {
             resolve_dynamic_virtual_key(&plane, Some("opaque-jwt")).await,
             DynamicKeyOutcome::NotApplicable
         ));
+        // A caller's OWN provider key must pass through, not collect a 401.
+        // Under the loose legacy rule each of these parses with a key_id of
+        // "proj" / "ant" / "or", misses the store, and used to deny.
+        for provider in [
+            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz01234",
+            "sk-or-v1-abcdefghijklmnopqrstuvwxyz012345678",
+        ] {
+            assert!(
+                matches!(
+                    resolve_dynamic_virtual_key(&plane, Some(provider)).await,
+                    DynamicKeyOutcome::NotApplicable
+                ),
+                "{provider} must fall through to its real owner"
+            );
+        }
         // No token at all is also not applicable.
         assert!(matches!(
             resolve_dynamic_virtual_key(&plane, None).await,

@@ -1928,7 +1928,15 @@ mod tests {
         assert_eq!(resp.0, 201);
         let v = parse(&resp);
         let token = v["token"].as_str().unwrap().to_string();
-        assert!(token.starts_with("sk-"));
+        // The minted shape is self-identifying, so the sweep can accept or
+        // reject a header value without a store lookup. Assert the whole
+        // contract, not just the prefix.
+        assert!(token.starts_with(sbproxy_keystore::crypto::TOKEN_PREFIX));
+        assert_eq!(token.len(), sbproxy_keystore::crypto::TOKEN_LEN);
+        assert!(
+            sbproxy_keystore::crypto::parse_minted_token(&token).is_some(),
+            "a minted token must round-trip through the strict parser"
+        );
         let key_id = v["key"]["key_id"].as_str().unwrap().to_string();
         assert_eq!(v["key"]["policy_revision"], 1);
         assert!(

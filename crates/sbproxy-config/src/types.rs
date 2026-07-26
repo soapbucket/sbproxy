@@ -1768,6 +1768,117 @@ impl KeyGovernanceConfig {
     }
 }
 
+/// One entry in `key_management.inbound.headers:`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct InboundHeaderConfig {
+    /// Header name, matched case-insensitively.
+    pub name: String,
+    /// Prefix stripped from the value before the token shape is tested,
+    /// matched case-insensitively. Empty for raw-value headers such as
+    /// `x-api-key`.
+    #[serde(default)]
+    pub scheme: String,
+}
+
+/// `key_management.inbound:` block. Controls which request headers are swept
+/// for a minted key, and whether a route refuses requests that carry none.
+///
+/// The header a key arrives in is a property of the calling tool, not of the
+/// key: to know which header holds the key you would have to have resolved it
+/// already. So extraction is configured per route here rather than per key.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct KeyInboundConfig {
+    /// Ordered candidate headers. The first value whose shape parses wins.
+    /// An empty list disables the sweep and leaves the legacy `authorization`
+    /// path as the only front door.
+    #[serde(default = "default_inbound_headers")]
+    pub headers: Vec<InboundHeaderConfig>,
+    /// Deny with 401 when no minted key resolved. Off by default, so an
+    /// upgrade changes nothing. Set per origin to make the proxy the only door
+    /// on a route that has no other auth provider.
+    #[serde(default)]
+    pub require: bool,
+}
+
+impl Default for KeyInboundConfig {
+    fn default() -> Self {
+        Self {
+            headers: default_inbound_headers(),
+            require: false,
+        }
+    }
+}
+
+/// Header names that may never be swept: hop-by-hop and framing headers, plus
+/// `cookie`, which has its own redaction and capture rules.
+pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "content-length",
+    "transfer-encoding",
+    "cookie",
+];
+
+fn default_inbound_headers() -> Vec<InboundHeaderConfig> {
+    vec![
+        InboundHeaderConfig {
+            name: "authorization".to_string(),
+            scheme: "Bearer ".to_string(),
+        },
+        InboundHeaderConfig {
+            name: "x-api-key".to_string(),
+            scheme: String::new(),
+        },
+        InboundHeaderConfig {
+            name: "x-sb-api".to_string(),
+            scheme: String::new(),
+        },
+    ]
+}
+
+impl KeyInboundConfig {
+    /// Reject header names that are not valid HTTP field names, are hop-by-hop
+    /// or framing headers, or repeat case-insensitively.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message naming the offending entry.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in &self.headers {
+            let lower = entry.name.trim().to_ascii_lowercase();
+            if lower.is_empty() || http::header::HeaderName::from_bytes(lower.as_bytes()).is_err() {
+                return Err(format!(
+                    "key_management.inbound.headers: {:?} is not a valid HTTP header name",
+                    entry.name
+                ));
+            }
+            if FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str()) {
+                return Err(format!(
+                    "key_management.inbound.headers: {:?} may not be swept for a key",
+                    entry.name
+                ));
+            }
+            if !seen.insert(lower) {
+                return Err(format!(
+                    "key_management.inbound.headers: {:?} is listed more than once",
+                    entry.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Lowercased names of every swept header, for the redaction and capture
+    /// denylists so a custom header does not have to be added to them by hand.
+    pub fn header_names(&self) -> Vec<String> {
+        self.headers
+            .iter()
+            .map(|entry| entry.name.trim().to_ascii_lowercase())
+            .collect()
+    }
+}
+
 /// Top-level `key_management:` block: the runtime key plane (mutable store,
 /// policy cache, governance, at-rest crypto, OIDC claim map, declarative seed).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1788,6 +1899,9 @@ pub struct KeyManagementConfig {
     /// At-rest crypto material.
     #[serde(default)]
     pub crypto: KeyCryptoConfig,
+    /// Which inbound headers carry a minted key, and whether one is required.
+    #[serde(default)]
+    pub inbound: KeyInboundConfig,
     /// Allow the admin API to override config-seeded records on reload. When
     /// false (default), config-seeded records are authoritative and re-asserted
     /// on every reload.
@@ -3720,6 +3834,11 @@ pub const SENSITIVE_HEADER_DENYLIST: &[&str] = &[
     "set-cookie",
     "proxy-authorization",
     "x-api-key",
+    // Default sidecar header for a minted virtual key. It matches none of the
+    // `-key` / `-secret` / `-token` suffix rules the log redactor uses, so
+    // without this entry a `capture_headers: ["*"]` glob logs a live key.
+    // Operator-configured sweep headers are added dynamically at reload.
+    "x-sb-api",
 ];
 
 /// Compiled allowlist suitable for the request hot path. Built once
@@ -8370,5 +8489,103 @@ publish:
             error.to_string().contains("rate_limit_totall_per_minute"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod inbound_key_header_tests {
+    use super::*;
+
+    #[test]
+    fn inbound_header_defaults_cover_the_three_common_shapes() {
+        let cfg = KeyInboundConfig::default();
+        let names: Vec<&str> = cfg.headers.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["authorization", "x-api-key", "x-sb-api"]);
+        assert_eq!(cfg.headers[0].scheme, "Bearer ");
+        assert_eq!(cfg.headers[1].scheme, "");
+        assert!(
+            !cfg.require,
+            "require is opt-in so an upgrade changes nothing"
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn inbound_validation_rejects_invalid_header_names() {
+        let bad = KeyInboundConfig {
+            headers: vec![InboundHeaderConfig {
+                name: "not a header".into(),
+                scheme: String::new(),
+            }],
+            require: false,
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn inbound_validation_rejects_hop_by_hop_and_framing_headers() {
+        for forbidden in FORBIDDEN_SWEEP_HEADERS {
+            let cfg = KeyInboundConfig {
+                headers: vec![InboundHeaderConfig {
+                    name: (*forbidden).to_string(),
+                    scheme: String::new(),
+                }],
+                require: false,
+            };
+            assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
+        }
+    }
+
+    #[test]
+    fn inbound_validation_rejects_case_insensitive_duplicates() {
+        let dupe = KeyInboundConfig {
+            headers: vec![
+                InboundHeaderConfig {
+                    name: "x-api-key".into(),
+                    scheme: String::new(),
+                },
+                InboundHeaderConfig {
+                    name: "X-API-Key".into(),
+                    scheme: String::new(),
+                },
+            ],
+            require: false,
+        };
+        assert!(dupe.validate().is_err());
+    }
+
+    #[test]
+    fn inbound_empty_header_list_is_valid_and_disables_the_sweep() {
+        let cfg = KeyInboundConfig {
+            headers: vec![],
+            require: false,
+        };
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.header_names().is_empty());
+    }
+
+    #[test]
+    fn header_names_are_lowercased_for_the_redaction_denylists() {
+        let cfg = KeyInboundConfig {
+            headers: vec![InboundHeaderConfig {
+                name: "  X-Tool-Auth  ".into(),
+                scheme: String::new(),
+            }],
+            require: false,
+        };
+        assert_eq!(cfg.header_names(), ["x-tool-auth"]);
+    }
+
+    #[test]
+    fn every_default_sweep_header_is_excluded_from_capture_globs() {
+        // A swept header carries a live secret. If a default one is missing
+        // from the denylist, `capture_headers: ["*"]` logs it in plaintext.
+        for entry in KeyInboundConfig::default().headers {
+            assert!(
+                SENSITIVE_HEADER_DENYLIST.contains(&entry.name.as_str()),
+                "{} must be excluded from capture globs",
+                entry.name
+            );
+        }
     }
 }

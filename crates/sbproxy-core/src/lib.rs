@@ -88,6 +88,7 @@ pub mod hook_registry;
 pub mod hooks;
 pub mod identity;
 /// WOR-1546: dynamic key plane assembly + process-global handle.
+pub mod inbound_key;
 pub mod key_plane;
 /// Canonical, secret-free lowering for governed key policy.
 pub mod key_policy;

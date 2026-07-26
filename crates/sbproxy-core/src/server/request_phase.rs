@@ -110,6 +110,73 @@ fn request_requires_graphql_replay(
     )
 }
 
+/// Outcome of the pre-auth inbound-key phase.
+#[derive(Debug)]
+pub(super) enum InboundKeyPhase {
+    /// No minted token in any configured header. The origin's configured auth
+    /// provider runs as normal.
+    NotPresent,
+    /// A minted key resolved. The configured auth provider is skipped.
+    Resolved,
+    /// Refuse the request with this status and message.
+    Deny(u16, String),
+}
+
+/// Resolve a minted virtual key out of the configured inbound headers, before
+/// the origin's configured auth provider runs.
+///
+/// Fail-closed on a store outage unless `failure_mode_allow` is set. An unknown
+/// id and a wrong secret return the same status so neither is an existence
+/// oracle.
+pub(super) async fn resolve_inbound_key(
+    plane: &crate::key_plane::KeyPlane,
+    headers: &http::HeaderMap,
+    ctx: &mut RequestContext,
+) -> InboundKeyPhase {
+    let (header, token) = match crate::inbound_key::sweep_headers(headers, plane.inbound()) {
+        crate::inbound_key::SweepOutcome::None => return InboundKeyPhase::NotPresent,
+        crate::inbound_key::SweepOutcome::Ambiguous => {
+            return InboundKeyPhase::Deny(
+                400,
+                "conflicting api keys in more than one header".to_string(),
+            );
+        }
+        crate::inbound_key::SweepOutcome::Found { header, token } => (header, token),
+    };
+
+    // Shape already proven by the sweep; this only re-splits the halves.
+    let Some((key_id, secret)) = sbproxy_keystore::crypto::parse_minted_token(&token) else {
+        return InboundKeyPhase::NotPresent;
+    };
+
+    let now = chrono::Utc::now();
+    match plane.cache().resolve_key(key_id).await {
+        Err(e) => {
+            if plane.failure_mode_allow() {
+                tracing::warn!(
+                    error = %e,
+                    "key store unavailable; failure_mode_allow set, falling through to configured auth"
+                );
+                InboundKeyPhase::NotPresent
+            } else {
+                InboundKeyPhase::Deny(503, "key store unavailable".to_string())
+            }
+        }
+        Ok(None) => InboundKeyPhase::Deny(401, "invalid key".to_string()),
+        Ok(Some(rec)) => {
+            if !plane.crypto().verify_record(&rec, secret, now) {
+                InboundKeyPhase::Deny(401, "invalid key".to_string())
+            } else if !rec.is_usable(now) {
+                InboundKeyPhase::Deny(403, "key is not active".to_string())
+            } else {
+                ctx.inbound_key_header = Some(header);
+                ctx.resolved_inbound_key = Some(Box::new(rec));
+                InboundKeyPhase::Resolved
+            }
+        }
+    }
+}
+
 /// Handle an incoming request before proxying. See the trait method
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 pub(super) async fn request_filter(
@@ -2160,8 +2227,63 @@ pub(super) async fn request_filter(
         }
     }
 
+    // --- Inbound minted-key resolution (before auth) ---
+    //
+    // Runs after every well-known, callback, health, metrics and CORS-preflight
+    // interception has already short-circuited, so a preflight carrying no
+    // credentials never reaches this and cannot be denied.
+    //
+    // Deliberately not an `Auth` variant: `pipeline.auths` holds one optional
+    // provider per origin, so a variant would force an origin to choose between
+    // minted keys and its existing JWT / OIDC / mTLS auth. Running first, and
+    // short-circuiting only on success, is what lets a minted key work in
+    // parallel with credentials the proxy does not own.
+    if let Some(plane) = crate::key_plane::current_key_plane() {
+        let origin_label = ctx.hostname.to_string();
+        // Bind the outcome before matching so the immutable borrow of
+        // `session` ends here rather than spanning the arms, which need it
+        // mutably to write an error response.
+        let outcome = resolve_inbound_key(&plane, &session.req_header().headers, ctx).await;
+        match outcome {
+            InboundKeyPhase::Resolved => {
+                sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", true);
+            }
+            InboundKeyPhase::NotPresent => {
+                if crate::inbound_key::requires_minted_key(plane.inbound()) {
+                    sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);
+                    emit_auth_audit(
+                        "auth_denied",
+                        "virtual_key",
+                        401,
+                        &origin_label,
+                        ctx,
+                        session,
+                    );
+                    send_error(session, 401, "an api key is required").await?;
+                    return Ok(true);
+                }
+            }
+            InboundKeyPhase::Deny(status, message) => {
+                sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);
+                emit_auth_audit(
+                    "auth_denied",
+                    "virtual_key",
+                    status,
+                    &origin_label,
+                    ctx,
+                    session,
+                );
+                send_error(session, status, &message).await?;
+                return Ok(true);
+            }
+        }
+    }
+
     // --- Auth check ---
-    if let Some(auth) = &pipeline.auths[origin_idx] {
+    // A resolved minted key already authenticated this request, so the origin's
+    // configured provider is skipped. That makes the two front doors
+    // alternatives rather than a chain.
+    if let (None, Some(auth)) = (&ctx.resolved_inbound_key, &pipeline.auths[origin_idx]) {
         let auth_type = auth.auth_type().to_string();
         let origin_label = ctx.hostname.to_string();
         // Handle forward auth (requires async HTTP subrequest).
@@ -4990,5 +5112,164 @@ mod olp_form_tests {
         )
         .unwrap();
         assert_eq!(got.client_id, "acme");
+    }
+}
+
+#[cfg(test)]
+mod inbound_key_phase_tests {
+    use super::*;
+    use sbproxy_keystore::crypto::KeyCrypto;
+    use sbproxy_keystore::record::{KeyRecord, RecordStatus};
+    use sbproxy_keystore::{KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig};
+    use std::sync::Arc;
+
+    /// A plane holding one active and one revoked key, plus their tokens.
+    async fn plane_with_keys() -> (crate::key_plane::KeyPlane, String, String) {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let now = chrono::Utc::now();
+
+        let active = crypto.mint_key();
+        let active_rec = KeyRecord::new(active.key_id.clone(), active.secret_hash.clone(), now);
+
+        let revoked = crypto.mint_key();
+        let mut revoked_rec =
+            KeyRecord::new(revoked.key_id.clone(), revoked.secret_hash.clone(), now);
+        revoked_rec.status = RecordStatus::Revoked;
+
+        let store = Arc::new(MemoryKeyStore::new());
+        store.put_key(active_rec).await.unwrap();
+        store.put_key(revoked_rec).await.unwrap();
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None);
+        (plane, active.token, revoked.token)
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (k, v) in pairs {
+            map.append(
+                http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    fn ctx() -> RequestContext {
+        RequestContext::default()
+    }
+
+    #[tokio::test]
+    async fn a_minted_key_on_x_api_key_resolves_and_records_its_header() {
+        let (plane, token, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let outcome = resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), &mut c).await;
+        assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
+        assert!(c.resolved_inbound_key.is_some());
+        // The caller strips exactly this header, so the proxy's own key never
+        // reaches the origin.
+        assert_eq!(c.inbound_key_header.as_deref(), Some("x-api-key"));
+    }
+
+    #[tokio::test]
+    async fn a_minted_key_is_also_accepted_on_bearer_authorization() {
+        let (plane, token, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("authorization", &format!("Bearer {token}"))]);
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, &mut c).await,
+            InboundKeyPhase::Resolved
+        ));
+        assert_eq!(c.inbound_key_header.as_deref(), Some("authorization"));
+    }
+
+    #[tokio::test]
+    async fn no_token_leaves_the_context_untouched_so_configured_auth_runs() {
+        let (plane, _, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("authorization", "Bearer some-opaque-jwt")]);
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, &mut c).await,
+            InboundKeyPhase::NotPresent
+        ));
+        assert!(c.resolved_inbound_key.is_none());
+        assert!(c.inbound_key_header.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_callers_own_provider_key_falls_through_rather_than_denying() {
+        // Parallel operation is the whole point: a tool presenting its real
+        // Anthropic key in x-api-key must reach the origin, not collect a 401.
+        let (plane, _, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("x-api-key", "sk-ant-api03-abcdefghijklmnopqrstuvwxyz")]);
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, &mut c).await,
+            InboundKeyPhase::NotPresent
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_key_denies_403() {
+        let (plane, _, revoked) = plane_with_keys().await;
+        let mut c = ctx();
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &revoked)]), &mut c).await;
+        assert!(
+            matches!(outcome, InboundKeyPhase::Deny(403, _)),
+            "{outcome:?}"
+        );
+        assert!(
+            c.resolved_inbound_key.is_none(),
+            "a denied key is not stamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_denies_401() {
+        let (plane, _, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let unknown = format!("sbp_{}_{}", "f".repeat(16), "e".repeat(64));
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &unknown)]), &mut c).await;
+        assert!(
+            matches!(outcome, InboundKeyPhase::Deny(401, _)),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_secret_denies_401_like_an_unknown_id() {
+        // Same status for both, so neither is an existence oracle.
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = &token[4..20];
+        let wrong = format!("sbp_{key_id}_{}", "0".repeat(64));
+        let mut c = ctx();
+        let outcome = resolve_inbound_key(&plane, &headers(&[("x-api-key", &wrong)]), &mut c).await;
+        assert!(
+            matches!(outcome, InboundKeyPhase::Deny(401, _)),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_tokens_in_two_headers_deny_400() {
+        let (plane, token, revoked) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("x-api-key", &token), ("x-sb-api", &revoked)]);
+        let outcome = resolve_inbound_key(&plane, &h, &mut c).await;
+        assert!(
+            matches!(outcome, InboundKeyPhase::Deny(400, _)),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn require_is_off_by_default_so_an_upgrade_changes_nothing() {
+        let cfg = sbproxy_config::types::KeyInboundConfig::default();
+        assert!(!crate::inbound_key::requires_minted_key(&cfg));
     }
 }

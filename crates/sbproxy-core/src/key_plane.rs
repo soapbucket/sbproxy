@@ -42,6 +42,7 @@ pub struct KeyPlane {
     governance: KeyGovernanceConfig,
     governance_store: Arc<dyn GovernanceStore>,
     approximate_store: Option<Arc<InMemoryGovernanceStore>>,
+    inbound: sbproxy_config::types::KeyInboundConfig,
 }
 
 impl KeyPlane {
@@ -98,7 +99,22 @@ impl KeyPlane {
             governance,
             governance_store,
             approximate_store,
+            inbound: sbproxy_config::types::KeyInboundConfig::default(),
         }
+    }
+
+    /// Attach the inbound header-sweep settings.
+    ///
+    /// Held on the plane rather than read from the pipeline per request, so the
+    /// request path reaches them through one already-cloned `Arc`.
+    pub(crate) fn with_inbound(mut self, inbound: sbproxy_config::types::KeyInboundConfig) -> Self {
+        self.inbound = inbound;
+        self
+    }
+
+    /// Which inbound headers carry a minted key, and whether one is required.
+    pub fn inbound(&self) -> &sbproxy_config::types::KeyInboundConfig {
+        &self.inbound
     }
 
     /// The shared crypto handle (pepper for inbound hashing, master for the
@@ -607,16 +623,19 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     })
     .context("seed key_management records")?;
 
-    let plane = Arc::new(KeyPlane::from_parts_with_governance(
-        crypto,
-        cache.clone(),
-        cfg.failure_mode_allow,
-        cfg.allow_api_override,
-        cfg.oidc_claim_map.as_ref().map(|m| m.claim_field.clone()),
-        cfg.governance.clone(),
-        governance_store,
-        approximate_store,
-    ));
+    let plane = Arc::new(
+        KeyPlane::from_parts_with_governance(
+            crypto,
+            cache.clone(),
+            cfg.failure_mode_allow,
+            cfg.allow_api_override,
+            cfg.oidc_claim_map.as_ref().map(|m| m.claim_field.clone()),
+            cfg.governance.clone(),
+            governance_store,
+            approximate_store,
+        )
+        .with_inbound(cfg.inbound.clone()),
+    );
     install_key_plane(plane);
 
     // Cross-replica invalidation: subscribe to the Redis channel so a peer's
