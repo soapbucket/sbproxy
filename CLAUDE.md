@@ -68,6 +68,39 @@ you're working in:
 - `cargo test -p sbproxy-e2e --release --test <name>` - one e2e test
   file (release build of the proxy is reused if present)
 
+### A per-crate lint can fail while the workspace lint passes
+
+`cargo clippy -p sbproxy-core` is a **stricter** check than
+`cargo clippy --workspace`, not a faster subset of it, and CI only runs
+the workspace form. If a per-crate invocation reports errors the CI lane
+does not, the crate is probably fine and your invocation is the one
+telling the truth.
+
+The mechanism is feature unification. `crates/sbproxy` is a workspace
+member and its `default` features enable things like
+`sbproxy-core/inprocess-classify`. Under `resolver = "2"` a
+`--workspace` build compiles one `sbproxy-core` with the union of
+features the whole graph asks for, so those features are **on**. Build
+`sbproxy-core` alone and it gets its own `default = []`, so they are
+**off**.
+
+That difference is visible for real. A helper function with no `#[cfg]`
+gate whose only callers sit behind `#[cfg(feature = ...)]` compiles
+clean workspace-wide (the callers exist) and fails per-crate with
+`function ... is never used` (they do not). This happened in `#757` and
+was fixed in `#759` by gating the helpers to match their callers.
+Demonstrated at that commit: `cargo clippy --workspace --all-targets`
+exits 0 while `cargo clippy -p sbproxy-core --all-targets` exits 101 on
+the same source.
+
+Two consequences worth remembering:
+
+- A green CI run does **not** mean every crate lints in isolation. When
+  you add a feature-gated caller, gate its helpers to match, and check
+  with `cargo clippy -p <crate> --all-targets`.
+- Do not conclude from a per-crate failure that `main` is red. Confirm
+  with the documented workspace command before filing anything.
+
 ## Workspace layout
 
 ```
