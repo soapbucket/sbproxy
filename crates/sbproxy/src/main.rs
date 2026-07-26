@@ -244,7 +244,7 @@ struct PlanArgs {
     out: Option<PathBuf>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 struct ApplyArgs {
     /// Proposed config file. Mutually exclusive with `-p`.
     #[arg(short = 'f', long = "config", conflicts_with = "plan_file")]
@@ -254,6 +254,35 @@ struct ApplyArgs {
     /// `baseline_revision` drifted. Mutually exclusive with `-f`.
     #[arg(short = 'p', long = "plan", conflicts_with = "config")]
     plan_file: Option<PathBuf>,
+    /// Admin API base URL of the proxy to apply to. Defaults to
+    /// `http://127.0.0.1:9090`.
+    #[arg(long = "admin-url", env = "SB_ADMIN_URL")]
+    admin_url: Option<String>,
+    /// Admin Basic Auth username. Defaults to `admin`.
+    #[arg(long = "username", env = "SB_ADMIN_USERNAME")]
+    username: Option<String>,
+    /// Admin Basic Auth password. Never printed.
+    #[arg(long = "password", env = "SB_ADMIN_PASSWORD")]
+    password: Option<String>,
+    /// Validate the config and stop. Contacts no proxy and changes
+    /// nothing. Use this in CI, where there is no running proxy to
+    /// apply to.
+    #[arg(long = "validate-only")]
+    validate_only: bool,
+}
+
+impl std::fmt::Debug for ApplyArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApplyArgs")
+            .field("config", &self.config)
+            .field("plan_file", &self.plan_file)
+            .field("admin_url", &self.admin_url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("validate_only", &self.validate_only)
+            .finish()
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -5745,10 +5774,13 @@ fn acquire_apply_lock(yaml_path: &std::path::Path) -> anyhow::Result<std::fs::Fi
 }
 
 /// Run the `sbproxy apply` subcommand. Loads + validates the proposed
-/// YAML, runs plan-time semantic validation, and calls into the
-/// existing `reload_from_config_path` primitive (the same call the
-/// file watcher and SIGHUP handler use). Refuses to apply when any
-/// `Severity::Error` finding is present.
+/// YAML, runs plan-time semantic validation, then pushes the config to a
+/// running proxy over the admin API and reports what the server did with
+/// it. Refuses to apply when any `Severity::Error` finding is present.
+///
+/// Exit codes: 0 applied, 3 validation refused, 4 the proxy refused it,
+/// 6 another apply holds the lock, 7 no proxy reachable, 8 applied but
+/// degraded.
 ///
 /// Two flows are supported:
 ///
@@ -5763,21 +5795,114 @@ fn acquire_apply_lock(yaml_path: &std::path::Path) -> anyhow::Result<std::fs::Fi
 /// Both flows take an exclusive `flock(2)` on
 /// `<yaml_path>.applylock` so two operators running `apply` against
 /// the same on-host config cannot race each other.
+/// Default admin endpoint, matching `AdminConfig`'s own defaults.
+const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9090";
+
+/// Push `yaml` to a running proxy over the admin API and report what the
+/// server did with it.
+///
+/// This is the whole point of `apply`. It used to call the in-process
+/// reload, which compiled the config into the short-lived CLI process,
+/// swapped that process's own pipeline, printed success, and exited
+/// without ever contacting the proxy. A running server picked the change
+/// up only if its file watcher happened to notice the file, so the exit
+/// code said nothing about whether the config was accepted or even seen.
+///
+/// `PUT /admin/config` is used rather than `POST /admin/reload` because
+/// apply is given a file, not a promise that the file is the one the
+/// proxy booted with. The server validates, persists, and swaps.
+fn apply_to_running_proxy(args: &ApplyArgs, yaml: &str) -> anyhow::Result<i32> {
+    use zeroize::Zeroize;
+
+    let base_url = args.admin_url.as_deref().unwrap_or(DEFAULT_ADMIN_URL);
+    let username = args.username.as_deref().unwrap_or("admin");
+    let mut password = args.password.clone().unwrap_or_default();
+
+    let url = format!("{}/admin/config", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let request = client
+        .put(&url)
+        .basic_auth(username, Some(password.as_str()))
+        .header(reqwest::header::CONTENT_TYPE, "application/yaml")
+        .body(yaml.to_string())
+        .build();
+    password.zeroize();
+
+    let response = match client.execute(request?) {
+        Ok(response) => response,
+        Err(error) => {
+            // Never fall back to something local that looks like success.
+            eprintln!(
+                "apply: could not reach the admin API at {base_url}: {error}\n\
+                 apply: nothing was applied. Point --admin-url at the running \
+                 proxy, or pass --validate-only to check the config without \
+                 applying it."
+            );
+            return Ok(7);
+        }
+    };
+
+    let status = response.status();
+    let body: serde_json::Value = response.json().unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let reason = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("admin request failed");
+        eprintln!("apply: the proxy refused the config (HTTP {status}): {reason}");
+        return Ok(4);
+    }
+
+    let revision = body
+        .get("config_revision")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    // `fully_applied` is absent on older proxies; absence is not failure.
+    let fully_applied = body
+        .get("fully_applied")
+        .and_then(serde_json::Value::as_bool);
+    let degraded: Vec<&str> = body
+        .get("degraded")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+
+    if fully_applied == Some(false) || !degraded.is_empty() {
+        let named = if degraded.is_empty() {
+            "one or more subsystems".to_string()
+        } else {
+            degraded.join(", ")
+        };
+        println!("apply: applied to {base_url}, config revision {revision}");
+        eprintln!(
+            "apply: warning: the config loaded but {named} did not take effect and \
+             kept stale state. The proxy is serving the new config otherwise."
+        );
+        return Ok(8);
+    }
+
+    println!("apply: applied to {base_url}, config revision {revision}");
+    Ok(0)
+}
+
 fn handle_apply_subcommand(args: &ApplyArgs) -> anyhow::Result<i32> {
     if let Some(plan_path) = args.plan_file.as_deref() {
-        return handle_apply_from_plan_file(plan_path);
+        return handle_apply_from_plan_file(args, plan_path);
     }
     let yaml_path = args
         .config
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing -f / --config or -p / --plan"))?;
-    handle_apply_from_yaml(yaml_path)
+    handle_apply_from_yaml(args, yaml_path)
 }
 
 /// `apply -f <yaml>` flow. Acquires the apply-lock, validates, and
-/// calls `reload_from_config_path`. Refuses on validation errors
-/// (exit 3) or lock contention (exit 6).
-fn handle_apply_from_yaml(yaml_path: &std::path::Path) -> anyhow::Result<i32> {
+/// pushes the config to a running proxy over the admin API. Refuses on
+/// validation errors (exit 3) or lock contention (exit 6).
+fn handle_apply_from_yaml(args: &ApplyArgs, yaml_path: &std::path::Path) -> anyhow::Result<i32> {
     let _lock = match acquire_apply_lock(yaml_path) {
         Ok(f) => f,
         Err(e) => {
@@ -5800,30 +5925,23 @@ fn handle_apply_from_yaml(yaml_path: &std::path::Path) -> anyhow::Result<i32> {
     }
 
     let yaml_path_str = yaml_path.to_string_lossy().into_owned();
-    let outcome = sbproxy_core::server::reload_from_config_path(&yaml_path_str)
-        .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
-    println!("apply: reloaded config from {yaml_path_str}");
-    report_reload_degradation(&outcome);
-    Ok(0)
-}
-
-/// Print the subsystems a reload could not apply, if any. The reload
-/// itself succeeded and the new pipeline is live, so this is a notice
-/// on stderr rather than a non-zero exit: an operator scripting `apply`
-/// should still see it without the script treating it as a failure.
-fn report_reload_degradation(outcome: &sbproxy_core::server::ReloadOutcome) {
-    if outcome.is_fully_applied() {
-        return;
+    if args.validate_only {
+        println!("apply: {yaml_path_str} is valid. Nothing was applied (--validate-only).");
+        return Ok(0);
     }
-    eprintln!("apply: warning, some subsystems did not apply: {outcome}");
-    eprintln!("apply: the new pipeline is live; those subsystems are serving prior state.");
+    let yaml = std::fs::read_to_string(yaml_path)
+        .map_err(|e| anyhow::anyhow!("read {yaml_path_str}: {e}"))?;
+    apply_to_running_proxy(args, &yaml)
 }
 
 /// `apply -p <plan-file>` flow. Reads the plan-file, locates the
 /// proposed YAML by reading the path the operator supplied via the
 /// `SB_APPLY_CONFIG` env var, recomputes the plan, and rejects with
 /// exit 5 if the baseline_revision drifted.
-fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i32> {
+fn handle_apply_from_plan_file(
+    args: &ApplyArgs,
+    plan_path: &std::path::Path,
+) -> anyhow::Result<i32> {
     let plan_path_str = plan_path.to_string_lossy().into_owned();
     let plan_file = sbproxy_config::PlanFile::read_from_path(plan_path)
         .map_err(|e| anyhow::anyhow!("failed to read plan-file '{plan_path_str}': {e}"))?;
@@ -5880,11 +5998,17 @@ fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i3
         return Ok(3);
     }
 
-    let outcome = sbproxy_core::server::reload_from_config_path(&yaml_path)
-        .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
-    println!("apply: reloaded config from {yaml_path} (via plan-file {plan_path_str})");
-    report_reload_degradation(&outcome);
-    Ok(0)
+    if args.validate_only {
+        println!(
+            "apply: {yaml_path} is valid (via plan-file {plan_path_str}). \
+             Nothing was applied (--validate-only)."
+        );
+        return Ok(0);
+    }
+    let yaml = std::fs::read_to_string(&yaml_path)
+        .map_err(|e| anyhow::anyhow!("read {yaml_path}: {e}"))?;
+    println!("apply: applying {yaml_path} (via plan-file {plan_path_str})");
+    apply_to_running_proxy(args, &yaml)
 }
 
 #[cfg(test)]
@@ -6668,6 +6792,70 @@ mod tests {
     #[test]
     fn shutdown_grace_default_is_30_seconds() {
         assert_eq!(DEFAULT_SHUTDOWN_GRACE_MS, 30_000);
+    }
+
+    // --- apply talks to a running proxy ---
+
+    fn apply_args_pointing_at(url: &str) -> ApplyArgs {
+        ApplyArgs {
+            config: None,
+            plan_file: None,
+            admin_url: Some(url.to_string()),
+            username: None,
+            password: Some("test-password".to_string()),
+            validate_only: false,
+        }
+    }
+
+    /// The behaviour this whole change exists for. Apply used to compile
+    /// the config into its own process, swap that process's pipeline, and
+    /// print success without contacting anything. An unreachable proxy
+    /// must now be a distinct non-zero exit, not a local no-op wearing a
+    /// success message.
+    #[test]
+    fn apply_reports_an_unreachable_proxy_rather_than_succeeding_locally() {
+        // Bind and immediately drop, so the port is almost certainly
+        // closed but is a real address rather than a routing black hole.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+            probe.local_addr().expect("probe addr").port()
+        };
+        let args = apply_args_pointing_at(&format!("http://127.0.0.1:{port}"));
+
+        let code = apply_to_running_proxy(&args, "proxy:\n  http_bind_port: 0\n")
+            .expect("unreachable proxy is a reported exit code, not an Err");
+
+        assert_eq!(
+            code, 7,
+            "an unreachable admin API must exit 7 so a deploy script can tell \
+             the difference between applied and never delivered"
+        );
+    }
+
+    /// A trailing slash on the admin URL must not produce a double slash
+    /// in the request path.
+    #[test]
+    fn apply_admin_url_trailing_slash_is_normalised() {
+        let base = "http://127.0.0.1:9090/";
+        assert_eq!(
+            format!("{}/admin/config", base.trim_end_matches('/')),
+            "http://127.0.0.1:9090/admin/config"
+        );
+    }
+
+    /// The password must never reach a log line through Debug.
+    #[test]
+    fn apply_args_debug_redacts_the_password() {
+        let args = apply_args_pointing_at("http://127.0.0.1:9090");
+        let rendered = format!("{args:?}");
+        assert!(
+            !rendered.contains("test-password"),
+            "ApplyArgs Debug leaked the admin password: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "expected a redaction marker"
+        );
     }
 
     // --- run-path resolution ---

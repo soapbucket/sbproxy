@@ -125,8 +125,9 @@ sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>]
 sbproxy validate <path> [--format text|json]
 sbproxy --config <path> --check
 sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
-sbproxy apply -f <yaml>
-sbproxy apply -p <plan-file>
+sbproxy apply -f <yaml> [--admin-url <url>] [--username <u>] [--password <p>]
+                        [--validate-only]
+sbproxy apply -p <plan-file> [--admin-url <url>] [--validate-only]
 sbproxy config {migrate|import-litellm|print}
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
 sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
@@ -262,7 +263,7 @@ When `--against` is omitted, the baseline is empty, so every origin in
 the proposed config surfaces as `added`. The `--running` baseline
 (pulled from a live admin socket) is deferred.
 
-### `apply` - validate and reload in place
+### `apply` - validate, then apply to a running proxy
 
 Two flows:
 
@@ -272,13 +273,29 @@ sbproxy apply -p /tmp/sb.plan          # replay a plan file
 ```
 
 `apply -f` validates the proposed YAML, runs plan-time semantic
-checks, and calls the same hot-reload primitive the SIGHUP handler
-and file watcher use. `apply -p` reads a plan file from a prior
-`plan --out`, recomputes the plan against the current baseline, and
-refuses (exit 5) if the recorded `baseline_revision` no longer
-matches the live one. Both flows take an exclusive `flock(2)` on
-`<yaml_path>.applylock` so two operators cannot race the same
-reload.
+checks, then pushes the config to a running proxy over the admin API
+(`PUT /admin/config`) and reports what the server did with it.
+`apply -p` reads a plan file from a prior `plan --out`, recomputes the
+plan against the current baseline, and refuses (exit 5) if the recorded
+`baseline_revision` no longer matches the live one. Both flows take an
+exclusive `flock(2)` on `<yaml_path>.applylock` so two operators cannot
+race the same apply.
+
+The admin endpoint defaults to `http://127.0.0.1:9090`; override it with
+`--admin-url` or `SB_ADMIN_URL`, and supply credentials with
+`--username` / `--password` or `SB_ADMIN_USERNAME` / `SB_ADMIN_PASSWORD`.
+If no proxy answers, apply exits 7 and applies nothing rather than
+reporting a success it did not achieve.
+
+Use `--validate-only` where there is no proxy to apply to, which is the
+normal case in CI. It runs every check and stops, contacting nothing.
+
+Earlier versions did not contact the proxy at all: apply compiled the
+config into its own short-lived process, swapped that process's pipeline,
+printed success, and exited. A running server noticed only if its file
+watcher happened to see the file, so exit 0 was not evidence the config
+had been accepted or even seen. If you have a CI step calling `apply` as
+a validation gate, switch it to `--validate-only`.
 
 The `-p` form is intentionally env-var driven for the YAML path and
 baseline: the plan file does not embed an on-disk path, so the
@@ -293,11 +310,14 @@ Exit codes:
 
 | Code | Meaning |
 |------|---------|
-| 0 | Reload applied cleanly. |
-| 1 | CLI / IO / reload error. |
-| 3 | Semantic-validation errors. Apply refused. |
+| 0 | Applied cleanly, or validated cleanly under `--validate-only`. |
+| 1 | CLI / IO error. |
+| 3 | Semantic-validation errors. Apply refused, nothing sent. |
+| 4 | The proxy refused the config. Nothing was applied. |
 | 5 | Plan file is stale. Rerun `plan` and re-apply. |
 | 6 | Another `apply` already holds the applylock. |
+| 7 | No proxy answered at the admin URL. Nothing was applied. |
+| 8 | Applied, but a subsystem kept stale state. See the warning on stderr. |
 
 ### `projections render` - serve-time documents on demand
 

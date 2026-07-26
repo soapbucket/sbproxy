@@ -179,6 +179,26 @@ across the estate so a multi-tenant gateway reports per tenant.
 
 ### Changed
 
+- **`sbproxy apply` now actually applies to the running proxy.** It used
+  to compile the config into its own short-lived process, swap that
+  process's pipeline, print `apply: reloaded config from ...`, and exit
+  without ever contacting the proxy. A running server picked the change
+  up only if its file watcher happened to notice the file, so exit 0 was
+  not evidence that the config had been accepted, or even seen. A config
+  the server would have rejected still exited 0. Apply now pushes the
+  config over the admin API and reports what the server did with it, so
+  the exit code means something: 4 if the proxy refused the config, 7 if
+  no proxy answered, 8 if it loaded but a subsystem kept stale state.
+  The admin endpoint defaults to `http://127.0.0.1:9090` and is
+  overridable with `--admin-url` or `SB_ADMIN_URL`.
+
+  **This changes the contract.** Apply previously needed no running proxy
+  and always exited 0; it now needs to reach one. If you call `apply` in
+  CI as a validation step, switch it to the new `--validate-only`, which
+  runs every check and stops without contacting anything. That flag is
+  the honest name for what the old behaviour was actually doing.
+
+
 - **The admin console follows the sbproxy.dev editorial system.**
   Paper and ink surfaces, a persistent top bar carrying the admin
   host, a live health dot, and the cluster node count, mono
