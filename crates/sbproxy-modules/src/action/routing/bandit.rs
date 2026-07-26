@@ -39,6 +39,7 @@
 //! `Some`.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::Result;
@@ -52,7 +53,8 @@ use super::{
 /// Maximum number of reload-stable bandit state namespaces held per process.
 const MAX_STATE_NAMESPACES: usize = 256;
 /// Maximum number of target arms retained in one bandit state namespace.
-const MAX_TARGETS_PER_NAMESPACE: usize = 256;
+pub(crate) const MAX_TARGETS_PER_NAMESPACE: usize = 256;
+static NAMESPACE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Default value for the `epsilon` config field (`0.1`).
 fn default_epsilon() -> f64 {
@@ -113,8 +115,23 @@ impl BanditStateRegistry {
         }
 
         if self.states.len() >= MAX_STATE_NAMESPACES {
-            if let Some(oldest) = self.order.pop_front() {
-                self.states.remove(&oldest);
+            let inactive_position = self.order.iter().position(|candidate| {
+                self.states
+                    .get(candidate)
+                    .is_some_and(|state| Arc::strong_count(state) == 1)
+            });
+            if let Some(position) = inactive_position {
+                if let Some(inactive) = self.order.remove(position) {
+                    self.states.remove(&inactive);
+                }
+            } else {
+                if !NAMESPACE_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        namespace_limit = MAX_STATE_NAMESPACES,
+                        "bandit state registry is full with live namespaces; using action-local bounded state"
+                    );
+                }
+                return Arc::new(Mutex::new(HashMap::new()));
             }
         }
 
@@ -305,7 +322,7 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata: HashMap::new(),
+            metadata: HashMap::new().into(),
         }
     }
 
@@ -464,7 +481,7 @@ mod tests {
                 healthy: true,
                 active_connections: 0,
                 weight: 1,
-                metadata: HashMap::new(),
+                metadata: HashMap::new().into(),
             },
             TargetState {
                 index: 1,
@@ -472,7 +489,7 @@ mod tests {
                 healthy: true,
                 active_connections: 0,
                 weight: 1,
-                metadata: HashMap::new(),
+                metadata: HashMap::new().into(),
             },
         ];
 
@@ -533,5 +550,63 @@ mod tests {
 
         assert_eq!(reloaded.select(&req(), &targets), Some(1));
         assert_eq!(independent.select(&req(), &targets), Some(0));
+    }
+
+    #[test]
+    fn namespace_pressure_evicts_the_oldest_inactive_state() {
+        let mut registry = BanditStateRegistry {
+            order: VecDeque::new(),
+            states: HashMap::new(),
+        };
+        let active = registry.state_for_namespace("active".to_string());
+        for index in 1..MAX_STATE_NAMESPACES {
+            drop(registry.state_for_namespace(format!("inactive-{index}")));
+        }
+
+        let inserted = registry.state_for_namespace("replacement".to_string());
+
+        assert!(
+            registry.states.contains_key("active"),
+            "a live action must retain its reload namespace"
+        );
+        assert!(
+            !registry.states.contains_key("inactive-1"),
+            "the oldest inactive namespace should be evicted first"
+        );
+        assert!(registry.states.contains_key("replacement"));
+        assert_eq!(Arc::strong_count(&active), 2);
+        assert_eq!(Arc::strong_count(&inserted), 2);
+    }
+
+    #[test]
+    fn fully_active_namespace_registry_uses_a_bounded_local_fallback() {
+        let mut registry = BanditStateRegistry {
+            order: VecDeque::new(),
+            states: HashMap::new(),
+        };
+        let active: Vec<_> = (0..MAX_STATE_NAMESPACES)
+            .map(|index| registry.state_for_namespace(format!("active-{index}")))
+            .collect();
+
+        let fallback = registry.state_for_namespace("overflow".to_string());
+        fallback
+            .lock()
+            .unwrap()
+            .insert("http://observed".to_string(), ArmStats::default());
+
+        assert_eq!(registry.states.len(), MAX_STATE_NAMESPACES);
+        assert!(
+            registry.states.contains_key("active-0"),
+            "pressure must not evict state still held by an action"
+        );
+        assert!(
+            !registry.states.contains_key("overflow"),
+            "overflow state must stay local instead of growing the registry"
+        );
+        assert!(
+            fallback.lock().unwrap().contains_key("http://observed"),
+            "the bounded fallback must retain observations for its live action"
+        );
+        assert_eq!(active.len(), MAX_STATE_NAMESPACES);
     }
 }

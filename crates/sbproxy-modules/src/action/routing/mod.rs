@@ -156,10 +156,11 @@ pub struct TargetState {
     /// Static weight from the target config (typically 1-100). Strategies
     /// that do not honour weights can ignore this.
     pub weight: u32,
-    /// Free-form metadata copied from the target config. Lets a strategy
+    /// Immutable free-form metadata snapshot for the target. Lets a strategy
     /// key on labels (e.g. `gpu_model`, `region`, loaded LoRA adapters)
-    /// without the trait needing a strategy-specific extension point.
-    pub metadata: HashMap<String, serde_json::Value>,
+    /// without the trait needing a strategy-specific extension point. Cloning
+    /// a target state shares this snapshot rather than cloning nested values.
+    pub metadata: Arc<HashMap<String, serde_json::Value>>,
 }
 
 /// One completed upstream attempt reported to a [`RoutingStrategy`].
@@ -432,18 +433,18 @@ mod tests {
 
     #[test]
     fn target_state_debug_and_clone_preserve_metadata() {
-        let mut t = TargetState {
+        let metadata = HashMap::from([("gpu_model".to_string(), serde_json::json!("a100"))]);
+        let t = TargetState {
             index: 3,
             url: "http://upstream-3.internal:8080".to_string(),
             healthy: true,
             active_connections: 17,
             weight: 50,
-            metadata: HashMap::new(),
+            metadata: Arc::new(metadata),
         };
-        t.metadata
-            .insert("gpu_model".to_string(), serde_json::json!("a100"));
 
         let cloned = t.clone();
+        assert!(Arc::ptr_eq(&t.metadata, &cloned.metadata));
         assert_eq!(cloned.index, 3);
         assert_eq!(cloned.url, "http://upstream-3.internal:8080");
         assert!(cloned.healthy);
@@ -469,7 +470,7 @@ mod tests {
                 healthy: false,
                 active_connections: 0,
                 weight: 1,
-                metadata: HashMap::new(),
+                metadata: HashMap::new().into(),
             },
             TargetState {
                 index: 1,
@@ -477,7 +478,7 @@ mod tests {
                 healthy: false,
                 active_connections: 0,
                 weight: 1,
-                metadata: HashMap::new(),
+                metadata: HashMap::new().into(),
             },
             TargetState {
                 index: 2,
@@ -485,7 +486,7 @@ mod tests {
                 healthy: true,
                 active_connections: 99,
                 weight: 1,
-                metadata: HashMap::new(),
+                metadata: HashMap::new().into(),
             },
         ];
         assert_eq!(strat.select(&req, &targets), Some(2));
@@ -501,7 +502,7 @@ mod tests {
             healthy: false,
             active_connections: 0,
             weight: 1,
-            metadata: HashMap::new(),
+            metadata: HashMap::new().into(),
         }];
         assert!(strat.select(&req, &targets).is_none());
     }

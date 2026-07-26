@@ -175,7 +175,7 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata,
+            metadata: metadata.into(),
         }
     }
 
@@ -192,7 +192,7 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata,
+            metadata: metadata.into(),
         }
     }
 

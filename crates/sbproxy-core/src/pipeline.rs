@@ -1194,8 +1194,12 @@ impl CompiledPipeline {
 
         for origin in &config.origins {
             // Compile action (required for every origin).
-            let action =
-                compile_action_for_origin(&origin.action_config, origin.origin_id.as_str())?;
+            let action_identity = routing_action_identity(
+                origin.workspace_id.as_str(),
+                origin.origin_id.as_str(),
+                None,
+            );
+            let action = compile_action_for_origin(&origin.action_config, &action_identity)?;
             actions.push(action);
 
             // Compile auth (optional per origin).
@@ -1258,8 +1262,11 @@ impl CompiledPipeline {
             transforms.push(origin_transforms);
 
             // Compile forward rules (zero or more per origin).
-            let origin_fwd_rules =
-                compile_forward_rules(&origin.forward_rules, origin.origin_id.as_str())?;
+            let origin_fwd_rules = compile_forward_rules(
+                &origin.forward_rules,
+                origin.workspace_id.as_str(),
+                origin.origin_id.as_str(),
+            )?;
             forward_rules.push(origin_fwd_rules);
 
             // Compile fallback origin (optional per origin).
@@ -1716,13 +1723,26 @@ fn compile_origin_policy_chain(
     Ok(chain)
 }
 
+fn routing_action_identity(
+    workspace_id: &str,
+    origin_id: &str,
+    forward_rule_index: Option<usize>,
+) -> String {
+    let scope = forward_rule_index
+        .map(|index| format!("forward-rule:{index}"))
+        .unwrap_or_else(|| "main".to_string());
+    serde_json::to_string(&(workspace_id, origin_id, scope))
+        .expect("routing action identity fields are serializable")
+}
+
 fn compile_forward_rules(
     raw_rules: &[serde_json::Value],
+    workspace_id: &str,
     origin_id: &str,
 ) -> anyhow::Result<Vec<CompiledForwardRule>> {
     let mut compiled = Vec::with_capacity(raw_rules.len());
     for (rule_index, rule_val) in raw_rules.iter().enumerate() {
-        let rule_id = format!("{origin_id}:forward-rule:{rule_index}");
+        let rule_id = routing_action_identity(workspace_id, origin_id, Some(rule_index));
         let fwd = compile_single_forward_rule(rule_val, &rule_id)?;
         compiled.push(fwd);
     }
@@ -2026,6 +2046,18 @@ mod tests {
     use super::*;
     use compact_str::CompactString;
     use std::collections::HashMap;
+
+    #[test]
+    fn routing_state_namespace_is_workspace_and_rule_scoped() {
+        let workspace_a = routing_action_identity("workspace-a", "shared-origin", None);
+        let workspace_b = routing_action_identity("workspace-b", "shared-origin", None);
+        let first_rule = routing_action_identity("workspace-a", "shared-origin", Some(0));
+        let second_rule = routing_action_identity("workspace-a", "shared-origin", Some(1));
+
+        assert_ne!(workspace_a, workspace_b);
+        assert_ne!(workspace_a, first_rule);
+        assert_ne!(first_rule, second_rule);
+    }
 
     fn make_config(
         hostname: &str,

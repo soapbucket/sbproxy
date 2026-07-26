@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use sbproxy_platform::circuitbreaker::CircuitBreaker;
 use sbproxy_platform::outlier::{OutlierDetector, OutlierDetectorConfig};
 use serde::Deserialize;
@@ -19,6 +20,11 @@ use serde::Deserialize;
 use super::routing::build_routing_strategy_with_name;
 use super::ForwardingHeaderControls;
 use super::{RoutingOutcome, RoutingRequest, RoutingStrategy, TargetState};
+
+const MAX_TARGET_METADATA_ENTRIES: usize = 64;
+const MAX_TARGET_METADATA_KEY_BYTES: usize = 64;
+const MAX_TARGET_METADATA_SERIALIZED_BYTES: usize = 16 * 1024;
+const MAX_TARGET_METADATA_NESTING_DEPTH: usize = 8;
 
 // --- Configuration types ---
 
@@ -269,6 +275,44 @@ fn default_weight() -> u32 {
     1
 }
 
+fn validate_target_metadata(metadata: &HashMap<String, serde_json::Value>) -> Result<()> {
+    anyhow::ensure!(
+        metadata.len() <= MAX_TARGET_METADATA_ENTRIES,
+        "target metadata cannot contain more than {MAX_TARGET_METADATA_ENTRIES} entries"
+    );
+    anyhow::ensure!(
+        metadata
+            .keys()
+            .all(|key| key.len() <= MAX_TARGET_METADATA_KEY_BYTES),
+        "target metadata keys cannot exceed {MAX_TARGET_METADATA_KEY_BYTES} bytes"
+    );
+    let serialized_size = serde_json::to_vec(metadata)?.len();
+    anyhow::ensure!(
+        serialized_size <= MAX_TARGET_METADATA_SERIALIZED_BYTES,
+        "target metadata serialized size cannot exceed {MAX_TARGET_METADATA_SERIALIZED_BYTES} bytes"
+    );
+
+    let mut pending: Vec<(&serde_json::Value, usize)> =
+        metadata.values().map(|value| (value, 1)).collect();
+    while let Some((value, depth)) = pending.pop() {
+        anyhow::ensure!(
+            depth <= MAX_TARGET_METADATA_NESTING_DEPTH,
+            "target metadata nesting depth cannot exceed {MAX_TARGET_METADATA_NESTING_DEPTH}"
+        );
+        match value {
+            serde_json::Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            serde_json::Value::Object(values) => {
+                pending.extend(values.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 /// Load balancing algorithm.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -319,6 +363,8 @@ struct LoadBalancerState {
     /// Per-target health: `0` = unknown (treated as healthy), `1` =
     /// healthy, `2` = unhealthy. Vec indexed by target index.
     health: Vec<AtomicU8>,
+    /// Immutable metadata snapshots swapped atomically by target index.
+    metadata: Vec<ArcSwap<HashMap<String, serde_json::Value>>>,
 }
 
 impl std::fmt::Debug for LoadBalancerState {
@@ -329,6 +375,7 @@ impl std::fmt::Debug for LoadBalancerState {
                 &self.round_robin_counter.load(Ordering::Relaxed),
             )
             .field("connections_len", &self.connections.len())
+            .field("metadata_len", &self.metadata.len())
             .finish()
     }
 }
@@ -398,14 +445,7 @@ impl LoadBalancerAction {
             "load balancer requires at least one target"
         );
         for target in &config.targets {
-            anyhow::ensure!(
-                target.metadata.len() <= 64,
-                "target metadata cannot contain more than 64 entries"
-            );
-            anyhow::ensure!(
-                target.metadata.keys().all(|key| key.len() <= 64),
-                "target metadata keys cannot exceed 64 bytes"
-            );
+            validate_target_metadata(&target.metadata)?;
         }
         anyhow::ensure!(
             config.lb_method.as_deref() != Some("plugin") || config.strategy.is_some(),
@@ -418,28 +458,42 @@ impl LoadBalancerAction {
                 .is_none_or(serde_json::Value::is_object),
             "strategy_config must be an object"
         );
+        if config.strategy.as_deref() == Some("bandit") {
+            anyhow::ensure!(
+                config.targets.len() <= super::routing::bandit::MAX_TARGETS_PER_NAMESPACE,
+                "bandit strategy supports at most {} targets",
+                super::routing::bandit::MAX_TARGETS_PER_NAMESPACE
+            );
+        }
         let num_targets = config.targets.len();
+        let metadata = config
+            .targets
+            .iter()
+            .map(|target| ArcSwap::from_pointee(target.metadata.clone()))
+            .collect();
         let (strategy_name, strategy) = match config.strategy.as_deref() {
             Some(name) => {
                 let mut strategy_config = config
                     .strategy_config
                     .unwrap_or_else(|| serde_json::json!({}));
-                let object = strategy_config
-                    .as_object_mut()
-                    .expect("strategy config was normalized to an object");
-                let target_urls: Vec<&str> = config
-                    .targets
-                    .iter()
-                    .map(|target| target.url.as_str())
-                    .collect();
-                let namespace = format!(
-                    "{origin_id}:{name}:{}",
-                    serde_json::to_string(&target_urls)?
-                );
-                object.insert(
-                    "state_namespace".to_string(),
-                    serde_json::Value::String(namespace),
-                );
+                if name == "bandit" {
+                    let object = strategy_config
+                        .as_object_mut()
+                        .expect("strategy config was normalized to an object");
+                    let target_urls: Vec<&str> = config
+                        .targets
+                        .iter()
+                        .map(|target| target.url.as_str())
+                        .collect();
+                    let namespace = format!(
+                        "{origin_id}:{name}:{}",
+                        serde_json::to_string(&target_urls)?
+                    );
+                    object.insert(
+                        "state_namespace".to_string(),
+                        serde_json::Value::String(namespace),
+                    );
+                }
                 let (registered_name, strategy) =
                     build_routing_strategy_with_name(name, &strategy_config)?;
                 (Some(registered_name), Some(strategy))
@@ -491,8 +545,34 @@ impl LoadBalancerAction {
                 round_robin_counter: AtomicU64::new(0),
                 connections: (0..num_targets).map(|_| AtomicU32::new(0)).collect(),
                 health: (0..num_targets).map(|_| AtomicU8::new(0)).collect(),
+                metadata,
             },
         })
+    }
+
+    /// Atomically replace one target's bounded strategy metadata snapshot.
+    pub fn update_target_metadata(
+        &self,
+        target_index: usize,
+        metadata: HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        validate_target_metadata(&metadata)?;
+        let slot = self.state.metadata.get(target_index).ok_or_else(|| {
+            anyhow::anyhow!("target metadata index {target_index} is out of range")
+        })?;
+        slot.store(Arc::new(metadata));
+        Ok(())
+    }
+
+    /// Return the current immutable strategy metadata snapshot for a target.
+    pub fn target_metadata_snapshot(
+        &self,
+        target_index: usize,
+    ) -> Option<Arc<HashMap<String, serde_json::Value>>> {
+        self.state
+            .metadata
+            .get(target_index)
+            .map(ArcSwap::load_full)
     }
 
     /// Returns `true` when the breaker for the target at `idx` would
@@ -830,7 +910,9 @@ impl LoadBalancerAction {
                             .map(|count| u64::from(count.load(Ordering::Relaxed)))
                             .unwrap_or_default(),
                         weight: target.weight,
-                        metadata: target.metadata.clone(),
+                        metadata: self
+                            .target_metadata_snapshot(*index)
+                            .expect("metadata state is parallel to configured targets"),
                     })
                     .collect();
                 strategy
@@ -1228,6 +1310,40 @@ fn extract_cookie(headers: &http::HeaderMap, cookie_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::routing::RoutingStrategyRegistration;
+
+    struct StrictConfigStrategy;
+
+    impl RoutingStrategy for StrictConfigStrategy {
+        fn select(&self, _request: &RoutingRequest, targets: &[TargetState]) -> Option<usize> {
+            (!targets.is_empty()).then_some(0)
+        }
+
+        fn name(&self) -> &str {
+            "strict-config-test"
+        }
+    }
+
+    fn build_strict_config_strategy(
+        value: &serde_json::Value,
+    ) -> anyhow::Result<Arc<dyn RoutingStrategy>> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictConfig {
+            enabled: bool,
+        }
+
+        let config: StrictConfig = serde_json::from_value(value.clone())?;
+        anyhow::ensure!(config.enabled, "strict test strategy must be enabled");
+        Ok(Arc::new(StrictConfigStrategy))
+    }
+
+    inventory::submit! {
+        RoutingStrategyRegistration {
+            name: "strict-config-test",
+            build: build_strict_config_strategy,
+        }
+    }
 
     struct DeferringStrategy;
 
@@ -1536,6 +1652,72 @@ mod tests {
     }
 
     #[test]
+    fn target_metadata_rejects_oversized_and_deep_values() {
+        let oversized = LoadBalancerAction::from_config(serde_json::json!({
+            "targets": [{
+                "url": "http://a:8080",
+                "metadata": {"payload": "x".repeat(17 * 1024)}
+            }]
+        }))
+        .expect_err("oversized metadata must be rejected");
+        assert!(
+            oversized.to_string().contains("serialized size"),
+            "unexpected error: {oversized}"
+        );
+
+        let mut nested = serde_json::json!("leaf");
+        for _ in 0..9 {
+            nested = serde_json::json!([nested]);
+        }
+        let too_deep = LoadBalancerAction::from_config(serde_json::json!({
+            "targets": [{
+                "url": "http://a:8080",
+                "metadata": {"nested": nested}
+            }]
+        }))
+        .expect_err("deeply nested metadata must be rejected");
+        assert!(
+            too_deep.to_string().contains("nesting depth"),
+            "unexpected error: {too_deep}"
+        );
+    }
+
+    #[test]
+    fn third_party_strategy_receives_exact_user_config() {
+        let lb = LoadBalancerAction::from_config_for_origin(
+            serde_json::json!({
+                "targets": [{"url": "http://a:8080"}],
+                "strategy": "strict-config-test",
+                "strategy_config": {"enabled": true}
+            }),
+            "workspace-a/origin-a",
+        )
+        .expect("internal routing context must not enter a third-party config");
+
+        let selection = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("strict strategy selection");
+        assert_eq!(selection.selection_method, "strict-config-test");
+    }
+
+    #[test]
+    fn bandit_rejects_a_257_target_pool_at_compile_time() {
+        let targets: Vec<serde_json::Value> = (0..257)
+            .map(|index| serde_json::json!({"url": format!("http://target-{index}:8080")}))
+            .collect();
+        let error = LoadBalancerAction::from_config(serde_json::json!({
+            "targets": targets,
+            "strategy": "bandit"
+        }))
+        .expect_err("a bandit pool above the retained arm bound must be rejected");
+
+        assert!(
+            error.to_string().contains("at most 256 targets"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn from_config_missing_targets_fails() {
         let result = LoadBalancerAction::from_config(serde_json::json!({}));
         assert!(result.is_err());
@@ -1821,6 +2003,61 @@ mod tests {
 
         assert_eq!(selection.target_index, 1);
         assert_eq!(selection.selection_method, "gpu-aware");
+    }
+
+    #[test]
+    fn target_metadata_can_be_updated_without_rebuilding_the_action() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {
+                    "url": "http://busy:8080",
+                    "metadata": {"gpu_utilization": 0.8}
+                },
+                {
+                    "url": "http://idle:8080",
+                    "metadata": {"gpu_utilization": 0.2}
+                }
+            ],
+            "strategy": "gpu-aware"
+        }));
+        let before = lb
+            .target_metadata_snapshot(0)
+            .expect("configured target metadata snapshot");
+        assert_eq!(
+            lb.select_target_for_request(RoutingRequest::new("POST", "/v1/chat", "ai.example.com"))
+                .expect("initial GPU-aware selection")
+                .target_index,
+            1
+        );
+
+        lb.update_target_metadata(
+            0,
+            HashMap::from([("gpu_utilization".to_string(), serde_json::json!(0.05))]),
+        )
+        .expect("bounded metadata update");
+
+        let after = lb
+            .target_metadata_snapshot(0)
+            .expect("updated target metadata snapshot");
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.get("gpu_utilization"), Some(&serde_json::json!(0.05)));
+        assert_eq!(
+            lb.select_target_for_request(RoutingRequest::new("POST", "/v1/chat", "ai.example.com"))
+                .expect("selection with updated metadata")
+                .target_index,
+            0
+        );
+
+        let invalid = HashMap::from([(
+            "payload".to_string(),
+            serde_json::json!("x".repeat(17 * 1024)),
+        )]);
+        assert!(lb.update_target_metadata(0, invalid).is_err());
+        assert!(Arc::ptr_eq(
+            &after,
+            &lb.target_metadata_snapshot(0)
+                .expect("rejected updates must preserve the current snapshot")
+        ));
     }
 
     #[test]

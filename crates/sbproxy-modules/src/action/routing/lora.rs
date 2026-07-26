@@ -156,7 +156,7 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata,
+            metadata: metadata.into(),
         }
     }
 
@@ -168,7 +168,7 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata: HashMap::new(),
+            metadata: HashMap::new().into(),
         }
     }
 
@@ -261,7 +261,7 @@ mod tests {
             healthy: true,
             active_connections: 0,
             weight: 1,
-            metadata: weird,
+            metadata: weird.into(),
         }];
         assert!(strat.select(&req(Some("alice-tone")), &targets).is_none());
     }
@@ -280,7 +280,7 @@ mod tests {
             healthy: true,
             active_connections: 0,
             weight: 1,
-            metadata: wrong,
+            metadata: wrong.into(),
         }];
         assert!(strat.select(&req(Some("alice-tone")), &targets).is_none());
     }
