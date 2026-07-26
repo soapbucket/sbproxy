@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-25*
+*Last modified: 2026-07-26*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -129,6 +129,19 @@ sbproxy apply -f <yaml> [--admin-url <url>] [--username <u>] [--password <p>]
                         [--validate-only]
 sbproxy apply -p <plan-file> [--admin-url <url>] [--validate-only]
 sbproxy config {migrate|import-litellm|print}
+sbproxy config authority init --dir <path> [--key-id <id>] [--authority-id <id>]
+                              [--force] [--format text|json]
+sbproxy config authority publish -f <payload.yml> [--mode overlay|replace]
+                              [--validate-only] [--admin-url <url>]
+                              [--username <u>] [--password <p>] [--format text|json]
+sbproxy config authority status [--admin-url <url>] [--format text|json]
+sbproxy config authority rollback [--admin-url <url>] [--format text|json]
+sbproxy config authority subscriber add <subscriber-id> [--admin-url <url>]
+                              [--format text|json]
+sbproxy config authority subscriber list [--admin-url <url>] [--format text|json]
+sbproxy config authority subscriber revoke {--credential-id <id> | --subscriber-id <id>}
+                              [--admin-url <url>] [--format text|json]
+sbproxy config pull <path> --dry-run [--format text|json]
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
 sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
                            [--engine auto|vllm|llama_cpp]
@@ -155,7 +168,7 @@ The full subcommand set, one line each:
 | `validate` | Validate an `sb.yml` without starting the proxy. |
 | `plan` | Diff a proposed config against a baseline. |
 | `apply` | Validate and reload a config in place; the same primitive the SIGHUP handler and file watcher use. |
-| `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked. |
+| `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked, `authority` operates a config authority (generate its key, publish, watch the rollout, roll back, manage subscriber credentials), `pull --dry-run` previews the bundle a subscriber would apply next. |
 | `projections` | Render projection documents (robots.txt, llms.txt, ...) for an origin without starting the proxy. |
 | `run` | Resolve a certified artifact, generate local admin auth, warm a canonical managed deployment, then print an OpenAI-compatible endpoint. |
 | `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, or drain and stop one. |
@@ -318,6 +331,167 @@ Exit codes:
 | 6 | Another `apply` already holds the applylock. |
 | 7 | No proxy answered at the admin URL. Nothing was applied. |
 | 8 | Applied, but a subsystem kept stale state. See the warning on stderr. |
+
+### `config authority` - operate a config authority
+
+A config authority signs one configuration and the fleet verifies and
+applies it. The schema, the wire contract, the deny list, and the
+subscriber side are documented in
+[configuration.md](configuration.md#config-authority-fleet-configuration-distribution);
+this section is the operator surface over it.
+
+```bash
+# Once, on the node that will publish.
+sbproxy config authority init --dir /etc/sbproxy/authority \
+  --authority-id control-plane-eu
+
+# Once per subscriber. Prints the credential exactly once.
+export SB_CONFIG_AUTHORITY_TOKEN="$(sbproxy config authority subscriber add edge-01)"
+
+# Every change.
+sbproxy config authority publish -f fleet.yml --mode overlay
+sbproxy config authority status
+sbproxy config authority rollback
+```
+
+Every command except `init` talks to the authority's admin API and
+reports what the server returned. None of them changes process-local
+state and calls that success: if the admin API cannot be reached, the
+command exits 7 and says nothing was changed. The endpoint defaults to
+`http://127.0.0.1:9090`; override it with `--admin-url` or `SB_ADMIN_URL`,
+and supply credentials with `--username` / `--password` or
+`SB_ADMIN_USERNAME` / `SB_ADMIN_PASSWORD`. A publishing node refuses the
+shipped default admin password, so an authority always has a real one.
+
+`--format json` is available on every one of these commands and emits a
+single object on stdout.
+
+#### `config authority init`
+
+Generates an Ed25519 key pair, writes `authority-signing.key` owner-only
+(0600) and `authority-keys.json` for distribution, and prints what to
+copy where. Local: it writes two files and contacts nothing, because a
+signing key that travelled over a network to reach its own authority has
+been somewhere else.
+
+The default `--key-id` is derived from the new public key
+(`authority-<12 chars>`), so a rotation never collides with the key it
+replaces. Pass `--key-id` to choose your own. `--authority-id` only
+affects the printed config snippet.
+
+It refuses to overwrite an existing signing key. `--force` rotates: the
+new signing key replaces the old one and the new verifying key is *added*
+to `authority-keys.json` alongside the old entry, so subscribers that
+still trust the old key keep verifying while they are updated. Drop the
+old entry a window later. The signing seed is printed by neither format.
+
+If the directory is reachable by other accounts on the host, `init` says
+so. It is a warning rather than a refusal: the key file itself is
+owner-only, and the loader refuses one that is not.
+
+#### `config authority publish`
+
+`-f <payload.yml>` is the payload subscribers apply, not this node's own
+config file. Before anything is sent, publish runs the same three checks
+the authority runs (`compile_config`, then the per-origin module
+constructors, then the model-host desired-state checks), through the same
+function the server route calls. A payload that would be refused is
+therefore refused here, and no revision number is spent on it. An
+unresolved `${VAR}` is a warning, not a refusal, because it may well
+resolve on the subscriber.
+
+`--mode` must match the `mode` each subscriber is configured for, or they
+refuse the bundle rather than guess. `--validate-only` runs every check
+and stops, contacting nothing, which is the CI form.
+
+#### `config authority status`
+
+Current revision and digest, the signing key id, the previous revision,
+the highest revision ever reserved, and every subscriber's last-seen
+revision with a `current` / `behind` / `never fetched` verdict. That last
+column is fleet drift, visible from a terminal.
+
+No secret appears in the output. Subscriber records carry a credential
+*id*, never the credential, and the authority stores only a SHA-256
+fingerprint of it in the first place. The verifying material is the
+public half of the signing key.
+
+#### `config authority rollback`
+
+Republishes the previous stored revision's payload. The store keeps the
+current bundle and the one before it for exactly this.
+
+The new revision number is *above* the one it replaces. A subscriber's
+anti-replay cursor refuses any revision that is not greater than the one
+it applied, so re-serving the old number would reach only the nodes that
+had not yet taken the revision being undone, which is the opposite of
+what you want at that moment. The output names all three numbers: what
+was restored, what it replaced, and what it was published as.
+
+The payload is revalidated on the way through, because a payload that
+published cleanly before a binary upgrade need not still construct after
+one.
+
+#### `config authority subscriber`
+
+`add <subscriber-id>` registers a node and mints its credential. The
+credential is printed **once**, here, and is not recoverable: the
+authority keeps only a fingerprint. In `--format text` it goes alone to
+stdout (so `export TOKEN="$(...)"` works) and the note saying so goes to
+stderr. Give it to the node as
+`proxy.config_authority.upstream.credential` by secret reference, not
+inline.
+
+`list` is the roster with each node's last-seen revision. `revoke`
+takes either `--credential-id` (one credential, which is how a rotation
+retires the old one) or `--subscriber-id` (every credential that node
+holds). A revoked node keeps serving what it already applied; it stops
+receiving updates.
+
+#### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Done, or a no-op. |
+| 1 | CLI / IO error, including naming no revoke selector. |
+| 3 | Refused locally, nothing sent: a payload that would not publish, or an `init` that would clobber a signing key. |
+| 4 | The authority answered and refused. Nothing changed on it. |
+| 7 | Nothing answered at the admin URL. Nothing was changed. |
+
+### `config pull` - preview the next bundle without applying it
+
+```bash
+sbproxy config pull /etc/sbproxy/sb.yml --dry-run
+```
+
+Runs a real subscriber cycle up to the point of applying: a conditional
+`GET` against the authority named in `proxy.config_authority.upstream`,
+signature and schema and digest and replay verification, the merge over
+this node's local document, and the unresolved-`${VAR}` screen. Then it
+prints the resulting plan diff, in `plan`'s format, and stops.
+
+Nothing is applied. The bundle cache is not written, the replay cursor is
+not advanced, and no reload happens. This is the one command in the group
+that is local, and it is local because it applies nothing: a short-lived
+CLI process cannot swap a running proxy's pipeline, and applying a bundle
+is the proxy's own poll loop's job. `--dry-run` is required for that
+reason, and the output says plainly that nothing was applied.
+
+The config path comes from the positional argument, then `-f/--config`,
+then `SB_CONFIG_FILE`.
+
+Because the fetch is conditional on this node's persisted cursor, a node
+that already holds the current revision gets a `304` and the command
+reports "no changes" rather than re-printing a diff of what it is already
+serving.
+
+| Code | Meaning |
+|------|---------|
+| 0 | Nothing to apply: the authority is serving the revision this node already holds. |
+| 1 | CLI / IO error, including a missing `--dry-run` or no `upstream` block. |
+| 2 | Changes present. The diff is on stdout. Nothing was applied. |
+| 3 | The bundle or the merged document was refused. The reason names which check fired. |
+| 7 | The authority could not be reached. Nothing was applied. |
 
 ### `projections render` - serve-time documents on demand
 
@@ -1689,6 +1863,9 @@ restart.
 | `SB_GRACE_TIME` | `--grace-time` | (unset) | Legacy Pingora grace period and shutdown timeout in seconds. Superseded by `SBPROXY_SHUTDOWN_GRACE_MS`. |
 | `SB_WORKER_THREADS` | (none) | (auto) | Override the auto-detected Pingora worker thread count. Positive integers only. |
 | `SB_DISABLE_SB_FLAGS` | `--disable-sb-flags` | `false` | Lock off the per-request `x-sb-flags` surface. Accepts `1`, `true`, `yes`, `on`. |
+| `SB_ADMIN_URL` | `--admin-url` | `http://127.0.0.1:9090` | Admin API base URL for the commands that talk to a running proxy: `apply`, `models ps` / `stop` / `remove`, `cluster status`, and every `config authority` subcommand. |
+| `SB_ADMIN_USERNAME` | `--username` | `admin` | Admin Basic Auth username for the same commands. |
+| `SB_ADMIN_PASSWORD` | `--password` | (unset) | Admin Basic Auth password for the same commands. Never printed, and cleared from memory once the request header is built. |
 | `SB_APPLY_CONFIG` | (none) | (unset) | Path to the proposed YAML used by `sbproxy apply -p <plan-file>`. Required for the `-p` flow because the plan file does not embed the YAML path. |
 | `SB_APPLY_BASELINE` | (none) | (unset) | Optional baseline override for `sbproxy apply -p`. When set, apply compares the plan's recorded baseline revision against this YAML's revision; otherwise the empty config is the baseline. |
 
