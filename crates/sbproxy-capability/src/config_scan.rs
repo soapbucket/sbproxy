@@ -389,6 +389,26 @@ struct FunctionReturn {
     result: TypeReference,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodReceiver {
+    SharedOrValue,
+    Mutable,
+}
+
+#[derive(Debug, Clone)]
+struct MethodSignature {
+    owner: TypeReference,
+    receiver: MethodReceiver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodReceiverResolution {
+    Missing,
+    SharedOrValue,
+    Mutable,
+    Ambiguous,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SymbolKind {
     Type,
@@ -466,6 +486,7 @@ struct RustTypeIndex {
     enum_tags: BTreeMap<String, String>,
     enum_variants: BTreeMap<String, BTreeSet<String>>,
     function_returns: BTreeMap<String, Vec<FunctionReturn>>,
+    method_signatures: BTreeMap<String, Vec<MethodSignature>>,
 }
 
 impl RustTypeIndex {
@@ -844,6 +865,48 @@ impl RustTypeIndex {
                 result,
             });
     }
+
+    fn record_method_signature(&mut self, owner: &TypeReference, signature: &syn::Signature) {
+        let Some(syn::FnArg::Receiver(receiver)) = signature.inputs.first() else {
+            return;
+        };
+        let receiver = if receiver.reference.is_some() && receiver.mutability.is_some()
+            || receiver.colon_token.is_some() && type_is_mutable_reference(&receiver.ty)
+        {
+            MethodReceiver::Mutable
+        } else {
+            MethodReceiver::SharedOrValue
+        };
+        self.method_signatures
+            .entry(signature.ident.to_string())
+            .or_default()
+            .push(MethodSignature {
+                owner: owner.clone(),
+                receiver,
+            });
+    }
+
+    fn method_receiver(&self, owner: &str, method: &str) -> MethodReceiverResolution {
+        let Some(signatures) = self.method_signatures.get(method) else {
+            return MethodReceiverResolution::Missing;
+        };
+        let mut resolved = None;
+        for signature in signatures {
+            if self.resolve_type_reference(&signature.owner).as_deref() != Some(owner) {
+                continue;
+            }
+            match resolved {
+                None => resolved = Some(signature.receiver),
+                Some(receiver) if receiver == signature.receiver => {}
+                Some(_) => return MethodReceiverResolution::Ambiguous,
+            }
+        }
+        match resolved {
+            Some(MethodReceiver::SharedOrValue) => MethodReceiverResolution::SharedOrValue,
+            Some(MethodReceiver::Mutable) => MethodReceiverResolution::Mutable,
+            None => MethodReceiverResolution::Missing,
+        }
+    }
 }
 
 struct TypeIndexVisitor<'a> {
@@ -901,6 +964,23 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         if !attributes_are_test_only(&node.attrs) {
             self.index.record_function_return(&node.sig, &self.context);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if attributes_are_test_only(&node.attrs) {
+            return;
+        }
+        let Some(owner) = type_reference(&node.self_ty, &self.context) else {
+            return;
+        };
+        for item in &node.items {
+            let syn::ImplItem::Fn(method) = item else {
+                continue;
+            };
+            if !attributes_are_test_only(&method.attrs) {
+                self.index.record_method_signature(&owner, &method.sig);
+            }
         }
     }
 
@@ -1117,6 +1197,7 @@ struct LocalSymbolScope {
     glob_imports: Vec<TypeReference>,
     type_declarations: BTreeSet<String>,
     function_declarations: BTreeSet<String>,
+    function_returns: BTreeMap<String, Vec<TypeReference>>,
     namespace_declarations: BTreeSet<String>,
 }
 
@@ -1270,6 +1351,28 @@ impl<'a> FieldReadVisitor<'a> {
 
     fn function_return_scoped(&self, path: &syn::Path) -> Option<String> {
         let reference = path_reference(path, &self.context)?;
+        if !reference.leading_colon && reference.segments.len() == 1 {
+            let name = reference.segments.first()?;
+            for scope_index in (0..self.local_scopes.len()).rev() {
+                let scope = &self.local_scopes[scope_index];
+                if !scope.function_declarations.contains(name) {
+                    continue;
+                }
+                let returns = scope.function_returns.get(name)?;
+                if returns.len() != 1 {
+                    return None;
+                }
+                return self
+                    .resolve_symbol_scoped_with_limit(
+                        SymbolKind::Type,
+                        &returns[0],
+                        scope_index + 1,
+                        &mut BTreeSet::new(),
+                        &mut BTreeSet::new(),
+                    )
+                    .exact();
+            }
+        }
         let symbol = self.resolve_symbol_scoped(SymbolKind::Function, &reference)?;
         let name = symbol.rsplit("::").next()?;
         let result = &self
@@ -1386,9 +1489,13 @@ impl<'a> FieldReadVisitor<'a> {
                     scope.namespace_declarations.insert(name);
                 }
                 syn::Item::Fn(item_fn) => {
-                    scope
-                        .function_declarations
-                        .insert(item_fn.sig.ident.to_string());
+                    let name = item_fn.sig.ident.to_string();
+                    scope.function_declarations.insert(name.clone());
+                    if let syn::ReturnType::Type(_, ty) = &item_fn.sig.output {
+                        if let Some(result) = type_reference(ty, &self.context) {
+                            scope.function_returns.entry(name).or_default().push(result);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1483,7 +1590,9 @@ impl<'a> FieldReadVisitor<'a> {
                     .or_else(|| value.map(|value| value.owner.clone()));
                 if let Some(pattern_owner) = pattern_owner {
                     for field in &record.fields {
-                        if matches!(field.pat.as_ref(), syn::Pat::Wild(_)) {
+                        if attributes_are_test_only(&field.attrs)
+                            || matches!(field.pat.as_ref(), syn::Pat::Wild(_))
+                        {
                             continue;
                         }
                         if let Some(member) = Self::named_member(&field.member) {
@@ -1540,6 +1649,134 @@ impl<'a> FieldReadVisitor<'a> {
         }
     }
 
+    fn members_match(left: &syn::Member, right: &syn::Member) -> bool {
+        match (left, right) {
+            (syn::Member::Named(left), syn::Member::Named(right)) => left == right,
+            (syn::Member::Unnamed(left), syn::Member::Unnamed(right)) => left.index == right.index,
+            _ => false,
+        }
+    }
+
+    fn record_paths_match(&self, left: &syn::Path, right: &syn::Path) -> bool {
+        if let (Some(left), Some(right)) = (
+            self.resolve_path_scoped(left),
+            self.resolve_path_scoped(right),
+        ) {
+            return left == right;
+        }
+        left.leading_colon.is_some() == right.leading_colon.is_some()
+            && left.segments.len() == right.segments.len()
+            && left
+                .segments
+                .iter()
+                .zip(&right.segments)
+                .all(|(left, right)| left.ident == right.ident)
+    }
+
+    fn visit_patterned_sequence(
+        &mut self,
+        patterns: &[&syn::Pat],
+        expressions: &[&syn::Expr],
+    ) -> bool {
+        let rest_positions: Vec<_> = patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pattern)| matches!(pattern, syn::Pat::Rest(_)).then_some(index))
+            .collect();
+
+        if rest_positions.is_empty() {
+            if patterns.len() != expressions.len() {
+                return false;
+            }
+            for (pattern, expression) in patterns.iter().zip(expressions) {
+                if !self.visit_patterned_initializer(pattern, expression) {
+                    self.visit_expr(expression);
+                }
+            }
+            return true;
+        }
+        if rest_positions.len() != 1 || expressions.len() + 1 < patterns.len() {
+            return false;
+        }
+
+        let rest_index = rest_positions[0];
+        for (pattern, expression) in patterns[..rest_index]
+            .iter()
+            .zip(&expressions[..rest_index])
+        {
+            if !self.visit_patterned_initializer(pattern, expression) {
+                self.visit_expr(expression);
+            }
+        }
+
+        let suffix_len = patterns.len() - rest_index - 1;
+        for expression in &expressions[rest_index..expressions.len() - suffix_len] {
+            self.visit_discarded_expr(expression);
+        }
+        for (pattern, expression) in patterns[rest_index + 1..]
+            .iter()
+            .zip(&expressions[expressions.len() - suffix_len..])
+        {
+            if !self.visit_patterned_initializer(pattern, expression) {
+                self.visit_expr(expression);
+            }
+        }
+        true
+    }
+
+    fn visit_patterned_record(
+        &mut self,
+        pattern: &syn::PatStruct,
+        expression: &syn::ExprStruct,
+    ) -> bool {
+        if !self.record_paths_match(&pattern.path, &expression.path) {
+            return false;
+        }
+        let pattern_fields: Vec<_> = pattern
+            .fields
+            .iter()
+            .filter(|field| !attributes_are_test_only(&field.attrs))
+            .collect();
+        let expression_fields: Vec<_> = expression
+            .fields
+            .iter()
+            .filter(|field| !attributes_are_test_only(&field.attrs))
+            .collect();
+        let mut matched = BTreeSet::new();
+
+        for pattern_field in pattern_fields {
+            let Some((index, expression_field)) = expression_fields
+                .iter()
+                .enumerate()
+                .find(|(_, field)| Self::members_match(&pattern_field.member, &field.member))
+            else {
+                return false;
+            };
+            if !matched.insert(index) {
+                return false;
+            }
+            if !self.visit_patterned_initializer(&pattern_field.pat, &expression_field.expr) {
+                self.visit_expr(&expression_field.expr);
+            }
+        }
+
+        if pattern.rest.is_none() && matched.len() != expression_fields.len() {
+            return false;
+        }
+        for (index, field) in expression_fields.iter().enumerate() {
+            if !matched.contains(&index) {
+                self.visit_discarded_expr(&field.expr);
+            }
+        }
+        if let Some(rest) = &expression.rest {
+            if pattern.rest.is_none() {
+                return false;
+            }
+            self.visit_discarded_expr(rest);
+        }
+        true
+    }
+
     fn visit_patterned_initializer(&mut self, pattern: &syn::Pat, expression: &syn::Expr) -> bool {
         match (pattern, expression) {
             (syn::Pat::Paren(pattern), _) => {
@@ -1568,52 +1805,15 @@ impl<'a> FieldReadVisitor<'a> {
             (syn::Pat::Tuple(pattern), syn::Expr::Tuple(expression)) => {
                 let patterns: Vec<_> = pattern.elems.iter().collect();
                 let expressions: Vec<_> = expression.elems.iter().collect();
-                let rest_positions: Vec<_> = patterns
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, pattern)| {
-                        matches!(pattern, syn::Pat::Rest(_)).then_some(index)
-                    })
-                    .collect();
-
-                if rest_positions.is_empty() {
-                    if patterns.len() != expressions.len() {
-                        return false;
-                    }
-                    for (pattern, expression) in patterns.into_iter().zip(expressions) {
-                        if !self.visit_patterned_initializer(pattern, expression) {
-                            self.visit_expr(expression);
-                        }
-                    }
-                    return true;
-                }
-                if rest_positions.len() != 1 || expressions.len() + 1 < patterns.len() {
-                    return false;
-                }
-
-                let rest_index = rest_positions[0];
-                for (pattern, expression) in patterns[..rest_index]
-                    .iter()
-                    .zip(&expressions[..rest_index])
-                {
-                    if !self.visit_patterned_initializer(pattern, expression) {
-                        self.visit_expr(expression);
-                    }
-                }
-
-                let suffix_len = patterns.len() - rest_index - 1;
-                for expression in &expressions[rest_index..expressions.len() - suffix_len] {
-                    self.visit_discarded_expr(expression);
-                }
-                for (pattern, expression) in patterns[rest_index + 1..]
-                    .iter()
-                    .zip(&expressions[expressions.len() - suffix_len..])
-                {
-                    if !self.visit_patterned_initializer(pattern, expression) {
-                        self.visit_expr(expression);
-                    }
-                }
-                true
+                self.visit_patterned_sequence(&patterns, &expressions)
+            }
+            (syn::Pat::Slice(pattern), syn::Expr::Array(expression)) => {
+                let patterns: Vec<_> = pattern.elems.iter().collect();
+                let expressions: Vec<_> = expression.elems.iter().collect();
+                self.visit_patterned_sequence(&patterns, &expressions)
+            }
+            (syn::Pat::Struct(pattern), syn::Expr::Struct(expression)) => {
+                self.visit_patterned_record(pattern, expression)
             }
             _ => false,
         }
@@ -1862,16 +2062,37 @@ impl<'a> FieldReadVisitor<'a> {
             syn::Expr::MethodCall(call) => {
                 let method = call.method.to_string();
                 let passes_item_to_closure = Self::method_passes_item_to_closure(method.as_str());
-                let reads_receiver = Self::method_reads_receiver(method.as_str());
-                let uses_mutable_receiver = Self::method_uses_mutable_receiver(method.as_str());
-                // Unknown methods fail closed as potential mutations. Place
-                // inference still traverses computations nested inside the
-                // receiver without turning the destination itself into a read.
-                let owner = if reads_receiver && !uses_mutable_receiver {
+                // First resolve the receiver as a place, which gives local
+                // method signatures an owner without treating the destination
+                // itself as a read.
+                let place_owner = self.infer_place_expr(&call.receiver);
+                let receiver = place_owner
+                    .as_ref()
+                    .map(|owner| self.types.method_receiver(&owner.owner, &method))
+                    .unwrap_or(MethodReceiverResolution::Missing);
+                let (reads_receiver, uses_mutable_receiver) = match receiver {
+                    MethodReceiverResolution::SharedOrValue => (true, false),
+                    MethodReceiverResolution::Mutable | MethodReceiverResolution::Ambiguous => {
+                        (false, true)
+                    }
+                    MethodReceiverResolution::Missing => (
+                        Self::method_reads_receiver(method.as_str()),
+                        Self::method_uses_mutable_receiver(method.as_str()),
+                    ),
+                };
+                // Unknown methods fail closed as potential mutations. Known
+                // standard mutable readers still evaluate their receiver as a
+                // value; mutable access only affects downstream provenance.
+                let mut owner = if reads_receiver {
                     self.infer_expr(&call.receiver)
                 } else {
-                    self.infer_place_expr(&call.receiver)
+                    place_owner
                 };
+                if uses_mutable_receiver {
+                    if let Some(owner) = owner.as_mut() {
+                        owner.mutable_place = true;
+                    }
+                }
                 let mut closure_result = None;
                 for argument in &call.args {
                     if passes_item_to_closure {
@@ -1906,7 +2127,7 @@ impl<'a> FieldReadVisitor<'a> {
             }
             syn::Expr::Struct(record) => {
                 for field in &record.fields {
-                    self.visit_expr(&field.expr);
+                    self.visit_field_value(field);
                 }
                 self.resolve_path_scoped(&record.path)
                     .map(|owner| InferredValue {
@@ -1958,7 +2179,9 @@ impl<'a> FieldReadVisitor<'a> {
             syn::Expr::Reference(reference) => self.infer_place_expr(&reference.expr),
             syn::Expr::Struct(record) => {
                 for field in &record.fields {
-                    let _ = self.infer_place_expr(&field.expr);
+                    if !attributes_are_test_only(&field.attrs) {
+                        let _ = self.infer_place_expr(&field.expr);
+                    }
                 }
                 if let Some(rest) = &record.rest {
                     let _ = self.infer_place_expr(rest);
@@ -2021,6 +2244,12 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
     fn visit_expr(&mut self, node: &'ast syn::Expr) {
         if !expr_attributes(node).is_some_and(attributes_are_test_only) {
             syn::visit::visit_expr(self, node);
+        }
+    }
+
+    fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+        if !attributes_are_test_only(&node.attrs) {
+            syn::visit::visit_field_value(self, node);
         }
     }
 
@@ -4080,6 +4309,53 @@ fn production() {
     }
 
     #[test]
+    fn block_local_factory_returns_preserve_config_provenance() {
+        let errors = guard_errors(&[
+            source_at(
+                "crates/sbproxy-config/src/lib.rs",
+                "pub struct GuardConfig { pub enabled: bool }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "fn outer() {\n\
+                     fn make() -> sbproxy_config::GuardConfig { todo!() }\n\
+                     consume(make().enabled);\n\
+                 }",
+            ),
+        ]);
+
+        assert!(
+            errors.is_empty(),
+            "a block-local factory return type must retain provenance: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn block_local_factories_shadow_imported_config_factories() {
+        let errors = guard_errors(&[
+            source_at(
+                "crates/sbproxy-config/src/lib.rs",
+                "pub struct GuardConfig { pub enabled: bool }\n\
+                 pub fn make() -> GuardConfig { todo!() }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "use sbproxy_config::make;\n\
+                 fn outer() {\n\
+                     fn make() -> external_crate::GuardConfig { todo!() }\n\
+                     consume(make().enabled);\n\
+                 }",
+            ),
+        ]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a local factory must shadow an imported config factory: {errors:?}"
+        );
+    }
+
+    #[test]
     fn unparseable_production_source_cannot_be_silently_skipped() {
         let keys = [key("proxy.indirect", "indirect")];
         let override_entry = ConfigKeyCapability {
@@ -4188,6 +4464,47 @@ fn cfg_test(config: &Config) {
         assert!(
             errors.is_empty(),
             "a statement reachable in a production feature remains evidence: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_attributed_struct_fields_are_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             struct Carrier { observed: bool, kept: bool }\n\
+             fn runtime(v: &GuardConfig) {\n\
+                 consume(Carrier {\n\
+                     #[cfg(test)]\n\
+                     observed: v.enabled,\n\
+                     kept: true,\n\
+                 });\n\
+             }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a test-only struct field must not prove a production reader: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn conditionally_production_struct_fields_remain_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             struct Carrier { observed: bool, kept: bool }\n\
+             fn runtime(v: &GuardConfig) {\n\
+                 consume(Carrier {\n\
+                     #[cfg(any(test, feature = \"fixtures\"))]\n\
+                     observed: v.enabled,\n\
+                     kept: true,\n\
+                 });\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a struct field reachable in production remains evidence: {errors:?}"
         );
     }
 
@@ -4438,6 +4755,83 @@ fn cfg_test(config: &Config) {
     }
 
     #[test]
+    fn ignored_array_initializer_elements_are_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn ignore(v: &GuardConfig) {\n\
+                 let [_, kept] = [v.enabled, true];\n\
+                 consume(kept);\n\
+             }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "an array initializer paired with `_` is discarded: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ignored_record_initializer_fields_are_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             struct Pair { ignored: bool, kept: bool }\n\
+             fn ignore(v: &GuardConfig) {\n\
+                 let Pair { ignored: _, kept } = Pair {\n\
+                     ignored: v.enabled,\n\
+                     kept: true,\n\
+                 };\n\
+                 consume(kept);\n\
+             }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a record initializer field paired with `_` is discarded: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn array_rest_and_nested_patterns_preserve_live_elements() {
+        for statement in [
+            "let [kept, ..] = [v.enabled, true]; consume(kept);",
+            "let [[kept, _], ..] = [[v.enabled, true], [false, false]]; consume(kept);",
+        ] {
+            let errors = guard_errors(&[source(&format!(
+                "struct GuardConfig {{ enabled: bool }}\n\
+                 fn inspect(v: &GuardConfig) {{ {statement} }}"
+            ))]);
+
+            assert!(
+                errors.is_empty(),
+                "a live array element remains reader evidence: {statement}\n{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_rest_and_nested_patterns_preserve_live_fields() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             struct Pair { ignored: bool, kept: (bool, bool), spare: bool }\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 let Pair { kept: (kept, _), .. } = Pair {\n\
+                     ignored: false,\n\
+                     kept: (v.enabled, true),\n\
+                     spare: false,\n\
+                 };\n\
+                 consume(kept);\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a live nested record field remains reader evidence: {errors:?}"
+        );
+    }
+
+    #[test]
     fn dereferenced_assignment_places_preserve_call_argument_reads() {
         let errors = guard_errors(&[source(
             "struct GuardConfig { enabled: bool }\n\
@@ -4496,6 +4890,108 @@ fn cfg_test(config: &Config) {
                 "a known reader method must still consume its receiver: {method}\n{errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolved_shared_receiver_methods_are_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct Flag;\n\
+             impl Flag { fn is_set(&self) -> bool { true } }\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn inspect(v: &GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a resolved `&self` method consumes its receiver: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_mutable_len_method_is_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct Flag;\n\
+             impl Flag { fn len(&mut self) -> usize { 0 } }\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn normalize(v: &mut GuardConfig) { consume(v.enabled.len()); }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a resolved custom `len(&mut self)` may only mutate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_mutable_clone_method_is_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct Flag;\n\
+             impl Flag { fn clone(&mut self) -> bool { true } }\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn normalize(v: &mut GuardConfig) { consume(v.enabled.clone()); }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a resolved custom `clone(&mut self)` may only mutate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_mutable_to_string_method_is_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct Flag;\n\
+             impl Flag { fn to_string(&mut self) -> String { String::new() } }\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn normalize(v: &mut GuardConfig) { consume(v.enabled.to_string()); }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a resolved custom `to_string(&mut self)` may only mutate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn option_as_mut_remains_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: Option<bool> }\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.as_mut()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "Option::as_mut observes whether the configured value exists: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn vec_iter_mut_remains_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: Vec<bool> }\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.iter_mut()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "Vec::iter_mut traverses the configured values: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn vec_retain_remains_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: Vec<bool> }\n\
+             fn inspect(v: &mut GuardConfig) { v.enabled.retain(|item| *item); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "Vec::retain reads configured values through its predicate: {errors:?}"
+        );
     }
 
     #[test]
