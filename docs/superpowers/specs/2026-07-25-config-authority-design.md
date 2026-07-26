@@ -1,6 +1,16 @@
 # Config authority: signed config distribution for a proxy fleet
 
-Status: design accepted 2026-07-25. Not yet implemented.
+Status: design accepted 2026-07-25, and partly built. Shipped: the reload
+transaction rework everything else depends on, the signed bundle format
+and its replay cursor, the merge engine and its deny-list, the admin
+hardening, and the subscriber client. Still to build: the authority
+server, the git source, the admin API and editor surfaces, the gossip
+accelerator, the CLI, and certification.
+
+The "Hard edges" and "Solutions" sections below are left as first
+written rather than tidied afterwards. What changed during the audit is
+the useful part of this document, and a version that reads as though it
+were correct from the start would be worth less.
 
 ## The problem
 

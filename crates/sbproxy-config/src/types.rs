@@ -569,6 +569,14 @@ pub struct ProxyServerConfig {
     /// Optional shared cluster substrate for keys, metrics, and managed models.
     #[serde(default)]
     pub cluster: Option<crate::cluster::ClusterConfig>,
+    /// Optional config-authority participation: subscribe to signed
+    /// configuration bundles published by an upstream authority.
+    ///
+    /// The whole block sits on [`crate::config_merge::AUTHORITY_DENIED_PATHS`],
+    /// so a bundle can never repoint a subscriber at a different authority
+    /// or relax its verification.
+    #[serde(default)]
+    pub config_authority: Option<ConfigAuthorityConfig>,
     /// Secrets management configuration.
     #[serde(default)]
     pub secrets: Option<SecretsConfig>,
@@ -764,6 +772,7 @@ impl Default for ProxyServerConfig {
             admin: None,
             model_host: None,
             cluster: None,
+            config_authority: None,
             secrets: None,
             key_management: None,
             l2_cache: None,
@@ -783,6 +792,390 @@ impl Default for ProxyServerConfig {
             tenants: Vec::new(),
             credentials: Vec::new(),
         }
+    }
+}
+
+// --- Config authority: subscriber side ---
+
+/// Default poll cadence against the upstream authority, in seconds.
+const DEFAULT_CONFIG_AUTHORITY_POLL_SECS: u64 = 30;
+
+/// Default staleness window for a cached bundle, in seconds.
+const DEFAULT_CONFIG_AUTHORITY_STALENESS_SECS: u64 = 24 * 60 * 60;
+
+/// Shortest poll cadence a subscriber may configure, in seconds.
+///
+/// A one-second poll is a denial-of-service tool aimed at the authority,
+/// and no configuration distribution needs sub-five-second latency.
+pub const MIN_CONFIG_AUTHORITY_POLL_SECS: u64 = 5;
+
+/// Longest poll cadence a subscriber may configure, in seconds.
+pub const MAX_CONFIG_AUTHORITY_POLL_SECS: u64 = 24 * 60 * 60;
+
+/// Longest staleness window a subscriber may configure, in seconds.
+///
+/// Past a month a cached bundle is an archaeological record rather than a
+/// configuration, so the schema refuses to call it fresh.
+pub const MAX_CONFIG_AUTHORITY_STALENESS_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Largest accepted path or identifier in this block, in bytes.
+const MAX_CONFIG_AUTHORITY_VALUE_BYTES: usize = 4_096;
+
+const fn default_config_authority_poll_secs() -> u64 {
+    DEFAULT_CONFIG_AUTHORITY_POLL_SECS
+}
+
+const fn default_config_authority_staleness_secs() -> u64 {
+    DEFAULT_CONFIG_AUTHORITY_STALENESS_SECS
+}
+
+/// `proxy.config_authority`: how this node takes part in config authority.
+///
+/// Today only the subscriber half exists: [`Self::upstream`] pulls signed
+/// bundles from an authority, verifies them, merges them over the local
+/// document, and applies the result through the ordinary reload
+/// transaction. The publishing half is a separate change; see
+/// [`ConfigAuthorityConfig::publishes_bundles`] for the seam it lands on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfigAuthorityConfig {
+    /// Upstream authority this node subscribes to. Absent means this node
+    /// pulls no remote configuration.
+    pub upstream: Option<ConfigAuthorityUpstreamConfig>,
+}
+
+impl ConfigAuthorityConfig {
+    /// Whether this node publishes bundles to subscribers of its own.
+    ///
+    /// The publishing half of the config authority is a separate change.
+    /// This is the seam it lands on: when a `publish:` block joins this
+    /// struct, this method returns whether it is present, and
+    /// [`Self::validate`] already refuses a node that both publishes and
+    /// subscribes. Deliberately not a `todo!()`: a subscriber-only build
+    /// has to answer the question, and the answer is `false`.
+    pub const fn publishes_bundles(&self) -> bool {
+        false
+    }
+
+    /// Validate the block, including the rules that cross fields.
+    ///
+    /// Run from `compile_config`, so `sbproxy validate` reports these
+    /// before a node boots on them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigAuthorityConfigError`] when a node both subscribes
+    /// and publishes, or when the upstream block fails any of its own
+    /// rules. See [`ConfigAuthorityUpstreamConfig::validate`].
+    pub fn validate(&self) -> Result<(), ConfigAuthorityConfigError> {
+        if let Some(upstream) = &self.upstream {
+            // One node cannot be both the authority and a subscriber of
+            // another authority: the deny list stops a bundle from
+            // rewriting `proxy.config_authority`, so a node in both roles
+            // would republish a document it does not fully own, and the
+            // provenance an auditor reads downstream would name this node
+            // rather than the authority the values actually came from.
+            if self.publishes_bundles() {
+                return Err(ConfigAuthorityConfigError::BothRoles);
+            }
+            upstream.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// `proxy.config_authority.upstream`: the authority this node pulls
+/// signed configuration bundles from.
+///
+/// ```yaml
+/// proxy:
+///   config_authority:
+///     upstream:
+///       url: https://control.example.com
+///       mode: overlay
+///       subscriber_id: edge-01
+///       credential: env:SB_CONFIG_TOKEN
+///       verifying_keys_file: /etc/sbproxy/authority-keys.json
+///       poll_interval: 30s
+///       cache_path: /var/lib/sbproxy/config-bundle.json
+///       max_staleness: 24h
+///       require_bundle_on_boot: false
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigAuthorityUpstreamConfig {
+    /// Absolute base URL of the authority, for example
+    /// `https://control.example.com`. The subscriber appends its own
+    /// path; a path on this URL is kept as a prefix.
+    ///
+    /// Must be `https` unless [`Self::allow_insecure_http`] is set.
+    pub url: String,
+    /// Whether a bundle merges over the local document or replaces it.
+    ///
+    /// Required rather than defaulted: the answer decides whether the
+    /// local file still describes what this node serves, which is not a
+    /// question to answer by omission.
+    pub mode: crate::config_bundle::BundleMode,
+    /// Stable identity this node presents to the authority. Sent on
+    /// every fetch so an authority can scope what it publishes.
+    pub subscriber_id: String,
+    /// Reference to the bearer credential presented to the authority.
+    ///
+    /// Resolved through the process secret resolver, so the accepted
+    /// forms are `env:NAME`, `${NAME}`, `file:/path`, and a
+    /// provider-URI reference such as `secret://backend/name`. An inline
+    /// literal is refused: a token committed to a config file is a token
+    /// in every git history that ever held it.
+    #[serde(default)]
+    pub credential: Option<String>,
+    /// Path to the JSON file naming every key this subscriber trusts.
+    /// See `VerifyingKeySet::from_file` for the file shape.
+    pub verifying_keys_file: String,
+    /// How often the subscriber polls the authority, in seconds. Accepts
+    /// a humanized duration (`30s`, `5m`) or bare seconds.
+    ///
+    /// The real interval carries jitter, so a fleet restarting together
+    /// does not synchronize onto the authority.
+    #[serde(
+        rename = "poll_interval",
+        alias = "poll_interval_secs",
+        default = "default_config_authority_poll_secs",
+        deserialize_with = "crate::duration::deserialize_secs"
+    )]
+    pub poll_interval_secs: u64,
+    /// Where the verified bundle is cached so the node can boot on the
+    /// last known configuration when the authority is unreachable. The
+    /// anti-replay cursor is stored beside it.
+    pub cache_path: String,
+    /// How old a cached bundle may be and still be used at boot, in
+    /// seconds. Accepts a humanized duration (`24h`, `7d`) or bare
+    /// seconds.
+    ///
+    /// A running node that exceeds this window keeps serving and logs at
+    /// error level every cycle; the window is a boot-time gate, not a
+    /// kill switch on a node that is already up.
+    #[serde(
+        rename = "max_staleness",
+        alias = "max_staleness_secs",
+        default = "default_config_authority_staleness_secs",
+        deserialize_with = "crate::duration::deserialize_secs"
+    )]
+    pub max_staleness_secs: u64,
+    /// Whether the node refuses to start without a usable bundle.
+    ///
+    /// Absent means `false` under `mode: overlay` and `true` under
+    /// `mode: replace`. An explicit `false` under `mode: replace` is a
+    /// config error rather than a silently overridden value: under
+    /// replace the local document is not a servable configuration, so
+    /// there would be nothing to boot on.
+    #[serde(default)]
+    pub require_bundle_on_boot: Option<bool>,
+    /// Permit a plaintext `http://` authority URL. Development only.
+    ///
+    /// Bundle signatures are checked either way, so this does not let an
+    /// attacker forge a configuration, but it does expose the credential
+    /// this node presents and reveals the whole configuration to anyone
+    /// on the path.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    /// Acknowledge that `hmac_sha256` entries in the verifying-key file
+    /// may verify bundles. Development only.
+    ///
+    /// A shared secret is symmetric: every subscriber holding it can
+    /// forge a bundle for every other subscriber. Off by default, and
+    /// verification refuses those bundles until it is on.
+    #[serde(default)]
+    pub allow_shared_secret_keys: bool,
+}
+
+impl ConfigAuthorityUpstreamConfig {
+    /// Whether this node refuses to start without a usable bundle.
+    ///
+    /// Resolves the documented default: `replace` implies `true`,
+    /// `overlay` implies `false`, and an explicit value wins in the
+    /// combinations [`Self::validate`] accepts.
+    pub fn requires_bundle_on_boot(&self) -> bool {
+        self.require_bundle_on_boot
+            .unwrap_or(self.mode == crate::config_bundle::BundleMode::Replace)
+    }
+
+    /// The merge mode this subscriber applies a bundle with.
+    pub fn merge_mode(&self) -> crate::config_merge::MergeMode {
+        match self.mode {
+            crate::config_bundle::BundleMode::Overlay => crate::config_merge::MergeMode::Overlay,
+            crate::config_bundle::BundleMode::Replace => crate::config_merge::MergeMode::Replace,
+        }
+    }
+
+    /// Validate every rule this block owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigAuthorityConfigError`] when the URL is not an
+    /// absolute `https` URL (and `allow_insecure_http` is unset), when
+    /// an identifier or path is empty or oversized, when the credential
+    /// is an inline literal rather than a reference, when a duration is
+    /// outside its documented bounds, or when `mode: replace` is paired
+    /// with an explicit `require_bundle_on_boot: false`.
+    pub fn validate(&self) -> Result<(), ConfigAuthorityConfigError> {
+        validate_authority_url(&self.url, self.allow_insecure_http)?;
+        validate_authority_value("subscriber_id", &self.subscriber_id)?;
+        validate_authority_value("verifying_keys_file", &self.verifying_keys_file)?;
+        validate_authority_value("cache_path", &self.cache_path)?;
+        if let Some(credential) = self.credential.as_deref() {
+            validate_authority_value("credential", credential)?;
+            if !is_secret_reference(credential) {
+                return Err(ConfigAuthorityConfigError::InlineCredential);
+            }
+        }
+        if self.poll_interval_secs < MIN_CONFIG_AUTHORITY_POLL_SECS
+            || self.poll_interval_secs > MAX_CONFIG_AUTHORITY_POLL_SECS
+        {
+            return Err(ConfigAuthorityConfigError::PollInterval {
+                found: self.poll_interval_secs,
+            });
+        }
+        if self.max_staleness_secs < self.poll_interval_secs
+            || self.max_staleness_secs > MAX_CONFIG_AUTHORITY_STALENESS_SECS
+        {
+            return Err(ConfigAuthorityConfigError::MaxStaleness {
+                found: self.max_staleness_secs,
+                poll_interval_secs: self.poll_interval_secs,
+            });
+        }
+        if self.mode == crate::config_bundle::BundleMode::Replace
+            && self.require_bundle_on_boot == Some(false)
+        {
+            return Err(ConfigAuthorityConfigError::ReplaceWithoutBundleOnBoot);
+        }
+        Ok(())
+    }
+}
+
+/// Why a `proxy.config_authority` block was refused.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ConfigAuthorityConfigError {
+    /// The node both subscribes to an authority and publishes to
+    /// subscribers of its own.
+    #[error("proxy.config_authority declares both `upstream` and a publishing role; one node cannot both subscribe to an authority and publish to subscribers, because the deny list keeps a bundle from rewriting proxy.config_authority and the republished provenance would name this node rather than the authority the values came from")]
+    BothRoles,
+    /// The authority URL was not usable.
+    #[error("proxy.config_authority.upstream.url {url:?} is invalid: {reason}")]
+    Url {
+        /// URL as configured.
+        url: String,
+        /// What was wrong with it.
+        reason: &'static str,
+    },
+    /// A required identifier or path was empty, oversized, or carried
+    /// control characters.
+    #[error("proxy.config_authority.upstream.{field} must be a bounded value with no control characters")]
+    Value {
+        /// Offending field name.
+        field: &'static str,
+    },
+    /// The credential was an inline literal rather than a reference.
+    #[error("proxy.config_authority.upstream.credential must be a secret reference (`env:NAME`, `${{NAME}}`, `file:/path`, or `secret://backend/name`), not an inline token: a token in a config file is a token in every copy of that file")]
+    InlineCredential,
+    /// The poll interval was outside its documented bounds.
+    #[error("proxy.config_authority.upstream.poll_interval is {found}s; it must be between {MIN_CONFIG_AUTHORITY_POLL_SECS}s and {MAX_CONFIG_AUTHORITY_POLL_SECS}s")]
+    PollInterval {
+        /// Configured interval, in seconds.
+        found: u64,
+    },
+    /// The staleness window was outside its documented bounds.
+    #[error("proxy.config_authority.upstream.max_staleness is {found}s; it must be at least the {poll_interval_secs}s poll interval and no more than {MAX_CONFIG_AUTHORITY_STALENESS_SECS}s")]
+    MaxStaleness {
+        /// Configured window, in seconds.
+        found: u64,
+        /// Configured poll interval, in seconds.
+        poll_interval_secs: u64,
+    },
+    /// `mode: replace` was paired with an explicit
+    /// `require_bundle_on_boot: false`.
+    #[error("proxy.config_authority.upstream sets `mode: replace` with `require_bundle_on_boot: false`; under replace the local document is not a servable configuration, so there is nothing to boot on. Remove the field (replace implies true) or switch to `mode: overlay`")]
+    ReplaceWithoutBundleOnBoot,
+}
+
+/// Whether `value` names a secret rather than carrying one inline.
+///
+/// Mirrors the forms the process secret resolver accepts. Deliberately a
+/// shape check only: `sbproxy validate` must not need the environment
+/// variable to be exported or the secret backend to be reachable.
+fn is_secret_reference(value: &str) -> bool {
+    let trimmed = value.trim();
+    for prefix in ["env:", "file:"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return !rest.is_empty();
+        }
+    }
+    if trimmed.starts_with("${") && trimmed.ends_with('}') && trimmed.len() > 3 {
+        return true;
+    }
+    // A provider-URI reference (`secret://`, `vault://`, `awssm://`, ...).
+    // Matched structurally rather than against a scheme allowlist, which
+    // lives in the vault crate; an unknown scheme fails loudly at
+    // resolution rather than being mistaken for an inline token here.
+    match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            !scheme.is_empty()
+                && scheme
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+' | b'.'))
+                && !matches!(scheme, "http" | "https")
+                && !rest.is_empty()
+        }
+        None => false,
+    }
+}
+
+/// Validate one bounded, non-empty, control-character-free value.
+fn validate_authority_value(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ConfigAuthorityConfigError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_CONFIG_AUTHORITY_VALUE_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigAuthorityConfigError::Value { field });
+    }
+    Ok(())
+}
+
+/// Validate the authority URL: absolute, `https` unless explicitly
+/// downgraded, with a host and no query or fragment.
+fn validate_authority_url(
+    url: &str,
+    allow_insecure_http: bool,
+) -> Result<(), ConfigAuthorityConfigError> {
+    let invalid = |reason: &'static str| ConfigAuthorityConfigError::Url {
+        url: url.to_string(),
+        reason,
+    };
+    validate_authority_value("url", url).map_err(|_| invalid("empty or oversized"))?;
+    if url.contains('?') || url.contains('#') {
+        return Err(invalid(
+            "must not carry a query string or fragment; the subscriber appends its own path",
+        ));
+    }
+    let uri: http::Uri = url.parse().map_err(|_| invalid("is not a valid URL"))?;
+    let scheme = uri.scheme_str().ok_or_else(|| {
+        invalid("must be absolute, including the scheme, for example https://control.example.com")
+    })?;
+    if uri.host().is_none_or(str::is_empty) {
+        return Err(invalid("must name a host"));
+    }
+    match scheme {
+        "https" => Ok(()),
+        "http" if allow_insecure_http => Ok(()),
+        "http" => Err(invalid(
+            "is plaintext http; set allow_insecure_http: true to accept the exposed \
+             credential and configuration, or use https",
+        )),
+        _ => Err(invalid(
+            "must use the https scheme (or http in development)",
+        )),
     }
 }
 
@@ -7088,4 +7481,308 @@ fn default_olp_scope() -> String {
 
 fn default_olp_ttl_secs() -> u64 {
     3600
+}
+
+#[cfg(test)]
+mod config_authority_tests {
+    use super::*;
+    use crate::config_bundle::BundleMode;
+    use crate::config_merge::MergeMode;
+
+    /// The block from the field documentation, so the documented example
+    /// is also the parsed fixture.
+    const UPSTREAM_YAML: &str = r#"
+upstream:
+  url: https://control.example.com
+  mode: overlay
+  subscriber_id: edge-01
+  credential: env:SB_CONFIG_TOKEN
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  poll_interval: 30s
+  cache_path: /var/lib/sbproxy/config-bundle.json
+  max_staleness: 24h
+  require_bundle_on_boot: false
+"#;
+
+    fn parse(yaml: &str) -> ConfigAuthorityConfig {
+        serde_yaml::from_str(yaml).expect("config_authority parses")
+    }
+
+    fn base_upstream() -> ConfigAuthorityUpstreamConfig {
+        parse(UPSTREAM_YAML).upstream.expect("upstream present")
+    }
+
+    #[test]
+    fn documented_block_parses_and_validates() {
+        let authority = parse(UPSTREAM_YAML);
+        authority.validate().expect("documented block validates");
+        let upstream = authority.upstream.expect("upstream present");
+        assert_eq!(upstream.url, "https://control.example.com");
+        assert_eq!(upstream.mode, BundleMode::Overlay);
+        assert_eq!(upstream.merge_mode(), MergeMode::Overlay);
+        assert_eq!(upstream.subscriber_id, "edge-01");
+        assert_eq!(upstream.credential.as_deref(), Some("env:SB_CONFIG_TOKEN"));
+        // Humanized durations land on the seconds fields.
+        assert_eq!(upstream.poll_interval_secs, 30);
+        assert_eq!(upstream.max_staleness_secs, 86_400);
+        assert!(!upstream.requires_bundle_on_boot());
+        assert!(!upstream.allow_insecure_http);
+        assert!(!upstream.allow_shared_secret_keys);
+    }
+
+    #[test]
+    fn omitted_durations_take_their_defaults() {
+        let authority = parse(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: overlay
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+"#,
+        );
+        let upstream = authority.upstream.expect("upstream present");
+        assert_eq!(upstream.poll_interval_secs, 30);
+        assert_eq!(upstream.max_staleness_secs, 86_400);
+        assert!(upstream.credential.is_none());
+    }
+
+    #[test]
+    fn absent_block_and_absent_upstream_both_validate() {
+        assert!(ConfigAuthorityConfig::default().upstream.is_none());
+        ConfigAuthorityConfig::default()
+            .validate()
+            .expect("an empty block is not a misconfiguration");
+    }
+
+    #[test]
+    fn replace_implies_require_bundle_on_boot() {
+        let authority = parse(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: replace
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+"#,
+        );
+        authority
+            .validate()
+            .expect("replace without the field is fine");
+        let upstream = authority.upstream.expect("upstream present");
+        assert_eq!(upstream.merge_mode(), MergeMode::Replace);
+        assert!(
+            upstream.requires_bundle_on_boot(),
+            "replace has nothing to serve without a bundle",
+        );
+    }
+
+    #[test]
+    fn replace_with_explicit_false_is_refused_rather_than_overridden() {
+        let authority = parse(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: replace
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+  require_bundle_on_boot: false
+"#,
+        );
+        let error = authority.validate().expect_err("must be refused");
+        assert_eq!(
+            error,
+            ConfigAuthorityConfigError::ReplaceWithoutBundleOnBoot
+        );
+        let message = error.to_string();
+        assert!(message.contains("nothing to boot on"), "{message}");
+    }
+
+    #[test]
+    fn overlay_keeps_an_explicit_true() {
+        let authority = parse(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: overlay
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+  require_bundle_on_boot: true
+"#,
+        );
+        authority.validate().expect("valid");
+        assert!(authority
+            .upstream
+            .expect("upstream present")
+            .requires_bundle_on_boot());
+    }
+
+    #[test]
+    fn plaintext_http_needs_the_escape_hatch() {
+        let mut upstream = base_upstream();
+        upstream.url = "http://control.example.com".to_string();
+        let error = upstream.validate().expect_err("plaintext must be refused");
+        let message = error.to_string();
+        assert!(message.contains("allow_insecure_http"), "{message}");
+
+        upstream.allow_insecure_http = true;
+        upstream
+            .validate()
+            .expect("the acknowledged development form is accepted");
+    }
+
+    #[test]
+    fn the_url_must_be_absolute_https_with_a_host_and_no_query() {
+        for (url, label) in [
+            ("control.example.com", "no scheme"),
+            ("/config-authority", "path only"),
+            ("https:///bundle", "no host"),
+            ("ftp://control.example.com", "unsupported scheme"),
+            ("https://control.example.com?tenant=a", "query string"),
+            ("https://control.example.com#frag", "fragment"),
+            ("", "empty"),
+        ] {
+            let mut upstream = base_upstream();
+            upstream.url = url.to_string();
+            // `allow_insecure_http` must not launder any of these.
+            upstream.allow_insecure_http = true;
+            assert!(
+                matches!(
+                    upstream.validate(),
+                    Err(ConfigAuthorityConfigError::Url { .. })
+                ),
+                "{label} ({url:?}) must be refused",
+            );
+        }
+
+        // A base path is kept; the subscriber appends its own path under it.
+        let mut upstream = base_upstream();
+        upstream.url = "https://control.example.com/fleet".to_string();
+        upstream.validate().expect("a base path is allowed");
+    }
+
+    #[test]
+    fn the_credential_must_be_a_reference_not_an_inline_token() {
+        for reference in [
+            "env:SB_CONFIG_TOKEN",
+            "${SB_CONFIG_TOKEN}",
+            "file:/etc/sbproxy/authority-token",
+            "secret://primary/authority-token",
+            "vault://primary/secret/data/authority",
+        ] {
+            let mut upstream = base_upstream();
+            upstream.credential = Some(reference.to_string());
+            upstream
+                .validate()
+                .unwrap_or_else(|error| panic!("{reference} must be accepted: {error}"));
+        }
+
+        for inline in [
+            "sk-live-abcdef",
+            "Bearer sk-live-abcdef",
+            "https://control.example.com/token",
+            "",
+        ] {
+            let mut upstream = base_upstream();
+            upstream.credential = Some(inline.to_string());
+            assert!(
+                upstream.validate().is_err(),
+                "{inline:?} must be refused as an inline credential",
+            );
+        }
+    }
+
+    #[test]
+    fn durations_are_bounded_and_ordered() {
+        let mut upstream = base_upstream();
+        upstream.poll_interval_secs = 1;
+        assert!(matches!(
+            upstream.validate(),
+            Err(ConfigAuthorityConfigError::PollInterval { found: 1 })
+        ));
+
+        let mut upstream = base_upstream();
+        upstream.poll_interval_secs = MAX_CONFIG_AUTHORITY_POLL_SECS + 1;
+        assert!(matches!(
+            upstream.validate(),
+            Err(ConfigAuthorityConfigError::PollInterval { .. })
+        ));
+
+        // A staleness window shorter than one poll interval declares every
+        // bundle stale the moment it arrives.
+        let mut upstream = base_upstream();
+        upstream.poll_interval_secs = 300;
+        upstream.max_staleness_secs = 60;
+        assert!(matches!(
+            upstream.validate(),
+            Err(ConfigAuthorityConfigError::MaxStaleness { .. })
+        ));
+
+        let mut upstream = base_upstream();
+        upstream.max_staleness_secs = MAX_CONFIG_AUTHORITY_STALENESS_SECS + 1;
+        assert!(matches!(
+            upstream.validate(),
+            Err(ConfigAuthorityConfigError::MaxStaleness { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_identifiers_and_paths_are_refused() {
+        for (label, mutate) in [
+            (
+                "subscriber_id",
+                (|upstream: &mut ConfigAuthorityUpstreamConfig| {
+                    upstream.subscriber_id = String::new();
+                }) as fn(&mut ConfigAuthorityUpstreamConfig),
+            ),
+            ("verifying_keys_file", |upstream| {
+                upstream.verifying_keys_file = "  ".to_string();
+            }),
+            ("cache_path", |upstream| {
+                upstream.cache_path = String::new();
+            }),
+        ] {
+            let mut upstream = base_upstream();
+            mutate(&mut upstream);
+            assert!(
+                matches!(
+                    upstream.validate(),
+                    Err(ConfigAuthorityConfigError::Value { field }) if field == label
+                ),
+                "{label} must be refused when empty",
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_key_is_refused_rather_than_defaulted() {
+        let error = serde_yaml::from_str::<ConfigAuthorityConfig>(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: overlay
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+  poll_intervall: 30s
+"#,
+        )
+        .expect_err("a typo must not silently take the default");
+        assert!(error.to_string().contains("poll_intervall"), "{error}");
+    }
+
+    #[test]
+    fn the_publish_seam_reports_no_publishing_role_yet() {
+        // The subscriber-only build answers the question rather than
+        // panicking, and the conflict rule it feeds is already written.
+        let authority = parse(UPSTREAM_YAML);
+        assert!(!authority.publishes_bundles());
+        let conflict = ConfigAuthorityConfigError::BothRoles.to_string();
+        assert!(conflict.contains("upstream"), "{conflict}");
+        assert!(conflict.contains("publish"), "{conflict}");
+    }
 }

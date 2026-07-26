@@ -25,6 +25,7 @@
         "alerting": null,
         "cache_reserve": null,
         "cluster": null,
+        "config_authority": null,
         "correlation_id": {
           "echo_response": true,
           "enabled": true,
@@ -379,6 +380,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/ClusterConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "config_authority": {
+          "description": "Optional config-authority participation: subscribe to signed configuration bundles published by an upstream authority.\n\nThe whole block sits on [`crate::config_merge::AUTHORITY_DENIED_PATHS`], so a bundle can never repoint a subscriber at a different authority or relax its verification.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConfigAuthorityConfig"
             },
             {
               "type": "null"
@@ -2491,6 +2504,122 @@
           "type": "string",
           "enum": [
             "all"
+          ]
+        }
+      ]
+    },
+    "ConfigAuthorityConfig": {
+      "description": "`proxy.config_authority`: how this node takes part in config authority.\n\nToday only the subscriber half exists: [`Self::upstream`] pulls signed bundles from an authority, verifies them, merges them over the local document, and applies the result through the ordinary reload transaction. The publishing half is a separate change; see [`ConfigAuthorityConfig::publishes_bundles`] for the seam it lands on.",
+      "type": "object",
+      "properties": {
+        "upstream": {
+          "description": "Upstream authority this node subscribes to. Absent means this node pulls no remote configuration.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConfigAuthorityUpstreamConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConfigAuthorityUpstreamConfig": {
+      "description": "`proxy.config_authority.upstream`: the authority this node pulls signed configuration bundles from.\n\n```yaml proxy: config_authority: upstream: url: https://control.example.com mode: overlay subscriber_id: edge-01 credential: env:SB_CONFIG_TOKEN verifying_keys_file: /etc/sbproxy/authority-keys.json poll_interval: 30s cache_path: /var/lib/sbproxy/config-bundle.json max_staleness: 24h require_bundle_on_boot: false ```",
+      "type": "object",
+      "required": [
+        "cache_path",
+        "mode",
+        "subscriber_id",
+        "url",
+        "verifying_keys_file"
+      ],
+      "properties": {
+        "url": {
+          "description": "Absolute base URL of the authority, for example `https://control.example.com`. The subscriber appends its own path; a path on this URL is kept as a prefix.\n\nMust be `https` unless [`Self::allow_insecure_http`] is set.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "Whether a bundle merges over the local document or replaces it.\n\nRequired rather than defaulted: the answer decides whether the local file still describes what this node serves, which is not a question to answer by omission.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/BundleMode"
+            }
+          ]
+        },
+        "subscriber_id": {
+          "description": "Stable identity this node presents to the authority. Sent on every fetch so an authority can scope what it publishes.",
+          "type": "string"
+        },
+        "credential": {
+          "description": "Reference to the bearer credential presented to the authority.\n\nResolved through the process secret resolver, so the accepted forms are `env:NAME`, `${NAME}`, `file:/path`, and a provider-URI reference such as `secret://backend/name`. An inline literal is refused: a token committed to a config file is a token in every git history that ever held it.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verifying_keys_file": {
+          "description": "Path to the JSON file naming every key this subscriber trusts. See `VerifyingKeySet::from_file` for the file shape.",
+          "type": "string"
+        },
+        "poll_interval": {
+          "description": "How often the subscriber polls the authority, in seconds. Accepts a humanized duration (`30s`, `5m`) or bare seconds.\n\nThe real interval carries jitter, so a fleet restarting together does not synchronize onto the authority.",
+          "default": 30,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_path": {
+          "description": "Where the verified bundle is cached so the node can boot on the last known configuration when the authority is unreachable. The anti-replay cursor is stored beside it.",
+          "type": "string"
+        },
+        "max_staleness": {
+          "description": "How old a cached bundle may be and still be used at boot, in seconds. Accepts a humanized duration (`24h`, `7d`) or bare seconds.\n\nA running node that exceeds this window keeps serving and logs at error level every cycle; the window is a boot-time gate, not a kill switch on a node that is already up.",
+          "default": 86400,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "require_bundle_on_boot": {
+          "description": "Whether the node refuses to start without a usable bundle.\n\nAbsent means `false` under `mode: overlay` and `true` under `mode: replace`. An explicit `false` under `mode: replace` is a config error rather than a silently overridden value: under replace the local document is not a servable configuration, so there would be nothing to boot on.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allow_insecure_http": {
+          "description": "Permit a plaintext `http://` authority URL. Development only.\n\nBundle signatures are checked either way, so this does not let an attacker forge a configuration, but it does expose the credential this node presents and reveals the whole configuration to anyone on the path.",
+          "default": false,
+          "type": "boolean"
+        },
+        "allow_shared_secret_keys": {
+          "description": "Acknowledge that `hmac_sha256` entries in the verifying-key file may verify bundles. Development only.\n\nA shared secret is symmetric: every subscriber holding it can forge a bundle for every other subscriber. Off by default, and verification refuses those bundles until it is on.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BundleMode": {
+      "description": "How a subscriber applies a verified bundle to its local configuration.\n\nDerives `JsonSchema` because `proxy.config_authority.upstream.mode` reuses this enum, and every type reachable from `ConfigFile` feeds the generated editor schema.",
+      "oneOf": [
+        {
+          "description": "Merge the bundle over the subscriber's own configuration, leaving anything the bundle does not mention untouched.",
+          "type": "string",
+          "enum": [
+            "overlay"
+          ]
+        },
+        {
+          "description": "Replace the subscriber's configuration wholesale. Anything absent from the bundle is dropped.",
+          "type": "string",
+          "enum": [
+            "replace"
           ]
         }
       ]

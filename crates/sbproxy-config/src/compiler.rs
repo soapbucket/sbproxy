@@ -383,6 +383,24 @@ fn scan_yaml_hazards(yaml: &str) -> Result<Vec<String>> {
     Ok(unresolved)
 }
 
+/// Every `${VAR}` reference in `yaml` that survives interpolation on this
+/// host, as `path: ${VAR}` pairs.
+///
+/// [`compile_config`] only warns about these and leaves them as literal
+/// text, because a hand-edited config is edited by someone watching the
+/// log. An authority-supplied document has no such reader: a bundle
+/// naming a variable one subscriber does not export would take effect
+/// fleet-wide as the literal string `${VAR}`. Callers that apply a
+/// document nobody proofread use this to refuse it instead.
+///
+/// Returns an empty vector for a document that does not parse, or one
+/// carrying an unsupported YAML tag; [`compile_config`] rejects both with
+/// a better message than this scan could give.
+#[must_use]
+pub fn unresolved_env_references(yaml: &str) -> Vec<String> {
+    scan_yaml_hazards(&interpolate_env_vars(yaml)).unwrap_or_default()
+}
+
 /// Recursively walk a JSON value and replace `{{vars.X}}` and `{{env.X}}`
 /// template patterns in all string values.
 ///
@@ -1239,6 +1257,16 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             validate_custom_log_fields(&obs.log.custom_fields)
                 .with_context(|| format!("origin `{host}` observability.log"))?;
         }
+    }
+
+    // Config-authority participation. Validated here rather than at first
+    // fetch so `sbproxy validate` catches an unusable authority URL, an
+    // inline credential, or a `replace` subscriber that has told itself it
+    // may boot without a bundle.
+    if let Some(authority) = config_file.proxy.config_authority.as_ref() {
+        authority
+            .validate()
+            .context("config compile: proxy.config_authority")?;
     }
 
     if let Some(cluster) = crate::cluster::resolve_effective_cluster(&config_file.proxy)

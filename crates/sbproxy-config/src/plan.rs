@@ -334,6 +334,19 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Restart,
         reason: "enabling or disabling the process-owned cluster requires restart",
     },
+    // --- Config authority: the subscriber, its HTTP client, its trusted
+    //     keys, and its poll loop are all built once at boot, and the
+    //     block is deny-listed so a bundle can never change it. ---
+    BlastRadiusRule {
+        pattern: "proxy.config_authority.**",
+        radius: BlastRadius::Restart,
+        reason: "the config-authority subscriber and its poll loop are built once at startup",
+    },
+    BlastRadiusRule {
+        pattern: "proxy.config_authority",
+        radius: BlastRadius::Restart,
+        reason: "subscribing to, or stopping subscription to, a config authority requires restart",
+    },
     // --- L2 cache: driver swap rebuilds the KV handle (restart);
     //     param tuning is hot-swappable. ---
     BlastRadiusRule {
@@ -1570,6 +1583,23 @@ origins:
         ] {
             let (radius, _) = lookup_blast_radius(path);
             assert_eq!(radius, BlastRadius::Reload, "{path}");
+        }
+    }
+
+    #[test]
+    fn matrix_lookup_config_authority_is_restart() {
+        // The subscriber, its HTTP client, its trusted keys, and its poll
+        // loop are all constructed at boot; a reload does not rebuild
+        // them.
+        for path in [
+            "proxy.config_authority",
+            "proxy.config_authority.upstream.url",
+            "proxy.config_authority.upstream.mode",
+            "proxy.config_authority.upstream.verifying_keys_file",
+            "proxy.config_authority.upstream.poll_interval",
+        ] {
+            let (radius, _) = lookup_blast_radius(path);
+            assert_eq!(radius, BlastRadius::Restart, "{path}");
         }
     }
 

@@ -1840,6 +1840,127 @@ pub fn record_config_reload(result: &'static str) {
     counter.with_label_values(&[result]).inc();
 }
 
+// --- config authority (subscriber) metrics ---------------------------
+//
+// A subscriber pulls signed config bundles from an upstream authority,
+// verifies them, merges them over its local document, and applies the
+// result through the ordinary reload transaction. These five families are
+// how an operator sees that the fleet's configuration plane is alive:
+// which revision each node holds, how long since it last heard from the
+// authority, and why a node stopped taking updates.
+
+/// Publish the authority revision this node currently serves on
+/// `sbproxy_config_bundle_revision`.
+///
+/// Set once per successful apply, and again at boot when a node applies a
+/// cached bundle, so a fleet-wide `min()` shows the laggard.
+pub fn set_config_bundle_revision(revision: i64) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_config_bundle_revision",
+            "Authority revision of the config bundle this node currently serves",
+        )
+        .expect("config bundle revision gauge registers")
+    });
+    gauge.set(revision);
+}
+
+/// Publish the age of the config bundle this node serves on
+/// `sbproxy_config_bundle_age_seconds`.
+///
+/// Age is measured from the moment this node received and applied the
+/// bundle, not from the authority's `issued_at`. The authority's clock is
+/// not this node's clock, and a skewed pair produces a negative or absurd
+/// age exactly when an operator is trying to decide whether config
+/// distribution is stuck. Receipt time is recorded alongside the cached
+/// bundle, so the value survives a restart. `issued_at` is still enforced
+/// through the bundle's own expiry check.
+pub fn set_config_bundle_age_seconds(age_seconds: f64) {
+    use prometheus::{register_gauge, Gauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<Gauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_gauge!(
+            "sbproxy_config_bundle_age_seconds",
+            "Seconds since this node received the config bundle it currently serves",
+        )
+        .expect("config bundle age gauge registers")
+    });
+    gauge.set(age_seconds);
+}
+
+/// Count one config-bundle fetch cycle on
+/// `sbproxy_config_bundle_fetch_total{result}`.
+///
+/// `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `ok` | Fetched, verified, merged, and applied. |
+/// | `not_modified` | The authority answered 304, or re-served the revision this node already holds. No compile and no reload. |
+/// | `unreachable` | Connect or read failure, timeout, or a status other than 200 and 304. The cached bundle keeps serving. |
+/// | `verify_failed` | Signature, schema, digest, expiry, declared-mode, or anti-replay refusal. |
+/// | `compile_failed` | The merged document did not compile, could not be constructed, or still carried an unresolved `${VAR}` reference. |
+/// | `denied_path` | The bundle named a path the subscriber owns outright. |
+/// | `reload_busy` | Another reload held the reload lock; the cycle was skipped and the next interval retries. |
+pub fn record_config_bundle_fetch(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_bundle_fetch_total",
+            "Config bundle fetch cycles, by result",
+            &["result"],
+        )
+        .expect("config bundle fetch counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
+/// Count one config bundle that applied cleanly on
+/// `sbproxy_config_bundle_applied_total`.
+///
+/// Disjoint from [`record_config_bundle_applied_degraded`] on purpose: a
+/// reload that published the pipeline while a subsystem stayed on prior
+/// state is not a clean apply, and folding the two together would make
+/// the healthy counter unusable as an alert baseline.
+pub fn record_config_bundle_applied() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_config_bundle_applied_total",
+            "Config bundles applied with every subsystem reloaded cleanly",
+        )
+        .expect("config bundle applied counter registers")
+    });
+    counter.inc();
+}
+
+/// Count one config bundle whose apply left a subsystem behind on
+/// `sbproxy_config_bundle_applied_degraded_total`.
+///
+/// The pipeline is live on the new configuration, but at least one
+/// subsystem carries prior state. Alert on any non-zero rate here.
+pub fn record_config_bundle_applied_degraded() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_config_bundle_applied_degraded_total",
+            "Config bundles applied while at least one subsystem stayed on prior state",
+        )
+        .expect("config bundle degraded counter registers")
+    });
+    counter.inc();
+}
+
 /// Count a well-known projection render failure on
 /// `sbproxy_projection_render_failures_total{projection}`. A non-zero
 /// value means a robots.txt / llms.txt / similar projection could not

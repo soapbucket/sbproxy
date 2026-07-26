@@ -471,6 +471,71 @@ pub(crate) fn reload_from_config_yaml(
     let _reload_guard = CONFIG_RELOAD_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reload_from_config_yaml_locked(config_path, yaml)
+}
+
+/// What a non-blocking reload attempt did.
+///
+/// The distinction exists for callers on a timer. [`Self::Busy`] is not a
+/// failure and must not be reported as one: the candidate was never
+/// examined, so nothing about it is known yet.
+#[derive(Debug)]
+pub enum TryReloadOutcome {
+    /// The transaction ran. Carries what it accomplished, including any
+    /// subsystem that stayed on prior state.
+    Applied(ReloadOutcome),
+    /// Another reload held the reload lock, so this attempt did nothing:
+    /// no compile, no construct, no publish. The caller retries on its
+    /// own schedule.
+    Busy,
+}
+
+/// Reload one exact config payload, but only if no other reload is
+/// running. See [`reload_from_config_yaml`] for the transaction itself.
+///
+/// The blocking entry point holds `CONFIG_RELOAD_LOCK` across the whole
+/// prepare-and-publish body, which for a large config is not brief. A
+/// caller on a fixed interval that waits behind it queues up: every
+/// pending poll cycle wakes into the same lock, and a fleet-wide slow
+/// reload turns into a backlog of reloads for a revision that has since
+/// been superseded. Such a caller wants to skip this cycle and try again
+/// at the next interval, which is what [`TryReloadOutcome::Busy`] says.
+///
+/// # Errors
+///
+/// Returns `Err` under exactly the conditions [`reload_from_config_yaml`]
+/// does. Contention is `Ok(TryReloadOutcome::Busy)`, never an error.
+pub(crate) fn try_reload_from_config_yaml(
+    config_path: &str,
+    yaml: &str,
+) -> anyhow::Result<TryReloadOutcome> {
+    let _reload_guard = match CONFIG_RELOAD_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(TryReloadOutcome::Busy),
+        // A poisoned lock means some other reload panicked mid-flight.
+        // The guarded data is `()`, so there is no corrupt state to
+        // inherit, and refusing every future reload over it would be
+        // worse than proceeding.
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
+    reload_from_config_yaml_locked(config_path, yaml).map(TryReloadOutcome::Applied)
+}
+
+/// Hold the reload lock so a test can prove that a caller which must not
+/// block on it does not.
+///
+/// The lock is a private static, and contention on it cannot be staged
+/// from another crate without this. Not for production use: holding the
+/// returned guard blocks every reload path in the process.
+#[doc(hidden)]
+pub fn hold_config_reload_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_RELOAD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The reload transaction body. Callers hold `CONFIG_RELOAD_LOCK`.
+fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Result<ReloadOutcome> {
     let compiled = sbproxy_config::compile_config(yaml)?;
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
@@ -1031,8 +1096,27 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // Load and compile the config.
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
+    // The drift baseline is the LOCAL file, deliberately captured before
+    // any authority bundle is folded in: `GET /admin/drift` answers "has
+    // the file on disk changed since we read it?", and a subscriber whose
+    // baseline was the merged document would report drift on every scrape
+    // forever.
     let initial_content_hash = crate::identity::config_revision(yaml.as_bytes());
     let compiled = sbproxy_config::compile_config(&yaml)?;
+
+    // Fold a cached config-authority bundle into the boot document before
+    // anything downstream reads the compiled config: listener ports, TLS
+    // hostnames, and the request pipeline all have to describe the
+    // configuration this node actually serves. A no-op when
+    // `proxy.config_authority.upstream` is absent, and an error (so the
+    // process exits) when the subscriber requires a bundle it does not
+    // have. No network I/O happens here; see the module docs.
+    // The effective document itself is not needed past this point: the
+    // compiled form is what boots, and the drift baseline is deliberately
+    // the local file captured above.
+    let (_effective_yaml, compiled, config_subscriber) =
+        crate::config_subscriber::fold_boot_bundle(config_path, yaml, compiled)?;
+
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
@@ -1288,6 +1372,12 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
 
     // Start file watcher for config hot-reload.
     start_config_watcher(config_path.to_string());
+
+    // Start the config-authority poller. Its cycles apply through the
+    // non-blocking reload entry point, so a slow file-watcher or SIGHUP
+    // reload never queues up poll cycles behind it. No-op when no
+    // authority is configured.
+    crate::config_subscriber::spawn(config_subscriber);
 
     // --- Wave 5 day-6 Item 4: SIGHUP re-bootstrap handler ---
     //

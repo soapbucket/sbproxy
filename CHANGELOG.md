@@ -12,6 +12,28 @@ the next version cut.
 
 ### Added
 
+- **Subscribe to signed configuration from an upstream authority.** A new
+  `proxy.config_authority.upstream` block points a node at an authority
+  that publishes signed configuration bundles. The node polls, verifies
+  the signature against the keys it trusts, merges the payload over its
+  own file, and applies the result through the same reload transaction a
+  SIGHUP takes, so a bad bundle is rejected before anything is published
+  and the previously applied configuration keeps serving. Paths that
+  describe the box rather than the fleet are refused outright: listeners,
+  TLS material, the admin surface, secret backends, cluster identity, and
+  the authority block itself. A monotonic cursor refuses a replayed or
+  rolled-back revision, including across a restart, and the verified
+  bundle is cached so an unreachable authority costs nothing but a
+  climbing staleness gauge. `mode: overlay` merges over the local file;
+  `mode: replace` treats the bundle as the configuration and will not
+  start without one. Bundles that still reference an environment
+  variable the node does not set are refused rather than applied as
+  literal text, because nobody is reading the log on a hundred machines
+  at once. New metrics: `sbproxy_config_bundle_revision`,
+  `sbproxy_config_bundle_age_seconds`,
+  `sbproxy_config_bundle_fetch_total`,
+  `sbproxy_config_bundle_applied_total`, and
+  `sbproxy_config_bundle_applied_degraded_total`.
 - **A response-cache store you can pick.** The response cache has had
   four storage backends for a while, but only one of them was reachable:
   nothing in the pipeline built the others, so no config could ask for

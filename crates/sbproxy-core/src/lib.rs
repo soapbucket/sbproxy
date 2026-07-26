@@ -67,6 +67,10 @@ pub mod compression_runtime;
 pub mod compression_store;
 /// Success-path bridge for prompt-free, per-lever AI compression value.
 pub mod compression_value;
+/// Config-authority subscriber: pull signed configuration from an
+/// upstream authority, verify it, merge it over the local document, and
+/// apply it through the shared reload transaction.
+pub mod config_subscriber;
 pub mod context;
 pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.

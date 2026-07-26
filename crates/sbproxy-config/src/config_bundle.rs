@@ -138,7 +138,11 @@ const ED25519_KEY_BYTES: usize = 32;
 type HmacSha256 = Hmac<Sha256>;
 
 /// How a subscriber applies a verified bundle to its local configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Derives `JsonSchema` because `proxy.config_authority.upstream.mode`
+/// reuses this enum, and every type reachable from `ConfigFile` feeds the
+/// generated editor schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BundleMode {
     /// Merge the bundle over the subscriber's own configuration, leaving
