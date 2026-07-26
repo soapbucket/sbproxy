@@ -410,7 +410,10 @@ struct TraitMethodSignature {
 #[derive(Debug, Clone)]
 enum TraitImplementationOwner {
     Exact(TypeReference),
-    Blanket,
+    Blanket {
+        bounds: Vec<TypeReference>,
+        has_unresolved_requirements: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +503,7 @@ struct RustTypeIndex {
     types_by_name: BTreeMap<String, BTreeSet<String>>,
     symbol_bindings: BTreeMap<String, Vec<TypeReference>>,
     glob_imports: BTreeMap<ModuleContext, Vec<TypeReference>>,
+    anonymous_imports: BTreeMap<ModuleContext, Vec<TypeReference>>,
     known_crates: BTreeSet<String>,
     known_modules: BTreeSet<String>,
     enum_tags: BTreeMap<String, String>,
@@ -508,6 +512,8 @@ struct RustTypeIndex {
     method_signatures: BTreeMap<String, Vec<MethodSignature>>,
     trait_method_signatures: BTreeMap<String, BTreeMap<String, Vec<TraitMethodSignature>>>,
     trait_implementations: Vec<TraitImplementation>,
+    trait_implementations_by_trait: BTreeMap<String, Vec<usize>>,
+    trait_method_candidates: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl RustTypeIndex {
@@ -535,6 +541,55 @@ impl RustTypeIndex {
             .entry(context.clone())
             .or_default()
             .push(target);
+    }
+
+    fn record_anonymous_import(&mut self, context: &ModuleContext, target: TypeReference) {
+        self.anonymous_imports
+            .entry(context.clone())
+            .or_default()
+            .push(target);
+    }
+
+    fn finalize_trait_method_candidates(&mut self) {
+        for (trait_owner, methods) in &self.trait_method_signatures {
+            for method in methods.keys() {
+                self.trait_method_candidates
+                    .entry(method.clone())
+                    .or_default()
+                    .insert(trait_owner.clone());
+            }
+        }
+        let implementations: Vec<_> = self
+            .trait_implementations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, implementation)| {
+                self.resolve_type_reference(&implementation.trait_reference)
+                    .map(|trait_owner| {
+                        (
+                            index,
+                            trait_owner,
+                            implementation
+                                .method_signatures
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+            })
+            .collect();
+        for (index, trait_owner, methods) in implementations {
+            self.trait_implementations_by_trait
+                .entry(trait_owner.clone())
+                .or_default()
+                .push(index);
+            for method in methods {
+                self.trait_method_candidates
+                    .entry(method)
+                    .or_default()
+                    .insert(trait_owner.clone());
+            }
+        }
     }
 
     fn namespace_exists(&self, context: &ModuleContext) -> bool {
@@ -941,6 +996,73 @@ impl RustTypeIndex {
         }
     }
 
+    fn collect_required_trait_bounds<'b>(
+        bounds: impl IntoIterator<Item = &'b syn::TypeParamBound>,
+        context: &ModuleContext,
+        out: &mut Vec<TypeReference>,
+        has_unresolved_requirements: &mut bool,
+    ) {
+        for bound in bounds {
+            match bound {
+                syn::TypeParamBound::Trait(bound)
+                    if matches!(bound.modifier, syn::TraitBoundModifier::None) =>
+                {
+                    if let Some(reference) = path_reference(&bound.path, context) {
+                        out.push(reference);
+                    } else {
+                        *has_unresolved_requirements = true;
+                    }
+                }
+                syn::TypeParamBound::Trait(_) | syn::TypeParamBound::Lifetime(_) => {}
+                _ => *has_unresolved_requirements = true,
+            }
+        }
+    }
+
+    fn blanket_trait_bounds(
+        item: &syn::ItemImpl,
+        parameter: &str,
+        type_parameters: &BTreeSet<String>,
+        context: &ModuleContext,
+    ) -> (Vec<TypeReference>, bool) {
+        let mut bounds = Vec::new();
+        let mut has_unresolved_requirements = false;
+        if let Some(parameter) = item.generics.params.iter().find_map(|candidate| {
+            let syn::GenericParam::Type(candidate) = candidate else {
+                return None;
+            };
+            (candidate.ident == parameter).then_some(candidate)
+        }) {
+            Self::collect_required_trait_bounds(
+                &parameter.bounds,
+                context,
+                &mut bounds,
+                &mut has_unresolved_requirements,
+            );
+        }
+        if let Some(where_clause) = &item.generics.where_clause {
+            for predicate in &where_clause.predicates {
+                match predicate {
+                    syn::WherePredicate::Type(predicate)
+                        if direct_type_parameter_name(&predicate.bounded_ty, type_parameters)
+                            .as_deref()
+                            == Some(parameter) =>
+                    {
+                        Self::collect_required_trait_bounds(
+                            &predicate.bounds,
+                            context,
+                            &mut bounds,
+                            &mut has_unresolved_requirements,
+                        );
+                    }
+                    syn::WherePredicate::Lifetime(_) => {}
+                    _ => has_unresolved_requirements = true,
+                }
+            }
+        }
+        (bounds, has_unresolved_requirements)
+    }
+
     fn record_trait_implementation(&mut self, item: &syn::ItemImpl, context: &ModuleContext) {
         let Some((negative, trait_path, _)) = &item.trait_ else {
             return;
@@ -960,14 +1082,20 @@ impl RustTypeIndex {
                 _ => None,
             })
             .collect();
-        let owner = if direct_type_parameter(&item.self_ty, &type_parameters) {
-            TraitImplementationOwner::Blanket
-        } else {
-            let Some(owner) = nominal_type_reference(&item.self_ty, context) else {
-                return;
+        let owner =
+            if let Some(parameter) = direct_type_parameter_name(&item.self_ty, &type_parameters) {
+                let (bounds, has_unresolved_requirements) =
+                    Self::blanket_trait_bounds(item, &parameter, &type_parameters, context);
+                TraitImplementationOwner::Blanket {
+                    bounds,
+                    has_unresolved_requirements,
+                }
+            } else {
+                let Some(owner) = nominal_type_reference(&item.self_ty, context) else {
+                    return;
+                };
+                TraitImplementationOwner::Exact(owner)
             };
-            TraitImplementationOwner::Exact(owner)
-        };
         let mut method_signatures = BTreeMap::<String, Vec<MethodReceiver>>::new();
         for impl_item in &item.items {
             let syn::ImplItem::Fn(method) = impl_item else {
@@ -1005,16 +1133,58 @@ impl RustTypeIndex {
         &self,
         implementation: &TraitImplementation,
         owner: &str,
+        resolving: &mut BTreeSet<String>,
     ) -> bool {
         match &implementation.owner {
-            TraitImplementationOwner::Blanket => true,
+            TraitImplementationOwner::Blanket {
+                bounds,
+                has_unresolved_requirements,
+            } => {
+                !has_unresolved_requirements
+                    && bounds.iter().all(|bound| {
+                        self.resolve_type_reference(bound).is_some_and(|bound| {
+                            self.owner_implements_trait(owner, &bound, resolving)
+                        })
+                    })
+            }
             TraitImplementationOwner::Exact(reference) => {
                 self.resolve_type_reference(reference).as_deref() == Some(owner)
             }
         }
     }
 
-    fn method_receiver(&self, owner: &str, method: &str) -> MethodReceiverResolution {
+    fn owner_implements_trait(
+        &self,
+        owner: &str,
+        trait_owner: &str,
+        resolving: &mut BTreeSet<String>,
+    ) -> bool {
+        let key = format!("{owner}:{trait_owner}");
+        if !resolving.insert(key.clone()) {
+            return false;
+        }
+        let implemented = self
+            .trait_implementations_by_trait
+            .get(trait_owner)
+            .is_some_and(|implementations| {
+                implementations.iter().any(|implementation| {
+                    self.trait_implementation_applies(
+                        &self.trait_implementations[*implementation],
+                        owner,
+                        resolving,
+                    )
+                })
+            });
+        resolving.remove(&key);
+        implemented
+    }
+
+    fn method_receiver(
+        &self,
+        owner: &str,
+        method: &str,
+        in_scope_traits: &BTreeSet<String>,
+    ) -> MethodReceiverResolution {
         let mut receivers = BTreeSet::new();
         if let Some(signatures) = self.method_signatures.get(method) {
             for signature in signatures {
@@ -1027,24 +1197,26 @@ impl RustTypeIndex {
         if inherent != MethodReceiverResolution::Missing {
             return inherent;
         }
+        if in_scope_traits.is_empty() {
+            return MethodReceiverResolution::Missing;
+        }
 
-        for implementation in &self.trait_implementations {
-            if !self.trait_implementation_applies(implementation, owner) {
+        for trait_owner in in_scope_traits {
+            let Some(implementations) = self.trait_implementations_by_trait.get(trait_owner) else {
                 continue;
-            }
-            if let Some(overrides) = implementation.method_signatures.get(method) {
-                receivers.extend(overrides);
-                continue;
-            }
-            let traits = self.resolve_symbol_reference(
-                SymbolKind::Type,
-                &implementation.trait_reference,
-                &mut BTreeSet::new(),
-            );
-            for trait_owner in traits.symbols {
+            };
+            for implementation in implementations {
+                let implementation = &self.trait_implementations[*implementation];
+                if !self.trait_implementation_applies(implementation, owner, &mut BTreeSet::new()) {
+                    continue;
+                }
+                if let Some(overrides) = implementation.method_signatures.get(method) {
+                    receivers.extend(overrides);
+                    continue;
+                }
                 let Some(signatures) = self
                     .trait_method_signatures
-                    .get(&trait_owner)
+                    .get(trait_owner)
                     .and_then(|methods| methods.get(method))
                 else {
                     continue;
@@ -1156,7 +1328,14 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
         let mut bindings = Vec::new();
         let mut globs = Vec::new();
-        collect_use_bindings(&node.tree, &mut Vec::new(), &mut bindings, &mut globs);
+        let mut anonymous = Vec::new();
+        collect_use_bindings(
+            &node.tree,
+            &mut Vec::new(),
+            &mut bindings,
+            &mut globs,
+            &mut anonymous,
+        );
         for (alias, segments) in bindings {
             self.index.record_symbol_binding(
                 self.context.symbol(&alias),
@@ -1169,6 +1348,16 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
         }
         for segments in globs {
             self.index.record_glob_import(
+                &self.context,
+                TypeReference {
+                    segments,
+                    context: self.context.clone(),
+                    leading_colon: node.leading_colon.is_some(),
+                },
+            );
+        }
+        for segments in anonymous {
+            self.index.record_anonymous_import(
                 &self.context,
                 TypeReference {
                     segments,
@@ -1210,11 +1399,12 @@ fn collect_use_bindings(
     prefix: &mut Vec<String>,
     out: &mut Vec<(String, Vec<String>)>,
     globs: &mut Vec<Vec<String>>,
+    anonymous: &mut Vec<Vec<String>>,
 ) {
     match tree {
         syn::UseTree::Path(path) => {
             prefix.push(path.ident.to_string());
-            collect_use_bindings(&path.tree, prefix, out, globs);
+            collect_use_bindings(&path.tree, prefix, out, globs, anonymous);
             prefix.pop();
         }
         syn::UseTree::Name(name) => {
@@ -1231,18 +1421,20 @@ fn collect_use_bindings(
         }
         syn::UseTree::Rename(rename) => {
             let alias = rename.rename.to_string();
-            if alias != "_" {
-                let mut target = prefix.clone();
-                let ident = rename.ident.to_string();
-                if ident != "self" {
-                    target.push(ident);
-                }
+            let mut target = prefix.clone();
+            let ident = rename.ident.to_string();
+            if ident != "self" {
+                target.push(ident);
+            }
+            if alias == "_" {
+                anonymous.push(target);
+            } else {
                 out.push((alias, target));
             }
         }
         syn::UseTree::Group(group) => {
             for item in &group.items {
-                collect_use_bindings(item, prefix, out, globs);
+                collect_use_bindings(item, prefix, out, globs, anonymous);
             }
         }
         syn::UseTree::Glob(_) => globs.push(prefix.clone()),
@@ -1264,6 +1456,7 @@ fn rust_type_index(sources: &[&SourceFile]) -> RustTypeIndex {
             visitor.visit_file(&file);
         }
     }
+    index.finalize_trait_method_candidates();
     index
 }
 
@@ -1299,20 +1492,21 @@ fn nominal_type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<Typ
     }
 }
 
-fn direct_type_parameter(ty: &syn::Type, parameters: &BTreeSet<String>) -> bool {
+fn direct_type_parameter_name(ty: &syn::Type, parameters: &BTreeSet<String>) -> Option<String> {
     match ty {
-        syn::Type::Group(group) => direct_type_parameter(&group.elem, parameters),
-        syn::Type::Paren(paren) => direct_type_parameter(&paren.elem, parameters),
+        syn::Type::Group(group) => direct_type_parameter_name(&group.elem, parameters),
+        syn::Type::Paren(paren) => direct_type_parameter_name(&paren.elem, parameters),
         syn::Type::Path(path)
             if path.qself.is_none()
                 && path.path.leading_colon.is_none()
                 && path.path.segments.len() == 1 =>
         {
             let segment = &path.path.segments[0];
-            matches!(segment.arguments, syn::PathArguments::None)
-                && parameters.contains(&segment.ident.to_string())
+            let name = segment.ident.to_string();
+            (matches!(segment.arguments, syn::PathArguments::None) && parameters.contains(&name))
+                .then_some(name)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -1383,6 +1577,8 @@ struct InferredValue {
 struct LocalSymbolScope {
     bindings: BTreeMap<String, Vec<LocalSymbolBinding>>,
     glob_imports: Vec<TypeReference>,
+    anonymous_imports: Vec<TypeReference>,
+    traits_by_method: BTreeMap<String, BTreeSet<String>>,
     type_declarations: BTreeSet<String>,
     function_declarations: BTreeSet<String>,
     function_returns: BTreeMap<String, Vec<TypeReference>>,
@@ -1537,6 +1733,94 @@ impl<'a> FieldReadVisitor<'a> {
         result
     }
 
+    fn traits_in_scope_for_method(&mut self, method: &str) -> BTreeSet<String> {
+        if let Some(traits) = self
+            .local_scopes
+            .last()
+            .and_then(|scope| scope.traits_by_method.get(method))
+        {
+            return traits.clone();
+        }
+        let Some(candidate_traits) = self.types.trait_method_candidates.get(method) else {
+            return BTreeSet::new();
+        };
+
+        let mut names = BTreeSet::new();
+        for trait_owner in candidate_traits {
+            if let Some(name) = trait_owner.rsplit("::").next() {
+                names.insert(name.to_string());
+            }
+        }
+        for scope in &self.local_scopes {
+            names.extend(scope.bindings.keys().cloned());
+        }
+        let module_prefix = format!("{}::", self.context.path());
+        for symbol in self
+            .types
+            .symbol_bindings
+            .range(module_prefix.clone()..)
+            .map(|(symbol, _)| symbol)
+        {
+            let Some(name) = symbol.strip_prefix(&module_prefix) else {
+                break;
+            };
+            if !name.contains("::") {
+                names.insert(name.to_string());
+            }
+        }
+
+        let mut traits = BTreeSet::new();
+        for name in names {
+            let reference = TypeReference {
+                segments: vec![name],
+                context: self.context.clone(),
+                leading_colon: false,
+            };
+            if let Some(symbol) = self.resolve_symbol_scoped(SymbolKind::Type, &reference) {
+                if candidate_traits.contains(&symbol) {
+                    traits.insert(symbol);
+                }
+            }
+        }
+        if let Some(imports) = self.types.anonymous_imports.get(&self.context) {
+            for import in imports {
+                if let Some(symbol) = self
+                    .types
+                    .resolve_symbol_reference(SymbolKind::Type, import, &mut BTreeSet::new())
+                    .exact()
+                {
+                    if candidate_traits.contains(&symbol) {
+                        traits.insert(symbol);
+                    }
+                }
+            }
+        }
+        for (scope_index, scope) in self.local_scopes.iter().enumerate() {
+            for import in &scope.anonymous_imports {
+                if let Some(symbol) = self
+                    .resolve_symbol_scoped_with_limit(
+                        SymbolKind::Type,
+                        import,
+                        scope_index + 1,
+                        &mut BTreeSet::new(),
+                        &mut BTreeSet::new(),
+                    )
+                    .exact()
+                {
+                    if candidate_traits.contains(&symbol) {
+                        traits.insert(symbol);
+                    }
+                }
+            }
+        }
+        if let Some(scope) = self.local_scopes.last_mut() {
+            scope
+                .traits_by_method
+                .insert(method.to_string(), traits.clone());
+        }
+        traits
+    }
+
     fn function_return_scoped(&self, path: &syn::Path) -> Option<String> {
         let reference = path_reference(path, &self.context)?;
         if !reference.leading_colon && reference.segments.len() == 1 {
@@ -1586,11 +1870,13 @@ impl<'a> FieldReadVisitor<'a> {
                 syn::Item::Use(item_use) => {
                     let mut bindings = Vec::new();
                     let mut globs = Vec::new();
+                    let mut anonymous = Vec::new();
                     collect_use_bindings(
                         &item_use.tree,
                         &mut Vec::new(),
                         &mut bindings,
                         &mut globs,
+                        &mut anonymous,
                     );
                     for (alias, segments) in bindings {
                         scope
@@ -1608,6 +1894,13 @@ impl<'a> FieldReadVisitor<'a> {
                     }
                     for segments in globs {
                         scope.glob_imports.push(TypeReference {
+                            segments,
+                            context: self.context.clone(),
+                            leading_colon: item_use.leading_colon.is_some(),
+                        });
+                    }
+                    for segments in anonymous {
+                        scope.anonymous_imports.push(TypeReference {
                             segments,
                             context: self.context.clone(),
                             leading_colon: item_use.leading_colon.is_some(),
@@ -1765,6 +2058,11 @@ impl<'a> FieldReadVisitor<'a> {
                     self.bind_pattern(element, value);
                 }
             }
+            syn::Pat::Slice(slice) => {
+                for element in &slice.elems {
+                    self.bind_pattern(element, value);
+                }
+            }
             syn::Pat::TupleStruct(tuple) => {
                 self.record_tagged_enum_match(&tuple.path);
                 for element in &tuple.elems {
@@ -1916,56 +2214,25 @@ impl<'a> FieldReadVisitor<'a> {
         &mut self,
         patterns: &[&syn::Pat],
         expression: &syn::Expr,
-        expression_count: usize,
     ) -> bool {
         let rest_positions: Vec<_> = patterns
             .iter()
             .enumerate()
             .filter_map(|(index, pattern)| matches!(pattern, syn::Pat::Rest(_)).then_some(index))
             .collect();
-        if rest_positions.is_empty() {
-            if patterns.len() != expression_count {
-                return false;
-            }
-            for pattern in patterns {
-                if !self.visit_patterned_initializer(pattern, expression) {
-                    self.visit_expr(expression);
-                }
-            }
-            return true;
-        }
-        if rest_positions.len() != 1 || expression_count + 1 < patterns.len() {
+        if rest_positions.len() > 1 {
             return false;
         }
-
-        let rest_index = rest_positions[0];
-        for pattern in &patterns[..rest_index] {
-            if !self.visit_patterned_initializer(pattern, expression) {
-                self.visit_expr(expression);
+        for pattern in patterns {
+            if matches!(pattern, syn::Pat::Rest(_)) {
+                self.visit_discarded_expr(expression);
+                continue;
             }
-        }
-        let suffix_len = patterns.len() - rest_index - 1;
-        if expression_count > rest_index + suffix_len {
-            self.visit_discarded_expr(expression);
-        }
-        for pattern in &patterns[rest_index + 1..] {
             if !self.visit_patterned_initializer(pattern, expression) {
                 self.visit_expr(expression);
             }
         }
         true
-    }
-
-    fn repeated_expression_count(expression: &syn::Expr) -> Option<usize> {
-        match expression {
-            syn::Expr::Group(group) => Self::repeated_expression_count(&group.expr),
-            syn::Expr::Lit(literal) => match &literal.lit {
-                syn::Lit::Int(value) => value.base10_parse().ok(),
-                _ => None,
-            },
-            syn::Expr::Paren(paren) => Self::repeated_expression_count(&paren.expr),
-            _ => None,
-        }
     }
 
     fn constructor_path(expression: &syn::Expr) -> Option<&syn::Path> {
@@ -2030,6 +2297,158 @@ impl<'a> FieldReadVisitor<'a> {
         true
     }
 
+    fn bind_patterned_sequence(
+        &mut self,
+        patterns: &[&syn::Pat],
+        expressions: &[&syn::Expr],
+    ) -> bool {
+        let rest_positions: Vec<_> = patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pattern)| matches!(pattern, syn::Pat::Rest(_)).then_some(index))
+            .collect();
+        if rest_positions.is_empty() {
+            if patterns.len() != expressions.len() {
+                return false;
+            }
+            for (pattern, expression) in patterns.iter().zip(expressions) {
+                self.bind_patterned_initializer(pattern, expression);
+            }
+            return true;
+        }
+        if rest_positions.len() != 1 || expressions.len() + 1 < patterns.len() {
+            return false;
+        }
+
+        let rest_index = rest_positions[0];
+        for (pattern, expression) in patterns[..rest_index]
+            .iter()
+            .zip(&expressions[..rest_index])
+        {
+            self.bind_patterned_initializer(pattern, expression);
+        }
+        let suffix_len = patterns.len() - rest_index - 1;
+        for (pattern, expression) in patterns[rest_index + 1..]
+            .iter()
+            .zip(&expressions[expressions.len() - suffix_len..])
+        {
+            self.bind_patterned_initializer(pattern, expression);
+        }
+        true
+    }
+
+    fn bind_repeated_patterned_sequence(
+        &mut self,
+        patterns: &[&syn::Pat],
+        expression: &syn::Expr,
+    ) -> bool {
+        if patterns
+            .iter()
+            .filter(|pattern| matches!(pattern, syn::Pat::Rest(_)))
+            .count()
+            > 1
+        {
+            return false;
+        }
+        for pattern in patterns {
+            if !matches!(pattern, syn::Pat::Rest(_)) {
+                self.bind_patterned_initializer(pattern, expression);
+            }
+        }
+        true
+    }
+
+    fn bind_patterned_record(
+        &mut self,
+        pattern: &syn::PatStruct,
+        expression: &syn::ExprStruct,
+    ) -> bool {
+        if !self.record_paths_match(&pattern.path, &expression.path) {
+            return false;
+        }
+        let expression_fields: Vec<_> = expression
+            .fields
+            .iter()
+            .filter(|field| !attributes_are_test_only(&field.attrs))
+            .collect();
+        for pattern_field in pattern
+            .fields
+            .iter()
+            .filter(|field| !attributes_are_test_only(&field.attrs))
+        {
+            let Some(expression_field) = expression_fields
+                .iter()
+                .find(|field| Self::members_match(&pattern_field.member, &field.member))
+            else {
+                return false;
+            };
+            self.bind_patterned_initializer(&pattern_field.pat, &expression_field.expr);
+        }
+        true
+    }
+
+    fn bind_patterned_initializer(&mut self, pattern: &syn::Pat, expression: &syn::Expr) {
+        let paired = match (pattern, expression) {
+            (syn::Pat::Paren(pattern), _) => {
+                self.bind_patterned_initializer(&pattern.pat, expression);
+                true
+            }
+            (syn::Pat::Reference(pattern), _) => {
+                self.bind_patterned_initializer(&pattern.pat, expression);
+                true
+            }
+            (syn::Pat::Type(pattern), _) => {
+                self.bind_patterned_initializer(&pattern.pat, expression);
+                true
+            }
+            (_, syn::Expr::Group(expression)) => {
+                self.bind_patterned_initializer(pattern, &expression.expr);
+                true
+            }
+            (_, syn::Expr::Paren(expression)) => {
+                self.bind_patterned_initializer(pattern, &expression.expr);
+                true
+            }
+            (syn::Pat::Wild(_) | syn::Pat::Rest(_), _) => true,
+            (syn::Pat::Tuple(pattern), syn::Expr::Tuple(expression)) => {
+                let patterns: Vec<_> = pattern.elems.iter().collect();
+                let expressions: Vec<_> = expression.elems.iter().collect();
+                self.bind_patterned_sequence(&patterns, &expressions)
+            }
+            (syn::Pat::TupleStruct(pattern), syn::Expr::Call(expression)) => {
+                match Self::constructor_path(&expression.func) {
+                    Some(path) if self.record_paths_match(&pattern.path, path) => {
+                        let patterns: Vec<_> = pattern.elems.iter().collect();
+                        let expressions: Vec<_> = expression.args.iter().collect();
+                        self.bind_patterned_sequence(&patterns, &expressions)
+                    }
+                    _ => false,
+                }
+            }
+            (syn::Pat::Slice(pattern), syn::Expr::Array(expression)) => {
+                let patterns: Vec<_> = pattern.elems.iter().collect();
+                let expressions: Vec<_> = expression.elems.iter().collect();
+                self.bind_patterned_sequence(&patterns, &expressions)
+            }
+            (syn::Pat::Slice(pattern), syn::Expr::Repeat(expression)) => {
+                let patterns: Vec<_> = pattern.elems.iter().collect();
+                self.bind_repeated_patterned_sequence(&patterns, &expression.expr)
+            }
+            (syn::Pat::Struct(pattern), syn::Expr::Struct(expression)) => {
+                self.bind_patterned_record(pattern, expression)
+            }
+            _ => false,
+        };
+        if !paired {
+            self.bind_inferred_pattern(pattern, expression);
+        }
+    }
+
+    fn bind_inferred_pattern(&mut self, pattern: &syn::Pat, expression: &syn::Expr) {
+        let inferred = self.infer_expr(expression);
+        self.bind_pattern(pattern, inferred.as_ref());
+    }
+
     fn visit_patterned_initializer(&mut self, pattern: &syn::Pat, expression: &syn::Expr) -> bool {
         match (pattern, expression) {
             (syn::Pat::Paren(pattern), _) => {
@@ -2077,16 +2496,8 @@ impl<'a> FieldReadVisitor<'a> {
                 self.visit_patterned_sequence(&patterns, &expressions)
             }
             (syn::Pat::Slice(pattern), syn::Expr::Repeat(expression)) => {
-                let Some(expression_count) = Self::repeated_expression_count(&expression.len)
-                else {
-                    return false;
-                };
                 let patterns: Vec<_> = pattern.elems.iter().collect();
-                let paired = self.visit_repeated_patterned_sequence(
-                    &patterns,
-                    &expression.expr,
-                    expression_count,
-                );
+                let paired = self.visit_repeated_patterned_sequence(&patterns, &expression.expr);
                 if paired {
                     self.visit_expr(&expression.len);
                 }
@@ -2348,7 +2759,11 @@ impl<'a> FieldReadVisitor<'a> {
                 let place_owner = self.infer_place_expr(&call.receiver);
                 let receiver = place_owner
                     .as_ref()
-                    .map(|owner| self.types.method_receiver(&owner.owner, &method))
+                    .map(|owner| {
+                        let in_scope_traits = self.traits_in_scope_for_method(&method);
+                        self.types
+                            .method_receiver(&owner.owner, &method, &in_scope_traits)
+                    })
                     .unwrap_or(MethodReceiverResolution::Missing);
                 let (reads_receiver, uses_mutable_receiver) = match receiver {
                     MethodReceiverResolution::SharedOrValue => (true, false),
@@ -2626,21 +3041,27 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
             return;
         }
         let saved_environment = self.environment.clone();
-        let inferred = node.init.as_ref().and_then(|init| {
+        let (inferred, patterned_initializer) = node.init.as_ref().map_or((None, false), |init| {
             if self.visit_patterned_initializer(&node.pat, &init.expr) {
-                None
+                (None, true)
             } else {
-                self.infer_expr(&init.expr)
+                (self.infer_expr(&init.expr), false)
             }
         });
         self.environment = saved_environment.clone();
         if let Some(init) = &node.init {
             if let Some((_, diverge)) = &init.diverge {
                 self.visit_expr(diverge);
-                self.environment = saved_environment;
+                self.environment = saved_environment.clone();
             }
         }
-        self.bind_pattern(&node.pat, inferred.as_ref());
+        if patterned_initializer {
+            if let Some(init) = &node.init {
+                self.bind_patterned_initializer(&node.pat, &init.expr);
+            }
+        } else {
+            self.bind_pattern(&node.pat, inferred.as_ref());
+        }
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
@@ -5191,6 +5612,55 @@ fn cfg_test(config: &Config) {
     }
 
     #[test]
+    fn tuple_initializer_bindings_preserve_config_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 let (cfg,) = (v,);\n\
+                 consume(cfg.enabled);\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a tuple-bound local must retain the initializer provenance: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn array_initializer_bindings_preserve_config_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 let [cfg] = [v];\n\
+                 consume(cfg.enabled);\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "an array-bound local must retain the initializer provenance: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_struct_initializer_bindings_preserve_config_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             struct Wrap<T>(T);\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 let Wrap(cfg) = Wrap(v);\n\
+                 consume(cfg.enabled);\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a tuple-struct-bound local must retain initializer provenance: {errors:?}"
+        );
+    }
+
+    #[test]
     fn ignored_repeat_initializer_elements_are_not_reader_evidence() {
         let errors = guard_errors(&[source(
             "struct GuardConfig { enabled: bool }\n\
@@ -5203,6 +5673,40 @@ fn cfg_test(config: &Config) {
             errors.len(),
             1,
             "a repeated initializer discarded by every element is not evidence: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn named_repeat_counts_do_not_revive_fully_discarded_reads() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             const N: usize = 2;\n\
+             fn ignore(v: &GuardConfig) {\n\
+                 let [_, _] = [v.enabled; N];\n\
+             }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a named repeat count must retain element-wise discard mapping: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn named_repeat_counts_preserve_live_binding_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             const N: usize = 1;\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 let [cfg] = [v; N];\n\
+                 consume(cfg.enabled);\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a live binding remains traceable through a named repeat count: {errors:?}"
         );
     }
 
@@ -5434,22 +5938,86 @@ fn cfg_test(config: &Config) {
     }
 
     #[test]
-    fn ambiguous_trait_receiver_semantics_fail_closed() {
+    fn unsatisfied_blanket_trait_bounds_do_not_poison_shared_methods() {
         let errors = guard_errors(&[source(
             "struct Flag;\n\
-             trait Observe { fn len(&self) -> usize { 0 } }\n\
-             trait Mutate { fn len(&mut self) -> usize { 0 } }\n\
-             impl Observe for Flag {}\n\
-             impl Mutate for Flag {}\n\
+             trait Marker {}\n\
+             trait State { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl State for Flag {}\n\
+             impl<T: Marker> Mutate for T {}\n\
              struct GuardConfig { enabled: Flag }\n\
-             fn inspect(v: &mut GuardConfig) { consume(v.enabled.len()); }",
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "an unsatisfied blanket bound cannot conflict with a shared method: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn out_of_scope_blanket_traits_do_not_poison_shared_methods() {
+        let errors = guard_errors(&[source(
+            "mod hidden {\n\
+                 pub trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+                 impl<T> Mutate for T {}\n\
+             }\n\
+             struct Flag;\n\
+             trait State { fn is_set(&self) -> bool { true } }\n\
+             impl State for Flag {}\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "only traits in lexical scope participate in method lookup: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn satisfied_blanket_bounds_preserve_mutable_receiver_semantics() {
+        let errors = guard_errors(&[source(
+            "struct Flag;\n\
+             trait Marker {}\n\
+             impl Marker for Flag {}\n\
+             trait Normalize { fn len(&mut self) -> usize { 0 } }\n\
+             impl<T: Marker> Normalize for T {}\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn normalize(v: &mut GuardConfig) { consume(v.enabled.len()); }",
         )]);
 
         assert_eq!(
             errors.len(),
             1,
-            "conflicting trait receiver signatures must fail closed: {errors:?}"
+            "a satisfied blanket bound retains its mutable semantics: {errors:?}"
         );
+    }
+
+    #[test]
+    fn imported_blanket_traits_remain_method_candidates() {
+        for import in [
+            "use extension::Normalize;",
+            "use extension::Normalize as _;",
+        ] {
+            let errors = guard_errors(&[source(&format!(
+                "mod extension {{\n\
+                     pub trait Normalize {{ fn len(&mut self) -> usize {{ 0 }} }}\n\
+                     impl<T> Normalize for T {{}}\n\
+                 }}\n\
+                 {import}\n\
+                 struct Flag;\n\
+                 struct GuardConfig {{ enabled: Flag }}\n\
+                 fn normalize(v: &mut GuardConfig) {{ consume(v.enabled.len()); }}"
+            ))]);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "an imported mutable extension trait remains visible: {import}\n{errors:?}"
+            );
+        }
     }
 
     #[test]
