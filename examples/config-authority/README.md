@@ -111,7 +111,7 @@ curl -sS -u admin:"$ADMIN_PASSWORD" \
 }
 ```
 
-Rotation is additive: publish under a new `key_id` while subscribers still trust the old one, then drop the old entry a window later. No synchronized fleet restart.
+Rotation is additive: publish under a new `key_id` while subscribers still trust the old one, then drop the old entry a window later. No restart on any node: a subscriber re-reads this file on every poll that returns a bundle, so adding an entry starts verifying and removing one stops verifying immediately. The removal half is the one worth knowing about, because it means revoking a leaked key is an edit rather than a rolling restart.
 
 ## Publish a configuration
 

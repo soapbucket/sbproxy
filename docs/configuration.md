@@ -4706,7 +4706,7 @@ A subscriber treats every non-`200`, non-`304` answer as "authority unreachable"
 }
 ```
 
-Rotation is additive: publish under the new `key_id` while subscribers still trust the old one, then drop the old entry a window later. No synchronized fleet restart. `hmac_sha256` is also accepted, for a single-operator lab, and refuses to verify unless the subscriber sets `allow_shared_secret_keys: true`; a shared secret is symmetric, so every subscriber holding it can forge a bundle for every other one.
+Rotation is additive: publish under the new `key_id` while subscribers still trust the old one, then drop the old entry a window later. No restart at all, on any node. A subscriber re-reads `verifying_keys_file` on every poll that returns a bundle, so adding an entry starts verifying and removing one stops verifying without the process being touched. That matters most for the removal: a key revoked because it leaked has to stop working when you edit the file, not when you finish restarting the fleet. A read that fails, which is what a file being rewritten looks like for an instant, keeps the key set already loaded rather than trusting nothing, so an ordinary rotation is not a window where every bundle is refused. `hmac_sha256` is also accepted, for a single-operator lab, and refuses to verify unless the subscriber sets `allow_shared_secret_keys: true`; a shared secret is symmetric, so every subscriber holding it can forge a bundle for every other one.
 
 ### Subscriber: `proxy.config_authority.upstream`
 
