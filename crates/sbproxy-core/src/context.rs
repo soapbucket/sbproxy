@@ -194,6 +194,10 @@ pub struct RequestContext {
     // --- Load balancer state ---
     /// Index of the selected load balancer target (for connection tracking).
     pub lb_target_idx: Option<usize>,
+    /// Wall-clock start of the current selected upstream attempt.
+    pub lb_attempt_started_at: Option<Instant>,
+    /// Whether strategy feedback was already emitted for the current attempt.
+    pub lb_outcome_recorded: bool,
 
     // --- Upstream retry state ---
     /// Number of retry attempts already made for this request.
@@ -1159,6 +1163,8 @@ impl RequestContext {
             origin_idx: None,
             pipeline: crate::reload::current_pipeline_full(),
             lb_target_idx: None,
+            lb_attempt_started_at: None,
+            lb_outcome_recorded: false,
             retry_count: 0,
             retry_backoff_ms: None,
             status_retry_skip_reason: None,
@@ -1376,6 +1382,8 @@ mod tests {
         assert!(ctx.client_ip.is_none());
         assert!(ctx.hostname.is_empty());
         assert!(ctx.origin_idx.is_none());
+        assert!(ctx.lb_attempt_started_at.is_none());
+        assert!(!ctx.lb_outcome_recorded);
         assert!(ctx.auth_result.is_none());
         assert!(!ctx.force_ssl_checked);
         assert!(ctx.short_circuit_status.is_none());

@@ -147,19 +147,36 @@ fn engage_validated_graphql_idempotency(
     false
 }
 
-/// Stable admin-console label for the generic load balancer's closed
-/// algorithm set.
-fn load_balancer_algorithm_name(algorithm: &sbproxy_modules::action::Algorithm) -> &'static str {
-    use sbproxy_modules::action::Algorithm;
-    match algorithm {
-        Algorithm::RoundRobin => "round_robin",
-        Algorithm::WeightedRandom => "weighted_random",
-        Algorithm::LeastConnections => "least_connections",
-        Algorithm::IpHash => "ip_hash",
-        Algorithm::UriHash => "uri_hash",
-        Algorithm::HeaderHash { .. } => "header_hash",
-        Algorithm::CookieHash { .. } => "cookie_hash",
+fn apply_load_balancer_selection(
+    ctx: &mut RequestContext,
+    selection: &sbproxy_modules::action::TargetSelection,
+) {
+    ctx.lb_target_idx = Some(selection.target_index);
+    ctx.lb_attempt_started_at = Some(std::time::Instant::now());
+    ctx.lb_outcome_recorded = false;
+    ctx.admin_load_balancer_strategy = Some(selection.selection_method.clone());
+    ctx.admin_load_balancer_target = Some(format!("{}:{}", selection.host, selection.port));
+}
+
+fn record_load_balancer_outcome(
+    ctx: &mut RequestContext,
+    target_index: usize,
+    success: bool,
+    elapsed: std::time::Duration,
+    record: impl FnOnce(usize, sbproxy_modules::RoutingOutcome),
+) {
+    if ctx.lb_outcome_recorded || ctx.lb_target_idx != Some(target_index) {
+        return;
     }
+
+    ctx.lb_outcome_recorded = true;
+    record(
+        target_index,
+        sbproxy_modules::RoutingOutcome {
+            success,
+            latency: elapsed,
+        },
+    );
 }
 
 /// Scheme-agnostic host + path of an upstream URL (WOR-1698).
@@ -294,6 +311,15 @@ async fn maybe_retry_upstream_status(
     let status = upstream_response.status.as_u16();
     let pipeline = ctx.pipeline.clone();
     let action = active_action(&pipeline, ctx)?;
+    if let (Action::LoadBalancer(lb), Some(target_idx)) = (action, ctx.lb_target_idx) {
+        let elapsed = ctx
+            .lb_attempt_started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        record_load_balancer_outcome(ctx, target_idx, status < 500, elapsed, |index, outcome| {
+            lb.record_strategy_outcome(index, outcome)
+        });
+    }
     let cfg = retry_config_for_action(action)?;
     if !cfg.enabled() || !cfg.allows_status(status) {
         return None;
@@ -582,36 +608,46 @@ impl ProxyHttp for SbProxy {
                 Ok(Box::new(peer))
             }
             Action::LoadBalancer(lb) => {
-                let client_ip_str = ctx.client_ip.map(|ip| ip.to_string());
-                let uri = _session.req_header().uri.path();
-                let headers = &_session.req_header().headers;
+                let request_header = _session.req_header();
+                let path = request_header.uri.path_and_query().map_or_else(
+                    || request_header.uri.path().to_string(),
+                    |value| value.to_string(),
+                );
+                let mut routing_request = sbproxy_modules::RoutingRequest::new(
+                    request_header.method.as_str(),
+                    path,
+                    ctx.hostname.as_str(),
+                );
+                routing_request.headers = request_header.headers.clone();
+                routing_request.client_ip = ctx.client_ip.map(|ip| ip.to_string());
+                let selection = lb.select_target_for_request(routing_request).map_err(|e| {
+                    warn!(error = %e, "load balancer target selection failed");
+                    Error::because(ErrorType::ConnectError, "lb target selection failed", e)
+                })?;
 
-                let (host, port, tls, target_idx) = lb
-                    .select_target(client_ip_str.as_deref(), uri, headers)
-                    .map_err(|e| {
-                        warn!(error = %e, "load balancer target selection failed");
-                        Error::because(ErrorType::ConnectError, "lb target selection failed", e)
-                    })?;
+                guard_upstream(
+                    &selection.host,
+                    selection.port,
+                    selection.tls,
+                    allow_private,
+                )
+                .await?;
 
-                guard_upstream(&host, port, tls, allow_private).await?;
-
-                lb.record_connect(target_idx);
-                ctx.lb_target_idx = Some(target_idx);
-                ctx.admin_load_balancer_strategy =
-                    Some(load_balancer_algorithm_name(&lb.algorithm).to_string());
-                ctx.admin_load_balancer_target = Some(format!("{host}:{port}"));
+                lb.record_connect(selection.target_index);
+                apply_load_balancer_selection(ctx, &selection);
 
                 debug!(
                     hostname = %ctx.hostname,
-                    upstream_host = %host,
-                    upstream_port = %port,
-                    tls = %tls,
-                    target_idx = %target_idx,
+                    upstream_host = %selection.host,
+                    upstream_port = %selection.port,
+                    tls = %selection.tls,
+                    target_idx = %selection.target_index,
+                    selection_method = %selection.selection_method,
                     "load balancer routing request to upstream"
                 );
 
-                let addr = format!("{host}:{port}");
-                let peer = tune_peer(HttpPeer::new(&*addr, tls, host));
+                let addr = format!("{}:{}", selection.host, selection.port);
+                let peer = tune_peer(HttpPeer::new(&*addr, selection.tls, selection.host));
                 Ok(Box::new(peer))
             }
             Action::A2a(a2a) => {
@@ -4123,6 +4159,15 @@ impl ProxyHttp for SbProxy {
         } else {
             pipeline.actions.get(origin_idx)
         };
+        if let (Some(Action::LoadBalancer(lb)), Some(target_idx)) = (action, ctx.lb_target_idx) {
+            let elapsed = ctx
+                .lb_attempt_started_at
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
+            record_load_balancer_outcome(ctx, target_idx, false, elapsed, |index, outcome| {
+                lb.record_strategy_outcome(index, outcome)
+            });
+        }
         let retry_cfg = action.and_then(retry_config_for_action);
         let Some(cfg) = retry_cfg else {
             return e;
@@ -4197,14 +4242,25 @@ impl ProxyHttp for SbProxy {
         let mut e = e.more_context(format!("Peer: {peer}"));
         e.retry
             .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
-        if e.retry() {
-            return e;
-        }
 
         let pipeline = ctx.pipeline.clone();
         let Some(action) = active_action(&pipeline, ctx) else {
             return e;
         };
+        if *e.esource() == pingora_error::ErrorSource::Upstream {
+            if let (Action::LoadBalancer(lb), Some(target_idx)) = (action, ctx.lb_target_idx) {
+                let elapsed = ctx
+                    .lb_attempt_started_at
+                    .map(|started| started.elapsed())
+                    .unwrap_or_default();
+                record_load_balancer_outcome(ctx, target_idx, false, elapsed, |index, outcome| {
+                    lb.record_strategy_outcome(index, outcome)
+                });
+            }
+        }
+        if e.retry() {
+            return e;
+        }
         let Some(cfg) = retry_config_for_action(action) else {
             return e;
         };
@@ -4654,6 +4710,24 @@ impl ProxyHttp for SbProxy {
                 .inc();
         }
 
+        // Finish strategy feedback before cleanup clears the selected target.
+        if let Some(target_idx) = ctx.lb_target_idx {
+            let pipeline = ctx.pipeline.clone();
+            if let Some(Action::LoadBalancer(lb)) = active_action(&pipeline, ctx) {
+                let elapsed = ctx
+                    .lb_attempt_started_at
+                    .map(|started| started.elapsed())
+                    .unwrap_or_default();
+                record_load_balancer_outcome(
+                    ctx,
+                    target_idx,
+                    e.is_none() && status_u16 < 500,
+                    elapsed,
+                    |index, outcome| lb.record_strategy_outcome(index, outcome),
+                );
+            }
+        }
+
         // Decrement load balancer connection count if this request used one.
         if let Some(target_idx) = ctx.lb_target_idx.take() {
             if let Some(origin_idx) = ctx.origin_idx {
@@ -4850,6 +4924,35 @@ mod tests {
     use super::*;
     use pingora_error::ErrorSource;
 
+    fn target_selection(
+        target_index: usize,
+        selection_method: &str,
+    ) -> sbproxy_modules::action::TargetSelection {
+        sbproxy_modules::action::TargetSelection {
+            host: format!("target-{target_index}.example.com"),
+            port: 443,
+            tls: true,
+            target_index,
+            selection_method: selection_method.to_string(),
+        }
+    }
+
+    fn capture_outcome(
+        ctx: &mut RequestContext,
+        target_index: usize,
+        success: bool,
+        latency_ms: u64,
+        outcomes: &mut Vec<(usize, sbproxy_modules::RoutingOutcome)>,
+    ) {
+        record_load_balancer_outcome(
+            ctx,
+            target_index,
+            success,
+            std::time::Duration::from_millis(latency_ms),
+            |index, outcome| outcomes.push((index, outcome)),
+        );
+    }
+
     fn pending_compression_value() -> sbproxy_ai::PendingCompressionValue {
         let run = sbproxy_ai::compression::CompressionRun {
             messages: Vec::new(),
@@ -4883,32 +4986,84 @@ mod tests {
     }
 
     #[test]
-    fn admin_load_balancer_algorithm_names_are_closed_and_stable() {
-        use sbproxy_modules::action::Algorithm;
+    fn successful_response_then_logging_cleanup_records_one_success() {
+        let mut ctx = RequestContext::default();
+        let mut outcomes = Vec::new();
+        apply_load_balancer_selection(&mut ctx, &target_selection(0, "bandit"));
 
-        let cases = [
-            (Algorithm::RoundRobin, "round_robin"),
-            (Algorithm::WeightedRandom, "weighted_random"),
-            (Algorithm::LeastConnections, "least_connections"),
-            (Algorithm::IpHash, "ip_hash"),
-            (Algorithm::UriHash, "uri_hash"),
-            (
-                Algorithm::HeaderHash {
-                    header: "x-tenant".to_string(),
-                },
-                "header_hash",
-            ),
-            (
-                Algorithm::CookieHash {
-                    cookie: "session".to_string(),
-                },
-                "cookie_hash",
-            ),
-        ];
+        capture_outcome(&mut ctx, 0, true, 12, &mut outcomes);
+        capture_outcome(&mut ctx, 0, true, 20, &mut outcomes);
 
-        for (algorithm, expected) in cases {
-            assert_eq!(load_balancer_algorithm_name(&algorithm), expected);
-        }
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, 0);
+        assert!(outcomes[0].1.success);
+        assert_eq!(outcomes[0].1.latency, std::time::Duration::from_millis(12));
+    }
+
+    #[test]
+    fn retry_selection_follows_one_failure_for_the_previous_response() {
+        let mut ctx = RequestContext::default();
+        let mut outcomes = Vec::new();
+        apply_load_balancer_selection(&mut ctx, &target_selection(0, "bandit"));
+
+        capture_outcome(&mut ctx, 0, false, 15, &mut outcomes);
+        apply_load_balancer_selection(&mut ctx, &target_selection(1, "bandit"));
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, 0);
+        assert!(!outcomes[0].1.success);
+        assert_eq!(ctx.lb_target_idx, Some(1));
+        assert!(!ctx.lb_outcome_recorded);
+        assert!(ctx.lb_attempt_started_at.is_some());
+    }
+
+    #[test]
+    fn retry_selection_follows_one_failure_for_a_connect_error() {
+        let mut ctx = RequestContext::default();
+        let mut outcomes = Vec::new();
+        apply_load_balancer_selection(&mut ctx, &target_selection(2, "bandit"));
+
+        capture_outcome(&mut ctx, 2, false, 7, &mut outcomes);
+        apply_load_balancer_selection(&mut ctx, &target_selection(3, "bandit"));
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, 2);
+        assert!(!outcomes[0].1.success);
+        assert_eq!(outcomes[0].1.latency, std::time::Duration::from_millis(7));
+        assert_eq!(ctx.lb_target_idx, Some(3));
+        assert!(!ctx.lb_outcome_recorded);
+    }
+
+    #[test]
+    fn timeout_then_generic_error_callback_records_one_failure() {
+        let mut ctx = RequestContext::default();
+        let mut outcomes = Vec::new();
+        apply_load_balancer_selection(&mut ctx, &target_selection(4, "bandit"));
+
+        capture_outcome(&mut ctx, 4, false, 30, &mut outcomes);
+        capture_outcome(&mut ctx, 4, false, 31, &mut outcomes);
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, 4);
+        assert!(!outcomes[0].1.success);
+        assert_eq!(outcomes[0].1.latency, std::time::Duration::from_millis(30));
+    }
+
+    #[test]
+    fn deferred_strategy_selection_records_the_builtin_algorithm() {
+        let mut ctx = RequestContext::default();
+        let selection = target_selection(0, "round_robin");
+
+        apply_load_balancer_selection(&mut ctx, &selection);
+
+        assert_eq!(
+            ctx.admin_load_balancer_strategy.as_deref(),
+            Some("round_robin")
+        );
+        assert_eq!(
+            ctx.admin_load_balancer_target.as_deref(),
+            Some("target-0.example.com:443")
+        );
     }
 
     #[test]
