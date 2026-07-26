@@ -135,6 +135,36 @@ impl AdminCacheStatus {
     }
 }
 
+/// Stable location of a load-balancer action inside the request's pinned
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoadBalancerActionKey {
+    pub(crate) origin_index: usize,
+    pub(crate) forward_rule_index: Option<usize>,
+}
+
+impl LoadBalancerActionKey {
+    pub(crate) const fn new(origin_index: usize, forward_rule_index: Option<usize>) -> Self {
+        Self {
+            origin_index,
+            forward_rule_index,
+        }
+    }
+}
+
+/// One selected load-balancer target and the action that owns its mutable
+/// connection, breaker, outlier, and strategy state.
+///
+/// The pinned pipeline plus this key keeps retry and terminal cleanup attached
+/// to the action that created the attempt, even when that action came from a
+/// forward rule.
+#[derive(Debug)]
+pub(crate) struct LoadBalancerAttemptToken {
+    pub(crate) action: LoadBalancerActionKey,
+    pub(crate) target_index: usize,
+    pub(crate) started_at: Instant,
+}
+
 /// Per-request state threaded through all Pingora phases as CTX.
 pub struct RequestContext {
     // --- Identity ---
@@ -192,12 +222,9 @@ pub struct RequestContext {
     pub short_circuit_content_type: Option<String>,
 
     // --- Load balancer state ---
-    /// Index of the selected load balancer target (for connection tracking).
-    pub lb_target_idx: Option<usize>,
-    /// Wall-clock start of the current selected upstream attempt.
-    pub lb_attempt_started_at: Option<Instant>,
-    /// Whether strategy feedback was already emitted for the current attempt.
-    pub lb_outcome_recorded: bool,
+    /// Currently active target attempt, tied to the exact main or forward-rule
+    /// load-balancer action that owns its mutable runtime state.
+    pub(crate) lb_attempt: Option<LoadBalancerAttemptToken>,
 
     // --- Upstream retry state ---
     /// Number of retry attempts already made for this request.
@@ -1175,9 +1202,7 @@ impl RequestContext {
             tenant_id: CompactString::const_new("__default__"),
             origin_idx: None,
             pipeline: crate::reload::current_pipeline_full(),
-            lb_target_idx: None,
-            lb_attempt_started_at: None,
-            lb_outcome_recorded: false,
+            lb_attempt: None,
             retry_count: 0,
             retry_backoff_ms: None,
             status_retry_skip_reason: None,
@@ -1397,8 +1422,7 @@ mod tests {
         assert!(ctx.client_ip.is_none());
         assert!(ctx.hostname.is_empty());
         assert!(ctx.origin_idx.is_none());
-        assert!(ctx.lb_attempt_started_at.is_none());
-        assert!(!ctx.lb_outcome_recorded);
+        assert!(ctx.lb_attempt.is_none());
         assert!(ctx.auth_result.is_none());
         assert!(!ctx.force_ssl_checked);
         assert!(ctx.short_circuit_status.is_none());

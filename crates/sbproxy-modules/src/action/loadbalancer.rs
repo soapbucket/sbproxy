@@ -977,7 +977,6 @@ impl LoadBalancerAction {
     }
 
     /// Get the current connection count for a target.
-    #[cfg(test)]
     pub fn connection_count(&self, target_idx: usize) -> u32 {
         if target_idx < self.state.connections.len() {
             self.state.connections[target_idx].load(Ordering::Relaxed)
