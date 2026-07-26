@@ -162,6 +162,7 @@ const createForm = reactive({
   inject_mcp: "",
   metadata: "",
   tags: "",
+  credential_id: "",
   expires_at: "",
 });
 const createBusy = ref(false);
@@ -194,6 +195,7 @@ function resetCreate() {
     inject_mcp: "",
     metadata: "",
     tags: "",
+    credential_id: "",
     expires_at: "",
   });
   createError.value = null;
@@ -246,6 +248,10 @@ async function submitCreate() {
     const body: Record<string, unknown> = buildPolicy(createForm);
     if (createForm.name) body.name = createForm.name;
     if (createForm.tags) body.tags = toList(createForm.tags);
+    // Binds this key to a stored upstream credential. The proxy then
+    // presents that credential instead of whatever the caller sent.
+    if (createForm.credential_id)
+      body.credential_id = createForm.credential_id.trim();
     if (createForm.expires_at) body.expires_at = createForm.expires_at;
     const created = await api.createKey(body);
     const token = created.token;
@@ -1107,6 +1113,20 @@ function statusOf(k: AdminKey): string {
         <div v-if="supportsPolicyField('tenant_id', 'tenant')" class="sb-field">
           <label class="sb-label">Tenant</label>
           <input class="sb-input" v-model="createForm.tenant_id" placeholder="default" />
+        </div>
+        <div class="sb-field">
+          <label class="sb-label">Upstream credential</label>
+          <input
+            class="sb-input"
+            v-model="createForm.credential_id"
+            placeholder="leave blank to use the origin's own credential"
+          />
+          <p class="sb-hint">
+            Binds this key to a stored credential, so the proxy presents that
+            secret upstream instead of whatever the caller sent. The credential
+            must be active and in the same tenant. If it later becomes
+            unresolvable the request is refused rather than falling back.
+          </p>
         </div>
         <div
           v-if="supportsPolicyField('bypass_prompt_injection')"

@@ -22,12 +22,12 @@ function credId(c: Credential): string {
 
 // ---- create ----
 const showCreate = ref(false);
-const form = reactive({ name: "", provider: "", kind: "", secret: "", tags: "" });
+const form = reactive({ name: "", provider: "", kind: "", secret: "", tags: "", header: "", scheme: "" });
 const busy = ref(false);
 const createError = ref<ApiError | null>(null);
 
 function reset() {
-  Object.assign(form, { name: "", provider: "", kind: "", secret: "", tags: "" });
+  Object.assign(form, { name: "", provider: "", kind: "", secret: "", tags: "", header: "", scheme: "" });
   createError.value = null;
 }
 
@@ -40,6 +40,11 @@ async function submit() {
     if (form.provider) body.provider = form.provider;
     if (form.kind) body.kind = form.kind;
     if (form.secret) body.secret = form.secret;
+    // Presentation belongs to the credential: how the upstream expects
+    // this secret sent, not how the caller sent theirs. Blank means the
+    // server default (authorization: Bearer ...).
+    if (form.header) body.header = form.header.trim();
+    if (form.scheme !== "") body.scheme = form.scheme;
     if (form.tags) body.tags = form.tags.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
     await api.createCredential(body);
     showCreate.value = false;
@@ -120,6 +125,7 @@ function statusOf(c: Credential): string {
         <tr>
           <th>Name</th>
           <th>Provider</th>
+          <th>Upstream header</th>
           <th>Status</th>
           <th>Created</th>
           <th>Expires</th>
@@ -136,6 +142,7 @@ function statusOf(c: Credential): string {
             </div>
           </td>
           <td class="sb-mono">{{ c.provider ?? c.kind ?? "n/a" }}</td>
+          <td class="sb-mono">{{ c.header ?? "authorization" }}</td>
           <td>
             <StatusBadge :label="statusOf(c)" />
             <div v-if="c.rotation_pending" style="margin-top: 4px">
@@ -205,6 +212,24 @@ function statusOf(c: Credential): string {
       <div class="sb-field">
         <label class="sb-label">Kind (optional)</label>
         <input class="sb-input" v-model="form.kind" placeholder="api_key" />
+      </div>
+    </div>
+    <div class="two">
+      <div class="sb-field">
+        <label class="sb-label">Upstream header</label>
+        <input class="sb-input" v-model="form.header" placeholder="authorization" />
+        <p class="sb-faint">
+          Where the upstream expects this secret. Blank means
+          <code>authorization</code>. Anthropic wants <code>x-api-key</code>.
+        </p>
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Scheme prefix</label>
+        <input class="sb-input" v-model="form.scheme" placeholder="Bearer " />
+        <p class="sb-faint">
+          Prefix on the header value. Blank means <code>Bearer&nbsp;</code>. Type
+          a single space to send the raw secret with no prefix.
+        </p>
       </div>
     </div>
     <div class="sb-field">

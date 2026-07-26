@@ -1359,6 +1359,12 @@ struct CredentialCreate {
     /// A plaintext secret to envelope-encrypt at rest (needs a master key).
     secret: Option<String>,
     tenant: Option<String>,
+    /// Upstream header this credential is written to. Defaults to
+    /// `authorization`.
+    header: Option<String>,
+    /// Scheme prefix on the header value. Defaults to `Bearer `. Send an empty
+    /// string for raw-value headers such as `x-api-key`.
+    scheme: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1383,6 +1389,19 @@ fn create_credential(body: Option<&str>) -> Resp {
     let id =
         c.id.clone()
             .unwrap_or_else(sbproxy_keystore::crypto::random_id);
+    // Reject a header the proxy could never legally set on an upstream
+    // request, at the boundary rather than at dispatch time.
+    let credential_header = c
+        .header
+        .as_deref()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .unwrap_or_else(sbproxy_keystore::record::default_cred_header);
+    if http::header::HeaderName::from_bytes(credential_header.as_bytes()).is_err() {
+        return bad_request("header is not a valid HTTP header name");
+    }
+    if sbproxy_config::types::FORBIDDEN_SWEEP_HEADERS.contains(&credential_header.as_str()) {
+        return bad_request("header may not be used to carry a credential");
+    }
     let material = match build_material(&plane, &id, c.vault_ref.as_deref(), c.secret.as_deref()) {
         Ok(m) => m,
         Err(e) => return bad_request(&e),
@@ -1393,8 +1412,10 @@ fn create_credential(body: Option<&str>) -> Resp {
         name: c.name.unwrap_or_else(|| id.clone()),
         provider: c.provider,
         kind: c.kind.unwrap_or_else(|| "ai_provider".to_string()),
-        header: sbproxy_keystore::record::default_cred_header(),
-        scheme: sbproxy_keystore::record::default_cred_scheme(),
+        header: credential_header,
+        scheme: c
+            .scheme
+            .unwrap_or_else(sbproxy_keystore::record::default_cred_scheme),
         material,
         status: RecordStatus::Active,
         tenant_id: c.tenant,
@@ -1661,6 +1682,10 @@ struct CredentialView {
     name: String,
     provider: Option<String>,
     kind: String,
+    /// Upstream header this credential is presented in. Not a secret.
+    header: String,
+    /// Scheme prefix on the header value. Not a secret.
+    scheme: String,
     status: RecordStatus,
     tenant_id: Option<String>,
     /// How the secret is held, without revealing it.
@@ -1684,6 +1709,8 @@ impl From<&CredentialRecord> for CredentialView {
             name: r.name.clone(),
             provider: r.provider.clone(),
             kind: r.kind.clone(),
+            header: r.header.clone(),
+            scheme: r.scheme.clone(),
             status: r.status,
             tenant_id: r.tenant_id.clone(),
             storage,
@@ -2021,6 +2048,50 @@ mod tests {
 
     fn parse(resp: &Resp) -> serde_json::Value {
         serde_json::from_str(&resp.2).unwrap()
+    }
+
+    #[test]
+    fn a_credential_carries_its_own_upstream_presentation() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let resp = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(r#"{"id":"anthropic","secret":"s","header":"X-Api-Key","scheme":""}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 201, "{}", resp.2);
+        let v = parse(&resp);
+        // Normalised to lowercase, because that is how it is written upstream.
+        assert_eq!(v["credential"]["header"], "x-api-key");
+        assert_eq!(v["credential"]["scheme"], "");
+    }
+
+    #[test]
+    fn a_credential_defaults_to_bearer_authorization() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let resp = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(r#"{"id":"openai","secret":"s"}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 201, "{}", resp.2);
+        let v = parse(&resp);
+        assert_eq!(v["credential"]["header"], "authorization");
+        assert_eq!(v["credential"]["scheme"], "Bearer ");
+    }
+
+    #[test]
+    fn a_credential_header_that_cannot_be_set_upstream_is_rejected() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        for bad in ["not a header", "host", "content-length"] {
+            let body = format!(r#"{{"id":"c","secret":"s","header":"{bad}"}}"#);
+            let resp = dispatch("POST", "/admin/credentials", Some(&body)).unwrap();
+            assert_eq!(resp.0, 400, "{bad} must be rejected: {}", resp.2);
+        }
     }
 
     #[test]
